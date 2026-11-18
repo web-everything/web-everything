@@ -2,7 +2,11 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
+import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
+import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
+import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
+import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, refreshApprovedHeadChecked, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
  *
@@ -140,11 +144,14 @@ import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs'
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, spawnSync } from 'node:child_process';
+import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
-import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { createLabelEnsurer, isLabelNotFoundError } from './lib/label-memo.mjs';
 import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
 import { planCoupleCascadeStep, carrierPreflight, openSiblingRefSet, candKey, isImplHalf, isCoupleCarrier } from './lib/couple-cascade.mjs';
@@ -176,8 +183,10 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydrated, resolvePrListPaging } from './lib/pr-list-paged.mjs';
+import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { resolveCardNumbering } from './lib/policy-cascade.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
@@ -194,11 +203,15 @@ import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
+import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
+import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
+import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
 import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
+import { isDaemonCaller } from './lib/github-auth-policy.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
@@ -206,7 +219,7 @@ import { createCardGrouping, runCardGroupPass } from './lib/card-group.mjs';
 import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
 import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
-import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
+import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, shouldPrepareBranchBeforeEnqueue, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
@@ -226,11 +239,11 @@ import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from '.
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-freeze-shared.mjs';
-import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
+import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON, freezeUnreadableOnly } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
-import { readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
-import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
+import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
+import { decideDrainWorkflowEditHold, decideWorkflowHoldRepark, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
@@ -240,12 +253,27 @@ export { remoteManifestApiArgs };
 // re-capture the current (possibly-tampered) body as the new trusted baseline — a durable bypass if the loss
 // races a tamper (see review-baseline-state.mjs's cache-loss residual). Co-located with the park-state cache;
 // resolved against cwd.
+function recordEnqueue(outcomes, repo, outcome) {
+  return recordEnqueueOutcome({ outcomes, repo, outcome, emit: appendDaemonEvent });
+}
+
+const mqSameHeadRefreshStore = createMqSameHeadRefreshStore({ path: mqSameHeadRefreshStatePath() });
+
 const REVIEW_BASELINE_STATE_PATH = resolve(process.cwd(), '.claude/skills/drain/review-baseline-state.json');
 
 const argv = process.argv.slice(2);
 const flags = parseArgvFlags(argv); // #2859 — single source: scripts/lib/reconcile-predicate.mjs
 
 // ── PURE helpers (unit-tested in scripts/__tests__/merge-ai-prs.test.mjs) ──────────────────────────────
+
+/** Only a non-daemon Actions dry-run may use the workflow's read-only token. Fail closed on any other dry-run spelling. */
+export function isCiReadonlyDryRun(env, argv) {
+  const flags = argv.filter(a => /^--(no-)?dry-run(=|$)/.test(a));
+  let daemon = true;
+  try { daemon = isDaemonCaller(env); } catch { /* fail closed */ }
+  return env.GITHUB_ACTIONS === 'true' && !daemon && !env.WE_GH_DAEMON_CALLER &&
+    flags.length === 1 && flags[0] === '--dry-run';
+}
 
 /**
  * #2423 — read EVERY occurrence of a REPEATABLE `--<name>` flag off the raw argv. The last-write-wins `flags`
@@ -880,6 +908,7 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
   let files = readOptions?.files;
   // A listing is trusted only with explicit completeness AND a head it was read at (#6021): an omitted flag or SHA
   // (the files-only shape) is unknown evidence and takes the pinned read below, never a default-trusted listing.
+  let netRead = false;
   let filesComplete = Array.isArray(files) && readOptions?.filesComplete === true
     && typeof readOptions.listedHeadSha === 'string' && !!readOptions.listedHeadSha
     && (!evidence.headSha || readOptions.listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase());
@@ -891,9 +920,25 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
       reason: `workflow-edit change list unreadable — merge deferred this pass: ${read.error}` };
     files = read.files;
     filesComplete = true;
+    netRead = true;
   }
   let workflow = decideDrainWorkflowEditHold({ files, filesComplete,
-    headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+    headSha: evidence.headSha || readOptions?.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+  // A listing that says "hold" may be stale: after a refresh merge GitHub's file list still shows main's content. Confirm
+  // against the NET diff (merge-base...head) at the exact head before parking; unreadable fails closed (defer).
+  if (workflow.hold && !workflow.defer && !netRead && readOptions?.workflowEditSetting !== 'off' && readOptions?.local
+    && typeof readOptions.defaultBranch === 'string' && readOptions.defaultBranch) { // unknown base: keep the listing's hold
+    const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
+      base: readOptions.defaultBranch, cwd: readOptions.cwd ?? process.cwd(),
+      exec: readOptions.exec ?? execFileSync });
+    // Unreadable or empty net diff never clears: the listing's hold stands (fail closed, same as before this recheck).
+    if (!read.error && read.files.length > 0) {
+      files = read.files;
+      filesComplete = true;
+      workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+        headSha: evidence.headSha || readOptions.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+    }
+  }
   if (workflow.defer) return { action: 'defer', applyLabel: null, reason: workflow.reason };
   // A workflow clearance may move over proven numbering or exact tree identity here. General refresh equivalence does not
   // waive the exact-head workflow ceremony. Record the carry before any gate can honour it.
@@ -1050,6 +1095,15 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // PR into the downstream passes gated on it (the escalation pass, the id-collision heal): those must only ever
   // see a PR the hold ALONE is holding, never one already unlandable for a different reason (finding 3 / 4).
   let reviewHeld = false;
+  let workflowHoldRepark = false;
+  // Repark only when the failed merge-gate is the sole CI blocker. This predicate also
+  // runs in the early required-check arm, before the ordinary mergeability/CodeQL arms.
+  const canReparkWorkflowHold = () => mergeable === 'MERGEABLE' && !offDefaultBase
+    && (landableState || state === 'BLOCKED')
+    && !(blockOnCodeQL && isCodeQLFailed(pr))
+    && [...new Set(['test', requiredCheck, ...(queueRequiredChecks || [])])]
+      .filter(name => name !== 'merge-gate').every(name => isRequiredCheckGreen(pr, name))
+    && decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
   let codeqlBlocked = false;
   let reason = certifyLabel
     ? `producer-certified (label "${trustLabel}"), required check green, cleanly mergeable`
@@ -1065,13 +1119,19 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
   else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
-  else if (!testGreen && !prestagePendingCi) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
+  else if (!testGreen && !prestagePendingCi) {
+    decision = 'skip'; reason = `required check "${requiredCheck}" is not green`;
+    workflowHoldRepark = canReparkWorkflowHold();
+  }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
   // The reason names the ACTUAL state: the old one-size text always said "BEHIND⇒needs rebase", so a PR that was
   // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
   // skip-reasons log and read as an unowned rebase.
-  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
+  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) {
+    decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker;
+    workflowHoldRepark = state === 'BLOCKED' && canReparkWorkflowHold();
+  }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
   else if (!hasNonEmptyBody(pr?.body)) { decision = 'skip'; reason = 'empty/whitespace description — refusing to land it (add a real summary of what changed and why; #2324)'; }
@@ -1084,6 +1144,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
   return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
+    ...(workflowHoldRepark ? { workflowHoldRepark: true } : {}),
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
@@ -1143,6 +1204,25 @@ export function isTransientUnknownMergeability(verdict) {
 
 /** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 3 × 20 s by default). */
 export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
+export const UNKNOWN_MERGEABILITY_MAX_RECOMPUTE = 10;
+
+/** Trigger GitHub's computation without refreshing or changing this pass's PR facts. */
+export async function triggerMergeabilityRecompute({ prsByRepo, recompute, log, max = UNKNOWN_MERGEABILITY_MAX_RECOMPUTE }) {
+  const seen = new Set();
+  for (const [repo, prs] of prsByRepo) {
+    for (const pr of prs) {
+      if (['CLOSED', 'MERGED'].includes(String(pr.state ?? '').toUpperCase())
+        || !['UNKNOWN', ''].includes(String(pr.mergeable ?? '').toUpperCase())) continue;
+      const key = `${repo}#${pr.number}`;
+      if (seen.has(key)) continue;
+      if (seen.size >= max) return;
+      seen.add(key);
+      try { await recompute({ repo, num: pr.number }); } catch { /* best effort; next pass reads fresh */ }
+      log(`mergeable-unknown-recompute ${String(repo ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, '')}#${pr.number}`);
+    }
+  }
+}
+
 /** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
 export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
@@ -1154,18 +1234,92 @@ export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
   return n <= 3 ? { ...setting, retries: n } : setting;
 }
 
+async function notifyPersistentUnknown(payload, { onPersistentUnknown, nudge }) {
+  // Recovery is advisory: failed hooks cannot turn a refusal into admission or abort the drain.
+  try { await onPersistentUnknown?.(payload); } catch { /* best effort */ }
+  try { await nudge?.(payload); } catch { /* best effort */ }
+}
+
 /**
  * `revalidateForMerge` over a fresh read, re-reading while the ONLY refusal is a transient UNKNOWN mergeability.
  * Fails closed exactly as before: an UNKNOWN that never resolves within the bound returns that same refusal.
  * IO is injected (`read` → the fresh PR or null; `sleep(ms)`), so the bound is testable without GitHub.
  */
-export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
+export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep, repo, num, onPersistentUnknown, nudge }) {
   let verdict = revalidateForMerge(await read(), opts);
   for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
     await sleep(setting.delayMs);
     verdict = revalidateForMerge(await read(), opts);
   }
+  if (isTransientUnknownMergeability(verdict)) {
+    await notifyPersistentUnknown({ repo, num, verdict }, { onPersistentUnknown, nudge });
+  }
   return verdict;
+}
+
+export function markStuckUnknown(marks, { repo, num, now }) {
+  const next = new Map(marks);
+  const key = `${repo}#${num}`;
+  if (!next.has(key) || next.get(key).resolved) next.set(key, { repo, num, since: now });
+  return next;
+}
+
+export function pruneStuckUnknown(marks, { prs, listedRepos = [], now = Date.now() }) {
+  const next = new Map(marks);
+  // Absence is evidence only for a successful, complete live candidate listing.
+  const complete = new Set(listedRepos);
+  const present = new Set(prs.map(pr => `${pr.repo}#${pr.num}`));
+  for (const [key, mark] of next) if (complete.has(mark.repo) && !present.has(key)) next.delete(key);
+  for (const pr of prs) {
+    const key = `${pr.repo}#${pr.num}`;
+    if (['CLOSED', 'MERGED'].includes(pr.state)) {
+      next.delete(key);
+    } else if (next.has(key) && ['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable)) {
+      // Resolution silences the alert, but must not reintroduce ready-not-reached
+      // starvation on this or a subsequent drain invocation.
+      next.set(key, { ...next.get(key), resolved: true });
+    } else if (next.get(key)?.resolved && pr.mergeable === 'UNKNOWN') {
+      // A new UNKNOWN episode must age even if another hold prevents revalidation.
+      next.set(key, { repo: pr.repo, num: pr.num, since: now });
+    }
+  }
+  return next;
+}
+
+export function orderStuckUnknownFirst(prs, marks, { priorityOf = () => 0 } = {}) {
+  const marked = pr => marks.has(`${pr.repo}#${pr.num}`);
+  return [...prs].sort((a, b) => priorityOf(a) - priorityOf(b) || Number(marked(b)) - Number(marked(a)));
+}
+
+export function nudgeMergeability({ repo, num, read }) {
+  return read({ repo, num, fields: ['mergeable'] });
+}
+
+export function decideStuckUnknownAlert(marks, { now, afterMinutes = 30 }) {
+  const bound = Number.isFinite(afterMinutes) && afterMinutes > 0 ? afterMinutes : 30;
+  return [...marks.values()].filter(mark => !mark.resolved && now - mark.since > bound * 60_000)
+    .map(mark => ({ kind: 'stuck-unknown-mergeability', ...mark, ageMinutes: (now - mark.since) / 60_000,
+      reason: 'mergeability remains UNKNOWN; inspect the PR on GitHub and retry the drain; merge remains refused' }));
+}
+
+function loadStuckUnknown(path) {
+  try {
+    const rows = JSON.parse(readFileSync(path, 'utf8'));
+    if (!Array.isArray(rows)) return new Map();
+    return new Map(rows.filter(row => typeof row?.repo === 'string' && Number.isInteger(row.num) && row.num > 0
+      && Number.isFinite(row.since)).map(row => [`${row.repo}#${row.num}`, { repo: row.repo, num: row.num, since: row.since,
+        ...(row.resolved === true ? { resolved: true } : {}) }]));
+  } catch { return new Map(); }
+}
+
+function saveStuckUnknown(path, marks) {
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(temporary, JSON.stringify([...marks.values()]) + '\n', { mode: 0o600 });
+    renameSync(temporary, path);
+  } catch { /* best-effort state never affects admission */ }
+  finally { try { unlinkSync(temporary); } catch { /* absent or unwritable */ } }
 }
 
 /** The pass's ordering: UNKNOWN listings are re-polled BEFORE the head-bound open-PR context is collected. */
@@ -1179,19 +1333,31 @@ export async function repollThenCollectContext({ repoll, collect }) {
  * `writeLabelWithHandoff`, so a `ci:failed` written here wakes the fix daemon right after the write lands.
  * Best effort: a failed write is skipped (the next pass retries). Returns whether every write landed.
  */
-export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch }) {
+export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch, onLabelNotFound = null }) {
   const flag = repo ? ['--repo', repo] : [];
   let ok = true;
   for (const rm of plan.toRemove) { try { exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; } }
+  const writeOnce = (add) => {
+    const write = () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] });
+    try { return write(); }
+    catch (err) { if (!onLabelNotFound || !isLabelNotFoundError(err) || !onLabelNotFound(add)) throw err; return write(); }
+  };
   for (const add of plan.toAdd) {
-    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }, signal); } catch { ok = false; }
+    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => writeOnce(add) }, signal); } catch { ok = false; }
   }
   return ok;
 }
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
-export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4 }) {
-  const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map(), onPersistentUnknown, nudge }) {
+  const unknown = pr => !['CLOSED', 'MERGED'].includes(String(pr.state ?? '').toUpperCase())
+    && String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+  const marked = [...prsByRepo].flatMap(([repo, prs]) => prs
+    .filter(pr => marks.has(`${repo}#${pr.number}`)).map(pr => ({ repo, pr })));
+  await mapWithConcurrency(marked, concurrency, async ({ repo, pr }) => {
+    const fresh = await read(repo, pr.number);
+    if (fresh?.number === pr.number) Object.assign(pr, fresh);
+  });
   let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
   for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
     await sleep(setting.delayMs);
@@ -1203,6 +1369,10 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, setting = 
     });
     pending = unresolved.filter(Boolean);
   }
+  // Listing UNKNOWNs never reach pre-merge revalidation. They need the same
+  // bounded recovery path, including when retries are configured to zero.
+  await mapWithConcurrency(pending, concurrency, ({ repo, pr }) =>
+    notifyPersistentUnknown({ repo, num: pr.number }, { onPersistentUnknown, nudge }));
 }
 
 /**
@@ -1907,7 +2077,10 @@ export function buildCarrierHealth(openPrContext = {}, { escalationRelief = { pr
     const [repoK, numK] = String(key).split('::');
     const num = Number(numK);
     const repo = repoK === 'cwd' ? null : repoK;
-    const degraded = !!degradedByPr.get(key);
+    // card 8036 R3 — a MALFORMED read (200 + bad JSON) no longer sets `degraded` (so it does not latch the whole
+    // context incomplete), but for the couple gate it is exactly main's unreadable carrier: keep the B1 marker.
+    const malformed = ctx.malformedByPr instanceof Map && ctx.malformedByPr.get(key) === true;
+    const degraded = !!degradedByPr.get(key) || malformed;
     // B6 — the SAME waiver `classifyPr` uses (per-PR `--no-review-escalation=<pr#>` OR the pass-wide bare flag,
     // gated on `!!label` exactly like the classify site) so the two `held` notions agree.
     const allowPending = (relief.prs || []).includes(num) || (!!relief.passWide && !!label);
@@ -1954,6 +2127,8 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
   const manifestByPr = new Map();
   const commitsByPr = new Map();
   const degradedByPr = new Map();
+  const malformedRepos = new Set();   // card 8036 — repos holding a PR whose manifest was unreadable JSON
+  const malformedByPr = new Map();    // card 8036 R3 — per-PR: buildCarrierHealth keeps main's B1 unreadable marker
   let listingTruncated = false;
   let listingFailed = false;
   const readsMap = reads instanceof Map ? reads : new Map();
@@ -1970,6 +2145,7 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
       const commits = Array.isArray(r.commits) ? r.commits : [];
       manifestByPr.set(key, manifest);
       commitsByPr.set(key, commits);
+      if (r.malformed) { malformedRepos.add(repo); malformedByPr.set(key, true); }
       degradedByPr.set(key, !!r.degraded);   // #xc7p3q9 Fix 2 — a swallowed-error read → fail closed in the couple gate
       if (manifest && manifest.item != null) openItems.add(asItemId(manifest.item));
     }
@@ -1980,7 +2156,46 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
   // cap (the oldest held blockers may be missing), and no per-PR read degraded (B1). Incomplete → the couple gate
   // reads a carrier's ABSENCE as UNKNOWN and fails closed, instead of as "landed" → orphan-land.
   const contextComplete = !!reconcileRan && !listingFailed && !listingTruncated && !anyDegraded;
-  return { prsByRepo, openItems, manifestByPr, commitsByPr, degradedByPr, truncated: listingTruncated, contextComplete };
+  return { prsByRepo, openItems, manifestByPr, commitsByPr, degradedByPr, malformedRepos, malformedByPr, truncated: listingTruncated, contextComplete };
+}
+
+/**
+ * card 8036 R3 — does this context PROVE that an item or carrier missing from it has really landed/closed? Only a
+ * complete context with NO malformed manifest does: a malformed read keeps `contextComplete` true (the listing is
+ * fine) yet hides what that PR carries — its item and its couple refs. The couple gate (`joinImplToCouples`) and
+ * `planLabelDrain` (via `contextProofFields`) both decide absence from this one rule. Pure.
+ * @param {{contextComplete?:boolean, malformedRepos?:Set<string|null>}|null} ctx
+ * @returns {boolean}
+ */
+export function contextProvesAbsence(ctx) {
+  const f = contextProofFields(ctx);
+  return f.contextComplete === true && f.malformedRepos.size === 0;
+}
+
+/**
+ * card 8036 R2 — the context-derived half of `planLabelDrain`'s proof bag, built in ONE place. Every production
+ * `planLabelDrain(` call spreads this (`planDrainPass` and runCli's `replan`), so the planner can never get
+ * `contextComplete` without `malformedRepos` — dropping one from a single call site was the review finding. Pure.
+ * @param {{contextComplete?:boolean, malformedRepos?:Set<string|null>}|null} ctx  an open-PR context (`reduceOpenPrContext`)
+ * @returns {{contextComplete:boolean, malformedRepos:Set<string|null>}}
+ */
+export function contextProofFields(ctx) {
+  const c = ctx || {};
+  return { contextComplete: !!c.contextComplete, malformedRepos: c.malformedRepos instanceof Set ? c.malformedRepos : new Set() };
+}
+
+/**
+ * card 8036 R2 — the per-PR read record both runCli `fetchOne` readers return (the open-PR context reader and the
+ * merge-candidate sweep). One shaper so the `malformed` flag (and `degraded`/`transient`) cannot be dropped from
+ * one of the two sites. `includeCommits:false` omits the `commits` key entirely (the context reader skips the
+ * commits read for non-target PRs in fast-drain scope). Pure.
+ * @param {{manifestRes?:{manifest?:object|null, degraded?:boolean, transient?:boolean, malformed?:boolean}, commitsRes?:{commits?:Array, degraded?:boolean}, includeCommits?:boolean}} o
+ * @returns {{manifest:(object|null|undefined), commits?:Array, degraded:boolean, transient:boolean, malformed?:true}}
+ */
+export function shapeOpenPrRead({ manifestRes = {}, commitsRes = { degraded: false }, includeCommits = true } = {}) {
+  const m = manifestRes || {};
+  const cm = commitsRes || {};
+  return { manifest: m.manifest, ...(includeCommits ? { commits: cm.commits } : {}), degraded: !!(m.degraded || cm.degraded), transient: !!m.transient, ...(m.malformed ? { malformed: true } : {}) };
 }
 
 /**
@@ -2034,7 +2249,14 @@ export async function readRemoteManifestViaApi({ exec, repo, headRef, apiArgs = 
   try {
     const { stdout } = await exec('gh', apiArgs(repo, headRef), { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const b64 = (stdout || '').trim();
-    if (b64) { const m = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); if (m && m.item != null) return { manifest: m, degraded: false }; }
+    if (b64) {
+      // card 8036 — a 200 whose body is not valid JSON is a poison record, not a transport failure: flag it
+      // `malformed` instead of `degraded`. The context stays complete, but planLabelDrain holds that PR
+      // (`malformed-manifest`) AND, as on main, every manifest-less non-WE PR (it may be the hidden carrier's impl half).
+      let m;
+      try { m = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch { return { manifest: null, degraded: false, malformed: true }; }
+      if (m && m.item != null) return { manifest: m, degraded: false };
+    }
     return { manifest: null, degraded: false }; // API read SUCCEEDED → confirmed no manifest, not degraded
   } catch (e) {
     return { manifest: null, degraded: !isContentsNotFound(e) };
@@ -2099,6 +2321,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       // fetched this pass, no extra `gh` call.
       v.baseRefName = typeof p.baseRefName === 'string' ? p.baseRefName : null;
       attachManifestToVerdict(v, read.manifest ?? null, { repo, isLocalRepo, localSlug });
+      if (read.malformed) { v.readMalformed = true; console.error(`  ⚠ card 8036 — #${p.number} (${repo || 'local'}): malformed head-tree manifest; holding this PR, and manifest-less non-WE PRs as possible impl halves`); }
       v.prLabels = p.labels || [];
       // #2447 — the body's own `graduatedTo:` note, extracted now so the escalation pass (which no longer holds `p`)
       // can derive the resolution basis without keeping the whole body on every verdict. `null` for nearly all PRs.
@@ -2362,6 +2585,42 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
   return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
 }
 
+const overlapNetDiffCache = new Map();
+/**
+ * Overlap-yield compares NET diffs (merge-base...head), not GitHub's file list: after a refresh merge that list
+ * still shows main's content and fakes an overlap. Only rows that overlap in the listing are re-read (one pinned
+ * read per head+base, cached); an unreadable or oversized read keeps the listing (no new yield, no lost one).
+ */
+export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = [], localSlug = null, readFiles, cache = overlapNetDiffCache } = {}) {
+  const paths = (r) => new Set((r.files || []).map((f) => f?.path ?? f));
+  const net = (r) => {
+    if ((r.repo || null) !== (localSlug || null) || typeof readFiles !== 'function') return r; // other repos keep their listing
+    if (!r.headSha || !r.baseRefName) { unreadable = true; return r; }
+    const key = `${r.headSha}@${r.baseRefName}`;
+    // The base tip is not in the key, so a cached read expires after a minute (a moved base can change a net diff).
+    const hit = cache.get(key);
+    let files = hit && Date.now() - hit.at < 60_000 ? hit.files : null;
+    if (!files) { const read = readFiles({ headSha: r.headSha, base: r.baseRefName }); files = !read?.error && Array.isArray(read?.files) ? read.files : null; if (files) cache.set(key, { files, at: Date.now() }); else cache.delete(key); }
+    if (!files) { unreadable = true; return r; } // unreadable: keep every listing, retry next pass
+    const listed = new Map((r.files || []).map((f) => [f?.path ?? f, f])); // keep each file's additions/deletions: land order ranks by size
+    return { ...r, sizeLines: (r.files || []).reduce((n, f) => n + (Number(f?.additions) || 0) + (Number(f?.deletions) || 0), 0), files: files.map((path) => (typeof listed.get(path) === 'object' ? listed.get(path) : { path, additions: 0, deletions: 0 })), filesComplete: true };
+  };
+  let unreadable = false;
+  const netByKey = new Map();
+  const refined = (r) => { const k = overlapRowKey(r); if (!netByKey.has(k)) netByKey.set(k, net(r)); return netByKey.get(k); };
+  const out = candidateRows.map((x) => {
+    const px = paths(x);
+    return openPrRows.some((y) => y.number !== x.number && (y.repo || null) === (x.repo || null) && [...paths(y)].some((p) => px.has(p))) ? refined(x) : x;
+  });
+  const ys = openPrRows.map((y) => {
+    const py = paths(y);
+    return candidateRows.some((x) => x.number !== y.number && (x.repo || null) === (y.repo || null) && [...paths(x)].some((p) => py.has(p))) ? refined(y) : y;
+  });
+  // Any unreadable net diff keeps EVERY listing: mixing net and listed sets could erase an overlap on unread evidence.
+  return unreadable ? { candidateRows, openPrRows } : { candidateRows: out, openPrRows: ys };
+}
+const readOverlapNetDiff = ({ headSha, base }) => readPinnedChangedFiles({ headSha, base, cwd: process.cwd() });
+
 /**
  * #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach half of the pass. `narrowPrsByRepo → buildDrainVerdicts`.
  * Deliberately does NOT couple-join or build carrier health: R5 moves the couple gate to AFTER the escalation/park
@@ -2401,7 +2660,7 @@ export function planDrainPass({ verdicts = null, listings = null, openPrContext 
   // sibling ref named in its manifest is still an open, not-landing PR (the impl-open couple-level invariant).
   const openHeadRefs = new Set();
   if (ctx.prsByRepo instanceof Map) for (const prs of ctx.prsByRepo.values()) for (const p of (Array.isArray(prs) ? prs : [])) { if (p && p.headRefName) openHeadRefs.add(p.headRefName); }
-  joinImplToCouples(vs, { carrierHealth, truncated: !!ctx.truncated, contextComplete: !!ctx.contextComplete, openHeadRefs });
+  joinImplToCouples(vs, { carrierHealth, truncated: !!ctx.truncated, contextComplete: contextProvesAbsence(ctx), openHeadRefs });
   // #3004 — `coupleIncomplete` is FORWARDED here, never DERIVED here, and that is deliberate: do NOT "helpfully"
   // move the derivation into this function. `joinImplToCouples` above has just stamped `coupleDefer:'impl-open'`
   // on every carrier the same predicate would flag, and such a carrier lands in `deferred`, never `ready` — so it
@@ -2409,7 +2668,7 @@ export function planDrainPass({ verdicts = null, listings = null, openPrContext 
   // `landedThisPass` by construction and can never change an answer: the tests would pass (they hand-seed the set)
   // while production behaviour stayed byte-identical. The live derivation belongs in the CASCADE, against refs
   // that ACTUALLY merged — see `deriveCoupleIncomplete`. The disjointness/reachability test pins this.
-  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, strictAbsentHashDependencies, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug, readyOrder });
+  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, ...contextProofFields(ctx), strictAbsentHashDependencies, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug, readyOrder });
   return { prsByRepo, verdicts: vs, carrierHealth, plan };
 }
 
@@ -2498,11 +2757,16 @@ export function isConfirmSweepSettled({ merged = 0, pendingRebased = 0, consider
  * structurally unsatisfiable — the livelock); such an edge is stripped.
  * `strictAbsentHashDependencies` (fast drain `--only` only; default off) — on incomplete context, a HASH `blockedBy`
  * absent from the open set defers until positively proven; numerics and full passes keep the absence rule.
- * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, strictAbsentHashDependencies?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapSkips?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
+ * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, malformedRepos?:(Set<string|null>|null), strictAbsentHashDependencies?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapSkips?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
  * @returns {{ready:Array, deferred:Array<{num,item,waitOn:Array<number|string>}>, staleLandedOpenItems:Array<number|string>}}  ready is ordered (item asc, then PR#); staleLandedOpenItems = items proven landed yet still named by an open PR (#999/xq985wu F2 stale-PR diagnostic).
  */
-export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, strictAbsentHashDependencies = false, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
+export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, malformedRepos = null, strictAbsentHashDependencies = false, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
+  // card 8036 R2 — ONE absence predicate for every consumer below. A malformed manifest keeps `contextComplete`
+  // true (so it holds only its own PR), but it still HIDES what that PR carries: its item, its couple refs. So an
+  // ABSENT item or carrier is unproven whenever the context is incomplete OR any manifest was unreadable JSON.
+  const malformedSet = malformedRepos instanceof Set ? malformedRepos : new Set();
+  const absenceUnproven = contextComplete !== true || malformedSet.size > 0;
   // Every candidate still in play keeps its item "open" — a red/skip blocker must still defer its dependents,
   // so the open set is ALL candidate items, not just the mergeable ones. (A merged item is removed by the
   // caller between passes, which is what frees the dependent.)
@@ -2577,7 +2841,7 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     // Fast drain only: failed/truncated context cannot establish that an absent HASH blocker has landed. A numeric
     // id exists only post-land (arm (4) above), and no caller proves numerics, so those keep clearing by absence.
     // A malformed id coerces to NaN in `asItemId`; only a real positive NNN may clear by absence.
-    const absentUnproven = (b) => strictAbsentHashDependencies === true && contextComplete !== true && !(Number.isInteger(b) && b > 0);
+    const absentUnproven = (b) => strictAbsentHashDependencies === true && absenceUnproven && !(Number.isInteger(b) && b > 0);
     const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => (openItems.has(b) || absentUnproven(b)) && !provenLanded(b));
     const stackWait = (Array.isArray(c.stackParents) ? c.stackParents : []).map(asItemId).filter((sp) => !stackProven(sp));
     // #xc7p3q9 — the COUPLE gate: a manifest-less impl PR joined to a WE couple defers with its carrier
@@ -2600,8 +2864,17 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     // #xc7p3q9 (R1) — PLAN-WIDE fail-closed backstop: in an INCOMPLETE context a manifest-less verdict from a
     // NON-WE repo MIGHT be a coupled impl whose carrier we could not read → it must never enter `ready`, whether or
     // not a join stamped `coupleDefer`. Catches the un-joined orphan the per-carrier gate structurally misses.
-    const blindImplDefer = contextComplete !== true && c.hasManifest !== true && !isWeRepo(c.repo);
-    const blindWait = blindImplDefer ? ['incomplete-context'] : [];
+    // card 8036 / R907 — a malformed manifest ANYWHERE hides a possible carrier's couple links, which may name an
+    // impl half in ANY repo, its own included (validateManifest does not forbid two refs in one repo). So the blanket
+    // deferral of manifest-less non-WE PRs stays exactly as on main, keyed on the shared `absenceUnproven`; no
+    // per-repo carve-out (card xvnrvsv is closed by this). The reasons are additive, so the malformed PR itself
+    // always also says `malformed-manifest` — the per-PR, operator-readable diagnostic card 8036 adds.
+    // The R825 residual (a malformed COUPLED CARRIER no longer holding its manifest-less impl half) is therefore
+    // CLOSED, not owed: pinned end to end in merge-ai-prs-couple-join-and-drain-verdicts.test.mjs by
+    // 'card xvnrvsv — a manifest-less impl half in the SAME repo as a malformed-manifest carrier is held (end to end)'
+    // and 'R907 item 3 — a CROSS-repo impl half without its (malformed, unreadable) carrier is still deferred (end to end)'.
+    const blindImplDefer = absenceUnproven && c.hasManifest !== true && !isWeRepo(c.repo);
+    const blindWait = [...(blindImplDefer ? ['incomplete-context'] : []), ...(c.readMalformed === true ? ['malformed-manifest'] : [])];
     // #xc7p3q9 (R2) — a verdict may NEVER waitOn its OWN item (a self-referential wait is structurally
     // unsatisfiable — the livelock). Strip any edge naming this verdict's own item.
     const waitOn = [...new Set([...blockWait, ...stackWait, ...coupleWait, ...blindWait, ...overlapWait])].filter((w) => c.item == null || String(w) !== String(c.item));
@@ -2695,13 +2968,13 @@ const ET_CLOCK = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York'
  * PURE (the IO arrives through `infoOf`). Order the ready set: `card-number` = the legacy order (card NNN, a hash or
  * no card last, then PR #); `ready-age` = delivery-priority class first when `priority.mode === 'enforce'` (shadow
  * only reports it), then the ready-label time (oldest first; unknown last), then PR #. Stable; the input is untouched.
- * The merge-queue class (main-fix first) is applied after this by `prioritizeMainFix`, and blockedBy/stack order is
+ * The optional `prioritize` applies the merge-queue class before reasons are built, and blockedBy/stack order is
  * realized across passes, as before.
  * @param {Array} ready
  * @param {{order:string, priority:object, now:number, infoOf:(c:object)=>({readyAtMs:number|null, facts:object})}} ctx
  * @returns {{ordered:Array, reasons:Array<{num:number, repo:(string|null), class:string, readyAtMs:(number|null), reason:string}>}}
  */
-export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }) } = {}) {
+export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }), stuckUnknownMarks = new Map(), prioritize = rows => rows } = {}) {
   const list = Array.isArray(ready) ? ready : [];
   const settings = resolvePrioritySettings(priority);
   const infos = list.map((c) => { try { return infoOf(c) ?? {}; } catch { return {}; } });
@@ -2712,14 +2985,20 @@ export function orderReadyCandidates(ready, { order = 'ready-age', priority, now
   const cls = (r) => PRIORITY_CLASSES.indexOf(r.p.class);
   const age = (r) => (r.readyAtMs == null ? Infinity : r.readyAtMs);
   if (order === 'ready-age') rows.sort((a, b) => (enforce ? cls(a) - cls(b) : 0) || (age(a) - age(b)) || (a.c.num - b.c.num) || (a.i - b.i));
-  const reasons = rows.map((r) => {
+  const byCandidate = new Map(rows.map(r => [r.c, r]));
+  const ordered = prioritize(orderStuckUnknownFirst(rows.map(r => r.c), stuckUnknownMarks, {
+    priorityOf: c => enforce ? cls(byCandidate.get(c)) : 0,
+  }));
+  const reasons = ordered.map(c => {
+    const r = byCandidate.get(c);
     const when = r.readyAtMs == null ? 'ready time unknown'
       : `ready ${ET_CLOCK.format(new Date(r.readyAtMs))} ET, waited ${Math.max(0, Math.floor((now - r.readyAtMs) / 60_000))} min`;
     const why = r.p.reasons.join('; ');
     const head = order === 'card-number' ? `card ${r.c.item ?? 'none'} · ${r.p.class}` : (enforce ? `${r.p.class} (${why})` : r.p.class);
-    return { num: r.c.num, repo: r.c.repo ?? null, class: r.p.class, readyAtMs: r.readyAtMs, reason: enforce ? `${head} · ${when}` : `${head} · ${when} · ${why}` };
+    const recovery = stuckUnknownMarks.has(`${c.repo}#${c.num}`) ? ' · persistent UNKNOWN recovery priority' : '';
+    return { num: r.c.num, repo: r.c.repo ?? null, class: r.p.class, readyAtMs: r.readyAtMs, reason: (enforce ? `${head} · ${when}` : `${head} · ${when} · ${why}`) + recovery };
   });
-  return { ordered: rows.map((r) => r.c), reasons };
+  return { ordered, reasons };
 }
 
 /** PURE. The pass's order log: a header line, then one line per ready PR with its reason. */
@@ -4378,14 +4657,58 @@ export function permissionChangeForCandidate(score) {
  * The full input object `runCli` hands `decideDrainReviewGate` for one candidate. Pure. One named place for every
  * score-derived gate input (`escalate`, `humanRequired`, `engineTier`, `permissionChange`) so a new signal cannot be
  * scored yet silently never reach the gate, and a test can drive a real `scoreEscalation` result straight through.
- * @param {{score: object, labels: any, deviation?: string|null}} candidate
+ * @param {{score: object, labels: any, deviation?: string|null, netScored?: boolean, humanPinned?: boolean}} candidate
  */
-export function drainGateInputs({ score, labels, deviation = null }) {
+export function drainGateInputs({ score, labels, deviation = null, netScored = false, humanPinned = true }) {
   return {
     escalate: score.escalate, humanRequired: score.humanRequired, labels,
+    // 6027: unknown pin evidence retains review:human, even beside a fresh scored net diff.
+    humanScoreFresh: netScored === true, humanPinned: humanPinned !== false,
     engineTier: engineTierForCandidate(score), deviation,
     permissionChange: permissionChangeForCandidate(score),
   };
+}
+
+/** Best-effort removal after the pending label is applied or already present. Dry runs never write. */
+export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, applyOk = false }, { exec = execFileSync } = {}) {
+  const removed = [];
+  // Fail closed: only an explicit applyOk===true (review:pending applied or already present) lets the hold go.
+  if (!gate.deescalatedHuman || dryRun || applyOk !== true) return removed;
+  for (const label of (gate.removeLabels || []).filter((l) => hasReviewLabel(labels, l))) {
+    try {
+      exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+      removed.push(label);
+    } catch { /* label best-effort */ }
+  }
+  return removed;
+}
+
+/**
+ * Apply the park label before releasing a de-escalated human hold, recording the verdict before any add.
+ * @returns {{added: boolean, removed: string[]}} Successful label writes only; dry runs never write.
+ */
+export function applyDrainParkLabel({ gate, labels, dryRun, pr, repo, onBeforeAdd, onLabelNotFound }, { exec = execFileSync } = {}) {
+  let added = false;
+  if (dryRun || !gate.applyLabel) return { added, removed: [] };
+  let applyOk = true; // already present => nothing to add
+  if (shouldApplyReviewLabel(gate.applyLabel, labels)) {
+    onBeforeAdd?.();
+    const addOnce = () => exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+    try {
+      try { addOnce(); }
+      catch (err) {
+        // A memoised label deleted on GitHub: heal (forget + re-mint) and retry once, so no PR goes unlabelled.
+        if (!onLabelNotFound || !isLabelNotFoundError(err) || !onLabelNotFound(gate.applyLabel)) throw err;
+        addOnce();
+      }
+      added = true;
+    } catch { applyOk = false; /* label best-effort */ }
+  }
+  // Never leave a PR with neither label if the pending add fails.
+  const removed = removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, applyOk }, { exec });
+  return { added, removed };
 }
 
 /**
@@ -4420,7 +4743,7 @@ async function runCli() {
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
   // PR #5729 — the drain is a daemon: install the gh refusal shim (or refuse) before any gh call.
-  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
@@ -4542,6 +4865,34 @@ async function runCli() {
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
   const leaseScope = [...new Set(REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
   const repoFlag = (repo) => (repo ? ['--repo', repo] : []);      // a slug → scope the gh call; null → cwd repo
+  // Provisioning receives the memo identity as --repo. Match implicit PR edits: honour GH_REPO, then
+  // let gh resolve its default remote (which may differ from origin). Resolve once, only when needed;
+  // use the URL so a remote on another GitHub host keeps its identity too. Never guess on a failed read.
+  let implicitLabelRepo;
+  const memoRepo = (repo) => {
+    if (repo || process.env.GH_REPO) return repo || process.env.GH_REPO;
+    if (!implicitLabelRepo) {
+      implicitLabelRepo = execFileSync('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }).trim();
+      if (!implicitLabelRepo) throw new Error('Cannot resolve implicit label repository');
+    }
+    return implicitLabelRepo;
+  };
+  const KNOWN_LABEL_META = { ...REVIEW_LABEL_META, ...CI_LIFECYCLE_LABEL_META };
+  // Not-found on a label write: drop the stale memo entries, re-mint, report whether a retry is worthwhile.
+  const healLabelNotFoundIn = (repo) => (name) => {
+    const meta = KNOWN_LABEL_META[name];
+    if (!meta) return false;
+    labelEnsurer.forget(memoRepo(repo), name);
+    ensuredLabels.delete(`${repo || 'cwd'}::${name}`);
+    labelEnsurer.ensure(memoRepo(repo), name, meta);
+    return true;
+  };
+  const addPrLabel = (repo, num, label) => {
+    const add = () => execFileSync('gh', ['pr', 'edit', String(num), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] });
+    try { add(); }
+    catch (err) { if (!isLabelNotFoundError(err) || !healLabelNotFoundIn(repo)(label)) throw err; add(); }
+  };
   // #gh-graphql-budget — the merge-candidate list's `--limit`: sized off the shared snapshot's real open count
   // (read-only, no gh call); the old 100 when there is no snapshot to size from (first pass, tests, cwd repo).
   const candidateListLimit = (repo) => { const n = repo ? snapshotOpenCount(repo) : null; return n == null ? 100 : Math.min(100, nextLimit(n)); };
@@ -4553,6 +4904,13 @@ async function runCli() {
   // pairs this process has already ensured exist so a long-lived watch doesn't `gh label create` the same
   // review:* labels every single pass (wasted round-trips on an idempotent one-time mint).
   const ensuredLabels = new Set();
+  // perf item 6 — the in-process memo above dies with each drain process; persist it (keyed by repo, with a TTL)
+  // so a restarted or one-shot drain does not re-mint labels every pass. A not-found on a label write forgets the
+  // entry and re-mints it (`healLabelNotFoundIn`), so a label deleted on GitHub is created again exactly when needed.
+  const labelEnsurer = createLabelEnsurer({
+    path: process.env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
+    run: (args, repo) => execFileSync('gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])], { stdio: ['ignore', 'ignore', 'pipe'] }),
+  });
 
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
@@ -4631,8 +4989,70 @@ async function runCli() {
   let passMainFix = new Set();
   const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
   const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
-  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
+    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
+  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
+    // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
+    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
+      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
+      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
+      enqueueAllowed: () => {
+        const repo = c.repo ?? localSlug;
+        const exec = createMqLiveReader();
+        const gh = args => exec('gh', args, { encoding: 'utf8', timeout: 60_000,
+          maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { personalRoute: false } });
+        const log = line => process.stderr.write(`  ${line}\n`);
+        try {
+          const comments = readCompletePrComments(c.num, { repo, exec });
+          if (!Array.isArray(comments)) throw Error('complete comments unreadable');
+          const safety = readDrainQueueSafety({ log });
+          if (safety.value.waitForRedTeamBeforeEnqueue) {
+            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
+            const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
+              readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
+              cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
+              unedited: target => readUneditedCommentIds(target, { gh }),
+            });
+            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
+          }
+          // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
+          const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,
+            '--json', 'headRefOid,baseRefName'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'pipe'] }));
+          if (live?.headRefOid !== sha || typeof live.baseRefName !== 'string' || !live.baseRefName) return false;
+          const read = readPinnedChangedFiles({ headSha: sha, base: live.baseRefName, cwd: process.cwd(), exec });
+          if (read.error) return false;
+          const workflow = resolveDrainWorkflowEditHuman();
+          log(`policy · drainWorkflowEditHuman=${workflow.value} (${workflow.source})`);
+          if (decideDrainWorkflowEditHold({ files: read.files, filesComplete: true, headSha: sha,
+            humanClearedSha: parseLatestHumanClearedSha(comments), setting: workflow.value }).hold) return false;
+          const surface = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
+          if (!surface.hold) return true;
+          if (!surface.humanOnly) return false;
+          const setting = resolveApprovalLicensesEnqueue();
+          log(`human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
+          if (!setting.value) return false;
+          const license = proveHumanOnlyLicense({ repo, pr: c.num, headSha: sha, cwd: process.cwd(), exec });
+          return license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
+        } catch { return false; }
+      } });
+    const guard = mqSameHeadGuard({ refresh, dryRun: DRY_RUN, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      log: line => process.stderr.write(`${line}\n`) });
+    // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
+    const shown = { line: guard.reason ?? guard.line };
+    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
+    const result = mergeStrategy.enqueue(c, sha, { ...options,
+      // The early queued bypass authorizes bookkeeping only. If membership disappears during the
+      // strategy's other checks, require fresh timeline admission immediately before any mutation.
+      sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+        allowAlreadyQueued: false, refresh, dryRun: DRY_RUN, log: line => process.stderr.write(`${line}\n`) }) });
+    if (result?.enqueued === true) {
+      try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
+    }
+    return result;
+  }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
     queueOwnsFreshness: () => mergeStrategy.queueOwnsFreshness(null),
@@ -4685,13 +5105,17 @@ async function runCli() {
     });
   };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
-  const fetchFreshPrForRevalidation = async (repo, num) => {
+  const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
-      const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json',
-        'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
+      const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo),
+        ...(fields ? ['--json', fields.join(',')] : ['--json', 'number,title,body,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'])],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
-      if (!data || data.number == null) return null;
+      if (!data || (!fields && data.number !== num)) return null;
+      // The nudge's partial response has no identity-bound evidence for state updates.
+      if (fields) return data;
+      const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
+      updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       return await resolveChecks(repo, data);
     } catch { return null; }
@@ -4699,6 +5123,46 @@ async function runCli() {
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
   const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  const stuckUnknownPath = join(dirname(refreshedStatePath()), 'stuck-unknown-mergeability.json');
+  let stuckUnknownMarks = loadStuckUnknown(stuckUnknownPath);
+  const updateStuckUnknown = next => {
+    const changed = next.size !== stuckUnknownMarks.size || [...next].some(([key, mark]) => mark.resolved !== stuckUnknownMarks.get(key)?.resolved);
+    if (!changed) return;
+    stuckUnknownMarks = next;
+    if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+    for (const [key] of stuckUnknownAlerts) if (!next.has(key) || next.get(key).resolved) stuckUnknownAlerts.delete(key);
+  };
+  const clearLandedStuckUnknown = c => updateStuckUnknown(pruneStuckUnknown(stuckUnknownMarks, {
+    prs: [{ repo: c.repo || localSlug, num: c.num, state: 'MERGED' }],
+  }));
+  // Persist canonical slugs; adapt keys to the pass's null-for-local convention without changing candidates.
+  const passStuckUnknownMarks = () => new Map([...stuckUnknownMarks.values()].flatMap(mark =>
+    [mark.repo, ...REPOS.filter(repo => (repo || localSlug) === mark.repo)]
+      .map(repo => [`${repo}#${mark.num}`, mark])));
+  let stuckUnknownTool;
+  try { stuckUnknownTool = readDeclaredDrainSettings()?.drain?.stuckUnknownMergeability; } catch { /* standard */ }
+  const stuckUnknownSetting = cascadePolicy('drain.stuckUnknownMergeability', stuckUnknownTool, {
+    standard: { afterMinutes: 30 }, env: process.env,
+    valid: { afterMinutes: v => Number.isFinite(v) && v > 0 },
+  });
+  process.stderr.write(`merge-ai-prs: stuckUnknownMergeability.afterMinutes=${stuckUnknownSetting.value.afterMinutes} (${stuckUnknownSetting.sources.afterMinutes})\n`);
+  const stuckUnknownAlerts = new Map();
+  const emitStuckUnknownAlerts = () => {
+    for (const alert of decideStuckUnknownAlert(stuckUnknownMarks, { now: Date.now(), ...stuckUnknownSetting.value })) {
+      const key = `${alert.repo}#${alert.num}`;
+      if (!stuckUnknownAlerts.has(key)) process.stderr.write(`merge-ai-prs · alert: ${JSON.stringify(alert)}\n`);
+      stuckUnknownAlerts.set(key, alert);
+    }
+  };
+  const unknownRecovery = {
+    onPersistentUnknown: ({ repo, num }) => {
+      stuckUnknownMarks = markStuckUnknown(stuckUnknownMarks, { repo: repo || localSlug, num, now: Date.now() });
+      if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+      emitStuckUnknownAlerts();
+    },
+    nudge: ({ repo, num }) => nudgeMergeability({ repo, num,
+      read: ({ repo, num, fields }) => fetchFreshPrForRevalidation(repo, num, fields) }),
+  };
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
@@ -4836,7 +5300,7 @@ async function runCli() {
   // `--only` sweep filtered out of the candidate set is still visible for the couple gate's health read.
   // #4108 (converge round 1 v3, simplicity lens) — no default: the sole call site (below) always passes
   // `liveListingsByRepo` explicitly.
-  const collectContext = (liveByRepo) => collectOpenPrContext({
+  const collectContext = (liveByRepo, readLiveRowsByRepo) => collectOpenPrContext({
     contextRepos: CONTEXT_REPOS,
     reconcileRan: true,
     // #999/xq985wu F3 — `--limit OPEN_PR_LIST_LIMIT` (raised off the old silent 100). This listing is the SOLE
@@ -4848,6 +5312,9 @@ async function runCli() {
       // that is in `CONTEXT_REPOS` but not `REPOS` (a narrowed `--repos`/`--this-repo` sweep's extra
       // constellation-context repos — rare, a no-op on the common full sweep) needs its own live open set.
       if (liveByRepo.has(repo)) return liveByRepo.get(repo);
+      // Round rows are candidate evidence only. Re-list pages live, reusing the hydrated
+      // heavy-field cache/shared host seed only after matching the live head and updatedAt.
+      if (readLiveRowsByRepo.has(repo)) return readLiveRowsByRepo.get(repo)();
       // xsbyo56 — `body` added so the #2832 held-reconcile branch (below) can read back the PR's own
       // `## Escalation reason` block (`buildHeldReviewHoldReason`/`parseEscalationReason`) and name the
       // specific file(s) that forced a review:human/pending/changes hold, not just the label.
@@ -4857,14 +5324,14 @@ async function runCli() {
       if (slug) {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+        const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
           heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
-          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } });
+          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
         return resolveListedChecks(repo, listed.rows);
       }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      return resolveListedChecks(repo, JSON.parse(stdout.trim() || '[]'));
+      return resolveListedChecks(repo, parseListOutput(stdout, { repo }));
     },
     // #2417 — fan out the per-PR manifest + commits reads across ALL repos' open PRs at once (bounded pool), cached
     // across `--watch` passes on unchanged head SHA + body. Returns key→{manifest, commits, degraded}.
@@ -4877,7 +5344,7 @@ async function runCli() {
         fetchOne: async ({ repo, p }) => {
           const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
           const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
-          return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient };
+          return shapeOpenPrRead({ manifestRes, commitsRes, includeCommits: readCommits });
         },
       });
       const out = new Map();
@@ -4923,8 +5390,10 @@ async function runCli() {
       for (const [name, meta] of Object.entries(CI_LIFECYCLE_LABEL_META)) {
         const ensureKey = `${repo || 'cwd'}::${name}`;
         if (ensuredLabels.has(ensureKey)) continue;
-        ensuredLabels.add(ensureKey);
-        try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+        try {
+          labelEnsurer.ensure(memoRepo(repo), name, meta);
+          ensuredLabels.add(ensureKey);
+        } catch { /* Repository resolution is best effort too; a later pass retries. */ }
       }
     }
     const reconciled = [];
@@ -4951,7 +5420,7 @@ async function runCli() {
       if (greenVerdict.label) {
         if (DRY_RUN) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would label "${label}" (required check green, was unlabelled)\n`); }
         else {
-          try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] }); touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} labelled "${label}" (post-CI reconcile — required check went green after a label-on-green timeout)\n`); }
+          try { addPrLabel(repo, p.number, label); touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} labelled "${label}" (post-CI reconcile — required check went green after a label-on-green timeout)\n`); }
           catch { /* a label race/permission miss is non-fatal — the next pass retries */ }
         }
       } else if (greenVerdict.reason === 'held') {
@@ -4998,7 +5467,7 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would reconcile ci-lifecycle → "${desired}"${plan.toRemove.length ? ` (drop ${plan.toRemove.join(', ')})` : ''}\n`);
           } else {
             // Best effort — a label race/permission miss is non-fatal; the next pass retries.
-            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug });
+            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug, onLabelNotFound: healLabelNotFoundIn(repo) });
             if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} ci-lifecycle → "${desired}" (reconcile)\n`); }
           }
         }
@@ -5057,6 +5526,51 @@ async function runCli() {
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  // Shared by the full cascade and the green-event shortcut, including --json callers.
+  let asyncShadow;
+  let shadowObserved = false;
+  if (!DRY_RUN) {
+    try { asyncShadow = createAsyncShadow(); } catch { /* Timing only. */ }
+  }
+  const summarizeAsyncShadow = (outcomes, candidates) => {
+    try {
+      const byPr = new Map(candidates.map(c => [`${c.repo || localSlug}#${Number(c.num)}`, c]));
+      for (const outcome of outcomes) {
+        if (outcome.outcome !== 'not-enqueued') continue;
+        const c = byPr.get(`${outcome.repo || localSlug}#${Number(outcome.num)}`);
+        if (c) asyncShadow?.noteSkipReason(`${c.repo || localSlug}#${c.num}@${c.headSha}`, outcome.kind);
+      }
+      const summary = asyncShadow?.emitSummary();
+      if (summary) process.stderr.write(`async-drain-shadow: summary n=${summary.n} median=${summary.medianDeltaMs == null ? 'null' : summary.medianDeltaMs / 1000}s p90=${summary.p90DeltaMs == null ? 'null' : summary.p90DeltaMs / 1000}s readyNotReached=${summary.readyNotReached}\n`);
+    } catch { /* Best-effort timing only. */ }
+  };
+  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
+  if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
+  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false, onUnreadable = null } = {}) => {
+    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
+    // still need the drain's rebase/refresh path, regardless of the head's human approval.
+    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
+    try {
+      // Strict (fail closed): an unrecognised env override counts as ON, never silently as off.
+      const settingValue = strict && approvedHeadSetting?.envInvalid ? 'on' : approvedHeadSetting?.value;
+      if (strict && (!['on', 'off'].includes(settingValue)
+          || !['env', 'settings'].includes(approvedHeadSetting?.source)))
+        throw new Error('approval settings unreadable or unresolvable; operator must inspect approval configuration');
+      const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
+      if (settingValue === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
+      // Refresh authorization must observe approval added since the memo was populated.
+      const decision = readApprovedHumanSurfaceHold({ setting: settingValue, pr: v.num, repo: v.repo || localSlug,
+        expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
+          ? (strict ? createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args, opts) : readGh(args, opts))
+          : execFileSync(file, args, { ...opts, cwd }) });
+      if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
+      return decision.hold;
+    } catch (e) {
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
+      if (strict) { onUnreadable?.(e); return true; }
+      return false;
+    }
+  };
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
   // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
@@ -5071,6 +5585,7 @@ async function runCli() {
     const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
     const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
     passMainFix = mainFixFrom(hold);
+    let prestageShadowCandidate;
     const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
@@ -5085,14 +5600,25 @@ async function runCli() {
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
       // The cached base was verified unchanged, and preparation required it to be the default branch.
-      beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
-      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      beforeEnqueue: (c, sha, entry) => {
+        prestageShadowCandidate = { repo: c.repo || localSlug, num: c.num, headSha: sha };
+        // Eligibility was just checked live. No label reads are added for telemetry.
+        try {
+          asyncShadow?.observePass({ candidates: [prestageShadowCandidate], observedPrs: [prestageShadowCandidate] });
+          shadowObserved = true;
+        } catch { /* Timing only. */ }
+        return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
+      },
+      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow),
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
     if (!fast.fallback) {
       const result = { ok: true, prestaged: true, considered: 1, merged: [], failed: [], pendingRebased: [], deferred: [],
-        enqueueOutcomes: [{ num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast }] };
+        enqueueOutcomes: [] };
+      recordEnqueue(result.enqueueOutcomes, localSlug,
+        { num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast });
+      summarizeAsyncShadow(result.enqueueOutcomes, prestageShadowCandidate ? [prestageShadowCandidate] : []);
       return { result, merged: [], failedMerges: [], pendingRebased: [], deferred: [], duplicateIdsOnMain: [] };
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
@@ -5151,7 +5677,7 @@ async function runCli() {
         '--json', RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '')];
       const { stdout } = await execFileP('gh', listArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      return JSON.parse(stdout.trim() || '[]');
+      return parseListOutput(stdout, { repo });
     };
     try {
       const slug = repo || localSlug;
@@ -5193,9 +5719,9 @@ async function runCli() {
           if (!snapshotSeed) {
             try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
           }
-          listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+          listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
-            maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
+            maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
           drainHeavyCacheByRepo.set(repo, listed.cache);
         } else if (!slug) {
           // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
@@ -5207,9 +5733,13 @@ async function runCli() {
         return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       };
       const rows = roundPath && slug
-        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget,
-          defaultBranch: () => defaultBranchByRepo.get(repo) ?? null,
-          listLive: async () => { const rows = await listLive(); await resolveDefaultBranch(repo); return rows; } })
+        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: true,
+          defaultBranch: async () => {
+            await __t.timeAsync('listing.defaultBranch', () => resolveDefaultBranch(repo));
+            return defaultBranchByRepo.get(repo) ?? null;
+          },
+          reuseDefaultBranch: name => { if (typeof name === 'string' && name.trim()) defaultBranchByRepo.set(repo, name); },
+          listLive })
         : await listLive();
       const listedRows = Array.isArray(rows) ? rows : [];
       const truncated = Array.isArray(rows) && isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT);
@@ -5218,7 +5748,7 @@ async function runCli() {
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       // A round listing is candidate evidence only, even after its target is refreshed.
       // Context must re-list live to discover newly opened blockers/carriers/siblings.
-      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', readLiveRows: listLive };
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
@@ -5248,12 +5778,22 @@ async function runCli() {
   if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
   for (const l of failedListings) process.stderr.write(`⚠️  DRAIN LISTING UNREADABLE — ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — candidates for this repo are UNKNOWN (not 0); retrying next pass\n`);
   listings = okListings;
+  // Do not prune against failed, truncated or round-snapshot listings, nor the
+  // later --pr narrowing: none proves that another marked PR left the queue.
+  for (const listing of listings) {
+    if (!listing.complete) continue;
+    const repo = listing.repo || localSlug;
+    updateStuckUnknown(pruneStuckUnknown(stuckUnknownMarks, {
+      prs: listing.prs.map(pr => ({ repo, num: pr.number })), listedRepos: [repo],
+    }));
+  }
   // #4108 — reuse only this pass's live listings; round snapshot rows never serve context.
   // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
   const liveListingsByRepo = buildLiveListingsByRepo(listings);
+  const readLiveRowsByRepo = new Map(listings.filter(l => l.listing === 'snapshot').map(l => [l.repo, l.readLiveRows]));
   // #2421 — the shared open-PR listing + manifest reads + cross-repo item-openness set the reconcile below
   // needs, computed ONCE for this pass (RECONCILE-gated — same cost profile as the reconcile it feeds: free on
   // a bare, unlabelled sweep). #4108 — reuses `liveListingsByRepo` above instead of re-listing every repo in
@@ -5263,8 +5803,17 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
-    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
+    repoll: async () => {
+      await triggerMergeabilityRecompute({ prsByRepo,
+        recompute: ({ repo, num }) => {
+          const slug = repo || localSlug;
+          return execFileP('gh', ['api', `repos/${slug}/pulls/${num}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        },
+        log: line => process.stderr.write(`${line}\n`),
+      });
+      await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts();
+    },
+    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo, readLiveRowsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
   // Round snapshots are candidate evidence only. Reuse the live context listing when available; a bare
@@ -5308,7 +5857,7 @@ async function runCli() {
     isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
     fetchOne: async ({ repo, p }) => {
       const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
-      return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded, transient: !!manifestRes.transient };
+      return shapeOpenPrRead({ manifestRes, commitsRes });
     },
   }));
   // #2421 (generalizes #2216) — total ci-lifecycle relabel first, per swept repo.
@@ -5458,48 +6007,31 @@ async function runCli() {
     }
   }
 
-  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
-  if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
-  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha) => {
-    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
-    // still need the drain's rebase/refresh path, regardless of the head's human approval.
-    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
-    try {
-      const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
-      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
-      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
-        expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }) });
-      if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
-      return decision.hold;
-    } catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy rebase/refresh path\n`);
-      return false;
-    }
-  };
   // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
   const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
+    ...unknownRecovery, repo: repo || localSlug, num,
     read: async () => {
       const pr = await fetchFreshPrForRevalidation(repo, num);
       return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
-  const refreshApprovedHead = async (v, options) => {
-    let hold = approvedHeadHold(v, options.expectedHead);
-    try {
-      if (hold && !options.runId) {
-        const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
-          defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
-        if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
-        options = { ...options, runId: facts.pr.requiredCheck?.runId ?? null };
-      }
-    }
-    catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head refresh proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy refresh path\n`);
-      hold = false;
-    }
-    return refreshHeldHead({ hold, options, refresh: refreshStalePr });
-  };
+  const refreshApprovedHead = (v, options) => refreshApprovedHeadChecked({
+    readHold: () => {
+      let unreadable = null;
+      const hold = approvedHeadHold(v, options.expectedHead, { strict: true, onUnreadable: (e) => { unreadable = e; } });
+      if (unreadable) throw unreadable; // strict reports an unreadable proof as a hold for the enqueue guard; the refresh must refuse instead
+      return hold;
+    },
+    readRunId: () => {
+      const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
+        defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
+      if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
+      return facts.pr.requiredCheck?.runId ?? null;
+    },
+    options, prNumber: Number(v.num), repo: v.repo || localSlug, refresh: refreshStalePr,
+    warn: (msg) => process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: ${msg}\n`),
+  });
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
   // shared `.lane-manifest.json` path lands instead of walling the whole queue. Per candidate: merge-tree
   // main×lane; if the ONLY conflict is the manifest, rebuild its tip onto main (manifest dropped) via pure
@@ -5643,7 +6175,7 @@ async function runCli() {
     for (const v of verdicts) {
       if (v.decision !== 'merge') continue; // @merge-gate-exempt DOWNGRADE-only backstop (merge→skip); a held PR is already `skip`, so it needs no reviewHeld branch — re-admitting it here could only wrongly merge it
       if (decideDrainWorkflowEditHold({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
-        setting: workflowEditSetting.value }).hold) {
+        headSha: v.listedHeadSha, setting: workflowEditSetting.value }).hold) {
         const gate = decideDrainReviewGate({ labels: v.prLabels, escalate: false }, {
           pr: v.num, repo: v.repo, ...workflowReadOptions(v), workflowOnly: true });
         if (gate.action !== 'merge') {
@@ -5712,8 +6244,10 @@ async function runCli() {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
           const ensureKey = `${repo || 'cwd'}::${name}`;
           if (ensuredLabels.has(ensureKey)) continue;
-          ensuredLabels.add(ensureKey);
-          try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+          try {
+            labelEnsurer.ensure(memoRepo(repo), name, meta);
+            ensuredLabels.add(ensureKey);
+          } catch { /* Repository resolution is best effort too; a later pass retries. */ }
         }
       }
     }
@@ -5734,9 +6268,17 @@ async function runCli() {
       // as a bare `skipped` — losing the parked/humanRequired signal the drain contract + gate tests require
       // (fixture #103). It still never merges: `toMerge` filters on `decision === 'merge'`, which a held PR is
       // not, and decideReviewGate never returns `merge` for it (an uncleared, non-accepted review label always
-      // parks). Everything else (no review label) is unaffected — only `decision === 'merge'` OR `reviewHeld`.
-      if (v.decision !== 'merge' && !v.reviewHeld) continue;
+      // parks). Accepted PRs with a failed merge-gate may also enter solely to restore a proven workflow hold.
+      if (v.decision !== 'merge' && !v.reviewHeld && !v.workflowHoldRepark) continue;
       const candidateDryRun = DRY_RUN || v.prestagePendingCi;
+      const reviewReadOptions = { pr: v.num, repo: v.repo,
+        cwd: isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo),
+        local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) };
+      // Re-admission is only for this hold. Verify before scoring can mutate labels/comments;
+      // a cleared head, plain diff or unreadable proof leaves the original skip untouched.
+      const workflowReparkGate = v.workflowHoldRepark ? decideDrainReviewGate(
+        { labels: v.prLabels, escalate: false }, { ...reviewReadOptions, workflowOnly: true, dryRun: true }) : null;
+      if (v.workflowHoldRepark && !workflowReparkGate.workflowEditHold) continue;
       let changedFiles = [];
       let diffLines = 0;
       // #2390-review-fix — the CUMULATIVE origin/main…head file set the gate-self/human trigger scores over
@@ -5868,7 +6410,7 @@ async function runCli() {
             // is reported and never changes the label write below.
             const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
             if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
@@ -5877,7 +6419,7 @@ async function runCli() {
           // diff either; carry review:awaiting-advisory alongside it so "not yet advised" stays a label even on
           // a re-park, not just a fresh park (review-pr.mjs's `advise` step clears it once it posts, #xlw02hw).
           if (shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #2832 / #984 F2 — this park CREATES a hold (review:human) on a PR that, being in the
           // `--label ready-to-merge` candidate set, carries the go-ahead. Strip it in the same operation, through
@@ -5916,7 +6458,7 @@ async function runCli() {
       // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
       // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
       let carryRetryable = false;
-      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted)) {
+      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
@@ -5949,7 +6491,7 @@ async function runCli() {
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
@@ -5989,7 +6531,7 @@ async function runCli() {
               const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
               if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
             }
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
@@ -5999,7 +6541,7 @@ async function runCli() {
           // mechanical park: the advisory runs for `review:human` PRs only, so the label would never be cleared; the
           // carry sweep adds it if it hands the hold to the operator (`review-set-label.mjs --to=restamp`).
           if (!mechanicalPark && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #2832 / #984 F2 — same as the manifest-tamper park above: this site CREATES a review hold on
           // a go-ahead-carrying candidate and `continue`s, so it must strip through the shared seam here.
@@ -6033,9 +6575,18 @@ async function runCli() {
       // `blockedBy` resolves. Flip `engineTierForCandidate` to delegate to `basisTouchesEngineTier(score)` once
       // `#2410` ships that writer — do not re-inline the computation here when that day comes, keep it in one
       // named, tested place.
-      const gate = decideDrainReviewGate(
-        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });
+      // Fail closed: no source here proves the CURRENT review:human is exclusively score-driven.
+      // Even a trusted-author drain marker or ledger row cannot rule out an operator's later/concurrent
+      // hold on the same label (see decideTestGamingPark). Missing, incomplete or unreadable evidence
+      // cannot release it. De-escalation stays wired but inert until sound ownership proof exists;
+      // the operator's sanctioned clear-human ceremony remains the release path.
+      const gate = workflowReparkGate ?? (() => {
+        const humanPinned = true;
+        const gate = decideDrainReviewGate(
+          drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
+          reviewReadOptions);
+        return gate;
+      })();
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
@@ -6087,7 +6638,7 @@ async function runCli() {
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
         if (gate.applyLabel && !candidateDryRun) {
-          if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {
+          applyDrainParkLabel({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo, onLabelNotFound: healLabelNotFoundIn(v.repo), onBeforeAdd: () => {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
             // `review-set-label.mjs`'s Phase-1 write: this hold is already DECIDED (the gate verdict above is
             // final), so a `gh` failure below must not un-form it — only the durable record of it. Fail-soft:
@@ -6095,12 +6646,11 @@ async function runCli() {
             // never this park.
             const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: gate.applyLabel, reason: v.reason, headSha: v.headSha ?? null });
             if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (#3215, drain hold, non-fatal) — ${ledgered.errors.join('; ')}\n`);
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', gate.applyLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
-          }
+          } });
           // mechanical-dispatcher — the companion "not yet advised" label, only for a review:human park (never
           // for a plain review:pending one). Same shared guard, same best-effort posture as the add above.
           if (gate.applyLabel === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #xmnl36p — A CLEARANCE REVOCATION IS NEVER SILENT, and this is the ONE path that guarantees it.
           // It sits AHEAD of `shouldPostParkReasonComment` (which returns false for every human park, routing
@@ -6255,7 +6805,7 @@ async function runCli() {
         // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
         // A MANUAL freeze is the operator's stop-the-line: quarantine never relaxes it (stop mode for every PR).
         const mode = resolveRedMainMode();
-        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual');
+        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual') && !sig.sources.includes('freeze-unreadable');
         let qList = null;
         let filesOf = () => null;
         if (quarantine) {
@@ -6271,9 +6821,11 @@ async function runCli() {
           const d = quarantine && isLocalRepo(v.repo)
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
             : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
-          if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
+          if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen && !freezeUnreadableOnly(sig) ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
         }
-        if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
+        if (!AS_JSON) process.stderr.write(freezeUnreadableOnly(sig)
+          ? `  🛑 freeze-unreadable-hold: freeze unreadable — ${held} PR(s) held until the shared freeze is readable\n`
+          : `  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
       }
     }
   }
@@ -6314,6 +6866,13 @@ async function runCli() {
   const drainPriority = { ...readDeliveryPrioritySettings(), mode: drainOrder.priorityMode };
   delete drainPriority.invalid;
   const drainMainFix = (() => { try { return readMainFixPriority(); } catch { return null; } })();
+  const MERGE_QUEUE = loadMergeQueueSettings();
+  const mainFixPriority = MERGE_QUEUE.queue.enabled ? drainMainFix : null;
+  const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
+  const prioritizeQueue = rows => prioritizeMainFix(rows, {
+    mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue,
+    isCoupleHalf: x => isImplHalf(x) || isCoupleCarrier(x), repoKeyOf: repoKeyOfVerdict,
+  });
   // The open PRs of c's repo: the context listing (has `files`) when collected, plus this pass's own listed verdicts
   // (always present; a dry-run / non-reconcile pass has no context listing), deduped by PR number.
   const openPrsOf = (c) => {
@@ -6358,7 +6917,7 @@ async function runCli() {
     const repoKey = isLocalRepo(c.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(c.repo);
     return { readyAtMs: info.readyAtMs, facts: drainPriorityFacts(c, { ...info, mainFix: drainMainFix, repoKey }) };
   };
-  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf });
+  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf, stuckUnknownMarks: passStuckUnknownMarks(), prioritize: prioritizeQueue });
   let lastDrainOrderLog = null;
   const logDrainOrder = (plan) => {
     if (AS_JSON || !Array.isArray(plan?.readyOrder) || !plan.readyOrder.length) return;
@@ -6369,7 +6928,8 @@ async function runCli() {
     process.stderr.write(`${lines.join('\n')}\n`);
   };
   const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
-  const overlapCtx0 = computeOverlapContext({ candidateRows: overlapRows0.candidateRows, openPrRows: overlapRows0.openPrRows, overrides: overlapYieldOverrides });
+  const overlapNet0 = refineOverlapRowsToNetDiff({ ...overlapRows0, localSlug, readFiles: readOverlapNetDiff });
+  const overlapCtx0 = computeOverlapContext({ candidateRows: overlapNet0.candidateRows, openPrRows: overlapNet0.openPrRows, overrides: overlapYieldOverrides });
   logOverlapYields(overlapCtx0);
   const preparedPass = planDrainPass({
     verdicts,
@@ -6400,13 +6960,27 @@ async function runCli() {
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
-    const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
+    const netRows = refineOverlapRowsToNetDiff({ ...rows, localSlug, readFiles: readOverlapNetDiff });
+    const octx = computeOverlapContext({ candidateRows: netRows.candidateRows, openPrRows: netRows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
-    const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
+    const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, ...contextProofFields(openPrContext), strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
     logDrainOrder(p);
     return p;
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge' && !v.prestagePendingCi); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
+  if (!DRY_RUN) {
+    try {
+      // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
+      // A failed prestage attempt can fall through within this same sweep, not a later missed pass.
+      asyncShadow?.observePass({ countMissed: !shadowObserved,
+        // A filtered/targeted listing is not evidence that another PR disappeared.
+        observedPrs: verdicts.map(c => ({ repo: c.repo || localSlug, num: c.num })),
+        candidates: toMerge.map(c => ({
+          repo: c.repo || localSlug, num: c.num, headSha: c.headSha,
+          readyAtMs: readyInfoMemo.has(`${c.repo || localSlug}#${c.num}@${c.listedHeadSha || c.headSha || null}`) ? readyInfoOf(c).readyAtMs : null,
+        })) });
+    } catch { /* Timing observations never affect enqueue decisions. */ }
+  }
   const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
   // #xc7p3q9 (R6) — the held couple's members (its `skip` carrier + its deferred impl half — both carry
   // `coupleDeferReason:'held'`) so `decideBatchesIdleExit` can SUBTRACT them from `considered` rather than waive
@@ -6477,11 +7051,9 @@ async function runCli() {
   const requiredWorkflowsRefusals = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
-  const MERGE_QUEUE = loadMergeQueueSettings();
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
-  const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
    * hook is off): merge as before. false = not this pass: it refreshed the PR onto main (once per pass, through
@@ -6549,14 +7121,14 @@ async function runCli() {
   if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
   const branchPreparationRequired = createBranchPreparationRequired({ enabled: numberingOnBranch,
     serial: resolvedMergePolicy.policy.concurrency.enqueue === 1,
-    readFiles: (c, sha) => readGit(['ls-tree', '-r', '--name-only', sha, '--', 'backlog/'], {
+    // -z: line output C-quotes non-ASCII names, which would hide a pending hash card.
+    readFiles: (c, sha) => readGit(['ls-tree', '-r', '-z', '--name-only', sha, '--', 'backlog/'], {
       cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo), encoding: 'utf8',
     }), hasPendingCards: (files) => hashBacklogFiles(files).length > 0 });
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
   const coupleSplit = [];
-  const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
   const repoKeyOfSlug = (slug) => (isLocalRepo(slug) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(slug));
   // All non-CI gates and the couple/dependency plan have now run. Provisional pending candidates
   // leave the real cascade here: preparation NEVER authorizes an enqueue (or a direct merge).
@@ -6619,7 +7191,7 @@ async function runCli() {
       const grouped = cardGrouping.holdFor(c);
       if (!grouped) continue;
       c.decision = 'skip'; c.reason = grouped.reason;
-      enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...grouped });
+      recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', ...grouped });
     }
     // #2257 — an item is unique per (repo, PR#): match/remove candidates on both so a WE #10 and a FUI #10 never
     // collide in the cascade bookkeeping.
@@ -6668,9 +7240,7 @@ async function runCli() {
       let progressed = false;
       // card xs1hdl7 — a P0 main-fix PR (the published main-red owner) goes first; it still has to be merge-fresh.
       // Reorders in place (same members), so every `coupleStep.ordered` lookup below sees the same list.
-      coupleStep.ordered = prioritizeMainFix(coupleStep.ordered, {
-        mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue, isCoupleHalf: (x) => isImplHalf(x) || isCoupleCarrier(x), repoKeyOf: repoKeyOfVerdict,
-      });
+      coupleStep.ordered = prioritizeQueue(coupleStep.ordered);
       await runEnqueueCandidates(coupleStep.ordered, {
         concurrency: resolvedMergePolicy.policy.concurrency.enqueue,
         canParallel: (c) => canParallelEnqueue(c, {
@@ -6779,6 +7349,7 @@ async function runCli() {
         // revalidation). Recorded into `merged` so its numbering / resolve-on-land / derived regen runs this pass —
         // those steps are idempotent, and once merged a PR drops off every later pass's open-PR listing.
         const recordAlreadyMerged = () => {
+          clearLandedStuckUnknown(c);
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null });
           progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c));
@@ -6904,24 +7475,24 @@ async function runCli() {
           // shares with a concurrent resident-daemon sweep (the fast drain bypasses the whole-process lease), so
           // it is what serializes the actual merge write, not just NNN allocation. Inside the lock, the re-check
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
-          if (branchPreparationRequired(c) && mergeStrategy.enqueues(c.repo) && !approvedHeadHold(c, traceHeadSha)) {
-            const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
-            if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+          if (shouldPrepareBranchBeforeEnqueue({ required: branchPreparationRequired(c), enqueues: mergeStrategy.enqueues(c.repo) })) {
+            const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, shadow: resolveCardNumbering().value.shadow, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
+            if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
             const groupHeld = cardGrouping.holdFor(c);
             if (groupHeld) return { skipped: 'card-group-hold', reason: groupHeld.reason };
-            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }, approvedHeadHold); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
           }, (mergeStrategy.enqueues(c.repo) || cardGrouping.mayHold()) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; xym8nt4 — nor may a direct merge's group re-check (a group claim holds this lock); a refused lock retries next pass
-          if (landLock.ran === false) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: `merge-write mutex held by ${landLock.heldBy || '?'}` }); if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+          if (landLock.ran === false) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: `merge-write mutex held by ${landLock.heldBy || '?'}` }); if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           if (landLock.result?.skipped === 'card-group-hold') {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'card-group-hold', reason: landLock.result.reason });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'card-group-hold', reason: landLock.result.reason });
             if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(c.repo)}${c.num} not landed: ${landLock.result.reason} — claimed by a card group after the pass-start check (xym8nt4)\n`);
             c.decision = 'skip'; c.reason = landLock.result.reason;
             const cc = remaining.find((x) => sameCand(x, c)); if (cc) { cc.decision = 'skip'; cc.reason = landLock.result.reason; }
@@ -6950,15 +7521,17 @@ async function runCli() {
             continue;
           }
           if (landLock.result?.enqueued === true) {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
             await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
+            try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: traceHeadSha }); } catch { /* timing only */ }
           }
           if (landLock.result?.enqueued === false) {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
             if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: ${landLock.result.kind || 'batching-deferred'}: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
+          clearLandedStuckUnknown(c);
           await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed merge writes the clearing facts
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
@@ -6971,7 +7544,7 @@ async function runCli() {
           if (!AS_JSON) process.stderr.write(`  ✓ merged ${repoTag(c.repo)}${c.num}${c.item ? ` (#${c.item})` : ''}\n`);
         } catch (e) {
           const detail = ghListErrText(e);
-          if (e.enqueueFailure) enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...e.enqueueFailure });
+          if (e.enqueueFailure) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', ...e.enqueueFailure }); }
           // #2683 — CONTENDED-FALLBACK idempotency recovery. If the merge write raced past the mutex (the
           // never-hang fallback ran `fn` un-locked) and LOST to a concurrent lander, `gh pr merge` throws here on
           // an already-merged PR. Re-probe: if it is now MERGED, this is the SAME safe idempotent no-op as the
@@ -7026,7 +7599,7 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnUnsatisfiedWorkflows=${requiredWorkflowsRefresh.value} (${requiredWorkflowsRefresh.source})${requiredWorkflowsRefresh.invalid.length ? ` · ignored invalid: ${requiredWorkflowsRefresh.invalid.join('; ')}` : ''}\n`);
       for (const { c, headSha, detail } of requiredWorkflowsRefusals) {
         const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
-        const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
+        const recovery = await handleRequiredWorkflowsRefusal({ c: { ...c, repo: c.repo || localSlug }, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
           setting: requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
           refreshStalePr: options => refreshApprovedHead(c, options), needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
         if (recovery.handled) {
@@ -7333,13 +7906,18 @@ async function runCli() {
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
   // #5444 — SHADOW ONLY: the pure ledger gate beside the label gate for every considered PR, journaled as one run
   // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
+  summarizeAsyncShadow(enqueueOutcomes, toMerge);
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
-  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
+  const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked, enqueueOutcomes });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
-  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const alerts = [...stuckUnknownAlerts.values()].filter(alert => {
+    const mark = stuckUnknownMarks.get(`${alert.repo}#${alert.num}`);
+    return mark && !mark.resolved;
+  });
+  const result = { alerts, ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
@@ -7473,7 +8051,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a

@@ -109,6 +109,11 @@ function assertSafeRef(ref, source) {
   return ref;
 }
 
+// Explicitly refresh only this validated overlay, even in single-branch clones.
+function overlayFetchRefspec(ref) {
+  return `+refs/heads/${ref}:refs/remotes/origin/${ref}`;
+}
+
 /**
  * The IO: verify the clone is on `homeBranch` and clean, fetch `origin/<ref>`, and merge it in. Never leaves
  * the tree mid-merge — a conflicting merge is ALWAYS aborted before this returns. Mirrors
@@ -137,7 +142,7 @@ export function mergeOverlayRef({ root, ref, homeBranch = 'main', run = gitRun, 
   // `--` ends option parsing (same defense-in-depth as daemon-self-sync.mjs's POC fetch): even a `ref` that
   // slipped past assertSafeRef somehow is never read as a git OPTION.
   repairCloneRefs(root, { log: (m) => console.error(m) }); // prune dangling remote-tracking refs before any fetch (no re-clone: this CLI does not hold the clone write lock)
-  const fetched = git(['fetch', '--quiet', '--', 'origin', ref]).status === 0;
+  const fetched = git(['fetch', '--quiet', '--', 'origin', overlayFetchRefspec(ref)]).status === 0;
   if (!fetched) return { merged: false, commits: 0, reason: 'fetch-failed' };
 
   const count = (range) => {
@@ -173,7 +178,7 @@ export function dryRunOverlay({ root, ref, homeBranch = 'main', run = gitRun, ti
   const onHome = head.status === 0 ? String(head.stdout ?? '').trim() === homeBranch : null;
   const status = git(['status', '--porcelain']);
   const dirty = status.status === 0 ? !!String(status.stdout ?? '').trim() : null;
-  const fetched = git(['fetch', '--quiet', '--', 'origin', ref]).status === 0;
+  const fetched = git(['fetch', '--quiet', '--', 'origin', overlayFetchRefspec(ref)]).status === 0;
   const count = (range) => {
     const r = git(['rev-list', '--count', range]);
     const out = String(r.stdout ?? '').trim();
@@ -307,7 +312,7 @@ export function overlayDispatchFiles({ tree, ref, patterns, run = gitRun }) {
  * Verify the fetched overlay tip is an ancestor of the installed HEAD. Read-only IO, failing closed.
  * @returns {{inHead:boolean, tip:string|null, head:string|null, reason:string}}
  */
-export function overlayInstalled({ root, ref, run = gitRun }) {
+export function overlayInstalled({ root, ref, refs = null, run = gitRun }) {
   try {
     assertSafeRef(ref, '--ref');
     const git = (args) => run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
@@ -318,7 +323,23 @@ export function overlayInstalled({ root, ref, run = gitRun }) {
     if (!tip) return { inHead: false, tip, head, reason: 'ref-unresolved' };
     if (!head) return { inHead: false, tip, head, reason: 'head-unresolved' };
     const { status } = git(['merge-base', '--is-ancestor', tip, head]);
-    return { inHead: status === 0, tip, head, reason: status === 0 ? 'in-head' : status === 1 ? 'not-in-head' : 'check-failed' };
+    const own = { inHead: status === 0, tip, head, reason: status === 0 ? 'in-head' : status === 1 ? 'not-in-head' : 'check-failed' };
+    if (!own.inHead || !Array.isArray(refs)) return own;
+    // Every OTHER registered overlay tip must be in the candidate too; any unknown or errored check refuses.
+    const missing = [];
+    for (const other of refs) {
+      if (other === ref) continue;
+      assertSafeRef(other, 'overlay ref');
+      const r = git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${other}^{commit}`]);
+      const otherTip = r.status === 0 ? String(r.stdout ?? '').trim() || null : null;
+      if (!otherTip) { missing.push({ ref: other, tip: null, reason: 'ref-unresolved' }); continue; }
+      const a = git(['merge-base', '--is-ancestor', otherTip, head]);
+      if (a.status !== 0) missing.push({ ref: other, tip: otherTip, reason: a.status === 1 ? 'not-in-head' : 'check-failed' });
+    }
+    return {
+      ...own, inHead: missing.length === 0, missing,
+      reason: missing.length === 0 ? 'in-head' : `registered-overlay-missing: ${missing.map((m) => m.ref).join(', ')}`,
+    };
   } catch {
     return { inHead: false, tip: null, head: null, reason: 'check-threw' };
   }
@@ -661,7 +682,7 @@ export async function runDaemonLoadOverlay({
   wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersionIfCurrent,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
   removeOverlayFn = removeOverlay, appendEventFn = appendOverlayEvent,
-  installed = overlayInstalled, followUpRebuilds = 1, clock = () => performance.now(), sleep = sleepAsync,
+  installed = overlayInstalled, readOverlayStateFn = readOverlayState, followUpRebuilds = 1, clock = () => performance.now(), sleep = sleepAsync,
 }) {
   if (!clone || typeof clone !== 'string') throw new TypeError('daemon-load-overlay: --clone=<path> is required');
   if (!ref || typeof ref !== 'string') throw new TypeError('daemon-load-overlay: --ref=<branch to overlay> is required');
@@ -855,7 +876,19 @@ export async function runDaemonLoadOverlay({
     rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
   }
 
-  let check = installedClosed(installed, { root, ref });
+  // Every currently registered overlay must be in the installed build; an unreadable registry refuses (fail closed).
+  const checkInstalled = () => {
+    let refs = null;
+    try {
+      const st = readOverlayStateFn(root, { env });
+      if (!st || st.corrupt || !Array.isArray(st.overlays)) refs = null;
+      else if (st.overlays.some((o) => !o || typeof o.ref !== 'string' || !o.ref)) refs = null; // malformed entry: refuse, never skip
+      else refs = [...new Set([ref, ...st.overlays.map((o) => o.ref)])];
+    } catch { refs = null; }
+    if (!refs) return { ...installedClosed(installed, { root, ref, refs: null }), inHead: false, reason: 'registry-unreadable' };
+    return installedClosed(installed, { root, ref, refs });
+  };
+  let check = checkInstalled();
   let staleAdopt;
   let followUps = 0;
   let alerts = rebuildResult.alerts;
@@ -874,7 +907,7 @@ export async function runDaemonLoadOverlay({
         rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
       }
       alerts = [...(alerts || []), ...(rebuildResult.alerts || [])];
-      check = installedClosed(installed, { root, ref });
+      check = checkInstalled();
       if (check.inHead || (rebuildResult.moved === false && !rebuildResult.adopted)) break;
     }
   }

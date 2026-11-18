@@ -200,7 +200,8 @@ import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCi
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
 
 /** Concurrency cap for `gh` calls routed through this wrapper — conservative against GitHub's 100-concurrent
- *  secondary ceiling, leaving headroom for callers not yet migrated. Overridable via `WE_GH_THROTTLE_CAP`. */
+ *  secondary ceiling, leaving headroom for callers not yet migrated. Overridden by the tool's ghThrottle.cap,
+ *  then `WE_GH_THROTTLE_CAP` (integer 1..50). */
 export const DEFAULT_GH_CONCURRENCY_CAP = 6;
 
 /** How often a blocked caller re-polls for a free slot (`gh` calls are far shorter than a heavy command, so
@@ -635,6 +636,36 @@ export function ghSlotWaitMs({ caller, waitClass, settings = GH_SLOT_WAIT_STANDA
   return { waitMs: ms, source: settings?.source?.backgroundWaitMs ?? 'standard', key: 'backgroundWaitMs' };
 }
 
+/** The one caller allowed the reserved slot: the drain's shared-freeze read. */
+export const GH_RESERVED_SLOT_CALLER = 'red-main-freeze-read';
+const RESERVED_WAIT_DEFAULT_MS = 20000;
+const reservedThrottledMessage = () => 'gh-throttle: throttled — reserved read exhausted its call bound; retry next tick\n';
+/** A reserved read that cannot be admitted is THROTTLED (fail closed): never the ungated or exception fail-open paths. */
+const RESERVED_CLOSED = Object.freeze({ ok: false, timedOut: true, waitedMs: 0 });
+/**
+ * PURE: may this call take the ONE reserved slot above the cap? Only the named freeze-read caller, only a plain
+ * `gh api -i [-H hdr] repos/{o}/{r}/(git/ref/heads|git/commits|git/trees|contents)/...` GET (no method override, no body/field flags, no other endpoint), never a write.
+ * Anything else (including an unparseable argv) stays in the ordinary queue.
+ */
+export function ghReservedSlotEligible({ throttle, caller, args, isWrite }) {
+  if (throttle?.reservedSlot !== true || isWrite || normalizeGhCaller(caller) !== GH_RESERVED_SLOT_CALLER) return false;
+  const a = Array.isArray(args) ? args.map(String) : [];
+  if (a[0] !== 'api') return false;
+  let paths = 0;
+  for (let i = 1; i < a.length; i += 1) {
+    if (a[i] === '-i') continue;
+    if (a[i] === '-H') { i += 1; if (i >= a.length) return false; continue; }
+    if (a[i].startsWith('-') || !/^repos\/[\w.-]+\/[\w.-]+\/(git\/ref\/heads\/|git\/commits\/|git\/trees\/|contents\/)/.test(a[i])) return false;
+    paths += 1;
+  }
+  return paths === 1;
+}
+/** A reserved read never waits for the slot longer than its own call timeout (the freeze read's remaining deadline). */
+function ghReservedWaitCapMs(opts) {
+  const t = Number(opts?.timeout);
+  return Number.isFinite(t) && t > 0 ? t : RESERVED_WAIT_DEFAULT_MS;
+}
+
 /** PURE slot-wait classification; malformed regex entries never interrupt a caller. */
 export function ghSlotWaitClass({ caller, args = [], isWrite, settings = GH_SLOT_WAIT_STANDARD }) {
   if (isWrite || classifyGhWrite(args)) return 'priority';
@@ -719,9 +750,31 @@ const CALL_LOG_FILENAME = 'calls.jsonl';
 const WRITE_BUDGET_LOCK_KEY = 'write-budget';
 const WRITE_BUDGET_STATE_FILENAME = 'write-budget-state.json';
 
-export function resolveGhCap(env = process.env) {
-  const n = Number(env.WE_GH_THROTTLE_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_GH_CONCURRENCY_CAP;
+/** Resolve default → tool → env, retaining provenance. `tool` injects the ghThrottle block;
+ *  `toolFile` injects its JSON file. Read fresh on every call; missing files contribute no override. */
+export function resolveGhCapDetailed(env = process.env, { tool, toolFile = GH_SLOT_WAIT_TOOL_FILE } = {}) {
+  let result = { cap: DEFAULT_GH_CONCURRENCY_CAP, source: 'default' };
+  const warn = source => process.stderr.write(`gh-throttle: invalid ${source} ghThrottle.cap; expected an integer 1..50; falling back to lower layer\n`);
+  if (tool === undefined) {
+    try {
+      tool = JSON.parse(readFileSync(toolFile, 'utf8'))?.ghThrottle;
+    } catch (error) {
+      if (error.code !== 'ENOENT') warn('tool');
+    }
+  }
+  const apply = (raw, source) => {
+    // Only env strings are coerced: JSON booleans/null/strings are not integer settings.
+    const n = source === 'env' && typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    if (Number.isInteger(n) && n >= 1 && n <= 50) result = { cap: n, source };
+    else warn(source);
+  };
+  if (tool && Object.hasOwn(tool, 'cap')) apply(tool.cap, 'tool');
+  if (env && Object.hasOwn(env, 'WE_GH_THROTTLE_CAP')) apply(env.WE_GH_THROTTLE_CAP, 'env');
+  return result;
+}
+
+export function resolveGhCap(env = process.env, options = {}) {
+  return resolveGhCapDetailed(env, options).cap;
 }
 
 export function resolveAcquireTimeoutMs(env = process.env) {
@@ -1714,6 +1767,31 @@ export function isRetryableGhJsonFailure(args, text) {
   return ghTransientRetryReason(args, text) !== null;
 }
 
+// ── wait log (R795): one small JSONL line per throttled call, to attribute `freeze-read: deadline` misses to
+// slot waits. Records ONLY the low-cardinality op label (ghOpLabel of the argv, never throttle.op or args), so no
+// token-bearing argument can reach it. Append-only, rotated to `<log>.1` past 5 MB, and a failure never fails a call.
+export const GH_WAITLOG_FILENAME = 'gh-waitlog.jsonl';
+export const GH_WAITLOG_MAX_BYTES = 5 * 1024 * 1024;
+/** Caller label for the wait log: keeps only a short identifier-shaped label, so a credential that ended up in
+ *  `GH_CALLER`/`throttle.caller` can never reach the log. */
+export function ghWaitLogCaller(caller) {
+  const s = String(caller ?? '').slice(0, 200);
+  if (/(?:gh[pousr]_|github_pat_)/i.test(s) || /[A-Za-z0-9+/_=-]{32,}/.test(s) || !/^[A-Za-z0-9._:@/-]{1,80}$/.test(s)) return 'redacted';
+  return s;
+}
+export function recordGhWaitLogEntry(logPath, entry) {
+  try {
+    let size = 0;
+    try { size = statSync(logPath).size; } catch { /* missing log */ }
+    if (size > GH_WAITLOG_MAX_BYTES) {
+      try { renameSync(logPath, `${logPath}.1`); } catch { return; } // cannot rotate: drop the line, never grow past the cap
+    }
+    appendFileSync(logPath, JSON.stringify(entry) + '\n', 'utf8');
+  } catch {
+    /* best-effort — logging must never fail the call */
+  }
+}
+
 export function recordGhCallLogEntry(logPath, entry) {
   try {
     rotateGhCallLogIfLarge(logPath);
@@ -1800,6 +1878,8 @@ function logFinishedCiHit(args, cls, throttle, env) {
  *   @param {()=>number} [opts.throttle.now]           injectable clock (tests)
  *   @param {(args:string[], opts:object)=>*} [opts.throttle.exec]  injectable `gh` exec (tests — mocks the real
  *     `execFileSync('gh', …)` call so no `gh` binary is needed to prove the semaphore/backoff logic)
+ *   @param {(opts:object)=>object} [opts.throttle.execOptions] refresh execution bounds after admission,
+ *     on every real execution (including retries/probes), before creating nested-shim timeout metadata
  *   @param {number} [opts.throttle.points]            REST points this call costs (default 1 — see the module
  *     header's #3670 section; pass the real cost for a known-heavier call, e.g. a 100-item list is 4)
  *   @param {number} [opts.throttle.budgetPerMin]      override the points-budget-per-minute (tests)
@@ -1808,6 +1888,8 @@ function logFinishedCiHit(args, cls, throttle, env) {
  *   @param {string} [opts.throttle.logPath]           override the sidecar call-log path (tests)
  *   @param {string} [opts.throttle.bin]               the executable the real exec runs (default `'gh'`; tests)
  *   @param {Function} [opts.throttle.spawn]           `spawnSync` stand-in for the #4375 capture path (tests)
+ *   @param {Function} [opts.throttle.execFileSync]    remote-read subprocess stand-in when cost-header capture is disabled;
+ *     retains execution bounds and nested-shim metadata (unlike `throttle.exec`)
  * @returns {Buffer|string} whatever the underlying `exec`/`execFileSync` call returns on success
  * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
@@ -1922,10 +2004,11 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const capture = !throttle.exec && resolveCostHeaderCapture(env) && !(execOpts.env || process.env).GH_DEBUG && stdioPipesStderr(execOpts.stdio);
   let lastCapture = null;
   const exec = throttle.exec || ((a, o) => {
+    if (throttle.execOptions) o = throttle.execOptions(o);
     const held = ghExecOptions(o, a, ghHolderPolicy(env));
     const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
       ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
-    if (!capture) return execFileSync(bin, a, childOpts);
+    if (!capture) return (throttle.execFileSync || execFileSync)(bin, a, childOpts);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
   });
@@ -1952,6 +2035,12 @@ function runGhSyncUnmemoized(args, opts = {}) {
     ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
     : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
   const slotTimeoutMs = slotWaitPick.waitMs;
+  // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
+  const reserved = ghReservedSlotEligible({ throttle, caller, args: args, isWrite });
+  const slotCap = cap + (reserved ? 1 : 0);
+  // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
+  const reservedCapMs = reserved ? ghReservedWaitCapMs(execOpts) : 0, reservedStartMs = reserved ? now() : 0;
+  const reservedLeftMs = () => Math.max(1, reservedCapMs - (now() - reservedStartMs));
   // #gh-graphql-budget — the shared primary-budget backoff (see that section above).
   const resource = classifyGhResource(args);
   // The credential the child really uses: the caller's explicit env, else — a config-only `throttle.env` carries
@@ -2002,17 +2091,23 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // The write-budget gate (writes only) and the points-budget gate both run BEFORE the concurrency slot — a
     // call waiting out either budget must not hold a scarce concurrency slot idle while it waits (same
     // reasoning as releasing the slot before a backoff sleep, below).
+    const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
-    }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn, slotWaitPick);
+      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
+      // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
+      if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
+      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+    }, { ...gateOpts, fallback: reserved ? RESERVED_CLOSED : { ok: false } }) : (reserved ? RESERVED_CLOSED : { ok: false });
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, reserved ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
+      recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(waitStartedMs).toISOString(), caller: ghWaitLogCaller(caller), op: ghOpLabel(args), waitMs: Date.now() - waitStartedMs, durMs: 0, ok: false });
       const error = new Error(throttledMessage);
       Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
       throw error;
     }
+    const waitMs = Date.now() - waitStartedMs;
+    const execStartedMs = Date.now();
     let result;
     let failure = null;
     try {
@@ -2022,16 +2117,19 @@ function runGhSyncUnmemoized(args, opts = {}) {
       // did not already ask for a specific debug mode of its own — never silently overridden. It changes
       // nothing about a SUCCESSFUL call's stdout (see the module header). The #4375 capture, when on, lives
       // inside the real `exec` itself and records what it read in `lastCapture`.
+      if (reserved && now() - reservedStartMs >= reservedCapMs) throw Object.assign(new Error(reservedThrottledMessage()), { status: 1, stdout: '', stderr: reservedThrottledMessage(), ghThrottled: { class: waitClass, waitedMs: reservedCapMs } });
       const routedOpts = effectiveExecOpts();
-      const callExecOpts = calibrateHeaders ? withDebugEnv(routedOpts) : routedOpts;
+      const boundedOpts = reserved ? { ...routedOpts, timeout: reservedLeftMs() } : routedOpts;
+      const callExecOpts = calibrateHeaders ? withDebugEnv(boundedOpts) : boundedOpts;
       lastCapture = null;
       result = exec(args, callExecOpts);
     } catch (e) {
       failure = e;
     } finally {
-      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
+      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap: slotCap, owner }), gateOpts);
     }
     if (!failure && isGhDeferred(result)) return result; // nested CLI deferral is not a landed write
+    recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(execStartedMs).toISOString(), caller: ghWaitLogCaller(caller), op: ghOpLabel(args), waitMs, durMs: Date.now() - execStartedMs, ok: !failure });
     const captured = lastCapture;
     if (captured) recordGhHeadroom(lockRoot, identity, rateLimitRecords(captured.responses));
     recordGhCallLogEntry(logPath, {
@@ -2051,7 +2149,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
       fallbackToOriginal(attempt);
       continue;
     }
-    const transient = jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(args, text) : null;
+    const transient = !reserved && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(args, text) : null;
     if (transient) {
       jsonRetry.used += 1;
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: transient, caller, w: isWrite, resource, id: identity, inv });
@@ -2074,7 +2172,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
     if (exhausted) {
       const probe = throttle.probeBudget || ((probeArgs) => exec(probeArgs, { ...effectiveExecOpts(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
       // Strict-budget background readers cannot spend an extra diagnostic request; use headers/fallback.
-      const until = resolveBudgetBlockUntil({ headers, resource: exhausted, probe: env.WE_GH_THROTTLE_NO_BUDGET_PROBE === '1' ? () => '' : probe });
+      // A reserved read never spends the extra diagnostic request: it would run past the read's own call bound. Headers/fallback decide the block instead.
+      const until = resolveBudgetBlockUntil({ headers, resource: exhausted, probe: reserved || env.WE_GH_THROTTLE_NO_BUDGET_PROBE === '1' ? () => '' : probe });
       if (until) {
         const rec = writeBudgetBlock(lockRoot, identity, exhausted, { untilMs: until.untilMs, nowMs: now(), source: until.source, op: opLabel, caller });
         recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'budget_exhausted', resource: exhausted, until: rec.until, caller, w: isWrite, id: identity });
@@ -2087,7 +2186,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
       }
     }
 
-    if (attempt >= maxAttempts) {
+    // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
+    if (attempt >= maxAttempts || reserved) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'retry_exhausted', caller, w: isWrite, id: identity });
       recordGhThrottleMetric('gh.throttle.rate_limited', 1, { op: opLabel, attempt, source: classifyRateLimitSignal(headers).kind, outcome: 'exhausted' });
       recordGhThrottleMetric('gh.throttle.exhausted', 1, { op: opLabel, attempt });
@@ -2212,6 +2312,12 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
     : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
   const slotTimeoutMs = slotWaitPick.waitMs;
+  // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
+  const reserved = ghReservedSlotEligible({ throttle, caller, args: argv, isWrite });
+  const slotCap = cap + (reserved ? 1 : 0);
+  // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
+  const reservedCapMs = reserved ? ghReservedWaitCapMs({ timeout: throttle.reservedTimeoutMs }) : 0, reservedStartMs = reserved ? now() : 0;
+  const reservedLeftMs = () => Math.max(1, reservedCapMs - (now() - reservedStartMs));
   // #gh-graphql-budget — the shared primary-budget backoff (see runGhSync's identical wiring).
   const resource = classifyGhResource(argv);
 
@@ -2275,19 +2381,22 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
-    }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn, slotWaitPick);
+      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
+      // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
+      if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+    }, { ...gateOpts, fallback: reserved ? RESERVED_CLOSED : { ok: false } }) : (reserved ? RESERVED_CLOSED : { ok: false });
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, reserved ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
     let r;
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});
       if (deferred) return { status: 0, deferred: true, stdout: Buffer.from(JSON.stringify(deferred)), stderr: Buffer.from(deferred.message) };
+      if (reserved && now() - reservedStartMs >= reservedCapMs) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(reservedThrottledMessage()) };
       // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
-      r = spawn(bin, argv, ghExecOptions(outerLimits === null ? spawnOpts : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
+      r = spawn(bin, argv, ghExecOptions(outerLimits === null ? (reserved ? { ...spawnOpts, timeout: reservedLeftMs() } : spawnOpts) : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
     } finally {
-      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
+      if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap: slotCap, owner }), gateOpts);
     }
     if (r.error) { recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'call', ok: false, caller, inv, ...ghCallHoldFields(argv, r.error), ...(outer ? { outer } : {}) }); throw r.error; } // e.g. `gh` not on PATH — not a `gh`-level failure to retry
     const stdoutOverflow = capture && r.stdout && r.stdout.length > maxBuffer;
@@ -2328,7 +2437,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     if (stdoutOverflow) throw captureStdoutOverflow(bin, argv);
     if (!failed && isWrite) markPrSnapshotDirty({ repo: repoFromGhArgs(argv), env }); // #gh-graphql-budget
     // A nested call leaves the truncated-JSON retry to its outer runGhSync (one retry per logical call).
-    const transient = failed && !outer && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(argv, stderrText) : null;
+    const transient = failed && !outer && !reserved && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(argv, stderrText) : null;
     if (transient) {
       jsonRetry.used += 1;
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: transient, caller, w: isWrite, resource, id: identity, inv });
@@ -2350,7 +2459,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
         return pr && pr.status === 0 && pr.stdout ? pr.stdout.toString('utf8') : '';
       });
       // Strict-budget background readers cannot spend an extra diagnostic request; use headers/fallback.
-      const until = resolveBudgetBlockUntil({ headers, resource: exhausted, probe: env.WE_GH_THROTTLE_NO_BUDGET_PROBE === '1' ? () => '' : probe });
+      // A reserved read never spends the extra diagnostic request (same rule as runGhSync): headers/fallback decide the block.
+      const until = resolveBudgetBlockUntil({ headers, resource: exhausted, probe: reserved || env.WE_GH_THROTTLE_NO_BUDGET_PROBE === '1' ? () => '' : probe });
       if (until) {
         const rec = writeBudgetBlock(lockRoot, identity, exhausted, { untilMs: until.untilMs, nowMs: now(), source: until.source, op: opLabel, caller });
         recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'budget_exhausted', resource: exhausted, until: rec.until, caller, w: isWrite, id: identity });
@@ -2373,7 +2483,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
         return { status: r.status == null ? 1 : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
       }
     }
-    if (attempt >= maxAttempts) {
+    // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
+    if (attempt >= maxAttempts || reserved) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'retry_exhausted', caller, w: isWrite, id: identity });
       recordGhThrottleMetric('gh.throttle.rate_limited', 1, { op: opLabel, attempt, source: classifyRateLimitSignal(headers).kind, outcome: 'exhausted' });
       recordGhThrottleMetric('gh.throttle.exhausted', 1, { op: opLabel, attempt });

@@ -1,0 +1,4 @@
+{
+  "$comment": "R212: recorded operator clearance licenses the drain to enqueue a human-only PR, subject to exact-head or mechanical-successor proof. WE_MERGE_QUEUE_HUMAN_ONLY_APPROVAL_LICENSES_ENQUEUE overrides this setting.",
+  "mergeQueue": { "humanOnly": { "approvalLicensesEnqueue": true } }
+}

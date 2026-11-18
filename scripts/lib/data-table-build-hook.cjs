@@ -25,7 +25,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
-const { execFileSync } = require('node:child_process');
+const { runCliToFile } = require('./run-cli-batch.cjs');
 
 /**
  * The pinned FUI build-artifact. A FIXED relative path resolved from the WE repo root against the sibling
@@ -132,7 +132,7 @@ function findDataTableBindings(html, data) {
  * build error when the artifact is absent (the ratified ordering means FUI built it first) or the process
  * fails — a missing/mis-emitted artifact must NOT silently skip (non-reproducible build).
  */
-function runBuildBatch(entries, repoRoot, runner = execFileSync) {
+function runBuildBatch(entries, repoRoot, runner = runCliToFile) {
   const cliPath = path.resolve(repoRoot, PINNED_CLI_RELATIVE);
   if (!fs.existsSync(cliPath)) {
     throw new Error(
@@ -141,7 +141,7 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
     );
   }
   const input = JSON.stringify(entries);
-  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
   let batch;
   try {
     batch = JSON.parse(out);
@@ -165,7 +165,7 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
  * nothing. Per-entry errors are isolated: a failed binding leaves the original element intact and is logged,
  * never aborting the page (keyed-batch isolation — one bad table never poisons the others or the build).
  */
-function spliceDataTables(content, data, repoRoot, runner = execFileSync) {
+function spliceDataTables(content, data, repoRoot, runner = runCliToFile) {
   if (typeof content !== 'string' || content.indexOf('we-data-table') === -1) return content;
   const bindings = findDataTableBindings(content, data || {});
   if (bindings.length === 0) return content;

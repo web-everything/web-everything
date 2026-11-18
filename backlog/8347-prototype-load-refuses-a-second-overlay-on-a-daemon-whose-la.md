@@ -1,0 +1,37 @@
+---
+bornAs: xolt50m
+kind: story
+size: 3
+status: open
+scope: ["we:scripts/operations/prototype-load.mjs we:scripts/worker-brief.mjs"]
+dateOpened: "2026-11-15"
+tags: []
+---
+
+# prototype-load refuses a second overlay on a daemon whose last load has no post-load outcome check; worker-brief proof includes a control case
+
+we:scripts/operations/prototype-load.mjs (2026-11-15 06:42 ET, MED): enforce one unproven overlay per daemon by refusing a second load on a daemon whose last load has no post-load outcome check, and make we:scripts/worker-brief.mjs default --proof include a control case ('the normal path still works'), not only the new case.
+
+## Acceptance
+
+- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Non-goals
+
+- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — TODO: the handling, or n/a: <why>.
+2. **Truncated reads** — TODO: the handling, or n/a: <why>.
+3. **Shared state files** — TODO: the handling, or n/a: <why>.
+4. **Fail closed** — TODO: the handling, or n/a: <why>.
+5. **Identity scoping** — TODO: the handling, or n/a: <why>.
+6. **State over time** — TODO: the handling, or n/a: <why>.
+7. **Who wrote it** — TODO: the handling, or n/a: <why>.

@@ -9,6 +9,7 @@
   "scripts/conveyor/stand-down-answer.mjs": 1,
   "scripts/conveyor/tick-core.mjs": 1,
   "scripts/lib/pr-state-io.mjs": 2,
+  "scripts/lib/pr-state/snapshot.mjs": 1,
   "scripts/lib/review-log-claims.mjs": 1,
   "scripts/merge-ai-prs.mjs": 3,
   "scripts/operations/extend-rounds-io.mjs": 1,

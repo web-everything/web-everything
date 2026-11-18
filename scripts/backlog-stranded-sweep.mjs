@@ -38,6 +38,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolveLandedItem } from './lane-drain.mjs'; // #3916 — the ONE resolve-on-land home (#2899 A5); never a second resolver
+import { fetchFresh } from './lib/git-fetch-fresh.mjs';
 
 /** Frontmatter-strict single-field read (#2603) — only the leading `---` block, never a body line. Pure. */
 export function readFrontmatterField(body, field) {
@@ -243,7 +244,7 @@ export function autoResolvableStrandings(cards = [], mainLog = []) {
 // EXPORTED (xvr2o8r) so `autoStrandedSweepPass` below — and the drain's own wiring — share this ONE read
 // rather than a second copy that could drift on the fetch/window behaviour.
 export function readMainLog(limit) {
-  try { execFileSync('git', ['fetch', 'origin', 'main', '--quiet'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch { /* best-effort — a stale local origin/main still degrades safely below */ }
+  try { fetchFresh({ cwd: process.cwd(), branches: ['main'], maxAgeMs: 0, run: (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* best-effort — a stale local origin/main still degrades safely below */ }
   try {
     const out = execFileSync('git', ['log', '--pretty=%s', ...(limit ? [`-n${limit}`] : []), 'origin/main'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
     return out.split('\n').filter(Boolean);

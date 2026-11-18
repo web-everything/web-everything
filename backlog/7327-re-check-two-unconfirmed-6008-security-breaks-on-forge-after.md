@@ -2,7 +2,7 @@
 bornAs: x9k2ott
 kind: task
 status: open
-scope: ["we:scripts/forge-exec-run.mjs", "we:scripts/remote-exec.mjs"]
+scope: ["we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---

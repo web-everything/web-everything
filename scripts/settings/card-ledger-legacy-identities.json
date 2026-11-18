@@ -1,0 +1,67 @@
+{
+  "we": [
+    {
+      "id": "xzdi27a",
+      "nums": [
+        3111,
+        3112
+      ],
+      "canonical": 3111,
+      "reason": "Existing duplicate birth identity; earlier-filed card is canonical (#6121)."
+    },
+    {
+      "id": "x2t6cr5",
+      "nums": [
+        3201,
+        3244
+      ],
+      "canonical": 3201,
+      "reason": "Existing duplicate birth identity; earlier-filed card is canonical (#6121)."
+    },
+    {
+      "id": "xu2krte",
+      "nums": [
+        3544,
+        3557
+      ],
+      "canonical": 3544,
+      "reason": "Existing duplicate birth identity; earlier-filed card is canonical (#6121)."
+    },
+    {
+      "id": "x8hzy1m",
+      "nums": [
+        3660,
+        3663
+      ],
+      "canonical": 3660,
+      "reason": "Existing duplicate birth identity; earlier-filed card is canonical (#6121)."
+    },
+    {
+      "id": "xhprieg",
+      "nums": [
+        3661,
+        3664
+      ],
+      "canonical": 3661,
+      "reason": "Existing duplicate birth identity; earlier-filed card is canonical (#6121)."
+    },
+    {
+      "id": "xldrls6",
+      "nums": [
+        3662,
+        3665
+      ],
+      "canonical": 3662,
+      "reason": "Existing duplicate birth identity; earlier-filed card is canonical (#6121)."
+    },
+    {
+      "id": "xp12dod",
+      "nums": [
+        4498,
+        4512
+      ],
+      "canonical": 4498,
+      "reason": "Existing duplicate birth identity; earlier-filed card is canonical (#6121)."
+    }
+  ]
+}

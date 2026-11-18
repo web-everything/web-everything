@@ -17,11 +17,12 @@ import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { briefPath, REPO_ROOT } from '../dispatch-lane-io.mjs';
-import { dispatchCiHeal, runReconcileCiHealDispatch, orderCiHealEntriesOldestFirst, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
+import { dispatchCiHeal, runReconcileCiHealDispatch, resetCiHealFlushDeadlineState, orderCiHealEntriesOldestFirst, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
 import { createCiHealReserve } from '../../lib/ci-heal-reserve.mjs';
 import { readUnsupported } from '../../conveyor/unsupported-repo.mjs';
 import { flushOwedWrites, readOwedWrites, recordOwedWrite, OWED_MAX_AGE_MS } from '../../conveyor/ci-heal-owed.mjs';
@@ -31,9 +32,10 @@ import { enrichPrsWithTimeoutEvidence } from '../../conveyor/reconcile-pass.mjs'
 import { readTimeoutBudget, timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 
-// Dispatch fixtures use a deterministic birth number; allocator transport has its own suite.
-// Replacing the filing sink alone still leaves planning able to reserve a live remote number.
+// Keep a regression to numeric allocation hermetic; follow-up filing must never call this mock.
 vi.mock('../../lib/card-number-allocator.mjs', () => ({
   allocateCardNumber: vi.fn(() => ({ ok: true, num: '90001' })),
 }));
@@ -81,6 +83,8 @@ afterAll(() => {
   rmSync(isolatedLockRoot, { recursive: true, force: true });
 });
 
+beforeEach(() => resetCiHealFlushDeadlineState());
+
 const FRESH = () => ({ fresh: true, behind: 0 });
 
 describe('oldest owed CI-heal first', () => {
@@ -121,9 +125,12 @@ describe('oldest owed CI-heal first', () => {
     })) });
     expect(plan.dispatch.map(e => e.prNumber)).toEqual([5087, 5082, 5017]);
     const dispatch = vi.fn(async planned => ({ pr: planned.pr }));
+    const recheckHost = vi.fn(() => ({ admit: true }));
     try {
       const result = await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
-        checkStaleness: FRESH, dispatch, dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap' }) },
+        checkStaleness: FRESH, dispatch, dispatchThrottle: {
+          tryAdmit: () => ({ admit: false, kind: 'fix-cap' }), recheckHost,
+        },
         ciHealReserve: createCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '3' }, gate: () => ({ admit: true }),
           listClaims: () => [5042, 5051].map(pr => ({ meta: { kind: 'ci-heal', pr } })) }),
         pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
@@ -133,6 +140,7 @@ describe('oldest owed CI-heal first', () => {
         fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
       });
       expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(recheckHost.mock.calls).toEqual([['ci-heal']]);
       expect(dispatch.mock.calls[0][0].pr).toBe(5017);
       expect(result.dispatched).toEqual([{ pr: 5017 }]);
       expect(result.refusals.map(r => [r.pr, r.kind])).toEqual([[5082, 'fix-cap'], [5087, 'fix-cap']]);
@@ -159,7 +167,7 @@ describe('dispatchCiHeal (#3852)', () => {
     expect(calls).toHaveLength(1);
     const slug = calls[0].sessionSlug;
     expect(calls[0].prompt).toBe(
-      `heal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${slug} scope=we:scripts/a.mjs,we:scripts/b.mjs why=red-ci`,
+      `${NO_PROMPT_COMMAND_RULES}\n\nheal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${slug} scope=we:scripts/a.mjs,we:scripts/b.mjs why=red-ci`,
     );
   });
 
@@ -196,7 +204,7 @@ describe('dispatchCiHeal (#3852)', () => {
     const { calls, sinks } = recordingSink();
     await dispatchCiHeal({ ...PLANNED, reason: 'behind' }, { readBrief: () => TEMPLATE, sinks });
     expect(calls[0].reason).toBe('behind');
-    expect(calls[0].prompt).toMatch(/why=behind$/);
+    expect(calls[0].prompt).toBe(`${NO_PROMPT_COMMAND_RULES}\n\nheal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${calls[0].sessionSlug} scope=we:scripts/a.mjs,we:scripts/b.mjs why=behind`);
   });
 
   it('a second call for the same PR comes back held, and dispatches nothing new', async () => {
@@ -228,7 +236,7 @@ describe('dispatchCiHeal (#3852)', () => {
   it('an item-less PR fills ITEM_NUM blank and reports itemNum null', async () => {
     const { calls, sinks } = recordingSink();
     const out = await dispatchCiHeal({ ...PLANNED, itemNum: null }, { readBrief: () => TEMPLATE, sinks });
-    expect(calls[0].prompt).toMatch(/^heal # pr=743/);
+    expect(calls[0].prompt.startsWith(`${NO_PROMPT_COMMAND_RULES}\n\nheal # pr=743`)).toBe(true);
     expect(calls[0].num).toBeUndefined();
     expect(out.itemNum).toBeNull();
   });
@@ -237,6 +245,20 @@ describe('dispatchCiHeal (#3852)', () => {
     const { sinks } = recordingSink({});
     const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
     expect(out.agentId).toBeNull();
+  });
+
+  it('R549: an unreadable launch (handle is only the minted session id) reports launched unverified, never an agentId', async () => {
+    const { sinks } = recordingSink({ handle: 'minted-uuid', dispatch: { handleVerified: false } });
+    const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
+    expect(out.agentId).toBeNull();
+    expect(out.launched).toBe('unverified');
+  });
+
+  it('R549: a verified launch keeps its agentId and carries no unverified marker', async () => {
+    const { sinks } = recordingSink({ handle: 'agent-1', dispatch: { handleVerified: true } });
+    const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
+    expect(out.agentId).toBe('agent-1');
+    expect(out.launched).toBeUndefined();
   });
 
   it('refuses a scope token the brief cannot carry safely, before any sink call', async () => {
@@ -258,7 +280,7 @@ describe('dispatchCiHeal (#3852)', () => {
   it('#x0mn6x0 — an empty scope (no item, nothing derivable from the diff either) fills SCOPE blank instead of throwing', async () => {
     const { calls, sinks } = recordingSink();
     const out = await dispatchCiHeal({ ...PLANNED, scope: [] }, { readBrief: () => TEMPLATE, sinks });
-    expect(calls[0].prompt).toBe(`heal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${calls[0].sessionSlug} scope= why=red-ci`);
+    expect(calls[0].prompt).toBe(`${NO_PROMPT_COMMAND_RULES}\n\nheal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${calls[0].sessionSlug} scope= why=red-ci`);
     expect(calls[0].scope).toEqual([]);
     expect(out.agentId).toBe('agent-1');
   });
@@ -834,19 +856,24 @@ describe('xng7q1p retry reservation and restart soak', () => {
   }));
   it('owed filing retries independently after CI passes and never reallocates its card identity', async () => harness(async (dir) => {
     const e = evidence(); const ids = []; let reject = true;
-    const allocationsBefore = vi.mocked(allocateCardNumber).mock.calls.length;
     const fileFollowup = vi.fn(async (p) => { ids.push(p.num); if (reject) throw new Error('disk unavailable'); });
     const opts = { dir, root: dir, repo: e.repo, fileFollowup, effects: { observe, request: () => ({ status: 'confirmed' }) } };
     await dispatchTimeoutRetry(e, opts);
     await dispatchTimeoutRetry({ ...e, jobs: [{ ...e.jobs[0], job: 21, attempt: 2 }] }, opts);
+    const payload = readState(dir, e).card.payload;
+    expect(payload.num).toMatch(/^x[0-9a-z]{6}$/);
+    expect(payload.content).not.toContain('bornAs:');
+    expect(readState(dir, e).card).toMatchObject({ filed: false, error: 'disk unavailable' });
     reject = false;
     await flushTimeoutFollowups(opts);
     await flushTimeoutFollowups(opts);
     expect(ids).toHaveLength(2); expect(new Set(ids).size).toBe(1);
-    expect(ids).toEqual(['90001', '90001']);
+    expect(ids).toEqual([payload.num, payload.num]);
     expect(fileFollowup.mock.calls[1][0]).toEqual(fileFollowup.mock.calls[0][0]);
-    expect(fileFollowup.mock.calls[0][0].abs).toBe(join(dir, 'backlog', '90001-investigate-timeout-retries-for-pr-3415-at-aaaaaaaa.md'));
-    expect(vi.mocked(allocateCardNumber).mock.calls.length - allocationsBefore).toBe(1);
+    expect(fileFollowup.mock.calls[0][0]).toEqual(payload);
+    expect(payload.abs).toBe(join(dir, 'backlog', `${payload.num}-investigate-timeout-retries-for-pr-3415-at-aaaaaaaa.md`));
+    expect(readState(dir, e).card).toMatchObject({ filed: true, payload });
+    expect(allocateCardNumber).not.toHaveBeenCalled();
   }));
   it('refuses stale heads and nonterminal jobs; a newly evidenced head gets a fresh budget', async () => harness(async (dir) => {
     const e = evidence(); let requests = 0;
@@ -1211,4 +1238,138 @@ it('bounds dispatch log reads to 64 KiB and treats missing or unreadable logs as
     mkdirSync(join(dir, 'directory.log'));
     expect(readSessionLog('directory', root)).toBe('');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('checks the current Argon Pro identity for CI-heal quota holds', () => {
+  const readHolds = vi.fn(() => null);
+  routeAvailableCiHeal({ scope: [] }, { readHolds, readScores: () => [], now: 123 });
+  expect(readHolds).toHaveBeenCalledWith('gemini-4-argon-high', { now: 123 });
+  expect(readHolds).not.toHaveBeenCalledWith('gemini-3.1-pro', expect.anything());
+});
+
+it('preserves oldest-owed order with a deadline and resumes at the exact PR cursor with wraparound', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-'));
+  let time = 10, inEffect = false;
+  const touched = [];
+  const now = vi.fn(() => time); // launches run concurrently now, so the old serial inEffect interleave no longer applies
+  const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
+    reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a',
+      waitingSince: { 3: '2026-10-13T01:00:00Z', 1: '2026-10-13T02:00:00Z', 2: '2026-10-13T03:00:00Z' }[prNumber],
+    })), refusals: [] }),
+    dispatch: async p => { inEffect = true; time = 11; touched.push(p.pr); await Promise.resolve(); return { pr: p.pr }; },
+    pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+    flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+    salvage: async () => null, currentBuild: () => null,
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => { inEffect = false; } },
+  };
+  try {
+    const first = await runReconcileCiHealDispatch(options);
+    // Dispatch time no longer starves later owed PRs: every cheap-gated entry launches, oldest first (ci-heal-starvation.test.mjs).
+    expect(first).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+    expect(touched).toEqual([3, 1, 2]);
+    touched.length = 0;
+    const second = await runReconcileCiHealDispatch({ ...options, cursor: 1, deadlineAt: 20 });
+    expect(touched).toEqual([1, 2, 3]);
+    expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+    touched.length = 0;
+    const third = await runReconcileCiHealDispatch({ ...options, cursor: 2, deadlineAt: 20 });
+    expect(touched).toEqual([2, 3, 1]);
+    expect(third).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('past deadline with a cursor skips every blocking prelude, keeps deferred=[cursor], and retries flushes next pass', async () => {
+  let time = 11;
+  const order = [];
+  const pollAttempts = vi.fn(() => { order.push('poll'); return []; });
+  const flushOwed = vi.fn(() => { order.push('owed'); return {}; });
+  const flushTimeouts = vi.fn(async () => { order.push('timeouts'); return []; });
+  const reconcile = vi.fn(() => { order.push('reconcile'); return { dispatch: [], refusals: [] }; });
+  const dispatch = vi.fn();
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => time,
+    deadlineAt: 10, cursor: 42, pollAttempts, flushOwed, flushTimeouts, reconcile, dispatch,
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), pickFreeLanes: () => [],
+  };
+  const first = await runReconcileCiHealDispatch(options);
+  expect(first).toMatchObject({ handled: 0, deferred: [42], nextCursor: 42 });
+  for (const fn of [pollAttempts, flushOwed, flushTimeouts, reconcile, dispatch]) expect(fn).not.toHaveBeenCalled();
+  time = 0;
+  const second = await runReconcileCiHealDispatch({ ...options, cursor: first.nextCursor });
+  expect(order).toEqual(['poll', 'owed', 'timeouts', 'reconcile']);
+  for (const fn of [pollAttempts, flushOwed, flushTimeouts, reconcile]) expect(fn).toHaveBeenCalledTimes(1);
+  expect(second).toMatchObject({ handled: 0, deferred: [], nextCursor: null });
+});
+
+it('past deadline without a cursor skips every blocking prelude (including reconcile), flags deadlineSkipped and starts from the top next pass', async () => {
+  const pollAttempts = vi.fn(() => []), flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []);
+  const reconcile = vi.fn(() => ({ dispatch: [42, 43].map(prNumber => ({ kind: 'ci-heal', prNumber })), refusals: [] }));
+  const dispatch = vi.fn();
+  const result = await runReconcileCiHealDispatch({ root: '/repo', checkStaleness: FRESH,
+    now: () => 11, deadlineAt: 10, pollAttempts, flushOwed, flushTimeouts, reconcile, dispatch,
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), pickFreeLanes: () => [],
+    resolveWorkUnit: () => ({ itemNum: null, scope: [] }), timeoutHold: () => null,
+  });
+  expect(result).toMatchObject({ handled: 0, deferred: [], nextCursor: null, deadlineSkipped: true });
+  for (const fn of [reconcile, pollAttempts, flushOwed, flushTimeouts, dispatch]) expect(fn).not.toHaveBeenCalled();
+});
+
+it('a flush skipped at the deadline runs on the next pass even if still past deadline, with a fresh gate slice for all PRs', async () => {
+  resetCiHealFlushDeadlineState();
+  const flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []);
+  const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'ci-heal', prNumber: 7, headRefOid: 'a' }, { kind: 'ci-heal', prNumber: 8, headRefOid: 'a' }], refusals: [] }));
+  const dispatch = vi.fn(async p => ({ pr: p.pr }));
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => 11, deadlineAt: 10, cursor: 7,
+    pollAttempts: () => [], flushOwed, flushTimeouts, reconcile, dispatch, pickFreeLanes: () => [1, 2],
+    resolveWorkUnit: () => ({ itemNum: null, scope: [] }), resolveProfile: () => ({ capabilities: { ciHeal: true } }),
+    timeoutHold: () => null, salvage: async () => null, currentBuild: () => null,
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => {} } };
+  await runReconcileCiHealDispatch(options);
+  expect(flushOwed).not.toHaveBeenCalled();
+  const second = await runReconcileCiHealDispatch(options);
+  expect(flushOwed).toHaveBeenCalledTimes(1);
+  expect(flushTimeouts).toHaveBeenCalledTimes(1);
+  expect(second).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+  expect(dispatch.mock.calls.map(([p]) => p.pr)).toEqual([7, 8]);
+});
+
+it('ci-heal: a prelude that always overruns the budget still handles all PRs every pass (no starvation)', async () => {
+  resetCiHealFlushDeadlineState();
+  let time = 0;
+  const handledPrs = [];
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => time,
+    pollAttempts: () => { time += 1000; return []; }, flushOwed: () => ({}), flushTimeouts: async () => [],
+    reconcile: () => ({ dispatch: [5, 6].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a' })), refusals: [] }),
+    dispatch: async p => { handledPrs.push(p.pr); return { pr: p.pr }; }, pickFreeLanes: () => [1, 2],
+    resolveWorkUnit: () => ({ itemNum: null, scope: [] }), resolveProfile: () => ({ capabilities: { ciHeal: true } }),
+    timeoutHold: () => null, salvage: async () => null, currentBuild: () => null,
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => {} } };
+  let cursor;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const result = await runReconcileCiHealDispatch({ ...options, deadlineAt: time + 100, cursor });
+    expect(result).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+    cursor = result.nextCursor ?? undefined;
+  }
+  expect(handledPrs).toEqual([5, 6, 5, 6]);
+});
+
+it('heals all PRs oldest first when the deadline passes before the loop', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-min-'));
+  const touched = [];
+  let time = 0;
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+    reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a',
+      waitingSince: `2026-10-13T0${prNumber}:00:00Z` })), refusals: [] }),
+    dispatch: async p => { touched.push(p.pr); return { pr: p.pr }; },
+    pickFreeLanes: () => [1, 2], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+    flushOwed: () => ({}), pollAttempts: () => { time = 100; return []; }, flushTimeouts: async () => [], timeoutHold: () => null,
+    salvage: async () => null, currentBuild: () => null,
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => {} },
+  };
+  try {
+    const result = await runReconcileCiHealDispatch(options);
+    expect(touched).toEqual([1, 2]);
+    expect(result).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

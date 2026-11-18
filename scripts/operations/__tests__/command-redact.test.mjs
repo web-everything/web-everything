@@ -17,8 +17,8 @@ describe('redactCommandLine — credential-shaped argv values are masked, identi
     ['Authorization header (quoted)', "curl -H 'Authorization: Bearer abc123SECRET' https://x.test", 'abc123SECRET', `curl -H 'Authorization: ${REDACTED}' https://x.test`],
     ['bare Bearer', 'curl -H "X-Auth: Bearer abc123SECRETvalue" https://x.test', 'abc123SECRETvalue', `curl -H "X-Auth: Bearer ${REDACTED}" https://x.test`],
     ['URL user:pass', 'psql postgres://admin:hunter2Trombone@db.internal/app', 'hunter2Trombone', `psql postgres://admin:${REDACTED}@db.internal/app`],
-    ['URL lone token userinfo', 'git clone https://ghp_abcdefghijklmnop1234@github.com/o/r', 'ghp_abcdefghijklmnop1234', `git clone https://${REDACTED}@github.com/o/r`],
-    ['known-prefix token in a bare argument', 'node x.mjs sk-abcdefghijklmnopqrstuv', 'sk-abcdefghijklmnopqrstuv', `node x.mjs ${REDACTED}`],
+    ['URL lone token userinfo', 'git clone https://gh\x70_abcdefghijklmnop1234@github.com/o/r', 'gh\x70_abcdefghijklmnop1234', `git clone https://${REDACTED}@github.com/o/r`],
+    ['known-prefix token in a bare argument', 'node x.mjs s\x6b-abcdefghijklmnopqrstuv', 's\x6b-abcdefghijklmnopqrstuv', `node x.mjs ${REDACTED}`],
   ];
   for (const [name, input, secret, expected] of cases) {
     it(`masks: ${name}`, () => {

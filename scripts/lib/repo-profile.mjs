@@ -27,7 +27,10 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from './constellation-repos.mjs';
+import { CONSTELLATION_REPOS, PENDING_REPOS, repoKeyForDir, repoKeyForSlug } from './constellation-repos.mjs';
+
+// Profile registration includes pending repos without enrolling them in constellation sweeps.
+const PROFILE_REPOS = Object.freeze({ ...CONSTELLATION_REPOS, ...PENDING_REPOS });
 
 // This module's OWN checkout root — the `we` entry's `path: ''` means "wherever this file is physically
 // checked out" (the primary checkout or a lane clone of it), never a fixed location. Computed once from
@@ -41,11 +44,12 @@ const SCOPE_PREFIXES = Object.freeze({
   we: Object.freeze(['we', 'webeverything']),
   frontierui: Object.freeze(['fui', 'frontierui']),
   'plateau-app': Object.freeze(['plateau', 'plateau-app']),
+  longshore: Object.freeze(['longshore']),
 });
 
 // The prefix each repo's own backlog cards actually write today (grepped `backlog/*.md`, 2026-09-23):
 // `we:` 31513 vs `webeverything:` 5; `fui:` 4147 vs `frontierui:` 281; `plateau:` 1667 vs `plateau-app:` 1436.
-const CANONICAL_PREFIX = Object.freeze({ we: 'we', frontierui: 'fui', 'plateau-app': 'plateau' });
+const CANONICAL_PREFIX = Object.freeze({ we: 'we', frontierui: 'fui', 'plateau-app': 'plateau', longshore: 'longshore' });
 
 // TODAY'S truth. `review` is true everywhere already; multi-repo slice 5 (`we:backlog/3966-*.md`) turned `fix`
 // on for the couple-repos — `reconcile-fix-dispatch.mjs#runReconcileFixDispatch` dispatches a real fix agent
@@ -58,6 +62,7 @@ const CAPABILITIES = Object.freeze({
   we: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'direct' }),
   frontierui: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }),
   'plateau-app': Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }),
+  longshore: Object.freeze({ review: false, fix: false, ciHeal: false, build: 'none' }),
 });
 
 // A scope prefix or full name that is not already a key/slug/slugTag (those are covered by `repoKeyForSlug` /
@@ -77,8 +82,8 @@ function resolveProfileKey(input) {
   if (!stripped) return null;
   const bySlugOrKey = repoKeyForSlug(stripped);
   if (bySlugOrKey !== null) return bySlugOrKey;
-  for (const [key, meta] of Object.entries(CONSTELLATION_REPOS)) {
-    if (meta.slugTag && meta.slugTag === stripped) return key;
+  for (const [key, meta] of Object.entries(PROFILE_REPOS)) {
+    if (key === stripped || meta.slug === stripped || (meta.slugTag && meta.slugTag === stripped)) return key;
   }
   return Object.hasOwn(PREFIX_ALIASES, stripped) ? PREFIX_ALIASES[stripped] : null;
 }
@@ -113,13 +118,13 @@ function resolveProfileKey(input) {
  * @returns {{
  *   key: string, slug: string, slugTag: string, checkoutPath: string, lanePoolRepo: string,
  *   scopePrefixes: string[], canonicalPrefix: string,
- *   capabilities: {review: boolean, fix: boolean, ciHeal: boolean, build: 'couple'|'direct'},
+ *   capabilities: {review: boolean, fix: boolean, ciHeal: boolean, build: 'couple'|'direct'|'none'},
  * }|null}
  */
 export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
   const key = resolveProfileKey(keyOrSlugOrPrefix);
   if (key === null) return null;
-  const meta = CONSTELLATION_REPOS[key];
+  const meta = PROFILE_REPOS[key];
   const checkoutPath = key === 'we' ? WE_CHECKOUT_ROOT : resolve(meta.path.replace(/^\$HOME(?=\/|$)/, home));
   const lanePoolRepo = checkoutPath;
   return Object.freeze({
@@ -142,7 +147,8 @@ export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
  * bare `npm run test:unit && npm run check:standards`, i.e. the FULL suite for every fix — observed 2026-09-25 as
  * several 10+ minute runs at once starving the host. The WE root is always this checkout's own root (the
  * dispatcher's current code), so a lane on an older base still gets today's selection policy.
- * Returns `null` when the profile is unknown OR the checkout does not exist (never throws). `readPackageJson`
+ * Returns `null` when the profile is unknown, its verification gate is not wired, or the checkout does not exist
+ * (never throws). Pending repos must wire a real gate before dispatch can use them. `readPackageJson`
  * is still accepted (and ignored) for call-site compatibility — script detection now happens inside verify-lane.
  * @param {unknown} keyOrSlugOrPrefix
  * @param {{home?: string, checkoutExists?: (p: string) => boolean, readPackageJson?: (p: string) => string, weRoot?: string}} [o]
@@ -151,6 +157,9 @@ export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
 export function gateFor(keyOrSlugOrPrefix, { home, checkoutExists = existsSync, weRoot = WE_CHECKOUT_ROOT } = {}) {
   const profile = repoProfile(keyOrSlugOrPrefix, { home });
   if (!profile) return null;
+  // Pending profiles (e.g. longshore's check:cards) are not wired into verify-lane's script selection.
+  // Sending them there would allow its "nothing to run" echo to count as successful verification.
+  if (!Object.hasOwn(CONSTELLATION_REPOS, profile.key)) return null;
   if (!checkoutExists(profile.checkoutPath)) return null;
   return `node ${join(weRoot, 'scripts', 'verify-lane.mjs')} run --repo=.`;
 }
@@ -242,7 +251,7 @@ export function primaryCheckoutForLanePath(lanePath, { home } = {}) {
 /**
  * build-path-codex-isolation-locus — THE FULL PROFILE (not just the checkout path) for a lane clone's own
  * absolute PATH, given nothing else. Generalizes {@link primaryCheckoutForLanePath}'s own pool-dir-basename
- * lookup (unchanged — same `repoKeyForDir`/`repoProfile` calls) so a caller that needs the repo's `key` or
+ * lookup (including profile-only pending repos) so a caller that needs the repo's `key` or
  * `canonicalPrefix` — e.g. `deliver-item-wrapper.mjs#commitBuildTurn`'s commit-subject prefix, which must say
  * `PLATEAU #<item>` for a plateau-app lane rather than an always-`WE` literal — has one shared lookup to call
  * instead of re-deriving the pool-dir-basename math a second time. Returns `null` under the exact same
@@ -254,7 +263,8 @@ export function primaryCheckoutForLanePath(lanePath, { home } = {}) {
  */
 export function repoProfileForLanePath(lanePath, { home } = {}) {
   const poolDirBasename = basename(dirname(String(lanePath ?? '')));
-  const key = repoKeyForDir(poolDirBasename);
+  const key = repoKeyForDir(poolDirBasename)
+    ?? Object.entries(PENDING_REPOS).find(([, meta]) => meta.dirs.includes(poolDirBasename))?.[0] ?? null;
   if (key === null) return null;
   return repoProfile(key, { home });
 }

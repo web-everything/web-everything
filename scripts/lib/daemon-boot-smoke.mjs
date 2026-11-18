@@ -256,11 +256,12 @@ export const strictEnvInteger = (v) => (/^\d+$/.test(String(v ?? '')) ? Number(v
 /** Initial boots are bounded; only native signal deaths get serial retries. */
 export function resolveBootSettings(env = process.env) {
   const r = cascadePolicy('rebuildSmoke', readDeclaredSettings().settings?.rebuildSmoke, {
-    env, standard: { bootSignalRetries: 1, bootConcurrency: 3 },
-    envValues: { bootSignalRetries: strictEnvInteger(env.WE_SMOKE_BOOT_SIGNAL_RETRIES), bootConcurrency: strictEnvInteger(env.WE_SMOKE_BOOT_CONCURRENCY) },
+    env, standard: { bootSignalRetries: 1, bootConcurrency: 3, bootMinChildMs: 10_000 },
+    envValues: { bootMinChildMs: strictEnvInteger(env.WE_SMOKE_BOOT_MIN_CHILD_MS), bootSignalRetries: strictEnvInteger(env.WE_SMOKE_BOOT_SIGNAL_RETRIES), bootConcurrency: strictEnvInteger(env.WE_SMOKE_BOOT_CONCURRENCY) },
     valid: {
       bootSignalRetries: v => Number.isSafeInteger(v) && v >= 0,
       bootConcurrency: v => Number.isSafeInteger(v) && v > 0,
+      bootMinChildMs: v => Number.isSafeInteger(v) && v > 0,
     },
   });
   return { ...r.value, sources: r.sources };
@@ -370,37 +371,54 @@ export function buildEntryBootScript(entry) {
 /** Boot ONE entry in its OWN fresh child — never throws; a child failure (killed, unparsable output) is
  *  reported the same shape as an entry that threw on import, so the caller has one uniform per-entry result.
  *  The result is the allow-listed summary only: raw child output goes to {@link writeStderrTail}'s 0600 file. */
-async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnosticsDir, now }) {
+async function bootOneEntry(entry, { root, timeoutMs, bootMinChildMs, runChild, env, diagnosticsDir, now }) {
+  let startMs = NaN;
   let startedAt = null;
-  try { startedAt = new Date(now()).toISOString(); } catch { /* a bad injected clock: no start time, never a throw */ }
+  try { startMs = now(); startedAt = new Date(startMs).toISOString(); } catch { /* a bad injected clock: no start time, never a throw */ }
+  const elapsed = () => {
+    try {
+      const ms = now() - startMs;
+      return Number.isFinite(ms) && ms >= 0 ? ms : null;
+    } catch { return null; }
+  };
   const keep = (text) => writeStderrTail(text, { dir: diagnosticsDir, label: `boot-${entry}`, now });
   // The culprit attribution (`daemon-rebuild/smoke.mjs#smokeFailureFiles`) reads these typed paths, not the text.
   const filesIn = (text) => sourceFilesIn(text, root).filter(isRepoFile);
+  const importFailure = (parsed, elapsedMs) => {
+    // The boot script joins its stack lines with ' | '.
+    const error = String(parsed?.error ?? '').split(' | ').join('\n');
+    return { entry, ok: false, kind: 'import failed', startedAt, elapsedMs, signal: null, exitCode: null,
+      errorClass: smokeErrorClass(error), files: filesIn(error), stderrFile: keep(error) };
+  };
   let out;
   try {
-    out = await runChild('node', ['--input-type=module', '-e', buildEntryBootScript(entry)], { cwd: root, timeoutMs, env });
+    out = await runChild('node', ['--input-type=module', '-e', buildEntryBootScript(entry)], { cwd: root, timeoutMs, minChildMs: Math.min(timeoutMs, bootMinChildMs), env });
   } catch (e) {
+    const elapsedMs = elapsed();
+    // An import may already have failed while an outstanding timer keeps the child alive until its kill.
+    // Only a complete failure report overrides the child failure; malformed/missing output stays failed.
+    let parsed;
+    try { parsed = JSON.parse(e?.stdout); } catch { /* no complete harness report */ }
+    if (parsed?.ok === false && typeof parsed.error === 'string') return importFailure(parsed, elapsedMs);
     const stderr = String(e?.stderr ?? '');
     // The rebuild's own budget refusal and the bounded child's own kill reasons (never child text): kept verbatim,
     // matched exactly, so a timeout still reads as one.
     const own = BUDGET_REFUSAL.exec(String(e?.message ?? '')) ?? BOUNDED_KILL.exec(String(e?.message ?? ''));
-    return { entry, ok: false, kind: own ? `child failed: ${own[0]}` : 'child failed', startedAt, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
+    return { entry, ok: false, kind: own ? `child failed: ${own[0]}` : 'child failed', timeoutMs, startedAt, elapsedMs, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
       errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(e?.message), files: filesIn(`${stderr}\n${e?.message ?? ''}`),
       stderrFile: keep(stderr || e?.message) };
   }
+  const elapsedMs = elapsed();
   let parsed;
   try {
     parsed = JSON.parse(out);
   } catch {
     // V8's parse message copies raw output with unescaped quotes, so the class is fixed text; the output goes to the file.
-    return { entry, ok: false, kind: 'unparsable child output', startedAt, signal: null, exitCode: null,
+    return { entry, ok: false, kind: 'unparsable child output', startedAt, elapsedMs, signal: null, exitCode: null,
       errorClass: 'SyntaxError: unparsable child output', stderrFile: keep(out) };
   }
-  if (parsed?.ok) return { entry, ok: true, startedAt };
-  // The boot script joins its stack lines with ' | '.
-  const error = String(parsed?.error ?? '').split(' | ').join('\n');
-  return { entry, ok: false, kind: 'import failed', startedAt, signal: null, exitCode: null,
-    errorClass: smokeErrorClass(error), files: filesIn(error), stderrFile: keep(error) };
+  if (parsed?.ok) return { entry, ok: true, startedAt, elapsedMs };
+  return importFailure(parsed, elapsedMs);
 }
 
 const BUDGET_REFUSAL = /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/;
@@ -441,7 +459,7 @@ export async function checkDaemonEntriesBoot({
   }
   const overrideMarker = overridden ? `⚠ WE_SMOKE_DAEMON_ENTRIES override active (${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}, real list bypassed) — ` : '';
   const timeoutMs = budgets.daemonBootMs ?? resolveChildTimeoutMs(env);
-  const options = { root, timeoutMs, runChild, env, diagnosticsDir, now };
+  const options = { root, timeoutMs, bootMinChildMs: settings.bootMinChildMs, runChild, env, diagnosticsDir, now };
   const results = new Array(entries.length);
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(settings.bootConcurrency, entries.length) }, async () => {

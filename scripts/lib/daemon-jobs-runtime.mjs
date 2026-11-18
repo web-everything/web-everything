@@ -22,14 +22,14 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import {
-  DEFAULT_BACKOFF_BASE_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_LAUNCH_GRACE_MS,
+  DEFAULT_BACKOFF_BASE_MS, DEFAULT_FOREIGN_STALE_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_LAUNCH_GRACE_MS,
   SLEEP_GAP_THRESHOLD_MS, admitJobs, classifyJob, detectSleep, markClaimed, markCheckpoint, markFailed,
   markHeartbeat, markLaunching, markQueued, markRequeued, markSpawned, markStepError, markStopped, markSucceeded,
   planReattach, taskDeadlineDecision,
@@ -183,7 +183,83 @@ export function createJobStore(dir) {
       }
       return { records, corrupt };
     },
+    /**
+     * {@link list} without re-reading history. Returns `{ live, done, corrupt, ordered }` (`ordered` is both lists interleaved in `list()`'s order): `live` is every NON-terminal job
+     * record in full (fresh from disk, same objects `list()` would give); `done` is `project(record)` for every
+     * TERMINAL one; `corrupt` is exactly `list().corrupt`. A terminal record is parsed once per process: a cached
+     * projection is reused only while the file's inode, size, mtime and ctime are unchanged, and a record write is
+     * always temp-file + rename (new inode), so a changed record can never be served stale (each file is judged as of its stat, the same per-file, non-atomic view `list()` has as of its read: a write that lands between a file's check and the caller's use is invisible to both, and the next call sees it); a file touched in the last 2 s is never trusted from cache (coarse timestamps). Corrupt or foreign
+     * files are never cached and are re-judged on every call, and a file that vanishes mid-scan is skipped, as in
+     * `list()`. `project` must be pure and return read-only data; `projectKey` names it for the cache.
+     */
+    scan(project, projectKey = 'default', { racyWindowMs = SCAN_RACY_WINDOW_MS } = {}) {
+      return scanJobStore(dir, project, projectKey, racyWindowMs);
+    },
   };
+}
+
+const scanCaches = new Map();
+/** A file younger than this is never trusted from the cache: filesystem timestamps are coarse, so an in-place rewrite inside one tick could keep the same signature. */
+const SCAN_RACY_WINDOW_MS = 2_000;
+function scanJobStore(dir, project, projectKey, racyWindowMs) {
+  const cacheKey = `${dir}\0${projectKey}`;
+  let cache = scanCaches.get(cacheKey);
+  if (!cache) scanCaches.set(cacheKey, cache = new Map());
+  const startedMs = Date.now();
+  const live = [];
+  const done = [];
+  const corrupt = [];
+  const ordered = []; // listing order (sorted filename), live and finished interleaved — what list() would walk
+  const seen = new Set();
+  for (const id of listRunIds(dir)) {
+    const path = runPath(id, dir);
+    let sig = null;
+    let racy = true;
+    try {
+      const st = statSync(path, { bigint: true });
+      sig = `${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+      racy = startedMs - Number(st.mtimeNs / 1_000_000n) < racyWindowMs || startedMs - Number(st.ctimeNs / 1_000_000n) < racyWindowMs;
+    } catch (e) {
+      // Only a confirmed absence skips the record (as tryReadRun's null does); any other stat failure goes to the
+      // read below, which judges it exactly as list() would.
+      if (e && e.code === 'ENOENT') { cache.delete(id); continue; }
+    }
+    seen.add(id);
+    const hit = cache.get(id);
+    if (sig && hit && hit.sig === sig && !racy) { done.push(hit.projected); ordered.push({ id, done: hit.projected }); continue; }
+    cache.delete(id);
+    try {
+      const r = tryReadRun(id, dir); // the signature was taken BEFORE this read, so a newer file only costs a re-read
+      if (!r || !isJobRecord(r)) continue;
+      if (TERMINAL_JOB_STATUSES.includes(r.job.status)) {
+        const projected = project(r);
+        if (sig && !racy) cache.set(id, { sig, projected });
+        done.push(projected);
+        ordered.push({ id, done: projected });
+      } else { live.push(r); ordered.push({ id, live: r }); }
+    } catch {
+      if (!isForeignJson(path)) corrupt.push(id);
+    }
+  }
+  for (const id of cache.keys()) if (!seen.has(id)) cache.delete(id);
+  return { live, done, corrupt, ordered };
+}
+
+/**
+ * {@link createJobStore}'s `scan`, falling back to `list()` for a store without one (test doubles), with the
+ * same `{ live, done, corrupt, ordered }` result.
+ */
+export function scanStore(store, project, projectKey) {
+  if (typeof store.scan === 'function') return store.scan(project, projectKey);
+  const { records, corrupt } = store.list();
+  const live = [];
+  const done = [];
+  const ordered = [];
+  for (const r of records) {
+    if (TERMINAL_JOB_STATUSES.includes(r.job.status)) { const projected = project(r); done.push(projected); ordered.push({ id: r.id, done: projected }); }
+    else { live.push(r); ordered.push({ id: r.id, live: r }); }
+  }
+  return { live, done, corrupt, ordered };
 }
 
 /**
@@ -271,13 +347,11 @@ export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots
   // Housekeeping runs only after the child exists and its pid is durable: a recursive snapshot delete
   // can outlast the tick watchdog, but must never strand a launching record without a spawned child.
   try {
-    const { records, corrupt } = store.list();
+    const { live: records, corrupt } = scanStore(store, () => null, 'live-only');
     // An unreadable record may belong to a live child whose snapshot references are unknown.
     // Fail closed until the record is repaired; the new child is already durably spawned.
     if (corrupt.length > 0) return spawned;
-    const referenced = records
-      .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
-      .flatMap((r) => r.job.snapshotKeys);
+    const referenced = records.flatMap((r) => r.job.snapshotKeys);
     evict({ jobsDir: store.dir, referenced });
   } catch { /* Snapshot cleanup is best-effort; the child is already spawned and recorded. */ }
   return spawned;
@@ -395,6 +469,21 @@ export function reapDeadGroup(handle, {
 }
 
 /**
+ * READ-ONLY confirmation that a handle's process and process group are gone on this machine. For a handle whose
+ * host name is not recognised (a renamed host: the job store is per-machine, so its pid still lives here). Never
+ * signals anything except signal 0. True only on confirmed absence; a live or reused pid, an existing group,
+ * unreadable evidence or an unexpected error all return false so the caller retains its claim.
+ */
+export function confirmHandleAbsent(handle, { readStart = readProcStart, kill = (pid, sig) => process.kill(pid, sig) } = {}) {
+  const h = parseJobHandle(handle);
+  if (!h?.pid) return false;
+  // Any process at the pid is unconfirmed: `ps lstart` is local-time with no zone, so a differing start string
+  // can be the same live owner read under another TZ, not a reused pid.
+  try { if (readStart(h.pid)) return false; } catch { return false; }
+  try { kill(-h.pid, 0); return false; } catch (error) { return error?.code === 'ESRCH'; } // a member of its group lives
+}
+
+/**
  * Tick clock for the sleep rule: each `observe()` compares the wall and monotonic gaps since the last call.
  */
 export function createTickClock({ wallNow = Date.now, monoNow = () => performance.now(), thresholdMs = SLEEP_GAP_THRESHOLD_MS } = {}) {
@@ -448,7 +537,7 @@ function completeTaskResult(r, { at, now, backoffBaseMs }) {
 /**
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
- *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, reapGroup?: Function,
+ *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, foreignStaleMs?: number, reapGroup?: Function,
  *   // reapGroup(handle, cutoff, { requireConfirmedDeath: true }) must return true only for confirmed absence.
  *   releaseTaskClaim?: (record: object) => void, // synchronous, attempt-scoped port; must throw on refusal
  *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
@@ -457,9 +546,11 @@ function completeTaskResult(r, { at, now, backoffBaseMs }) {
 export async function reattachTick({
   store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
+  foreignStaleMs = DEFAULT_FOREIGN_STALE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
   releaseTaskClaim = () => {},
   reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs }),
+  confirmForeignGone = (h) => confirmHandleAbsent(h), // read-only; true only on confirmed absence
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -471,8 +562,17 @@ export async function reattachTick({
   };
   if (slept) log(`daemon-jobs: host slept (wall-vs-monotonic gap ${Math.round(gapMs)}ms) — skipping the staleness check this tick`);
   const actions = [];
-  const confirmTaskGroupGone = (record, state) => {
+  const confirmTaskGroupGone = (record, state, { foreign = false } = {}) => {
     if (!record.job.handle) return true; // unclaimed launch; no process group was recorded
+    if (foreign) {
+      // Stale heartbeat alone is not death: confirm read-only (never signalling) before releasing exclusion.
+      let gone = false;
+      try { gone = confirmForeignGone(record.job.handle) === true; } catch { /* unreadable evidence retains exclusion */ }
+      if (gone) return true;
+      actions.push({ id: record.id, state, action: 'stop-failed' });
+      log(`daemon-jobs: stale foreign owner ${record.id} (${record.job.handle}) is not confirmed gone — retains claim and slot; inspect owner before recovery`);
+      return false;
+    }
     const lastAliveMs = Date.parse(record.job.heartbeatAt ?? record.job.startedAt ?? '');
     try {
       if (reapGroup(record.job.handle, lastAliveMs + staleMs, { requireConfirmedDeath: true }) === true) return true;
@@ -495,16 +595,18 @@ export async function reattachTick({
       }
     };
     const liveness = r.job.handle ? observeOwner() : null;
-    const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, sleepDetected: slept });
+    const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, foreignStaleMs, sleepDetected: slept });
+    // A stale foreign heartbeat permits record recovery, never local PID/group cleanup.
+    const staleForeignDead = liveness === 'foreign' && state === 'dead';
     const taskDeadline = isTask ? taskDeadlineDecision(r, { now }) : null;
     const deadline = isTask ? taskDeadline?.deadlineAt : deadlineAt(r);
     const expired = Number.isFinite(deadline) && now >= deadline && state !== 'terminal' && (isTask || state !== 'foreign');
     const savedResult = r.job.task?.execution?.results?.[r.job.attempts];
-    if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || !expired)) {
-      if (liveness !== 'dead') continue; // publication does not revoke a live/unknown owner
-      if (!confirmTaskGroupGone(r, state)) continue;
+    if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || staleForeignDead || !expired)) {
+      if (liveness !== 'dead' && !staleForeignDead) continue; // publication does not revoke a live/unknown owner
+      if (!confirmTaskGroupGone(r, state, { foreign: staleForeignDead })) continue;
       store.update(r.id, f => {
-        if (!sameGeneration(f, r)) return null;
+        if (!sameGeneration(f, r) || (staleForeignDead && f.job.heartbeatAt !== r.job.heartbeatAt)) return null;
         if (!tryReleaseTaskClaim(f)) return null;
         return completeTaskResult(f, { at: iso(now), now, backoffBaseMs });
       });
@@ -518,8 +620,8 @@ export async function reattachTick({
       : expired ? { type: 'fail', stopFirst: liveness === 'alive',
         reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
         : planReattach(r, state, { kindDef });
-    // Unknown task ownership never enters the unclaimed-launch recovery path.
-    if (isTask && r.job.handle && state !== 'terminal' && liveness !== 'alive' && liveness !== 'dead') {
+    // Unknown ownership retains exclusion; classified stale foreign owners may recover.
+    if (isTask && r.job.handle && state !== 'terminal' && liveness !== 'alive' && liveness !== 'dead' && !staleForeignDead) {
       actions.push({ id: r.id, state, action: 'stop-failed' });
       log(`daemon-jobs: cannot confirm task owner ${r.id} (${r.job.handle}) — retains claim and slot; inspect owner before recovery`);
       continue;
@@ -527,7 +629,7 @@ export async function reattachTick({
     if (plan.type === 'none') continue;
     const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
     let stopped;
-    if (plan.stopFirst) {
+    if (plan.stopFirst && liveness !== 'foreign') {
       const res = await stop(r.job.handle, {
         ...(kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {}),
         ...(isTask ? { requireConfirmedDeath: true } : {}),
@@ -542,14 +644,15 @@ export async function reattachTick({
     }
     // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
     // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
-    if (isTask) {
-      if (!confirmTaskGroupGone(r, state)) continue;
+    if (isTask || staleForeignDead) {
+      // A stale foreign heartbeat is never proof of death, task or not: a still-alive local pid must not be relaunched.
+      if (!confirmTaskGroupGone(r, state, { foreign: staleForeignDead })) continue;
     } else if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) {
       log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     }
     const at = iso(Date.now());
     const written = store.update(r.id, (f) => {
-      if (!sameGeneration(f, r)) return null; // the child claimed or finished since we looked — re-judge next tick
+      if (!sameGeneration(f, r) || (staleForeignDead && f.job.heartbeatAt !== r.job.heartbeatAt)) return null; // the child claimed or finished since we looked — re-judge next tick
       if (isTask) {
         // Synchronous claim port under the record lock: a concurrent finish/new attempt wins.
         if (!tryReleaseTaskClaim(f)) return null;

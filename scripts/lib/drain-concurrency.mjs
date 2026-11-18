@@ -16,6 +16,11 @@ export function canParallelEnqueue(c, { enqueues = false, numbering = false, may
   return enqueues && !numbering && !mayRefresh && !coupled && !c.rebaseDrop;
 }
 
+/** An approved-head hold avoids rebasing; pending cards still need numbering before enqueue. */
+export function shouldPrepareBranchBeforeEnqueue({ required, enqueues }) {
+  return Boolean(required && enqueues);
+}
+
 /** Skip branch preparation only when the entire pinned tree is proven free of pending cards. A miss stays serial. */
 export function createBranchPreparationRequired({ enabled, serial, readFiles, hasPendingCards }) {
   const memo = new Map();

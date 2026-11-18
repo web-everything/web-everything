@@ -15,11 +15,11 @@
 - 105. Claim Ignores Git State — backlog ownership=status:active NOT the working tree; uncommitted edits never a drop-reason
 - 148. Worker Model Routing — Sonnet default; Opus = design of hard stuff only and delegates execution; never Fable; never hand-set the model; fix limiting operations on the prototype
 - 149. Operation Limit Fixed On The Prototype — an operation with a limitation is fixed on the prototype, never worked around in private notes
+- 152. New Work Gets Placed, Not Started — triage operator points into priorities + propose a slot; only blockers start now ([[new-work-gets-placed-not-started]])
 
 <!-- categories: everything else, recall-gated — open the sub-index whose keywords match the task -->
 - **[Constellation & Placement](index-arch.md)** — placement · WE/FUI/Plateau · boundary · contract · impl · home · migration (21 rules)
 - **[Standards · Intents · Protocols · Authoring](index-std.md)** — standard · intent · protocol · adapter · authoring · dimension · native-first (23 rules)
-- **[Monetization](index-monetization.md)** — pricing · open-core · license · free/paid · cost↔revenue · on-device · assembler line (5 rules)
 - **[Backlog Workflow & Item State](index-back.md)** — backlog · item state · resolve · slice · park · epic · NNN · locus (22 rules)
 - **[Decisions & Forks](index-dec.md)** — decision · fork · ratify · prepare · merit · confidence · residual (24 rules)
 - **[Verification & Proof](index-verif.md)** — verify · prove · probe · grounding · closure · evidence (8 rules)

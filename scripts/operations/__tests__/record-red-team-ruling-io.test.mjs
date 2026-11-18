@@ -296,6 +296,7 @@ describe('existing-card IO', () => {
     expect(labelSyncs).toEqual([{ repo, pr: PR, head: HEAD }]);
     expect(warnings).toEqual([`red-team-status-label-miss: ${repo}#${PR}: label service unavailable`]);
   });
+  // Cold TypeScript import + IO parsing exceed 5s under Forge self-hosted parallel load (run 40944695769, shard 4).
   it('operation IO rulableBreaks and liveResultGateState call sites pass standing-ruling scope explicitly', async () => {
     const { default: ts } = await import('typescript');
     const dir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -324,7 +325,7 @@ describe('existing-card IO', () => {
     }
     expect(calls.length).toBeGreaterThan(0);
     expect(missingScope).toEqual([]);
-  });
+  }, 60_000);
   it('pre-write refuses every selected break when only part of the selection is still held', () => {
     const findings = [1, 2].map(n => ({ summary: `confirmed break ${n}`, category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }));
     const initial = [redTeam(HEAD, findings), capped()];
@@ -356,18 +357,19 @@ describe('existing-card IO', () => {
     expect(f.labelSyncs).toHaveLength(1);
   });
   it('reader and sink default to the production standing-ruling scope verifier', async () => {
+    const env = { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' };
     const comments = standingThread();
     const scope = verifiedScope({ repo, pr: { number: PR, headRefOid: HEAD, comments } });
     const { vi } = await import('vitest');
     const spy = vi.spyOn(await import('../../conveyor/standing-ruling-io.mjs'), 'standingRulingScope').mockReturnValue(scope);
     try {
       const readThread = () => ({ headRefOid: HEAD, labels: [], comments });
-      const context = createRecordRedTeamRulingReader({ assertFresh: () => {}, readThread,
+      const context = createRecordRedTeamRulingReader({ env, assertFresh: () => {}, readThread,
         resolveIdentity: () => OP, resolveCard: () => card, readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }) })(input());
       expect(context.standingRuling).toBe(scope);
       expect(() => planRedTeamRuling(context, input())).toThrow(/no red-team break is held/);
       const posted = [];
-      const sinks = createRecordRedTeamRulingSinks({ readThread, resolveIdentity: () => OP, post: (...args) => posted.push(args) });
+      const sinks = createRecordRedTeamRulingSinks({ env, readThread, resolveIdentity: () => OP, post: (...args) => posted.push(args) });
       expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no red-team break is held.*nothing written/);
       expect(posted).toEqual([]);
       expect(spy).toHaveBeenCalledTimes(2);
@@ -547,6 +549,7 @@ describe('standalone CLI', () => {
     const { createMemoryCallLogStore } = await import('../call-log-store.mjs');
     const f = fake({ initial: standingThread(lateCap) });
     const entry = () => ({ declaration: recordRedTeamRulingOperation({ readRulingContext: createRecordRedTeamRulingReader({
+      env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' },
       assertFresh: () => {}, readThread: () => ({ headRefOid: HEAD, comments: f.comments }),
       readStandingRulingScope: verifiedScope,
       readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), resolveIdentity: () => OP, resolveCard: () => card,

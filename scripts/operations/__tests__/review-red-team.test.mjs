@@ -9,7 +9,9 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertLaneCwd, buildJudgeArgv, deriveSessionId } from '../../lib/judge-spawn.mjs';
-import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
+import { classAction } from '../../lib/finding-class-policy.mjs';
+import { normalizeFinding, foldRedTeamVerdict } from '../../lib/jury-core.mjs';
+import { parseRedTeamComment, planRedTeamActions, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { scrubPublish } from '../../lib/secret-scrub.mjs';
 
 import {
@@ -88,6 +90,43 @@ function fakeIo(over = {}) {
   };
   return { io, calls, rows, trials };
 }
+
+describe('failed red-team executions (#6096)', () => {
+  it.each(['quota', 'daily cap'])('a failed seat still defers another call under its %s', async limit => {
+    const { io, rows, calls } = fakeIo({ cliAvailable: provider => provider === 'codex',
+      runSeat: async () => limit === 'quota'
+        ? { report: { quotaState: 'exhausted', quotaResetsAt: NOW + 60 * 60_000 }, error: 'quota exhausted' }
+        : { report: null, error: 'provider unavailable' } });
+    io.readRecords = () => rows;
+    const append = io.append;
+    io.append = row => append({ ...row, scoredAt: new Date(NOW).toISOString() });
+    const input = { pr: 5, repo: REPO, loopPayload: payload('accept'),
+      env: { WE_REVIEW_SEAT_CAP_CODEX: limit === 'daily cap' ? '1' : '100' } };
+    expect((await runRedTeam(input, io)).status).toBe('failed');
+    const result = await runRedTeam(input, io);
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain(limit === 'quota' ? 'quota exhausted' : 'daily-cap:');
+    expect(calls.filter(call => call[0] === 'reserve')).toHaveLength(1);
+    expect(rows).toHaveLength(1);
+  });
+
+  it.each([
+    [{ report: null, error: 'provider unavailable' }, 'error', 'provider unavailable'],
+    [{ report: null, timedOut: true }, 'timeout', 'seat call hit its wall'],
+    [{ report: { quotaState: 'exhausted' }, error: 'quota exhausted' }, 'quota-exhausted', 'quota exhausted'],
+  ])('returns failed with the seat reason and retains budget evidence: %s', async (run, status, reason) => {
+    const redTeamStatus = vi.fn();
+    const { io, rows, calls, trials } = fakeIo({ redTeamStatus, runSeat: async () => run });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, io);
+    expect(result).toMatchObject({ status: 'failed', reason, foldedVerdict: 'needs-human', rowsWritten: 1 });
+    expect(redTeamStatus).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'finished', result: 'failed' }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status, error: reason, rev: REV });
+    expect(result.findings).toEqual([]);
+    expect(trials).toEqual([]);
+    expect(calls.some(c => ['post', 'recheck'].includes(c[0]))).toBe(false);
+  });
+});
 
 describe('speculative red-team repository isolation', () => {
   it.each([REPO, 'other/repo', undefined])('only a clean row from the target repository supersedes a pass: %s', async rowRepo => {
@@ -873,5 +912,81 @@ describe('red-team scheduling status', () => {
     const out = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
     expect(out).toMatchObject({ status: 'skipped', reason: 'red team skipped: card-only' });
     expect(redTeamStatus).not.toHaveBeenCalled();
+  });
+});
+
+
+it('reloads red-team routing each pass, enables unset Gemini, preserves explicit zero, and restores disable on clear', async () => {
+  const { createRoutingPolicyReader } = await import('../../lib/dispatch-routing-policy-io.mjs');
+  const { DEFAULT_ROUTING_POLICY, resolveOperationRoute: pureRoute } = await import('../../lib/dispatch-routing-policy.mjs');
+  let overrides = { 'review-seat:red-team': { provider: 'agy-gemini', model: 'pro', disabledProviders: ['codex', 'agy-claude'] } };
+  const reader = createRoutingPolicyReader({ read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+    preferences: () => ({ prefs: { routingOverrides: overrides }, errors: [] }), emit: () => true });
+  resolveOperationRoute.mockImplementation(pureRoute);
+  try {
+    const env = {};
+    const first = fakeIo({ readRoutingPolicy: reader });
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: payload('accept').findings.read, env }, first.io);
+    expect(pass.status).toBe('speculated');
+    expect(first.calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-4-argon-high' });
+    const capped = fakeIo({ readRoutingPolicy: reader });
+    expect((await speculateRedTeam({ pr: 8, repo: REPO, read: payload('accept').findings.read,
+      env: { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } }, capped.io)).status).toBe('skipped');
+    expect(capped.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
+    overrides = {};
+    const cleared = fakeIo({ readRoutingPolicy: reader, cliAvailable: p => p === 'agy-gemini' });
+    const result = await speculateRedTeam({ pr: 6, repo: REPO, read: payload('accept').findings.read, env }, cleared.io);
+    expect(result.status).toBe('skipped');
+    expect(cleared.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
+    overrides = { 'review-seat:red-team': { enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'] } };
+    const enabled = fakeIo({ readRoutingPolicy: reader });
+    expect((await speculateRedTeam({ pr: 7, repo: REPO, read: payload('accept').findings.read, env }, enabled.io)).status).toBe('speculated');
+    expect(enabled.calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
+  } finally { resolveOperationRoute.mockReturnValue(null); }
+});
+
+
+describe('security classification policy transitions', () => {
+  it.each([
+    ['correctness-in-normal-use', 'security-reachable-today', {}],
+    ['security-reachable-today', 'correctness-in-normal-use', { 'security-reachable-today': 'defer-card', allowSecurityDefer: true }],
+  ])('retains security from either reviewer through persistence and replay after policy changes: %s → %s', async (original, rechecked, initialPolicy) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-security-policy-'));
+    const path = join(dir, 'operator.json');
+    const previous = process.env.WE_PLATFORM_PREFERENCES_FILE;
+    process.env.WE_PLATFORM_PREFERENCES_FILE = path;
+    const save = findingClasses => writeFileSync(path, JSON.stringify({ findingClasses }));
+    try {
+      save(initialPolicy);
+      const { io, rows } = fakeIo({
+        runSeat: seatSays([{ ...BREAK, findingClass: original, classBasis: 'original evidence' }]),
+        runRecheck: async () => ({ checks: [{ index: 0, confirmed: true, reason: 'demonstrated break',
+          findingClass: rechecked, classBasis: 'independent evidence', filesRead: ['x.mjs'], unverifiable: false }] }),
+      });
+      const input = { pr: 5, repo: REPO, loopPayload: payload('accept'), env: { WE_PLATFORM_PREFERENCES_FILE: path } };
+      expect((await runRedTeam(input, io)).status).toBe('ran');
+      const stored = JSON.parse(JSON.stringify(rows.find(row => row.seat === 'red-team')));
+      expect(stored.findings[0].findingClass).toBe('correctness-in-normal-use');
+      const policy = { 'correctness-in-normal-use': 'defer-card', 'security-reachable-today': 'defer-card' };
+      save(policy);
+      io.readRecords = () => [stored];
+      io.runSeat = io.runRecheck = () => { throw Error('replay must not call a model'); };
+      const replay = await runRedTeam(input, io);
+      expect(replay.status).toBe('resumed');
+      expect(classAction(normalizeFinding(stored.findings[0]), policy)).toBe('fix-now');
+      const parsed = parseRedTeamComment(replay.comment.body);
+      expect(classAction(parsed.findings[0], policy)).toBe('fix-now');
+      expect(foldRedTeamVerdict({ ran: true, findings: parsed.findings, findingClasses: policy })).toBe('changes');
+      expect(classAction(parsed.findings[0], { 'correctness-in-normal-use': 'defer-card', allowSecurityDefer: true })).toBe('fix-now');
+      expect(planRedTeamActions(parsed, { broken: 'send-back', findingClasses: policy }).sendBack).toHaveLength(1);
+      const withoutSecurity = structuredClone(parsed);
+      delete withoutSecurity.findings[0].securityReachableToday;
+      expect(redTeamResultId(parsed)).not.toBe(redTeamResultId(withoutSecurity));
+      expect(classAction(parsed.findings[0], { ...policy, allowSecurityDefer: true })).toBe('defer-card');
+    } finally {
+      if (previous === undefined) delete process.env.WE_PLATFORM_PREFERENCES_FILE;
+      else process.env.WE_PLATFORM_PREFERENCES_FILE = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

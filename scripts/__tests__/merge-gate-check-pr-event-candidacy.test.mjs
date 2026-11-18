@@ -15,6 +15,7 @@ const base = () => ({
   bodyHistory: { bodies: ['A real body'], complete: true },
   duplicateIds: { main: [] },
   redMain: { source: 'ops/red-main', frozen: false },
+  redTeamCheck: { ok: true, reason: 'red-team check run succeeded for this PR on head' },
   enqueueClearance: null,
   ledger: { authority: 'labels', folded: null, derived: null },
   pinnedHead: { sha: HEAD },

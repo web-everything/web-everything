@@ -567,6 +567,7 @@ export function writeInfraStore(store, path = resolveInfraStorePath()) {
  * slow IO (e.g. a blocking `pr-land`) while holding it. Returns `fn()`'s result.
  * Set `requireLock` to refuse an unlocked fallback write when preserving concurrent updates is required.
  */
+const lockWaitCell = new Int32Array(new SharedArrayBuffer(4));
 export function withInfraLock(path, fn, { staleMs = 15_000, timeoutMs = 5_000, requireLock = false } = {}) {
   const lockPath = `${path}.lock`;
   mkdirSync(dirname(path), { recursive: true });
@@ -583,10 +584,16 @@ export function withInfraLock(path, fn, { staleMs = 15_000, timeoutMs = 5_000, r
       if (e && e.code !== 'EEXIST') { break; } // unexpected fs error → proceed unlocked (never fail a tick)
       // A holder exists — steal a STALE lock, else spin briefly, else give up (proceed unlocked).
       let age = Infinity;
-      try { age = Date.now() - statSync(lockPath).mtimeMs; } catch { age = Infinity; }
+      try { age = Date.now() - statSync(lockPath).mtimeMs; } catch (statErr) {
+        // The holder released between our failed create and this stat: there is nothing to steal. Retry the
+        // create — unlinking here would delete a lock a THIRD process has just taken and break mutual exclusion.
+        if (statErr && statErr.code === 'ENOENT') continue;
+      }
       if (age > staleMs) { try { unlinkSync(lockPath); } catch { /* someone else stole it */ } continue; }
       if (Date.now() - start > timeoutMs) break; // give up waiting — degrade to best-effort
-      const spinUntil = Date.now() + 8; while (Date.now() < spinUntil) { /* brief busy-wait — sections are µs */ }
+      // Sleep (don't spin): a busy-wait burns the CPU the lock HOLDER needs, so on a loaded/small runner several
+      // waiters starve the holder until the wait budget runs out (red main @ 7974d7119 — 8 waiters, 5s timeout).
+      Atomics.wait(lockWaitCell, 0, 0, 8);
     }
   }
   if (requireLock && !held) throw new Error(`could not acquire store lock: ${lockPath}`);

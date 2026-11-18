@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -21,6 +22,11 @@ import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conve
  * step that needs the network or the lane pool — acquire the lane at the PR's head ref, push, re-arm, release — and
  * the agent only edits files in the lane. A preamble on the brief says so. Antigravity runs Gemini in the existing lane; the launcher owns commits and pushes.
  */
+import { fixPushGate } from '../lib/review-timing.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
+import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { markFixPushAwaitingCi } from '../conveyor/fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
@@ -39,6 +45,10 @@ import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
+import { buildFixEvidenceComment, sendBackItems, renderRequiredCitations } from '../lib/fix-evidence-post.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
 // `dispatch-lane-io.mjs` -> `dispatch-provider-registry.mjs`, so a static import here is a cycle that makes the
@@ -64,9 +74,9 @@ const pendingRearmDir = () => join(homedir(), '.claude', 'conveyor', 'fix-run-pe
 const pendingKey = (repo, pr) => `${String(repo ?? 'we').replace(/[^\w.-]/g, '_')}-${String(pr).replace(/[^\w.-]/g, '_')}.json`;
 
 /**
- * A repair that is PUSHED but not yet re-armed (the re-arm call failed): the next launch of the same PR opens its lane
- * at that pushed tip, sees no new commit, and would otherwise skip the re-arm for good. This records "owed" durably
- * between the two steps so a no-change retry can finish the hand-back. Default = a file under `~/.claude/conveyor`.
+ * A pushed repair or published no-change evidence can still owe a re-arm. Record the debt before the external
+ * effect so retries can finish the hand-back. Evidence markers require a fresh closed-send-back check on recovery;
+ * legacy markers without a kind retain push recovery. Default = a file under `~/.claude/conveyor`.
  */
 export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
   read(repo, pr, now = Date.now()) {
@@ -75,9 +85,9 @@ export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
       return v && typeof v.sha === 'string' && now - Number(v.at) < PENDING_REARM_MAX_AGE_MS ? v : null;
     } catch { return null; }
   },
-  write(repo, pr, sha, now = Date.now()) {
+  write(repo, pr, sha, now = Date.now(), kind = 'push') {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now }), { mode: 0o600 });
+    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, kind }), { mode: 0o600 });
   },
   clear(repo, pr) { try { unlinkSync(join(dir, pendingKey(repo, pr))); } catch { /* already gone */ } },
 });
@@ -124,12 +134,16 @@ export const SANDBOX_PREAMBLE = [
   'already done for you: take the latest changes-requested (or advisory) comment in that section as the authoritative ask.',
   'The sandbox forbids ALL `.git` writes. Edit files only; do NOT run git add, commit, merge, checkout, reset, stash or rebase.',
   'You may write a commit message to .fix-commit-msg.txt. The launcher stages, commits, pushes and re-arms review after you exit.',
+  'Write your fix evidence to .fix-evidence.md at the lane root (gitignored), including for each open operator send-back item a line: - send-back <id> item <n>: <file:line>. Cite tests by file:line too (e.g. scripts/x/__tests__/y.test.mjs:24).',
   '',
   '---',
   '',
 ].join('\n');
 
-const sh = (cmd, args, opts) => String(execFileSync(cmd, args, { encoding: 'utf8', ...opts }) ?? '');
+const sh = (cmd, args, opts) => {
+  const output = execFileSync(cmd, args, { encoding: 'utf8', ...opts });
+  return opts?.encoding === null ? output : String(output ?? '');
+};
 
 
 const singleLine = (text) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
@@ -614,6 +628,11 @@ export async function runFixCli(argv = [], {
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
   readCiHeal = readCiHealInputs,
+  timingPolicy = resolveTimingPolicy().fix,
+  readChecks = readReviewChecks,
+  readRequired = getRequiredStatusChecks,
+  sleep = delay,
+  clock = Date.now,
   appendLoopRow = appendFixLoopRow,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
@@ -622,6 +641,13 @@ export async function runFixCli(argv = [], {
   renewLease = defaultRenewLease,
   heartbeatMs = 60_000,
   readFile = readLaneFileSafe,
+  persistEvidence = ({ repoKey, pr, text }) => {
+    const dir = join(resolveCoordinationRoot(), 'fix-evidence');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${repoKey}-${pr}.md`);
+    writeFileSync(file, text, { mode: 0o600 });
+    nodeFs.chmodSync(file, 0o600);
+  },
   stageEntry = laneStageEntry,
   fileExists = existsSync,
   weRoot = REPO_ROOT,
@@ -689,7 +715,7 @@ export async function runFixCli(argv = [], {
   const { pr, sessionSlug, ref } = launch;
   write(`fix-run: starting borrowed repair of PR #${pr} (session ${sessionSlug}, provider ${launch.provider}) - pid ${process.pid}\n`);
   try {
-    const brief = readPrompt(launch.promptFile);
+    const brief = assertBriefTaskContent(readPrompt(launch.promptFile));
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
     const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
     prHeadSha = prHead.headRefOid ?? null;
@@ -700,6 +726,7 @@ export async function runFixCli(argv = [], {
     if (mergeOnto && !target) throw new LauncherError('cannot resolve PR base for conflict merge');
     if (mergeConflictingBase) write(`fix-run: PR #${pr} conflicts with ${target}; launcher merges origin/${target} first\n`);
     let prContext;
+    let openSendBacks = [];
     let repeatPlan = { action: 'patch' };
     if (launch.repairKind === 'ci-heal') {
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
@@ -707,6 +734,7 @@ export async function runFixCli(argv = [], {
       prContext = renderCiHealContext(inputs);
     } else {
       const comments = await readComments(pr, { repo: launch.repo });
+      openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
       for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
       repeatPlan = repeatedFindingPlan(comments, { enabled: safety.value.resetOnRepeatedFinding });
@@ -718,6 +746,47 @@ export async function runFixCli(argv = [], {
       prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
         : renderPrContext({ ...prHead, comments });
+    }
+    // Wait before the repair so failures from the previous head can join the same agent run and push.
+    // The push boundary below reuses this deadline rather than starting a second wait budget.
+    let firstHeldAt;
+    let previousChecks;
+    let previousRequired;
+    let lastChecksAt;
+    let completedPushReadiness;
+    const awaitPreviousCi = async () => {
+      if (!timingPolicy.pushAfterCi) return { action: 'push', reason: 'off' };
+      if (completedPushReadiness) return completedPushReadiness;
+      firstHeldAt ??= clock();
+      if (previousRequired === undefined) {
+        try { previousRequired = readRequired({ repo: launch.repo })?.checks ?? null; }
+        catch { previousRequired = null; }
+      }
+      for (;;) {
+        const now = clock();
+        // The bound releases even when evidence is unreadable; never reset it after a poll or agent run.
+        const bound = fixPushGate({ previousHeadChecks: null, requiredChecks: previousRequired, firstHeldAt, now, policy: timingPolicy });
+        if (bound.action === 'push') {
+          write('fix-run: previous-head CI wait bound elapsed; pushing available repair after safety checks\n');
+          return bound;
+        }
+        if (lastChecksAt !== undefined && now - lastChecksAt < 30_000) await sleep(30_000 - (now - lastChecksAt));
+        if (clock() >= bound.deadline) continue;
+        lastChecksAt = clock();
+        try { previousChecks = await readChecks({ repo: launch.repo, headSha: prHeadSha }); }
+        catch { previousChecks = null; }
+        const decision = fixPushGate({ previousHeadChecks: previousChecks, requiredChecks: previousRequired,
+          firstHeldAt, now: clock(), policy: timingPolicy });
+        if (decision.action === 'push') {
+          if (decision.reason === 'ci-complete') completedPushReadiness = decision;
+          return decision;
+        }
+        write(`fix-run: waiting for previous-head CI until ${decision.deadline}ms epoch; bound fallback is push\n`);
+      }
+    };
+    const pushReadiness = timingPolicy.pushAfterCi ? await awaitPreviousCi() : null;
+    if (pushReadiness?.ciFailures?.length) {
+      prContext += `\n## Previous-head CI failures (same repair)\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(pushReadiness.ciFailures))}\n`;
     }
     const acquireWait = resolveAcquireWaitPolicy();
     write(`fix-run: lane acquire wait ${acquireWait.ms}ms (${acquireWait.source})\n`);
@@ -746,10 +815,7 @@ export async function runFixCli(argv = [], {
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
     before = checkLane(prHeadSha).laneHead;
-    const rearm = head => {
-      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
-      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
-      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
+    const rearmReview = () => {
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
       } catch (e) {
@@ -761,13 +827,26 @@ export async function runFixCli(argv = [], {
         throw e;
       }
     };
-    // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
-    // now, before spending a whole agent run on it.
-    if (pendingRearm.read(launch.repo, pr)?.sha === before) {
-      rearm(before);
+    const rearm = head => {
+      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
+      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
+      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
+      return rearmReview();
+    };
+    // Recover only at the recorded tip. An evidence marker precedes publication, so it alone cannot prove that
+    // publication succeeded: unresolved requests must go through the agent/evidence path again.
+    const pending = pendingRearm.read(launch.repo, pr);
+    const pendingEvidence = pending?.kind === 'evidence';
+    const recoverPending = pending?.sha === before && (!pendingEvidence || !openOperatorSendBacks({
+      comments: await readComments(pr, { repo: launch.repo }), headRefOid: prHeadSha,
+    }).length);
+    if (recoverPending) {
+      if (pendingEvidence) rearmReview();
+      else rearm(before);
       pendingRearm.clear(launch.repo, pr);
-      const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
-      outcome = FIX_RUN_OUTCOME.PUSHED; reason = 'finished an earlier push';
+      const result = `PR #${pr} (${pendingEvidence ? 'evidence already posted for' : 'already pushed'} ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
+      outcome = pendingEvidence ? FIX_RUN_OUTCOME.NO_CHANGE : FIX_RUN_OUTCOME.PUSHED;
+      reason = pendingEvidence ? 'finished an earlier evidence re-arm' : 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
     }
@@ -843,6 +922,50 @@ export async function runFixCli(argv = [], {
       .filter(m => m && OID_RE.test(m[2]) && m[4] === path)
       .map(m => ({ mode: m[1], oid: m[2], stage: m[3] }));
     let preparedHead = before;
+    // Keep Git's marker allocation bounded (2.43 overflows its int parser on e.g. 99999999999).
+    // Oversized attributes use the normal width 7; preserve the tracked attributes and restore local overrides.
+    const MAX_MARKER_SIZE = 1024;
+    const boundedMarkerPaths = new Set();
+    const mergeWithBoundedMarkers = (target) => {
+      const inspect = (args, input) => {
+        // Decode only after checking round-trip fidelity. Replacement decoding could target a different path,
+        // and downstream conflict handling also needs UTF-8 paths. Refuse unsupported names before merging.
+        const bytes = Buffer.from(run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv, input, encoding: null, maxBuffer: BLOB_MAX_BYTES }));
+        const text = bytes.toString('utf8');
+        if (!Buffer.from(text).equals(bytes)) throw new LauncherError('cannot bound conflict markers: non-UTF-8 path bytes; rename these paths to UTF-8 before retrying');
+        return text;
+      };
+      const paths = [...new Set((inspect(['ls-tree', '-r', '--name-only', '-z', 'HEAD']) + inspect(['ls-tree', '-r', '--name-only', '-z', `origin/${target}`])).split('\0').filter(Boolean))];
+      // Repository-sized path lists exceed ARG_MAX; keep argv fixed and preserve every path byte through NUL stdin.
+      const input = paths.join('\0') + '\0';
+      if (paths.length) for (const source of [[], [`--source=origin/${target}`]]) {
+        const attrs = inspect(['check-attr', ...source, '-z', '--stdin', 'conflict-marker-size'], input).split('\0');
+        for (let i = 0; i + 2 < attrs.length; i += 3) if (Math.abs(Number.parseInt(attrs[i + 2], 10)) > MAX_MARKER_SIZE) boundedMarkerPaths.add(attrs[i]);
+      }
+      if (!boundedMarkerPaths.size) return git('merge', '--no-commit', '--no-ff', `origin/${target}`);
+      const path = resolve(lanePath, git('rev-parse', '--git-path', 'info/attributes').trim());
+      let original = null;
+      try {
+        const stat = nodeFs.lstatSync(path);
+        if (!stat.isFile() || stat.nlink !== 1) throw new LauncherError('cannot bound conflict markers: info/attributes must be a single-link regular file; restore it before retrying');
+        original = readFileSync(path);
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      // C-quote bytes and escape glob metacharacters: even whitespace/newline/glob-bearing paths match literally.
+      const rules = [...boundedMarkerPaths].map(p => {
+        const literal = '/' + p.replace(/[\\*?\[\]]/g, '\\$&');
+        const rule = '"' + [...Buffer.from(literal)].map(b => '\\' + b.toString(8).padStart(3, '0')).join('') + '" conflict-marker-size=7\n';
+        // Git 2.43 ignores attribute lines at its 2048-byte buffer limit. Never let a safety rule be ignored.
+        if (Buffer.byteLength(rule) >= 2048) throw new LauncherError('cannot bound conflict markers: literal override exceeds Git attribute line limit; shorten paths or reduce conflict-marker-size before retrying');
+        return rule;
+      }).join('');
+      write(`fix-run: conflict-marker-size exceeds ${MAX_MARKER_SIZE} in ${boundedMarkerPaths.size} path(s); using width 7 for this merge\n`);
+      try {
+        writeFileSync(path, Buffer.concat([original ?? Buffer.alloc(0), Buffer.from('\n' + rules)]));
+        return git('merge', '--no-commit', '--no-ff', `origin/${target}`);
+      } finally {
+        if (original === null) rmSync(path); else writeFileSync(path, original);
+      }
+    };
     let unmerged = [];
     let mergePrompt = '';
     if (target) {
@@ -861,7 +984,7 @@ export async function runFixCli(argv = [], {
         git('merge', '--abort');
       };
       checkLane(before, false);
-      try { git('merge', '--no-commit', '--no-ff', `origin/${target}`); }
+      try { mergeWithBoundedMarkers(target); }
       catch (e) {
         const conflicts = unmergedPaths(git('status', '--porcelain=v1', '-z'));
         if (!inMerge() || !conflicts.length) throw e;
@@ -891,12 +1014,13 @@ export async function runFixCli(argv = [], {
       for (let i = 0; i + 2 < attrs.length; i += 3) {
         const sizes = attrSizes.get(attrs[i]);
         if (!sizes) continue;
-        if (/^[1-9]\d{0,8}$/.test(attrs[i + 2])) { sizes.add(Number(attrs[i + 2])); continue; }
+        if (boundedMarkerPaths.has(attrs[i])) sizes.add(7);
+        if (/^[1-9]\d{0,8}$/.test(attrs[i + 2]) && Number(attrs[i + 2]) <= MAX_MARKER_SIZE) { sizes.add(Number(attrs[i + 2])); continue; }
         // Anything else (unspecified, `+10`, `10x`, an out-of-range number): git's own parse may give 7 or the leading
         // number, so scan for both rather than guess.
         sizes.add(7);
         const lead = Number.parseInt(attrs[i + 2], 10);
-        if (lead > 0 && lead < 2 ** 31) sizes.add(lead);
+        if (lead > 0 && lead <= MAX_MARKER_SIZE) sizes.add(lead);
       }
     }
     const markerSizes = new Map(unmerged.map(path => {
@@ -937,9 +1061,11 @@ export async function runFixCli(argv = [], {
       try {
         spawned = await provider.spawn({
           taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
-          sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
+          sessionId: undefined, prompt: renderNoPromptCommandRules(mergePrompt + (launch.repairKind === 'ci-heal'
             ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
-            : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+            : SANDBOX_PREAMBLE) + (openSendBacks.length
+            ? `## Required fix-evidence citations\nCopy these keys into .fix-evidence.md and replace each <file:line> with a changed, tracked file and its line at HEAD.\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', renderRequiredCitations(openSendBacks))}\n\n`
+            : '') + prContext + brief, launch.repairKind === 'ci-heal' ? 'ci-heal' : 'fix'), lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
           ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
         }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
           spawnAgent: async (...args) => {
@@ -1000,11 +1126,69 @@ export async function runFixCli(argv = [], {
       withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file));
     }
     const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
+    let evidenceText = null, evidencePersisted = false;
+    try { evidenceText = readFile(join(lanePath, '.fix-evidence.md'), lanePath); }
+    catch (e) { writeErr(`fix-run: could not read fix evidence: ${singleLine(e?.message ?? e)}\n`); }
+    if (evidenceText != null) {
+      const repoKey = String(launch.claimRepo ?? launch.repo ?? 'we').replace(/[^\w.-]/g, '_');
+      try { await persistEvidence({ repoKey, pr, text: evidenceText }); evidencePersisted = true; }
+      catch (e) { writeErr(`fix-run: could not persist fix evidence: ${singleLine(e?.message ?? e)}\n`); }
+    }
+    const allItems = () => openSendBacks.flatMap(item => sendBackItems(item).map(({ n }) => `${item.id}#${n}`));
+    const baseRef = String(prHead.baseRefName ?? '').trim();
+    let changedAtHead = null;
+    const verifyCitation = ({ path, line }) => {
+      try {
+        if (!baseRef) return false;
+        if (changedAtHead === null) {
+          const mergeBase = git('merge-base', `origin/${baseRef}`, 'HEAD').trim();
+          if (!OID_RE.test(mergeBase)) return false;
+          changedAtHead = new Set(git('diff', '--name-only', '-z', `${mergeBase}..HEAD`).split('\0').filter(Boolean));
+        }
+        if (!changedAtHead.has(path)) return false;
+        const entry = /^(\d{6}) blob ([0-9a-f]+)\t([^\0]+)\0$/.exec(git('ls-tree', '-z', 'HEAD', '--', path));
+        if (!entry || !REGULAR_MODES.has(entry[1]) || !OID_RE.test(entry[2]) || entry[3] !== path) return false;
+        const text = blob(`HEAD:${path}`);
+        const lineCount = text ? text.split('\n').length - Number(text.endsWith('\n')) : 0;
+        return line >= 1 && line <= lineCount;
+      } catch { return false; }
+    };
+    const postEvidence = async head => {
+      if (launch.repairKind === 'ci-heal') return { posted: false, missing: [] };
+      try {
+        const comments = await readComments(pr, { repo: launch.repo });
+        openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
+        if (evidenceText != null && !evidencePersisted) return { posted: false, missing: allItems(), reason: 'fix evidence persistence failed' };
+        if (!openSendBacks.length) return { posted: false, missing: [] };
+        if (!evidenceText) return { posted: false, missing: allItems() };
+        const evidence = buildFixEvidenceComment({ openSendBacks, evidenceText, head, verifyCitation });
+        if (!evidence.ok) return { posted: false, missing: evidence.missing };
+        // Fail closed if the debt cannot be saved. Posting can close the last request, removing the retry trigger.
+        if (after === before) pendingRearm.write(launch.repo, pr, head, Date.now(), 'evidence');
+        withMessageFile(evidence.body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+        return { posted: true, missing: [] };
+      } catch (e) {
+        writeErr(`fix-run: could not post fix evidence: ${singleLine(e?.message ?? e)}\n`);
+        return { posted: false, missing: allItems(), reason: 'fix evidence comment read or post failed' };
+      }
+    };
     let result;
     if (after === before) {
       outcome = FIX_RUN_OUTCOME.NO_CHANGE; reason = finalMessage || 'agent committed nothing';
-      result = `no-change (${singleLine(reason)}; claim released, PR is re-planned)`;
+      const evidence = await postEvidence(after);
+      if (openSendBacks.length || evidence.reason) {
+        if (evidence.posted) {
+          rearmReview();
+          pendingRearm.clear(launch.repo, pr);
+          reason = `evidence posted for send-back(s) ${openSendBacks.map(item => item.id).join(', ')}; review re-armed: ${finalMessage}`;
+        } else {
+          outcome = FIX_RUN_OUTCOME.NO_CHANGE_UNPROVEN;
+          reason = evidence.reason ?? `missing or unverified fix evidence: ${evidence.missing.join(', ')}`;
+        }
+      }
+      result = `${outcome} (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
+      if (timingPolicy.pushAfterCi) await awaitPreviousCi();
       // Defense in depth (config was already re-checked right after the agent): this push runs outside the sandbox with
       // our credentials, so refuse again if the repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
       // risky, and run the push with the code-running keys pinned inert (env, so no gap after the check) and no hooks.
@@ -1016,6 +1200,7 @@ export async function runFixCli(argv = [], {
       try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
       assertLaneLease({ lanePath, holder, readLease, phase: 'push' });
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
+      await postEvidence(after);
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
       result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;

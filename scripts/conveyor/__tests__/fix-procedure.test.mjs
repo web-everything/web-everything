@@ -430,6 +430,10 @@ describe('planReconcile — a live fix claim refuses every dispatch', () => {
     expect(released.dispatch).toEqual([expect.objectContaining({ prNumber: 2811, kind: 'promote-draft' })]);
   });
 
+  it('R502: enrichPrsWithFixClaims marks a failed claim read as unknown instead of silently absent', () => {
+    const [a] = enrichPrsWithFixClaims([{ number: 5 }], { repo: 'we', readClaim: () => { throw new Error('EACCES'); } });
+    expect(a).toEqual({ number: 5, fixClaimUnknown: true });
+  });
   it('enrichPrsWithFixClaims attaches the claim off the store (and nothing when there is none)', () => {
     acquireFixClaim({ repo: 'we', pr: 2811, who: 'fix-2811', why: 'w', lockRoot: root, nowMs: Date.now() });
     const readClaim = (o) => readLiveFixClaim({ ...o, lockRoot: root });

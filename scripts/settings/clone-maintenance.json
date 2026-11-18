@@ -1,0 +1,4 @@
+{
+  "$comment": "Idle daemon clone git gc. Standard/platform/tool/env cascade; WE_DAEMON_CLONE_MAINTENANCE_INTERVAL_MS overrides intervalMs (0..31536000000). Default 24 hours; failed attempts are also limited. Unreadable stamps block GC: inspect or repair clone-maintenance-<cloneLockKey>.json in WE_DAEMON_STATE_DIR.",
+  "cloneMaintenance": { "intervalMs": 86400000 }
+}

@@ -9,16 +9,16 @@
  * is injected.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import { createWakeObservers } from '../wake.mjs';
 import { createDispatchObservers } from '../dispatch-lane-io.mjs';
 import { createExploreObservers } from '../explore-io.mjs';
 
 import { advanceWhileRunning, runStatus, startRun } from '../engine.mjs';
-import { applyPendingEffects, inFlight, inFlightEntries } from '../effect-executor.mjs';
+import { applyPendingEffects, inFlight, inFlightEntries, notApplied } from '../effect-executor.mjs';
 import { createEffectObserver, observeRun, planObservations, OBSERVATIONS, SKIPS } from '../effect-observer.mjs';
-import { hoursStuck, isParkedOnDispatch, renderPass, stuckPast, wakePass, wakeRun, STUCK_ESCALATION_HOURS } from '../wake.mjs';
+import { hoursStuck, isParkedOnDispatch, isParkedUnsettled, renderPass, stuckPast, wakePass, wakeRun, STUCK_ESCALATION_HOURS } from '../wake.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { createRegistry, op } from '../registry.mjs';
 import { confirm as confirmStep, effect, judge as judgeStep } from '../step-kinds.mjs';
@@ -783,5 +783,234 @@ describe('the observer table the CLI actually runs', () => {
     for (const [key, observer] of Object.entries(createWakeObservers())) {
       expect(typeof observer, `observer for ${key}`).toBe('function');
     }
+  });
+});
+
+// A PERMANENT GUARD REFUSAL AFTER A RESOLVED DISPATCH (PR #6584 red-team). driveRun hands a refusal to advance
+// so the engine settles the run refused; the waker used to exit on outcome.error before advancing, leaving
+// statuses applied/refused with pending still set: awaiting-effect forever, every later wake a no-op.
+describe('wakeRun settles a permanent guard refusal exactly as driveRun does', () => {
+  const REFUSE_OP = 'fx-wake-refuse';
+  const refuseRegistry = () => {
+    const r = createRegistry();
+    r.register(op(REFUSE_OP, {
+      input: { pr: { type: 'number', required: true } },
+      go: effect({
+        reads: ['input.pr'],
+        effects: () => [
+          { type: 'start.build', payload: {}, dispatch: true },
+          { type: 'guard.check', payload: {} },
+        ],
+      }),
+    }));
+    return r;
+  };
+  const sinksFor = (guard) => ({ 'start.build': SINKS['start.build'], 'guard.check': guard });
+  const observers = { 'start.build': async () => ({ status: 'succeeded', result: { exit: 0 } }) };
+  const REFUSAL = 'guard: SELF-CLEAR REFUSED — author cannot clear';
+
+  async function parkedRefuse(guard) {
+    const reg = refuseRegistry();
+    const store = createMemoryRunStore();
+    let run = advanceWhileRunning(startRun({ op: REFUSE_OP, id: 'run-r', input: { pr: 7 }, registry: reg }), { registry: reg });
+    store.write(run);
+    run = (await applyPendingEffects(run, { sinks: sinksFor(guard), store })).run;
+    expect(run.effects[0].status).toBe('in-flight');
+    return { run, store, reg };
+  }
+
+  it('advances to a terminal refused outcome, and a second wake leaves the settled run alone', async () => {
+    const guard = async () => { throw notApplied(REFUSAL); };
+    const { run, store, reg } = await parkedRefuse(guard);
+
+    const report = await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(report.advanced).toBe(true);
+    expect(report.status).toBe('complete');
+    // Not silent: the refusal is reported once so the wake CLI exits non-zero, as driveRun's effect-refused does.
+    expect(report.errors.map((e) => e.error)).toEqual([REFUSAL]);
+    const saved = store.read('run-r');
+    expect(saved.outcome).toBe('refused');
+    expect(saved.pending).toBeNull();
+    expect(saved.effects.map((e) => e.status)).toEqual(['applied', 'refused']);
+
+    const again = await wakeRun(saved, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(again.status).toBe('complete');
+    expect(again.errors).toEqual([]);
+    expect(store.read('run-r').outcome).toBe('refused');
+  });
+
+  it('never re-invokes the refused guard on a later wake', async () => {
+    const guard = vi.fn(async () => { throw notApplied(REFUSAL); });
+    const { run, store, reg } = await parkedRefuse(guard);
+    await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    await wakeRun(store.read('run-r'), { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(guard).toHaveBeenCalledTimes(1);
+  });
+
+  // A REFUSAL PERSISTED BEFORE RUN FINALIZATION (PR #6584 round 2): the process stopped after
+  // `applyPendingEffects` wrote `refused` and before `advance` cleared `pending`. Nothing is in flight and nothing
+  // was observed, so the timer used to skip the record and the run stayed nonterminal indefinitely.
+  describe('a refusal persisted before the run was finalized', () => {
+    const GUARD_OP = 'fx-wake-guard-only';
+    const guardRegistry = () => {
+      const r = createRegistry();
+      r.register(op(GUARD_OP, {
+        input: { pr: { type: 'number', required: true } },
+        go: effect({ reads: ['input.pr'], effects: () => [{ type: 'guard.check', payload: {} }] }),
+      }));
+      return r;
+    };
+
+    async function crashedAfterRefusal(guard) {
+      const reg = guardRegistry();
+      const store = createMemoryRunStore();
+      let run = advanceWhileRunning(startRun({ op: GUARD_OP, id: 'run-g', input: { pr: 7 }, registry: reg }), { registry: reg });
+      store.write(run);
+      // The executor persists `refused`; the process dies before `advance`, so `pending` is still set.
+      run = (await applyPendingEffects(run, { sinks: { 'guard.check': guard }, store })).run;
+      expect(run.effects[0].status).toBe('refused');
+      expect(runStatus(run, { registry: reg })).toBe('awaiting-effect');
+      expect(isParkedOnDispatch(run)).toBe(false);
+      return { run, store, reg };
+    }
+
+    it('wakePass finds it and settles it refused, reporting the refusal once', async () => {
+      const guard = vi.fn(async () => { throw notApplied(REFUSAL); });
+      const { store, reg } = await crashedAfterRefusal(guard);
+      const resolveFor = () => ({ registry: reg, sinks: { 'guard.check': guard } });
+
+      const pass = await wakePass({ store, observers: {}, resolveFor });
+      expect(pass.parked).toBe(1);
+      expect(pass.runs[0].advanced).toBe(true);
+      expect(pass.runs[0].status).toBe('complete');
+      expect(pass.runs[0].errors.map((e) => e.error)).toEqual([REFUSAL]);
+      const saved = store.read('run-g');
+      expect(saved.outcome).toBe('refused');
+      expect(saved.pending).toBeNull();
+
+      // Settled: a later tick neither picks it up again nor repeats the report, and never re-invokes the guard.
+      const again = await wakePass({ store, observers: {}, resolveFor });
+      expect(again.parked).toBe(0);
+      expect(again.runs).toEqual([]);
+      expect(guard).toHaveBeenCalledTimes(1);
+    });
+
+    it('wakeRun settles it directly even though nothing was observed', async () => {
+      const guard = async () => { throw notApplied(REFUSAL); };
+      const { run, store, reg } = await crashedAfterRefusal(guard);
+      const report = await wakeRun(run, { observers: {}, store, registry: reg, sinks: { 'guard.check': guard } });
+      expect(report.advanced).toBe(true);
+      expect(report.status).toBe('complete');
+      expect(store.read('run-g').outcome).toBe('refused');
+    });
+
+    it('a non-permanent failure on an unfinalized run is NOT picked up as a refusal', async () => {
+      const { run } = await crashedAfterRefusal(async () => { throw notApplied(REFUSAL); });
+      // Same shape, but a plain `failed` entry (or a `refused` one with no recognized marker): not the refusal path.
+      const failedRun = { ...run, effects: run.effects.map((e) => ({ ...e, status: 'failed', error: 'transient: try again' })) };
+      expect(isParkedUnsettled(failedRun)).toBe(false);
+      const unmarked = { ...run, effects: run.effects.map((e) => ({ ...e, error: 'some other refusal' })) };
+      expect(isParkedUnsettled(unmarked)).toBe(false);
+      // A settled (terminal) refusal is not parked either.
+      expect(isParkedUnsettled({ ...run, pending: null })).toBe(false);
+    });
+
+    // THE WAKER SELECTS BY THE ENGINE'S OWN TEST (self-review of round 2): a refusal that `advance` would not
+    // settle must not be picked up, or the timer retries sinks and re-reports it on every tick forever.
+    it('is scoped to the pending step and to what advance can settle — never a refusal advance would ignore', async () => {
+      const guard = async () => { throw notApplied(REFUSAL); };
+      const { run } = await parkedRefuse(guard); // [start.build in-flight, guard.check declared], pending step 0
+      const refusal = { status: 'refused', attempts: 1, error: REFUSAL };
+      const withEffects = (patch) => ({ ...run, effects: run.effects.map((e, i) => ({ ...e, ...patch[i] })) });
+
+      // Refusal behind an in-flight sibling: the observer path owns it, advance cannot settle it.
+      expect(isParkedUnsettled(withEffects([{}, refusal]))).toBe(false);
+      // Refusal behind an earlier `failed` sibling (the executor would retry it every tick).
+      expect(isParkedUnsettled(withEffects([{ status: 'failed', error: 'x' }, refusal]))).toBe(false);
+      // Refusal in front of an untried `declared` sibling is settleable (the engine ignores the tail).
+      expect(isParkedUnsettled(withEffects([{ status: 'applied' }, refusal]))).toBe(true);
+      expect(isParkedUnsettled(withEffects([{ ...refusal, status: 'refused' }, { status: 'declared' }]))).toBe(true);
+      // A refusal recorded against a DIFFERENT step says nothing about the pending one.
+      const elsewhere = withEffects([{ status: 'failed', error: 'x' }, { ...refusal, stepIndex: 99 }]);
+      expect(isParkedUnsettled(elsewhere)).toBe(false);
+    });
+
+    it('an unfinalized refusal behind a failed sibling is left alone by the pass: no retry, no report', async () => {
+      const guard = vi.fn(async () => { throw notApplied(REFUSAL); });
+      const { run, store, reg } = await parkedRefuse(guard);
+      store.write({ ...run, effects: run.effects.map((e, i) => (i === 0
+        ? { ...e, status: 'failed', error: 'x' }
+        : { ...e, status: 'refused', attempts: 1, error: REFUSAL })) });
+      const pass = await wakePass({ store, observers: {}, resolveFor: () => ({ registry: reg, sinks: sinksFor(guard) }) });
+      expect(pass.parked).toBe(0);
+      expect(pass.errors).toEqual([]);
+      expect(guard).not.toHaveBeenCalled();
+    });
+
+    // THE ANTI-SPIN BREAK (PR #6584 round 4): wakeRun called directly on a refusal `advance` cannot settle (an
+    // attempted sibling still `pending` behind it) must report ONCE and stop, not re-apply the refusal each turn.
+    it('wakeRun stops after one report when advance cannot settle the refusal (no turn-cap spin)', async () => {
+      const TWO_OP = 'fx-wake-two-guards';
+      const reg = createRegistry();
+      reg.register(op(TWO_OP, {
+        input: { pr: { type: 'number', required: true } },
+        go: effect({ reads: ['input.pr'], effects: () => [
+          { type: 'start.build', payload: {}, dispatch: true },
+          { type: 'guard.check', payload: {} },
+          { type: 'guard.other', payload: {} },
+        ] }),
+      }));
+      const guard = vi.fn(async () => { throw notApplied(REFUSAL); });
+      const other = vi.fn(async () => ({ ok: true }));
+      const sinks = { 'start.build': SINKS['start.build'], 'guard.check': guard, 'guard.other': other };
+      const store = createMemoryRunStore();
+      let run = advanceWhileRunning(startRun({ op: TWO_OP, id: 'run-t', input: { pr: 7 }, registry: reg }), { registry: reg });
+      store.write(run);
+      run = (await applyPendingEffects(run, { sinks, store })).run; // parks on the dispatch (start.build in-flight)
+      expect(run.effects[0].status).toBe('in-flight');
+      // A sibling attempted earlier whose outcome is unknown sits behind the guard the executor will refuse first,
+      // so advance cannot settle the refusal. Reaching the loop needs a resolved dispatch (else wakeRun returns
+      // early), which `observers` supplies.
+      run = { ...run, effects: run.effects.map((e, i) => (i === 2 ? { ...e, status: 'failed', attempts: 1, error: 'transient: try again' } : e)) };
+      store.write(run);
+      const report = await wakeRun(run, { observers, store, registry: reg, sinks });
+      expect(guard).toHaveBeenCalledTimes(1);
+      expect(report.errors).toHaveLength(1);
+      expect(report.errors[0].error).toBe(REFUSAL);
+      expect(report.status).toBe('awaiting-effect');
+    });
+
+    // THE SAME CLASS, ANOTHER MEMBER: every effect of the step durably `applied` (the waker's own observer write,
+    // a last sink write, a `--resolve` close-out), process gone before `advance` cleared `pending`.
+    it('wakePass finishes a step whose effects are all applied but whose pending was never cleared', async () => {
+      const guard = vi.fn(async () => ({ ok: true }));
+      const { run, store, reg } = await parkedRefuse(guard);
+      const stuck = { ...run, effects: run.effects.map((e) => ({ ...e, status: 'applied', result: { ok: true } })) };
+      store.write(stuck);
+      expect(runStatus(stuck, { registry: reg })).toBe('awaiting-effect');
+      expect(isParkedOnDispatch(stuck)).toBe(false);
+
+      const resolveFor = () => ({ registry: reg, sinks: sinksFor(guard) });
+      const pass = await wakePass({ store, observers: {}, resolveFor });
+      expect(pass.parked).toBe(1);
+      expect(pass.runs[0].advanced).toBe(true);
+      expect(pass.runs[0].status).toBe('complete');
+      expect(pass.runs[0].errors).toEqual([]);
+      const saved = store.read('run-r');
+      expect(saved.pending).toBeNull();
+      expect(saved.outcome ?? null).toBeNull();
+      expect(guard).not.toHaveBeenCalled();
+
+      expect((await wakePass({ store, observers: {}, resolveFor })).parked).toBe(0);
+    });
+  });
+
+  it('an ordinary (non-permanent) failure still stops the pass and reports the error, unchanged', async () => {
+    const guard = async () => { throw new Error('network down'); };
+    const { run, store, reg } = await parkedRefuse(guard);
+    const report = await wakeRun(run, { observers, store, registry: reg, sinks: sinksFor(guard) });
+    expect(report.errors.map((e) => e.error)).toEqual(['network down']);
+    expect(store.read('run-r').outcome ?? null).toBeNull();
+    expect(report.status).toBe('awaiting-effect');
   });
 });

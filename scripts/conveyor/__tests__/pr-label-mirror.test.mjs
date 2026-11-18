@@ -94,6 +94,18 @@ const FACTS = { headSha: HEAD, head: { sha: HEAD }, labels: [], checks: [], requ
 const humanVerdict = (pr) => buildVerdictRecord({ repo: REPO, pr, verdict: 'human', at: '2026-10-12T10:00:00.000Z', reason: 'needs a person', headSha: HEAD, declaredActor: 'op', session: 's', channel: 'chat', source: 'review-set-label' });
 const tl = (label, change, actor, createdAt = '2026-10-12T11:00:00Z', actorType = 'User') => ({ label, change, actor, actorType, createdAt });
 
+describe('apply-path ledger reads are decision reads (fresh: true)', () => {
+  it('the per-PR idempotency and re-derive reads in runMirrorApply pass fresh: true', async () => {
+    const w = world({ labels: [] });
+    const seen = [];
+    const read = w.opts.readEvents;
+    w.opts.readEvents = async (repo, o) => { seen.push(o?.fresh); return read(repo, o); };
+    await runMirrorApply(w.opts);
+    expect(seen.length).toBeGreaterThanOrEqual(3); // first = the pass-start read, left cached
+    expect(seen.slice(1).every((f) => f === true)).toBe(true);
+  });
+});
+
 /** A fake world: ledger rows, live labels, a call log whose ORDER the tests assert. */
 function world({ labels = [], verdict = 'human', timeline = { status: 'ok', items: [] }, appendOk = true } = {}) {
   const w = { log: [], rows: verdict ? [{ type: 'verdict', ...humanVerdict(7), verdict }] : [], labels };
@@ -412,6 +424,20 @@ describe('#5649 planLabelInputRows', () => {
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: HEAD, items: addition })).toEqual([]);
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: 'b'.repeat(40), items: addition })).toHaveLength(1);
   });
+  it('a delegated approval never lets the mirror skip a hold: the evaluator binds it to the hold id', () => {
+    const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00Z', source: 'test', approval: 'judge',
+      delegation: { by: 'op', scope: 'pr', expires: '2026-10-12T14:00:00Z' }, headSha: HEAD, basis: ['hold:12345678'] });
+    const opts = { ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'operator')],
+      headSha: HEAD, now: Date.parse('2026-10-12T13:00:00Z') };
+    // basis names some other event, not this hold: the hold must still be recorded
+    expect(planLabelInputRows({ ...opts, events: [approval] })).toHaveLength(1);
+    for (const binding of [{ headSha: undefined }, { headSha: 'b'.repeat(40) }, { basis: undefined }]) {
+      expect(planLabelInputRows({ ...opts, events: [{ ...approval, ...binding }] })).toHaveLength(1);
+    }
+    for (const binding of [{ headSha: 'garbage' }, { basis: [] }]) {
+      expect(() => planLabelInputRows({ ...opts, events: [{ ...approval, ...binding }] })).toThrow(TypeError);
+    }
+  });
   it('a bot or missing actor is hand-made for added, not for removed', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'ci[bot]', undefined, 'Bot')] })).toHaveLength(1);
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', null, undefined, null)] })[0].sender).toBe('unknown');
@@ -618,6 +644,7 @@ describe('#5647 single ruling-needed writer', () => {
       'conveyor/referral-auto-block.mjs': 'documentation of the ruling signal',
       'conveyor/review-hold-ledger-shadow.mjs': 'documentation of the shadow input',
       'conveyor/review-referral-hold.mjs': 'documentation of the referral hold',
+      'lib/delivery-capacity.mjs': 'read-only held-label vocabulary for the capacity readout',
     };
     const paths = readdirSync(root, { recursive: true }).filter(p => /\.(?:[cm]?[jt]s|sh|bash|py)$/.test(p)
       && !p.includes('__tests__') && !p.includes('soak/') && !/\.(test|spec)\./.test(p));

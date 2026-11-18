@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { withFileLock } from './atomic-json-file.mjs';
+import { scanStore } from './daemon-jobs-runtime.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { RESOURCE_POLICY_KINDS } from './resource-policy.mjs';
 import { taskRunId, markQueued, DEFAULT_TASK_TIMEOUT_MS, validateTaskPolicy, taskFailureCharge } from './daemon-jobs.mjs';
@@ -29,6 +30,15 @@ const positive = value => typeof value === 'number' && Number.isFinite(value) &&
 const policyLeaf = value => positive(value); // Explicit caller budgets/age bounds must also be positive.
 
 /** All work inside the tuple callback is synchronous. */
+/** The only facts the enqueue exclusion check reads from a job record (kept small so history is cached cheaply). */
+function tupleProjection(record) {
+  const other = record.job.task;
+  if (!other) return Object.freeze({ id: record.id, hasTask: false });
+  return Object.freeze({ id: record.id, hasTask: true, kind: other.kind, repo: other.repo, item: other.item,
+    invalid: validateTaskMetadata(other).length > 0 || other.kind !== record.job.kind,
+    terminal: TERMINAL_JOB_STATUSES.includes(record.job.status) });
+}
+
 export function enqueueItemTask({ store, kindDef, kind = kindDef?.kind, repo, item, seq, id,
   input = {}, codeSha = null, now = Date.now(), acting, resourceKind, actingRepoCap,
   policyOptions = {}, lockOptions = {},
@@ -67,15 +77,14 @@ export function enqueueItemTask({ store, kindDef, kind = kindDef?.kind, repo, it
   const lockPath = join(store.dir, `${taskTupleLockId(identity)}.lock`);
   try {
     return withFileLock(lockPath, () => {
-      const { records, corrupt } = store.list();
+      const { ordered, corrupt } = scanStore(store, tupleProjection, 'item-task-tuple');
       if (corrupt.length) throw new Error(`corrupt records ${corrupt.join(', ')}`);
-      for (const existing of records) {
-        const other = existing.job.task;
-        if (!other) continue;
-        const invalid = validateTaskMetadata(other);
-        if (invalid.length || other.kind !== existing.job.kind) throw new Error(`corrupt record ${existing.id}`);
-        if (other.kind === kind && other.repo === repo && other.item === item && !TERMINAL_JOB_STATUSES.includes(existing.job.status)) {
-          throw new Error(`active tuple held by ${existing.id}`);
+      for (const entry of ordered) { // listing order, as store.list() walked it
+        const row = entry.live ? tupleProjection(entry.live) : entry.done;
+        if (!row.hasTask) continue;
+        if (row.invalid) throw new Error(`corrupt record ${row.id}`);
+        if (row.kind === kind && row.repo === repo && row.item === item && !row.terminal) {
+          throw new Error(`active tuple held by ${row.id}`);
         }
       }
       return store.create(record);

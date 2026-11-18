@@ -13,8 +13,9 @@
  *
  * Scenario: the REAL lock module from the tree under test, on a scratch lock root. A sibling's long tick holds a
  * read slot throughout; each round a mover reserves the writer and waits for it (short waits stand in for 60s);
- * the review reader tries its read once per round, while the mover is draining. FIXED: the reader gets in within a
- * few rounds. PRE-fix: refused every round — `reader-starved`.
+ * the review reader tries its read once per round, while the mover is draining. FIXED: the reader gets in once the
+ * writer's bounded override of reader priority runs out (a handful of rounds). PRE-fix: refused every round —
+ * `reader-starved`.
  */
 
 import { readFileSync } from 'node:fs';
@@ -22,7 +23,10 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
 
-const ROUNDS = 6;
+// The writer's own claim may now override reader priority for a BOUNDED window (writerPriorityAfter +
+// writerPriorityMaxSkips + 1 attempts, 6 by default) before it yields, so the reader is guaranteed in only after
+// that bound — not within the first few rounds. Run past the bound so the break still proves the reader gets in.
+const ROUNDS = 12;
 
 export default {
   id: 'clone-reader-starved',

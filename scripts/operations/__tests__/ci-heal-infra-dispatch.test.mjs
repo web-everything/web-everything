@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dispatchTimeoutRetry, timeoutGithubEffects } from '../ci-heal-pr-dispatch.mjs';
 import { readTimeoutBudget } from '../../conveyor/timeout-retry-state.mjs';
+import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
 
-// Dispatch coverage uses a deterministic birth number; allocator transport has its own suite.
+// A regression to numeric allocation stays hermetic and is detected below.
 vi.mock('../../lib/card-number-allocator.mjs', () => ({
-  allocateCardNumber: () => ({ ok: true, num: '90001' }),
+  allocateCardNumber: vi.fn(() => ({ ok: true, num: '90001' })),
 }));
 
 // Dispatch-level coverage of the infra-cancelled re-run path (PR #4024 review): the planner tests pin WHEN a re-run
@@ -63,9 +64,11 @@ describe('infra-cancelled dispatch', () => {
     expect(statuses).toEqual(['requested', 'requested', 'refused', 'refused']);
     expect(request).toHaveBeenCalledTimes(2);
     expect(fileFollowup).toHaveBeenCalledTimes(1);
-    expect(fileFollowup.mock.calls[0][0]).toMatchObject({
-      num: '90001', abs: join(dir, 'backlog', '90001-investigate-timeout-retries-for-pr-4023-at-aaaaaaaa.md'),
-    });
+    const payload = fileFollowup.mock.calls[0][0];
+    expect(payload.num).toMatch(/^x[0-9a-z]{6}$/);
+    expect(payload.abs).toBe(join(dir, 'backlog', `${payload.num}-investigate-timeout-retries-for-pr-4023-at-aaaaaaaa.md`));
+    expect(payload.content).not.toContain('bornAs:');
+    expect(allocateCardNumber).not.toHaveBeenCalled();
   }));
 
   it('files NO flaky-test follow-up card for infra re-runs (at 2 or at the cap), but still files one for ordinary timeouts at 2', async () => harness(async (dir) => {

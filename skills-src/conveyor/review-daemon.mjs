@@ -74,6 +74,8 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
+import { createPlannerFactCache } from '../../scripts/conveyor/planner-fact-cache.mjs';
+import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -89,10 +91,17 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
-import { dispatchReviewJob, dispatchReviewByMode, readRedTeamRecoveryStatus } from '../../scripts/operations/review-job.mjs';
+import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { reviewSessionSlug } from '../../scripts/conveyor/review-session-slug.mjs';
+import { diagnoseEndedJob, summarizeDiagnosis, writeEndedJobDiagnosis } from '../../scripts/operations/review-job-end-diagnosis.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
-import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
+import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
+import { sampleHost } from '../../scripts/lib/host-sample.mjs';
+import { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
+import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue, readLiveRedTeamPr } from '../../scripts/lib/red-team-dispatch-queue.mjs';
+import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
+import { runGateCatchUp } from '../../scripts/lib/red-team-gate-catchup.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -105,6 +114,7 @@ import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
 // PRs — landing it in `runner.mjs` alone would leave #2549/#2578's stray labels uncleaned indefinitely, the
 // exact gap this wiring closes.
 import { sweepReviewHoldLabels } from '../../scripts/conveyor/review-hold-reconcile.mjs';
+import { sweepAuthorStamps } from '../../scripts/lib/author-stamp-restore.mjs';
 import { sweepHumanSurfaceRepark } from '../../scripts/conveyor/human-surface-repark.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
 // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session executor for a
@@ -231,16 +241,20 @@ export function formatOperatorHoldsRecord({ repo, observedAt, intervalMs, holds 
  *  unlogged for hours because its refusal was dropped here and the notice that excuses the silence is posted once). */
 const ALWAYS_EXPLAINED_LABEL = 'review:human';
 
+// Restart-local scheduling history; keys include the repo so equal PR numbers stay independent.
+const reviewDispatchState = { firstOwedAt: new Map(), lastDispatched: new Map(), noVerdictCounts: new Map() };
+
 /**
  * The dispatch order for this tick's owed reviews. Pure, stable. Rank 0: a main-fix PR (the plan marks it
  * `mainFix`); rank 1: a PR someone is blocked on (`review:human` or `ready-to-merge`); rank 2: the rest.
- * Within a rank the oldest PR (lowest number) goes first. Only the plan's own review rows move: a red-team
+ * Within a rank the longest continuously owed PR goes first, then the lowest number.
+ * Only the plan's own review rows move: a red-team
  * request row (`redTeamRequest` / `carriedAcceptHead`) keeps its slot, since the code that adds those rows already
  * places them deliberately (the main-fix PR's red-team first).
  * @param {Array<object>} reviews
- * @param {{labelsByPr?:Map<number, Array<string|{name:string}>>, plan?:{dispatch?:Array<object>}}} [o]
+ * @param {{labelsByPr?:Map<number, Array<string|{name:string}>>, plan?:{dispatch?:Array<object>}, owedSince?:Map<number,number>}} [o]
  */
-export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan = {} } = {}) {
+export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan = {}, owedSince = new Map() } = {}) {
   const mainFixPrs = new Set((plan?.dispatch ?? []).filter((d) => d?.mainFix).map((d) => Number(d.prNumber)));
   const rank = (d) => {
     const n = Number(d?.prNumber);
@@ -251,7 +265,9 @@ export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan 
   const movable = (d) => !d?.redTeamRequest && !d?.carriedAcceptHead;
   const slots = reviews.map((d, i) => (movable(d) ? i : -1)).filter((i) => i >= 0);
   const sorted = slots.map((i) => ({ d: reviews[i], i, r: rank(reviews[i]), n: Number(reviews[i]?.prNumber) }))
-    .sort((a, b) => a.r - b.r || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i);
+    .sort((a, b) => a.r - b.r
+      || (owedSince.get(a.n) ?? Infinity) - (owedSince.get(b.n) ?? Infinity)
+      || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i);
   const out = [...reviews];
   slots.forEach((slot, k) => { out[slot] = sorted[k].d; });
   return out;
@@ -372,6 +388,7 @@ export function runReviewTick({
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   redTeamOnSkip = null,
+  reconcileRedTeamQueue = null,
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
   statusCandidates = selectStatusCandidates,
@@ -382,6 +399,7 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  recoveryAcquirableLanes = acquirableLanes,
   // verify-admission (2026-10-20) — host-level admission for new review sessions: `() => {admitted, reason,
   // maxPerTick?}`. Not admitted ⇒ nothing is dispatched this tick (every review stays owed: queued, never dropped);
   // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
@@ -432,11 +450,18 @@ export function runReviewTick({
   log = () => {},
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
+  dispatchState = reviewDispatchState,
+  isPidAlive = pidAlive,
+  diagnoseJob = diagnoseEndedJob,
+  writeJobDiagnosis = writeEndedJobDiagnosis,
 } = {}) {
   // #x01u7az — runs FIRST and INDEPENDENTLY of `reconcile`'s own plan: it is a plain `gh pr list` + label read
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
   // below must never suppress it. Isolated in its own try/catch, same "one bad entry never aborts the rest"
   // discipline as every other step in this tick — a `gh` hiccup here must not cost a review dispatch.
+  // Maintenance also runs on paused ticks and before any reconcile/read failure can return early.
+  try { reconcileRedTeamQueue?.({ repo }); }
+  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let rawPrs = null;
   let rawPrsError = null;
@@ -448,7 +473,8 @@ export function runReviewTick({
   let holdReconcileError = null;
   try {
     // Both hold sweeps nominate candidates from number/labels; all mutations still use fresh live reads.
-    holdReconcileResults = holdReconcile({ repo, ...(sharedReads && !rawPrsFailed ? { listPrs: () => rawPrs } : {}) }) ?? [];
+    holdReconcileResults = holdReconcile({ repo, restoreStamps: sweepAuthorStamps,
+      ...(sharedReads && !rawPrsFailed ? { listPrs: () => rawPrs } : {}) }) ?? [];
   } catch (e) {
     holdReconcileError = String((e && e.message) || e).split('\n')[0];
   }
@@ -482,6 +508,9 @@ export function runReviewTick({
     } else {
       plan = reconcile({ repo, defaultBranch });
     }
+    // A deferred PR read (gh low budget / slot throttle / author-lookup budget) planned NOTHING: that is "owed unknown",
+    // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
+    if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
@@ -577,6 +606,56 @@ export function runReviewTick({
   const mergeConflictedByPr = new Map((Array.isArray(rawPrs) ? rawPrs : [])
     .map((p) => [Number(p?.number), String(p?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY']));
   const reviews = (plan.dispatch ?? []).filter((d) => d && d.kind === 'review');
+  const keyFor = pr => `${repo}#${Number(pr)}`;
+  const owedKeys = new Set(reviews.map(d => keyFor(d.prNumber)));
+  const refusedKeys = new Set((plan.refusals ?? []).map(d => keyFor(d.prNumber)));
+  const openPrs = Array.isArray(rawPrs) ? new Map(rawPrs.map(p => [keyFor(p?.number), p])) : null;
+  const noVerdictCounts = dispatchState.noVerdictCounts ??= new Map();
+  for (const key of new Set([...dispatchState.firstOwedAt.keys(), ...noVerdictCounts.keys()])) {
+    if (!key.startsWith(`${repo}#`)) continue;
+    if ((!owedKeys.has(key) && !refusedKeys.has(key)) || (openPrs && !openPrs.has(key))) {
+      dispatchState.firstOwedAt.delete(key);
+      noVerdictCounts.delete(key);
+    } else if (openPrs?.get(key)?.headRefOid && noVerdictCounts.get(key)?.head !== openPrs.get(key).headRefOid) {
+      noVerdictCounts.delete(key);
+    }
+  }
+  const owedSince = new Map();
+  const endedNoVerdict = [];
+  const observedAt = now();
+  for (const d of reviews) {
+    const key = keyFor(d.prNumber);
+    if (!dispatchState.firstOwedAt.has(key)) dispatchState.firstOwedAt.set(key, observedAt);
+    const prior = dispatchState.lastDispatched.get(key);
+    const head = d.headRefOid ?? d.headSha ?? d.head
+      ?? rawPrs?.find(p => Number(p?.number) === Number(d.prNumber))?.headRefOid;
+    if (head && noVerdictCounts.get(key)?.head !== head) noVerdictCounts.delete(key);
+    if (prior && head && prior.head === head && isPidAlive(prior.pid) === false) {
+      const count = (noVerdictCounts.get(key)?.count ?? 0) + 1;
+      noVerdictCounts.set(key, { head, count });
+      // One immediate retry keeps its place; repeated failures yield to waiting peers.
+      if (count >= 2) dispatchState.firstOwedAt.set(key, observedAt);
+      let diagnosis = 'exit=? signal=? last="diagnosis unavailable"';
+      try {
+        const slug = prior.slug ?? reviewSessionSlug(d.prNumber, repoKeyForSlug(repo));
+        const job = { slug, pid: prior.pid };
+        const detail = diagnoseJob(job);
+        diagnosis = summarizeDiagnosis(detail);
+        writeJobDiagnosis(job, detail);
+      } catch { /* Diagnostics must never interrupt a retry. */ }
+      endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
+      dispatchState.lastDispatched.delete(key);
+      try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`); } catch {}
+    }
+    owedSince.set(Number(d.prNumber), dispatchState.firstOwedAt.get(key));
+  }
+  // Keep a live job's identity across planner live-process refusals; drop closed PRs when known.
+  if (Array.isArray(rawPrs)) {
+    const open = new Set(rawPrs.map(p => keyFor(p?.number)));
+    for (const key of dispatchState.lastDispatched.keys()) {
+      if (key.startsWith(`${repo}#`) && !open.has(key)) dispatchState.lastDispatched.delete(key);
+    }
+  }
   // Live-caught 2026-09-22, #xli631k: a PR that moved to being owed a FIX (not a review) used to never
   // reach `statusCandidates` at all, so its `review-status:reviewing` label sat stale once its review
   // session finished (PR #2472, ~2 hours stale). `selectStatusCandidates` now takes fix-owed entries as a
@@ -601,7 +680,7 @@ export function runReviewTick({
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
   // 2026-10-20 — when this tick can dispatch fewer reviews than are owed, the scarce seats go in priority
   // order (see orderReviewsForDispatch): main-fix first, then PRs a human or the merge queue waits on, oldest first.
-  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
+  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan, owedSince }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   let host = { admitted: true, maxPerTick: Infinity };
@@ -611,6 +690,7 @@ export function runReviewTick({
   const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
   const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
     ? Math.max(0, liveReviewBudget.left) : Infinity;
+  const initialReviewCapacity = remainingReviewCapacity();
   const dispatchable = [];
   let occupiedLanes = 0;
   const dispatched = [];
@@ -655,6 +735,43 @@ export function runReviewTick({
       scopeBloatRefreshed.push({ prNumber: row.prNumber, ok: result?.ok === true, action: result?.action ?? null });
     }
   }
+  let redTeamOnSkipResult;
+  const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
+  const recoverRedTeam = (recoveryStarts) => {
+    if (paused || typeof redTeamOnSkip !== 'function') return;
+    // Recovery starts need only one lane; ordinary rounds reserve a companion lane too.
+    // A failed recovery-only read must not abort the tick (it runs before ordinary dispatch): read it as 0 lanes.
+    let rawLanes = 0;
+    try { rawLanes = recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo }); }
+    catch (e) { log(`review-daemon: ${repo} recovery lane read failed (${String(e?.message ?? e).split('\n')[0]}); recovery gets 0 lanes this tick`); }
+    const rawAcquirable = Math.max(0, (Array.isArray(rawLanes) ? rawLanes.length : Number(rawLanes)) || 0);
+    const recoveryLanes = Math.max(0, rawAcquirable - occupiedLanes);
+    let taken = 0;
+    const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
+      startsCeiling: Math.max(0, hostLimit - occupiedLanes - (reviews.length ? 1 : 0)),
+      take: () => { taken++; if (typeof host.take === 'function') host.take(1); } };
+    try {
+      // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
+      // guard. For red-team recovery they are also already reviewed; the recovery planner still
+      // requires an accepting, head-bound payload and checks comments, status and cooldown.
+      // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
+      const recoveryRefusals = (plan.refusals ?? []).map(row =>
+        row.kind === 'nothing-owed' && row.phase === 'queued'
+          ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
+          : row);
+      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
+        capacity, paused });
+    } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
+    finally {
+      // Recovery reports the same start through multiple counters; count it only once, even on error.
+      // An unbounded budget (Infinity) minus itself is NaN, which would poison every later `>=` limit check
+      // and silently disable host-start enforcement; an unbounded or garbage reading spent nothing.
+      const spent = (before, after) => { const n = before - after; return Number.isFinite(n) ? Math.max(0, n) : 0; };
+      occupiedLanes += Math.max(taken, spent(recoveryStarts, capacity.remainingStarts), spent(recoveryLanes, capacity.lanes));
+    }
+  };
+  // Reserve recovery-first capacity only when ordinary reviews can still get a host start.
+  if (reservedRecoveryStarts > 0) recoverRedTeam(reservedRecoveryStarts);
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,
   // and `onTick` reads both shapes.
   const notStarted = [];
@@ -689,6 +806,10 @@ export function runReviewTick({
         prNumber: d.prNumber, agentId: result?.agentId ?? null,
         ...(result?.mode ? { mode: result.mode } : {}), ...(Number.isInteger(result?.jobPid) ? { jobPid: result.jobPid } : {}),
       });
+      const head = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
+      if (Number.isInteger(result?.jobPid) && result.jobPid > 0 && head) {
+        dispatchState.lastDispatched.set(keyFor(d.prNumber), { pid: result.jobPid, head, ...(result.sessionSlug ? { slug: result.sessionSlug } : {}) });
+      }
       occupiedLanes++;
       if (typeof host.take === 'function') host.take(1);
     } catch (e) {
@@ -700,38 +821,34 @@ export function runReviewTick({
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
   }
-  let redTeamOnSkipResult;
-  if (!paused && typeof redTeamOnSkip === 'function') {
-    try {
-      // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
-      // guard. For red-team recovery they are also already reviewed; the recovery planner still
-      // requires an accepting, head-bound payload and checks comments, status and cooldown.
-      // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
-      const recoveryRefusals = (plan.refusals ?? []).map(row =>
-        row.kind === 'nothing-owed' && row.phase === 'queued'
-          ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
-          : row);
-      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
-        capacity: { lanes: Math.max(0, acquirable - occupiedLanes), budget: liveReviewBudget,
-          remainingStarts: Math.max(0, hostLimit - occupiedLanes),
-          take: () => { if (typeof host.take === 'function') host.take(1); } }, paused });
-    } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
-  }
+  if (reservedRecoveryStarts === 0) recoverRedTeam(Math.max(0, hostLimit - occupiedLanes));
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
-  const hostBound = !paused && (!host.admitted || (hostLimit < acquirable && hostLimit - occupiedLanes <= liveCap));
-  const capBound = !paused && !hostBound && liveCap < acquirable - occupiedLanes;
+  const earlierDispatches = Number.isFinite(liveReviewBudget?.max) && Number.isFinite(liveReviewBudget?.live)
+    ? Math.max(0, liveReviewBudget.max - liveReviewBudget.live - initialReviewCapacity) : 0;
+  // Never clamp: an overrun (10 live of max 8) must still read "10 of 8".
+  const live = Number.isFinite(liveReviewBudget?.live)
+    ? liveReviewBudget.live + earlierDispatches + (initialReviewCapacity - liveCap)
+    : Number.isFinite(liveReviewBudget?.max) ? liveReviewBudget.max - liveCap : NaN;
+  let capReason = Number.isFinite(live)
+    ? liveReviewBudget?.reason?.replace(/live review rounds \d+ of /, `live review rounds ${live} of `)
+    : liveReviewBudget?.reason;
+  if (capReason && earlierDispatches > 0) capReason += `; ${earlierDispatches} seat(s) taken by dispatches earlier in this tick`;
+  const hostBound = !paused && (!host.admitted || hostLimit - occupiedLanes <= 0);
+  const capBound = !paused && !hostBound && liveCap === 0;
   const deferredTotal = reviews.length - dispatchable.length;
   const deferredForHost = hostBound ? deferredTotal : 0;
   const deferredForCap = capBound ? deferredTotal : 0;
   const deferredForLanes = paused || hostBound || capBound ? 0 : deferredTotal;
   const deferredForAuth = paused ? deferredTotal : 0;
   const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
-    : hostBound ? `review owed, but held by host admission (${host.reason ?? 'per-tick dispatch budget exhausted'})`
-    : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
+    : hostBound ? (host.admitted
+      ? `review owed, held by the per-tick review start budget (${host.startBudget ?? hostLimit} of ${host.startBudget ?? hostLimit} used this tick; host admitted: ${host.reason ?? 'not checked'})`
+      : `review owed, but held by host admission (${host.reason ?? 'host start budget exhausted'})`)
+    : capBound ? `review owed, but held by the live-review cap (${capReason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
       : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
-  if (deferredForCap && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${liveReviewBudget.reason}\n`);
+  if (deferredForCap && capReason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${capReason}\n`);
   if (deferredForHost) process.stderr.write(`review-daemon: ${deferredForHost} owed review(s) queued — ${deferReason}\n`);
   if (poolExhaustion && !paused) {
     try {
@@ -775,12 +892,13 @@ export function runReviewTick({
     }
   }
   return {
+    ...(endedNoVerdict.length ? { endedNoVerdict } : {}),
     ...(redTeamOnSkipResult !== undefined ? { redTeamOnSkip: redTeamOnSkipResult } : {}),
     reviewsOwed: reviews.length, dispatched, failed, notStarted, refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
     }),
-    reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (liveReviewBudget?.reason ?? null) : null,
+    reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (capReason ?? null) : null,
     deferredForAuth, deferredForHost, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
@@ -824,10 +942,11 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  * per-PR, one level up. Every downstream step this daemon already calls (`reconcile-pass.mjs`,
  * `review-dispatch.mjs`, both tag scripts) was already fully repo-generic before this — the daemon's own tick
  * was the only WE-hardcoded link (see `runReviewTick`'s own `repo` fix above, filed the same day this was).
- * @param {{repos?:string[], tick?:Function, authGateOverride?:Function}} [o] - `tick` is injectable (defaults to
+ * @param {{repos?:string[], tick?:Function, authGateOverride?:Function, startIndex?:number}} [o] - `tick` is injectable (defaults to
  *   `runReviewTick`); every other option is forwarded to it for EVERY repo except `repo` itself, which this
  *   loop supplies per-iteration. `authGateOverride` (card x5kagse) is a test-only injection point for
  *   {@link planClaudeAuthDispatchGate}'s own real IO decision — see the block below for when the real one runs.
+ *   `startIndex` pins the first repo; omitted, successive ticks rotate first access to shared capacity.
  * @returns {{repos:Array<{repo:string, result?:object, error?:string}>, reviewsOwed:number,
  *   dispatched:Array<object>, failed:Array<object>, refusals:number, reconcileFailed:Array<{repo:string, error:string}>,
  *   deferredForLanes:number, deferredForAuth:number, authPaused:boolean, authPauseReason:(string|null),
@@ -837,20 +956,48 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  */
 /** Wrap a host admission so it is evaluated once and its `maxPerTick` is a budget shared by every caller: each
  *  call returns the SAME verdict with what is left, and `take(n)` spends it. A throwing check fails closed. */
-export function sharedHostBudget(hostAdmission) {
+const malformedReviewStartBudgets = new Set();
+export function sharedHostBudget(hostAdmission, log = console.error) {
   let verdict = null;
   let left = 0;
-  return () => {
+  let spentTotal = 0;
+  const shared = () => {
     if (!verdict) {
       try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
       catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
-      left = verdict.admitted ? (Number.isFinite(verdict.maxPerTick) && verdict.maxPerTick >= 1 ? verdict.maxPerTick : Infinity) : 0;
+      let budget = verdict.maxPerTick;
+      if (verdict.admitted && !(Number.isInteger(budget) && budget >= 0)) {
+        let got;
+        try { got = String(budget); } catch { got = typeof budget; }
+        const reason = `${typeof budget}:${got}`;
+        budget = Number.isInteger(DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK) && DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK >= 0
+          ? DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK : 1;
+        if (!malformedReviewStartBudgets.has(reason)) {
+          malformedReviewStartBudgets.add(reason);
+          try { log(`review-daemon: review-start-budget-malformed (got ${got}) - using safe default ${budget}`); }
+          catch { /* Diagnostics must not interrupt admission. */ }
+        }
+      }
+      verdict = { ...verdict, maxPerTick: budget };
+      left = verdict.admitted ? budget : 0;
     }
-    return { ...verdict, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
+    return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { const before = left; left = Math.max(0, left - n); spentTotal += before - left; } };
   };
+  // Seats spent so far through ANY path (dispatch, failed dispatch, red-team recovery): the rotation reads this
+  // per repo instead of trusting `dispatched`, which misses seats a failed or recovery start still consumed.
+  shared.spent = () => spentTotal;
+  return shared;
 }
 
-export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
+// Round-robin cursor for first access to the shared review seats. It moves only when a tick actually handed out
+// a seat (see the end of the repo loop below): a tick with no free seat must not spend any repo's turn, or a
+// seat pattern that repeats with the rotation (1,0,0 over three repos) would serve the same repo forever.
+let reviewRepoRotation = 0;
+
+export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride,
+  startIndex, ...tickOpts } = {}) {
+  const pinnedStart = startIndex !== undefined;
+  if (!pinnedStart) startIndex = reviewRepoRotation;
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -859,15 +1006,47 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   // `authGateOverride` to test the gate itself.
   const authGate = authGateOverride ? authGateOverride()
     : (tick === runReviewTick ? planClaudeAuthDispatchGate() : { paused: false, reason: null });
-  const perRepoMs = {};
+  const perRepoMs = Object.fromEntries(repos.map(repo => [repo, 0]));
   // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
   // the per-tick cap is host-wide (never cap × repos).
-  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission);
-  const perRepo = forEachRepo(repos, (repo) => {
+  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission, tickOpts.log);
+  // Give each repo first access to the shared seats on successive ticks. An injected index pins
+  // execution order for callers/tests without advancing the default round-robin counter.
+  const start = repos.length && Number.isSafeInteger(startIndex)
+    ? ((startIndex % repos.length) + repos.length) % repos.length : 0;
+  const orderedRepos = [...repos.slice(start), ...repos.slice(0, start)];
+  const seatTakers = new Set();
+  const rotatedResults = forEachRepo(orderedRepos, (repo) => {
     const started = Date.now();
+    const spentBefore = tickOpts.hostAdmission?.spent?.() ?? 0;
+    // The live-review pool is a second shared seat pool: a live-job skip can keep its seat without a host take or a
+    // dispatch entry, so a net drop in `left` over this repo's tick also counts as a seat spent.
+    const leftBefore = tickOpts.liveReviewBudget?.left;
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
-    finally { perRepoMs[repo] = Date.now() - started; }
+    finally {
+      perRepoMs[repo] = Date.now() - started;
+      const leftAfter = tickOpts.liveReviewBudget?.left;
+      if ((tickOpts.hostAdmission?.spent?.() ?? 0) > spentBefore
+        || (Number.isFinite(leftBefore) && Number.isFinite(leftAfter) && leftAfter < leftBefore)) seatTakers.add(repo);
+    }
   });
+  // Preserve the public result (and aggregate) order even when execution starts at another repo.
+  const split = repos.length - start;
+  const perRepo = [...rotatedResults.slice(split), ...rotatedResults.slice(0, split)];
+  // Advance the default rotation past the last repo (in execution order) that actually took a seat — a seat
+  // spent from the shared host budget (dispatch, failed dispatch, red-team recovery, or a tick that threw after
+  // spending) or a reported dispatch; leave it untouched when nobody did, and never move it for an injected
+  // `startIndex`. Over-counting is safe (the repo just goes last); missing a spender would pin it first.
+  if (!pinnedStart && repos.length) {
+    let lastServed = -1;
+    rotatedResults.forEach((entry, i) => {
+      const r = entry?.result;
+      // `failed` is deliberately NOT a signal: it also lists non-seat failures (pause notice, scope-bloat) that
+      // happen on ticks with no free seat and must not spend a repo's turn.
+      if (seatTakers.has(orderedRepos[i]) || (r?.dispatched?.length ?? 0) > 0) lastServed = i;
+    });
+    if (lastServed >= 0) reviewRepoRotation = (start + lastServed + 1) % repos.length;
+  }
   const dispatched = [];
   const failed = [];
   const notStarted = [];
@@ -1098,8 +1277,8 @@ export function hasStaleMainRefusal(tickResult) {
 }
 
 /**
- * #3383 bug 3 — the REAL `acquirableLanes` effect: how many lanes are acquirable RIGHT NOW in `repo`'s own
- * pool. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
+ * #3383 bug 3 — the REAL `acquirableLanes` effect: how many review starts fit RIGHT NOW in `repo`'s own
+ * pool, allowing roughly two lanes per round. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
  * --acquirable --json` read `tick-core.mjs`'s IO shell already uses — rather than re-deriving a second copy;
  * `repoProfile(repo).lanePoolRepo` is the exact same derivation `review-dispatch.mjs#planReviewDispatch`
  * already uses to pick which pool a given repo's own review session acquires from. Fail-soft, like
@@ -1113,9 +1292,17 @@ export function defaultAcquirableLaneCount({ repo }) {
   return defaultAcquirableLaneNumbers({ repo }).length;
 }
 
-/** Preserve the tick's fresh scan so sibling jobs acquire distinct lanes without scanning again. */
-export function defaultAcquirableLaneNumbers({ repo }) {
-  return freeLaneNumbers({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+/** Preserve distinct preferred lanes while leaving one companion lane per review round available.
+ * A round needs roughly two lanes; an unmatched lane cannot fit another round this tick.
+ * Returning no candidates uses the existing typed lane deferral / poolExhaustion path. */
+export function defaultAcquirableLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  const lanes = readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+  return lanes.slice(0, Math.floor(lanes.length / 2));
+}
+
+/** Red-team-only recovery needs one lane per start, so every free lane is available. */
+export function defaultRecoveryLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  return readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
 }
 
 /** The lane-pool repo path for `repo` (the same derivation {@link defaultAcquirableLaneCount} uses). */
@@ -1219,24 +1406,102 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
  *  (we:scripts/lib/host-load.mjs — host load per core, then free memory + swap headroom) plus the per-tick
  *  dispatch cap, all from the host-overload cascade (sources logged by the loader). Fails closed: an unreadable
  *  policy or host reading admits nothing, so owed reviews wait for the next tick. */
-export function defaultReviewHostAdmission({ env = process.env, admission = hostLoadAdmission, loadPolicy = loadHostOverloadSettings } = {}) {
+export function defaultReviewHostAdmission({ env = process.env, admission = hostLoadAdmission, loadPolicy = loadHostOverloadSettings,
+  loadFloor = loadRedTeamQueueFloor, readCpuIdlePct = () => sampleHost().idlePct, log = console.error } = {}) {
   let policy;
   try { policy = loadPolicy({ env }); } catch (e) { return { admitted: false, reason: `host policy unreadable: ${String(e?.message ?? e).split('\n')[0]}` }; }
   const verdict = admission({ policy, env, interactive: false });
-  return { ...verdict, maxPerTick: policy.settings.host.maxReviewDispatchPerTick };
+  let maxPerTick = policy.settings.host.maxReviewDispatchPerTick;
+  if (verdict.admitted) {
+    try {
+      const floor = loadFloor({ env });
+      const cpuIdlePct = readCpuIdlePct();
+      const raised = raiseReviewStartsPerTick(maxPerTick, { floor, cpuIdlePct });
+      if (raised > maxPerTick) {
+        try { log(`review-daemon: CPU idle ${cpuIdlePct}% >= ${floor.idlePct}% raises maxPerTick ${maxPerTick} -> ${raised}`); }
+        catch { /* Diagnostics must not interrupt admission. */ }
+        maxPerTick = raised;
+      }
+    } catch { /* Unreadable floor or CPU evidence leaves the host allowance unchanged. */ }
+  }
+  return { ...verdict, maxPerTick };
 }
 
 /** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
-export function cliReviewTickOpts({ log = console } = {}) {
+let redTeamDispatchQueue;
+const redTeamGateRetryHistory = new Map();
+let lastRedTeamQueueFloorLine;
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
+  const livePrs = new Map();
+  const readQueuePr = args => {
+    const key = `${args.repo}#${args.pr}`;
+    if (!livePrs.has(key)) {
+      try { livePrs.set(key, readLivePr(args)); } catch { livePrs.set(key, null); }
+    }
+    return livePrs.get(key);
+  };
   return {
     log: line => log.error(line),
-    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+    acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
+    readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
-    liveReviewBudget: liveReviewRoundBudget(),
-    redTeamOnSkip: o => runRedTeamOnSkip({ ...o, readStatus: readRedTeamRecoveryStatus,
-      dispatch: d => dispatchReviewJob(d), log: line => log.error(line) }),
+    // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
+    liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
+    reconcileRedTeamQueue: () => {
+      livePrs.clear();
+      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      // Maintenance evicts terminal PRs and re-keys changed live heads.
+      redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
+    },
+    redTeamOnSkip: o => {
+      let rawPrs = o.rawPrs;
+      try {
+        ({ rawPrs } = syncResultOnHeadLabels({ repo: o.repo, refusals: o.plan?.refusals,
+          rawPrs, log: line => log.error(line) }));
+      } catch { /* Label repair must never block red-team recovery. */ }
+      try {
+        runGateCatchUp({ repo: o.repo, refusals: o.plan?.refusals, rawPrs,
+          history: redTeamGateRetryHistory, log: line => log.error(line) });
+      } catch { /* Gate catch-up must never block the capacity queue. */ }
+      const options = { ...o, rawPrs,
+        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
+      // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
+      const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
+      const queueWord = String(queueSetting ?? '').trim().toLowerCase();
+      // Same words the other boolean env settings accept; an unrecognised value fails open to the default (on), logged.
+      const queueOff = ['off', '0', 'false', 'no'].includes(queueWord);
+      if (queueWord && !queueOff && !['on', '1', 'true', 'yes'].includes(queueWord)) {
+        options.log(`review-daemon: red-team queue ignoring unrecognised WE_RED_TEAM_DISPATCH_QUEUE value (expected on/off/1/0/true/false); queue stays on`);
+      }
+      if (queueOff) {
+        options.log('review-daemon: red-team queue off (source: env WE_RED_TEAM_DISPATCH_QUEUE); recovery runs directly');
+        return runRedTeamOnSkip(options);
+      }
+      if (!redTeamDispatchQueue) {
+        options.log(`review-daemon: red-team queue on (source: ${queueSetting === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`);
+        redTeamDispatchQueue = createRedTeamDispatchQueue({ log: options.log });
+      }
+      // Reload operator policy every tick; retain only the diagnostic, never admission evidence.
+      let floor = null;
+      let floorLine;
+      try {
+        floor = loadRedTeamQueueFloor({ log: line => {
+          if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
+          else options.log(line);
+        } });
+      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+      if (floorLine !== lastRedTeamQueueFloorLine) {
+        if (floorLine !== undefined) {
+          try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
+        }
+        lastRedTeamQueueFloorLine = floorLine;
+      }
+      return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
+        floor, readLivePr: readQueuePr, readCpuIdlePct: () => sampleHost().idlePct });
+    },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,
     postRefreshMarker: defaultPostRebaseComment,
@@ -1565,22 +1830,30 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
   return count;
 }
 
+const REVIEW_CONCURRENCY_PATH = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json');
+
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync } = {}) {
+  const validMax = v => Number.isSafeInteger(v) && v >= 1 && v <= 16;
+  // Invalid overrides fall back to the committed cap; unreadable/invalid defaults hold all new rounds.
+  let defaultMax = 0;
+  try {
+    const configured = JSON.parse(readFile(REVIEW_CONCURRENCY_PATH, 'utf8')).maxLiveReviewRounds;
+    if (validMax(configured)) defaultMax = configured;
+  } catch { /* fail closed with zero slots */ }
   let tool;
-  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  try { tool = JSON.parse(readFile(toolPath, 'utf8')); } catch { tool = undefined; }
   const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
   const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
-    env, standard: { maxLiveReviewRounds: null },
+    env, standard: { maxLiveReviewRounds: defaultMax },
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
-    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
+    valid: { maxLiveReviewRounds: validMax },
   });
   const max = r.value.maxLiveReviewRounds;
-  if (max == null) return null;
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
@@ -1605,7 +1878,7 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 }
 
 export function buildCliDaemonEffects({
-  owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
+  owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, factCache = null,
   reapSessions = defaultReapSessions,
   // Keep the production runReview closure testable without replacing its executor bindings.
   tick = runReviewTick,
@@ -1620,12 +1893,12 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
   reviewTickOpts = cliReviewTickOpts,
-  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log }), ...opts }),
+  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log, factCache }), ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).
   runConvertAdvisories = (opts) => runConvertAdvisoryTickAllRepos({
-    readPrs: defaultReadPrs, readAgents: defaultReadAgents, ...opts,
+    readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents, ...opts,
   }),
   // ON by default: the planner withholds a normal review from a convert-advisory-owed PR, so leaving
   // its executor off strands the PR forever (live #5020, 2026-10-12). The committed product knob is
@@ -1642,10 +1915,12 @@ export function buildCliDaemonEffects({
   // again — see that function's own `for (;;) { await tickOnce(); ... }` shape — so there is never a second,
   // concurrent tick reading or writing this while one is in flight.
   let priorityNames = new Set();
+  let passCount = 0;
   return {
     intervalMs,
     tickOnce: async () => {
       const started = Date.now();
+      factCache?.resetStats();
       const sharing = resolveReviewTickSharing();
       const plans = new Map();
       const onPlan = sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null;
@@ -1710,11 +1985,22 @@ export function buildCliDaemonEffects({
         log.error(`review-daemon: prep-review stage failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
       phaseMs.prep = Date.now() - phaseStarted;
+      let cacheTiming = '';
+      if (factCache) {
+        const stats = factCache.stats();
+        const diffCount = factCache.diffCount;
+        factCache.recordPass({ diffCount, compared: stats.compared });
+        try { await factCache.saveSnapshot(); }
+        catch (e) { log.error(`review-daemon: planner-cache snapshot failed: ${String(e?.message ?? e).split('\n')[0]}`); }
+        cacheTiming = ` · planner-cache hits=${stats.hits} misses=${stats.misses} diffs=${diffCount} shadowEndRule=${JSON.stringify(factCache.shadowEndRule())}`;
+      }
       if (sharing.phaseTimings) {
         const seconds = (ms) => `${(ms / 1000).toFixed(1)}s`;
         const repos = Object.entries(result?.perRepoMs ?? {}).map(([repo, ms]) => `${repo.split('/').at(-1)} ${seconds(ms)}`).join(', ');
-        log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})`);
+        log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})${cacheTiming}`);
       }
+      passCount += 1;
+      logDaemonHeap({ daemon: 'review-daemon', pass: passCount, passMs: Date.now() - started, log });
       return { ...result, sessionReap, convertAdvisory, prepReview };
     },
     sleep: realSleep,
@@ -1723,7 +2009,7 @@ export function buildCliDaemonEffects({
       // A `withSelfSync`-skipped tick (`skippedTick`: `repos: []`) used to print as "tick () — 0 owed", which read
       // like discovery had watched NO repo. Say what actually happened.
       if (result?.skipped) { log.error(`review-daemon: tick skipped (${result.reason ?? 'unknown'}) — no repo was read this tick`); return; }
-      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap: ${result.deferredForCapReason ?? 'maxLiveReviewRounds'})` : ''}`);
+      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap: ${result.deferredForCapReason ?? 'maxLiveReviewRounds'})` : ''}${result.reconcileFailed?.length ? `, LIST/RECONCILE FAILED ${result.reconcileFailed.length} repo(s) — "owed" is NOT trustworthy this tick` : ''}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick review dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read.
       // One structured record per successfully planned repository; the health watch's `operator-hold-aged` smell reads
@@ -1748,6 +2034,7 @@ export function buildCliDaemonEffects({
       // `h.remove`/`h.healed`/`h.flagged` are INDEPENDENT optional fields on one entry (see
       // `sweepReviewHoldLabels`'s own return doc) — never assume any one of them is present.
       for (const h of (result.holdReconcile ?? [])) {
+        if (h.stampRestore) log.error(`review-daemon: ${h.repo}#${h.num} author-stamp ${h.stampRestore} - ${h.detail?.reason ?? ''}`.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' '));
         if (h.repark) log.error(`review-daemon: ${h.repo}#${h.num} human-surface re-park ${h.repark} at ${String(h.head||'').slice(0,9)} (${(h.files||[]).join(',')})${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.remove?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile removed ${h.remove.join(',')}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.healed?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile HEALED — removed ${h.healed.join(',')}${h.commentPosted ? ', comment posted' : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`);
@@ -1813,11 +2100,18 @@ async function main() {
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });
     process.exit(0);
   };
+  const requestedCacheMode = process.env.WE_PLANNER_CACHE;
+  const cacheMode = requestedCacheMode === 'off' ? 'off' : 'shadow';
+  console.error(`review-daemon: planner-cache mode=${cacheMode} (source ${requestedCacheMode === undefined ? 'standard' : 'env'})${requestedCacheMode === 'on' ? '; on is not supported yet; using shadow' : ''}`);
+  const factCache = cacheMode === 'off' ? null : createPlannerFactCache({
+    mode: 'shadow', snapshotPath: join(selfRoot, '.conveyor', 'planner-facts.json'),
+  });
+  await factCache?.loadSnapshot();
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged): a relevant PR event ends the sleep
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
   );

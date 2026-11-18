@@ -407,8 +407,42 @@ export function isLoadOnlyRedStandDown(c) {
   return isTrustedMarkerAuthor(c) && body.trimStart().startsWith(STAND_DOWN_MARKER)
     && STAND_DOWN_TRAILER_RE.exec(body)?.[1] === 'gate-red'
     && !isLoadFlakeStandDown(c) && !parseAltBranch(body)?.sha
-    && /\bred only on\b/i.test(reason) && /\bhost[\s-]+load\b/i.test(reason)
-    && /\b(?:wall-clock|timing|timeouts?|latency)\b/i.test(reason);
+    && ((/\bred only on\b/i.test(reason) && /\bhost[\s-]+load\b/i.test(reason)
+      && /\b(?:wall-clock|timing|timeouts?|latency)\b/i.test(reason))
+      || (statesOutOfDiffTimeoutEvidence(reason) && /stopped rather than guessing:[^\n]*\n\n/.test(body))); // a persisted multi-line detail (text below the reason line) is never read as flake
+}
+
+/**
+ * #6469 live: a fixer stood down (gate-red) on one test timeout in a file outside the PR diff and nothing re-armed
+ * it, because only the "red only on ... host load" wording was read. A reason now counts as load-only red when it
+ * states ALL of: a test TIMEOUT (never an assertion failure), that it is outside this change (unrelated / outside the
+ * diff), and the corroboration (other tests pass, passes alone, or the same timeout on base). A diff-touched failure
+ * says none of that and stays terminal; the text is a keyword grammar (it cannot see the diff), so the re-dispatched fixer's own GREEN verify, not this classifier, is what stops a real failure from being pushed; the re-dispatch still needs a GREEN verify before any push.
+ */
+/** A gate-red detail naming a timeout is flattened to one line, so a failure on a later line cannot hide below the one line the classifier reads. */
+export function flattenTimeoutDetail(reason, detail) {
+  return reason === 'gate-red' && typeof detail === 'string' && /\btimed out\b|\btimeout\b/i.test(detail) ? detail.replace(/\s+/g, ' ').trim() : detail;
+}
+
+export function statesOutOfDiffTimeoutEvidence(reason) {
+  // WHITELIST, not a blacklist (the audit kept finding new failure wordings): drop the stock clause and the
+  // recognized evidence phrases; if any other word remains, the report says something else and stays terminal.
+  const TEST_FILE = /[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi;
+  let r = String(reason ?? '').replace(STAND_DOWN_REASONS['gate-red'], ' ');
+  if (new Set(r.match(TEST_FILE) ?? []).size !== 1) return false; // exactly one named file, so the CLI can check it against the diff
+  const UNRELATED = /\bunrelated to this (?:change|pr)\b|\b(?:outside|not in) (?:the |this )?(?:pr'?s? )?diff\b/i;
+  const CORROBORATION = /\ball \d+ other tests?(?: incl\.? [\w./-]+)? pass(?:ed)?\b|\bevery other test passe?s?\b|\bother tests? (?:all )?pass(?:ed)?\b|\bpasses? (?:alone|in isolation)\b|\bsame (?:timeout|failure) on (?:base|main|[0-9a-f]{7,40})\b/gi;
+  if (!/\btimed out\b|\btimeout\b/i.test(r) || !UNRELATED.test(r) || !CORROBORATION.test(r)) return false;
+  // One quoted test name at most (it is the title of the timed-out test), and it may not itself narrate a failure.
+  const quoted = r.match(/'[^']*'|"[^"]*"/g) ?? [];
+  if (quoted.length > 1 || quoted.some((q) => !/^['"][A-Za-z _.,-]*['"]$/.test(q) || /\bmismatch|\bversus\b|\bvs\b|\bdiffer|\bequal|\binstead\b|\bthan\b|\bnot\b|\bfail|assert|expect|receiv|!==|===|\bmodif|\bchang|\btouch|\bdiff\b|\bPR\b|\bpass/i.test(q))) return false;
+  r = r.replace(TEST_FILE, ' ').replace(/'[^']*'|"[^"]*"/g, ' ').replace(CORROBORATION, ' ')
+    .replace(/\btimed out(?: at \d+ ?ms)?\b|\btimeouts?\b/gi, ' ').replace(new RegExp(UNRELATED.source, 'gi'), ' ')
+    .replace(/\bred only on\b/gi, ' ');
+  const words = r.match(/[a-z][a-z-]*/gi) ?? [];
+  // Digits and operators left behind (`1 !== 2`) are assertion evidence too: only punctuation may remain beside words.
+  if (/[0-9=<>!~^&|+*\/\\]/.test(r)) return false;
+  return words.every((w) => /^(?:a|the|in|of|at|on|and|but|test|file|it|ms|ran|run|file|is|its)$/i.test(w));
 }
 
 function loadTrailer(body, name) {
@@ -763,7 +797,7 @@ if (IS_CLI) {
     fail(`usage: stand-down.mjs <pr> [--repo=<owner/name>] [--reason=<${Object.keys(STAND_DOWN_REASONS).join('|')}>] [--who=<session slug>] [--actor=<name>] [--detail=<text>] [--head=<sha> --alt=<lane/…-alt> --alt-sha=<sha>] [--superseded-by=<n> --merged-at=<iso>]  (pr must be a positive integer)`);
   }
   const actor = typeof flags.actor === 'string' ? flags.actor : undefined;
-  const detail = typeof flags.detail === 'string' ? flags.detail : undefined;
+  let detail = typeof flags.detail === 'string' ? flags.detail : undefined;
   let findingRefs;
   if (flags['finding-refs'] !== undefined) {
     try { findingRefs = JSON.parse(flags['finding-refs']); } catch { fail('--finding-refs must be JSON [{"runId":"…","key":"…"}]'); }
@@ -777,6 +811,23 @@ if (IS_CLI) {
   const redispatch = loadFlakeRedispatchRequest({ reason: flags.reason, alt: flags.alt, altSha: flags['alt-sha'], repoKey: repoKeyForSlug(flags.repo) });
   if (flags.reason === 'load-flake' && !loadHold) {
     process.stderr.write(redispatch ? '⚠ stand-down: recording a quiet-host re-dispatch hold (no saved fix)\n' : '⚠ stand-down: unknown repo; recording a terminal gate-red stand-down instead\n');
+  }
+  // The prose cannot see the diff, so the CLI can: a timeout in a file this PR changes is never out-of-diff, and the
+  // note it adds names the diff so the evidence grammar rejects it (terminal stays terminal).
+  // standDownReason reads only the first body line, so a multi-line detail could hide a failure below it: flatten.
+  detail = flattenTimeoutDetail(flags.reason, detail);
+  const diffTouched = (() => {
+    if (flags.reason !== 'gate-red' || !/\btimed out\b|\btimeout\b/i.test(detail ?? '')) return false;
+    const named = new Set((detail ?? '').match(/[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?\b/gi) ?? []);
+    if (!named.size) return false;
+    try {
+      const out = execFileSync('gh', ['pr', 'diff', String(pr), '--name-only', ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : [])], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+      return out.split('\n').some((f) => named.has(f.split('/').pop()));
+    } catch { return true; } // unreadable diff: fail closed, stays terminal
+  })();
+  if (diffTouched) detail = `${detail} (a file in this PR's diff)`;
+  if (flags.reason === 'gate-red' && /\btimed out\b|\btimeout\b/i.test(detail ?? '') && !statesOutOfDiffTimeoutEvidence(detail ?? '')) {
+    process.stderr.write('⚠ stand-down: detail names a timeout. If the failing test is NOT in this PR\'s diff, state: the file, "unrelated to this change"/"outside the diff", and "passes alone" or "all N other tests pass" or "same timeout on <base sha>" so it becomes a re-armable load-flake hold; otherwise it stays terminal\n');
   }
   const supersededBy = flags.reason === 'superseded' && typeof flags['superseded-by'] === 'string' ? Number(flags['superseded-by']) : null;
   if (flags.reason === 'superseded' && !(Number.isInteger(supersededBy) && supersededBy > 0)) fail('--reason=superseded needs --superseded-by=<merged PR number>');

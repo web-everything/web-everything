@@ -41,7 +41,18 @@ export const RUN_RECORD_VERSION = 1;
  * a spawned session — and a replay must RESUME it. One status cannot carry both without the replay guard being
  * wrong half the time.
  */
-export const EFFECT_STATUSES = Object.freeze(['declared', 'pending', 'in-flight', 'applied', 'failed']);
+export const EFFECT_STATUSES = Object.freeze(['declared', 'pending', 'in-flight', 'applied', 'failed', 'refused']);
+
+/** Recognized permanent guards, shared by the executor and persisted-record readers. */
+export const PERMANENT_GUARD_REFUSAL_MARKERS = Object.freeze(['SELF-CLEAR REFUSED']);
+
+/** A refused entry can settle a run only with evidence of an attempted permanent guard refusal. */
+export function hasPermanentGuardRefusalEvidence(entry) {
+  return entry?.status === 'refused'
+    && Number.isInteger(entry.attempts) && entry.attempts >= 1
+    && typeof entry.error === 'string' && entry.error.trim().length > 0
+    && PERMANENT_GUARD_REFUSAL_MARKERS.some((marker) => entry.error.includes(marker));
+}
 
 /** Ids are used as filenames, so the character set is closed — no separators, no traversal, no surprises. */
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -70,9 +81,12 @@ function isPlainObject(v) {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
-/** Is `id` usable as a run id (and therefore as a filename)? */
+/**
+ * Is `id` usable as a run id (and therefore as a filename)? R755: an id ending `.abandoned` is reserved for the
+ * `<id>.abandoned.json` tombstone sidecar, so listRunIds never mistakes a tombstone for a run record.
+ */
 export function isValidRunId(id) {
-  return typeof id === 'string' && RUN_ID_RE.test(id) && id !== '.' && id !== '..';
+  return typeof id === 'string' && RUN_ID_RE.test(id) && id !== '.' && id !== '..' && !id.endsWith('.abandoned');
 }
 
 /**
@@ -121,7 +135,7 @@ export function newJobRunRecord({ id, kind, input = {}, codeMode, maxAttempts, c
  * `usage` is handled separately (it is an object of counters, not a scalar).
  */
 const TELEMETRY_NUMBERS = Object.freeze(['costUsd', 'durationMs', 'wallMs', 'numTurns', 'loadedContextTokens', 'exitCode', 'attempts']);
-const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision', 'signal', 'stderrTail', 'failure']);
+const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision', 'signal', 'stderrTail', 'failure', 'failureKind', 'failureText']);
 /**
  * Held item 223 — WHY A SEAT FAILED, not only what it cost. `exitCode`, `signal`, `attempts`, `failure` and a
  * `stderrTail` come from `we:scripts/lib/judge-spawn.mjs#JudgeUnparseableError`'s telemetry. Before they were on this
@@ -129,7 +143,7 @@ const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'mod
  * could say whether the juror was killed, crashed or printed nothing. `stderrTail` is bounded here as well as at the
  * source, because this row is written on every `advance`.
  */
-const TELEMETRY_STRING_MAX = Object.freeze({ stderrTail: 1000 });
+const TELEMETRY_STRING_MAX = Object.freeze({ stderrTail: 1000, failureText: 500 });
 /**
  * THE FLAGS, recorded only when TRUE. A `timedOut: false` on every row is noise; the fact being recorded is
  * the exception, and its absence is the ordinary case (#3203). Without it a juror that hit the wall and a
@@ -160,7 +174,10 @@ export function normalizeJudgeTelemetry({ step = '', stepIndex = null, telemetry
     if (typeof src[k] === 'number' && Number.isFinite(src[k])) row[k] = src[k];
   }
   for (const k of TELEMETRY_STRINGS) {
-    if (typeof src[k] === 'string' && src[k]) row[k] = TELEMETRY_STRING_MAX[k] ? src[k].slice(-TELEMETRY_STRING_MAX[k]) : src[k];
+    if (typeof src[k] === 'string' && src[k]) {
+      const max = TELEMETRY_STRING_MAX[k];
+      row[k] = max ? (k === 'stderrTail' ? src[k].slice(-max) : src[k].slice(0, max)) : src[k];
+    }
   }
   for (const k of TELEMETRY_FLAGS) {
     if (src[k] === true) row[k] = true;
@@ -459,6 +476,9 @@ export function validateRunRecord(record) {
       if (!Number.isInteger(e.index) || e.index < 0) errors.push(`effects[${i}] has an invalid index`);
       if (!EFFECT_STATUSES.includes(e.status)) {
         errors.push(`effects[${i}] has status ${JSON.stringify(e.status)}; expected one of ${EFFECT_STATUSES.join('|')}`);
+      }
+      if (e.status === 'refused' && !hasPermanentGuardRefusalEvidence(e)) {
+        errors.push(`effects[${i}] is refused without permanent guard evidence — requires positive integer attempts and a non-empty error containing a recognized permanent-guard marker`);
       }
       // THE FIELDS `in-flight` DEPENDS ON (#3073; PR #1180 review, finding 4). Adding the status to the enum
       // without checking its payload lets a hand-built or truncated record claim a state the executor's rules

@@ -88,7 +88,7 @@ describe('recordAntigravityRunScorecard (#3383 mechanical-dispatcher Gap 1 fix â
     const scoreTranscript = vi.fn(() => ({ rubricVersion: '2026-09-13.1', criteriaEvaluated: 1, deductions: [], score: 100 }));
     const row = recordAntigravityRunScorecard({
       transcriptFile: '/tmp/some-antigravity-judge-transcript.jsonl', dispatchKind: 'advisory-review',
-      kind: 'review', role: 'advisory-review', model: 'gemini-3.1-pro', effort: 'low',
+      kind: 'review', role: 'advisory-review', model: 'gemini-4-argon-high', effort: 'low',
     }, { scoreTranscript, append, statusFor });
 
     expect(scoreTranscript).toHaveBeenCalledWith('/tmp/some-antigravity-judge-transcript.jsonl');
@@ -97,12 +97,12 @@ describe('recordAntigravityRunScorecard (#3383 mechanical-dispatcher Gap 1 fix â
     expect(stored.dispatchKind).toBe('advisory-review');
     expect(stored.subjectClass).toBe('work-agent'); // 'review' is a WORK_AGENT_KINDS member
     expect(stored.provider).toBe('antigravity');
-    expect(stored.model).toBe('gemini-3.1-pro');
+    expect(stored.model).toBe('gemini-4-argon-high');
     expect(stored.effort).toBe('low');
     expect(stored.probationStatus).toBe('probation');
     expect(stored.outcome).toBeNull(); // #3649 Fork 1 â€” joined later, never guessed here
     expect(typeof stored.score).toBe('number');
-    expect(statusFor).toHaveBeenCalledWith({ provider: 'antigravity', model: 'gemini-3.1-pro', role: 'advisory-review' });
+    expect(statusFor).toHaveBeenCalledWith({ provider: 'antigravity', model: 'gemini-4-argon-high', role: 'advisory-review' });
     expect(row).toBe(stored);
   });
 
@@ -110,11 +110,11 @@ describe('recordAntigravityRunScorecard (#3383 mechanical-dispatcher Gap 1 fix â
     const classify = vi.fn(() => 'work-agent');
     const statusFor = vi.fn(() => 'trusted');
     recordAntigravityRunScorecard(
-      { transcriptFile: '/tmp/t.jsonl', dispatchKind: 'advisory-review', role: 'advisory-review', model: 'gemini-3.1-pro' },
+      { transcriptFile: '/tmp/t.jsonl', dispatchKind: 'advisory-review', role: 'advisory-review', model: 'gemini-4-argon-high' },
       { scoreTranscript: vi.fn(() => ({ rubricVersion: 'x', criteriaEvaluated: 0, deductions: [], score: null })), classify, append: vi.fn(), statusFor },
     );
     expect(classify).toHaveBeenCalledWith({ kind: 'advisory-review' });
-    expect(statusFor).toHaveBeenCalledWith({ provider: 'antigravity', model: 'gemini-3.1-pro', role: 'advisory-review' });
+    expect(statusFor).toHaveBeenCalledWith({ provider: 'antigravity', model: 'gemini-4-argon-high', role: 'advisory-review' });
   });
 
   it('NEVER THROWS â€” a scoring failure (e.g. `transcriptFile: null`, a failed persist) returns null', () => {

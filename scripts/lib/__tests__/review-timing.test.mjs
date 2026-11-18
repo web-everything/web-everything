@@ -1,17 +1,225 @@
 import { describe, it, expect } from 'vitest';
 import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
-  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
+  fixPushGate, reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
+import * as reviewTiming from '../review-timing.mjs';
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
+import { reviewCiGate } from '../review-ci-gate.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
+import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
+describe('pending-CI start policy', () => {
+  it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
+    const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
+    const result = reviewStartGate({ headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
+    expect(result.affected).toEqual([{ name: 'standards', reason: 'missing' }]);
+  });
+  // Red team on f4ed5360 (#6326): a green LEGACY commit status (`{context, state}`) must imply integration in the
+  // registration gate exactly as the strict gate (which normalizes statuses first) already does.
+  describe.each(['ci-green', 'fast-checks', 'push'])('a green legacy status test implies integration under startAfter=%s', startAfter => {
+    const policy = startEarly => ({ ...review, startAfter, startEarly, fastChecks: ['test', 'integration'] });
+    const requiredChecks = ['test', 'integration'];
+    it.each([['shadow', 'success'], ['on', 'success'], ['shadow', 'SUCCESS'], ['on', 'SUCCESS']])('startEarly=%s state=%s', (startEarly, state) => {
+      const checks = [{ context: 'test', state }];
+      expect(reviewCiGate({ headSha: head, checks, requiredChecks })).toMatchObject({ allowed: true });  // the strict gate already accepts
+      expect(reviewStartGate({ headSha: head, requiredChecks, checks, policy: policy(startEarly) })).toMatchObject({ allowed: true });
+    });
+    it.each(['pending', 'failure', 'error'])('a %s legacy status implies nothing', state => {
+      const result = reviewStartGate({ headSha: head, requiredChecks, checks: [{ context: 'test', state }], policy: policy('shadow') });
+      expect(result.allowed).toBe(false);
+    });
+    it.each(['shadow', 'on'])('a status row carrying status:null is not normalized, as in the strict gate (startEarly=%s)', startEarly => {
+      const checks = [{ context: 'test', state: 'success', status: null }];
+      expect(reviewCiGate({ headSha: head, checks, requiredChecks }).allowed).toBe(false);
+      expect(reviewStartGate({ headSha: head, requiredChecks, checks, policy: policy(startEarly) }).allowed).toBe(false);
+    });
+    // Self-review on 9d3b3764: a contradictory aggregate (`state` red/pending, `conclusion: success`) is NOT green to
+    // the strict gate (its `state` wins), so it must not imply integration in the registration gate either.
+    it.each([['failure', 'shadow'], ['error', 'on'], ['pending', 'shadow'], ['FAILURE', 'on']])(
+      'a contradictory status (state=%s, conclusion=success) implies nothing (startEarly=%s)', (state, startEarly) => {
+        const checks = [{ context: 'test', state, conclusion: 'success' }];
+        expect(reviewCiGate({ headSha: head, checks, requiredChecks: ['integration'] }).allowed).toBe(false);
+        expect(reviewStartGate({ headSha: head, requiredChecks: ['integration'], checks, policy: policy(startEarly) }).allowed).toBe(false);
+      });
+  });
+  it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
+    expect(reviewStartGate({ headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
+      policy: { ...review, startAfter: 'ci-green', startEarly: 'off' } })).toEqual({ allowed: false,
+      headSha: head, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] });
+  });
+  it('off preserves strict fast-check failure diagnostics when the required set is unknown', () => {
+    expect(reviewStartGate({ headSha: head, checks: [check('test', 'failure')],
+      policy: { ...review, startAfter: 'fast-checks', fastChecks: ['test'], startEarly: 'off' } })).toEqual({
+      allowed: false, headSha: head, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] });
+  });
+  it.each(['push', 'fast-checks', 'ci-green'])('requires every prerequisite registered on this head under %s', startAfter => {
+    const names = ['standards', 'test'];
+    for (const startEarly of ['on', 'shadow']) {
+      const input = { headSha: head, requiredChecks: names, policy: { ...review, startAfter, startEarly, fastChecks: names } };
+      for (const checks of [[check('unrelated', null, { status: 'queued' })], [check('test', null, { status: 'queued' })]]) {
+        const result = reviewStartGate({ ...input, checks });
+        expect(result).toMatchObject({ allowed: false, reason: 'ci-not-registered' });
+        expect(result.affected).toContainEqual({ name: 'standards', reason: 'missing' });
+        expect(result.earlyStartNote).toBeUndefined();
+        expect(result.wouldStartEarly).not.toBe(true);
+      }
+      const checks = names.map(name => check(name, null, { status: 'queued' }));
+      expect(reviewStartGate({ ...input, checks }).allowed).toBe(startAfter === 'push' || startEarly === 'on');
+      expect(reviewStartGate({ ...input, checks: [check('standards', 'failure'), checks[1]] }))
+        .toMatchObject({ allowed: false, reason: 'ci-red' });
+      expect(reviewStartGate({ ...input, checks: [check('standards', 'success', { head_sha: 'b'.repeat(40) }), checks[1]] }).allowed).toBe(false);
+      for (const conclusion of ['neutral', 'skipped']) expect(reviewStartGate({ ...input, checks: [check('standards', conclusion), checks[1]] }).allowed).toBe(false);
+    }
+  });
+  it.each(['push', 'fast-checks', 'ci-green'])('refuses unknown prerequisites under %s', startAfter => {
+    expect(reviewStartGate({ headSha: head, checks: [check('unrelated', null, { status: 'queued' })],
+      requiredChecks: [], policy: { ...review, fastChecks: null, startAfter, startEarly: 'on' } }))
+      .toMatchObject({ allowed: false, reason: 'unknown-required-set' });
+  });
+  it('keeps the off-mode strict refusal for missing and pending prerequisites', () => {
+    expect(reviewStartGate({ headSha: head, checks: [check('test', null, { status: 'queued' })],
+      requiredChecks: ['standards', 'test'], policy: { ...review, startAfter: 'ci-green', startEarly: 'off' } }))
+      .toMatchObject({ allowed: false, reason: 'required-checks-not-successful', affected: [
+        { name: 'standards', reason: 'missing' }, { name: 'test', reason: 'pending' }] });
+  });
+  it('resolves shipped R468 timing from review.json as push start, red cancellation, and shadow early policy', () => {
+    const resolved = resolveTimingPolicy({ env: {}, fix: {}, platformReview: {}, platformFix: {}, log: () => {} });
+    expect(resolved.review).toMatchObject({ startAfter: 'push', cancelOnCiRed: true, startEarly: 'shadow' });
+    expect(resolved.sources.review).toMatchObject({ startAfter: 'tool', cancelOnCiRed: 'tool', startEarly: 'tool' });
+  });
+  it.each(['fast-checks', 'ci-green'])('allows an environment rollback of shipped push timing to %s', startAfter => {
+    const resolved = resolveTimingPolicy({ env: { WE_REVIEW_START_AFTER: startAfter }, fix: {}, platformReview: {}, platformFix: {}, log: () => {} });
+    expect(resolved.review.startAfter).toBe(startAfter);
+    expect(resolved.sources.review.startAfter).toBe('env');
+  });
+  const args = { headSha: head, repo: 'we', requiredChecks: ['integration'],
+    checks: [check('standards'), check('test-shard (1)', null, { status: 'in_progress' })] };
+  it('starts early only in on mode; shadow reports the opportunity and off is unchanged', () => {
+    const run = startEarly => reviewStartGate({ ...args, policy: { ...review, startEarly } });
+    expect(run('on')).toMatchObject({ allowed: true, reason: 'early-pending-ci', earlyStart: true, headSha: head,
+      affected: [{ name: 'test-shard (1)', reason: 'pending' }] });
+    expect(run('shadow')).toMatchObject({ allowed: false, wouldStartEarly: true,
+      earlyStartNote: `review-early-start: would start early on ${head} (pending: test-shard (1)=pending)` });
+    expect(run('off')).toEqual({ allowed: false, headSha: head, reason: 'required-checks-not-successful',
+      affected: [{ name: 'test-shard (1)', reason: 'pending' }] });
+  });
+  it.each(['fast-checks', 'ci-green'])('allows all registered prerequisites queued or running under %s', startAfter => {
+    const names = startAfter === 'ci-green' ? ['integration', 'second-required'] : fast;
+    for (const status of ['queued', 'in_progress']) {
+      const checks = names.map(name => check(name, null, { status }));
+      expect(reviewStartGate({ ...args, requiredChecks: ['integration', 'second-required'], checks,
+        policy: { ...review, startAfter, startEarly: 'on' } }))
+        .toMatchObject({ allowed: true, earlyStart: true, headSha: head });
+    }
+  });
+  it.each(['on', 'shadow'])('requires a pending prerequisite rather than an unrelated row for %s bypass', startEarly => {
+    for (const startAfter of ['fast-checks', 'ci-green']) {
+      for (const checks of [[check('unrelated')], [check('unrelated', null, { status: 'queued' })],
+        [check(startAfter === 'ci-green' ? 'integration' : 'standards')]]) {
+        const result = reviewStartGate({ ...args, requiredChecks: ['integration', 'second-required'], checks,
+          policy: { ...review, startAfter, startEarly } });
+        expect(result.allowed).toBe(false);
+        expect(result.wouldStartEarly).not.toBe(true);
+        expect(result.earlyStartNote).toBeUndefined();
+      }
+    }
+  });
+  it('push mode waits for registered head CI and refuses unknown-set healable red', () => {
+    const policy = { ...review, startAfter: 'push', fastChecks: ['test'] };
+    expect(reviewStartGate({ headSha: head, checks: [], verifyGreen: true, policy: { ...policy, startBeforeCi: true } }))
+      .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [{ name: 'test', reason: 'missing' }] });
+    for (const checks of [[], undefined, null]) {
+      expect(reviewStartGate({ headSha: head, checks, policy }))
+        .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [{ name: 'test', reason: 'missing' }] });
+    }
+    for (const requiredChecks of [undefined, null, []]) {
+      expect(reviewStartGate({ headSha: head, checks: [check('test', 'failure')], requiredChecks, policy }))
+        .toMatchObject({ allowed: false, reason: 'ci-red', affected: [] });
+      expect(reviewStartGate({ headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks, policy }))
+        .toMatchObject({ allowed: true, reason: 'push', headSha: head });
+    }
+  });
+  it.each(['on', 'shadow'])('refuses empty or absent registered CI evidence without an early-start note (%s)', startEarly => {
+    for (const checks of [[], undefined, null]) {
+      const result = reviewStartGate({ ...args, checks, policy: { ...review, startEarly } });
+      expect(result.allowed).toBe(false);
+      expect(result.wouldStartEarly).not.toBe(true);
+      expect(result.earlyStartNote).toBeUndefined();
+    }
+  });
+  it('validates and cascades the early publication wait and poll settings with provenance', () => {
+    const base = { env: {}, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {} };
+    expect(resolveTimingPolicy(base).review).toMatchObject({ startEarlyPublishWaitMs: 1500000, startEarlyPollMs: 30000 });
+    const logs = [];
+    resetCascadeLogForTest();
+    const resolved = resolveTimingPolicy({ ...base, platformReview: { startEarlyPublishWaitMs: 700, startEarlyPollMs: 90 },
+      review: { startEarlyPublishWaitMs: 500, startEarlyPollMs: 80 },
+      env: { WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100', WE_POLICY_CASCADE_LOG: '1' },
+      log: line => logs.push(line) });
+    expect(resolved.review).toMatchObject({ startEarlyPublishWaitMs: 250, startEarlyPollMs: 100 });
+    expect(resolved.sources.review).toMatchObject({ startEarlyPublishWaitMs: 'env', startEarlyPollMs: 'env' });
+    expect(logs.join('\n')).toContain('startEarlyPublishWaitMs=250 (env)');
+    expect(logs.join('\n')).toContain('startEarlyPollMs=100 (env)');
+    expect(resolveTimingPolicy({ ...base, platformReview: { startEarlyPublishWaitMs: 700, startEarlyPollMs: 90 },
+      review: { startEarlyPublishWaitMs: -1, startEarlyPollMs: 0 },
+      env: { WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: 'invalid', WE_REVIEW_START_EARLY_POLL_MS: '1.5' } }).review)
+      .toMatchObject({ startEarlyPublishWaitMs: 700, startEarlyPollMs: 90 });
+  });
+  it.each(['off', 'shadow', 'on'])('never permits healable red CI in %s mode', startEarly => {
+    for (const startAfter of ['fast-checks', 'ci-green']) {
+      expect(reviewStartGate({ ...args, checks: [...args.checks, check('integration', 'failure')],
+        policy: { ...review, startAfter, startEarly } })).toMatchObject({ allowed: false,
+        reason: startEarly === 'off' && startAfter === 'ci-green' ? 'required-checks-not-successful' : 'ci-red' });
+    }
+  });
+  it('fails closed on missing heads, wrong heads, malformed rows, red fast checks and unknown requirements', () => {
+    const policy = { ...review, startEarly: 'on' };
+    for (const override of [
+      { headSha: null }, { checks: null }, { checks: [null] },
+      { checks: [check('standards', 'success', { head_sha: 'b'.repeat(40) })] },
+      { checks: [check('standards', null, { status: 'queued', head_sha: '' })] },
+      { checks: [check('standards', 'failure', { status: 'in_progress' })] },
+      { checks: [check('standards', 'failure')] },
+      { checks: [check('unrelated', null, { status: 'unknown' })] },
+      { checks: [{ name: 'standards', status: 'queued', state: 'success' }] },
+      { policy: { ...policy, startAfter: 'ci-green' }, requiredChecks: [] },
+    ]) {
+      const result = reviewStartGate({ ...args, policy, ...override });
+      expect(result.allowed).toBe(false);
+      expect(result.wouldStartEarly).not.toBe(true);
+      expect(result.earlyStart).not.toBe(true);
+    }
+  });
+  it('resolves startEarly across every layer, rejects invalid values, and logs provenance', () => {
+    const base = { env: {}, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {} };
+    expect(resolveTimingPolicy(base).review.startEarly).toBe('shadow');
+    expect(resolveTimingPolicy({ ...base, platformReview: { startEarly: 'on' } }).sources.review.startEarly).toBe('platform');
+    expect(resolveTimingPolicy({ ...base, platformReview: { startEarly: 'on' }, review: { startEarly: 'off' } }).review.startEarly).toBe('off');
+    const logs = [];
+    const result = resolveTimingPolicy({ ...base, review: { startEarly: 'off' },
+      env: { WE_REVIEW_START_EARLY: 'on', WE_POLICY_CASCADE_LOG: '1' }, log: line => logs.push(line) });
+    expect(result.review.startEarly).toBe('on');
+    expect(result.sources.review.startEarly).toBe('env');
+    expect(logs.join('\n')).toContain('startEarly="on" (env)');
+    expect(resolveTimingPolicy({ ...base, review: { startEarly: 'on' }, env: { WE_REVIEW_START_EARLY: 'invalid' } }).review.startEarly).toBe('on');
+    expect(resolveTimingPolicy({ ...base, review: { startEarly: true } }).review.startEarly).toBe('shadow');
+  });
+  it('reads the tool timing block while preserving legacy timing leaves', () => {
+    const result = resolveTimingPolicy({ env: {}, platformReview: {}, platformFix: {},
+      read: path => path.endsWith('/settings/review.json') ? '{"timing":{"startEarly":"off"}}'
+        : path.endsWith('/review-settings.json') ? '{"startAfter":"ci-green"}' : '{}' });
+    expect(result.review).toMatchObject({ startAfter: 'ci-green', startEarly: 'off' });
+    expect(result.sources.review.startEarly).toBe('tool');
+  });
+});
 describe('parallel review start and void', () => {
   it('starts after only fast checks, with full CI still pending', () => {
     const checks = [...fast.map(n => check(n)), check('integration', null, { status: 'in_progress' })];
     expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(true);
     expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter: 'ci-green' } }).allowed).toBe(false);
-    expect(reviewStartGate({ headSha: head, checks: [], policy: { ...review, startAfter: 'push' } }).allowed).toBe(true);
+    expect(reviewStartGate({ headSha: head, repo: 'we', checks: [], policy: { ...review, startAfter: 'push' } }))
+      .toMatchObject({ allowed: false, reason: 'ci-not-registered' });
   });
   it('requires each fast check on the head and refuses a red non-fast check', () => {
     for (const checks of [[], [check('standards')], fast.map(n => check(n, 'success', { head_sha: 'b'.repeat(40) })),
@@ -140,10 +348,11 @@ it('resolves every timing leaf through the cascade, logging sources and rejectin
   const result = resolveTimingPolicy({ env: { WE_REVIEW_DELTA_MAX_LINES: '12', WE_FIX_JOIN_CI_AND_REVIEW: 'false' },
     review: { deltaMaxFiles: 2, cancelOnCiRed: 'bad' }, fix: {}, platformReview: { cancelOnCiRed: false }, platformFix: { joinWaitMaxMin: 7 } });
   expect(result.review).toMatchObject({ startAfter: 'fast-checks', deltaMaxLines: 12, deltaMaxFiles: 2, cancelOnCiRed: false });
-  expect(result.fix).toEqual({ joinCiAndReview: false, joinWaitMaxMin: 7 });
+  expect(result.fix).toEqual({ joinCiAndReview: false, joinWaitMaxMin: 7, pushAfterCi: false, pushAfterCiMaxMin: 30 });
   expect(result.sources.review).toMatchObject({ startAfter: 'standard', deltaMaxLines: 'env', deltaMaxFiles: 'tool', cancelOnCiRed: 'platform' });
 });
 it('logs each timing setting with its effective source, including enabled defaults', () => {
+  resetCascadeLogForTest();
   const logs = [];
   resolveTimingPolicy({ env: { WE_POLICY_CASCADE_LOG: '1' }, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {}, log: line => logs.push(line) });
   expect(logs.join('\n')).toContain('startAfter="fast-checks" (standard)');
@@ -151,4 +360,161 @@ it('logs each timing setting with its effective source, including enabled defaul
   expect(logs.join('\n')).toContain('skipDrainMechanical=true (standard)');
   expect(logs.join('\n')).toContain('joinCiAndReview=true (standard)');
   expect(logs.join('\n')).toContain('joinWaitMaxMin=15 (standard)');
+});
+
+describe('verified early review', () => {
+  it.each(['fast-checks', 'ci-green'])('starts with an exact-head verification under %s', startAfter => {
+    const args = { headSha: head, checks: [], requiredChecks: ['test'], verifyGreen: true,
+      policy: { ...review, startAfter, startBeforeCi: true } };
+    expect(reviewStartGate(args)).toMatchObject({ allowed: true, reason: 'verify-marker' });
+    for (const verifyGreen of [false, undefined, 'true'])
+      expect(reviewStartGate({ ...args, verifyGreen }).allowed).toBe(false);
+    expect(reviewStartGate({ ...args, headSha: null }).allowed).toBe(false);
+    expect(reviewStartGate({ ...args, policy: { ...args.policy, startBeforeCi: false } }).allowed).toBe(false);
+    expect(reviewStartGate({ ...args, checks: [check('test', 'failure')] })).toMatchObject({ allowed: false, reason: 'ci-red' });
+    // Unknown required set: a red check still blocks the marker path.
+    expect(reviewStartGate({ ...args, requiredChecks: [], checks: [check('test', 'failure')] })).toMatchObject({ allowed: false, reason: 'ci-red' });
+  });
+});
+describe('fix push gate', () => {
+  const policy = { ...fix, pushAfterCi: true, pushAfterCiMaxMin: 1 };
+  const args = { previousHeadChecks: [check('test', null, { status: 'in_progress' })], requiredChecks: ['test'], firstHeldAt: 1000, now: 1000, policy };
+  it('is immediate when off, waits with a fixed deadline when on, and pushes at the bound', () => {
+    expect(fixPushGate({ ...args, policy: fix })).toEqual({ action: 'push', reason: 'off' });
+    expect(fixPushGate(args)).toEqual({ action: 'wait', reason: 'ci-pending', deadline: 61000 });
+    expect(fixPushGate({ ...args, now: 61000 })).toMatchObject({ action: 'push', reason: 'bound' });
+  });
+  it('folds completed required failures and ignores pending optional checks', () => {
+    expect(fixPushGate({ ...args, previousHeadChecks: [check('test', 'failure'), check('optional', null, { status: 'queued' })] }))
+      .toMatchObject({ action: 'push', reason: 'ci-complete', ciFailures: [{ name: 'test', conclusion: 'failure' }] });
+    expect(fixPushGate({ ...args, previousHeadChecks: [check('test')] })).toMatchObject({ action: 'push', reason: 'ci-complete', ciFailures: [] });
+  });
+  it.each([undefined, null, [], [{ name: 'test', status: 'completed', conclusion: null }]])('waits on missing or unreadable evidence: %j', previousHeadChecks => {
+    expect(fixPushGate({ ...args, previousHeadChecks }).action).toBe('wait');
+    expect(fixPushGate({ ...args, previousHeadChecks, now: 61000 }).reason).toBe('bound');
+  });
+});
+
+it('push gating refuses unknown required evidence and waits for remaining required checks after a failure', () => {
+  const args = { previousHeadChecks: [check('test')], firstHeldAt: 0, now: 0, policy: { ...fix, pushAfterCi: true } };
+  for (const requiredChecks of [null, undefined, []]) expect(fixPushGate({ ...args, requiredChecks }).action).toBe('wait');
+  expect(fixPushGate({ ...args, requiredChecks: ['test', 'smoke'], previousHeadChecks: [check('test', 'failure'), check('smoke', null, { status: 'queued' })] }).action).toBe('wait');
+});
+
+
+describe('R359 early start shadow (xtxt36v / xrz0ezn)', () => {
+  const policy = { ...review, earlyStartShadow: true, earlyStartCare: ['none', 'low'],
+    earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: ['code'] };
+  const args = { headSha: head, checks: [check('test', null, { status: 'in_progress' })],
+    requiredChecks: ['test'], verifyGreen: true, care: 'low', lines: 100, files: 3,
+    kinds: ['code'], isDraft: false, policy };
+  const shadow = overrides => reviewTiming.earlyStartShadow({ ...args, ...overrides });
+  const waits = result => {
+    expect(result).toEqual({ wouldStartEarly: false, reason: expect.any(String), mergeAllowed: false });
+    expect(result.reason.length).toBeGreaterThan(0);
+  };
+
+  it('waits on incomplete or malformed CI evidence and never throws', () => {
+    for (const requiredChecks of [null, undefined, []]) waits(shadow({ requiredChecks }));
+    for (const checks of [[], [{}], [null], null, undefined]) waits(shadow({ checks }));
+  });
+  it('waits when a required check row is missing, unreadable, or belongs to another head', () => {
+    waits(shadow({ requiredChecks: ['test', 'smoke'] }));
+    waits(shadow({ checks: [{ name: 'test' }] }));
+    waits(shadow({ checks: [check('test', null, { status: 'in_progress', head_sha: 'other-head' })] }));
+  });
+  it('waits on unknown status values and completed checks without a conclusion', () => {
+    waits(shadow({ checks: [check('test', null, { status: 'garbage' })] }));
+    waits(shadow({ checks: [check('test', null, { status: 'completed' })] }));
+  });
+  it('waits on a malformed conclusion or head_sha field', () => {
+    waits(shadow({ checks: [check('test', null, { status: 'in_progress', conclusion: 'garbage' })] }));
+    waits(shadow({ checks: [check('test', null, { status: 'in_progress', head_sha: 0 })] }));
+  });
+  it('waits on padded or upper-case conclusions that ciRedOnHead would not read as red', () => {
+    for (const conclusion of [' failure ', 'FAILURE']) waits(shadow({ checks: [check('test', conclusion, { status: 'completed' })] }));
+  });
+  it('waits when an unrelated row has a malformed head_sha', () => {
+    waits(shadow({ checks: [...args.checks, { name: 'smoke', status: 'in_progress', head_sha: 123 }] }));
+  });
+  it('waits on sparse arrays', () => {
+    waits(shadow({ kinds: new Array(1) }));
+    waits(shadow({ requiredChecks: new Array(1) }));
+    waits(shadow({ checks: new Array(1) }));
+  });
+  it('waits on a conclusion without a status', () => {
+    waits(shadow({ checks: [{ name: 'test', conclusion: 'success' }] }));
+  });
+  it('waits on a sparse array that also carries an extra property', () => {
+    const holey = Object.assign(new Array(1), { extra: true });
+    waits(shadow({ kinds: holey }));
+    waits(shadow({ requiredChecks: holey }));
+  });
+  it('waits when an explicit row kind does not match its fields', () => {
+    waits(shadow({ checks: [{ __typename: 'CheckRun', name: 'test', state: 'success' }] }));
+    waits(shadow({ checks: [{ __typename: 'Mystery', name: 'test', status: 'in_progress' }] }));
+  });
+  it('waits on raw rows that collapse away or contradict themselves', () => {
+    waits(shadow({ checks: [{ name: 'test', status: 'in_progress', head_sha: 123 }, ...args.checks] }));
+    waits(shadow({ checks: [{ name: 'test', state: 'failure', conclusion: 'success' }] }));
+  });
+  it('waits on an unfinished check that already carries a conclusion', () => {
+    waits(shadow({ checks: [{ name: 'test', status: 'in_progress', conclusion: 'success' }] }));
+  });
+  it('exports a pure earlyStartShadow decision', () => {
+    expect(reviewTiming.earlyStartShadow).toBeTypeOf('function');
+  });
+  it('defaults to shadow-off and explicitly disables evaluation', () => {
+    for (const off of [review, { ...policy, earlyStartShadow: false }])
+      expect(shadow({ policy: off })).toEqual({ wouldStartEarly: false, reason: 'shadow-off', mergeAllowed: false });
+  });
+  it.each(['none', 'low'])('would start verified %s-care code, including drafts, at inclusive limits', care => {
+    for (const isDraft of [false, true]) {
+      const result = shadow({ care, isDraft, lines: 400, files: 12 });
+      expect(result).toEqual({ wouldStartEarly: true, reason: expect.any(String), mergeAllowed: false });
+      expect(result.reason.length).toBeGreaterThan(0);
+    }
+  });
+  it.each(['elevated', 'high'])('waits for %s care', care => waits(shadow({ care })));
+  it.each(['docs', 'config', 'data'])('waits when kinds contain %s alongside code', kind => {
+    waits(shadow({ kinds: ['code', kind] }));
+  });
+  it.each(['care', 'lines', 'files', 'kinds', 'verifyGreen', 'headSha'])('fails closed on absent %s', key => {
+    for (const value of [undefined, null]) {
+      const result = shadow({ [key]: value });
+      waits(result);
+      if (key === 'care') expect(result.reason).toBe('missing-care');
+    }
+  });
+  it.each([
+    ['care', 'unknown'], ['care', ''], ['lines', NaN], ['lines', -1], ['lines', '100'],
+    ['files', NaN], ['files', -1], ['files', '3'], ['kinds', []], ['kinds', ['unknown']],
+    ['kinds', 'code'], ['verifyGreen', false], ['verifyGreen', 'true'], ['headSha', ''],
+  ])('fails closed on unknown or invalid %s=%j', (key, value) => waits(shadow({ [key]: value })));
+  it.each([{ lines: 401 }, { files: 13 },
+    { lines: 101, policy: { ...policy, earlyStartMaxLines: 100 } },
+    { files: 4, policy: { ...policy, earlyStartMaxFiles: 3 } },
+  ])('waits beyond configured bounds: %j', over => waits(shadow(over)));
+  it('waits on healable CI red on the current head', () => {
+    expect(shadow({ checks: [check('test', 'failure')] }))
+      .toEqual({ wouldStartEarly: false, reason: 'ci-red', mergeAllowed: false });
+    expect(shadow({ checks: [check('test', 'failure', { head_sha: 'b'.repeat(40) }), ...args.checks] }).wouldStartEarly).toBe(true);
+  });
+  it.each(['fast-checks', 'ci-green', 'push'])('never changes reviewStartGate under %s', startAfter => {
+    for (const checks of [args.checks, [check('test')], [check('test', 'failure')]]) {
+      const input = { ...args, checks, policy: { ...policy, startAfter } };
+      expect(reviewStartGate(input)).toEqual(reviewStartGate({ ...input, policy: { ...input.policy, earlyStartShadow: false } }));
+    }
+  });
+  it('never grants merge permission, even after CI turns green', () => {
+    for (const checks of [args.checks, [check('test')], [check('test', 'failure')]])
+      for (const earlyStartShadow of [false, true])
+        expect(shadow({ checks, policy: { ...policy, earlyStartShadow } }).mergeAllowed).toBe(false);
+  });
+  it('does not mutate inputs and returns the same decision for the same evidence', () => {
+    const input = structuredClone(args);
+    const before = structuredClone(input);
+    expect(reviewTiming.earlyStartShadow(input)).toEqual(reviewTiming.earlyStartShadow(input));
+    expect(input).toEqual(before);
+  });
 });

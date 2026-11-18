@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { decideDrainReviewGate, applyEscalationRelief, buildDrainVerdicts } from '../merge-ai-prs.mjs';
+import { readFileSync } from 'node:fs';
+import { classifyPr, decideDrainReviewGate, applyEscalationRelief, buildDrainVerdicts } from '../merge-ai-prs.mjs';
 import { LISTED_FILES_CAP } from '../lib/red-main-quarantine.mjs';
 
 const fixtures = [
@@ -10,7 +11,7 @@ const fixtures = [
     labels: ['ready-to-merge', 'review:accepted', 'review-round:1'],
     files: ['.github/workflows/merge-gate.yml', 'scripts/lib/__tests__/merge-gate-ci.test.mjs', 'scripts/lib/merge-gate-ci.mjs'] },
 ];
-function replay(pr, { setting, clearance, author = 'web-everything', ...extra } = {}) {
+function replay(pr, { setting, clearance, author = 'chalbert', ...extra } = {}) {
   const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
   if (clearance) comments.push({ author: { login: author }, body: `<!-- reviewed-sha: ${clearance} -->\n<!-- cleared-human: operator -->` });
   const repo = 'web-everything/web-everything';
@@ -23,6 +24,84 @@ function replay(pr, { setting, clearance, author = 'web-everything', ...extra } 
   });
 }
 describe('live workflow-edit replay', () => {
+  const blockedPr = (extra = {}) => ({ ...fixtures[1], body: 'Workflow update', mergeable: 'MERGEABLE',
+    mergeStateStatus: 'BLOCKED', statusCheckRollup: [
+      { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' },
+    ], ...extra });
+  it.each(['test', 'merge-gate'])('admits skipped accepted workflow PRs for repark (required %s)', (requiredCheck) => {
+    const pr = blockedPr();
+    expect(classifyPr(pr, { requiredCheck })).toMatchObject({ decision: 'skip', workflowHoldRepark: true });
+    expect(replay(pr)).toMatchObject({ action: 'park', workflowEditHold: true, applyLabel: 'review:human' });
+    const cleared = replay(pr, { clearance: pr.headRefOid });
+    expect(cleared.action).toBe('merge');
+    expect(cleared.workflowEditHold).toBeUndefined();
+    expect(cleared.applyLabel).toBeFalsy();
+  });
+  it.each([
+    { labels: ['ready-to-merge', 'review:accepted', 'review:human'] },
+    { labels: ['ready-to-merge'] },
+    { statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] },
+    { mergeStateStatus: 'BEHIND' },
+    { mergeable: 'CONFLICTING' },
+    { baseRefName: 'lane/stack' },
+    { requiredCheckReadError: 'unreadable checks' },
+  ])('does not broaden other skip paths: %j', (extra) => {
+    expect(classifyPr(blockedPr(extra)).workflowHoldRepark).toBeUndefined();
+  });
+  for (const requiredCheck of ['test', 'merge-gate']) {
+    it.each([
+      ['conflicting', { mergeable: 'CONFLICTING' }],
+      ['unknown mergeability', { mergeable: 'UNKNOWN' }],
+      ['behind', { mergeStateStatus: 'BEHIND' }],
+      ['dirty', { mergeStateStatus: 'DIRTY' }],
+      ['unknown state', { mergeStateStatus: 'UNKNOWN' }],
+      ['human hold', { labels: ['review:accepted', 'review:human'] }],
+      ['non-default base', { baseRefName: 'release' }],
+      ['merge-gate passing', { statusCheckRollup: [
+        { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'SUCCESS' },
+      ] }],
+      ['merge-gate pending', { statusCheckRollup: [
+        { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', status: 'IN_PROGRESS' },
+      ] }],
+      ['test also failing', { statusCheckRollup: [
+        { name: 'test', conclusion: 'FAILURE' }, { name: 'merge-gate', conclusion: 'FAILURE' },
+      ] }],
+      ['test missing', { statusCheckRollup: [{ name: 'merge-gate', conclusion: 'FAILURE' }] }],
+      ['CodeQL failing', { statusCheckRollup: [
+        { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' },
+        { name: 'CodeQL', conclusion: 'FAILURE' },
+      ] }],
+    ])(`classifyPr refuses repark for %s (required ${requiredCheck})`, (_name, extra) => {
+      const verdict = classifyPr(blockedPr(extra), { requiredCheck, defaultBranch: 'trunk', blockOnCodeQL: true });
+      expect(verdict.decision).toBe('skip');
+      expect(verdict.workflowHoldRepark).toBeUndefined();
+      if (requiredCheck === 'merge-gate' && !['merge-gate passing'].includes(_name)) {
+        expect(verdict.reason).toBe(extra.baseRefName ? 'base is not trunk (release)' : 'required check "merge-gate" is not green');
+      }
+    });
+    it(`requires every additional required check to pass (required ${requiredCheck})`, () => {
+      const pr = blockedPr();
+      const options = { requiredCheck, queueRequiredChecks: ['test', 'merge-gate', 'smoke'] };
+      expect(classifyPr(pr, options).workflowHoldRepark).toBeUndefined();
+      pr.statusCheckRollup.push({ name: 'smoke', conclusion: 'FAILURE' });
+      expect(classifyPr(pr, options).workflowHoldRepark).toBeUndefined();
+      pr.statusCheckRollup[2].conclusion = 'SUCCESS';
+      expect(classifyPr(pr, options).workflowHoldRepark).toBe(true);
+    });
+  }
+  it('runCli pass filter admits workflowHoldRepark skips alongside merge and review-held verdicts', () => {
+    const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    expect(source).toContain("if (v.decision !== 'merge' && !v.reviewHeld && !v.workflowHoldRepark) continue;");
+  });
+  it('uses the repark pre-check verdict without another gate read or mutation', () => {
+    const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    const [callSite] = source.match(/const gate = workflowReparkGate \?\? \(\(\) => \{[\s\S]*?\}\)\(\);/);
+    const evaluate = new Function('workflowReparkGate', 'decideDrainReviewGate', `${callSite}\nreturn gate;`);
+    const precheck = { action: 'park', workflowEditHold: true, applyLabel: 'review:human' };
+    let calls = 0;
+    expect(evaluate(precheck, () => { calls++; throw new Error('unexpected gate evaluation'); })).toBe(precheck);
+    expect(calls).toBe(0);
+  });
   for (const changeType of ['RENAMED', 'COPIED', undefined]) {
     for (const workflowOnly of [false, true]) {
       it(`reads both paths for ${changeType ?? 'untyped'} listing entries (bare sweep: ${workflowOnly})`, () => {
@@ -96,7 +175,7 @@ describe('live workflow-edit replay', () => {
     });
     expect(result).toMatchObject({ action: 'park', applyLabel: 'review:human' });
     expect(calls.find(([, args]) => args[0] === 'diff')).toEqual(['git',
-      ['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/trunk...${fixtures[1].headRefOid}`], '/fixture']);
+      ['diff', '--name-only', '--no-renames', '--no-relative', '-z', '--end-of-options', `refs/remotes/origin/trunk...${fixtures[1].headRefOid}`], '/fixture']);
   });
   it('bare sweep does no acceptance or git calls for complete non-workflow files', () => {
     let calls = 0;
@@ -117,4 +196,40 @@ describe('live workflow-edit replay', () => {
   it('unreadable acceptance still defers without writing a label', () => {
     expect(replay(fixtures[0], { exec: () => { throw new Error('offline'); } })).toMatchObject({ action: 'defer', applyLabel: null });
   });
+});
+
+describe('refreshed PR: stale listing vs net diff', () => {
+  const pr = { number: 6666, headRefOid: '5ab05b337d000000000000000000000000000000', labels: ['ready-to-merge', 'review:accepted'],
+    files: ['.github/workflows/ci.yml', 'backlog/4456-x.md'] };
+  const netExec = (net) => (cmd, args) => cmd === 'gh'
+    ? JSON.stringify({ headRefOid: pr.headRefOid, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }] })
+    : args[0] === 'diff' ? net : '';
+  it('stale listing naming ci.yml does not hold when the net diff has no workflow path', () => {
+    expect(replay(pr, { exec: netExec('backlog/4456-x.md\0') }).action).toBe('merge');
+  });
+  it('a real workflow edit in the net diff still holds, with the head sha in the message', () => {
+    const r = replay(pr, { exec: netExec('.github/workflows/ci.yml\0') });
+    expect(r).toMatchObject({ action: 'park', humanRequired: true });
+    expect(r.reason).toContain('5ab05b337');
+    expect(r.reason).not.toContain('unknown');
+  });
+  it('unreadable net diff keeps the hold (fail closed)', () => {
+    const r = replay(pr, { exec: (cmd, args) => { if (cmd === 'git' && args[0] === 'diff') throw new Error('boom'); return netExec('')(cmd, args); } });
+    expect(r).toMatchObject({ action: 'park', humanRequired: true });
+  });
+  it('empty net diff against a workflow listing keeps the hold', () => {
+    expect(replay(pr, { exec: netExec('') }).action).toBe('park');
+  });
+});
+
+it('unknown default branch keeps the listing hold (no net-diff clearing against a guessed base)', () => {
+  const pr = { number: 6666, headRefOid: '5ab05b337d000000000000000000000000000000', labels: ['ready-to-merge', 'review:accepted'], files: ['.github/workflows/ci.yml'] };
+  const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
+  expect(replay(pr, { defaultBranch: undefined, exec: (cmd) => cmd === 'gh' ? JSON.stringify({ headRefOid: pr.headRefOid, comments }) : '' }).action).toBe('park');
+});
+
+it('a re-admitted workflow-hold PR never takes the test-tampering mechanical park', () => {
+  const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+  expect(src).toMatch(/gaming\.tampered && hasReviewLabel\(v\.prLabels, REVIEW_LABELS\.accepted\) && !v\.workflowHoldRepark/);
+  expect(src).toMatch(/if \(!v\.workflowHoldRepark && shouldReparkForTestTampering\(/);
 });

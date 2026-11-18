@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { extractNightlyCoroner } from '../../nightly-coroner-job.mjs';
+import { extractNightlyCoroner, NIGHTLY_DEFAULTS } from '../../nightly-coroner-job.mjs';
 
 const SOURCE = 'scripts/conveyor/nightly-coroner-job.mjs';
 export default {
@@ -37,7 +37,9 @@ if (resolve(process.argv[1]) === fileURLToPath(import.meta.url)) console.log(JSO
         env[`WE_CORONER_${key}`] = join(root, key.toLowerCase());
       }
       // Probe the actual CLI surface without invoking lane-pool, GitHub, or operator state.
-      const input = { night: '2026-10-16', until: '2026-10-17T02:17:00.000Z', dir: join(root, 'state') };
+      // This break probes extraction only: the coverage judge (live `gh pr list`) is switched off, never reached.
+      const input = { night: '2026-10-16', until: '2026-10-17T02:17:00.000Z', dir: join(root, 'state'),
+        nightly: { ...NIGHTLY_DEFAULTS, judge: { ...NIGHTLY_DEFAULTS.judge, enabled: false } } };
       const lane = { lane: 7, holder: 'soak-coroner', path: lanePath };
       let acquired = 0, released = 0, swept = 0, calls = 0;
       const io = { home: join(root, 'handoff'), statusFeed: join(root, 'feed.jsonl'),

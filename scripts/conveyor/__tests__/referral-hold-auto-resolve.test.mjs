@@ -4,7 +4,8 @@
  * carried a ruling. No push or re-arm was coming. The fixtures are the three live threads (and their review-run
  * projections) as captured at 2026-10-21T17:30Z.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { buildClearedFromMarker } from '../../lib/review-escalation.mjs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 import { readFileSync } from 'node:fs';
@@ -27,7 +28,17 @@ const here = dirname(fileURLToPath(import.meta.url));
 const BOTS = new Set(['plateau-merger', 'plateau-reviewer', 'plateau-worker']);
 const load = n => {
   const fx = JSON.parse(readFileSync(join(here, 'fixtures', `pr-${n}-stale-referral-hold.json`), 'utf8'));
-  return { ...fx, comments: fx.comments.map(c => (BOTS.has(c.author?.login) ? { ...c, author: { login: 'web-everything' } } : c)) };
+  // R706: a drain carry record counts only when it cites the human clearance comment by id. The captured thread predates
+  // the `cleared-from` marker and has no comment ids, so the loader adds both to the SAME two comments (the human
+  // clear-human ceremony and the drain's carry record); every other byte of the capture is untouched.
+  const sourceIndex = fx.comments.findIndex(c => c.author?.login === 'chalbert' && c.body.includes('cleared via the sanctioned path'));
+  const carryIndex = fx.comments.findIndex(c => c.body.includes('human clearance carried forward'));
+  return { ...fx, comments: fx.comments.map((c, i) => {
+    const comment = BOTS.has(c.author?.login) ? { ...c, author: { login: 'web-everything' } } : c;
+    if (i === sourceIndex) return { ...comment, id: 'IC_clearance_5773' };
+    if (i === carryIndex) return { ...comment, body: `${comment.body}\n${buildClearedFromMarker('IC_clearance_5773')}` };
+    return comment;
+  }) };
 };
 const FX = { 5773: load(5773), 5775: load(5775), 5800: load(5800) };
 const repo = 'web-everything/web-everything';
@@ -94,7 +105,12 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', counts: { 'not-real': 3 } });
   });
 
-  it('#5773: its carried human clearance is final even though its one finished review left no advisory', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  // R711: the live thread's carry is a drain NUMBERING carry (the reviewed-diff changed), which counts only when
+  // humanClearance.mechanicalCarry is trust-drain-record AND the record cites the human clearance (R706).
+  it('#5773: its carried human clearance is final even though its one finished review left no advisory (mechanicalCarry=trust-drain-record)', () => {
+    vi.stubEnv('WE_HUMAN_CLEARANCE_MECHANICAL_CARRY', 'trust-drain-record');
     const p = plan(enrich(FX[5773]));
     // Its live head also carries a trusted human clearance, which is final: the hold is resolved, but no further review
     // is dispatched for the head (already-reviewed-head), where the same fixture used to resume a review.
@@ -102,6 +118,12 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     expect(p.dispatch).toEqual([]);
     expect(p.notes.filter(n => n.kind === 'referral-hold-auto-resolved')).toEqual([expect.objectContaining({
       prNumber: 5773, head: FX[5773].headRefOid, outcome: 'resume', next: 'advisory-review', counts: { 'not-real': 3 } })]);
+  });
+
+  it('#5773: under the default (mechanicalCarry=refuse) the numbering carry is not a clearance, so the head is not final', () => {
+    const p = plan(enrich(FX[5773]));
+    expect(p.refusals.map(r => r.kind)).not.toEqual(['already-reviewed-head']);
+    expect(p.refusals.map(r => r.kind)).toEqual([]);
   });
 
   it('#5773: a resumed review that DIES before advise (no finished run, no advisory) is not resumed again', () => {

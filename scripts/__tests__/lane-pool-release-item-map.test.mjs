@@ -50,6 +50,9 @@ beforeAll(() => {
   git(['add', 'file.txt', '.gitignore'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'main v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  // Each named pool needs its primary checkout (a sibling of the reference): release proves lane work against
+  // that primary's canonical origin and refuses when it cannot resolve one.
+  for (const pool of ['poolA', 'poolB']) git(['clone', '--quiet', originDir, join(fixtureRoot, pool)]);
   sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
 });
 
@@ -126,6 +129,8 @@ describe('lane-pool release clears the lane-ports registry entry (#3466)', () =>
     // release with `cwd: referenceDir`, not by passing `--reference=` (which the real reaper never does).
     provision(1, 'basetest');
     expect(acquire(['--lane=1', '--item=3466'], 'basetest').code).toBe(0);
+    // The selected pool's primary supplies the canonical origin the release proof reads (removed in afterEach).
+    git(['clone', '--quiet', originDir, join(fixtureRoot, 'basetest')]);
     const r = runPool(['release', '--pool=basetest', '--lane=1', '--force'], { LANE_POOL_ROOT: poolRoot }, { cwd: referenceDir });
     expect(r.code).toBe(0);
     expect(readRegistry()).toEqual({});

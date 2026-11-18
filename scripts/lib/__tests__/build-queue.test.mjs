@@ -420,6 +420,8 @@ describe('#4355 build-queue --json cache is invalidated by every input the clear
 });
 
 
+const absentRuntime = () => { throw Object.assign(new Error('absent runtime'), { code: 'ENOENT' }); };
+
 describe('build.priority operator list', () => {
   it('accepts all shipped repo priority ids through the real settings reader', () => {
     const shipped = JSON.parse(readFileSync(join(SETTINGS_DIR, 'build-priority.json'), 'utf8')).build.priority;
@@ -428,7 +430,7 @@ describe('build.priority operator list', () => {
     expect(resolveBuildPriority({ tool: { priority: shipped } }))
       .toEqual({ ids: shipped, source: 'tool' });
     // Explicit env isolates this pin from operator overrides and local platform preferences.
-    expect(readBuildPrioritySettings({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-repo-pin' } }))
+    expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-repo-pin' } }))
       .toEqual({ ids: shipped, source: 'tool' });
   });
   it('resolves valid layers, trims and deduplicates, and lets empty env clear', () => {
@@ -445,7 +447,7 @@ describe('build.priority operator list', () => {
   });
   it('ignores invalid env and tolerates an unreadable tool setting', () => {
     expect(resolveBuildPriority({ tool: { priority: ['2'] }, env: { WE_BUILD_PRIORITY: 'bad' } })).toEqual({ ids: ['2'], source: 'tool' });
-    expect(readBuildPrioritySettings({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-test' }, read: () => { throw Error('unreadable'); } })).toEqual({ ids: [], source: 'standard' });
+    expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-test' }, read: () => { throw Error('unreadable'); } })).toEqual({ ids: [], source: 'standard' });
   });
   it('logs canonical values once and names rejected layers through the shared cascade', () => {
     const dir = mkdtempSync(join(tmpdir(), 'build-priority-'));
@@ -455,13 +457,13 @@ describe('build.priority operator list', () => {
     resetCascadeLogForTest();
     try {
       const env = { WE_POLICY_CASCADE_LOG: '1', WE_PLATFORM_PREFERENCES_FILE: path };
-      expect(readBuildPrioritySettings({ env, read: () => ({ build: { priority: ['bad'] } }) }))
+      expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env, read: () => ({ build: { priority: ['bad'] } }) }))
         .toEqual({ ids: ['7'], source: 'platform' });
       expect(log.mock.calls[0][0]).toContain('ignored invalid: tool.priority=');
       log.mockClear();
       resetCascadeLogForTest();
       for (const value of ['8, 9,8', '8,9']) {
-        expect(readBuildPrioritySettings({ env: { ...env, WE_BUILD_PRIORITY: value }, read: () => ({}) }))
+        expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env: { ...env, WE_BUILD_PRIORITY: value }, read: () => ({}) }))
           .toEqual({ ids: ['8', '9'], source: 'env' });
       }
       expect(log).toHaveBeenCalledTimes(1);
@@ -511,6 +513,51 @@ describe('build.priority operator list', () => {
   });
 });
 
+
+it('runtime reads one second apart share the CLI cache key and hit the cache until semantics change', () => {
+  const root = mkdtempSync(join(tmpdir(), 'build-priority-runtime-cache-'));
+  const dir = join(root, 'backlog');
+  const cacheFile = buildQueueCacheFile(dir);
+  try {
+    mkdirSync(dir);
+    card(dir, '9101-first.md', { kind: 'story', size: 2, status: 'open', dateOpened: '2026-01-01', tags: [] });
+    const queueFile = join(root, 'queue.json');
+    writeFileSync(queueFile, '[]');
+    const runtimePath = join(root, 'runtime.json');
+    const clockPath = join(root, 'clock.mjs');
+    writeFileSync(clockPath, 'Date.now = () => Number(process.env.WE_TEST_RUNTIME_CACHE_NOW);');
+    const record = { ids: ['9101'], mode: 'only', setBy: 'operator', at: new Date(NOW).toISOString(), ttlHours: 1 };
+    writeFileSync(runtimePath, JSON.stringify(record));
+    const env = { ...process.env, CONVEYOR_QUEUE_FILE: queueFile, WE_BUILD_QUEUE_CACHE: '1',
+      WE_BUILD_PRIORITY_RUNTIME_FILE: runtimePath, WE_POLICY_CASCADE_LOG: '0' };
+    delete env.WE_BUILD_PRIORITY;
+    const run = at => JSON.parse(execFileSync(process.execPath,
+      ['--import', clockPath, BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${dir}`],
+      { env: { ...env, WE_TEST_RUNTIME_CACHE_NOW: String(at) }, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 }));
+    const cache = () => JSON.parse(readFileSync(cacheFile, 'utf8'));
+    const first = run(NOW);
+    const firstCache = cache();
+    const second = run(NOW + 1000);
+    expect(cache().key).toBe(firstCache.key);
+    expect(cache().at).toBe(NOW); // A recompute would publish NOW + 1000.
+    expect(second).toEqual(first);
+    expect(first.buildPriority.runtime.ageMs).toBe(0);
+
+    // TTL status, mode, list contents and fail-closed holds all invalidate the cache.
+    expect(run(NOW + 3600001).buildPriority.runtime.expired).toBe(true);
+    expect(cache().key).not.toBe(firstCache.key);
+    let previousKey = cache().key;
+    for (const update of [{ ...record, mode: 'lift' }, { ...record, ids: [] }, null]) {
+      writeFileSync(runtimePath, JSON.stringify(update));
+      run(NOW + 3600002);
+      expect(cache().key).not.toBe(previousKey);
+      previousKey = cache().key;
+    }
+  } finally {
+    rmSync(cacheFile, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 it('build-queue --next carries operator metadata and invalidates cached order when the list changes', () => {
   const root = mkdtempSync(join(tmpdir(), 'build-priority-cli-'));

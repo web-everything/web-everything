@@ -424,3 +424,7 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
     });
   });
 });
+
+it.each(['card-ledger-trust.json', 'card-ledger-legacy-identities.json'])('ledger root %s requires human policy review', file => {
+  expect(TRUST_CHAIN.find(m => m.file === file)).toMatchObject({ tier: 'policy', leash: 'spec', homes: [`scripts/settings/${file}`] });
+});

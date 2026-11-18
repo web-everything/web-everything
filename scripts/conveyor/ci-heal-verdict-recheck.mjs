@@ -8,14 +8,13 @@
  * for hours, and the notes half told the operator it "needs your decision".
  *
  * `not-a-ci-break` means "every required check is green; only the review gate is red". A required check other than
- * `review-gate` whose LATEST run on this head completed failing contradicts it. Two uses:
+ * `review-gate` with any failing row on this head contradicts it. Two uses:
  *   - {@link contradictingChecks}: the daemon voids a contradicted verdict (a void comment, see
  *     `ci-heal-escalation-mark.mjs#CI_HEAL_VERDICT_VOID_MARKER`); the ordinary ci-heal path (caps included) resumes.
  *   - {@link unsettledRequiredChecks}: the escalation CLI refuses to record `not-a-ci-break` while a required check is
  *     still pending, missing, or red — the verdict can only be true once they have all finished green.
  *
- * Reuses the repo's own readers: `collapseRollupToLatestPerName` (latest run per check name), the shared
- * `FAILING_CONCLUSIONS` table, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
+ * Reuses the shared check-state predicate, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
@@ -24,9 +23,9 @@ import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
+import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
+import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -79,40 +78,77 @@ export function ciGreenForEscalation({ rollup, requiredChecks }) {
   return !red.length && !pending.length && !missing.length;
 }
 
-const sameSha = (a, b) => {
+export const sameSha = (a, b) => {
   const x = String(a ?? '').trim().toLowerCase();
   const y = String(b ?? '').trim().toLowerCase();
   return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
 };
 
+const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
+const lowerState = state => String(state ?? '').toLowerCase();
+const normalizeRollupCheck = row => {
+  const check = { ...row, name: row?.name || row?.context };
+  if (row?.status == null && row?.state != null) {
+    if (['pending', 'expected'].includes(lowerState(row.state))) check.status = 'pending';
+    else check.conclusion = row.state;
+  }
+  return check;
+};
+
+/** Compatibility export: preserve every rollup row; metadata never selects evidence. */
+export function latestRollupAttempts(rollup) {
+  return Array.isArray(rollup) ? [...rollup] : [];
+}
+
+/** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
+function checkEvidence(rollup, requiredChecks) {
+  const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
+  // Only the shared merge-gate hold classifier's annotation proves a review hold.
+  // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
+  const holdGateNames = [REVIEW_GATE_CHECK];
+  const mergeGates = checks.filter(row => row.name === 'merge-gate');
+  if (mergeGates.length && mergeGates.every(row =>
+    classifyCheck({ ...row, required: true }) === 'green' || row.mergeGateReviewHold)) {
+    holdGateNames.push('merge-gate');
+  }
+  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
+    .filter(name => !holdGateNames.includes(name));
+  // CodeQL evidence is never excused by a drain setting or an optional roster.
+  if (checks.some(row => row.name === CODEQL_CHECK_NAME) && !roster.includes(CODEQL_CHECK_NAME)) {
+    roster.push(CODEQL_CHECK_NAME);
+  }
+  return { checks, roster, holdGateNames };
+}
+
 /**
- * The required checks (minus `review-gate`) on this head, split by their LATEST run. PURE.
- * An empty/unknown required set returns nothing at all: with no list to judge against, nothing is claimed.
+ * The required checks (minus review-gate and proven merge-gate review holds), judged across every row. PURE.
+ * An empty/unknown required set judges only observed CodeQL evidence.
  * @returns {{red: string[], pending: string[], missing: string[], green: string[]}}
  */
 export function requiredCheckStates({ rollup, requiredChecks }) {
   const out = { red: [], pending: [], missing: [], green: [] };
-  const latest = collapseRollupToLatestPerName(rollup);
-  const required = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], latest)
-    .filter((name) => name !== REVIEW_GATE_CHECK);
-  for (const name of required) {
-    const run = latest.find((r) => (r?.name ?? r?.context) === name);
-    if (!run) { out.missing.push(name); continue; }
-    // A CheckRun carries status + conclusion; a legacy StatusContext carries only `state`.
-    const isRun = run.status != null;
-    if (isRun && String(run.status).toLowerCase() !== 'completed') { out.pending.push(name); continue; }
-    const conclusion = String((isRun ? run.conclusion : run.state) ?? '').toLowerCase();
-    if (FAILING_CONCLUSIONS.includes(conclusion) || conclusion === 'error') out.red.push(name);
-    else if (conclusion === 'success') out.green.push(name);
-    else if (conclusion === 'pending' || conclusion === 'expected') out.pending.push(name);
-    else out.green.push(name); // skipped/neutral: not red, and not what a not-a-ci-break verdict is about
+  const { checks, roster } = checkEvidence(rollup, requiredChecks);
+  const { redSet, pendingSet } = summarize(checks, { requiredNames: roster });
+  const observed = new Set(checks.map(row => row.name));
+  for (const name of roster) {
+    if (!observed.has(name)) out.missing.push(name);
+    else if (redSet.has(name)) out.red.push(name);
+    else if (pendingSet.has(name)) out.pending.push(name);
+    else out.green.push(name);
   }
   return out;
 }
 
+/** Include gates and CodeQL evidence, even outside the required roster. */
+export function gateOnlyRedStates({ rollup, requiredChecks }) {
+  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
+  const requiredNames = [...roster, ...gateNames];
+  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
+  return { gateOnlyRed, red: [...redSet] };
+}
+
 /**
- * The required checks that contradict a `not-a-ci-break` verdict on THIS head: names whose latest run completed
- * failing. `[]` when the escalation is not `not-a-ci-break`, names another head, or nothing is red. PURE.
+ * The required checks that contradict a `not-a-ci-break` verdict on THIS head: names with any failing row. `[]` when the escalation is not `not-a-ci-break`, names another head, or nothing is red. PURE.
  * @param {{escalation:{outcome?:string, headSha?:string}|null, headSha:string, rollup:Array<object>, requiredChecks:string[]}} o
  * @returns {string[]}
  */

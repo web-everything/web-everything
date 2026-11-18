@@ -62,8 +62,10 @@ import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
  */
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { resolveRunsDir } from './operations/run-store.mjs';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 // Rebase resolution (2026-08-08): the UNION of both sides. `buildReviewedDiffMarker` is #2979's accept
@@ -71,7 +73,7 @@ import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqu
 // #x9xqexm's base-independent third marker. Independent concerns.
 import {
   REVIEW_PR_CHANNEL, REVIEW_LABELS, hasReviewLabel, buildReviewedShaMarker, buildReviewedDiffMarker,
-  buildReviewedContributionMarker, buildClearedHumanMarker, READY_TO_MERGE_LABEL,
+  buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId, latestHumanClearanceComment, READY_TO_MERGE_LABEL,
   // #3007 — the SAME two digests the markers carry, taken raw so the ledger row records the witnesses
   // themselves rather than re-deriving them from the rendered comment. One computation, two consumers.
   normalizeDiffFingerprint, normalizeContributionFingerprint,
@@ -98,7 +100,7 @@ import {
 } from './lib/review-escalation.mjs';
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
-import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
@@ -154,7 +156,7 @@ import {
 // its own writer. NOTHING MERGES ON IT YET — the drain still reads labels; `we:scripts/review-ledger-check.mjs`
 // reports any ledger/label disagreement, and that evidence is what decides whether Phase 2 is safe.
 import {
-  buildVerdictRecord, buildLedgerEvent, appendVerdict, verdictForLabelTarget, verdictClears, APPROVAL_KINDS, EVENT_TYPES,
+  buildVerdictRecord, buildLedgerEvent, appendVerdict, verdictForLabelTarget, verdictClears, APPROVAL_KINDS, EVENT_TYPES, ledgerWriteErrorSummary,
 } from './lib/verdict-ledger.mjs';
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
@@ -197,6 +199,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 // call. See `we:backlog/3631-migrate-remaining-gh-cli-call-sites-to-the-gh-throttle-wrapp.md` for the tracked
 // item this is one slice of.
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
+import { refreshMergeGateAfterRestamp } from './lib/merge-gate-refresh.mjs';
 // #4317 — the approval-time prevention filer no longer shells `file-item` INLINE (in whatever checkout is
 // reviewing the PR, routinely a read-only daemon clone that never commits or pushes — see
 // `fileApprovalPreventionCard`'s own doc below for the incident). It hands the composed card off to a DETACHED
@@ -289,7 +292,8 @@ export function restoreClearanceOverRacedPark({ provider, repo, pr, headSha, com
   if (parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
   if (!hasReviewLabel(labels, REVIEW_LABELS.human) || hasReviewLabel(labels, REVIEW_LABELS.changes)
     || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
-  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+  // #6595: the human ceremony is the final verdict, so it also supersedes a pending advisory (same write).
+  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: presentRemoveLabels([REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], labels) });
   return true;
 }
 
@@ -325,7 +329,7 @@ export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s =
     const fresh = provider.readPrState(repo, pr);
     if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
-    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: presentRemoveLabels([REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], fresh.labels) });
     return { reapplied: true };
   } catch (e) {
     warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
@@ -405,7 +409,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -472,7 +476,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // on the PR through three more review rounds with no `review:human` left to explain it.
       removeLabels: [
         REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
-        ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
+        REVIEW_LABELS.awaitingAdvisory, ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
       reason: humanOnlyHold && !isHuman && !isHeldMechanical
@@ -637,7 +641,8 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
     return {
       allowed: true,
       addLabel: REVIEW_LABELS.accepted,
-      removeLabels: [],
+      // R907: an explicit OPERATOR restamp also drops a stale pending advisory in the same write; any other actor keeps it.
+      removeLabels: operatorRestamp ? presentRemoveLabels([REVIEW_LABELS.awaitingAdvisory], currentLabels) : [],
       keepsHuman: isHuman,
       reason: 're-stamped — acceptance carried across a drain-authored rebase; no review was re-run',
     };
@@ -846,22 +851,25 @@ export const bodyFileRoots = (cwd = process.cwd(), tmp = tmpdir()) => [cwd, tmp,
  *   --json comments` array. `headSha` is the head this restamp is stamping (post-#x9krtkb bug-2 fix, the
  *   caller-asserted `--new-head` when supplied, never a racy re-read). `headDiff` is the FRESH net diff text (or
  *   precomputed fingerprint) this restamp already computed against that head, reused rather than re-fetched.
- * @returns {{actor:string, sha:string}|null}
+ * @returns {{actor:string, sha:string, sourceId?:string}|null}
  */
 export function decideRestampHumanClearance({ comments, headSha, headDiff } = {}) {
   const humanClearedSha = parseLatestHumanClearedSha(comments);
   if (!humanClearedSha) return null;
+  // The fingerprints and actor come from the comment the shared scan accepted, never a rejected carrier's markers.
+  const accepted = latestHumanClearanceComment(comments);
   const coverage = acceptanceCoversHead({
     acceptedSha: humanClearedSha,
     headSha,
-    acceptedDiff: parseReviewedDiff(comments),
+    acceptedDiff: parseReviewedDiff(accepted ? [accepted] : []),
     headDiff,
-    acceptedContribution: parseReviewedContribution(comments),
+    acceptedContribution: parseReviewedContribution(accepted ? [accepted] : []),
     headContribution: headDiff,
   });
   if (!coverage.covers) return null;
-  const clearance = parseOperatorClearance((Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor));
-  return { actor: clearance ? clearance.actor : 'the operator', sha: humanClearedSha };
+  const clearance = parseOperatorClearance(accepted ? [accepted] : []);
+  const sourceId = latestHumanClearanceSourceId(comments);
+  return { actor: clearance ? clearance.actor : 'the operator', sha: humanClearedSha, ...(sourceId ? { sourceId } : {}) };
 }
 
 // ── APPROVAL-TIME PREVENTION FILING (operator, 2026-09-27) ──────────────────────────────────────────────────
@@ -1071,7 +1079,7 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * @param {{argv?:string[], fixedTo?:string|null, defaultActor:string, repoOptional?:boolean, usage:string,
  *   allowClearHuman?:boolean,
  *   buildComment:(o:{to:string,actor:string,decision:object,headSha:string,reason:string,
- *     humanClearance?:{actor:string,sha:string}|null})=>string,
+ *     humanClearance?:{actor:string,sha:string,sourceId?:string}|null})=>string,
  *   successResult:(o:{pr:number,to:string,decision:object,labels:string[]})=>object,
  *   refusalResult:(o:{pr:number,decision:object})=>object,
  *   emit?:(line:string)=>void}} cfg
@@ -1083,6 +1091,43 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * never have caught the truncation it looks like it is testing. An in-process caller passes its own collector
  * instead of pretending to own fd 1.
  */
+/**
+ * A human `clear-human` ruling supersedes the review panel's own open confirm ask ("Record which verdict?") for the SAME
+ * PR at the SAME head: that run stays `pending` forever and the red-team queue reads it as `review-unfinished` (live
+ * #6381 #6595 #6637 #6633). Answer it `abstain` (writes nothing) through the operation's own resume path. A run on another
+ * head, another PR, or with any other pending ask is never touched. Best effort: a failure never undoes the clearance.
+ */
+const defaultAbstainResume = id => {
+  const res = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'operations', 'run.mjs'),
+    'review-pr', `--resume=${id}`, '--answer=abstain'], { encoding: 'utf8', timeout: 120_000 });
+  return res.status === 0;
+};
+export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolveRunsDir(), resume = defaultAbstainResume } = {}) {
+  const out = { closed: [], failed: [] };
+  if (!/^[0-9a-f]{40}$/i.test(String(headSha || ''))) return out;
+  let names;
+  try { names = readdirSync(dir); } catch { return out; }
+  for (const name of names) {
+    if (!name.startsWith('review-pr-') || !name.endsWith('.json')) continue;
+    let text;
+    try { text = readFileSync(join(dir, name), 'utf8'); } catch { continue; }
+    if (!text.includes('"confirm"') || !text.toLowerCase().includes(String(headSha).toLowerCase())) continue;
+    let r;
+    try { r = JSON.parse(text); } catch { continue; }
+    if (r?.op !== 'review-pr' || name !== `${r.id}.json` || r.input?.repo !== repo || Number(r.input?.pr) !== Number(pr)) continue;
+    if (r.pending?.kind !== 'confirm') continue;
+    if (String(r.findings?.read?.netBasis?.rev || '').toLowerCase() !== String(headSha).toLowerCase()) continue;
+    let ok = false;
+    try { ok = resume(r.id) === true; } catch { ok = false; }
+    (ok ? out.closed : out.failed).push(r.id);
+  }
+  return out;
+}
+
+// Only the real gh-backed provider may trigger the live merge-gate refresh; an injected (test/fake) provider never does.
+const liveGhProviders = new WeakSet();
+const createLiveGhProvider = () => { const p = createGhProvider(); liveGhProviders.add(p); return p; };
+
 export function runReviewLabelCli({
   argv = process.argv.slice(2),
   fixedTo = null,
@@ -1103,7 +1148,8 @@ export function runReviewLabelCli({
   // THE FORGE SEAM (#x8xf5rl). Defaults to `gh`, byte-identical to the inline calls this replaced.
   // Injected so the WRITE ARC — above all the #2964 ordering below — is assertable without `gh`,
   // which it never was: the suite could only reach this function's pure helpers and its refusals.
-  provider = createGhProvider(),
+  provider = createLiveGhProvider(),
+  refreshGate = undefined,
   // Pinned re-arm marker retries are bounded to three attempts; tests inject a no-op delay.
   rearmRetrySleep = sleepSyncMs,
   readTrialStore = readStore,
@@ -1120,6 +1166,7 @@ export function runReviewLabelCli({
   // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
+  closeConfirmRuns = closeConfirmRunsAfterClearance,
   // The fix daemon's wake signal after a `review:changes` write; injected by tests so no run touches a real mailbox.
   signalFix = signalFixDispatch,
   // PR #5758 — the read-time verified standing-ruling scope, so the red-team ruling check credits an automatic round
@@ -1537,6 +1584,7 @@ export function runReviewLabelCli({
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
+    operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
   });
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
@@ -1750,6 +1798,16 @@ export function runReviewLabelCli({
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
     }
+    // R728: the label-level record (`latestAcceptRecord`) reads any `cleared-human` marker, but the shared scan is the
+    // proof. With no citable source (an unproven carrier ended the chain) the clearance cannot be carried, so the lift
+    // must not add `review:accepted` under a plain restamp: hand the hold to the operator, a human re-clear is owed.
+    // The full thread only: a full first page can still cite a source that a carrier past comment 100 has ended.
+    if (clearance && !latestHumanClearanceSourceId(readCarryEvidence().comments)) {
+      const reason = 'the clearance has no proven carry chain to this head (an unproven carrier ended it), so a human must re-clear';
+      handMechanicalHoldToOperator(reason, { overridesLiveClearance: true });
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason, ...(handOffRetryable ? { retryable: true } : {}) } }))}\n`);
+      process.exit(1);
+    }
     carriedHumanClearance = clearance;
     clearReason = `carried from ${humanCarry.from} to ${humanCarry.to}: ${humanCarry.reason}. ${clearReason}`.trim();
   }
@@ -1790,6 +1848,10 @@ export function runReviewLabelCli({
   let humanClearance = null;
   if (to === 'restamp') {
     humanClearance = carriedHumanClearance ?? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff });
+    if (guardedRestamp && parseLatestHumanClearedSha(prComments)
+      && (!humanClearance || parseReviewedDiff([latestHumanClearanceComment(prComments)]) !== normalizeDiffFingerprint(reviewedDiff))) {
+      fail('CI-heal human clearance NOT carried: net reviewed diff changed — a human must re-approve', 1);
+    }
     if (!humanClearance && !guardedRestamp && !restampAcrossHold) {
       const derived = deriveHumanCarry();
       // An unreadable review / full-thread read must not mint this accept WITHOUT its `cleared-human` marker: that would drop
@@ -1825,6 +1887,14 @@ export function runReviewLabelCli({
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — render the durable comment ONCE, here, so the bytes
   // that are size-checked, written and posted are the same bytes.
+  if (to === 'restamp' && humanClearance) {
+    // The full thread only (re-read when the page is full; a short page IS the thread): a page-first answer could cite a
+    // source that a later carrier past comment 100 already ended.
+    const sourceId = latestHumanClearanceSourceId(readCarryEvidence().comments);
+    // R728: with no citable source the clearance cannot be carried. Readers would treat an uncited carrier as a plain
+    // accept that ends the chain, so post exactly that: a plain restamp, never a `cleared-human` record nobody proved.
+    humanClearance = sourceId ? { ...humanClearance, sourceId } : null;
+  }
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
   }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
@@ -1846,6 +1916,27 @@ export function runReviewLabelCli({
   // argv projection stays as belt-and-braces only because it can name the offending flag before any gh call.
   if (commentBody.length > GH_COMMENT_MAX) {
     fail(`the rendered comment is ${commentBody.length} chars, over GitHub's ${GH_COMMENT_MAX} limit — trim the body/--reason/--actor (nothing was changed)`);
+  }
+
+  // PR #6529 round 3 — THE READER AGREES BEFORE ANY WRITE. A restamp that carries the operator's clearance must leave a
+  // record the gate reader (`parseLatestHumanClearedSha`) reads as clearing THIS head. The writer's own proof can be
+  // wider than the reader's (a fingerprint re-derived from git for a clearing comment that has none, a carrier with no
+  // resolvable `cleared-from` source): posting it would lift the hold, and the reader would then still name the old head,
+  // so the next tampering check reparks. So the rendered comment is read back through the reader, as an automation
+  // carrier appended to the COMPLETE thread, before the ledger, the label or the comment is written. A disagreement is a
+  // decided refusal: across the drain's mechanical park the hold goes to the operator; a plain restamp writes nothing.
+  if (to === 'restamp' && humanClearance) {
+    const thread = readCarryEvidence().comments;
+    const selfCheck = { id: 'IC_restamp_reader_self_check', author: { login: AUTOMATION_LOGINS[0] ?? 'web-everything' }, body: commentBody };
+    const readerSha = Array.isArray(thread) ? parseLatestHumanClearedSha([...thread, selfCheck]) : null;
+    if (String(readerSha ?? '') !== String(headSha).toLowerCase()) {
+      const why = `the restamped clearance would not be readable by the gate (it reads the clearance on ${readerSha ? String(readerSha).slice(0, 9) : 'no head'}, not ${String(headSha).slice(0, 9)}): `
+        + 'the operator clearance has no reviewed-diff fingerprint or no citable source comment, so a carrier cannot prove it (R706)';
+      if (restampAcrossHold) handMechanicalHoldToOperator(why);
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason: why,
+        ...(restampAcrossHold && handOffRetryable ? { retryable: true } : {}) } }))}\n`);
+      process.exit(1);
+    }
   }
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1947,6 +2038,7 @@ export function runReviewLabelCli({
 
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
+  let clearingLedgerError;
   try {
     const appended = appendVerdict(buildVerdictRecord({
       repo,
@@ -1974,6 +2066,7 @@ export function runReviewLabelCli({
       // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
       // a holding target still swaps (the hold must apply even when the ledger is down).
       clearingLedgerMiss = verdictClears(ledgerVerdict);
+      clearingLedgerError = appended.git?.error ?? appended.errors.join('; ');
     } else if (to === 'clear-human') {
       // #5649 — the audit row beside the clearing verdict. Only `clear-human` writes one: an ordinary `accepted` is a
       // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
@@ -1997,6 +2090,7 @@ export function runReviewLabelCli({
       if (!approval?.ok) {
         process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
         clearingLedgerMiss = true;
+        clearingLedgerError = approval?.git?.error ?? approval?.errors?.join('; ');
       }
     }
   } catch (e) {
@@ -2004,7 +2098,7 @@ export function runReviewLabelCli({
   }
   // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
   if (clearingLedgerMiss) {
-    fail('verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; retry once the ledger transport is reachable', 1);
+    fail(`verdict-ledger write refused for a clearing verdict (F4): ${ledgerWriteErrorSummary(clearingLedgerError)}; the label is NOT swapped; retry once the ledger transport is reachable`, 1);
   }
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
@@ -2050,6 +2144,7 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE DURABLE RECORD. Write the body to a temp file to dodge
   // shell-quoting pitfalls (emoji/newlines), then `--body-file`. This is the half that carries the `reviewed-sha`
   // (and `reviewed-diff`) marker the #2409 staleness gate reads.
+  let restampedAt;
   const postComment = () => {
     let commentFailure;
     for (let attempt = 0; attempt < (pinnedPlainRearm ? 3 : 1); attempt++) {
@@ -2067,6 +2162,7 @@ export function runReviewLabelCli({
         try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
       }
       try {
+        restampedAt = Date.now();
         provider.postComment(repo, pr, commentBody);
         return;
       } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
@@ -2157,12 +2253,21 @@ export function runReviewLabelCli({
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   const order = resumePinnedRearm ? ['comment'] : pinnedPlainRearm ? ['swap', 'comment'] : writeOrder({ acceptanceAlreadyLive });
   for (const step of order) { steps[step](); }
+  const refreshFn = refreshGate ?? (liveGhProviders.has(provider) ? refreshMergeGateAfterRestamp : null);
+  const gateRefresh = to === 'restamp' && refreshFn
+    ? refreshFn({ repo, pr, head: headSha, restampedAtMs: restampedAt }) : null;
   signalFix({ repo, pr, label: decision.addLabel });
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
   if (to === 'clear-human' && acceptanceAlreadyLive) reassertHumanClearance({ provider, repo, pr, headSha });
+  if (to === 'clear-human') {
+    try {
+      const r = closeConfirmRuns({ repo, pr, headSha });
+      if (r.closed.length || r.failed.length) process.stderr.write(`review-set-label: confirm runs abstained ${JSON.stringify(r.closed)} failed ${JSON.stringify(r.failed)}\n`);
+    } catch { /* best effort: the clearance stands */ }
+  }
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and
@@ -2283,7 +2388,8 @@ export function runReviewLabelCli({
     newLabels = [...new Set([...names, decision.addLabel])];
   }
 
-  emit(`${JSON.stringify(successResult({ pr: Number(pr), to, decision, labels: newLabels }))}\n`);
+  emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision, labels: newLabels }),
+    ...(gateRefresh ? { gateRefresh } : {}) })}\n`);
   process.exit(0);
 }
 
@@ -2330,7 +2436,7 @@ export function runReviewLabelCli({
  *
  * @param {{to:string, actor:string, headSha?:string, body?:string, reason?:string, reviewedDiff?:string,
  *   clearerId?:string, independence?:{independent:boolean,status:string,reason:string}|null,
- *   channel?:string, humanClearance?:{actor:string,sha:string}|null}} o -
+ *   channel?:string, humanClearance?:{actor:string,sha:string,sourceId?:string}|null}} o -
  *   #x169fqe: `reviewedDiff` is the raw diff (or a precomputed fingerprint) the verdict was formed against.
  *   Omitted → no diff marker → the gate falls back to SHA identity, i.e. pre-#x169fqe behaviour.
  *   #2898: `channel` is the SURFACE the verdict came through, free text like `actor` (see `normalizeChannel`).
@@ -2376,6 +2482,7 @@ export function buildVerdictComment({
       buildReviewedContributionMarker(reviewedDiff),
       to === 'clear-human' ? buildClearedHumanMarker(actor)
         : carriesHumanClearance ? buildClearedHumanMarker(humanClearance.actor) : '',
+      carriesHumanClearance ? buildClearedFromMarker(humanClearance.sourceId) : '',
       // The shared marker builder refuses only `\n`; a CR or U+2028/9 in the id would still end the marker's line
       // early, so the id is refused (no marker, like an unusable id) before it reaches that builder.
       buildClearerActorMarker(/[\r\n\p{Zl}\p{Zp}]/u.test(String(clearerId)) ? '' : clearerId),
@@ -2618,7 +2725,9 @@ export function projectVerdictCommentLength({ body = '', actor = '', reason = ''
   // a proof — unlike every other branch of this projection, which is exact — but it is strictly better than the
   // blind spot it replaces, and the RENDERED-BYTES guard in `runReviewLabelCli` (checked against the REAL
   // `humanClearance`, before any write) is what actually enforces the cap; this projection is belt-and-braces.
-  const humanClearances = [null, { actor: actor || 'x', sha: 'f'.repeat(40) }];
+  // Source ids are unavailable at preflight too; reserve a GraphQL-id sized citation here.
+  // Longer ids are still checked by the final rendered-byte guard before any write.
+  const humanClearances = [null, { actor: actor || 'x', sha: 'f'.repeat(40), sourceId: 'IC_' + 'x'.repeat(64) }];
   return Math.max(...REVIEW_LABEL_TARGETS.flatMap((to) => outcomes.flatMap((independence) => humanClearances.map(
     (humanClearance) => buildVerdictComment({
       to, actor, headSha: 'f'.repeat(40), body, reason, reviewedDiff: 'f'.repeat(64), clearerId, independence,

@@ -199,3 +199,66 @@ describe('lane-pool constellation sibling clones (#2166 → #2282 → #2349)', (
     expect(existsSync(join(poolRoot, 'some-other-pool', 'plateau-app'))).toBe(false);
   });
 });
+
+describe('lane-pool heal-siblings (R817: Forge needs ../frontierui next to every lane)', () => {
+  const healArgs = (extra = []) => [
+    'heal-siblings', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=web-everything', '--branch=main', '--no-install', ...extra,
+  ];
+  const heal = (extra) => runPool(healArgs(extra), { LANE_POOL_ROOT: poolRoot });
+  const poolFui = () => join(poolRoot, 'web-everything', 'frontierui');
+  const danglingPath = () => join(base, 'frontierui', 'frontierui');
+  const setup = () => {
+    makeSiblingPrimary('frontierui', { withBuildTools: true });
+    makeSiblingPrimary('plateau-app', { withBuildTools: false });
+    mkdirSync(join(poolRoot, 'web-everything'), { recursive: true });
+  };
+
+  it('heal-recreates: an absent pool-root sibling comes back as a REAL clone, not a symlink', () => {
+    setup();
+    expect(existsSync(poolFui())).toBe(false);
+    const r = heal();
+    expect(r.code).toBe(0);
+    expect(lstatSync(poolFui()).isSymbolicLink()).toBe(false);
+    expect(existsSync(join(poolFui(), '.git'))).toBe(true);
+  });
+
+  it('dangling-symlink-removed: a dangling symlink at the primary sibling path is removed and logged once', () => {
+    setup();
+    symlinkSync(join(base, 'no-such-target'), danglingPath());
+    const r = heal();
+    expect(r.code).toBe(0);
+    expect(() => lstatSync(danglingPath())).toThrow();
+    expect((r.err + r.out).match(/removed dangling symlink/g) || []).toHaveLength(1);
+  });
+
+  it('live-symlink-kept: a symlink whose target exists is never removed', () => {
+    setup();
+    const target = join(base, 'live-target');
+    mkdirSync(target);
+    symlinkSync(target, danglingPath());
+    expect(heal().code).toBe(0);
+    expect(lstatSync(danglingPath()).isSymbolicLink()).toBe(true);
+    expect(existsSync(target)).toBe(true);
+  });
+
+  it('real-dir-kept: a real directory (and an untracked .claude/) at those paths is never touched', () => {
+    setup();
+    mkdirSync(danglingPath());
+    writeFileSync(join(danglingPath(), 'keep.txt'), 'x\n');
+    mkdirSync(join(base, 'frontierui', '.claude'));
+    writeFileSync(join(base, 'frontierui', '.claude', 'keep.json'), '{}\n');
+    expect(heal().code).toBe(0);
+    expect(readFileSync(join(danglingPath(), 'keep.txt'), 'utf8')).toBe('x\n');
+    expect(readFileSync(join(base, 'frontierui', '.claude', 'keep.json'), 'utf8')).toBe('{}\n');
+  });
+
+  it('dry-run-no-op: --dry-run reports but changes nothing', () => {
+    setup();
+    symlinkSync(join(base, 'no-such-target'), danglingPath());
+    const r = heal(['--dry-run']);
+    expect(r.code).toBe(0);
+    expect(lstatSync(danglingPath()).isSymbolicLink()).toBe(true);
+    expect(existsSync(poolFui())).toBe(false);
+    expect(r.err + r.out).toMatch(/dry.?run/i);
+  });
+});

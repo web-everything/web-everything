@@ -4,6 +4,16 @@ import { vi, it, expect, describe } from 'vitest';
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
+vi.mock('../../lib/pid-alive.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  const { execFileSync } = await import('node:child_process');
+  return {
+    ...actual,
+    // pid-alive can already be loaded by the test setup, before the subprocess mock.
+    // Keep its real parser and the default probe wiring; inject only the ps reader.
+    pidIdentity: (pid, opts) => actual.pidIdentity(pid, { exec: execFileSync, ...opts }),
+  };
+});
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
   return {
@@ -444,11 +454,11 @@ const HEAD_2752 = '253d75c2b82988be773903cba4e5ed172be57fb8';
 const BASE_2752 = '06d01a43e0000000000000000000000000000000';
 const BLOB = 'b'.repeat(40);
 
-it('enrichPrsWithAlreadyLandedFacts skips a PR with no merge-status:conflicting label entirely — zero extra IO', async () => {
+it('enrichPrsWithAlreadyLandedFacts skips a PR with neither conflict label nor DIRTY merge state entirely — zero extra IO', async () => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const fetchRef = vi.fn();
   const readMergeBase = vi.fn();
-  const prs = [{ number: 1, labels: [{ name: 'review:changes' }] }];
+  const prs = [{ number: 1, headRefOid: HEAD_2752, mergeStateStatus: 'CLEAN', labels: [{ name: 'review:changes' }] }];
   const out = enrichPrsWithAlreadyLandedFacts(prs, { fetchRef, readMergeBase });
   expect(fetchRef).not.toHaveBeenCalled();
   expect(readMergeBase).not.toHaveBeenCalled();
@@ -509,6 +519,42 @@ it('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base
   expect(readChanges).not.toHaveBeenCalled();
   expect(enrichPrsWithAlreadyLandedFacts([pr], { fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges })[0]
     .alreadyLandedInMain).toBeUndefined();
+  const readMergeBase = vi.fn();
+  const hostile = { ...pr, headRefOid: '--output=/x' };
+  expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
+  expect(readMergeBase).not.toHaveBeenCalled();
+});
+
+// A PR whose conflict is only visible as `mergeStateStatus: DIRTY` (no `merge-status:conflicting` label yet) takes
+// the same already-landed enrichment path as a labelled one — same attach / never-guess guarantees.
+it.each([
+  { labels: [{ name: 'review:changes' }], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts treats a DIRTY merge state as conflict evidence: attaches the carrier PR on a full match, evidence %j', async (conflictEvidence) => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752, ...conflictEvidence };
+  const readChanges = vi.fn(() => [{ status: 'A', path: 'a.txt', dstMode: '100644', dstBlob: BLOB }]);
+  const out = enrichPrsWithAlreadyLandedFacts([pr], {
+    fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges,
+    findMatchingCommit: vi.fn(() => '22faaaa916445657928d5e30720881b830387ab6'), readPulls: vi.fn(() => [2759]),
+  });
+  expect(out[0].alreadyLandedInMain).toEqual({ carrierPr: 2759 });
+});
+
+it.each([
+  { labels: [], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts with DIRTY merge state never guesses partial containment or a non-sha head, evidence %j', async (conflictEvidence) => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752, ...conflictEvidence };
+  const readChanges = vi.fn(() => [
+    { status: 'A', path: 'b.txt', dstMode: '100644', dstBlob: BLOB },
+    { status: 'D', path: 'a.txt', dstMode: '000000', dstBlob: '0'.repeat(40) },
+  ]);
+  const findMatchingCommit = vi.fn((change) => (change.path === 'b.txt' ? 'commit1' : null));
+  expect(enrichPrsWithAlreadyLandedFacts([pr], {
+    fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges, findMatchingCommit, readPulls: vi.fn(),
+  })[0].alreadyLandedInMain).toBeUndefined();
   const readMergeBase = vi.fn();
   const hostile = { ...pr, headRefOid: '--output=/x' };
   expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
@@ -1219,12 +1265,13 @@ it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads
 it('xe8y12n real PR read shell enriches the reported missing-family shape from commit evidence', async () => {
   const { defaultReadPrs } = await import('../reconcile-pass.mjs');
   const { planReconcile } = await import('../reconcile-core.mjs');
-  const calls = [];
-  const prs = defaultReadPrs({ repo: 'o/r', exec: (_bin, args) => {
+  const calls = [], steps = [];
+  const prs = defaultReadPrs({ step: (name, fn) => { steps.push(name); return fn(); }, repo: 'o/r', exec: (_bin, args) => {
     calls.push(args);
     return JSON.stringify(args[1] === 'list' ? [{ number: 3239, labels: [], comments: [], statusCheckRollup: [] }]
       : { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { messageHeadline: 'repair', authors: { nodes: [{ name: 'Claude' }] } } }] } } } } });
   } });
+  expect(steps).toContain('planner-cache-diff');
   expect(calls.some(args => args.some(arg => arg.includes('commits(first:')))).toBe(true);
   expect(planReconcile({ prs }).notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
 });
@@ -1307,6 +1354,51 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
 });
 
 // LIVE INCIDENT 2026-10-04, PR #3826: card-only PR, an UNTOUCHED test hit the 5000 ms default, 3/3 heals burned.
+describe('timeout evidence required-check origin recovery', () => {
+  const repo = 'web-everything/web-everything';
+  const head = 'a'.repeat(40);
+  const origin = `https://github.com/${repo}/actions/runs/10/job/20`;
+  const fixture = () => ({ number: 5273, headRefOid: head, requiredCheckName: 'test',
+    statusCheckRollup: [
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ],
+  });
+
+  it('recovers the required check own run URL and reads timeout evidence exactly once with that origin', () => {
+    const pr = fixture();
+    const timeoutRetry = { eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory' };
+    const read = vi.fn(() => timeoutRetry);
+    const readCheckOrigin = vi.fn(({ repo: slug, pr: number, head: sha, name }) => {
+      expect({ repo: slug, pr: number, head: sha, name }).toEqual({ repo, pr: pr.number, head, name: pr.requiredCheckName });
+      return origin;
+    });
+    const [result] = enrichPrsWithTimeoutEvidence([pr], {
+      repo, enabled: true, read, readCheckOrigin, readBudget: () => ({ confirmed: 0, rejected: 0 }),
+    });
+    expect.soft(readCheckOrigin).toHaveBeenCalledTimes(1);
+    expect.soft(read).toHaveBeenCalledTimes(1);
+    expect.soft(read).toHaveBeenCalledWith(expect.objectContaining({
+      requiredCheckName: 'test',
+      statusCheckRollup: [pr.statusCheckRollup[0], { ...pr.statusCheckRollup[1], detailsUrl: origin }],
+    }), { repo });
+    expect.soft(result.timeoutRetry?.reason).not.toBe('missing-check-origin');
+    expect.soft(result.timeoutRetry).toEqual(timeoutRetry);
+  });
+
+  it('fails closed with missing-check-origin and never reads timeout evidence when origin recovery returns null', () => {
+    const read = vi.fn(() => ({ eligible: true }));
+    const readCheckOrigin = vi.fn(() => null);
+    const [result] = enrichPrsWithTimeoutEvidence([fixture()], {
+      repo, enabled: true, read, readCheckOrigin, readBudget: () => ({ confirmed: 0, rejected: 0 }),
+    });
+    expect.soft(readCheckOrigin).toHaveBeenCalledTimes(1);
+    expect.soft(readCheckOrigin).toHaveBeenCalledWith({ repo, pr: 5273, head, name: 'test' });
+    expect.soft(read).not.toHaveBeenCalled();
+    expect.soft(result.timeoutRetry).toEqual({ eligible: false, reason: 'missing-check-origin' });
+  });
+});
+
 describe('timeout re-run eligibility — card-only diff + derived red checks (PR #3826)', () => {
   const sources = { 'a.test.mjs': 'import "./b.mjs"; process.env.X;', 'b.mjs': 'export const b = 1;', 'vite.config.mts': 'export default {};' };
   const base = { head: 'h', sourceHead: 'h', sources, roots: ['vite.config.mts', 'a.test.mjs'] };
@@ -1549,9 +1641,40 @@ describe('readTimeoutEvidence — authoritative cancelled check suites (#4651)',
   it('does not rerun a cancelled older suite superseded by a successful newer suite of the same name', () => {
     const exec = execFor(10, 20);
     expect(readTimeoutEvidence(pr, { repo, exec })).toEqual({
-      eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory',
+      eligible: false, reason: 'timeout-evidence:no-primary-failed-checks',
     });
     expect(exec.mock.calls.some(([, args]) => args[1].includes('/actions/'))).toBe(false);
+  });
+
+  it('review-gate as the only red check is no-primary-failed-checks, never an incomplete inventory (live 2026-11-09 #6612/#6621)', () => {
+    const json = JSON.stringify;
+    const exec = vi.fn((_c, [, path]) => {
+      if (/\/pulls\/7$/.test(path)) return json({ head: { sha: head }, base: { sha: 'b' }, state: 'open', changed_files: 1 });
+      if (/pulls\/7\/files/.test(path)) return json([{ filename: 'a.ts' }]);
+      if (/check-runs/.test(path)) return json({ total_count: 2, check_runs: [
+        { id: 1, name: 'test', status: 'completed', conclusion: 'success', details_url: url(50, 1), check_suite: { id: 5 } },
+        { id: 2, name: 'review-gate', status: 'completed', conclusion: 'failure', details_url: url(60, 2), check_suite: { id: 6 } },
+      ] });
+      if (/\/status$/.test(path)) return json({ total_count: 0 });
+      throw new Error(`unexpected ${path}`);
+    });
+    expect(readTimeoutEvidence(pr, { repo, exec })).toEqual({ eligible: false, reason: 'timeout-evidence:no-primary-failed-checks' });
+  });
+
+  it('a red aggregate test hidden by a superseded failed shard stays incomplete-failure-inventory (not review-hold-only)', () => {
+    const json = JSON.stringify;
+    const exec = vi.fn((_c, [, path]) => {
+      if (/\/pulls\/7$/.test(path)) return json({ head: { sha: head }, base: { sha: 'b' }, state: 'open', changed_files: 1 });
+      if (/pulls\/7\/files/.test(path)) return json([{ filename: 'a.ts' }]);
+      if (/check-runs/.test(path)) return json({ total_count: 3, check_runs: [
+        { id: 1, name: 'test-shard (1)', status: 'completed', conclusion: 'failure', details_url: url(50, 1), check_suite: { id: 5 } },
+        { id: 2, name: 'test-shard (1)', status: 'completed', conclusion: 'success', details_url: url(51, 2), check_suite: { id: 6 } },
+        { id: 3, name: 'test', status: 'completed', conclusion: 'failure', details_url: url(52, 3), check_suite: { id: 6 } },
+      ] });
+      if (/\/status$/.test(path)) return json({ total_count: 0 });
+      throw new Error(`unexpected ${path}`);
+    });
+    expect(readTimeoutEvidence(pr, { repo, exec })).toEqual({ eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory' });
   });
 
   it('reruns only run 200 when its newer suite is cancelled despite the older suite having a higher green check-run id', () => {
@@ -1594,4 +1717,385 @@ it('re-probes a bound PID on each pass, discarding an earlier live result even w
   expect(dead.pidAlive).toBe(false);
   expect(assessLiveness([{ agent: dead }])).toBeNull();
   expect(enrichAgents([row], { probe: () => null })[0]).not.toHaveProperty('pidAlive');
+});
+
+
+describe('pid reuse: a process that started after the session registered is not that session', () => {
+  const ps = (lstart) => () => `S ${lstart} claude bg-spare x\n`;
+  const SESSION_MS = Date.parse('2026-11-03T14:00:00Z');
+  it('reused pid (process started 1h after the session) reads dead', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: ps('Tue Nov  3 15:00:00 2026') })).toMatchObject({ alive: false, reason: 'started-after-holder' });
+  });
+  it('live holder (pre-warmed bg-spare started before the session) reads alive', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: ps('Tue Nov  3 13:00:00 2026') }).alive).toBe(true);
+  });
+  it('unreadable ps stays unknown (fail closed: keep)', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: () => { throw Object.assign(new Error('x'), { stderr: 'boom' }); } }).alive).toBeNull();
+  });
+  it('dead holder reads dead; enrichAgents passes the session start through to the probe', async () => {
+    const { enrichAgents, probePid } = await import('../reconcile-pass.mjs');
+    const seen = [];
+    // Mirrors the production call shape: probe(pid, kill, identity, opts) — opts is the FOURTH argument.
+    const probe = (pid, _kill, _identity, opts) => { seen.push(opts); return probePid(pid, () => { throw Object.assign(Error('x'), { code: 'ESRCH' }); }, undefined, opts); };
+    const out = enrichAgents([{ pid: 66752, startedAt: SESSION_MS, state: 'working' }], { probe })[0];
+    expect(out.pidAlive).toBe(false);
+    expect(seen[0]).toEqual({ startedBy: SESSION_MS });
+  });
+});
+
+it('enrichAgents default probe path: reused pid (process newer than session) is marked pidAlive:false', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
+  // Keep the default probe/identity wiring, supplying ps through this file's subprocess mock.
+  // The current pid exists; the fixture process started after the registered session.
+  execFileSync.mockReturnValueOnce('S Tue Nov  3 15:00:00 2026 claude bg-spare x\n');
+  const out = enrichAgents([{ pid: process.pid, startedAt: Date.parse('2020-01-01T00:00:00Z'), state: 'working' }],
+    { readLaneHead: () => null })[0];
+  expect(out.pidAlive).toBe(false);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
+});
+
+it('enrichAgents reads ISO-string and numeric-string startedAt for the reuse guard', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
+  for (const startedAt of ['2020-01-01T00:00:00Z', String(Date.parse('2020-01-01T00:00:00Z'))]) {
+    execFileSync.mockReturnValueOnce('S Tue Nov  3 15:00:00 2026 claude bg-spare x\n');
+    expect(enrichAgents([{ pid: process.pid, startedAt, state: 'working' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+    expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
+  }
+});
+
+it.each(['malformed ps output', new Error('ps unavailable')])('enrichAgents default probe keeps unreadable identity unknown (%s)', async snapshot => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
+  execFileSync.mockImplementationOnce(() => {
+    if (snapshot instanceof Error) throw snapshot;
+    return snapshot;
+  });
+  const row = { pid: process.pid, pidAlive: true, startedAt: '2020-01-01T00:00:00Z', state: 'working' };
+  const out = enrichAgents([row], { readLaneHead: () => null })[0];
+  expect(out).not.toHaveProperty('pidAlive');
+  expect(out).toMatchObject({ pid: process.pid, startedAt: row.startedAt, state: 'working' });
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
+});
+
+// Red-team round 5 (PR #6346): a wrapped worker resumed by the harness keeps its first-launch startedAt while its new
+// child pid started later. The reuse guard must not call that live child a recycled pid.
+it('enrichAgents keeps a resumed wrapped worker alive: its startedAt is the first launch, its child pid is newer', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
+  const { wrappedRecordToAgentRow } = await import('../../operations/worker-wrapper-launch.mjs');
+  const { COMPLETION_RECORD_V2 } = await import('../../operations/completion-store.mjs');
+  const firstLaunch = Date.parse('2020-01-01T00:00:00Z');
+  const row = wrappedRecordToAgentRow({
+    v: COMPLETION_RECORD_V2, launcher: 'claude-p', role: 'fix', status: 'started', session: 'fix-1', pid: process.pid,
+    startedAt: new Date(firstLaunch).toISOString(), cwd: '/lane',
+  }, { isAlive: () => true });
+  expect(row).toMatchObject({ kind: 'wrapped-worker', pid: process.pid, startedAt: firstLaunch });
+  const snapshot = 'S Tue Nov  3 15:00:00 2026 claude bg-spare x\n';
+  execFileSync.mockReturnValueOnce(snapshot);
+  expect(enrichAgents([row], { readLaneHead: () => null })[0].pidAlive).toBe(true);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
+  // the same pid on a NON-wrapped row with the same old start is still a reused pid (the guard stays armed there)
+  execFileSync.mockReturnValueOnce(snapshot);
+  expect(enrichAgents([{ ...row, kind: 'bg' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
+});
+
+it('holderStartedBy: null for a wrapped worker, the parsed start for any other row, null when unreadable', async () => {
+  const { holderStartedBy } = await import('../../lib/pid-alive.mjs');
+  const { startedAtMs } = await import('../reconcile-core.mjs');
+  expect(holderStartedBy({ kind: 'wrapped-worker', startedAt: 1_700_000_000_000 }, startedAtMs)).toBeNull();
+  expect(holderStartedBy({ kind: 'bg', startedAt: 1_700_000_000_000 }, startedAtMs)).toBe(1_700_000_000_000);
+  expect(holderStartedBy({ startedAt: '2020-01-01T00:00:00Z' }, startedAtMs)).toBe(Date.parse('2020-01-01T00:00:00Z'));
+  expect(holderStartedBy({ startedAt: 'nope' }, startedAtMs)).toBeNull();
+  expect(holderStartedBy(null, startedAtMs)).toBeNull();
+});
+
+describe('freshAgentStatus — uncached status read at decision time', () => {
+  it('returns the row status for the matching sessionId; unreadable/absent fails closed to null', async () => {
+    const { freshAgentStatus } = await import('../reconcile-pass.mjs');
+    const exec = () => JSON.stringify([{ sessionId: 'a', status: 'busy' }, { sessionId: 'b', status: 'idle' }]);
+    const seen = [];
+    expect(freshAgentStatus({ sessionId: 'b' }, (...a) => { seen.push(a); return exec(); })).toBe('idle');
+    expect(seen[0][0]).toBe('claude');
+    expect(seen[0][1]).toEqual(['agents', '--json']);
+    expect(freshAgentStatus({ sessionId: 'zzz' }, exec)).toBeNull();
+    expect(freshAgentStatus({ sessionId: 'b' }, () => { throw new Error('x'); })).toBeNull();
+  });
+});
+
+describe('makeReconcileIdleFinishedInfoFor — the reconcile-only wiring of the idle-row override (R810)', () => {
+  it('opts in with the 3x hung grace and the injected exec for the fresh read; a busy fresh read keeps the session', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'reconcile-idle-wiring-'));
+    const cwd = '/Users/fixture/workspace/dispatch-1';
+    const sessionId = 'sess-wiring-0001';
+    mkdirSync(join(root, cwd.replaceAll('/', '-')), { recursive: true });
+    vi.stubEnv('CLAUDE_PROJECTS_DIR', root);
+    vi.resetModules();
+    try {
+      const { makeReconcileIdleFinishedInfoFor } = await import('../reconcile-pass.mjs');
+      const now = Date.now();
+      const MIN = 60_000;
+      const write = (minsAgo) => writeFileSync(join(root, cwd.replaceAll('/', '-'), `${sessionId}.jsonl`), `${JSON.stringify({
+        type: 'assistant', timestamp: new Date(now - minsAgo * MIN).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'x' } }] },
+      })}\n`);
+      const execFor = (status) => () => JSON.stringify([{ sessionId, status }]);
+      const row = { cwd, sessionId, status: 'idle' };
+      write(100);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(true);
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('busy') })(row, now, 10 * MIN).finished).toBe(false);
+      write(75); // inside 3 x 30 min
+      expect(makeReconcileIdleFinishedInfoFor({ hungThresholdMs: 30 * MIN, exec: execFor('idle') })(row, now, 10 * MIN).finished).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('defaultReadAgents — the production default wires the reconcile-only idle-row override (R810)', () => {
+  it('a listed idle row ending on a dangling call, silent past 3x the hung threshold, is marked idleFinished; a busy fresh read is not', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'reconcile-default-wiring-'));
+    const cwd = '/Users/fixture/workspace/dispatch-2';
+    const sessionId = 'sess-default-0001';
+    mkdirSync(join(root, cwd.replaceAll('/', '-')), { recursive: true });
+    vi.stubEnv('CLAUDE_PROJECTS_DIR', root);
+    vi.resetModules();
+    try {
+      const { defaultReadAgents } = await import('../reconcile-pass.mjs');
+      const now = Date.now();
+      const MIN = 60_000;
+      writeFileSync(join(root, cwd.replaceAll('/', '-'), `${sessionId}.jsonl`), `${JSON.stringify({
+        type: 'assistant', timestamp: new Date(now - 100 * MIN).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'x' } }] },
+      })}\n`);
+      const none = () => null;
+      const read = (freshStatus) => defaultReadAgents({
+        exec: () => JSON.stringify([{ sessionId, cwd, name: 'ci-heal-1', status: freshStatus, state: 'blocked', pid: 1 }]),
+        env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' }, now, hungThresholdMs: 30 * MIN, completionFor: none, hungInfoFor: none, authExpiredInfoFor: none,
+        bgIsolationStallInfoFor: none, listJobs: () => [],
+      });
+      expect(read('idle').find((r) => r.sessionId === sessionId)?.idleFinished).toBe(true);
+      expect(read('busy').find((r) => r.sessionId === sessionId)?.idleFinished).not.toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+it.each([true, false])('CLI preserves failure output and publishes planner timings only on success (fail=%s)', async fail => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, resolve } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'reconcile-cli-timings-'));
+  const prsPath = join(dir, 'prs.json');
+  const agentsPath = join(dir, 'agents.json');
+  writeFileSync(prsPath, '[]');
+  writeFileSync(agentsPath, '[]');
+  const savedArgv = process.argv;
+  const stopped = new Error('CLI exited');
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw stopped; });
+  try {
+    vi.resetModules();
+    if (fail) {
+      const { getRequiredStatusChecks } = await import('../../lib/required-status-checks.mjs');
+      getRequiredStatusChecks.mockImplementationOnce(() => { throw new Error('HTTP 502: Bad Gateway'); });
+    }
+    process.argv = [process.execPath, resolve('scripts/conveyor/reconcile-pass.mjs'), '--json',
+      `--prs-file=${prsPath}`, `--agents-file=${agentsPath}`];
+    const cli = import('../reconcile-pass.mjs');
+    if (fail) {
+      await expect(cli).rejects.toBe(stopped);
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(stderr.mock.calls.map(([line]) => line).join('')).toBe('✗ reconcile pass could not read state: HTTP 502: Bad Gateway\n');
+      expect(logs.mock.calls.flat().join('\n')).not.toContain('planner-step');
+      expect(stdout).not.toHaveBeenCalled();
+    } else {
+      await cli;
+      expect(logs.mock.calls.flat().join('\n')).toContain('planner-step name=read-prs ');
+      expect(logs.mock.calls.flat().join('\n')).toContain('planner-step name=plan ');
+      expect(JSON.parse(stdout.mock.calls.map(([line]) => line).join('')).prs).toBe(0);
+      expect(exit).not.toHaveBeenCalled();
+    }
+  } finally {
+    process.argv = savedArgv;
+    exit.mockRestore(); logs.mockRestore(); stdout.mockRestore(); stderr.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it('logs one timing line per planner step (name, repo, ms, startedAt) so a slow step is visible', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  let time = 1000;
+  const lines = [];
+  runReconcilePass({ ...xxOptions(), env: {}, readPrs: () => [],
+    stepNow: () => time, stepLog: line => lines.push(line),
+    enrichMainRed: prs => { time += 250; return { prs, mainRedWindows: [] }; },
+    enrichTimeouts: prs => { time += 4000; return prs; },
+    readAgents: () => { time += 7; return []; } });
+  const text = lines.join('\n');
+  expect(text).toMatch(/planner-step name=enrich-timeouts repo=we ms=4000 startedAt=/);
+  expect(text).toMatch(/planner-step name=enrich-main-red repo=we ms=250 startedAt=/);
+  expect(text).toMatch(/planner-step name=read-agents repo=we ms=7 startedAt=/);
+  for (const name of ['read-prs', 'required-checks', 'hydrate-checks', 'enrich-already-landed', 'enrich-base-ref', 'enrich-system-fix', 'enrich-fix-claims', 'enrich-referral-holds', 'enrich-ledger-holds', 'plan']) expect(text).toContain(`planner-step name=${name} `);
+});
+
+
+// Frozen raw-reader verdicts replay the old serial map, including its live infra policy.
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from '../timeout-evidence-pool.mjs';
+import { writeFileSync as evidenceWrite, existsSync as evidenceExists, readFileSync as evidenceRead } from 'node:fs';
+import { join as evidenceJoin } from 'node:path';
+const recordedTimeouts = JSON.parse(evidenceRead('scripts/conveyor/__tests__/fixtures/timeout-evidence-verdicts.json', 'utf8'));
+const evidenceRepo = 'fixture/repo';
+const evidenceOptions = { repo: evidenceRepo, enabled: true, readBudget: () => ({ confirmed: 0, pending: false }),
+  readCheckOrigin: () => null, log: () => {} };
+const fixtureRead = pr => structuredClone(recordedTimeouts.find(row => row.pr.number === pr.number).raw);
+function oldTimeoutMap(prs, mode) {
+  return prs.map(pr => {
+    if (!pr.statusCheckRollup.some(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
+    const timeoutRetryBudget = evidenceOptions.readBudget();
+    if (!pr.statusCheckRollup.some(c => c.detailsUrl?.startsWith(`https://github.com/${evidenceRepo}/actions/runs/`))) {
+      return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
+    }
+    let timeoutRetry = fixtureRead(pr);
+    if (timeoutRetry?.infraCancelled) timeoutRetry = mode === 'rerun'
+      ? { ...timeoutRetry, cap: timeoutRetry.cancelledShard ? 1 : 2 }
+      : { eligible: false, reason: 'infra-cancelled-heal-mode' };
+    return { ...pr, timeoutRetry, timeoutRetryBudget };
+  });
+}
+describe('timeout evidence bounded readers', () => {
+  it.each(['rerun', 'heal'])('matches recorded old serial and pooled output in order (%s)', mode => {
+    const prs = recordedTimeouts.map(row => row.pr), expected = oldTimeoutMap(prs, mode);
+    const opts = { ...evidenceOptions, infraMode: mode, infraMaxReruns: 2 };
+    const read = vi.fn(fixtureRead);
+    expect(enrichPrsWithTimeoutEvidence(prs, { ...opts, read, concurrency: 1 })).toEqual(expected);
+    expect(read.mock.calls.map(([pr]) => pr.number)).toEqual(recordedTimeouts.filter(row => row.raw).map(row => row.pr.number));
+    read.mockClear();
+    expect(enrichPrsWithTimeoutEvidence(prs, { ...opts, read, concurrency: 1 })).toEqual(expected);
+    expect(read.mock.calls.map(([pr]) => pr.number)).toEqual(recordedTimeouts.filter(row => row.raw).map(row => row.pr.number));
+    const poolRunner = vi.fn(rows => rows.map(fixtureRead));
+    expect(enrichPrsWithTimeoutEvidence(prs, { ...opts, concurrency: 3, poolRunner })).toEqual(expected);
+    expect(poolRunner.mock.calls[0][0].map(pr => pr.number)).toEqual(recordedTimeouts.filter(row => row.raw).map(row => row.pr.number));
+    expect(poolRunner.mock.calls[0][1].concurrency).toBe(3);
+  });
+  it('logs the exact timeout-evidence summary without cache counters', () => {
+    const log = vi.fn();
+    enrichPrsWithTimeoutEvidence([recordedTimeouts[0].pr], { ...evidenceOptions, read: fixtureRead, concurrency: 1, clock: () => 10, log });
+    expect(log.mock.calls.at(-1)).toEqual(['timeout-evidence prs=1 read=1 concurrency=1 ms=0']);
+  });
+  it('keeps injected reads serial and ordered even with concurrency eight', () => {
+    const read = vi.fn(fixtureRead), poolRunner = vi.fn();
+    enrichPrsWithTimeoutEvidence(recordedTimeouts.slice(0, 3).map(row => row.pr), { ...evidenceOptions, read, concurrency: 8, poolRunner });
+    expect(read.mock.calls.map(([pr]) => pr.number)).toEqual([7100, 7101, 7102]);
+    expect(poolRunner).not.toHaveBeenCalled();
+  });
+  it('returns the original array untouched when WE_CI_TIMEOUT_RERUN_ENABLED=0', () => {
+    vi.stubEnv('WE_CI_TIMEOUT_RERUN_ENABLED', '0');
+    try {
+      const prs = recordedTimeouts.map(row => row.pr), read = vi.fn(), poolRunner = vi.fn();
+      expect(enrichPrsWithTimeoutEvidence(prs, { repo: evidenceRepo, read, poolRunner })).toBe(prs);
+      expect(read).not.toHaveBeenCalled(); expect(poolRunner).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('resolves standard/platform/tool/env concurrency with bounds and provenance', () => {
+    const resolve = opts => resolveTimeoutEvidenceConcurrency({ env: {}, settings: {}, platform: {}, ...opts });
+    expect(resolve({})).toEqual({ value: 4, source: 'standard' });
+    expect(resolve({ platform: { timeoutEvidenceConcurrency: 2 } })).toEqual({ value: 2, source: 'platform' });
+    expect(resolve({ platform: { timeoutEvidenceConcurrency: 2 }, settings: { ci: { timeoutEvidenceConcurrency: 3 } } })).toEqual({ value: 3, source: 'tool' });
+    expect(resolve({ env: { WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY: '8' } })).toEqual({ value: 8, source: 'env' });
+    for (const raw of ['0', '9', '1.5', 'bad']) expect(resolve({ env: { WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY: raw } }).value).toBe(4);
+  });
+  it('bounds live children, preserves slots on failure/deadline and cleans files and whole process groups', () => {
+    const children = new Map(); let peak = 0, pid = 2000000000, now = 0, folder;
+    const kill = vi.spyOn(process, 'kill').mockImplementation((target, signal) => {
+      if (signal === 'SIGKILL') children.delete(-target);
+      else if (!children.has(target)) throw new Error('gone');
+      return true;
+    });
+    const launch = (_node, args, opts) => {
+      expect(opts.stdio.slice(1).every(Number.isInteger)).toBe(true);
+      expect(args[4]).toContain('readTimeoutEvidence');
+      expect(opts.detached).toBe(true);
+      const output = args.at(-1); folder = evidenceJoin(output, '..');
+      const child = { pid: pid++, on: () => {} };
+      children.set(child.pid, { output, input: args.at(-2) }); peak = Math.max(peak, children.size);
+      return child;
+    };
+    try {
+      const prs = Array.from({ length: 11 }, (_, number) => ({ number }));
+      const results = runTimeoutEvidencePool(prs, { concurrency: 3, probe: () => true, launch, groupAlive: pid => children.has(pid), now: () => now, pause: () => {
+        now += 20;
+        for (const { output, input } of children.values()) {
+          const number = JSON.parse(evidenceRead(input, 'utf8')).pr.number;
+          if (number !== 10) evidenceWrite(output, number === 9 ? '{bad' : JSON.stringify({ eligible: true, number }));
+        }
+      }, deadlineMs: 100 });
+      expect(peak).toBe(3);
+      expect(results.slice(0, 9).map(v => v.number)).toEqual([0,1,2,3,4,5,6,7,8]);
+      expect(results[9]).toBeUndefined(); expect(results[10]).toBeUndefined();
+      expect(children.size).toBe(0); expect(evidenceExists(folder)).toBe(false);
+      expect(kill.mock.calls.filter(([, s]) => s === 'SIGKILL').every(([p]) => p <= -2000000000)).toBe(true);
+    } finally { kill.mockRestore(); }
+  });
+});
+
+it('serially falls back through the throttle when the pool fails or returns a missing slot', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+  execFileSync.mockImplementation(() => { throw new Error('fixture-transient-read-error'); });
+  const pr = recordedTimeouts[0].pr;
+  const expected = enrichPrsWithTimeoutEvidence([pr], { ...evidenceOptions, concurrency: 1 });
+  execFileSyncThrottled.mockClear();
+  for (const poolRunner of [() => [], () => { throw new Error('worker failure'); }]) {
+    const log = vi.fn();
+    expect(enrichPrsWithTimeoutEvidence([pr], { ...evidenceOptions, concurrency: 4, poolRunner, log })).toEqual(expected);
+    expect(log.mock.calls.flat().join('\n')).toContain('serial-fallback');
+  }
+  expect(execFileSyncThrottled).toHaveBeenCalled();
+  expect(execFileSyncThrottled.mock.calls.every(([file]) => file === 'gh')).toBe(true);
+  execFileSync.mockReset();
+});
+it('runs the file-based synchronous pool with real child processes and cleans its temp directory', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const lockRoot = mkdtempSync(evidenceJoin(tmpdir(), 'timeout-pool-throttle-'));
+  const { spawn, execFileSync: realExec } = await vi.importActual('node:child_process');
+  const groupAlive = pid => realExec('ps', ['-axo', 'pgid=,stat='], { encoding: 'utf8' }).split('\n').some(line => {
+    const [group, state] = line.trim().split(/\s+/);
+    return Number(group) === pid && state && !state.startsWith('Z');
+  });
+  let folder;
+  const launch = (node, args, opts) => {
+    folder = evidenceJoin(args.at(-1), '..');
+    const script = `import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+      const [input, output] = process.argv.slice(1);
+      const { pr } = JSON.parse(readFileSync(input, 'utf8'));
+      writeFileSync(output + '.tmp', JSON.stringify({ eligible: true, number: pr.number }));
+      renameSync(output + '.tmp', output); ${keepAliveScript({ maxLifetimeMs: 10_000 })}`;
+    return spawn(process.execPath, ['--input-type=module', '-e', script, ...args.slice(-2)], opts);
+  };
+  try {
+    expect(runTimeoutEvidencePool([{ number: 1 }, { number: 2 }, { number: 3 }], {
+      launch, groupAlive, concurrency: 2, deadlineMs: 3000,
+      env: { ...process.env, WE_GH_THROTTLE_LOCK_ROOT: lockRoot, WE_GH_THROTTLE_CAP: '4' },
+    })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
+    expect(evidenceExists(folder)).toBe(false);
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });

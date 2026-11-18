@@ -1,7 +1,7 @@
 /**
  * @file scripts/lib/host-sample.mjs
  * @description Cheap real-host reading for the dispatch gate: CPU idle % and free-memory %. macOS load average counts
- *   threads blocked on I/O and kernel work, so it overstates CPU saturation (live 2026-10-07: load 35-41 on 12 cores
+ *   threads blocked on I/O and kernel work, so it overstates CPU saturation (live 2026-10-07: load 35-41 against the host core count
  *   while `top` showed 17-25% idle and 86% memory free). Source: `top -l 2 -n 0 -s 1` (second sample = a real 1 s
  *   interval, not the since-boot first one) and `memory_pressure`. The result is cached in a small file for a few
  *   seconds so every caller (daemons, passes) shares one sample. Never throws; a failed read is `{ok:false}` and the

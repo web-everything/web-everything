@@ -27,6 +27,8 @@ import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
 
 export const RED_MAIN_HOLD_REASON = 'red-main-hold';
+export const FREEZE_UNREADABLE_HOLD_REASON = 'freeze-unreadable-hold';
+export const freezeUnreadableOnly = signal => signal.sources?.length === 1 && signal.sources[0] === 'freeze-unreadable';
 export const RED_MAIN_HOLD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-main-hold.json');
 
 const norm = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'on' || x === 'off' ? x : null; };
@@ -66,7 +68,7 @@ const live = (r, now) => !!r && Number.isFinite(r.expiresAt) && now < r.expiresA
 /**
  * Is main red right now, and which PRs own the fix? PURE.
  * @param {{mainRedState?:object|null, priority?:object|null, manualFreeze?:object|null, now:number, repo?:string}} o
- * @returns {{red:boolean, sources:string[], fixPrs:number[], firstRedSha:string|null, since:number|null}}
+ * @returns {{red:boolean, sources:string[], fixPrs:number[], firstRedSha:string|null, latestRedSha:string|null, since:number|null}}
  */
 export function redMainSignal({ mainRedState = null, priority = null, manualFreeze = null, now, repo = 'we' } = {}) {
   const sources = [];
@@ -80,12 +82,14 @@ export function redMainSignal({ mainRedState = null, priority = null, manualFree
     sources,
     fixPrs,
     firstRedSha: mainRedState?.firstRedSha ?? pri?.firstRedSha ?? manualFreeze?.mergeSha ?? null,
+    latestRedSha: mainRedState?.latestRedSha ?? pri?.latestRedSha ?? null,
     since: Number.isFinite(mainRedState?.since) ? mainRedState.since : null,
   };
 }
 
 /** The stable (pass-to-pass identical) hold reason, so the drain's "reason changed" comment fires once. PURE. */
 export function redMainHoldReason(signal) {
+  if (freezeUnreadableOnly(signal)) return `${FREEZE_UNREADABLE_HOLD_REASON}: freeze unreadable — the shared freeze could not be read, so nothing lands (main is NOT known red) until it is readable`;
   const since = Number.isFinite(signal.since) ? ` since ${new Date(signal.since).toISOString()}` : '';
   const sha = signal.firstRedSha ? ` (first red ${String(signal.firstRedSha).slice(0, 9)})` : '';
   const fix = signal.fixPrs.length ? `only the main-fix PR ${signal.fixPrs.map((n) => `#${n}`).join(', ')} lands` : 'nothing lands (no main-fix PR published yet)';
@@ -101,7 +105,7 @@ export function redMainHoldReason(signal) {
  */
 export function decideRedMainHold({ num, isLocal = true, signal, setting = 'on' }) {
   if (setting !== 'on' || !signal?.red) return { hold: false };
-  if (!isLocal && !signal.sources?.includes('manual')) return { hold: false };
+  if (!isLocal && !signal.sources?.includes('manual') && !signal.sources?.includes('freeze-unreadable')) return { hold: false };
   if (isLocal && signal.fixPrs.includes(Number(num))) return { hold: false, fix: true };
   return { hold: true, reason: redMainHoldReason(signal) };
 }

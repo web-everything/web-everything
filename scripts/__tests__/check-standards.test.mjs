@@ -33,6 +33,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const DATA = join(ROOT, 'src/_data');
 const loadJson = (rel) => JSON.parse(readFileSync(join(DATA, rel), 'utf8'));
 
+function cloneFixture(src, dest) {
+  // CI partial clones disable lazy fetch: depth 1 needs only HEAD's checked-out tree,
+  // avoiding missing historical blobs that a shared clone would try to fetch.
+  execFileSync('git', ['clone', '--quiet', '--no-local', '--depth=1', `file://${src}`, dest], { stdio: 'pipe' });
+}
+
 // ── Synthetic fixtures ────────────────────────────────────────────────────────
 // A compact registry so resolution is deterministic: `intent:droplist` / `intent:motion` and
 // `block:data-grid` resolve; everything else does not.
@@ -534,9 +540,46 @@ describe('#3337 scope entry basename matches a tracked file at a different path'
         for (const s of f.suggestions) expect(index.paths.has(s), `${file}: suggested ${s}`).toBe(true);
       }
     }
-    // The rule must stay a needle, not a firehose: a corpus-wide count in the hundreds would drown the
-    // gate's existing warnings rather than add to them. It was 4 when this landed.
-    expect(total).toBeLessThan(30);
+    // Firehose-regression bound ONLY (R907): ordinary card filing must never fail the merge queue, so the
+    // tight "needle" cap moved to the gate's visible WARNING (§6d-septies, threshold default 30). This
+    // generous bound trips only if the rule itself starts flagging everything.
+    expect(total).toBeLessThan(200);
+  });
+
+  it('FIXTURE corpus: the rule flags exactly the one mis-scoped open card, with one suggestion', () => {
+    // The rule's behaviour is asserted on a synthetic corpus, never by counting the live backlog.
+    const dir = mkdtempSync(join(tmpdir(), 'scope-basename-fixture-'));
+    try {
+      const card = (name, status, scope) =>
+        writeFileSync(join(dir, name), `---\nstatus: ${status}\nscope:\n${scope.map((e) => `  - ${e}`).join('\n')}\n---\nbody\n`);
+      card('mis.md', 'open', ['we:scripts/wrong/dir/foo.mjs']);
+      card('done.md', 'resolved', ['we:scripts/wrong/dir/foo.mjs']);
+      card('clean.md', 'open', ['we:scripts/foo.mjs']);
+      const index = buildTrackedPathIndex(['scripts/foo.mjs']);
+      const found = [];
+      for (const file of readdirSync(dir).filter((f) => f.endsWith('.md')).sort()) {
+        const { data } = matter(readFileSync(join(dir, file), 'utf8'));
+        for (const f of scopeBasenameMismatches(data, index)) found.push({ file, f });
+      }
+      expect(found).toHaveLength(1);
+      expect(found[0].file).toBe('mis.md');
+      expect(found[0].f.suggestions).toEqual(['scripts/foo.mjs']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('§6d-septies WARNS (never errors) when the live count exceeds a setting-driven threshold', () => {
+    const gate = readFileSync(join(ROOT, 'scripts/check-standards.mjs'), 'utf8');
+    const from = gate.indexOf('// ── 6d-septies.');
+    const tail = gate.slice(from, from + 6000);
+    expect(tail).toMatch(/SCOPE_BASENAME_WARN_THRESHOLD/);
+    expect(tail).toMatch(/process\.env\.SCOPE_BASENAME_WARN_THRESHOLD/);
+    expect(tail).toMatch(/warn\(`[^`]*scope-basename[^`]*\$\{scopeBasenameTotal\}/);
+    expect(tail).not.toMatch(/err\([^)]*scopeBasenameTotal/);
+    // Counting + comparison are reachable: the counter bumps inside the finding loop, the WARN fires strictly
+    // above the threshold, and a non-integer/empty env falls back to the default 30.
+    expect(gate.slice(from, from + 1500)).toMatch(/for \(const finding of scopeBasenameMismatches\(raw, trackedIndex\)\) \{\s*scopeBasenameTotal\+\+;/);
+    expect(tail).toMatch(/if \(scopeBasenameTotal > SCOPE_BASENAME_WARN_THRESHOLD\)\s*warn\(/);
+    expect(tail).toMatch(/!== ''\s*\?\s*Number\(process\.env\.SCOPE_BASENAME_WARN_THRESHOLD\)\s*:\s*30;/);
   });
 
   // ── #3337 wiring: §6d-septies must call the SHIPPED function, not re-derive it inline ──────────
@@ -636,7 +679,7 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
     try {
       // A private checkout gives the CLI real Git/index/untracked state without touching
       // the developer's backlog, refs or index. Only the shipped runner is overlaid.
-      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      cloneFixture(ROOT, repo);
       // Seed legacy debt in this fixture's baseline, so paying down the real corpus
       // never breaks this regression. Plumbing creates no commit in the source checkout.
       const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
@@ -717,7 +760,7 @@ Add a probe.
 ${note}
 `;
     try {
-      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      cloneFixture(ROOT, repo);
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
       for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'scripts/lib/tests-first-policy.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/under-test.mjs', 'scripts/lib/under-test.cjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md', 'backlog/4397-salvagelane-aborts-forever-on-a-socket-fifo-device-file-unde.md']) copyFileSync(join(ROOT, f), join(repo, f));
@@ -757,7 +800,7 @@ Add a probe.
 ${note}
 `;
     try {
-      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      cloneFixture(ROOT, repo);
       // The backlog guards need a base ref. A CI checkout is detached, so the shared clone has no
       // origin/main of its own: pin one to HEAD instead of relying on the developer's local branches.
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo, stdio: 'pipe' });

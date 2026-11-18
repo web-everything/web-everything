@@ -65,7 +65,7 @@ function validRow(row) {
   return !isStubSession(row?.session) && row?.v === 1 && typeof row.repo === 'string' && Number.isInteger(row.pr) && row.pr > 0
     && ['ci-heal', 'fix', 'rearm', 'park', 'outcome'].includes(row.kind)
     && (row.kind !== 'outcome' || (typeof row.session === 'string' && row.session.trim().length > 0
-      && ['pushed', 'no-change', 'failed'].includes(row.outcome) && typeof row.infra === 'boolean'
+      && ['pushed', 'no-change', 'no-change-unproven', 'failed'].includes(row.outcome) && typeof row.infra === 'boolean'
       && (row.reason === undefined || typeof row.reason === 'string')))
     && (!['rearm', 'park'].includes(row.kind) || typeof row.reason === 'string') && /^[a-f\d]{40}$/i.test(row.head ?? '')
     && typeof row.at === 'string' && Number.isFinite(Date.parse(row.at));
@@ -123,7 +123,7 @@ export const FIX_RUN_INFRA_PATTERNS = Object.freeze([
 ]);
 /** Shared with the launcher: every emitted terminal must participate in session-log alignment. */
 export const FIX_RUN_OUTCOME = Object.freeze({
-  FAILED: 'failed', NO_CHANGE: 'no-change', PUSHED: 'pushed', LEASE_LOST: 'lease-lost',
+  FAILED: 'failed', NO_CHANGE: 'no-change', NO_CHANGE_UNPROVEN: 'no-change-unproven', PUSHED: 'pushed', LEASE_LOST: 'lease-lost',
 });
 const FIX_RUN_TERMINAL = new RegExp(`^fix-run: PR #(\\d+) (${Object.values(FIX_RUN_OUTCOME).join('|')}) \\((.*)\\); claim`);
 /** PURE. Only failed launcher infrastructure outcomes are discounted, including card 5947 (live #5045, 2026-10-13). */

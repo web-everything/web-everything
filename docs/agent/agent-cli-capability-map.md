@@ -189,11 +189,12 @@ override syntax; effort validation and end-to-end model selection were not estab
 was verified; the cache is advertised availability, not proof of successful API access. [C] §5.
 
 **Antigravity.** `--model <name>` and `--effort <low|medium|high>` select model/effort.
+Effort is a model-id suffix OR the flag, never both; Argon has only effort-suffixed ids.
 `/model <name>` switches the conversation; `/model <name> <prompt>` is a one-prompt override that
 reverts afterward. `agy models` returned `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`,
 `gemini-3.8-flash-low`, `gemini-3.7-flash-high`, `gemini-3.7-flash-medium`, `gemini-3.7-flash-low`,
-`gemini-3.6-flash-high`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-low`, `gemini-3.1-pro-high`,
-`gemini-3.1-pro-low`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`.
+`gemini-3.6-flash-high`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-low`, `gemini-4-argon-high`,
+`gemini-4-argon-medium`, `gemini-4-argon-low`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`.
 `GEMINI_API_KEY` with `modelProvider: "gemini"` selects direct Gemini API access;
 `GOOGLE_GEMINI_BASE_URL` overrides that endpoint. Listing a model does not establish a successful
 turn for every listed model. [A] §5.

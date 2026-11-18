@@ -48,7 +48,11 @@ export default {
       const { revalidateForMerge } = await load('scripts/merge-ai-prs.mjs');
       const { runReviewJob } = await load('scripts/operations/review-job.mjs');
       const { contributionPatchId, parseVerdictCarriedMarker } = await load('scripts/lib/rebase-verdict-carry.mjs');
-      const { gateOutcomesForHead } = await load('scripts/lib/red-team-gate.mjs');
+      const { gateOutcomesForHead, parseRedTeamComment, redTeamGateMarker, redTeamResultId } = await load('scripts/lib/red-team-gate.mjs');
+      // #6606: a carry moves only a publishable red-team result; this is the canonical policy-clear one, with the
+      // gate decision bound to it, as the gate records it.
+      const clearResult = `<!-- we:red-team-advisory pr=5354 rev=${HEAD} -->\n\nRed team not required on this head: not owed (stored review)`;
+      const clearId = redTeamResultId(parseRedTeamComment(clearResult));
 
       const clearance = trusted(`<!-- reviewed-sha: ${HEAD} -->\n<!-- cleared-human: operator -->`);
       const readHold = (overrides = {}) => {
@@ -76,7 +80,7 @@ export default {
         const hold = readHold().hold;
         check(hold, `tick ${tick}: the approved live head lost its hold`);
         const result = await refreshHeldHead({ hold, refresh: refreshStalePr,
-          options: { laneRef: 'lane/approved-human', expectedHead: HEAD, runId: tick, readTip: () => HEAD,
+          options: { laneRef: 'lane/approved-human', prNumber: 7, expectedHead: HEAD, runId: tick, readTip: () => HEAD,
             refresh: () => { rebuilds++; return { ok: true, action: 'rebuilt', newCommit: NEXT }; },
             rerun: id => reruns.push(id) } });
         check(result.ok && result.action === 'rerun' && !result.newCommit, `tick ${tick}: freshness moved the head instead of rerunning`);
@@ -96,7 +100,7 @@ export default {
       }
       const beforeRace = reruns.length;
       const raced = await refreshHeldHead({ hold: true, refresh: refreshStalePr,
-        options: { laneRef: 'lane/approved-human', expectedHead: HEAD, runId: 4, readTip: () => NEXT,
+        options: { laneRef: 'lane/approved-human', prNumber: 7, expectedHead: HEAD, runId: 4, readTip: () => NEXT,
           rerun: id => reruns.push(id) } });
       check(!raced.ok && raced.action === 'head-moved' && reruns.length === beforeRace, 'a concurrent push was rerun without a new proof');
       const red = { ...pr, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };
@@ -114,7 +118,7 @@ export default {
           updateRecord: () => {}, releaseLane: () => {},
           carryAcrossRebaseSetting: () => ({ value: mode === 'off' ? 'off' : 'on', source: 'soak' }),
           readCarryEvidence: () => ({ headSha: NEXT, comments: [clearance,
-            ...(mode === 'red-team-pending' ? [] : [trusted(`<!-- we:red-team-gate pr=5354 rev=${HEAD} outcome=card-queued -->`
+            ...(mode === 'red-team-pending' ? [] : [trusted(clearResult), trusted(redTeamGateMarker(5354, HEAD, 'card-queued', clearId)
               + (mode === 'gate-with-hold' ? '\nunknown hold' : ''))])] }),
           contributionPatchId: ({ sha }) => contributionPatchId({ sha, exec(tool, args, options) {
             if (tool !== 'git') throw Error(`unexpected tool: ${tool}`);

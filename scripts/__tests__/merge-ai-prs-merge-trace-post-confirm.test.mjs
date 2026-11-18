@@ -175,6 +175,12 @@ describe('merge-ai-prs — #4138: a PR about to be closed by the stacked-base ca
     expect(call).toBeGreaterThan(-1);
     expect(src.indexOf('const landLock = withLandWriteLock(', call)).toBeGreaterThan(call);
     // The green-event shortcut runs it through `beforeEnqueue`, which enqueuePrestage awaits before its lock.
-    expect(src).toMatch(/beforeEnqueue: \(c, sha, entry\) => announceAndRetargetBeforeLand\(c,/);
+    // Shadow timing adds work inside this callback; scope the return assertion to the hook so a call in
+    // another branch cannot satisfy it, and keep checking the fresh comments and cached base arguments.
+    const hookStart = src.indexOf('      beforeEnqueue: (c, sha, entry) => {');
+    expect(hookStart).toBeGreaterThan(-1);
+    const hookEnd = src.indexOf('\n      },', hookStart);
+    expect(hookEnd).toBeGreaterThan(hookStart);
+    expect(src.slice(hookStart, hookEnd)).toMatch(/return announceAndRetargetBeforeLand\(c, \{ preread: fetchPrComments\(c\.repo, c\.num\), defaultBranch: entry\.baseRefName \}\);/);
   });
 });

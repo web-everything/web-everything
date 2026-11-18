@@ -30,7 +30,9 @@ export default {
     const realExit = process.exit;
     const exitSignal = Symbol('expected CLI exit');
     const head = 'a'.repeat(40), moved = 'b'.repeat(40);
-    const comment = (body, createdAt) => ({ body, createdAt, author: { login: 'web-everything' } });
+    // Never-edited comments, as a live `gh pr view --json comments` read reports them; an unstamped automation-posted
+    // ruling needs that proof to clear (PR #6529).
+    const comment = (body, createdAt) => ({ body, createdAt, includesCreatedEdit: false, author: { login: 'web-everything' } });
     try {
       process.env.WE_VERDICT_LEDGER_DIR = ledgerDir;
       process.env.WE_VERDICT_LEDGER_STORE = 'home';

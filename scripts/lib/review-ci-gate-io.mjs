@@ -1,3 +1,5 @@
+import { greenLedgerDir, hasGreenLedger } from './lane-verify.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { ciRedOnHead, fastChecksFor, reviewStartGate, reviewUsesRequiredChecks } from './review-timing.mjs';
 import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
@@ -14,7 +16,7 @@ export const readReviewHead = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 
 /** Fetch labels with the head so the default gate needs no separate label request. */
 export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']));
 /**
- * Every check run PLUS every legacy commit status (`{context, state}`) for the SHA: a required context may be
+ * Every check run PLUS every legacy commit status (`{context, state, target_url}`) for the SHA: a required context may be
  * published through either, and a reader of check runs alone would call a green commit-status context missing.
  * The combined-status endpoint already reports only the latest state per context.
  */
@@ -29,13 +31,15 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
     'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
   ])).flatMap(page => {
     if (!Array.isArray(page.statuses)) throw new Error('unreadable commit statuses');
-    return page.statuses.map(({ context, state }) => ({ context, state }));
+    return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
   }),
 ];
 
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
   readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
+  readVerifyGreen = hasGreenLedger, coordinationRoot,
+  log = line => console.error(line),
   readChecks = readReviewChecks, readRequired = getRequiredStatusChecks, policy = resolveTimingPolicy().review } = {}) {
   let headSha = null;
   let labels;
@@ -50,11 +54,18 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     headSha = head({ repo, pr });
     if (typeof headSha !== 'string' || !headSha.trim()) return { ...reviewCiGate({ headSha }), startAfter: policy.startAfter };
     let checks;
-    const fast = policy.startAfter === 'fast-checks' ? fastChecksFor(policy.fastChecks, repo) : null;
+    const fast = ['fast-checks', 'push'].includes(policy.startAfter) ? fastChecksFor(policy.fastChecks, repo) : null;
     // A repo whose CI does not publish fast checks waits on its own required set, exactly as ci-green does.
     const needsRequired = reviewUsesRequiredChecks(policy, repo);
     let required = { source: 'timing-policy', checks: fast ?? [] };
-    if (needsRequired) required = readRequired({ repo, ttlMs: 0 });
+    if (needsRequired) {
+      try { required = readRequired({ repo, ttlMs: 0 }); }
+      catch (error) {
+        if (policy.startAfter !== 'push') throw error;
+        // Keep reading head-bound checks so a discovery failure cannot hide red CI.
+        required = { source: 'fallback', checks: [] };
+      }
+    }
     else {
       checks = readChecks({ repo, headSha });
       // Early review needs branch-protection discovery only to identify an owner for red CI.
@@ -71,7 +82,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
     const trustedRequired = ['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) || trustedStale;
-    if (needsRequired && !trustedRequired) {
+    if (needsRequired && !trustedRequired && policy.startAfter !== 'push') {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
     checks ??= readChecks({ repo, headSha });
@@ -87,8 +98,23 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
     const requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
+    // A discovery fault or untrusted/empty set cannot excuse healable red in push mode.
+    if (policy.startAfter === 'push' && ciRedOnHead({ headSha, checks,
+      requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
+      return withSource({ allowed: false, headSha, reason: 'ci-red', affected: [], checks, requiredChecks });
     // `requiredChecks` rides along so a publish-time void judges only healable reds, as review start does.
-    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks, checks, policy }), checks, requiredChecks });
+    let verifyGreen = false;
+    if (policy.startBeforeCi) {
+      try { verifyGreen = readVerifyGreen({ dir: greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot() }), sha: headSha }) === true; }
+      catch { /* Unreadable verification waits on CI. */ }
+    }
+    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, policy, verifyGreen });
+    if (gate.earlyStartNote) {
+      // console is wrapped by the project's daemon logger; injected loggers keep fixtures hermetic.
+      try { log(gate.earlyStartNote.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 2000)); }
+      catch { /* Diagnostics cannot change permission. */ }
+    }
+    return withSource({ ...gate, checks, requiredChecks });
   } catch (error) {
     return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }

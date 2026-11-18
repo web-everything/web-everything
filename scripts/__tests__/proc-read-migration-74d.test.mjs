@@ -93,11 +93,12 @@ describe('#74d migrated readers: oversize completes, failure is never empty', ()
     }
   });
 
+  // Cold health-watch imports exceed 5s under Forge self-hosted parallel load (run 40944695769, shard 4).
   it('health-watch probeLaneVerifyMarkers: missing pool is tolerated (never throws)', async () => {
     const { probeLaneVerifyMarkers } = await import('../conveyor/health-watch.mjs');
     fake({ fail: true });
     expect(() => probeLaneVerifyMarkers({ poolRoot: join(dir, 'none') })).not.toThrow();
-  });
+  }, 60_000);
 });
 
 describe('#74d migrated modules stay on the safe helper', () => {

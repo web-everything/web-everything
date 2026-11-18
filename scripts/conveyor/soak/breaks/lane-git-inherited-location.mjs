@@ -31,8 +31,10 @@ export default {
           { cwd: ROOT, env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
         if (realpathSync(git(['rev-parse', '--show-toplevel'])) !== ROOT) violations.push(`${name}: repository redirected`);
         const config = git(['config', '--list']);
-        for (const key of ['soak.parameter', 'soak.counted']) {
-          if (config.includes(`${key}=inherited`) !== keepsConfig) violations.push(`${name}: wrong inherited config policy for ${key}`);
+        // The lane case keeps inherited GIT_CONFIG_COUNT entries (the pins follow and win), but never an inherited
+        // GIT_CONFIG_PARAMETERS: git applies it after the pins, so it would outrank them (PR #6319).
+        for (const [key, kept] of [['soak.parameter', false], ['soak.counted', keepsConfig]]) {
+          if (config.includes(`${key}=inherited`) !== kept) violations.push(`${name}: wrong inherited config policy for ${key}`);
         }
         if (env.GIT_REFERENCE_BACKEND !== undefined || env.GIT_REF_PARANOIA !== '1') violations.push(`${name}: unsafe ref environment`);
         // A second scrub must retain the repository protection: the hardened env picks up a fresh redirect (a retry
@@ -42,7 +44,7 @@ export default {
         const again = laneGitHardeningEnv(scrub({ ...env, ...Object.fromEntries(location.map((k) => [k, inherited[k]])),
           GIT_REF_PARANOIA: '0', GIT_CONFIG_PARAMETERS: inherited.GIT_CONFIG_PARAMETERS }));
         if (location.some((k) => again[k] !== undefined) || again.GIT_REF_PARANOIA !== '1'
-          || (again.GIT_CONFIG_PARAMETERS === inherited.GIT_CONFIG_PARAMETERS) !== keepsConfig) violations.push(`${name}: retry lost repository protection`);
+          || again.GIT_CONFIG_PARAMETERS !== undefined) violations.push(`${name}: retry lost repository protection`);
       } catch { violations.push(`${name}: read-only Git probe failed`); }
     }
     log?.(`lane Git environment replay: ${violations.length} violation(s)`);

@@ -51,12 +51,22 @@ export default {
       const REPO = CONSTELLATION_REPOS.we.slug;
       const hold = await load('scripts/conveyor/review-referral-hold.mjs');
       const { planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
+      const { buildClearedFromMarker } = await load('scripts/lib/review-escalation.mjs');
       const fixtures = join(sourceRoot, 'scripts/conveyor/__tests__/fixtures');
       const fx = n => {
         const path = join(fixtures, `pr-${n}-stale-referral-hold.json`);
         // A pre-fix tree has no fixtures either: replay the captured threads from this file's own tree.
         const raw = JSON.parse(readFileSync(existsSync(path) ? path : join(ROOT, 'scripts/conveyor/__tests__/fixtures', `pr-${n}-stale-referral-hold.json`), 'utf8'));
-        return { ...raw, comments: raw.comments.map(c => (BOTS.has(c.author?.login) ? { ...c, author: { login: 'web-everything' } } : c)) };
+        // R706: a drain carry record counts only when it cites the human clearance comment by id; the capture predates
+        // the `cleared-from` marker and has no ids, so add both to the SAME two comments (as the unit test's loader does).
+        const sourceIndex = raw.comments.findIndex(c => c.author?.login === 'chalbert' && c.body.includes('cleared via the sanctioned path'));
+        const carryIndex = raw.comments.findIndex(c => c.body.includes('human clearance carried forward'));
+        return { ...raw, comments: raw.comments.map((c, i) => {
+          const comment = BOTS.has(c.author?.login) ? { ...c, author: { login: 'web-everything' } } : c;
+          if (i === sourceIndex) return { ...comment, id: 'IC_clearance_5773' };
+          if (i === carryIndex) return { ...comment, body: `${comment.body}\n${buildClearedFromMarker('IC_clearance_5773')}` };
+          return comment;
+        }) };
       };
       const asPr = f => ({ number: f.number, headRefOid: f.headRefOid, body: f.body, createdAt: f.createdAt, isDraft: false,
         baseRefName: 'main', labels: f.labels.map(name => ({ name })), comments: f.comments,
@@ -78,7 +88,14 @@ export default {
           `#${n}: an all-ruled review:human pause must move to the human /review (already-reviewed-head), no new panel`);
       }
       const f5773 = fx(5773);
-      const p5773 = planFor(f5773, {});
+      // R711: the live thread's carry is a drain numbering carry (the reviewed diff changed), which counts only under
+      // humanClearance.mechanicalCarry=trust-drain-record. Scope that setting to this plan, then restore it.
+      const KEY = 'WE_HUMAN_CLEARANCE_MECHANICAL_CARRY';
+      const prior = process.env[KEY];
+      process.env[KEY] = 'trust-drain-record';
+      let p5773;
+      try { p5773 = planFor(f5773, {}); }
+      finally { if (prior === undefined) delete process.env[KEY]; else process.env[KEY] = prior; }
       check(!kinds(p5773).includes(PAUSED), `#5773: every live-head finding is ruled, yet the plan still refuses ${PAUSED}`);
       check((p5773.dispatch ?? []).length === 0 && (p5773.refusals ?? []).some(r =>
         r.kind === 'already-reviewed-head' && r.why.includes('human clearance')),

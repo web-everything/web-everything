@@ -22,10 +22,13 @@
  *   node scripts/lib/daemon-rebuild/rebuild-job.mjs          # the job child (env from the runtime)
  */
 import { spawn as spawnChild, execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
 import {
   existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
@@ -35,7 +38,10 @@ import {
 import { evictSnapshots, npmCiInstaller } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
-import { cloneKey } from '../daemon-overlays.mjs';
+import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { cloneLockDirs } from '../daemon-clone-lock.mjs';
+import { lockIdFor } from '../../readiness/file-locks.mjs';
+import { alertsFilePath } from './state.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -63,20 +69,41 @@ export const REBUILD_JOB_KINDS = kindRegistry([REBUILD_JOB_KIND]);
 
 /** The `rebuildAsJob` block of daemon-rebuild-settings.json (missing / unreadable = off), as the tool layer over the
  *  team's platform preference `rebuildAsJob` (shared policy cascade, we:scripts/lib/policy-cascade.mjs). */
-export function loadRebuildAsJobSettings(path = SETTINGS_PATH, { env = process.env } = {}) {
+export function loadRebuildAsJobSettings(path = SETTINGS_PATH, { env = process.env, log = console.error } = {}) {
   try {
     let tool;
     try { tool = JSON.parse(readFileSync(path, 'utf8'))?.rebuildAsJob; } catch { tool = undefined; }
-    const raw = cascadePolicy('rebuildAsJob', tool, { env,
-      standard: { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS } }).layered;
-    if (!raw || typeof raw !== 'object') return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS };
+    const resolved = cascadePolicy('rebuildAsJob', tool, { env, log,
+      valid: { minIntervalJitterPct: Number.isFinite },
+      standard: { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS, minIntervalJitterPct: 20 } });
+    const raw = resolved.value;
+    if (!raw || typeof raw !== 'object') return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS, minIntervalJitterPct: 20 };
+    const jitterPct = clampJitterPct(raw.minIntervalJitterPct);
+    if (jitterPct !== raw.minIntervalJitterPct) {
+      log(`daemon-rebuild-job: minIntervalJitterPct=${jitterPct} (${resolved.sources.minIntervalJitterPct ?? 'standard'}; clamped to 0-100)`);
+    }
     return {
       entries: Array.isArray(raw.entries) ? raw.entries.filter((e) => typeof e === 'string' && e) : [],
+      minIntervalJitterPct: jitterPct,
       minIntervalMs: Number.isFinite(raw.minIntervalMs) && raw.minIntervalMs >= 0 ? raw.minIntervalMs : DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS,
     };
   } catch {
-    return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS };
+    return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS, minIntervalJitterPct: 20 };
   }
+}
+
+function clampJitterPct(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 20;
+}
+
+/** Stable across restarts and checkout paths; an injected RNG must also stay within the spacing floor. */
+export function rebuildJobInterval({ minIntervalMs, minIntervalJitterPct }, entries = [], rng) {
+  const pct = clampJitterPct(minIntervalJitterPct);
+  if (pct === 0) return minIntervalMs;
+  const name = entries.map(e => basename(e)).sort().join('\0');
+  const fraction = rng ? rng() : createHash('sha256').update(name).digest().readUInt32BE(0) / 0xffffffff;
+  const bounded = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 1;
+  return minIntervalMs * (1 + bounded * pct / 100);
 }
 
 /**
@@ -144,12 +171,12 @@ function clockFor(dir) {
  * `job` (the in-flight or just-started job) and `finishedJobs` (outcomes consumed this tick).
  * @param {{root: string, env?: object, log?: object, mainOnly?: boolean, entries?: string[],
  *   adopt: (o?: object) => Promise<object>, store?: object, reattach?: Function, clock?: object, now?: () => number,
- *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function}} o
+ *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function, rng?: () => number}} o
  */
 export async function rebuildCloneAsJob({
   root, env = process.env, log = console, mainOnly = false, entries = [], adopt,
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
-  codeSha, snapshot, settings = loadRebuildAsJobSettings(), evict = evictSnapshots,
+  codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
   mkdirSync(store.dir, { recursive: true });
@@ -220,10 +247,11 @@ export async function rebuildCloneAsJob({
     .sort((a, b) => Date.parse(b.job.finishedAt || 0) - Date.parse(a.job.finishedAt || 0))[0];
   const lastRes = last ? readResult(store.dir, last.id) : null;
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
-  if (last && !lastRes?.readyRecorded && sinceMs < settings.minIntervalMs) {
+  const intervalMs = rebuildJobInterval(settings, entries, rng);
+  if (last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
     housekeeping();
     return {
-      moved: false, reason: 'rebuild-job-spaced', retryInMs: settings.minIntervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
+      moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
     };
   }
   let queued;
@@ -285,26 +313,89 @@ export function runRebuildChild({
   });
 }
 
-async function jobMain() {
+/** The ready-only child excludes just its spawner; the next daemon tick still honours its writer slot. */
+export function rebuildChildEnv(env = process.env, { ppid = process.ppid, host = hostname() } = {}) {
+  const childEnv = { ...env, [REBUILD_AS_JOB_ENV]: '0' };
+  for (const k of Object.keys(childEnv)) if (k.startsWith('DAEMON_JOB_')) delete childEnv[k];
+  for (const k of ['OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS']) delete childEnv[k];
+  if (ppid > 1) childEnv.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS = `${host}:${ppid}`;
+  return childEnv;
+}
+
+/** PURE: a reader timeout ends this job with explicit, bounded operator evidence. Missing evidence stays null. */
+export function buildReaderWaitOutcome(r, { command = null, readerEntry = null, nowMs = Date.now() } = {}) {
+  if (r?.reason !== 'tick-in-progress') return null;
+  const match = /^(.+):([1-9]\d*)$/.exec(r.heldBy ?? '');
+  const parsedPid = match ? Number(match[2]) : null;
+  const pid = Number.isSafeInteger(parsedPid) ? parsedPid : null;
+  const stamp = [readerEntry?.heartbeatAt, readerEntry?.acquiredAt].map(Date.parse).find(Number.isFinite);
+  return {
+    reason: 'reader-wait-timeout',
+    detail: {
+      pid,
+      command: command == null ? null : String(command).replace(/[\x00-\x1f\x7f-\x9f]/g, '').trim().slice(0, 200),
+      tickAgeMs: Number.isFinite(stamp) ? Math.max(0, nowMs - stamp) : null,
+    },
+  };
+}
+
+/** Same two audit sinks as auto-rebase's reportNeedsYou; all evidence and reporting IO is injectable. */
+export function reportReaderWaitTimeout({
+  root, env = process.env, r, io = fs, event = appendOverlayEvent, exec = execFileSync,
+  now = Date.now, host = hostname(),
+}) {
+  if (r?.reason !== 'tick-in-progress') return null;
+  let readerEntry = null;
+  let command = null;
+  const nowMs = now();
+  try {
+    const { readersRoot } = cloneLockDirs(root, env.WE_DAEMON_CLONE_LOCK_ROOT);
+    const entry = JSON.parse(io.readFileSync(join(readersRoot, lockIdFor(r.heldBy), 'lock.json'), 'utf8'));
+    if (entry?.owner === r.heldBy) readerEntry = entry;
+  } catch { /* unreadable reader evidence stays null */ }
+  const initial = buildReaderWaitOutcome(r, { nowMs });
+  if (initial.detail.pid && r.heldBy === `${host}:${initial.detail.pid}`) {
+    try {
+      command = exec('ps', ['-o', 'command=', '-p', String(initial.detail.pid)], {
+        encoding: 'utf8', timeout: 5000, maxBuffer: 65536, stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch { /* exited / unreadable process evidence stays null */ }
+  }
+  const outcome = buildReaderWaitOutcome(r, { command, readerEntry, nowMs });
+  const kind = 'reader-wait-timeout-needs-you';
+  try { event(root, { kind, ...outcome.detail }, { env }); } catch { /* alert still attempted */ }
+  try {
+    const file = alertsFilePath(root, env);
+    io.mkdirSync(dirname(file), { recursive: true });
+    io.appendFileSync(file, `${JSON.stringify({ at: new Date(nowMs).toISOString(), kind, detail: outcome.detail })}\n`);
+  } catch { /* best-effort audit trail; the result file still carries the timeout */ }
+  return outcome;
+}
+
+export async function jobMain({
+  runChild = runRebuildChild, reportTimeout = reportReaderWaitTimeout, env = process.env,
+  ppid = process.ppid, host = hostname(),
+} = {}) {
   let child = null;
   for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, () => { try { child?.kill('SIGTERM'); } catch { /* gone */ } process.exit(143); });
   }
-  const dir = process.env.OPERATION_RUNS_DIR;
+  const dir = env.OPERATION_RUNS_DIR;
   const out = await runJob({
     steps: [{
       name: 'rebuild',
       run: async ({ jobId, input }) => {
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} building ${input.target ?? 'main + overlays'} for ${input.root}\n`);
-        const childEnv = { ...process.env, [REBUILD_AS_JOB_ENV]: '0' };
-        for (const k of ['DAEMON_JOB_ID', 'DAEMON_JOB_ATTEMPT', 'DAEMON_JOB_HEARTBEAT_MS', 'OPERATION_RUNS_DIR']) delete childEnv[k];
-        const r = await runRebuildChild({ input, env: childEnv, onChild: (c) => { child = c; } });
+        const childEnv = rebuildChildEnv(env, { ppid, host });
+        const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
+        const timeout = reportTimeout({ root: input.root, env, r });
         const result = {
-          finishedAt: Date.now(), reason: r.reason ?? null, readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
+          finishedAt: Date.now(), reason: r.reason ?? null, ...(r.mutation ? { mutation: r.mutation } : {}), readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
           alerts: (r.alerts || []).map((a) => a.kind),
+          ...(timeout ?? {}),
         };
         writeFileSync(join(dir, `${jobId}${RESULT_SUFFIX}`), `${JSON.stringify(result)}\n`);
-        process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);
+        process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.mutation ? ` (${result.mutation})` : ''}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);
         return { reason: result.reason, readyRecorded: result.readyRecorded };
       },
     }],

@@ -203,10 +203,56 @@ export function aheadCommitsPreserved(dir, branchRef, commits, maxProbes = MAX_C
     if (equivalent.has(sha)) { result.set(sha, true); continue; }
     if (probes >= maxProbes) { result.set(sha, false); continue; }
     probes += 1;
-    const containing = tryGit(dir, ['branch', '-r', '--contains', sha]);
-    result.set(sha, !!(containing && containing.trim()));
+    result.set(sha, commitPreservedOnRemote(dir, sha, branchRef));
   }
   return result;
+}
+
+let warnedUnknownObject = false;
+
+/** `git merge-base --is-ancestor`: true (0), false (1), null = unknown (any other exit: missing object, bad ref). */
+function isAncestor(dir, sha, ref) {
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', sha, ref], {
+      cwd: dir, stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', env: laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }),
+    });
+    return true;
+  } catch (err) {
+    return err && err.status === 1 ? false : null;
+  }
+}
+
+/**
+ * Is `sha` reachable from a remote ref that matters: `branchRef` (the integration branch), this lane's OWN
+ * pushed `origin/<branch>`, or a remote ref whose tip is `sha`/the lane's HEAD? Two `merge-base --is-ancestor` probes against named refs, replacing
+ * `git branch -r --contains <sha>` across every remote ref (~1,060 in a long-lived lane): that walk cost ~3.4 s
+ * and logged ~350 errors per call whenever a borrowed object (alternates) had been pruned. A missing object is
+ * "unknown": reported unpreserved (conservative, never a false "preserved") and logged ONCE per process.
+ */
+export function commitPreservedOnRemote(dir, sha, branchRef) {
+  // Fully qualified: a bare `origin/x` can resolve to a local branch/tag of that name (not a remote proof).
+  const qualify = (r) => (r.startsWith('refs/') ? r : `refs/remotes/${r}`);
+  const refs = [qualify(branchRef)];
+  const head = tryGit(dir, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  if (head) refs.push(`refs/remotes/origin/${head}`);
+  // Pushed under a different name (pr-land pushes HEAD to its own `lane/*` ref): `--points-at` matches ref tips
+  // with no history walk, so it stays cheap and never touches a pruned object.
+  for (const target of [sha, 'HEAD']) {
+    const tips = tryGit(dir, ['for-each-ref', '--points-at', target, '--format=%(refname)', 'refs/remotes']) || '';
+    for (const ref of tips.split('\n').filter(Boolean).slice(0, 5)) if (!refs.includes(ref)) refs.push(ref);
+  }
+  let unknown = false;
+  for (const ref of refs) {
+    const verdict = isAncestor(dir, sha, ref);
+    if (verdict === true) return true;
+    if (verdict === null) unknown = true;
+  }
+  if (unknown && !warnedUnknownObject) {
+    warnedUnknownObject = true;
+    process.stderr.write(`lane-whois: preservation of ${sha.slice(0, 7)} unknown in ${dir} (missing object or ref); treated as unpreserved, not logged again\n`);
+  }
+  return false;
 }
 
 /**

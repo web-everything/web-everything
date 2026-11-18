@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The review daemon runs from its OWN dedicated clone (wev-review-daemon). Its V8 heap cap comes from
+	scripts/settings/node-heap-cap.json (key review-daemon); keep the flag below equal to it (a test pins this).
+
+	BEFORE INSTALLING: clone and `npm ci` in ~/workspace/wev-review-daemon, then add the GitHub App secrets
+	the live plist carries: never commit them here.
+	INSTALL:  cp to ~/Library/LaunchAgents/com.we.review-daemon.plist (drop `.example`), then
+	          launchctl bootstrap gui/$(id -u) it.
+	-->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/you/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+		<string>120000</string>
+		<key>WE_GH_THROTTLE_PERSONAL_ROUTE</key>
+		<string>1</string>
+		<key>WE_GITHUB_APP_ID</key>
+		<string>&lt;app-id&gt;</string>
+		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
+		<string>&lt;installation-id&gt;</string>
+		<key>WE_HEAVY_ADMISSION_CAP</key>
+		<string>2</string>
+		<key>WE_HEAVY_ADMISSION_FAST_SLOTS</key>
+		<string>2</string>
+		<key>WE_PROBATION_LAUNCH</key>
+		<string>off</string>
+		<key>WE_PR_EVENTS</key>
+		<string>1</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.we.review-daemon</string>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/you/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>--max-old-space-size=4608</string>
+		<string>/Users/you/workspace/wev-review-daemon/skills-src/conveyor/review-daemon.mjs</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/you/workspace/wev-review-daemon/.conveyor/review-daemon.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/you/workspace/wev-review-daemon/.conveyor/review-daemon.log</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/you/workspace/wev-review-daemon</string>
+</dict>
+</plist>

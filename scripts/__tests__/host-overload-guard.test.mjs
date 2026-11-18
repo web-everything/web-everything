@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { runInNewContext } from 'node:vm';
+import { findPrimaryForPool, poolNameFromLanePath } from '../lib/lane-alternates.mjs';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'overload-')); dirs.push(d); return d; };
 afterEach(() => { vi.unstubAllEnvs(); for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -19,8 +20,10 @@ function poolFunction(name, seams) {
 it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc and continues to the next lane', (damage) => {
   let broken = true;
   const config = vi.fn((_args, dir) => { if (broken && dir.endsWith('lane-1')) throw Error(damage); });
+  const laneDir = (_repo, n) => `/pool/lane-${n}`;
+  const ensureAlternatesFor = vi.fn(poolFunction('ensureAlternatesFor', { laneDir }));
   const heal = poolFunction('fetchOriginHealing', {
-    laneDir: (_repo, n) => `/pool/lane-${n}`,
+    laneDir, ensureAlternatesFor,
     fetchOriginPruneWithRetry: (dir) => { if (broken && dir.endsWith('lane-1')) throw Error('not a git repository'); },
     healSharedStoreFor: () => false, diagnoseLane: () => ({ ok: !broken, problems: [damage] }),
     looksLikeCorruption: () => false, msgOf: (e) => e.message, log: () => {}, healLaneRefs: () => {},
@@ -35,6 +38,7 @@ it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc
   });
   for (const n of [1, 2]) expect(refresh({ branch: 'main' }, n).skipped).toBe(true);
   expect(broken).toBe(false);
+  expect(ensureAlternatesFor.mock.calls.map(([, n]) => n)).toEqual([1, 2]);
   expect(scrub.mock.calls).toEqual([
     ['/pool/lane-1', 'before refresh fetch'],
     ['/pool/lane-2', 'before refresh fetch'],
@@ -88,10 +92,13 @@ it('gc command runs one pass and watch re-resolves policy with interactive bypas
 // Exercise each scheduled-pass refusal in both command modes, including the next watch tick.
 it.each([false, true])('gc recovery only follows completed scheduled passes (watch=%s)', async watch => {
   for (const reason of ['host overloaded', 'unreadable policy', 'gc lock held', 'gc schedule not due']) {
-    const scheduledLaneGc = vi.fn().mockReturnValueOnce({ ran: false, reason }).mockReturnValue({ ran: true });
-    const recoverRepoPool = vi.fn(async () => {}), timers = [], log = vi.fn();
+    // A completed pass admits lane 1 by running its gc through the injected `exec`; a refused pass never does.
+    const scheduledLaneGc = vi.fn().mockReturnValueOnce({ ran: false, reason })
+      .mockImplementation((dirs, opts) => { opts.exec('git', ['gc'], { cwd: dirs[0] }); return { ran: true }; });
+    const recoverRepoPool = vi.fn(async () => {}), salvageUnpushed = vi.fn(async () => true), timers = [], log = vi.fn();
     const command = poolFunction('cmdGc', {
       scheduledLaneGc, flags: { watch }, existingLanes: () => [1], laneDir: () => '/pool/lane-1',
+      execFileSync: () => '', salvageUnpushed, salvageRefName: () => 'ref',
       recoveryEnabled: () => true, recoverRepoPool, log, process: { stdin: {} },
       loadHostOverloadSettings: () => ({ settings: { lanes: { gc: { schedule: 60000 } } } }),
       setTimeout: (fn, ms) => timers.push({ fn, ms }),
@@ -99,13 +106,17 @@ it.each([false, true])('gc recovery only follows completed scheduled passes (wat
     const repo = { originUrl: 'https://example.org/canonical.git' };
     await command(repo);
     expect(recoverRepoPool).not.toHaveBeenCalled();
+    expect(salvageUnpushed).not.toHaveBeenCalled();
     if (watch) {
       expect(timers[0].ms).toBe(60000);
       await timers[0].fn();
       expect(timers[1].ms).toBe(60000);
     } else await command(repo);
     expect(recoverRepoPool).toHaveBeenCalledTimes(1);
-    expect(recoverRepoPool).toHaveBeenCalledWith(repo);
+    // Recovery and salvage act only on the lanes the completed pass admitted.
+    expect(recoverRepoPool).toHaveBeenCalledWith(repo, [1]);
+    expect(salvageUnpushed).toHaveBeenCalledTimes(1);
+    expect(salvageUnpushed).toHaveBeenCalledWith(repo, expect.objectContaining({ lanes: [1] }));
   }
 });
 
@@ -142,6 +153,7 @@ it.each(['lane', 'linked lane worktree', 'unreadable owner', 'primary', 'explici
       resolveReal: value => value, POOL_ROOT: '/pool', CWD_TOP_LEVEL: true, CHECKOUT_ROOT: '/primary/project',
       process: { env: {} }, laneGitHardeningEnv: value => value, scrubGitRepoEnv: value => value,
       LOCAL_GIT_TIMEOUT_MS: 1000, tryGit, fail: message => { throw Error(message); },
+      findPrimaryForPool, poolNameFromLanePath,
     })();
     expect(repo.poolDir).toBe('/pool/project');
     expect(repo.originUrl).toBe(['primary', 'explicit origin'].includes(kind) ? origin : null);
@@ -288,9 +300,12 @@ it('host policy regression: preference files merge per leaf and canonical confli
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 60000 } } },
   { host: { maxWaitMs: 250 }, lanes: { gc: { schedule: 120000 } } });
   const policy = loadHostOverloadSettings(opts);
-  expect(policy.settings).toEqual({ host: { maxLoadPerCore: 0.5, maxWaitMs: 250, minMemoryHeadroomMb: 2048, maxReviewDispatchPerTick: 2 },
+  expect(policy.settings).toEqual({ host: { capacitySignal: 'load',
+    capacity: { memoryMetric: 'available', memAvailableFloorMb: 2048, snapshotMaxFreshMs: 20000, snapshotClockSkewMs: 2000, cpuIdleLowPct: 15, memFreeLowPct: 15, cpuIdleMediumPct: 30, memFreeMediumPct: 30 },
+    maxLoadPerCore: 0.5, maxWaitMs: 250, minMemoryHeadroomMb: 2048, maxReviewDispatchPerTick: 2 },
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 120000 } } });
-  expect(Object.values(policy.sources)).toEqual(['platform', 'platform', 'standard', 'standard', 'platform', 'platform']);
+  expect(Object.values(policy.sources)).toEqual(['standard', 'standard', 'standard', 'standard', 'standard', 'standard', 'standard', 'standard', 'standard',
+    'platform', 'platform', 'standard', 'standard', 'platform', 'platform']);
   expect(hostLoadAdmission({ ...opts, interactive: false, load: () => [1], cores: () => 1 }).admitted).toBe(false);
 });
 
@@ -331,6 +346,40 @@ it('scheduled gc is host single-flight and skips before the next due pass', asyn
   expect(exec).toHaveBeenCalledTimes(2);
   expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['gc.autoDetach=false', '--no-detach']), expect.objectContaining({ timeout: 120000 }));
   expect(scheduledLaneGc(['/pool/lane-1'], opts).ran).toBe(false);
+});
+
+it('scheduled gc falls back only for an unsupported --no-detach, retaining foreground and no-prune guarantees', async () => {
+  const { scheduledLaneGc } = await import('../lib/host-load.mjs');
+  const exec = vi.fn().mockImplementationOnce(() => { throw Object.assign(new Error('unsupported'), { status: 129, stderr: "error: unknown option `no-detach'\n" }); });
+  const opts = { stateRoot: temp(), exec, admission: () => ({ admitted: true }), log: () => {}, schedule: 60000, nowMs: 100000 };
+  expect(scheduledLaneGc(['/pool/lane-1'], opts)).toEqual({ ran: true });
+  expect(exec.mock.calls.map(([, args]) => args)).toEqual([
+    ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'],
+    ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc'],
+  ]);
+  expect(exec.mock.calls.every(([, , options]) => options.cwd === '/pool/lane-1' && options.timeout === 120000)).toBe(true);
+  expect(scheduledLaneGc(['/pool/lane-1'], opts).ran).toBe(false);
+  expect(exec).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  { status: 129, stderr: 'fatal: bad object' },
+  { status: 1, stderr: "error: unknown option `no-detach'\n" },
+  { status: 1 },
+  { code: 'ETIMEDOUT', stderr: "error: unknown option `no-detach'\n" },
+])('scheduled gc does not retry an unrelated failure: %j', async (failure) => {
+  const { scheduledLaneGc } = await import('../lib/host-load.mjs');
+  const exec = vi.fn(() => { throw Object.assign(new Error('gc failed'), failure); });
+  const log = vi.fn();
+  const opts = { stateRoot: temp(), exec, admission: () => ({ admitted: true }), log, schedule: 60000, nowMs: 100000 };
+  expect(scheduledLaneGc(['/pool/lane-1'], opts)).toEqual({ ran: false, reason: '1 lane gc run(s) failed' });
+  expect(exec).toHaveBeenCalledTimes(1);
+  expect(exec.mock.calls[0][1]).toContain('--no-detach');
+  expect(log.mock.calls.flat().join(' ')).toContain('/pool/lane-1');
+  // Failed work remains due; a later scheduled pass may try once again.
+  exec.mockClear();
+  scheduledLaneGc(['/pool/lane-1'], opts);
+  expect(exec).toHaveBeenCalledTimes(1);
 });
 
 it('a failing gc lane does not starve later lanes or advance its successful-run cursor', async () => {
@@ -501,4 +550,19 @@ describe('memory-aware host admission (verify-admission, 2026-10-20)', () => {
     expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MIN_MEMORY_HEADROOM_MB: '0' }, log })).toThrow();
     expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '0' }, log })).toThrow();
   });
+});
+
+it('R553: the memory floor defaults to 2048 MB, resolves through the cascade with its source, and rejects zero or junk', async () => {
+  const { resolveHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+  const log = [];
+  const s = resolveHostOverloadSettings({ platform: {}, tool: {}, env: {}, log: (l) => log.push(l) });
+  expect(s.settings.host.capacity.memAvailableFloorMb).toBe(2048);
+  expect(s.sources['host.capacity.memAvailableFloorMb']).toBe('standard');
+  expect(log.join('\n')).toMatch(/host\.capacity\.memAvailableFloorMb=2048 \(standard\)/);
+  const env = resolveHostOverloadSettings({ platform: {}, tool: {}, env: { WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB: '4096' }, log: () => {} });
+  expect(env.settings.host.capacity.memAvailableFloorMb).toBe(4096);
+  expect(env.sources['host.capacity.memAvailableFloorMb']).toBe('env');
+  for (const bad of ['0', '-5', 'abc']) {
+    expect(() => resolveHostOverloadSettings({ platform: {}, tool: {}, env: { WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB: bad }, log: () => {} })).toThrow();
+  }
 });

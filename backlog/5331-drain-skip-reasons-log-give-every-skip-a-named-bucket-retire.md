@@ -37,3 +37,7 @@ Original incident: plateau-app #212 spent 86 drain passes in an unnamed bucket w
 ## Open questions
 
 STALE: should this card be closed as already implemented? Matching code and regression assertions exist. The queued regression attempt was deferred by host load (exit 75); no passing run is claimed.
+
+## Progress (2026-11-07)
+
+PR #6476 names real enqueue holds in skip reasons, overlapping the A1 on partner-pending and ready-not-reached (not verified; the PR cites 6222, not this item). Remains: confirm A1 and give every skip a named bucket.

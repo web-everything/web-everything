@@ -27,20 +27,22 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, onTestFinished } from 'vitest';
 
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome, parseOperationArgv } from '../cli-adapter.mjs';
 import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
-import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint } from '../../lib/review-loop-policy.mjs';
+import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint, postAcceptAdvisoryShadowReport } from '../../lib/review-loop-policy.mjs';
 import {
-  applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
+  runReviewLoopCliOnce, createReviewPassPrReader, defaultFindResumableRun, RESUME_MAX_ATTEMPTS, applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
-import { createReviewPrSinks } from '../review-pr-io.mjs';
+import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating, createReviewPrSinks } from '../review-pr-io.mjs';
+import { planRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
@@ -50,7 +52,7 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 // explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
 // lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
 const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
-const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, ...options });
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), recordAdvisoryLoops: () => null, recordAdvisoryRating: () => null, ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.
@@ -1552,14 +1554,17 @@ describe('unattended accept reads the live head', () => {
   const record = { version: 1, repo, pr: 1234, head: HEAD_A, runId: 'referred-run',
     reviewer: mandatoryReferralReviewer('referred-run'), authorBody: '<!-- authored-by-actor: author -->',
     attempted: true, referrals: [{ key, seat, original, finding: normalizeFinding(original) }], rulings: [] };
-  const comment = body => ({ body, author: { login: 'web-everything' } });
+  const comment = (body, login = 'web-everything') => ({ body, author: { login } });
   it.each(['accept', 'prevention-outstanding'].flatMap(verdict =>
     [null, 'auto-policy', 'card', 'not-real'].map(result => [verdict, result])))
   ('%s with live referral ruling %s gates the actual accept effects', async (verdict, result) => {
     const comments = [comment(renderReferralRecord(record))];
+    // The policy ruling is posted by automation; an operator's clearing ruling by that operator (PR #6529: an
+    // unstamped automation copy posted after poster stamping shipped keeps only its block rows).
     if (result) comments.push(comment(buildOperatorRulingComment({ version: 1, repo, pr: 1234, head: HEAD_A,
       actor: result === 'auto-policy' ? 'auto-policy' : 'chalbert', channel: 'operator-chat', reason: 'checked the finding', at: '2026-10-15T15:45:00Z', clearerId: 'operator-session',
-      rulings: [{ runId: record.runId, key, result: result === 'auto-policy' ? 'block' : result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] })));
+      rulings: [{ runId: record.runId, key, result: result === 'auto-policy' ? 'block' : result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] }),
+      result === 'auto-policy' ? 'web-everything' : 'chalbert'));
     const { declaration, registry } = registryFor({ rev: HEAD_A });
     const seen = [];
     const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A, body: record.authorBody, comments }));
@@ -1577,5 +1582,750 @@ describe('unattended accept reads the live head', () => {
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(cleared);
     expect(fileItem).toHaveBeenCalledTimes(verdict === 'prevention-outstanding' && cleared ? 1 : 0);
     if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
+  });
+});
+
+
+describe('post-accept advisory shadow wiring', () => {
+  it.each(['CONFIRMED', 'PLAUSIBLE', 'writer-error', 'logger-error'])(
+    'CLI records later %s broken ratings and preserves off/shadow/on live effects', async scenario => {
+      const execute = async mode => {
+        const rows = [], effects = [], outcomes = [], logs = [];
+        const io = { readLedgerRows: () => structuredClone(rows),
+          appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+        const store = createMemoryRunStore();
+        const review = async (head, id, later) => {
+          const { declaration, registry } = registryFor({ rev: head });
+          const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+            sinks: recordingSinks(effects), mintRunId: () => id,
+            makeJudge: () => async request => judgeOutcome(request.lens === 'correctness' ? {
+              summary: 'review', findings: [{ file: NET_PATHS[0], line: 4,
+                summary: later ? 'a fresh description of the defect' : 'improve diagnostic',
+                disposition: later ? 'bug' : 'nit', category: 'correctness/correctness',
+                verdict: scenario === 'PLAUSIBLE' ? 'PLAUSIBLE' : 'CONFIRMED',
+                introduced: true, worseThanBase: true, parallelizable: true,
+                impactIfUnfixed: later ? 'broken' : 'cosmetic' }],
+            } : CLEAN_ANSWER, {}),
+            advisorySettings: () => ({ value: { mode } }),
+            recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+            recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+            recordAdvisoryRating: facts => {
+              if (later && scenario.endsWith('error')) throw new Error('rating writer unavailable\n');
+              return recordPostAcceptAdvisoryRating({ ...facts, ...io });
+            },
+            advisoryLog: line => { logs.push(line); if (scenario === 'logger-error') throw new Error('logger unavailable'); },
+          });
+          outcomes.push({ code: out.code, stopped: out.stopped, lines: out.lines, verdict: out.run.verdict });
+          return out;
+        };
+        const accepted = await review(HEAD_A, 'cosmetic-accept', false);
+        expect(accepted.run.findings.confirm).toBe('accept');
+        if (mode !== 'off') expect(rows.find(row => row.wouldCard)).toMatchObject({
+          findings: [expect.objectContaining({ impactIfUnfixed: 'cosmetic' })],
+        });
+        await review(HEAD_B, 'broken-review', true);
+        const beforeReplay = structuredClone(rows);
+        await review(HEAD_B, 'broken-review', true);
+        expect(rows).toEqual(beforeReplay);
+        return { effects, outcomes, rows, logs };
+      };
+      const baseline = await execute('off');
+      expect(baseline.rows).toEqual([]);
+      for (const mode of ['shadow', 'on']) {
+        const result = await execute(mode);
+        expect(result.effects).toEqual(baseline.effects);
+        expect(result.outcomes).toEqual(baseline.outcomes);
+        expect(postAcceptAdvisoryShadowReport(result.rows)).toMatchObject({
+          wouldCard: 1, findings: 1, loopsAfter: 1,
+          laterBroken: scenario === 'CONFIRMED' ? 1 : 0,
+          unconfirmedBroken: scenario === 'PLAUSIBLE' ? 1 : 0, skipped: 0, unresolved: 0,
+        });
+        expect(result.rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(scenario.endsWith('error') ? 0 : 1);
+        if (scenario.endsWith('error')) expect(result.logs.join('\n')).toContain('live review unaffected');
+      }
+    });
+
+  it.each([null, {}, { value: [] }, { value: { mode: undefined } },
+    { value: { mode: 'off' }, invalid: true }, { value: { mode: 'off' }, invalid: 'false' }])(
+    'fails closed on malformed resolved settings %j while preserving a completed accept', async settings => {
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const decisions = [], logs = [];
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER),
+        mintRunId: () => 'malformed-settings', advisorySettings: () => settings,
+        recordAdvisoryLoops: async () => null,
+        recordAdvisoryShadow: facts => { decisions.push(facts.decision); }, advisoryLog: line => logs.push(line),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({ wouldPush: true, wouldCard: false, reason: 'invalid-mode' });
+      expect(logs.join('\n')).toContain('invalid resolved settings; using shadow');
+    });
+
+  it.each(['shadow', 'on', 'recorder-error', 'logging-error'])(
+    '%s measures later review runs once per run ID and preserves mode-off live effects', async scenario => {
+      const execute = async mode => {
+        const rows = [], effects = [], outcomes = [], logs = [];
+        const io = { readLedgerRows: () => structuredClone(rows),
+          appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+        const store = createMemoryRunStore();
+        const review = async (rev, id, answer = CLEAN_ANSWER) => {
+          const { declaration, registry } = registryFor({ rev });
+          const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+            sinks: recordingSinks(effects), makeJudge: cannedJudge(answer), mintRunId: () => id,
+            advisorySettings: () => ({ value: { mode: mode === 'off' ? 'off' : mode === 'on' ? 'on' : 'shadow' } }),
+            recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+            recordAdvisoryLoops: facts => {
+              if (facts.head !== HEAD_A && (mode === 'recorder-error' || mode === 'logging-error')) throw new Error('loops ledger unavailable');
+              return recordPostAcceptAdvisoryLoops({ ...facts, ...io });
+            },
+            advisoryLog: line => { logs.push(line); if (mode === 'logging-error') throw new Error('logger failed'); },
+          });
+          outcomes.push({ code: out.code, stopped: out.stopped, lines: out.lines, verdict: out.run.verdict });
+          return out;
+        };
+        // An actual accepted earlier head, followed by later reviews that need not accept.
+        await review(HEAD_A, 'accepted');
+        if (mode !== 'off') {
+          expect(rows).toHaveLength(2);
+          expect(rows[0]).toMatchObject({ kind: 'advisory-run', headSha: HEAD_A, runId: 'accepted' });
+          expect(rows[1]).toMatchObject({ headSha: HEAD_A, loopsAfter: null });
+        }
+        await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
+        if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops'))
+          .toMatchObject([{ headSha: HEAD_A, loopsAfter: 1, runId: 'later-1' }]);
+        await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
+        if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops')).toHaveLength(1);
+        await review(HEAD_B, 'later-2', BLOCKING_ANSWER);
+        return { rows, effects, outcomes, logs };
+      };
+      const baseline = await execute('off');
+      const result = await execute(scenario);
+      expect(result.effects).toEqual(baseline.effects);
+      expect(result.outcomes).toEqual(baseline.outcomes);
+      if (['shadow', 'on'].includes(scenario)) expect(result.rows.filter(row => row.kind === 'loops'))
+        .toMatchObject([{ headSha: HEAD_A, loopsAfter: 1, runId: 'later-1' }, { headSha: HEAD_A, loopsAfter: 2, runId: 'later-2' }]);
+      else expect(result.logs.join('\n')).toContain('live review unaffected');
+    });
+
+  it('normalization-poisoned rows from another PR preserve live effects and recording across replay', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'web-everything/web-everything', pr: 9999,
+      headSha: 'poison', wouldCard: true, wouldPush: false, loopsAfter: null,
+      findings: [{ category: 'correctness/correctness', summary: 'poison', impactIfUnfixed: 'cosmetic',
+        rootCause: { toString: null } }] }];
+    const logs = [], effects = [], store = createMemoryRunStore();
+    const io = { readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+    const review = async (rev, id) => {
+      const { declaration, registry } = registryFor({ rev });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks(effects), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => id,
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: line => logs.push(line),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+        recordAdvisoryRating: facts => recordPostAcceptAdvisoryRating({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+    };
+    await review(HEAD_A, 'safe-A');
+    const firstCount = effects.length;
+    await review(HEAD_B, 'safe-B');
+    const before = structuredClone(rows), applied = structuredClone(effects);
+    const secondEffects = applied.slice(firstCount);
+    expect(secondEffects.length).toBeGreaterThan(0);
+    await review(HEAD_B, 'safe-B');
+    expect(rows).toEqual(before);
+    expect(effects.slice(applied.length)).toEqual(secondEffects);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([{ headSha: HEAD_A, loopsAfter: 1 }]);
+    expect(rows.filter(row => row.kind === 'we.post-accept-advisory-shadow')).toHaveLength(3);
+    expect(postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 1, wouldPush: 2, loopsAfter: 1, skipped: 1, unresolved: 1,
+    });
+    expect(logs).toEqual([]);
+  });
+
+  it('corrupt persisted loops refuse telemetry on both heads while the live review still completes', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'web-everything/web-everything', pr: 1234, headSha: HEAD_A,
+      wouldCard: false, wouldPush: true, findings: [], loopsAfter: null },
+    { kind: 'loops', repo: 'web-everything/web-everything', pr: 1234, headSha: HEAD_A, runId: 'R', loopsAfter: 99 }];
+    const before = structuredClone(rows), logs = [];
+    for (const rev of [HEAD_A, HEAD_B]) {
+      const { declaration, registry } = registryFor({ rev });
+      const io = { readLedgerRows: () => structuredClone(rows),
+        appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'R',
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: line => logs.push(line),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(rows).toEqual(before);
+    }
+    expect(logs.filter(line => line.includes('invalid loop history; inspect shadow ledger'))).toHaveLength(4);
+  });
+
+  it('replaying accepted run A after accepted run B never counts A against B', async () => {
+    const rows = [], store = createMemoryRunStore();
+    const io = { readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    const review = async (rev, id) => {
+      const { declaration, registry } = registryFor({ rev });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => id,
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: () => {},
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+    };
+    await review(HEAD_A, 'accept-A');
+    await review(HEAD_B, 'accept-B');
+    const before = structuredClone(rows);
+    await review(HEAD_A, 'accept-A');
+    expect(rows).toEqual(before);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
+      { headSha: HEAD_A, runId: 'accept-B', loopsAfter: 1 },
+    ]);
+  });
+
+  it.each(['shadow', 'on', 'invalid-settings', 'settings-error', 'recorder-error'])(
+    '%s preserves all live effects for an advisory-bearing would-card accept', async scenario => {
+      const execute = async mode => {
+        const { declaration, registry } = registryFor({ rev: HEAD_A });
+        const effects = [], rows = [], decisions = [];
+        const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+        const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+          store: createMemoryRunStore(), sinks: recordingSinks(effects), fileItem,
+          makeJudge: () => async request => judgeOutcome(request.lens === 'correctness' ? { summary: 'advisory only', findings: [{ file: NET_PATHS[0], line: 4,
+            summary: 'improve diagnostic', disposition: 'nit', category: 'correctness/correctness',
+            introduced: true, worseThanBase: true, parallelizable: true,
+            impactIfUnfixed: 'cosmetic' }] } : CLEAN_ANSWER, {}), mintRunId: () => 'r-advisory-effects',
+          advisorySettings: () => {
+            if (mode === 'settings-error') throw new Error('settings unavailable');
+            return { value: { mode: ['off', 'on'].includes(mode) ? mode : 'shadow' }, invalid: mode === 'invalid-settings' };
+          },
+          recordAdvisoryShadow: facts => {
+            decisions.push(facts.decision);
+            if (mode === 'recorder-error') throw new Error('ledger unavailable');
+            return recordPostAcceptAdvisoryShadow({ ...facts, readLedgerRows: () => rows,
+              appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+          }, advisoryLog: () => {},
+        });
+        return { out, effects, rows, decisions, filings: fileItem.mock.calls };
+      };
+      const baseline = await execute('off');
+      const result = await execute(scenario);
+      expect(result.out.code).toBe(0);
+      expect(result.out.stopped).toBe('complete');
+      expect(result.out.run.findings.confirm).toBe('accept');
+      expect(result.out.run.verdict).toEqual(baseline.out.run.verdict);
+      expect(result.out.lines).toEqual(baseline.out.lines);
+      expect(result.effects).toEqual(baseline.effects);
+      expect(result.filings).toEqual(baseline.filings);
+      expect(baseline.rows).toHaveLength(0);
+      expect(result.rows).toHaveLength(['shadow', 'on', 'invalid-settings'].includes(scenario) ? 1 : 0);
+      if (scenario !== 'settings-error') expect(result.decisions[0]).toMatchObject({
+        wouldCard: scenario !== 'invalid-settings', wouldPush: scenario === 'invalid-settings',
+      });
+      if (result.rows.length) expect(result.rows.find(row => row.kind === 'we.post-accept-advisory-shadow').loopsAfter).toBeNull();
+    });
+
+  it.each(['off', 'shadow', 'on'])('%s preserves acceptance and effects, recording only when enabled', async mode => {
+    const execute = async currentMode => {
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const rows = [];
+      const effects = [];
+      const fileItem = vi.fn(() => { throw new Error('shadow must not file'); });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks(effects),
+        makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-advisory-shadow', fileItem,
+        advisorySettings: () => ({ value: { mode: currentMode } }),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts,
+          readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } }),
+      });
+      expect(fileItem).not.toHaveBeenCalled();
+      return { out, rows, effects };
+    };
+    const baseline = await execute('off');
+    const result = await execute(mode);
+    expect(result.out.code).toBe(0);
+    expect(result.out.stopped).toBe('complete');
+    expect(result.out.run.findings.confirm).toBe('accept');
+    expect(result.out.lines).toEqual(baseline.out.lines);
+    expect(result.effects.map(effect => effect.type)).toEqual(baseline.effects.map(effect => effect.type));
+    expect(result.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL))
+      .toEqual(baseline.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL));
+    expect(result.rows).toHaveLength(mode === 'off' ? 0 : 1);
+    if (mode !== 'off') expect(result.rows.find(row => row.kind === 'we.post-accept-advisory-shadow')).toMatchObject({ pr: 1234, headSha: HEAD_A, wouldPush: true });
+  });
+
+  it.each(['settings', 'ledger', 'logging'])('%s failure never changes a completed accept', async failure => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const log = vi.fn(() => { if (failure === 'logging') throw new Error('logger failed'); });
+    const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-advisory-error',
+      advisorySettings: () => { if (failure === 'settings') throw new Error('unreadable'); return { value: { mode: 'shadow' } }; },
+      recordAdvisoryShadow: () => { throw new Error('ledger unavailable'); }, advisoryLog: log,
+    });
+    expect(out.code).toBe(0);
+    expect(out.stopped).toBe('complete');
+    expect(out.run.findings.confirm).toBe('accept');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('live review unaffected'));
+  });
+});
+
+
+describe('CI-held record driver resume', () => {
+  async function fixture(max = 3, { answer = CLEAN_ANSWER, ...overrides } = {}) {
+    const declaration = reviewPrOperation({ readPr: input => {
+      const view = stubReader({ rev: HEAD_A })(input);
+      return { ...view, body: '<!-- authored-by-actor: author -->' };
+    } });
+    const registry = createRegistry(); registry.register(declaration);
+    const store = createMemoryRunStore(), seen = [];
+    const judge = vi.fn(async () => judgeOutcome(answer, {}));
+    let time = 0;
+    const publishGate = vi.fn(() => ({ allowed: false, headSha: HEAD_A, reason: 'required-checks-not-successful' }));
+    const runNode = vi.fn(() => { throw Error('CI pending must prevent publication'); });
+    const timingEnv = { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '1', WE_REVIEW_START_EARLY_POLL_MS: '1' };
+    const root = mkdtempSync(join(tmpdir(), 'ci-held-resume-'));
+    onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+    const label = createReviewPrSinks({
+      root, runStore: store, env: timingEnv,
+      labelProvider: { readPrState: () => ({ comments: [] }) }, postRedTeamCheckRun: async () => ({ ok: true }), out: () => {},
+      publishGate, readPublishHead: () => HEAD_A, now: () => time, sleep: async ms => { time += ms; }, runNode,
+    })[REVIEW_EFFECTS.LABEL];
+    const sinks = { ...recordingSinks(seen), [REVIEW_EFFECTS.LABEL]: label };
+    const env = { WE_REVIEW_RED_TEAM_ON_SKIP_CI_HELD_RECORD_RETRY_MAX: String(max) };
+    const find = input => defaultFindResumableRun(input, { env,
+      readPr: () => ({ headRefOid: HEAD_A, comments: [] }),
+      readRuns: () => [reviewRunEvidence(store.read('ci-held-original'))],
+    });
+    const args = { declaration, registry, store, sinks, argv: [...BASE_ARGV, '--json'], makeJudge: () => judge,
+      mintRunId: () => 'ci-held-original', redTeamOnSkipSettings: () => ({ value: { ciHeldRecordRetryMax: max } }),
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, body: '<!-- authored-by-actor: author -->', comments: [] }),
+      ...overrides,
+    };
+    await runReviewLoopOnce(args);
+    const saved = store.read('ci-held-original');
+    expect(saved.pending).toMatchObject({ kind: 'effect', step: 'record' });
+    expect(saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed', unknownAttempts: 1,
+      error: 'review held: CI still pending on reviewed head' });
+    return { args, store, saved, judge, seen, publishGate, runNode, find, timingEnv };
+  }
+
+  it.each(['automatic', 'explicit'].flatMap(mode => ['card', 'not-real'].flatMap(result =>
+    [false, true].map(cleared => [mode, result, cleared]))))(
+    '%s prevention-outstanding CI-held resume rechecks live %s clearance (still holds=%s)', async (mode, result, cleared) => {
+      const repo = BASE_ARGV[1].slice(7);
+      const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      const seat = 'judge', key = referralFindingKey(seat, original);
+      const record = { version: 1, repo, pr: 1234, head: HEAD_A, runId: 'referred-run',
+        reviewer: mandatoryReferralReviewer('referred-run'), authorBody: '<!-- authored-by-actor: author -->',
+        attempted: true, referrals: [{ key, seat, original, finding: normalizeFinding(original) }], rulings: [] };
+      const comments = [{ body: renderReferralRecord(record), author: { login: 'web-everything' } },
+        { body: buildOperatorRulingComment({ version: 1, repo, pr: 1234, head: HEAD_A,
+          actor: 'chalbert', channel: 'operator-chat', reason: 'checked the finding', at: '2026-10-15T15:45:00Z', clearerId: 'operator-session',
+          rulings: [{ runId: record.runId, key, result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] }),
+        author: { login: 'chalbert' } }];
+      let cardExists = true;
+      const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A, body: record.authorBody, comments }));
+      const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+      const f = await fixture(3, {
+        answer: { ...PREVENTION_ANSWER, findings: PREVENTION_ANSWER.findings.map(({ impactIfUnfixed, ...finding }) => finding) },
+        acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: true } },
+        readAcceptancePr, cardReadable: () => cardExists, fileItem,
+      });
+      expect(f.saved.verdict.verdict).toBe('prevention-outstanding');
+      expect(f.saved.findings.confirm).toBe('accept');
+      expect(fileItem).toHaveBeenCalledOnce();
+      if (!cleared) {
+        if (result === 'card') cardExists = false;
+        else comments.pop();
+      }
+      const judges = f.judge.mock.calls.length, writes = f.seen.length, checks = f.publishGate.mock.calls.length;
+      readAcceptancePr.mockClear();
+      const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find,
+        ...(mode === 'explicit' ? { argv: [`--resume=${f.saved.id}`, '--json'] } : {}),
+        mintRunId: () => { throw Error('fresh panel'); } });
+      expect(readAcceptancePr).toHaveBeenCalled();
+      expect(out.run.id).toBe(f.saved.id);
+      expect(f.judge).toHaveBeenCalledTimes(judges);
+      expect(f.seen).toHaveLength(writes);
+      expect(fileItem).toHaveBeenCalledOnce();
+      expect(f.runNode).not.toHaveBeenCalled();
+      if (cleared) {
+        expect(out.stopped).toBe('effect-halted');
+        expect(out.run.resumedAt).toBeTruthy();
+        expect(out.run.recordEffectResumeAttempts).toBe(1);
+        expect(out.run.cursor).toBe(f.saved.cursor);
+        expect(out.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed', unknownAttempts: 2 });
+        expect(f.publishGate.mock.calls.length).toBeGreaterThan(checks);
+      } else {
+        expect(out).toMatchObject({ code: 2, stopped: 'refused', run: f.saved });
+        expect(out.lines.join(' ')).toMatch(/unattended accept held: mandatory referrals remain open/);
+        expect(f.store.read(f.saved.id)).toEqual(f.saved);
+        expect(f.publishGate).toHaveBeenCalledTimes(checks);
+      }
+    });
+
+  it.each(['automatic', 'explicit'])('%s resume keeps a CI-held label swap held after timing settings change, then applies on green without a fresh panel', async mode => {
+    const f = await fixture();
+    if (mode === 'explicit') f.args.argv = [`--resume=${f.saved.id}`, '--json'];
+    Object.assign(f.timingEnv, { WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_CANCEL_ON_CI_RED: 'false' });
+    // The default lookup resolves the environment setting when no driver override is supplied.
+    expect(f.find({ repo: BASE_ARGV[1].slice(7), pr: 1234 })).toBe(f.saved.id);
+    const judges = f.judge.mock.calls.length, writes = f.seen.length, checks = f.publishGate.mock.calls.length;
+    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => { throw Error('fresh panel'); } });
+    expect(out.run.id).toBe(f.saved.id);
+    expect(out.run.cursor).toBe(f.saved.cursor);
+    expect(out.run.resumedAt).toBeTruthy();
+    expect(out.run.recordEffectResumeAttempts).toBe(1);
+    expect(out.run.resumeOf).toBeUndefined();
+    expect(out.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed', unknownAttempts: 2 });
+    expect(f.publishGate.mock.calls.length).toBeGreaterThan(checks);
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(f.judge).toHaveBeenCalledTimes(judges);
+    expect(f.seen).toHaveLength(writes);
+    expect(out.stopped).toBe('effect-halted');
+    expect(out.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).error).toBe('review held: CI still pending on reviewed head');
+    f.publishGate.mockReturnValue({ allowed: true, headSha: HEAD_A, reason: 'required-checks-successful' });
+    f.runNode.mockReturnValue('{"ok":true}');
+    const green = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => { throw Error('fresh panel'); } });
+    expect(green.run.id).toBe(f.saved.id);
+    expect(green.stopped).toBe('complete');
+    expect(green.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status).toBe('applied');
+    expect(f.runNode).toHaveBeenCalledOnce();
+    expect(f.judge).toHaveBeenCalledTimes(judges);
+    for (const [args] of f.publishGate.mock.calls) expect(args.policy)
+      .toMatchObject({ startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false });
+  });
+
+  it.each(['automatic', 'explicit'].flatMap(mode =>
+    ['pending', 'revoked', 'green', 'exhausted', 'unknown'].map(next => [mode, next])))(
+    '%s CI-held retry preserves guards after EAGAIN (%s)', async (mode, next) => {
+      const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      const seat = 'judge', key = referralFindingKey(seat, original);
+      const reviewer = mandatoryReferralReviewer('ci-held-cleared-referral');
+      const record = { version: 1, repo: BASE_ARGV[1].slice(7), pr: 1234, head: HEAD_A,
+        runId: 'ci-held-cleared-referral', reviewer, authorBody: '<!-- authored-by-actor: author -->', attempted: true,
+        referrals: [{ key, seat, original, finding: normalizeFinding(original) }],
+        rulings: [{ id: 'clearance', key, reviewerId: reviewer.id, lens: 'correctness', result: 'not-real',
+          rationale: 'Verified against the pinned diff', evidence: ['diff:launch-guard'] }],
+      };
+      // A body edit revokes this reviewer's independence only when a real referral uses its clearance.
+      // A clean review with no referral remains acceptable without an author stamp.
+      let cleared = true;
+      const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A,
+        body: cleared ? record.authorBody : `<!-- authored-by-actor: ${reviewer.id} -->`,
+        comments: [{ body: renderReferralRecord(record), author: { login: 'web-everything' } }] }));
+      const f = await fixture(3, { acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: true } },
+        readAcceptancePr });
+      f.publishGate.mockReturnValue({ allowed: true, headSha: HEAD_A, reason: 'required-checks-successful' });
+      f.runNode.mockImplementation(() => { throw Object.assign(Error('spawn EAGAIN'), { code: 'EAGAIN' }); });
+      const args = { ...f.args, findResumableRun: f.find,
+        ...(mode === 'explicit' ? { argv: [`--resume=${f.saved.id}`, '--json'] } : {}),
+        mintRunId: () => { throw Error('fresh panel'); } };
+      const failed = await runReviewLoopOnce(args);
+      expect(failed.stopped).toBe('effect-halted');
+      expect(failed.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed',
+        error: 'review-set-label.mjs could not be started, nothing was written: EAGAIN' });
+      Object.assign(f.timingEnv, { WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_CANCEL_ON_CI_RED: 'false' });
+      f.runNode.mockClear();
+      f.runNode.mockReturnValue('{"ok":true}');
+      f.publishGate.mockClear();
+      readAcceptancePr.mockClear();
+      if (next === 'pending') f.publishGate.mockReturnValue({ allowed: false, headSha: HEAD_A, reason: 'required-checks-not-successful' });
+      if (next === 'revoked') cleared = false;
+      if (next === 'exhausted' || next === 'unknown') {
+        const saved = f.store.read(f.saved.id);
+        if (next === 'exhausted') saved.recordEffectResumeAttempts = RESUME_MAX_ATTEMPTS;
+        else saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status = 'pending';
+        f.store.write(saved);
+        // Bypass discovery to exercise the driver's/executor's own refusal.
+        args.findResumableRun = () => f.saved.id;
+        args.argv = [`--resume=${f.saved.id}`, '--json'];
+      }
+      const before = f.store.read(f.saved.id);
+      const out = next === 'unknown' ? await runReviewLoopCliOnce(args) : await runReviewLoopOnce(args);
+      if (next === 'green') {
+        expect(out.stopped).toBe('complete');
+        expect(f.runNode).toHaveBeenCalledOnce();
+      } else {
+        expect(out.stopped).toBe(next === 'pending' ? 'effect-halted' : 'refused');
+        expect(f.runNode).not.toHaveBeenCalled();
+      }
+      if (['pending', 'revoked', 'green'].includes(next)) expect(readAcceptancePr).toHaveBeenCalled();
+      if (next === 'revoked') {
+        expect(out.lines.join(' ')).toContain('unattended accept held: mandatory referrals remain open on the live head');
+        expect(f.store.read(f.saved.id)).toEqual(before);
+      }
+      if (['pending', 'green'].includes(next)) expect(f.publishGate).toHaveBeenCalled();
+      else expect(f.publishGate).not.toHaveBeenCalled();
+    });
+
+  it.each([['at bound', 3, 3, true], ['over bound', 3, 4, false], ['zero disables retries', 0, 1, false]])(
+    '%s uses the setting and preserves the fresh path when ineligible', async (_name, max, attempts, resumes) => {
+      const f = await fixture(max);
+      const saved = f.store.read(f.saved.id);
+      saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).unknownAttempts = attempts;
+      f.store.write(saved);
+      const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => 'fresh-panel' });
+      expect(out.run.id).toBe(resumes ? saved.id : 'fresh-panel');
+      expect(out.run.recordEffectResumeAttempts).toBe(resumes ? 1 : undefined);
+    });
+
+  it.each([0, 3])('the driver itself rejects an ineligible CI retry even if lookup returns it (max=%i)', async max => {
+    const f = await fixture(max);
+    const saved = f.store.read(f.saved.id);
+    saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).unknownAttempts = max + 1;
+    f.store.write(saved);
+    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: () => saved.id, mintRunId: () => 'fresh-panel' });
+    expect(out.run.id).toBe('fresh-panel');
+    expect(f.store.read(saved.id).recordEffectResumeAttempts).toBeUndefined();
+  });
+
+  it.each(['automatic', 'explicit'])('%s resume refuses at the independent record-attempt guard without starting a fresh panel', async mode => {
+    const f = await fixture();
+    f.store.write({ ...f.saved, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
+    if (mode === 'explicit') f.args.argv = [`--resume=${f.saved.id}`, '--json'];
+    const judges = f.judge.mock.calls.length;
+    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: () => f.saved.id, mintRunId: () => { throw Error('fresh panel'); } });
+    expect(out.stopped).toBe('refused');
+    expect(out.lines.join(' ')).toContain('record effect resume attempts spent');
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(f.store.read(f.saved.id)).toEqual({ ...f.saved, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
+    expect(f.judge).toHaveBeenCalledTimes(judges);
+  });
+
+  it.each(['automatic', 'explicit'].flatMap(mode => ['recordEffectResumeAttempts', 'unknownAttempts'].flatMap(field =>
+    ['corrupt', -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1].map(value => [mode, field, value]))))(
+    '%s resume refuses malformed saved %s=%s without applying the label', async (mode, field, value) => {
+      const f = await fixture();
+      const raw = f.saved;
+      if (field === 'unknownAttempts') raw.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)[field] = value;
+      else raw[field] = value;
+      // Run-store JSON turns NaN into null; exercise the actual saved representation.
+      const saved = JSON.parse(JSON.stringify(raw));
+      f.store.write(saved);
+      expect(f.find(saved.input)).toBeNull();
+      const judges = f.judge.mock.calls.length, checks = f.publishGate.mock.calls.length;
+      const out = await runReviewLoopOnce({ ...f.args,
+        ...(mode === 'explicit' ? { argv: [`--resume=${saved.id}`, '--json'] } : {}),
+        findResumableRun: () => saved.id, mintRunId: () => { throw Error('fresh panel'); } });
+      expect(out).toMatchObject({ code: 2, stopped: 'refused', run: saved });
+      expect(out.lines.join(' ')).toContain('malformed CI-held record retry counters');
+      expect(f.store.read(saved.id)).toEqual(saved);
+      expect(f.judge).toHaveBeenCalledTimes(judges);
+      expect(f.publishGate).toHaveBeenCalledTimes(checks);
+      expect(f.runNode).not.toHaveBeenCalled();
+    });
+
+  it.each([['over bound', 3, 4], ['zero disables retries', 0, 1]])(
+    'explicit CI-held resume refuses when %s without applying the label', async (_name, max, attempts) => {
+      const f = await fixture(max);
+      const saved = f.store.read(f.saved.id);
+      saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).unknownAttempts = attempts;
+      f.store.write(saved);
+      const checks = f.publishGate.mock.calls.length, judges = f.judge.mock.calls.length;
+      const out = await runReviewLoopOnce({ ...f.args, argv: [`--resume=${saved.id}`, '--json'],
+        mintRunId: () => { throw Error('fresh panel'); } });
+      expect(out).toMatchObject({ code: 2, stopped: 'refused', run: saved });
+      expect(out.lines.join(' ')).toContain('CI-held record retry attempts spent or disabled');
+      expect(f.store.read(saved.id)).toEqual(saved);
+      expect(f.publishGate).toHaveBeenCalledTimes(checks);
+      expect(f.judge).toHaveBeenCalledTimes(judges);
+      expect(f.runNode).not.toHaveBeenCalled();
+    });
+
+  it.each([RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS, RESUME_MAX_ATTEMPTS + 1])(
+    'driver and planner agree on the independent record resume budget (%s)', async resumeAttempts => {
+      const f = await fixture();
+      const saved = { ...f.saved, recordEffectResumeAttempts: resumeAttempts };
+      f.store.write(saved);
+      const { repo, pr } = saved.input;
+      const [plan] = planRedTeamOnSkip({ repo,
+        refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: HEAD_A }],
+        rawPrs: [{ number: pr, headRefOid: HEAD_A, comments: [], reviews: [] }],
+        readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+        readReviewRuns: () => [reviewRunEvidence(saved)], headNeverReviewed: () => false,
+        setting: { enabled: true, retryCooldownMin: 30, ciHeldRecordRetryMax: 3 },
+        lastDispatch: new Map(), now: 2_000_000,
+      });
+      const eligible = resumeAttempts < RESUME_MAX_ATTEMPTS;
+      expect(f.find({ repo, pr })).toBe(eligible ? saved.id : null);
+      expect(plan.action).toBe(eligible ? 'review' : 'skip');
+      if (!eligible) expect(plan).toMatchObject({ why: 'review-unfinished', escalate: true });
+      // Bypass discovery to probe the driver's own guard against the same saved run.
+      const out = await runReviewLoopOnce({ ...f.args, findResumableRun: () => saved.id,
+        mintRunId: () => { throw Error('fresh panel'); } });
+      expect(out.stopped === 'refused').toBe(!eligible);
+      expect(out.run.recordEffectResumeAttempts).toBe(eligible ? resumeAttempts + 1 : resumeAttempts);
+      if (!eligible) expect(out.lines.join(' ')).toContain('record effect resume attempts spent');
+    });
+
+  it('never replays an unknown pending label outcome on explicit resume', async () => {
+    const f = await fixture();
+    const saved = f.store.read(f.saved.id);
+    saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status = 'pending';
+    f.store.write(saved);
+    const checks = f.publishGate.mock.calls.length;
+    const out = await runReviewLoopCliOnce({ ...f.args, argv: [`--resume=${saved.id}`, '--json'] });
+    expect(out.code).not.toBe(0);
+    expect(out.stopped).toBe('refused');
+    expect(out.run).toBeNull();
+    expect(out.lines.join(' ')).toContain('UNKNOWN');
+    expect(f.publishGate).toHaveBeenCalledTimes(checks);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+});
+
+describe('review pass PR metadata snapshot', () => {
+  it('caches resume reads per repo/PR and uses exactly one fresh pr view per acceptance read', () => {
+    let head = HEAD_A;
+    const exec = vi.fn(() => JSON.stringify({ headRefOid: head, body: 'body', createdAt: 'date' }));
+    const readComments = vi.fn(() => [{ body: `thread-${readComments.mock.calls.length}` }]);
+    const input = { repo: 'owner/repo', pr: 7 };
+    for (const expectedHead of [HEAD_A, HEAD_B]) {
+      head = expectedHead;
+      const readPr = createReviewPassPrReader({ exec, readComments });
+      const views = () => exec.mock.calls.filter(([, args]) => args[0] === 'pr' && args[1] === 'view').length;
+      const before = views();
+      expect(defaultFindResumableRun(input, { readPr, readRuns: () => [] })).toBeNull();
+      expect(readPr(input)).toMatchObject({ headRefOid: expectedHead });
+      expect(readPr(input, { refreshHead: true })).toMatchObject({ headRefOid: expectedHead, body: 'body', createdAt: 'date' });
+      expect(readPr(input, { refreshHead: true }).comments).toEqual([{ body: `thread-${readComments.mock.calls.length}` }]);
+      // Acceptance needs fresh author stamps as well as the head; only resume reads share the cache.
+      expect(views() - before).toBe(3);
+      readPr({ ...input, repo: 'another/repo' });
+      readPr({ ...input, pr: 8 });
+      expect(views() - before).toBe(5);
+    }
+    expect(readComments).toHaveBeenCalledTimes(12);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(0);
+    expect(exec.mock.calls[0][1]).toContain('headRefOid,body,createdAt');
+  });
+
+  it('acceptance sees an author-stamp body edit made after the resume read', () => {
+    let body = 'original author stamp';
+    const exec = vi.fn(() => JSON.stringify({ headRefOid: HEAD_A, body, createdAt: 'date' }));
+    const readPr = createReviewPassPrReader({ exec, readComments: () => [] });
+    const input = { repo: 'owner/repo', pr: 7 };
+    expect(readPr(input).body).toBe(body);
+    body = 'changed author stamp';
+    expect(readPr(input, { refreshHead: true })).toMatchObject({ headRefOid: HEAD_A, body });
+    expect(readPr(input).body).toBe(body);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls.every(([, args]) => args.at(-1) === 'headRefOid,body,createdAt')).toBe(true);
+  });
+
+  it('retains an unreadable metadata failure for the pass and retries on the next pass', () => {
+    const exec = vi.fn(() => { throw new Error('unreadable PR'); });
+    const readComments = vi.fn();
+    const input = { repo: 'owner/repo', pr: 7 };
+    const readPr = createReviewPassPrReader({ exec, readComments });
+    expect(defaultFindResumableRun(input, { readPr, readRuns: () => [] })).toBeNull();
+    expect(() => readPr(input)).toThrow('unreadable PR');
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(readComments).not.toHaveBeenCalled();
+    expect(() => createReviewPassPrReader({ exec, readComments })(input)).toThrow('unreadable PR');
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('acceptance refreshes the resume snapshot head', () => {
+  it.each(['pushed head', 'unreadable head', 'missing head'])(
+    'refuses acceptance after resume lookup when the remote has a %s', async scenario => {
+      let afterResume = false;
+      const exec = vi.fn((_cmd, args) => {
+        expect(args).toEqual(['pr', 'view', '1234', '--repo', 'web-everything/web-everything', '--json', 'headRefOid,body,createdAt']);
+        if (afterResume && scenario === 'unreadable head') throw new Error('head read failed');
+        const headRefOid = !afterResume ? HEAD_A : scenario === 'missing head' ? null : HEAD_B;
+        return JSON.stringify({ headRefOid, body: '', createdAt: '' });
+      });
+      const readComments = vi.fn(() => []);
+      const readResumePr = createReviewPassPrReader({ exec, readComments });
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const seen = [];
+      const fileItem = vi.fn();
+      const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks(seen), readResumePr,
+        findResumableRun: input => {
+          expect(defaultFindResumableRun(input, { readPr: readResumePr, readRuns: () => [] })).toBeNull();
+          afterResume = true; // The fresh acceptance view must observe evidence after the resume read.
+          return null;
+        },
+        makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => `snapshot-${scenario.replaceAll(' ', '-')}`, fileItem,
+      });
+      expect(out.stopped).toBe('confirm');
+      expect(out.run.findings.confirm).toBeUndefined();
+      expect(seen.some(effect => effect.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+      expect(fileItem).not.toHaveBeenCalled();
+      expect(out.lines.join('\n')).toContain(scenario === 'pushed head'
+        ? 'live head does not match the reviewed head' : 'live referrals unavailable');
+      // One resume view, then fresh views for auto-confirm and the parked-outcome refusal.
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'pr' && args[1] === 'view')).toHaveLength(3);
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(0);
+      expect(readComments.mock.calls.length).toBeGreaterThan(1);
+    },
+  );
+
+  it.each(['unchanged', 'changed'])('uses the fresh %s author body to authorize referral clearance', async scenario => {
+    const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const seat = 'judge';
+    const key = referralFindingKey(seat, original);
+    const reviewer = mandatoryReferralReviewer('snapshot-body-referral');
+    const authorBody = '<!-- authored-by-actor: author -->';
+    const record = { version: 1, repo: 'web-everything/web-everything', pr: 1234, head: HEAD_A,
+      runId: 'snapshot-body-referral', reviewer, authorBody, attempted: true,
+      referrals: [{ key, seat, original, finding: normalizeFinding(original) }],
+      rulings: [{ id: 'clearance', key, reviewerId: reviewer.id, lens: 'correctness', result: 'not-real',
+        rationale: 'Verified against the pinned diff', evidence: ['diff:launch-guard'] }],
+    };
+    let body = authorBody;
+    const exec = vi.fn((_cmd, args) => {
+      expect(args).toEqual(['pr', 'view', '1234', '--repo', record.repo, '--json', 'headRefOid,body,createdAt']);
+      return JSON.stringify({ headRefOid: HEAD_A, body, createdAt: '' });
+    });
+    const readComments = vi.fn(() => [{ body: renderReferralRecord(record), author: { login: 'web-everything' } }]);
+    const readResumePr = createReviewPassPrReader({ exec, readComments });
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const fileItem = vi.fn();
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen), readResumePr,
+      findResumableRun: input => {
+        expect(defaultFindResumableRun(input, { readPr: readResumePr, readRuns: () => [] })).toBeNull();
+        if (scenario === 'changed') body = `<!-- authored-by-actor: ${reviewer.id} -->`;
+        return null;
+      },
+      makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => `snapshot-body-${scenario}`, fileItem,
+    });
+    if (scenario === 'changed') {
+      expect(out.stopped).toBe('confirm');
+      expect(out.run.findings.confirm).toBeUndefined();
+      expect(seen.some(effect => effect.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+      expect(out.lines.join('\n')).toContain('mandatory referrals remain open on the live head');
+    } else {
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(seen.some(effect => effect.type === REVIEW_EFFECTS.LABEL)).toBe(true);
+    }
+    expect(fileItem).not.toHaveBeenCalled();
+    // A refusal rechecks acceptance when rendering the parked outcome; a successful accept does not.
+    const reads = scenario === 'changed' ? 3 : 2;
+    expect(exec).toHaveBeenCalledTimes(reads);
+    expect(readComments).toHaveBeenCalledTimes(reads);
   });
 });

@@ -7,7 +7,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { buildCliDaemonEffects, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
+import { buildCliDaemonEffects, cliReviewTickOpts, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
 
 // The stale-accept provider's `defaultRearmStaleAcceptance` export, swapped per test through a getter: the production default
@@ -40,6 +40,8 @@ describe('buildCliDaemonEffects — production executor wiring (#5793)', () => {
     const tick = vi.fn(() => ({ reviewsOwed: 0, refusals: 0, dispatched: [], failed: [] }));
     const effects = buildCliDaemonEffects({
       owner: 'wiring-test', log, tick, reapSessions: () => null,
+      // Never list the host's real processes (their script paths would be stat'ed on disk).
+      reviewTickOpts: args => cliReviewTickOpts({ ...args, listCommands: () => '' }),
       convertAdvisoryEnabled: false, runPrepReview: () => null,
     });
     await effects.tickOnce();

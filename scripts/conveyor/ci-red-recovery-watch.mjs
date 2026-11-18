@@ -62,7 +62,7 @@ import { dirname, join, resolve } from 'node:path';
 import { linkSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
@@ -72,7 +72,9 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   realRequiredFailures, retryOutcome, wrongSpentStandDowns, buildResolvedSpentComment,
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
-import { pushMissingRunCommit } from './missing-run-push.mjs';
+import { ownerInstallationToken, pushMissingRunCommit } from './missing-run-push.mjs';
+import { recoveryPreflight } from './recovery-preflight.mjs';
+import { installationForOwner, ownerOfSlug } from '../lib/github-app-installations.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -89,7 +91,7 @@ import {
   classifyCiFailureAttribution, countRebaseOntoMainComments, buildRebaseOntoMainComment,
   DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   DEFAULT_REQUIRED_CONTEXTS, DEFAULT_MISSING_RUN_THRESHOLD_MS, DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA,
-  buildMissingRunCandidates, planMissingRunRecoveries, countMissingRunComments, buildMissingRunComment,
+  buildMissingRunCandidates, isStartupFailure, planMissingRunRecoveries, countMissingRunComments, buildMissingRunComment,
   DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, failingRequiredCheckForAttribution, isAnyRequiredCheckFailed,
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
   mainLatestGreenShaForCheck, isMainGreenFixOwed, classifyMainDefect, classifierNeedsComments, isMainLatestCheckGreen, isMainFixedSignatureOwed,
@@ -251,7 +253,17 @@ export function sweepCiRedRecovery({
   reconcileAcceptance = reconcileAcceptanceAfterRebase,
   // Card xu1nixv — the published red-main priority record (WE only); hermetic (null) inside a test run.
   readPriority = () => readMainRedPriority(),
+  // 2026-11-03 live: the first apply tick after main went green refreshed PRs until the 300 s pass deadline
+  // SIGTERMed it mid-batch. The apply loop stops STARTING refreshes once the budget (measured from the tick's
+  // start, so discovery counts) or the per-tick batch cap is spent; the rest wait for the next tick.
+  now = Date.now, applyBudgetMs = resolveApplyBudgetMs(), maxApplyPerTick = resolveMaxApplyPerTick(),
+  // Review round 4 of #6340: ticks are stateless, so slow free deferrals at the front of a stable queue spent every
+  // tick's budget and the refreshable PR behind them was never tried. `applyLedger` ({ read, write }, see
+  // {@link createFileApplyLedger}) remembers which PRs were attempted so the next tick starts with the
+  // least-recently-attempted. null = no memory (the plan's own order); the CLI wires the file-backed one.
+  applyLedger = null,
 } = {}) {
+  const tickStartedAt = now();
   const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
   const prs = readOpenPrs({ repo, extraFields: ['labels'] });
   // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
@@ -347,18 +359,66 @@ export function sweepCiRedRecovery({
   const repoRoot = resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
 
   const applied = [];
+  let ledgerError = null;
   if (apply) {
-    for (const d of plan.dispatch) {
+    // `started` counts refreshes that did work (they spend the progress floor and the per-tick cap). A deferral writes
+    // nothing, so it is never counted; but its network reads cost TIME, and the time check below runs for every PR, so
+    // slow deferrals are bounded by the budget (review round 3 of #6340: they used to run until the 300 s pass deadline
+    // killed the sweep). There is deliberately no count cap on deferrals: instant ones (a cross-repo PR) are free, and
+    // a count cap would let a stable run of them at the head of the queue starve every later PR on every tick.
+    let started = 0;
+    const applyStartedAt = now();
+    const floorGraceMs = Math.min(applyBudgetMs, APPLY_FLOOR_GRACE_MS);
+    // Fairness across ticks (review round 4 of #6340): least-recently-attempted first, never-attempted before any
+    // attempted, ties in the plan's own order. A PR the budget deferred without trying stays unmarked, so it leads
+    // the next tick; a PR that was tried (even a slow free deferral) goes behind everything not yet tried.
+    // Attempts are recorded BEFORE the refresh runs and written at once, so a sweep killed at the pass deadline
+    // mid-refresh has still moved that PR to the back. Ledger trouble only costs fairness — it never stops the sweep.
+    // The key is the PR number alone (the file is per repo): a head that moves between ticks (author push, our own
+    // rebase) must not reset a PR's place. An entry also survives the PR dropping out of the plan for a tick (a
+    // transient comment-read failure) — it expires only after APPLY_LEDGER_TTL_MS, and the file is capped.
+    const applyKey = (d) => String(d.prNumber);
+    const readLedger = () => {
+      try { return normalizeApplyLedger(applyLedger.read()); } catch (e) { ledgerError = `read: ${e?.message ?? e}`; return null; }
+    };
+    let ledger = (applyLedger && readLedger()) || normalizeApplyLedger(null);
+    const order = plan.dispatch.map((d, i) => ({ d, i, seen: ledger.at[applyKey(d)] ?? 0 }))
+      .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.d);
+    for (const d of order) {
+      // Progress floor: once over budget, the tick may still start a refresh that does work — discovery (per-PR
+      // comment reads) can by itself outlast the budget, and without the floor every tick would defer everything.
+      // Deferrals do not spend the floor, but they may only hunt for that refresh for `floorGraceMs` of loop time.
+      const overBudget = now() - tickStartedAt >= applyBudgetMs;
+      if (started >= maxApplyPerTick
+        || (overBudget && (started >= 1 || now() - applyStartedAt >= floorGraceMs))) {
+        applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
+          error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
+        continue;
+      }
       const held = checkClaim({ repo, branch: d.headRefName });
+      if (!held && applyLedger) {
+        // Re-read and merge (max per key) just before writing: a sweep that overlapped this one (a manual run, or a
+        // slow predecessor) must not lose its stamps to this tick's older snapshot.
+        const fresh = readLedger();
+        if (fresh) ledger = mergeApplyLedgers(ledger, fresh);
+        ledger = pruneApplyLedger(ledger, now());
+        ledger.seq += 1;
+        ledger.at[applyKey(d)] = ledger.seq;
+        ledger.ts[applyKey(d)] = now();
+        try { applyLedger.write(ledger); } catch (e) { ledgerError = `write: ${e?.message ?? e}`; }
+      }
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
         : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
       // 2026-10-10 live: #4784 claim-held refusals burned the cap. A failed push re-reads the claim store (the push
       // race); the failure text is never trusted to say a claim is held (PR #4825 round 4).
       if (held || result.deferred || (!result.ok && checkClaim({ repo, branch: d.headRefName }))) {
+        // A deferral did no work, so it never spends the progress floor or the per-tick cap (review round 2 of #6340:
+        // counting it before the refresh ran let one free deferral starve every later PR in the tick).
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, error: result.error });
         continue;
       }
+      started += 1;
       // Posted on EVERY attempt, success or failure — mirrors `sweepHungCiRecovery`'s own discipline: a
       // permanently-failing refresh must still trip {@link DEFAULT_MAX_REBASE_RETRIES_PER_SHA}'s cap, not
       // retry forever silently.
@@ -379,7 +439,7 @@ export function sweepCiRedRecovery({
   }
   // Keep discovery rows too: a retry can have gone green (or be missing checks) since the last tick.
   // The exhausted pass merges these with the attributed candidates instead of rebuilding ownership.
-  return { ...plan, applied, mainRedWindows, mainLatestCheckRuns, mainRuns, candidates, prs: prList, requiredChecks: checks };
+  return { ...plan, applied, ...(ledgerError ? { applyLedgerError: ledgerError } : {}), mainRedWindows, mainLatestCheckRuns, mainRuns, mainGreen: mainGreen ? !mainGreen.red : null, candidates, prs: prList, requiredChecks: checks };
 }
 
 // live PR #5195, 2026-10-14: read FAILED sibling logs, not just the aggregate check's 3s log.
@@ -587,6 +647,48 @@ export function formatExhaustedRetryReport({ dispatch = [], refusals = [], appli
  *  must still count) — so the body always states the real outcome, never implying a rerun that never happened. */
 export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
 
+/** A value written on ONE `key: value` marker line. A check/job name is PR-author controlled text, so any line
+ *  break (LF, CR, NEL, U+2028/2029) is folded to a space: it can never smuggle a `reason:`/`run:`/`sha:` line into
+ *  a bot-authored (trusted) marker. Null/undefined stay null so callers keep their `(unknown)` fallback. */
+export function markerLineValue(value) {
+  if (value == null) return null;
+  return String(value).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ').trim();
+}
+
+/**
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#normalizeRunAttempt — the ONE definition of a usable workflow
+ * run attempt: a positive integer (a number, or a string of digits only), returned as its canonical decimal text;
+ * anything else (missing, zero, negative, fractional, non-numeric, multi-line) is null. PURE.
+ * @param {*} value
+ * @returns {string|null}
+ */
+export function normalizeRunAttempt(value) {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+  if (typeof value === 'string' && /^[1-9]\d{0,8}$/.test(value)) return value;
+  return null;
+}
+
+/**
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadRunAttempt — the run's CURRENT attempt number
+ * (`run_attempt`), or null when it cannot be read as a positive integer. Never throws: with no handled marker
+ * yet an unknown attempt yields a marker with no attempt line; with one on record the sweep refuses the candidate
+ * (`run-attempt-unreadable`) and writes nothing, so an unknown attempt can neither suppress nor loop recovery.
+ * @param {number|string} runId
+ * @param {{repo?:string|null, exec?:Function}} [o]
+ * @returns {number|null}
+ */
+export function defaultReadRunAttempt(runId, { repo = null, exec = execFileSyncThrottled } = {}) {
+  try {
+    const out = String(exec('gh', ['api', `repos/${repoSlug(repo)}/actions/runs/${runId}`, '--jq', '.run_attempt'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }) ?? '').trim();
+    const attempt = normalizeRunAttempt(out);
+    return attempt == null ? null : Number(attempt);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#buildHungCiComment — the durable comment body posted after
  * EVERY hung-run attempt, whatever its outcome. Its first line MUST be {@link HUNG_CI_COMMENT_MARKER}; its body
@@ -604,27 +706,40 @@ export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
  * @returns {string}
  */
 export function buildHungCiComment({
-  actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null,
+  actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null, runAttempt = null,
   kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
+  // A workflow re-run reuses the run id AND head sha and only bumps the run attempt, so the attempt is part of
+  // the marker's identity. Only a positive integer is ever written (never free text), so it cannot forge a line.
+  const attemptText = normalizeRunAttempt(runAttempt);
+  // Every PR-author / caller-controlled value interpolated into the outcome text is folded to ONE line first
+  // (markerLineValue), in EVERY branch: the run-already-completed reader trusts exact `reason:`/`run:`/`sha:`
+  // lines, so a job name with embedded newlines must never be able to forge them (operator send-back, PR #6719).
+  const runText = markerLineValue(runId) ?? '?';
+  const jobText = markerLineValue(jobName) ?? '?';
   const outcome = ok
     ? (reason === 'run-not-found-retrigger'
-      ? `could not cancel run ${runId ?? '?'}; triggered CI for the current PR head via "${markerFreeText(action)}".`
+      ? `could not cancel run ${runText}; triggered CI for the current PR head via "${markerFreeText(action)}".`
+      : reason === 'run-already-completed'
+      ? `found run ${runText} (job "${jobText}") already completed, so there was nothing to cancel and it was NOT re-run; recorded as handled for this head — any failure is left to the existing ci-red -> ci-heal path.`
+      : action === 'rerun-failed-jobs-after-completed'
+      ? `found run ${runText} (job "${jobText}") already completed as cancelled/timed out, so there was nothing to cancel; re-ran its failed jobs.`
       : kind === 'repeat-hang'
-      ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
+      ? `cancelled run ${runText} (job "${jobText}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
       : kind === 'hung-cap-escalate'
-        ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
-        : `found run ${runId ?? '?'} stuck in_progress/queued past the hung threshold; cancelled it and asked GitHub to re-run it.`)
-    : `attempted "${action}" on run ${runId ?? '?'} and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
+        ? `cancelled run ${runText} (job "${jobText}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
+        : `found run ${runText} stuck in_progress/queued past the hung threshold; cancelled it and asked GitHub to re-run it.`)
+    : `attempted "${markerLineValue(action)}" on run ${runText} and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
   return [
     HUNG_CI_COMMENT_MARKER,
     '',
-    `sha: ${headSha ?? '(unknown)'}`,
-    `run: ${runId ?? '(unknown)'}`,
-    `job: ${jobName ?? '(unknown)'}`,
+    `sha: ${markerLineValue(headSha) ?? '(unknown)'}`,
+    `run: ${markerLineValue(runId) ?? '(unknown)'}`,
+    ...(attemptText ? [`attempt: ${attemptText}`] : []),
+    `job: ${markerLineValue(jobName) ?? '(unknown)'}`,
     ...(reason ? [`reason: ${markerFreeText(reason)}`] : []),
     ...(cancelError != null ? [`Original cancel error: ${markerFreeText(cancelError)}`] : []),
-    `${actor} ${outcome}`,
+    `${markerLineValue(actor)} ${outcome}`,
   ].join('\n');
 }
 
@@ -689,7 +804,7 @@ export function countHungCiComments(comments, headSha = null) {
 export function countHungCiCommentsByJob(comments, jobName = null) {
   if (!Array.isArray(comments)) return 0;
   const scoped = jobName
-    ? comments.filter((c) => bodyHasExactLine(typeof c === 'string' ? c : c?.body, `job: ${jobName}`))
+    ? comments.filter((c) => bodyHasExactLine(typeof c === 'string' ? c : c?.body, `job: ${markerLineValue(jobName)}`))
     : comments;
   return countTrustedLeadingMarker(scoped, HUNG_CI_COMMENT_MARKER);
 }
@@ -770,11 +885,11 @@ export function reconcileAcceptanceAfterRebase({
  *   jobName?:(string|null), kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null), cancelError?:(string|null)}} [o]
  */
 export function defaultPostHungCiComment(prNumber, {
-  exec = execFileSyncThrottled, repo = null, runId = null, headSha = null, jobName = null,
+  exec = execFileSyncThrottled, repo = null, runId = null, headSha = null, jobName = null, runAttempt = null,
   kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
   const argv = ['pr', 'comment', String(prNumber), '--body', buildHungCiComment({
-    runId, headSha, jobName, kind, reason, ok, action, error, cancelError,
+    runId, headSha, jobName, runAttempt, kind, reason, ok, action, error, cancelError,
   })];
   if (repo) argv.push('--repo', repo);
   exec('gh', argv, {
@@ -827,6 +942,13 @@ export function describeExecError(e) {
   return raw.length > 500 ? `${raw.slice(0, 500)}…` : raw;
 }
 
+/** Final run conclusions that mean the hang ended by cancellation/timeout, so re-running its jobs is the recovery. */
+const RERUNNABLE_COMPLETED_CONCLUSIONS = new Set(['cancelled', 'timed_out']);
+/** Final conclusions that belong to ci-red/ci-heal (or need nothing): recorded as handled, never re-run here. */
+const SETTLED_NO_RERUN_CONCLUSIONS = new Set(['success', 'failure', 'neutral', 'skipped', 'action_required', 'startup_failure', 'stale']);
+
+const COMPLETED_CANCEL_REFUSAL_RE = /cannot cancel a workflow run that is completed/i;
+
 export function isRunNotFoundError(error) {
   return typeof error === 'string' && /\bHTTP 404\b|\bNot Found\b/i.test(error);
 }
@@ -847,7 +969,11 @@ export function cancelHungRun(runId, { repo = null, exec = execFileSyncThrottled
   try {
     exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
-    return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
+    const error = describeExecError(e);
+    // A run that already finished needs no cancel: GitHub's 409 "run that is completed" means done. No rerun here
+    // (the cap holds); the existing ci-heal / needs-you path takes the PR once.
+    if (COMPLETED_CANCEL_REFUSAL_RE.test(error)) return { ok: true, action: 'already-completed' };
+    return { ok: false, action: 'cancel-failed', error };
   }
   return { ok: true, action: 'cancelled-no-rerun' };
 }
@@ -868,7 +994,45 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
   try {
     exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
-    return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
+    const error = describeExecError(e);
+    // The run finished before the cancel landed: GitHub refuses with a 409 "run that is completed". That is no
+    // refusal (same rule as ci-queue-watch's refusalAftermath), so re-run just its failed/cancelled jobs.
+    if (!COMPLETED_CANCEL_REFUSAL_RE.test(error)) {
+      return { ok: false, action: 'cancel-failed', error };
+    }
+    // Read the run's FINAL conclusion first: a run that finished with a genuine failure (or success) after
+    // candidate selection is ci-red/ci-heal's, never re-run here. Only a cancelled/timed-out end is the hang
+    // resolving. An unreadable conclusion fails closed (counted attempt, no write).
+    let conclusion;
+    try {
+      conclusion = String(exec('gh', ['api', `repos/${slug}/actions/runs/${runId}`, '--jq', '.conclusion'], opts) ?? '').trim();
+    } catch (e3) {
+      return { ok: false, action: 'conclusion-unreadable', error: describeExecError(e3) };
+    }
+    if (!RERUNNABLE_COMPLETED_CONCLUSIONS.has(conclusion)) {
+      if (SETTLED_NO_RERUN_CONCLUSIONS.has(conclusion)) return { ok: true, action: 'already-completed' };
+      return { ok: false, action: 'conclusion-unreadable', error: `run ${runId} conclusion is not a known final value ("${conclusion.slice(0, 40)}")` };
+    }
+    // A run can end `cancelled`/`timed_out` while one of its jobs genuinely FAILED, and `rerun-failed-jobs` would
+    // re-execute that failure too. Attribute first: any job with a `failure` conclusion belongs to ci-red/ci-heal.
+    // An unreadable or empty job list fails closed (counted attempt, no write), like an unreadable conclusion.
+    let jobConclusions;
+    try {
+      jobConclusions = String(exec('gh', ['api', '--paginate', `repos/${slug}/actions/runs/${runId}/jobs?per_page=100`, '--jq', '.jobs[].conclusion'], opts) ?? '')
+        .split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    } catch (e4) {
+      return { ok: false, action: 'jobs-unreadable', error: describeExecError(e4) };
+    }
+    if (jobConclusions.length === 0) {
+      return { ok: false, action: 'jobs-unreadable', error: `run ${runId} job list was empty or unreadable` };
+    }
+    if (jobConclusions.includes('failure')) return { ok: true, action: 'already-completed' };
+    try {
+      exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun-failed-jobs`], opts);
+    } catch (e2) {
+      return { ok: false, action: 'rerun-failed', error: describeExecError(e2) };
+    }
+    return { ok: true, action: 'rerun-failed-jobs-after-completed' };
   }
   sleepSync(waitMs);
   try {
@@ -896,7 +1060,8 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
  * posting a counted marker, so the trigger remains eligible when that precondition clears.
  * @param {{repo?:string|null, apply?:boolean, requiredCheck?:string, workflowName?:string, thresholdMs?:number,
  *   maxRetriesPerSha?:number, readOpenPrs?:Function, readComments?:Function, cancelAndRerun?:Function,
- *   cancelOnly?:Function, trigger?:Function, defaultBranch?:string, postComment?:Function, now?:number}} [o]
+ *   cancelOnly?:Function, trigger?:Function, defaultBranch?:string, postComment?:Function, now?:number,
+ *   readRunAttempt?:Function}} [o] `readRunAttempt(runId, {repo})` → the run's current attempt (positive integer) or null.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepHungCiRecovery({
@@ -904,8 +1069,16 @@ export function sweepHungCiRecovery({
   thresholdMs = DEFAULT_HUNG_THRESHOLD_MS, maxRetriesPerSha = DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
   readOpenPrs = defaultReadOpenPrs, readComments = defaultReadPrComments,
   cancelAndRerun = cancelAndRerunHungRun, cancelOnly = cancelHungRun, postComment = defaultPostHungCiComment, now = Date.now(),
-  trigger = triggerCiForPr, defaultBranch = 'main',
+  trigger = triggerCiForPr, defaultBranch = 'main', readRunAttempt = defaultReadRunAttempt,
 } = {}) {
+  // The run's current attempt as a canonical positive-integer string, or null when unknown. Never throws.
+  const currentAttempt = (runId) => {
+    try { return normalizeRunAttempt(readRunAttempt(runId, { repo })); } catch { return null; }
+  };
+  // The attempt is read ONCE per hung candidate, BEFORE any cancel/rerun write, and that same value is used for the
+  // handled-marker check and for the marker later written. Reading it after the cancel would let a re-run landing
+  // in between be recorded as handled although nobody examined it.
+  const attemptByRun = new Map();
   const prs = readOpenPrs({ repo });
   const rawCandidates = buildHungCandidates(prs, { requiredCheck, workflowName });
   const retriggerRefusals = [];
@@ -928,6 +1101,34 @@ export function sweepHungCiRecovery({
       return !outcome.includes(' and it FAILED:') && outcome.includes('; triggered CI for the current PR head via "');
     });
     const successfulRetriggerCount = countHungCiComments(successfulRetriggers, c.headSha);
+    // A run the cancel found already completed was recorded as handled for this head: do not select it again.
+    // Provenance: only a trusted-author leading-marker comment counts; any other commenter's body is data.
+    // A workflow re-run reuses the run id and head sha, so a marker also has to name the run attempt it handled:
+    // it suppresses only that attempt. A marker with no attempt line never suppresses; an unreadable current
+    // attempt (with a marker on record) refuses the candidate instead — see below.
+    const handledMarkers = comments.filter((cm) => {
+      const body = typeof cm === 'string' ? cm : cm?.body;
+      return countTrustedLeadingMarker([cm], HUNG_CI_COMMENT_MARKER) > 0
+        && bodyHasExactLine(body, 'reason: run-already-completed') && bodyHasExactLine(body, `run: ${c.runId}`)
+        && bodyHasExactLine(body, `sha: ${c.headSha}`);
+    });
+    const attemptNow = currentAttempt(c.runId);
+    attemptByRun.set(`${c.prNumber}:${c.runId}`, attemptNow);
+    if (handledMarkers.length > 0 && attemptNow == null) {
+      // Fail closed: with a handled marker on record and the current attempt unknowable, neither suppressing nor
+      // acting is safe — acting again would post another attempt-less marker every tick for as long as the PR
+      // stays hung. Report it and write nothing; the next tick retries the read.
+      retriggerRefusals.push({ ...c, kind: 'run-attempt-unreadable',
+        why: 'A handled marker exists for this head and run, but the current run attempt could not be read; nothing is written until it can be, so a re-run is neither suppressed nor re-attempted blindly.' });
+      return null;
+    }
+    const alreadyCompleted = attemptNow != null
+      && handledMarkers.some((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm.body, `attempt: ${attemptNow}`));
+    if (alreadyCompleted) {
+      retriggerRefusals.push({ ...c, kind: 'run-already-completed',
+        why: 'This head and run were already found completed and recorded as handled; the failed run is left to ci-red/ci-heal. No further attempt owed.' });
+      return null;
+    }
     if (successfulRetriggerCount > 0) {
       retriggerRefusals.push({ ...c, kind: 'run-not-found-retriggered',
         why: 'This head and run already have a recorded retrigger outcome that succeeded; see its run-not-found-retrigger comment. No further attempt owed.' });
@@ -966,11 +1167,15 @@ export function sweepHungCiRecovery({
         result = triggered;
         reason = 'run-not-found-retrigger';
       }
+      if (!reason && result.ok && result.action === 'already-completed') reason = 'run-already-completed';
       // A temporary trigger hold is not a spent recovery attempt. Keep it visible in the report,
       // without a counted marker that would exhaust the only retrigger path before the hold clears.
       if (d.runId != null && !result.deferred) {
+        // Only the handled marker names the attempt it settled: the one read BEFORE the cancel, never a later read.
+        const runAttempt = reason === 'run-already-completed' ? (attemptByRun.get(`${d.prNumber}:${d.runId}`) ?? null) : null;
         postComment(d.prNumber, {
-          repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind, ok: result.ok, action: result.action, error: result.error ?? null,
+          repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind,
+          ...(runAttempt ? { runAttempt } : {}), ok: result.ok, action: result.action, error: result.error ?? null,
           ...(reason ? { reason, cancelError } : {}),
         });
       }
@@ -1091,6 +1296,70 @@ export function defaultReadHeadCommittedAt(sha, { repo = null, exec = execFileSy
  */
 export function triggerCiForPr(d, options = {}) {
   return pushMissingRunCommit(d, options);
+}
+
+/** Read current PR eligibility independently of the shared listing. Unknowns
+ * remain unknown so the pure admission gate refuses them. */
+export function defaultReadRecoveryPr(d, { repo, exec = execFileSyncThrottled } = {}) {
+  try {
+    return JSON.parse(exec('gh', ['pr', 'view', String(d.prNumber), '--repo', repo,
+      '--json', 'state,baseRefName,isCrossRepository,mergeable,headRefOid,headRefName'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }));
+  } catch { return null; }
+}
+
+/** Use the same owner-bound credential provenance as the writer. A missing
+ * environment credential gets one bounded auth read, never a guessed identity. */
+export function defaultReadRecoveryCredential({ repo, exec = execFileSyncThrottled,
+  env = process.env, readCache, now = Date.now() } = {}) {
+  try {
+    const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
+    const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh',
+      ['auth', 'token', '--hostname', 'github.com'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024,
+        timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', env,
+      })).trim();
+    return { token, env: ownerToken ? { ...env,
+      WE_GH_AUTH_INSTALLATION: String(installationForOwner(ownerOfSlug(repo), env)),
+      WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(token).digest('hex'),
+    } : env };
+  } catch { return { token: null, env }; }
+}
+
+/** One bounded head read; incomplete evidence keeps the cap and human/ci-heal fallback. */
+export function defaultReadHeadRuns({ repo, headSha, exec = execFileSyncThrottled } = {}) {
+  try {
+    const runs = JSON.parse(exec('gh', ['api',
+      `repos/${repoSlug(repo)}/actions/runs?head_sha=${headSha}&per_page=100`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }));
+    if (!Number.isSafeInteger(runs.total_count) || runs.total_count < 0 || runs.total_count >= 100
+      || !Array.isArray(runs.workflow_runs) || runs.workflow_runs.length !== runs.total_count) return null;
+    return runs.workflow_runs;
+  } catch { return null; }
+}
+
+/** Two bounded reads per admitted push candidate, with no pagination or guessed
+ * empty result. A full page may be truncated: hand off to human/ci-heal instead.
+ */
+export function defaultReadRecoveryEvidence(d, {
+  repo, requiredContexts, exec = execFileSyncThrottled,
+} = {}) {
+  try {
+    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
+    const live = JSON.parse(exec('gh', ['pr', 'view', String(d.prNumber), '--repo', repo,
+      '--json', 'headRefOid,statusCheckRollup'], opts));
+    const runs = JSON.parse(exec('gh', ['api',
+      `repos/${repo}/actions/runs?head_sha=${d.headSha}&per_page=100`], opts));
+    if (live.headRefOid !== d.headSha || !Array.isArray(live.statusCheckRollup)
+      || !Number.isSafeInteger(runs.total_count) || runs.total_count < 0 || runs.total_count >= 100
+      || !Array.isArray(runs.workflow_runs) || runs.workflow_runs.length !== runs.total_count) return null;
+    return { requiredContexts, rollup: live.statusCheckRollup, workflowRuns: runs.workflow_runs };
+  } catch { return null; }
 }
 
 /**
@@ -1270,9 +1539,10 @@ export function restackStackedPr(d, {
  * shape and injectability exactly — every reader/writer is injectable so the whole sweep is exercisable with no
  * network and no credential.
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
- *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
+ *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function, readHeadRuns?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
- *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps only ruleset-only candidates across SHAs.
+ *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps plain-absent ruleset candidates across SHAs;
+ *   startup-failure admission counts only current-head attempts.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepMissingRunRecovery({
@@ -1284,6 +1554,9 @@ export function sweepMissingRunRecovery({
   readAttributedRequiredChecks = readRequiredContexts === defaultReadRequiredContexts
     ? defaultReadAttributedRequiredChecks : readRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
+  readRecoveryEvidence = defaultReadRecoveryEvidence, readHeadRuns = defaultReadHeadRuns,
+  readRecoveryPr = defaultReadRecoveryPr, readRecoveryCredential = defaultReadRecoveryCredential,
+  checkClaim = pushRefusal,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
@@ -1311,6 +1584,26 @@ export function sweepMissingRunRecovery({
   const classicCandidateNumbers = new Set(buildMissingRunCandidates(prs, {
     requiredContexts: requiredContexts ?? null, stalledPartialContexts,
   }).map(c => c.prNumber));
+  // Isolate the startup-failure expansion against the SAME required context set,
+  // including ruleset checks. Plain-absent #5060 candidates keep their call path.
+  // Treat startup failures as reported for classification only, including
+  // workflow-only evidence; admission still reads the unmodified live evidence.
+  const legacyCandidateNumbers = new Set();
+  for (const pr of Array.isArray(prs) ? prs : []) {
+    const legacyPr = {
+      ...pr,
+      workflowRuns: Array.isArray(pr?.workflowRuns)
+        ? pr.workflowRuns.map(run => isStartupFailure(run) ? { ...run, conclusion: 'success' } : run)
+        : pr?.workflowRuns,
+      statusCheckRollup: Array.isArray(pr?.statusCheckRollup)
+        ? pr.statusCheckRollup.map(row => isStartupFailure(row) ? { ...row, conclusion: 'FAILURE' } : row)
+        : pr?.statusCheckRollup,
+    };
+    for (const c of buildMissingRunCandidates([legacyPr], {
+      requiredContexts: requiredContexts ?? null,
+      stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
+    })) legacyCandidateNumbers.add(c.prNumber);
+  }
   const rawCandidates = (Array.isArray(prs) ? prs : []).flatMap(pr => buildMissingRunCandidates([pr], {
     requiredContexts: requiredContexts ?? null,
     stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
@@ -1340,10 +1633,20 @@ export function sweepMissingRunRecovery({
     candidates, now, thresholdMs, maxRetriesPerSha,
   });
   const attemptsByPr = new Map(candidates.map(c => [c.prNumber, c.triggerAttemptsForPr]));
+  const candidateByPr = new Map(candidates.map(c => [c.prNumber, c]));
   plan.dispatch = plan.dispatch.filter(d => {
     if (classicCandidateNumbers.has(d.prNumber)) return true;
+    // Startup failures get the current head's budget, already bounded by the planner.
+    // Keep the cross-head cap for the original plain-absent ruleset candidates.
+    if (!legacyCandidateNumbers.has(d.prNumber)) return true;
     const attempts = attemptsByPr.get(d.prNumber) ?? 0;
     if (attempts < maxRetriesPerPr) return true;
+    // Open-PR listings omit workflow runs. Check only otherwise capped heads for
+    // startup failures; the planner has already enforced the per-SHA cap.
+    try {
+      const runs = readHeadRuns({ repo: repoSlug(repo), headSha: d.headSha });
+      if (Array.isArray(runs) && runs.some(isStartupFailure)) return true;
+    } catch { /* Unknown evidence keeps the refusal and its operator fallback. */ }
     plan.refusals.push({ ...d, kind: 'missing-run-pr-cap-exhausted', attempts,
       why: `PR #${d.prNumber} already had ${attempts} missing-run trigger attempt(s) across all head SHAs (cap ${maxRetriesPerPr}) — needs human/ci-heal inspection` });
     return false;
@@ -1355,6 +1658,34 @@ export function sweepMissingRunRecovery({
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;
+      if (!legacyCandidateNumbers.has(d.prNumber)) {
+        const c = candidateByPr.get(d.prNumber);
+        let admission;
+        try {
+          const slug = repoSlug(repo);
+          const pr = readRecoveryPr(d, { repo: slug });
+          const held = checkClaim({ repo: slug, branch: d.headRefName });
+          const credential = readRecoveryCredential({ repo: slug, now });
+          admission = recoveryPreflight({
+            repo: slug, head: d.headSha, headRefName: d.headRefName, defaultBranch, pr,
+            recoveryEvidence: readRecoveryEvidence(d, {
+              repo: slug, requiredContexts: defaultBasePartialContexts,
+            }),
+            claimed: held === null ? false : true,
+            token: credential?.token, env: credential?.env,
+            attemptsForSha: c?.triggerAttemptsForSha, attemptsForPr: c?.triggerAttemptsForSha,
+            maxRetriesPerSha, maxRetriesPerPr,
+          });
+        } catch {
+          admission = { allow: false, reason: 'recovery preflight inputs unreadable; needs human/operator or ci-heal inspection' };
+        }
+        if (!admission.allow) {
+          plan.refusals.push({ ...d, kind: 'missing-run-preflight-refused', why: admission.reason });
+          applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why,
+            ok: false, action: 'pull-request-push', deferred: true, labelCleared: false, error: admission.reason });
+          continue;
+        }
+      }
       const result = stacked
         ? restack(d, { prs, repo, defaultBranch, readIsCrossRepository, root: resolveLanePoolRepoPath(repo) ?? REPO_ROOT })
         : trigger(d, { repo: repoSlug(repo), defaultBranch });
@@ -1650,6 +1981,119 @@ function parseFlags(argv) {
   return flags;
 }
 
+/** Over budget with no refresh that did work yet, the loop may keep probing (deferrals) for at most this long. */
+const APPLY_FLOOR_GRACE_MS = 60_000;
+
+/** we:scripts/conveyor/ci-red-recovery-watch.mjs#resolveApplyBudgetMs — how long (from the tick's start) the apply
+ *  loop may keep STARTING refreshes. The pass deadline is 300 s and three more passes follow, so default 170 s. */
+export function resolveApplyBudgetMs(env = process.env) {
+  const n = Number(env.WE_RECOVERY_APPLY_BUDGET_MS);
+  return Number.isFinite(n) && n > 0 ? n : 170_000;
+}
+
+/** Per-tick refresh cap: bounds the storm when main turns green with many owed PRs (the rest drain next tick). */
+export function resolveMaxApplyPerTick(env = process.env) {
+  const n = Number(env.WE_RECOVERY_MAX_APPLY_PER_TICK);
+  return Number.isInteger(n) && n > 0 ? n : 8;
+}
+
+/** we:scripts/conveyor/ci-red-recovery-watch.mjs#detectMainTransition — true only for a recorded red tick followed
+ *  by a green one (no record = unknown = not a transition). */
+export function detectMainTransition({ prevGreen = null, mainGreen = null } = {}) {
+  return prevGreen === false && mainGreen === true;
+}
+
+function mainStatePath(repo = null, home = handoffHome()) {
+  return join(home, `ci-red-recovery-main-state.${encodeURIComponent(repoSlug(repo))}.json`);
+}
+
+/** An attempt record older than this is forgotten (the PR is then "never attempted" and leads again). */
+export const APPLY_LEDGER_TTL_MS = 24 * 60 * 60 * 1000;
+/** The ledger keeps at most this many PRs (highest stamps win), so a hostile or huge file stays bounded. */
+export const APPLY_LEDGER_MAX_ENTRIES = 500;
+/** Past this stamp the ledger is re-ranked 1..n, so `seq + 1` can never saturate and tie every new stamp. */
+export const APPLY_LEDGER_SEQ_REBASE = 1_000_000_000;
+
+/** we:scripts/conveyor/ci-red-recovery-watch.mjs#normalizeApplyLedger — any unreadable or malformed ledger is an empty
+ *  one (fairness restarts from the plan's order; it can never block a refresh). Keeps only positive-integer stamps
+ *  with a numeric attempt time, at most {@link APPLY_LEDGER_MAX_ENTRIES}, and re-ranks a near-saturated sequence. */
+export function normalizeApplyLedger(raw) {
+  const rows = [];
+  if (raw && typeof raw === 'object' && raw.at && typeof raw.at === 'object' && !Array.isArray(raw.at)) {
+    const times = raw.ts && typeof raw.ts === 'object' && !Array.isArray(raw.ts) ? raw.ts : {};
+    for (const [k, v] of Object.entries(raw.at)) {
+      if (k === '__proto__' || !Number.isSafeInteger(v) || v <= 0) continue;
+      rows.push([k, v, Number.isFinite(times[k]) ? times[k] : 0]);
+    }
+  }
+  rows.sort((a, b) => b[1] - a[1]);
+  const kept = rows.slice(0, APPLY_LEDGER_MAX_ENTRIES);
+  const top = kept.length ? kept[0][1] : 0;
+  let seq = Number.isSafeInteger(raw?.seq) && raw.seq >= top ? raw.seq : top;
+  const at = Object.create(null);
+  const ts = Object.create(null);
+  if (seq > APPLY_LEDGER_SEQ_REBASE) {
+    kept.reverse().forEach(([k, , t], i) => { at[k] = i + 1; ts[k] = t; });
+    seq = kept.length;
+  } else {
+    for (const [k, v, t] of kept) { at[k] = v; ts[k] = t; }
+  }
+  return { seq, at, ts };
+}
+
+/** Max stamp and latest attempt time per PR, max sequence — two writers can only ever move a PR further back. */
+export function mergeApplyLedgers(a, b) {
+  const at = Object.create(null);
+  const ts = Object.create(null);
+  for (const src of [a, b]) {
+    for (const k of Object.keys(src.at)) {
+      if (!(k in at) || src.at[k] > at[k]) at[k] = src.at[k];
+      ts[k] = Math.max(ts[k] ?? 0, src.ts[k] ?? 0);
+    }
+  }
+  return normalizeApplyLedger({ seq: Math.max(a.seq, b.seq), at, ts });
+}
+
+/** Forgets attempts older than the TTL (a future-dated time, e.g. after a clock step back, is kept, never trusted to expire). */
+export function pruneApplyLedger(ledger, nowMs, ttlMs = APPLY_LEDGER_TTL_MS) {
+  const at = Object.create(null);
+  const ts = Object.create(null);
+  for (const k of Object.keys(ledger.at)) {
+    if (nowMs - (ledger.ts[k] ?? 0) > ttlMs) continue;
+    at[k] = ledger.at[k];
+    ts[k] = ledger.ts[k] ?? 0;
+  }
+  return { seq: ledger.seq, at, ts };
+}
+
+function applyLedgerPath(repo = null, home = handoffHome()) {
+  return join(home, `ci-red-recovery-apply-ledger.${encodeURIComponent(repoSlug(repo))}.json`);
+}
+
+/** File-backed fairness ledger for the apply loop (`{ read, write }`). Hermetic inside a test run unless a `path` is
+ *  given: never the live record. A missing file reads as empty; any other read error propagates to the sweep, which
+ *  reports it as `applyLedgerError` and carries on. */
+export function createFileApplyLedger({ repo = null, path, env = process.env } = {}) {
+  if (path === undefined && (env?.VITEST || env?.WE_UNDER_TEST)) return { read: () => ({ seq: 0, at: {} }), write: () => {} };
+  const file = path ?? applyLedgerPath(repo);
+  return {
+    read() {
+      try { return JSON.parse(readFileSync(file, 'utf8')); }
+      catch (e) { if (e.code === 'ENOENT' || e instanceof SyntaxError) return null; throw e; }
+    },
+    write(state) { writeMainRetriggerRecord(file, { v: 1, seq: state.seq, at: { ...state.at }, ts: { ...state.ts } }); },
+  };
+}
+
+/** Reads the previous tick's main state, records this one; returns whether this tick is the red→green flip. */
+export function recordMainState({ repo = null, mainGreen = null, path = mainStatePath(repo) } = {}) {
+  if (typeof mainGreen !== 'boolean') return false;
+  let prevGreen = null;
+  try { prevGreen = JSON.parse(readFileSync(path, 'utf8')).green; } catch { /* first tick */ }
+  try { writeMainRetriggerRecord(path, { green: mainGreen, at: new Date().toISOString() }); } catch { return false; } // unrecorded → never report (else the flip repeats every tick)
+  return detectMainTransition({ prevGreen, mainGreen });
+}
+
 /** we:scripts/conveyor/ci-red-recovery-watch.mjs#formatReport — one line per dispatch/refusal/applied result,
  *  mirroring `reconcile-pass.mjs#formatReport`'s own "a pass that acts silently has reproduced the defect one
  *  level up" discipline. */
@@ -1681,7 +2125,8 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
     return;
   }
   const exhaustedRetrySettings = sweepOptions.exhaustedRetrySettings ?? resolveExhaustedRetry();
-  const options = { ...sweepOptions, repo: repoFlag, apply: !!flags.apply };
+  const options = { ...sweepOptions, repo: repoFlag, apply: !!flags.apply,
+    applyLedger: sweepOptions.applyLedger ?? (flags.apply ? createFileApplyLedger({ repo: repoFlag }) : null) };
   let failed = false;
   const runPass = (name, sweep, args) => {
     try { return sweep(args); }
@@ -1694,6 +2139,9 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
   };
   const result = runPass('main-red', sweepMainRed, { ...options, exhaustedRetrySettings });
   // Never rediscover exhausted candidates if the first pass failed: ownership facts may be incomplete.
+  if (recordMainState({ repo: repoFlag, mainGreen: result.mainGreen })) {
+    writeLine(2, `ci-red-recovery-watch: main turned green since the previous tick — ${result.dispatch?.length ?? 0} refresh(es) owed, ${result.applied?.filter((a) => a.ok).length ?? 0} applied this tick`);
+  }
   const exhaustedResult = runPass('exhausted-retry', sweepExhausted, { ...options,
     settings: exhaustedRetrySettings, mainRuns: result.mainRuns, candidates: result.candidates ?? [],
     prs: result.prs ?? [], requiredChecks: result.requiredChecks });

@@ -1,3 +1,5 @@
+import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
+import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -10,6 +12,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
   requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason, verifierEvidenceCitesClaim } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
+import { loadDaemonVersionsSettingsFile, resolveDaemonVersionsSettings } from '../lib/daemon-versions-settings.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
 import { buildReviewJudgeRequest } from './review-pr.mjs';
@@ -43,8 +46,9 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assembleReviewDetail } from '../review-detail.mjs';
@@ -59,7 +63,7 @@ import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-pro
 import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // The `advisory:accepted` / `advisory:changes` label the `advise` step's SECOND effect applies — the pure plan
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
-import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
+import { ADVISORY_LABELS, ADVISORY_OUTCOMES, ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { ledgerFindingKey, REFERRAL_RETIRED_CHANNEL } from '../lib/pr-state/referrals.mjs';
@@ -67,9 +71,9 @@ import { ledgerFindingKey, REFERRAL_RETIRED_CHANNEL } from '../lib/pr-state/refe
 const MANDATORY_LEDGER_SYNC_PASSES = 3;
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
-import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
+import { acceptanceIds, enclosingSymbol, foldFindingStatuses, isReviewRunRow, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
-import { sharedRunsDir } from './run-store.mjs';
+import { createFileRunStore, sharedRunsDir } from './run-store.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -137,6 +141,117 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
     throw new TypeError(`operations: invalid review write-up file name ${JSON.stringify(bodyFile)} — expected a bare file name`);
   }
   return join(reviewSidecarDir(root), runId, name);
+}
+
+/**
+ * PR #6601 operator send-back: a versioned daemon checkout (`<home>/<name>/versions/<id>`) links each configured
+ * state path to `<home>/<name>/state/<path>` (`linkVersionState`, scripts/lib/daemon-version-state.mjs). Its
+ * `.operations` link is accepted only when `.operations` is a configured state path (daemon-versions settings, env
+ * override included) AND the link resolves to exactly that state target. Any other target, layout or unreadable
+ * evidence is refused (fail closed).
+ */
+function versionStateTarget(root, link) {
+  try {
+    const { values } = resolveDaemonVersionsSettings({ fileConfig: loadDaemonVersionsSettingsFile(), env: process.env });
+    if (!values.statePaths.includes('.operations')) return null;
+    const version = realpathSync(root);
+    if (basename(dirname(version)) !== 'versions') return null;
+    const expected = realpathSync(join(dirname(dirname(version)), 'state', '.operations'));
+    return realpathSync(link) === expected ? expected : null;
+  } catch { return null; }
+}
+
+/**
+ * PR #6601 operator send-back 2: `review-set-label.mjs` accepts a `--body-file` only under its cwd or a temp dir, by
+ * REAL path (`checkBodyFileLocation`), and that guard is deliberately not widened. In a versioned daemon checkout the
+ * staged write-up really lives in the sibling state dir (see versionStateTarget), so it would be refused on every
+ * resume. Then the CLI gets a private copy: a fresh `mkdtemp` dir under `tmpDir`, the file mode 0600, removed by
+ * `cleanup()` whatever the outcome. A staged file inside the checkout is passed unchanged. Any local failure is
+ * notApplied (nothing has been published yet), and a half-made copy is removed.
+ */
+function cliBodyFile({ root, staged, tmpDir }) {
+  const none = { path: staged, cleanup: () => {} };
+  let dir = null;
+  try {
+    const real = realpathSync(staged);
+    const home = realpathSync(root);
+    if (real === home || real.startsWith(home + sep)) return none;
+    dir = mkdtempSync(join(tmpDir, 'review-body-'));
+    const path = join(dir, basename(staged));
+    writeFileSync(path, readFileSync(real, 'utf8'), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    const made = dir;
+    return { path, cleanup: () => { try { rmSync(made, { recursive: true, force: true }); } catch { /* best effort */ } } };
+  } catch (e) {
+    if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
+    throw notApplied(`the staged write-up could not be copied to a temp file for review-set-label.mjs: ${String((e && e.message) || e)}`, {});
+  }
+}
+
+/**
+ * Resume-from-any-lane: make sure the run's staged write-up exists under THIS checkout's sidecar.
+ *
+ * The write-up is staged under the checkout that ran effect 0, but a `--resume` may run from another lane, whose
+ * sidecar has no such file. The durable run record keeps the frozen `WRITE_UP` payload, so a missing file is
+ * regenerated from it (same bytes the first stage wrote), and a staged file that differs from the frozen payload is
+ * rewritten from it. A missing, unreadable or write-up-less record refuses (not-applied): the frozen payload is the only evidence.
+ *
+ * @returns {string} the body path (whether or not it could be recovered).
+ */
+export function ensureStagedBody({ root, runId, bodyFile, runStore, readRun }) {
+  const path = reviewBodyPath({ root, runId, bodyFile });
+  // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included. The one exception is
+  // the top-level `.operations` of a versioned daemon checkout, linked to its persistent state (see versionStateTarget).
+  const operations = join(root, '.operations');
+  let stateTarget = null;
+  for (const part of [operations, reviewSidecarDir(root), dirname(path), path]) {
+    let link = false;
+    try { link = lstatSync(part).isSymbolicLink(); } catch { /* not created yet */ }
+    if (link && part === operations) stateTarget = versionStateTarget(root, operations);
+    if (link && !(part === operations && stateTarget)) {
+      throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
+    }
+  }
+  let record = null;
+  // The executor's own store first (`ctx.readRun`, #6661), chosen HERE once for every sink that recovers; the sink's
+  // store only for a caller with no executor.
+  try { record = typeof readRun === 'function' ? readRun(runId) : (runStore ?? createFileRunStore()).read(runId); } catch (e) {
+    // An unreadable or corrupt record is not "no write-up": refuse before anything is published.
+    throw notApplied(`the run record for ${runId} could not be read to verify the staged write-up: ${String((e && e.message) || e)}`, {});
+  }
+  // Only THIS run's APPLIED write-up is evidence: a sibling run's record or a never-applied entry is not.
+  const entry = record?.id === runId ? (record.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.status === 'applied'
+    && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string') : null;
+  // A record that exists but holds no matching write-up gives no evidence the staged bytes are the verdict.
+  if (!entry || !entry.payload.body.trim()) {
+    throw notApplied(`the run record for ${runId} ${record ? 'holds no frozen write-up' : 'was not found'} for ${bodyFile}; refusing to publish an unverified staged file`, {});
+  }
+  // The frozen payload is the durable truth: a missing, truncated or altered staged file is rewritten from it.
+  let current = null;
+  try { current = readFileSync(path, 'utf8'); } catch { current = null; }
+  if (current !== entry.payload.body) {
+    try {
+      // An accepted state link must still lead to the SAME state target at write time (a link swapped after the check
+      // would otherwise pass the containment check below, since both of its sides resolve through the new link).
+      const swapped = () => notApplied(`the review sidecar for ${runId} no longer resolves to the versioned state target`, {});
+      if (stateTarget && realpathSync(operations) !== stateTarget) throw swapped();
+      mkdirSync(dirname(path), { recursive: true });
+      // The run directory must really live under this checkout's sidecar: a symlinked directory would redirect the write.
+      const sidecar = realpathSync(reviewSidecarDir(root));
+      if (stateTarget && sidecar !== join(stateTarget, 'review')) throw swapped();
+      const dir = realpathSync(dirname(path));
+      if (dir !== join(sidecar, runId)) throw notApplied(`the staged write-up directory for ${runId} resolves outside the review sidecar`, {});
+      // Never write THROUGH a link: any existing staged file (symlink included) is unlinked and recreated, not followed.
+      try { lstatSync(path); unlinkSync(path); } catch { /* absent */ }
+      writeFileSync(path, entry.payload.body, { encoding: 'utf8', flag: 'wx' });
+    } catch (e) {
+      if (e?.notApplied) throw e;
+      // Every step above is LOCAL and runs before any external write, so a filesystem failure (EACCES, ENOSPC, EEXIST…)
+      // proves nothing was published: refuse as notApplied so the effect stays retryable once the lane is repaired,
+      // instead of an ordinary throw the executor must treat as an UNKNOWN outcome and refuse on every later resume.
+      throw notApplied(`the staged write-up for ${runId} could not be regenerated from the run record: ${String((e && e.message) || e)}`, {});
+    }
+  }
+  return path;
 }
 
 /**
@@ -402,7 +517,7 @@ export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLe
   if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) return null;
   try {
     const rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
-      && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING));
+      && isReviewRunRow(r));
     return reviewRoundOf(rows, head);
   } catch { return null; }
 }
@@ -422,7 +537,7 @@ export function readReviewRoundAsOf({ repo, pr, at, head = null, readLedgerRows 
   if (!Number.isFinite(t)) return null;
   try {
     const heads = new Set((readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
-      && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING) && Date.parse(r.at) <= t
+      && isReviewRunRow(r) && Date.parse(r.at) <= t
       && typeof r.headSha === 'string' && r.headSha).map((r) => r.headSha.toLowerCase()));
     if (typeof head === 'string' && /^[0-9a-f]{40}$/i.test(head)) heads.add(head.toLowerCase());
     return heads.size > 0 ? heads.size : null;
@@ -476,9 +591,9 @@ export function recordScopedRereviewShadow({ payload, exec, readLedgerRows, appe
     let rows = [];
     let ledger = 'ok';
     try { rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)); } catch { rows = []; ledger = 'unreadable'; }
-    // Reviewed heads, in append order: a completed run's review-run row, and the shadow's own finding rows (written at
-    // review time, so a round parked for a ruling is counted too).
-    const reviewRuns = rows.filter((r) => r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING);
+    // Reviewed heads, in append order: review-run rows and the shadow's review-status finding rows.
+    // Red-team dispositions never establish a reviewed head or consume a round.
+    const reviewRuns = rows.filter(isReviewRunRow);
     const fromLedger = ledger === 'ok' ? lastReviewedHead(reviewRuns, head) : null;
     // The ledger names the last reviewed head (edge 6). A PR whose earlier rounds predate the review-run rows falls
     // back to the trusted `Net basis:` marker the latest-fix read already used; anything else is a full review.
@@ -797,7 +912,30 @@ export function createReviewPrReader({
  * unrecognised failure is how a comment gets double-posted. This list only ever narrows the refusal; it never
  * widens what counts as safe.
  */
+/**
+ * Spawn errors that mean the child process never started, so it cannot have written anything. A child that ran and
+ * then failed carries an exit `status` or a `signal` (a timeout kills with SIGTERM, ENOBUFS kills a running child),
+ * and those stay indeterminate.
+ */
+const SPAWN_NEVER_STARTED = Object.freeze(new Set(['ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'ENOMEM', 'E2BIG', 'EMFILE', 'ENFILE']));
+function childNeverStarted(e) {
+  return !!e && e.status == null && !e.signal && SPAWN_NEVER_STARTED.has(e.code);
+}
+
+// These argument checks run in the CLI entry point before runReviewLabelCli can mutate anything.
+// Exported so a test can require one real-CLI no-write case per pattern: each one licenses a replay.
+// ANCHORED to the start of the CLI's own error text (optionally behind the sink's own UNKNOWN wrapper), so a
+// post-write `gh` stderr line that merely CONTAINS one of these phrases never licenses a replay.
+const BODY_FILE_ANCHOR = '^(?:review-set-label\\.mjs (?:failed|reported an error) and its outcome is UNKNOWN: )?';
+export const BODY_FILE_REFUSALS = Object.freeze([
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is unreadable \\(`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is empty — pass the verdict write-up`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file must live under the repo root or a temp dir \\(got `),
+]);
+export const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_REFUSALS.some(p => p.test(text));
+
 const PRE_WRITE_REFUSALS = Object.freeze([
+  ...BODY_FILE_REFUSALS,
   'usage: review-set-label.mjs',
   'invalid --repo',
   'invalid --to',
@@ -837,7 +975,7 @@ function boundedReferral(original, source) {
 /** Is this CLI error text one we can PROVE happened before any write? */
 export function isPreWriteRefusal(text) {
   const s = String(text || '');
-  return PRE_WRITE_REFUSALS.some((p) => s.includes(p));
+  return PRE_WRITE_REFUSALS.some((p) => p instanceof RegExp ? p.test(s) : s.includes(p));
 }
 
 /** Lines around a cited line that count as "the cited code changed" when carrying an operator ruling forward. */
@@ -907,6 +1045,24 @@ export function createChangedLinesReader(ghJson) {
   };
 }
 
+/** Required checks that evaluate the review verdict itself, so they cannot be a precondition of publishing it. */
+const VERDICT_DEPENDENT_CHECKS = Object.freeze(['merge-gate', 'review-gate']);
+/**
+ * The strict gate's "some required rows are not green" refusals (review-ci-gate.mjs#reviewCiGate): a required
+ * review-gate among them names the reason `required-review-gate-conflict`. A trusted stale required-set read
+ * suffixes either one (review-ci-gate-io.mjs#withSource). Any other reason is not an affected-rows judgment.
+ */
+const AFFECTED_ROW_REFUSALS = Object.freeze(['required-checks-not-successful', 'required-review-gate-conflict']);
+const STALE_CACHE_SUFFIX = / \(stale-cache cache-age-ms=[^()]*\)$/;
+
+/** True when a strict refusal on the reviewed head is held up ONLY by missing/pending verdict-dependent checks. */
+function onlyVerdictDependentPending(ci, reviewedHead) {
+  if (ci?.allowed !== false || ci.headSha !== reviewedHead || typeof ci.reason !== 'string') return false;
+  if (!AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))) return false;
+  return Array.isArray(ci.affected) && ci.affected.length > 0
+    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name) && ['missing', 'pending'].includes(row?.reason));
+}
+
 /**
  * THE SINKS, bound to a repo root and an output channel.
  *
@@ -927,10 +1083,18 @@ export function createChangedLinesReader(ghJson) {
 export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
+  // The SAME store the executor and `run.mjs --resume` use (`resolveRunsDir()`, where `OPERATION_RUNS_DIR` wins);
+  // reading `sharedRunsDir` here would miss every run a daemon job child or a test wrote under that override.
+  runStore = createFileRunStore(),
   referralJudge = judgeSpawn,
+  postRedTeamCheckRun = defaultPostRedTeamCheckRun,
   sameGapJudge,
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  now = Date.now,
+  // Where the LABEL sink puts the private --body-file copy for a versioned checkout (see cliBodyFile).
+  tmpDir = tmpdir(),
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -968,7 +1132,7 @@ export function createReviewPrSinks({
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
-  const assertPublishable = async payload => {
+  const assertPublishable = async (payload, { requireCiGate = false } = {}) => {
     // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
     // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
     // is no reviewed commit against which to apply head/CI cancellation. Never
@@ -985,6 +1149,28 @@ export function createReviewPrSinks({
         throw notApplied('review void: head moved or current head could not be read');
     };
     await assertHead();
+    if ((requireCiGate || policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
+      const deadline = now() + policy.startEarlyPublishWaitMs;
+      const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
+      for (;;) {
+        let ci;
+        try { ci = await publishGate({ ...args, policy: strictPolicy }); }
+        catch { /* Missing/unreadable CI evidence waits; it never authorizes acceptance. */ }
+        await assertHead();
+        if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
+          throw notApplied('review void: head moved or CI became red');
+        if (ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
+        // merge-gate / review-gate evaluate THIS verdict and only appear after it lands: waiting on them deadlocks the
+        // accept. Judge the rest; the merge itself still enforces them. Any other affected row keeps the hold.
+        if (onlyVerdictDependentPending(ci, payload.reviewedHead)) return;
+        if (ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path');
+        const remaining = deadline - now();
+        if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head');
+        // Clamp to Node's timer range even when an operator configures a very large poll interval.
+        await sleep(Math.min(policy.startEarlyPollMs, remaining, 2147483647));
+        await assertHead();
+      }
+    }
     if (!policy.cancelOnCiRed) return;
     let ci;
     try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
@@ -994,6 +1180,49 @@ export function createReviewPrSinks({
         requiredChecks: ci?.requiredChecks, policy }))
       throw notApplied('review void: head moved or CI became red');
     await assertHead();
+  };
+  // Supersede any same-head success before acceptance can become visible. A failed publication is
+  // provably before acceptance writes, so leave the effect retryable on resume.
+  // Post only when a red-team pass will finish the check. A head that already carries a trusted result keeps it:
+  // the pass's recovery guard refuses that head, and its duplicate check (`redTeamCommentPosted`, which reads the
+  // complete thread too) posts no second result, so a pending check there would never complete and the result is
+  // final for the head, leaving the barrier nothing to supersede. An unreadable or
+  // incomplete thread proves nothing either way: refuse before any write and leave the effect retryable.
+  // The barrier follows #6535's publish-first scope (the shared `redTeamCheckRunIsEvidence`). merge-gate reads the
+  // red-team check in `both` and `check-run`, so there a failed read or post stops the accept. In the `drain-scan`
+  // rollback the check is not evidence: the barrier still posts, best effort (so a later switch back to `both` finds
+  // no older success as the newest check), but a failure only logs and the accept proceeds as before this barrier
+  // existed. The effective source and its layer are logged on every call.
+  const postPendingRedTeam = async (payload, liveState) => {
+    const { repo, pr, reviewedHead: headSha } = payload;
+    const binding = redTeamCheckRunIsEvidence({ env, log: out });
+    const refuse = reason => {
+      if (binding) throw notApplied(`red-team pending check not posted: ${reason}; retry/resume review`);
+      out(`review-pr: ${repo}#${pr} red-team pending check not posted: ${reason} (redTeamGate.source=drain-scan: accept proceeds)`);
+    };
+    let comments;
+    try {
+      const state = liveState ?? labelProvider.readPrState(repo, pr);
+      comments = state?.comments;
+      if (Array.isArray(comments) && comments.length >= PR_COMMENTS_PAGE_SIZE) {
+        if (!labelProvider.readComments) throw new Error('complete comments reader unavailable');
+        comments = labelProvider.readComments(repo, pr);
+      }
+      if (!Array.isArray(comments)) throw new Error('comments missing');
+    } catch (error) {
+      return refuse(`PR thread unreadable (${String(error?.message ?? error).split('\n')[0].slice(0, 200)})`);
+    }
+    if (redTeamForHead(comments, pr, headSha)) {
+      out(`review-pr: ${repo}#${pr} red-team result already on ${String(headSha).slice(0, 12)}; pending check not posted`);
+      return;
+    }
+    let result;
+    try {
+      // The sink's env, not the process env: the writer env and the check lock dir derive from it (#6606).
+      result = await postRedTeamCheckRun({ repo, pr, headSha, env,
+        payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'in_progress' }) });
+    } catch (error) { result = { ok: false, reason: String(error?.message ?? error).split('\n')[0].slice(0, 300) }; }
+    if (result?.ok !== true) refuse(String(result?.reason ?? 'publication unconfirmed'));
   };
   // Both publication steps must derive authority from a complete, pinned thread.
   const readReferralState = (repo, pr, head, { pinned = true } = {}) => {
@@ -1006,7 +1235,7 @@ export function createReviewPrSinks({
     if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
     return state;
   };
-  return {
+  const sinks = {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
       const { recheckCarriedReferrals } = resolveReviewSettings({ env });
@@ -1543,10 +1772,14 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
-      await assertPublishable(payload);
-      // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
-      // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
-      const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
+      await assertPublishable(payload, { requireCiGate: ctx?.requireCiGate });
+      // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
+      const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
+      // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
+      const { path: bodyPath, cleanup } = cliBodyFile({ root, staged, tmpDir });
+      if (payload.to === 'accepted' && payload.redTeamOwed) {
+        try { await postPendingRedTeam(payload); } catch (e) { cleanup(); throw e; }
+      }
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
         String(payload.pr),
@@ -1569,11 +1802,15 @@ export function createReviewPrSinks({
           // PROVABLY nothing landed → `failed`, retried on the next pass.
           throw notApplied(`review-set-label.mjs refused before any write: ${text}`, { argv });
         }
+        if (childNeverStarted(e)) {
+          // The single home never ran (spawn refused: no exit status, no signal), so it wrote nothing → retryable.
+          throw notApplied(`review-set-label.mjs could not be started, nothing was written: ${e.code}`, { argv });
+        }
         // INDETERMINATE. A plain throw leaves the entry `pending`; the effect is declared NON-idempotent, so
         // the executor REFUSES to replay it and a person decides. That is the fail-closed answer, and it is
         // what stops a second durable comment being posted on a guess.
         throw new Error(`review-set-label.mjs failed and its outcome is UNKNOWN: ${text}`);
-      }
+      } finally { cleanup(); }
       const parsed = safeJson(stdout);
       if (parsed && parsed.error) {
         if (isPreWriteRefusal(parsed.error)) throw notApplied(`review-set-label.mjs refused: ${parsed.error}`, { argv });
@@ -1735,9 +1972,12 @@ export function createReviewPrSinks({
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
       await assertPublishable(payload);
-      const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
+      // Fail closed: no staged body and no recoverable write-up means no note and no marker.
+      if (!staged.trim()) throw notApplied(`stack-hold has no staged or recoverable write-up at ${bodyPath}`, {});
+      if (payload.redTeamOwed) await postPendingRedTeam(payload);
       // The staged write-up quotes juror text, which an attacker's diff can steer. Defuse every HTML-comment opener in it
       // so it cannot carry a forged marker (or hide the real one); the note opens and the marker closes the comment, and
       // `parseStackMarkers` reads only those two ends.
@@ -1760,6 +2000,7 @@ export function createReviewPrSinks({
     // reuses it directly rather than re-implementing a `gh pr comment` invocation a third time.
     [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload) => {
       await assertPublishable(payload);
+      if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed) await postPendingRedTeam(payload);
       postComment(payload.repo, payload.pr, String(payload.body));
       return { posted: true };
     },
@@ -1784,6 +2025,14 @@ export function createReviewPrSinks({
       const plan = planAdvisoryLabels({ outcome: payload.outcome, currentLabels: labels });
       if (plan.reason) return { applied: false, reason: plan.reason };
       if (!plan.add && plan.remove.length === 0) return { applied: false, reason: 'already-current' };
+      // The label is a second acceptance write, so it carries the barrier too, but only when this write makes the
+      // accept visible: a refused, already-current or removal-only plan adds no acceptance, and a check posted then
+      // would replace a finished result with one nothing completes. A payload declared before `redTeamOwed`
+      // existed carries no owed-ness and skips the barrier, the same as the note it was declared with (ruled
+      // `not-real` as a defect: such a run is unchanged from the code that declared it).
+      if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed && plan.add === ADVISORY_LABELS.ACCEPTED) {
+        await postPendingRedTeam(payload, state);
+      }
       // `gh pr edit --add-label` refuses a label the repo has never had; ensure is create-or-update (`--force`).
       if (plan.add) labelProvider.ensureLabel(payload.repo, plan.add, ADVISORY_LABEL_META[plan.add]);
       labelProvider.setLabels(payload.repo, payload.pr, { add: plan.add ?? undefined, remove: plan.remove });
@@ -1809,6 +2058,9 @@ export function createReviewPrSinks({
       return { cleared: true };
     },
   };
+  // Only historical body-file argument refusals prove a pending label attempt never wrote.
+  sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
+  return sinks;
 }
 
 /** The `{"error": …}` payload the review CLIs print on a refusal, or `''`. */
@@ -1824,4 +2076,79 @@ function safeJson(stdout) {
     try { return JSON.parse(lines[i]); } catch { /* keep walking back */ }
   }
   return null;
+}
+
+/** Advisory observations use a separate shadow ledger, never judgment-bearing verdict events. */
+export async function recordPostAcceptAdvisoryShadow(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryShadow', options);
+}
+
+export async function recordPostAcceptAdvisoryLoops(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryLoops', options);
+}
+
+export async function recordPostAcceptAdvisoryRating(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryRating', options);
+}
+
+// Injected IO shares an in-process queue; persisted IO additionally locks beside the ledger across processes.
+const advisoryWrites = new Map();
+async function recordAdvisoryObservation(recorder, options) {
+  try {
+    return await recordAdvisoryObservationContained(recorder, options);
+  } catch { return null; }
+}
+
+async function recordAdvisoryObservationContained(recorder, options) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) return null;
+  const injected = Object.hasOwn(options, 'readLedgerRows') || Object.hasOwn(options, 'appendLedgerRow');
+  const path = options.ledgerPath ?? join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');
+  const previous = advisoryWrites.get(path) ?? Promise.resolve();
+  const pending = previous.then(async () => {
+    let lock;
+    const lockPath = `${path}.lock`;
+    try {
+      if (injected && (typeof options.readLedgerRows !== 'function' || typeof options.appendLedgerRow !== 'function')) {
+        throw new Error('incomplete shadow ledger IO; supply both reader and writer');
+      }
+      if (!injected) {
+        mkdirSync(dirname(path), { recursive: true });
+        const deadline = Date.now() + 2000;
+        for (;;) {
+          try { lock = openSync(lockPath, 'wx'); break; }
+          catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            if (Date.now() >= deadline) throw new Error('shadow ledger lock busy after 2000ms; inspect writer before removing an orphaned lock');
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+        }
+      }
+      const policy = await import('../lib/review-loop-policy.mjs');
+      return await policy[recorder]({
+        readLedgerRows: () => {
+          let text;
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+          return text.split('\n').filter(Boolean).flatMap(line => {
+            try { return [JSON.parse(line)]; } catch { return []; }
+          });
+        },
+        appendLedgerRow: row => {
+          let text = '';
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+          const separator = text && !text.endsWith('\n') ? '\n' : '';
+          appendFileSync(path, `${separator}${JSON.stringify(row)}\n`);
+          return { ok: true };
+        },
+        ...options,
+      });
+    } catch (error) {
+      try { options.out?.(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+      return null;
+    } finally {
+      if (lock !== undefined) { closeSync(lock); unlinkSync(lockPath); }
+    }
+  });
+  advisoryWrites.set(path, pending);
+  try { return await pending; }
+  finally { if (advisoryWrites.get(path) === pending) advisoryWrites.delete(path); }
 }

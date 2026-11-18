@@ -41,6 +41,8 @@ export const DRAIN_GATES = Object.freeze([
   { id: 'mergeable', where: 'queue', input: 'github', signals: [], skipKinds: ['unknown-mergeability', 'conflicting'] },
   { id: 'landable-state', where: 'queue', input: 'github', signals: [], skipKinds: ['behind'] },
   { id: 'non-empty-body', where: 'merge-gate', input: 'github', signals: ['hasNonEmptyBody'], skipKinds: ['empty-body'] },
+  { id: 'red-team', where: 'merge-gate', input: 'github', signals: [], skipKinds: [],
+    note: 'latest red-team check from WE_APP_ID on the exact PR head; missing or unreadable evidence holds' },
   { id: 'review-hold-labels', where: 'merge-gate', input: 'github', signals: ['hasUnclearedReviewLabel'], skipKinds: ['review-hold'] },
   { id: 'review-acceptance', where: 'merge-gate', input: 'git', signals: ['decideDrainReviewGate', 'decideReviewGate', 'acceptanceCoversHead', 'decideAcceptCarryForward', 'decideDrainWorkflowEditHold'], skipKinds: ['review-hold'],
     note: 'acceptance covers the live head (reviewed-sha / reviewed-diff / contribution markers), escalation score, human-required, permission change, deviation; a workflow-file edit needs a clear-human ceremony at the exact head (merge-gate: workflowEditHold)' },
@@ -69,8 +71,10 @@ export const DRAIN_GATES = Object.freeze([
 /** Gate-shaped drain calls that are NOT merge gates, each with why. */
 export const NON_GATE_CALLS = Object.freeze({
   shouldApplyReviewLabel: 'label-write idempotence',
+  decideWorkflowHoldRepark: 'park-pass admission only (re-admits a skipped PR so the review gate can re-park a workflow hold; never lands anything)',
   shouldRepollForLabelLag: 'listing re-poll',
   shouldReadContextCommits: 'fast-drain context read scope (target selection, not merge eligibility)',
+  shouldPrepareBranchBeforeEnqueue: 'branch preparation routing (numbering before enqueue; preparation failure still refuses enqueue)',
   shouldPostParkReasonComment: 'comment routing',
   shouldLabelOnGreen: 'ci-lifecycle labelling',
   isRequiredCheckFailed: 'ci-lifecycle labelling',
@@ -79,6 +83,7 @@ export const NON_GATE_CALLS = Object.freeze({
   decideDrainLeaseGate: 'process lease (the queue serialises merges)',
   decideBatchesIdleExit: 'watch-loop exit',
   decideDurableEscalationRecord: 'durable comment',
+  decideStuckUnknownAlert: 'operator alert for persistent UNKNOWN mergeability; merge eligibility is unchanged',
   decideParkReadyStrip: 'label strip on park',
   isPrAlreadyMerged: 'idempotent merge write',
   applyEscalationRelief: 'operator LOOSENING (--no-review-escalation); merge-gate never applies it',

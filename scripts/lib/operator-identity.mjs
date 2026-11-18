@@ -13,7 +13,7 @@
  *     itself (follow-up hook in `red-team-gate.mjs`); this module's callers apply it today.
  */
 import { spawnSync } from 'node:child_process';
-import { OPERATOR_LOGINS } from './marker-authorship.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isJudgeAuthored, readJudgeActorPolicy } from './marker-authorship.mjs';
 import { parseRedTeamGateMarker } from './red-team-gate.mjs';
 
 /** Gate-record outcomes only an operator may write. */
@@ -27,8 +27,8 @@ export function operatorGhEnv(env = process.env) {
 }
 
 /** The authenticated `gh` identity under the operator channel. Throws when it cannot be read. */
-export function resolveOperatorIdentity({ env = process.env, run = spawnSync } = {}) {
-  const r = run('gh', ['api', 'user'], { env: operatorGhEnv(env), encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+export function resolveOperatorIdentity({ env = process.env, run = spawnSync, automation = false } = {}) {
+  const r = run('gh', ['api', 'user'], { env: automation ? env : operatorGhEnv(env), encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
   if (r.status !== 0) throw new Error(`could not resolve the posting identity (gh api user failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 200)})`);
   const user = JSON.parse(String(r.stdout ?? '{}'));
   return { login: String(user.login ?? ''), type: String(user.type ?? '') };
@@ -49,15 +49,48 @@ export function assertHumanOperator(identity, actor) {
 
 /** Is this comment written by a human operator account? PURE. */
 export function isHumanOperatorComment(c) {
+  if (parseRedTeamGateMarker(c?.body)?.actor !== undefined
+    || /^Cleared by judge:r10\b/m.test(String(c?.body ?? ''))) return false;
   const login = String((typeof c === 'string' ? '' : (c?.author?.login ?? c?.user?.login)) ?? '').toLowerCase();
   const a = typeof c === 'string' ? null : (c?.author ?? c?.user);
   return isHuman(login, String(a?.type ?? '')) && a?.is_bot !== true && OPERATOR_LOGINS.includes(login);
 }
 
 /** Drop every `operator-*` gate record that a human operator did not author. All other comments pass. PURE. */
-export function operatorBoundComments(comments) {
+export function operatorBoundComments(comments, { policy = judgePolicyOnce() } = {}) {
   return (Array.isArray(comments) ? comments : []).filter((c) => {
     const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isHumanOperatorComment(c);
+    if (m?.actor !== undefined) return isRulingComment(c, policy);
+    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isRulingComment(c, policy);
   });
+}
+
+/**
+ * One judge-policy read per reader pass (#6494 F2): resolved lazily on the first judge-marked comment, then reused —
+ * a failed read included, so an unreadable policy refuses every judge comment of the pass without re-reading.
+ * @param {() => {value: object}} [resolve] the resolver; a writer passes its own env-bound one for its read-back.
+ */
+export function judgePolicyOnce(resolve = () => readJudgeActorPolicy()) {
+  let r;
+  return () => {
+    if (!r) { try { r = { value: resolve().value }; } catch (error) { r = { error }; } }
+    if (r.error) throw r.error;
+    return r.value;
+  };
+}
+
+export function assertRulingIdentity(identity, actor) {
+  if (actor !== JUDGE_ACTOR) return assertHumanOperator(identity, actor);
+  if (!isJudgeAuthored({ author: identity })) throw new Error('judge posting identity must be trusted automation');
+  return identity.login;
+}
+/** Judge comments can only add a hold, with explicit attribution and live policy. */
+export function isRulingComment(c, policy = judgePolicyOnce()) {
+  const m = parseRedTeamGateMarker(c?.body);
+  if (m?.actor === undefined) return isHumanOperatorComment(c);
+  if (m.actor !== JUDGE_ACTOR || m.outcome !== 'operator-block' || !isJudgeAuthored(c)
+    || JUDGE_RESERVED_TOKEN_RE.test(String(c?.body ?? ''))
+    || !String(c?.body ?? '').split(/\r?\n/).some(line => line === JUDGE_ATTRIBUTION || line === `${JUDGE_ATTRIBUTION} (${JUDGE_ACTOR})`)) return false;
+  try { const p = policy(); return p.enabled === true && p.actor === JUDGE_ACTOR; }
+  catch { return false; }
 }

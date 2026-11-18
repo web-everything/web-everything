@@ -8,13 +8,18 @@ import { join } from 'node:path';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrePrCheckReader } from '../pre-pr-check-io.mjs';
 import { assessPrePrCheck } from '../pre-pr-check.mjs';
-import { treeOf, mergeBaseOf, RECEIPT_FILE } from '../../lib/pre-pr-review.mjs';
+import { treeOf, mergeBaseOf, RECEIPT_FILE, checkPrePrReview, BUILT_IN_PRE_PR_SETTINGS } from '../../lib/pre-pr-review.mjs';
+
+// Hermetic: pin the mode so these tests exercise the reader's real-git read whatever the shipped
+// scripts/pre-pr-review-settings.json mode is (`off` short-circuits before any risk read).
+const advise = { ...BUILT_IN_PRE_PR_SETTINGS, mode: 'advise' };
+const reader = () => createPrePrCheckReader({ check: (o) => checkPrePrReview({ ...o, settings: advise }) });
 
 describe('createPrePrCheckReader (real git)', () => {
   it('a code-only commit with no prepared card reads as gated, with the receipt commands', async () => {
     await withBareOrigin(async ({ clone, commit }) => {
       commit({ 'src/a.mjs': 'export const a = 1;\n' }, 'feat: code');
-      const v = assessPrePrCheck({ checkout: clone, decision: createPrePrCheckReader()({ checkout: clone }) });
+      const v = assessPrePrCheck({ checkout: clone, decision: reader()({ checkout: clone }) });
       expect(v.gated).toBe(true);
       expect(v.reasons.join(' ')).toMatch(/no prepared card/);
       expect(v.next).toContain(`converge-cli.mjs receipt --lane=${clone}`);
@@ -24,7 +29,7 @@ describe('createPrePrCheckReader (real git)', () => {
   it('a card-only commit reads as not gated', async () => {
     await withBareOrigin(async ({ clone, commit }) => {
       commit({ 'backlog/1-x.md': '---\nkind: story\n---\n# x\n' }, 'card');
-      const v = assessPrePrCheck({ checkout: clone, decision: createPrePrCheckReader()({ checkout: clone }) });
+      const v = assessPrePrCheck({ checkout: clone, decision: reader()({ checkout: clone }) });
       expect(v).toMatchObject({ gated: false, needsReview: false });
     });
   });
@@ -37,7 +42,7 @@ describe('createPrePrCheckReader (real git)', () => {
     await withBareOrigin(async ({ clone, commit }) => {
       commit({ 'src/a.mjs': 'export const a = 1;\n' }, 'feat: code');
       writeReceipt(clone, { tree: treeOf(clone), base: mergeBaseOf({ cwd: clone }), verdict: 'land' });
-      const v = assessPrePrCheck({ checkout: clone, decision: createPrePrCheckReader()({ checkout: clone }) });
+      const v = assessPrePrCheck({ checkout: clone, decision: reader()({ checkout: clone }) });
       expect(v).toMatchObject({ gated: true, needsReview: false, why: 'receipt', next: '' });
     });
   });
@@ -47,7 +52,7 @@ describe('createPrePrCheckReader (real git)', () => {
       commit({ 'src/a.mjs': 'export const a = 1;\n' }, 'feat: code');
       writeReceipt(clone, { tree: treeOf(clone), base: mergeBaseOf({ cwd: clone }), verdict: 'land' });
       commit({ 'src/b.mjs': 'export const b = 2;\n' }, 'feat: more code');
-      const v = assessPrePrCheck({ checkout: clone, decision: createPrePrCheckReader()({ checkout: clone }) });
+      const v = assessPrePrCheck({ checkout: clone, decision: reader()({ checkout: clone }) });
       expect(v).toMatchObject({ gated: true, needsReview: true, why: 'receipt-stale' });
     });
   });
@@ -56,7 +61,7 @@ describe('createPrePrCheckReader (real git)', () => {
     await withBareOrigin(async ({ clone, commit }) => {
       commit({ 'src/a.mjs': 'export const a = 1;\n' }, 'feat: code');
       writeReceipt(clone, { tree: treeOf(clone), base: '0'.repeat(40), verdict: 'land' });
-      const v = assessPrePrCheck({ checkout: clone, decision: createPrePrCheckReader()({ checkout: clone }) });
+      const v = assessPrePrCheck({ checkout: clone, decision: reader()({ checkout: clone }) });
       expect(v).toMatchObject({ gated: true, needsReview: true, why: 'receipt-base-mismatch' });
     });
   });

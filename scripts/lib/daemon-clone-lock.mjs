@@ -5,6 +5,10 @@
  *   operator CLIs safely share ONE daemon clone while `daemon-rebuild.mjs` (card 4044) moves it under them.
  *   Ruling: docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle (clauses 2-5).
  *
+ * Single-owner heartbeats and durable rebuild requests coordinate shared clones. Failure counts
+ * survive daemon restarts; stale requests retry until success or bounded abandonment. Acknowledgements
+ * name immutable request IDs, preserving concurrent publications. Unknown reader evidence blocks moves.
+ *
  * WHY a reader/writer lock, not just the per-path lock `scripts/readiness/file-locks.mjs` already has: that
  * module guards individual FILES inside the shared central checkout so two lanes never edit the same path.
  * Here the unit under contention is an entire CLONE'S WORKING TREE moving out from under a running tick — a
@@ -36,9 +40,10 @@
  * compose the reader/writer protocol ourselves.
  */
 
+import { createHash, randomUUID } from 'node:crypto';
 import { hostname, homedir } from 'node:os';
-import { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
-import { join, resolve as resolvePath } from 'node:path';
+import fs, { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
+import { basename, join, resolve as resolvePath } from 'node:path';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -47,6 +52,7 @@ import {
   readLockEntry,
   releaseLockDir,
   heartbeat,
+  heartbeatOwn,
   parseLockEntry,
   isLeaseExpired,
   lockIdFor,
@@ -87,6 +93,222 @@ export function cloneLockKey(root) {
 export function cloneLockDirs(root, lockRoot = defaultLockRoot()) {
   const base = join(lockRoot, cloneLockKey(root));
   return { base, writerRoot: join(base, 'writer'), readersRoot: join(base, 'readers'), starvedRoot: join(base, 'starved') };
+}
+
+// Clone coordination sidecars share the lock identity and survive working-tree replacement.
+const OWNER_ENTRIES = Object.freeze({ 'wev-review-daemon': 'review-daemon.mjs' });
+const loggedSettings = new Set();
+function settingLog(key, value, source, log = console) {
+  const message = `daemon-clone-lock: ${key}=${value} (source ${source})`;
+  if (!loggedSettings.has(message)) { loggedSettings.add(message); log.error?.(message); }
+}
+function positiveSetting(key, fallback, env = process.env, integer = false) {
+  const n = Number(env?.[key]);
+  const valid = Number.isFinite(n) && n > 0 && (!integer || Number.isSafeInteger(n));
+  const value = valid ? n : fallback;
+  settingLog(key, value, valid ? 'environment' : 'standard');
+  return value;
+}
+function atomicSidecar(file, record) {
+  mkdirSync(join(file, '..'), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  // Look up native operations at publication time so the hermetic fs guard and fault probes stay live.
+  try { fs.writeFileSync(tmp, `${JSON.stringify(record)}\n`, 'utf8'); fs.renameSync(tmp, file); }
+  finally { rmSync(tmp, { force: true }); }
+}
+function sidecar(root, name, lockRoot) { return join(cloneLockDirs(root, lockRoot).base, name); }
+// Election and rebuild execution share this mutex. A live local process cannot lose the
+// fence during an event-loop pause: reclaim requires observed process death, not wall time.
+// Unknown liveness fails closed; an operator must repair an unreadable coordination lock.
+const ELECTION_KEY = '<clone:ownership>';
+const OWNER_FUTURE_SKEW_MS = 30_000;
+function ownershipGuard(root, lockRoot) {
+  const guardRoot = sidecar(root, 'coordination', lockRoot);
+  const owner = `${defaultOwner()}-${randomUUID()}`;
+  const nowMs = Date.now();
+  const held = reserve(guardRoot, ELECTION_KEY, owner, nowMs, new Date(nowMs).toISOString(),
+    process.pid, defaultProbePidLiveness, Infinity);
+  return held.ok ? () => releaseLockDir(guardRoot, ELECTION_KEY) : null;
+}
+export function touchOwnerHeartbeat(root, { lockRoot, nowMs = Date.now(), key } = {}) {
+  const file = key ? join(sidecar(root, 'owner-candidates', lockRoot),
+    `${createHash('sha256').update(key).digest('hex')}.json`) : sidecar(root, 'owner-heartbeat.json', lockRoot);
+  atomicSidecar(file, { at: nowMs, ...(key ? { key } : {}) });
+}
+function readOwnershipLease(root, lockRoot) {
+  try {
+    const lease = JSON.parse(readFileSync(sidecar(root, 'owner-lease.json', lockRoot), 'utf8'));
+    if (!Number.isSafeInteger(lease.epoch) || lease.epoch < 1 || typeof lease.key !== 'string'
+      || typeof lease.session !== 'string') throw new Error('invalid owner lease');
+    return lease;
+  } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+export function resolveCloneOwnership({ root, entries = [], env = process.env, nowMs = Date.now(), lockRoot } = {}) {
+  const override = typeof env?.WE_DAEMON_CLONE_OWNER_ENTRY === 'string' ? env.WE_DAEMON_CLONE_OWNER_ENTRY.trim() : '';
+  const entry = override || OWNER_ENTRIES[basename(canonicalCloneRoot(root))];
+  settingLog('WE_DAEMON_CLONE_OWNER_ENTRY', entry ?? 'unconfigured', override ? 'environment' : 'standard');
+  if (!entry) return { owner: true, reason: 'owner-unconfigured' };
+  const key = (Array.isArray(entries) ? entries : []).filter(Boolean).map((e) => basename(String(e))).sort()[0];
+  if (!key) return { owner: false, reason: 'owner-key-missing' };
+  const configured = basename(entry);
+  const staleMs = positiveSetting('WE_DAEMON_CLONE_OWNER_STALE_MS', 15 * 60_000, env);
+  const live = (rec) => Number.isFinite(rec?.at) && nowMs - rec.at >= -OWNER_FUTURE_SKEW_MS && nowMs - rec.at < staleMs;
+  let release;
+  try {
+    // Every sibling advertises itself, including while another process holds the fence.
+    touchOwnerHeartbeat(root, { lockRoot, nowMs, key });
+    if (key === configured) touchOwnerHeartbeat(root, { lockRoot, nowMs });
+    release = ownershipGuard(root, lockRoot);
+    if (!release) {
+      // Multiple wrappers in this process may await the same deferred mutation.
+      // Reuse only our own existing token; execution still checks the fence.
+      const current = readOwnershipLease(root, lockRoot);
+      if (current?.key === key && current.session === defaultOwner()) {
+        return { ...current, owner: true, reason: key === configured ? 'owner-entry' : 'owner-stale-elected' };
+      }
+      return { owner: false, reason: 'owner-election-contended' };
+    }
+    const candidates = new Set();
+    const dir = sidecar(root, 'owner-candidates', lockRoot);
+    for (const file of readdirSync(dir)) {
+      let rec;
+      try { rec = JSON.parse(readFileSync(join(dir, file), 'utf8')); } catch { continue; }
+      if (typeof rec?.key === 'string' && live(rec)) candidates.add(rec.key);
+    }
+    try {
+      if (live(JSON.parse(readFileSync(sidecar(root, 'owner-heartbeat.json', lockRoot), 'utf8')))) candidates.add(configured);
+    } catch { /* Missing legacy heartbeat leaves the live-key election in charge. */ }
+    const winner = candidates.has(configured) ? configured : [...candidates].sort()[0];
+    if (winner !== key) return { owner: false, reason: winner === configured ? 'owner-active' : 'owner-election-lost' };
+    const previous = readOwnershipLease(root, lockRoot);
+    const session = defaultOwner();
+    const epoch = previous?.key === key && previous.session === session ? previous.epoch : (previous?.epoch ?? 0) + 1;
+    if (!Number.isSafeInteger(epoch)) throw new Error('owner epoch exhausted');
+    atomicSidecar(sidecar(root, 'owner-lease.json', lockRoot), { key, epoch, session });
+    return { owner: true, reason: key === configured ? 'owner-entry' : 'owner-stale-elected', key, epoch, session };
+  } catch {
+    console.error('daemon-clone-lock: ownership evidence unavailable; rebuild deferred until coordination state is repaired');
+    return { owner: false, reason: 'owner-election-unavailable' };
+  } finally { release?.(); }
+}
+/** Validate the fencing token under the election mutex and retain it throughout the rebuild.
+ * Reader locks remain independent; the rebuild still takes its existing phased write locks. */
+const ownershipExecutions = new Map();
+export async function withCloneOwnership(root, lease, fn, { lockRoot } = {}) {
+  if (lease?.reason === 'owner-unconfigured') return fn();
+  // Wrappers in one process may share a daemon key. Serialize their executions,
+  // then validate each token after the wait, just as for a cross-process contender.
+  const key = cloneLockDirs(root, lockRoot).base;
+  const previous = ownershipExecutions.get(key);
+  let complete;
+  const pending = new Promise((resolve) => { complete = resolve; });
+  ownershipExecutions.set(key, pending);
+  await previous;
+  let release;
+  try {
+    let current;
+    try {
+      release = ownershipGuard(root, lockRoot);
+      if (!release) return { owner: false, moved: false, reason: 'owner-election-contended' };
+      current = readOwnershipLease(root, lockRoot);
+    } catch { return { owner: false, moved: false, reason: 'owner-election-unavailable' }; }
+    if (!lease?.owner || !current || current.epoch !== lease.epoch || current.key !== lease.key || current.session !== lease.session) {
+      return { owner: false, moved: false, reason: 'clone-owner-fenced' };
+    }
+    return await fn();
+  } finally {
+    release?.();
+    if (ownershipExecutions.get(key) === pending) ownershipExecutions.delete(key);
+    complete();
+  }
+}
+export function writeRebuildRequest(root, { by = null, reason, ref, nowMs = Date.now(), lockRoot } = {}) {
+  const rec = { by, reason, ref, at: nowMs, id: randomUUID() };
+  atomicSidecar(sidecar(root, 'rebuild-request.json', lockRoot), rec);
+  return rec;
+}
+export function readRebuildRequest(root, { nowMs = Date.now(), ttlMs, lockRoot, env = process.env, onStale, onAbandoned, onCorrupt, onUnreadable } = {}) {
+  const ttl = ttlMs ?? positiveSetting('WE_DAEMON_REBUILD_REQUEST_TTL_MS', 30 * 60_000, env);
+  const file = sidecar(root, 'rebuild-request.json', lockRoot);
+  let stamp;
+  try { stamp = fs.statSync(file).mtimeMs; }
+  catch (error) { if (error.code === 'ENOENT') return null; }
+  let rec;
+  try { rec = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return null; }
+  const valid = rec && typeof rec.at === 'number' && Number.isFinite(rec.at) && Number.isFinite(ttl) && ttl > 0
+    && typeof rec.reason === 'string' && typeof rec.ref === 'string' && (rec.by === null || typeof rec.by === 'string')
+    && typeof rec.id === 'string' && !!rec.id;
+  if (!valid) rec = { corrupt: true, id: `corrupt:${Number.isFinite(stamp) ? stamp : 'unknown'}` };
+  // An unknown generation cannot be safely suppressed by a previous acknowledgement.
+  if (valid || Number.isFinite(stamp)) {
+    try {
+      const ack = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request-ack.json', lockRoot), 'utf8'));
+      if (ack?.id === rec.id) return null;
+    } catch { /* unknown acknowledgement evidence leaves work visible */ }
+  }
+  const ledger = readRequestFailures(root, lockRoot);
+  if (!ledger) onUnreadable?.(rec);
+  const failures = ledger?.id === rec.id ? ledger.failures : 0;
+  if ((valid || Number.isFinite(stamp)) && ledger && failures >= requestMaxFailures(env)) { onAbandoned?.(rec); return null; }
+  if (rec.corrupt) onCorrupt?.(rec);
+  else if (nowMs - rec.at >= ttl) onStale?.(rec);
+  return rec;
+}
+/** Acknowledge a specific immutable request ID, never unlink the publication path. With no ID, capture
+ * the current ID first (legacy clear API). Publication may race any subsequent operation safely because a
+ * fresh publication always has a fresh ID. Out-of-order acknowledgements can replay work, never lose it.
+ * Keep just one acknowledgement sidecar, so storage stays bounded across repeated publications. */
+export function clearRebuildRequest(root, { lockRoot, id } = {}) {
+  if (id === undefined) {
+    id = readRebuildRequest(root, { lockRoot })?.id;
+  }
+  if (typeof id !== 'string' || !id || !readRequestFailures(root, lockRoot)) return;
+  atomicSidecar(sidecar(root, 'rebuild-request-ack.json', lockRoot), { id });
+}
+// A bounded single-record ledger follows the current publication ID, rather than a daemon/PID.
+function requestMaxFailures(env) { return positiveSetting('WE_DAEMON_REBUILD_REQUEST_MAX_FAILURES', 5, env, true); }
+function readRequestFailures(root, lockRoot) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request-failures.json', lockRoot), 'utf8'));
+    return rec && typeof rec.id === 'string' && rec.id && Number.isSafeInteger(rec.failures) && rec.failures >= 0 ? rec : null;
+  } catch (error) { return error.code === 'ENOENT' ? { id: null, failures: 0 } : null; }
+}
+/** Record one observed attempt. Serializing the ledger prevents lost increments across owner restarts.
+ * Publication stays independent: both ledger and acknowledgement select IDs, so an older completion
+ * cannot charge a newer request or remove its wakeup. Unknown persistence leaves the request pending. */
+export function recordRebuildRequestResult(root, {
+  id, success, lockRoot, env = process.env, nowMs = Date.now(), onAbandoned, onUnreadable,
+} = {}) {
+  if (success !== true && success !== false) return { pending: true };
+  if (typeof id !== 'string' || !id || id === 'corrupt:unknown') return { pending: true };
+  const guardRoot = sidecar(root, 'coordination', lockRoot);
+  const key = '<clone:rebuild-request-update>';
+  const owner = `${defaultOwner()}-${randomUUID()}`;
+  const wallNow = Date.now();
+  let held;
+  try { held = reserve(guardRoot, key, owner, wallNow, new Date(wallNow).toISOString(), process.pid, defaultProbePidLiveness, 1); }
+  catch { return { pending: true }; }
+  if (!held.ok) return { pending: true };
+  try {
+    const ledger = readRequestFailures(root, lockRoot);
+    if (!ledger) { onUnreadable?.({ id }); return { pending: true }; }
+    const request = readRebuildRequest(root, { lockRoot, env, nowMs });
+    if (request?.id !== id) return { pending: !!request }; // replaced or already concluded
+    if (success) {
+      clearRebuildRequest(root, { lockRoot, id });
+      return { cleared: true };
+    }
+    const failures = (ledger.id === id ? ledger.failures : 0) + 1;
+    atomicSidecar(sidecar(root, 'rebuild-request-failures.json', lockRoot), { id, failures });
+    if (failures >= requestMaxFailures(env)) {
+      clearRebuildRequest(root, { lockRoot, id });
+      onAbandoned?.(request);
+      return { cleared: true, failures };
+    }
+    return { pending: true, failures };
+  } catch { return { pending: true }; }
+  finally { releaseLockDir(guardRoot, key); }
 }
 
 // ── reader fairness (live 2026-10-05 20:18-20:37 ET) ─────────────────────────────────────────────────────────
@@ -157,7 +379,7 @@ function clearReaderStarved(starvedRoot, readerKey) {
 /** The live starved reader (if any, other than `owner`) that writers must yield to. A claim lapses with the same
  *  lease as a lock entry (`lastRefusedAt` older than `leaseMinutes`) or when its same-host pid is dead — those
  *  are removed on sight, so a crashed reader can never hold writers off. */
-function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after }) {
+function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after, startedBeforeMs = null }) {
   if (!(after > 0)) return null;
   for (const rec of readStarvedRecords(starvedRoot)) {
     const asEntry = { owner: rec.owner, pid: rec.pid, heartbeatAt: rec.lastRefusedAt };
@@ -166,6 +388,10 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
       continue;
     }
     if (rec.owner === owner) continue;
+    // Bounded: the override lives only inside one writer wait (capped by waitMs); the starved reader's claim is
+    // kept, so the writer's NEXT attempt (and its start check) yields to it again. A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
+    // Fail closed: a record with a missing/invalid timestamp is treated as older, so the writer still yields.
+    if (startedBeforeMs !== null && Number.isFinite(isoMs(rec.firstRefusedAt)) && !(isoMs(rec.firstRefusedAt) < startedBeforeMs)) continue;
     if (rec.count >= after) return rec;
   }
   return null;
@@ -176,22 +402,42 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
 // each tick holds its read slot for minutes; the review daemon only tries to move the clone once per ITS tick
 // start, waits up to 900s for that read slot, gives up, ticks itself, and tries again — finding the sibling
 // mid-tick every time. Between attempts no writer key exists, so the sibling's next tick always got straight in:
-// the clone did not move for 5.5 h. Now a writer that gave up `tick-in-progress` WRITER_PRIORITY_AFTER times in a
+// the clone did not move for 5.5 h. A writer refused `tick-in-progress` or `reader-priority` WRITER_PRIORITY_AFTER times in a
 // row leaves a writer-priority claim; while it is live, NEW reads by anyone else are refused `writer-priority`
 // (ticks already in flight are never touched, so #4044 never-read-mid-move holds trivially), so the in-flight ticks
 // drain and the next writer gets the clone. Any writer that gets the clone clears the claim (the clone is moving).
-// No mutual back-off: the OLDER claim wins — a writer only yields to a starved reader whose starvation began
-// before the writer's claim, and a reader only ignores a writer claim younger than its own starvation. Refusals
-// by a writer claim never count toward reader starvation, so they can never re-trigger reader priority.
+// Once effective, the writer claim overrides reader starvation, including older claims, for at most
+// writerPriorityMaxSkips + 1 attempts. Then yielding to a starved reader resets the writer's count, so neither
+// side yields forever. Readers also bypass the claim after writerPriorityMaxSkips refusals, and the claim
+// expires on its TTL. Refusals by a writer claim never count toward reader starvation.
 
-/** Setting: consecutive `tick-in-progress` give-ups after which a writer's claim blocks NEW reads. Default 1;
+/** Setting: consecutive `tick-in-progress` or `reader-priority` refusals after which a writer's claim blocks NEW reads. Default 3;
  *  `0` turns writer priority off (the pre-fix behaviour). */
 export const WRITER_PRIORITY_AFTER_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER';
-export const DEFAULT_WRITER_PRIORITY_AFTER = 1;
+export const DEFAULT_WRITER_PRIORITY_AFTER = 3;
 /** Setting: how long a writer claim stays live without being refreshed by another attempt (its owner's next tick
  *  start re-tries; a claim never outlives a dead owner pid). Default 30 min — longer than one sibling tick. */
 export const WRITER_CLAIM_TTL_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_CLAIM_TTL_MS';
 export const DEFAULT_WRITER_CLAIM_TTL_MS = 30 * 60_000;
+
+/** Setting: how long (ms) a writer must have waited for readers to drain before it stops backing off to readers
+ *  that began starving AFTER its wait began (the reader stream its own reservation refuses). Already-held
+ *  reader locks are never broken; the writer intent is its ordinary lease/pid-liveness reservation, so a crashed
+ *  writer's intent lapses on its own. Default `0` = OFF (today's reader-priority behaviour, exactly); a daemon
+ *  opts in with a positive value (enabling needs an operator ruling). */
+export const WRITER_WAIT_PRIORITY_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS';
+export const DEFAULT_WRITER_WAIT_PRIORITY_MS = 0;
+/** The override is a bounded window, not forever: this long after the threshold the writer yields to starved
+ *  readers again (so a stream of starved readers is queued behind a writer for at most this long). */
+export const WRITER_WAIT_PRIORITY_WINDOW_MS = 5 * 60_000;
+
+/** PURE: the writer wait-priority threshold from env (a non-negative number of ms, else the default 0 = off). */
+export function resolveWriterWaitPriorityMs(env = process.env) {
+  const raw = env?.[WRITER_WAIT_PRIORITY_ENV];
+  if (raw === undefined || String(raw).trim() === '') return DEFAULT_WRITER_WAIT_PRIORITY_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_WRITER_WAIT_PRIORITY_MS;
+}
 
 /** PURE: the writer-priority threshold from env (a non-negative integer, else the default; 0 = off). */
 export function resolveWriterPriorityAfter(env = process.env) {
@@ -200,8 +446,8 @@ export function resolveWriterPriorityAfter(env = process.env) {
   return Number.isInteger(n) && n >= 0 ? n : DEFAULT_WRITER_PRIORITY_AFTER;
 }
 
-/** Setting: the most CONSECUTIVE ticks one reader may lose to a writer claim (`writer-priority`) before it ignores
- *  the claim and takes a normal read slot (live 2026-10-07: the review daemon skipped whole ticks, back-to-back,
+/** Setting: the most CONSECUTIVE refusals (`writer-priority` or `writer-active`) before a reader ignores
+ *  writer claims and attempts a normal read slot (live 2026-10-07: the review daemon skipped whole ticks, back-to-back,
  *  while the fix daemon's claim stood). The ordinary `writer-active` refusal is untouched, so a reader still never
  *  starts inside a move (#4044). Default 2; `0` = never skip for writer priority at all. */
 export const WRITER_PRIORITY_MAX_SKIPS_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS';
@@ -223,7 +469,7 @@ function readWriterSkips(starvedRoot) {
   } catch { return {}; }
 }
 
-/** Best-effort: set one reader's consecutive writer-priority skip count (0 removes it). Returns the new count. */
+/** Best-effort: set one reader's consecutive writer refusal count (0 removes it). Returns the new count. */
 function setWriterSkips(starvedRoot, readerKey, count) {
   const m = readWriterSkips(starvedRoot);
   if (count > 0) m[readerKey] = count; else if (!(readerKey in m)) return 0; else delete m[readerKey];
@@ -255,15 +501,16 @@ function readWriterClaim(starvedRoot) {
   } catch { return null; }
 }
 
-/** Record one more consecutive `tick-in-progress` give-up by `owner`. A claim by a DIFFERENT live owner is kept
+/** Record one more consecutive `tick-in-progress` or `reader-priority` refusal by `owner`. A claim by a DIFFERENT live owner is kept
  *  (first come keeps its age); our own is bumped. Best-effort. */
 function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe }) {
   const prev = readWriterClaim(starvedRoot);
   if (prev && prev.owner !== owner && writerClaimIsLive(prev, nowMs, ttlMs, probe)) return prev;
-  const same = prev && prev.owner === owner;
+  const same = prev && prev.owner === owner && writerClaimIsLive(prev, nowMs, ttlMs, probe);
   const nowIso = new Date(nowMs).toISOString();
   const rec = {
-    owner, pid, count: (same ? prev.count : 0) + 1, heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
+    owner, pid, count: Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, same ? prev.count : 0) + 1),
+    heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
   };
   try {
     const file = writerClaimFile(starvedRoot);
@@ -330,32 +577,29 @@ export function defaultProbePidLiveness(entry) {
  *  provably `dead` — the two-tier floor the file header describes. `null`/missing entries are never live. */
 function entryIsLive(entry, nowMs, leaseMinutes, probe) {
   if (!entry) return false;
+  if (entry.unreadable) return true; // no trustworthy identity or lease evidence to reclaim
   if (isLeaseExpired(entry, nowMs, leaseMinutes)) return false;
   if (probe(entry) === 'dead') return false;
   return true;
 }
 
-/** List every reader entry currently on disk under `readersRoot`. NOT a new lock primitive — `readLockEntry`
- *  only knows how to read ONE already-known path's entry, and readers need to be enumerated (their key is the
- *  owner string, unknown to us up front), so this walks the directory and reuses {@link parseLockEntry} to
- *  interpret each `lock.json` it finds. A missing/unreadable/corrupt entry is skipped, never thrown. */
+/** Unknown reader evidence is a blocker, including the mkdir/write gap. Only a provably absent
+ * readers root or disappeared reader directory means no reader; valid leases retain normal reclamation. */
 function listReaderEntries(readersRoot) {
   let names;
-  try {
-    names = readdirSync(readersRoot);
-  } catch {
-    return [];
+  try { names = fs.readdirSync(readersRoot); }
+  catch (error) {
+    return error.code === 'ENOENT' ? [] : [{ owner: '<unreadable-readers>', unreadable: true, error: error.code ?? 'read-failed' }];
   }
   const out = [];
   for (const name of names) {
-    let text;
-    try {
-      text = readFileSync(join(readersRoot, name, 'lock.json'), 'utf8');
-    } catch {
-      continue;
-    }
-    const entry = parseLockEntry(text);
-    if (entry) out.push(entry);
+    const dir = join(readersRoot, name);
+    let entry;
+    try { entry = parseLockEntry(fs.readFileSync(join(dir, 'lock.json'), 'utf8')); } catch { /* inspect existence below */ }
+    if (entry && Number.isFinite(Date.parse(entry.heartbeatAt))) { out.push(entry); continue; }
+    try { fs.statSync(dir); }
+    catch (error) { if (error.code === 'ENOENT') continue; }
+    out.push({ owner: `<unreadable-reader:${name}>`, unreadable: true });
   }
   return out;
 }
@@ -393,15 +637,17 @@ export function acquireRead(root, opts = {}) {
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
   const nowIso = new Date(nowMs).toISOString();
 
-  // Writer fairness: a starved writer's claim refuses NEW reads (never counted as reader starvation) — unless
-  // this reader's own starvation is OLDER than the claim (older claim wins, so the two never both back off).
+  // Writer fairness: an effective claim refuses NEW reads regardless of reader claim age. The skip cap
+  // bypasses writer CLAIMS only, bounding claim-induced skips; a live writer can still delay admission
+  // (#4044). Already-held read slots are never removed by this check.
+  // A reader whose attempts only land during writer-active can still be delayed repeatedly;
+  // starvation freedom is bounded by these overrides, not strictly proven.
   const claim = findPriorityWriter(starvedRoot, {
     owner, nowMs, ttlMs: writerClaimTtlMs, probe, after: writerPriorityAfter,
   });
   if (claim) {
-    const mine = readStarvedRecords(starvedRoot).find((r) => r.readerKey === readerKey);
     const skips = readWriterSkips(starvedRoot)[readerKey] ?? 0;
-    if (!(mine && isoMs(mine.firstRefusedAt) < isoMs(claim.since)) && skips < writerPriorityMaxSkips) {
+    if (skips < writerPriorityMaxSkips) {
       if (trackStarvation) setWriterSkips(starvedRoot, readerKey, skips + 1);
       return { ok: false, reason: 'writer-priority', heldBy: claim.owner, writerStarved: claim.count, claimSince: claim.since };
     }
@@ -416,6 +662,7 @@ export function acquireRead(root, opts = {}) {
   };
   const refuse = (r) => {
     if (!trackStarvation) return r;
+    setWriterSkips(starvedRoot, readerKey, (readWriterSkips(starvedRoot)[readerKey] ?? 0) + 1);
     return { ...r, starved: noteReaderRefused(starvedRoot, { readerKey, owner, pid, nowMs, heldBy: r.heldBy }) };
   };
 
@@ -455,20 +702,24 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *       a dead/expired one is reclaimed by {@link reserve} itself, same as any other stale key.
  *   (2) poll `readers/` until no LIVE entry other than `owner` remains, or `waitMs` elapses. Any dead/expired
  *       reader entry seen along the way is removed on sight (reclaim) rather than left to rot.
+ *       explicitly supplied `ignoreOwners` (default: []) never block;
+ *       their entries are retained unless the liveness probe proves them dead.
  *       Timeout ⇒ release the writer key we took and report `tick-in-progress` (a live tick is still running).
  * @param {string} root
- * @param {{owner?:string, lockRoot?:string, waitMs?:number, pollMs?:number, sleep?:(ms:number)=>Promise<void>,
+ * @param {{owner?:string, ignoreOwners?:string[], lockRoot?:string, waitMs?:number, pollMs?:number, sleep?:(ms:number)=>Promise<void>,
  *   now?:()=>number, pid?:number, leaseMinutes?:number, probe?:(entry:object|null)=>('dead'|'alive'|'unknown')}} [opts]
  * Reader fairness: before reserving, and on every drain poll, a live starved reader (refused
  * `readerPriorityAfter` times in a row) makes this writer back off — `reader-priority`, writer key released. Only
  * ever during the drain wait, before anything moved; a writer that returned ok is never interrupted.
- * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress'|'reader-priority', heldBy:string|null, starved?:number}>}
+ * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress'|'reader-priority'|'lock-lost', heldBy:string|null, starved?:number}>}
  */
 export async function acquireWrite(root, opts = {}) {
   const {
     owner = defaultOwner(opts.pid),
+    // Callers must explicitly opt in to excluding readers; inherited env never grants a bypass.
+    ignoreOwners = [],
     lockRoot = defaultLockRoot(),
-    waitMs = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
+    waitMs: waitMsOpt = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
     pollMs = 1000,
     sleep = defaultSleep,
     now = () => Date.now(),
@@ -479,36 +730,69 @@ export async function acquireWrite(root, opts = {}) {
     readerPriorityAfter = resolveReaderPriorityAfter(),
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
+    writerPriorityMaxSkips = resolveWriterPriorityMaxSkips(),
+    writerWaitPriorityMs: writerWaitPriorityMsOpt = resolveWriterWaitPriorityMs(),
+    writerWaitPriorityWindowMs: writerWaitPriorityWindowMsOpt = WRITER_WAIT_PRIORITY_WINDOW_MS,
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
+  // Fail closed on an unbounded/invalid wait: the wait-priority override must always end.
+  const waitMs = Number.isFinite(Number(waitMsOpt)) && Number(waitMsOpt) >= 0 ? Number(waitMsOpt) : 600_000;
 
+  // The override window can only shrink below the built-in cap; a non-finite or negative value uses the cap.
+  // Normalize a direct option too (a string must not concatenate); invalid or negative means off.
+  const writerWaitPriorityMs = Number.isFinite(Number(writerWaitPriorityMsOpt)) && Number(writerWaitPriorityMsOpt) > 0
+    ? Number(writerWaitPriorityMsOpt) : 0;
+  const windowMs = Number.isFinite(Number(writerWaitPriorityWindowMsOpt)) && Number(writerWaitPriorityWindowMsOpt) >= 0
+    ? Math.min(Number(writerWaitPriorityWindowMsOpt), WRITER_WAIT_PRIORITY_WINDOW_MS) : WRITER_WAIT_PRIORITY_WINDOW_MS;
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
-  // Writer fairness: our own live, effective claim (we already starved). Older claim wins — we only yield to a
-  // starved reader whose starvation began BEFORE our claim (see "writer fairness" above).
+  // Use the same live-claim lookup as readers, including expiry of partial counts.
   const ownClaim = () => {
-    if (!(writerPriorityAfter > 0)) return null;
-    const c = readWriterClaim(starvedRoot);
-    return c && c.owner === owner && c.count >= writerPriorityAfter
-      && writerClaimIsLive(c, now(), writerClaimTtlMs, probe) ? c : null;
+    const c = findPriorityWriter(starvedRoot, {
+      owner: null, nowMs: now(), ttlMs: writerClaimTtlMs, probe, after: writerPriorityAfter,
+    });
+    return c?.owner === owner ? c : null;
+  };
+  const claimWindowEnd = writerPriorityAfter + Math.max(1, writerPriorityMaxSkips + 1);
+  const noteRefusal = (nowMs, heldBy, yieldingToReader = false) => {
+    if (yieldingToReader && ownClaim()?.count >= claimWindowEnd) {
+      clearWriterClaim(starvedRoot);
+      return null;
+    }
+    return writerPriorityAfter > 0
+      ? noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs: writerClaimTtlMs, probe }) : null;
   };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
   const priorityFor = (nowMsN) => {
+    const claim = ownClaim();
+    if (claim && claim.count < claimWindowEnd) return null;
+    const waited = nowMsN - startMs;
+    const waitedPast = !claim && writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
+      && waited < writerWaitPriorityMs + windowMs;
     const r = findPriorityReader(starvedRoot, {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
+      startedBeforeMs: waitedPast ? startMs : null,
     });
-    if (!r) return null;
-    const mine = ownClaim();
-    return mine && isoMs(mine.since) <= isoMs(r.firstRefusedAt) ? null : r;
+    return r;
   };
   const yieldTo = priorityFor(startMs);
-  if (yieldTo) return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
-  const currentWriter = readLockEntry(writerRoot, WRITER_KEY);
-  const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe(currentWriter), leaseMinutes);
+  if (yieldTo) {
+    noteRefusal(startMs, yieldTo.owner, true);
+    return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
+  }
+  const writerToken = randomUUID();
+  const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe, leaseMinutes, { writerToken });
   if (!writerReserve.ok) {
     return { ok: false, reason: 'concurrent-mover', heldBy: writerReserve.heldBy };
   }
 
+  // The reservation is immutable; a resumed drain must never rewrite a successor's entry.
+  const entryFile = join(writerRoot, lockIdFor(WRITER_KEY), 'lock.json');
+  const readRecord = () => { try { return readFileSync(entryFile, 'utf8'); } catch { return null; } };
+  const record = readRecord();
+  const stillOurs = () => record !== null && readRecord() === record
+    && readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken === writerToken;
+  const lockLost = () => ({ ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null });
   const deadline = startMs + waitMs;
   let lastHeartbeatMs = startMs;
   let lastBlockers = [];
@@ -516,14 +800,21 @@ export async function acquireWrite(root, opts = {}) {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const nowMsN = now();
+    if (!stillOurs()) return lockLost();
     // live 2026-10-11 rebuild-job livelock: keep the reservation live through a long drain.
     if (nowMsN - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-      heartbeat(writerRoot, WRITER_KEY, owner, new Date(nowMsN).toISOString(), pid);
+      if (!heartbeatOwn(writerRoot, WRITER_KEY, owner, new Date(nowMsN).toISOString()) || !stillOurs()) return lockLost();
       lastHeartbeatMs = nowMsN;
     }
     const blockers = [];
     for (const entry of listReaderEntries(readersRoot)) {
+      if (entry.unreadable) { blockers.push(entry.owner); continue; }
       if (entry.owner === owner) continue;
+      if (ignoreOwners.includes(entry.owner)) {
+        // An ignored reader still owns its entry, even after lease expiry; only proven death reclaims it.
+        if (probe(entry) === 'dead') releaseLockDir(readersRoot, entry.owner);
+        continue;
+      }
       if (entryIsLive(entry, nowMsN, leaseMinutes, probe)) {
         blockers.push(entry.owner);
       } else {
@@ -533,8 +824,10 @@ export async function acquireWrite(root, opts = {}) {
     lastBlockers = blockers;
     // Still draining — nothing moved yet — so backing off to a starved reader is always safe.
     const starvedReader = priorityFor(nowMsN);
+    if (!stillOurs()) return lockLost();
     if (starvedReader) {
       releaseLockDir(writerRoot, WRITER_KEY);
+      noteRefusal(nowMsN, starvedReader.owner, true);
       return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
     }
     if (blockers.length === 0) {
@@ -549,11 +842,7 @@ export async function acquireWrite(root, opts = {}) {
     if (nowMsN >= deadline) {
       releaseLockDir(writerRoot, WRITER_KEY);
       // Writer fairness: leave (or bump) a claim so NEW reads yield until a writer gets the clone.
-      const claim = writerPriorityAfter > 0
-        ? noteWriterGaveUp(starvedRoot, {
-          owner, pid, nowMs: nowMsN, heldBy: lastBlockers[0] || null, ttlMs: writerClaimTtlMs, probe,
-        })
-        : null;
+      const claim = noteRefusal(nowMsN, lastBlockers[0] || null);
       return {
         ok: false, reason: 'tick-in-progress', heldBy: lastBlockers[0] || null,
         ...(claim && claim.owner === owner ? { writerStarved: claim.count } : {}),
@@ -610,9 +899,10 @@ export async function withReadLock(root, fn, opts = {}) {
 /**
  * Run `fn` while holding the WRITE lock on `root` (see {@link acquireWrite} for the wait/timeout semantics).
  * Same heartbeat-while-held / always-release-in-finally shape as {@link withReadLock}.
+ * The callback receives `stillHeld()` to fence publication after asynchronous work.
  * @template T
  * @param {string} root
- * @param {() => (T|Promise<T>)} fn
+ * @param {(stillHeld: () => boolean) => (T|Promise<T>)} fn
  * @param {object} [opts]  same shape as {@link acquireWrite}
  * @returns {Promise<{ok:true, value:T}|{ok:false, reason:string, heldBy:string|null}>}
  */
@@ -624,16 +914,41 @@ export async function withWriteLock(root, fn, opts = {}) {
   if (!acquired.ok) return acquired;
 
   const { writerRoot } = cloneLockDirs(root, lockRoot);
+  // heartbeatOwn leaves this entry immutable: compare the whole acquisition record, including
+  // any fencing token, rather than accepting a replacement with the same owner string.
+  const entryFile = join(writerRoot, lockIdFor(WRITER_KEY), 'lock.json');
+  const readRecord = () => { try { return readFileSync(entryFile, 'utf8'); } catch { return null; } };
+  const record = readRecord();
+  const writerToken = readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken;
+  const stillOurs = () => record !== null && writerToken != null && readRecord() === record
+    && readLockEntry(writerRoot, WRITER_KEY)?.owner === owner
+    && readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken === writerToken;
+  let lost = false;
+  const loseLock = () => {
+    if (lost) return;
+    lost = true;
+    clearInterval(timer);
+    (opts.log || console.error)('daemon-clone-lock: write lock lost; result withheld');
+  };
   const timer = setInterval(() => {
-    try { heartbeat(writerRoot, WRITER_KEY, owner, new Date().toISOString(), pid); } catch { /* best-effort */ }
+    try {
+      if (!stillOurs() || !heartbeatOwn(writerRoot, WRITER_KEY, owner, new Date().toISOString()) || !stillOurs()) loseLock();
+    } catch { loseLock(); }
   }, HEARTBEAT_INTERVAL_MS);
   if (typeof timer.unref === 'function') timer.unref();
   try {
-    const value = await fn();
+    if (!stillOurs()) loseLock();
+    if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
+    const value = await fn(() => {
+      if (!stillOurs()) loseLock();
+      return !lost;
+    });
+    if (!stillOurs()) loseLock();
+    if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
     return { ok: true, value };
   } finally {
     clearInterval(timer);
-    releaseWrite(root, { owner, lockRoot });
+    if (!lost && stillOurs()) releaseWrite(root, { owner, lockRoot });
   }
 }
 

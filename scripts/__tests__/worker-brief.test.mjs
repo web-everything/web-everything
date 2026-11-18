@@ -1,8 +1,65 @@
 /** @file Tests for the generated standard worker rules and injectable CLI. */
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
-import { main, renderWorkerBrief } from '../worker-brief.mjs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { main, renderWorkerBrief, renderScopeFlags, readForgeAllowlist } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
+import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
+import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
+import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
+
+/**
+ * Only a bundle with no `.claude/agents` directory (a Forge exec bundle, which sets a generic CI=true
+ * yet ships without it) may omit the runner definition — and never on GitHub Actions, where the
+ * checkout always has it. A present-but-renamed runner still throws.
+ */
+function readRunnerDefinition({ root = process.cwd(), env = process.env } = {}) {
+  const file = path.resolve(root, '.claude/agents/codex-runner.md');
+  try { return fs.readFileSync(file, 'utf8'); }
+  catch (error) {
+    if (error.code !== 'ENOENT' || env.GITHUB_ACTIONS || fs.existsSync(path.join(root, '.claude/agents'))) throw error;
+    return null;
+  }
+}
+
+const runnerDefinition = readRunnerDefinition();
+
+describe('runner-definition availability', () => {
+  const withTree = (check) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-runner-'));
+    try { check(root); }
+    finally { fs.rmSync(root, { recursive: true, force: true }); }
+  };
+
+  it('allows a Forge bundle with no .claude/agents (generic CI=true, .claude present)', () => withTree(root => {
+    expect(readRunnerDefinition({ root, env: {} })).toBeNull();
+    fs.mkdirSync(path.join(root, '.claude'));
+    expect(readRunnerDefinition({ root, env: { CI: 'true' } })).toBeNull();
+  }));
+
+  it('rejects a missing runner in CI even without a .claude tree', () => withTree(root => {
+    expect(() => readRunnerDefinition({ root, env: { GITHUB_ACTIONS: 'true' } })).toThrow(/codex-runner/);
+  }));
+
+  it('rejects a missing or renamed runner when .claude exists outside CI', () => withTree(root => {
+    fs.mkdirSync(path.join(root, '.claude/agents'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.claude/agents/renamed-runner.md'), 'runner');
+    expect(() => readRunnerDefinition({ root, env: {} })).toThrow(/codex-runner/);
+  }));
+
+  it('reads a present runner and propagates non-missing read errors', () => withTree(root => {
+    const file = path.join(root, '.claude/agents/codex-runner.md');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'runner instructions');
+    expect(readRunnerDefinition({ root, env: { GITHUB_ACTIONS: 'true' } })).toBe('runner instructions');
+    fs.rmSync(file);
+    fs.mkdirSync(file);
+    expect(() => readRunnerDefinition({ root, env: {} })).toThrow();
+  }));
+});
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
@@ -10,6 +67,118 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  // Every operation added to the brief needs a rendered command assertion here.
+  it('requires the declared await-checks operation for CI waits and refuses raw watch', () => {
+    const brief = renderWorkerBrief(params);
+    expect(brief).toContain('node scripts/operations/run.mjs await-checks --pr=<N> --repo=<owner/name> --check=test --timeoutMin=60');
+    expect(brief).toContain('Never use raw `gh pr checks --watch` (refused)');
+    expect(brief).toContain('harness-tracked background call');
+  });
+
+  it('words the red and green runs only as the Forge-allowed npm run test:unit form', () => {
+    const brief = renderWorkerBrief(params);
+    expect(brief).not.toContain('npx vitest');
+    expect(brief).toContain('run those tests through `npm run test:unit -- <test-file>`');
+    expect(brief).toContain('Run tests with `npm run test:unit -- <test files>`');
+  });
+
+  it('tells dispatchers every Agent brief needs a Slot line with all four forms', () => {
+    expect(renderWorkerBrief(params)).toContain('Every build Agent brief (the ones the prep gate covers) needs a `Slot:` line: `Slot: plan:<item>`, `Slot: blocker:<what it unblocks>`, `Slot: operator:<quoted placement>`, or `Slot: waived — <reason>`.');
+  });
+
+  it.each([
+    ['Alice1', 'alice1'],
+    ['abcdEFGhiJKlmnop', 'AbcDeFgHIjKLmnop'],
+  ])('prints distinct lowercase scratch paths for case-distinct owners %s and %s', (first, second) => {
+    const paths = [first, second].map(owner => {
+      const brief = renderWorkerBrief({ ...params, owner });
+      return /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    });
+    expect(paths[0].toLowerCase()).not.toBe(paths[1].toLowerCase());
+  });
+
+  it('carries the R662 no-bypass-flags rule', () => {
+    expect(renderWorkerBrief(params)).toContain('Never use bypass/skip flags (--skipPrePrReview, RAW_PR_CREATE_OK, WE_LAND_UNVERIFIED, WE_PR_OPEN_SOAK_PRECHECK, MAIN_SESSION_BUILD_OK), even quoting the operator; if a gate refuses, stop and report.');
+  });
+
+  it('isolates distinct purpose/owner pairs whose hyphen concatenations collide', () => {
+    const pairs = [['fix-widget', 'abc12345'], ['fix', 'widget-abc12345'], ['fix-', 'widget-abc12345'], ['fix', '-widget-abc12345']];
+    // The first three are valid; a leading hyphen owner remains invalid.
+    const paths = pairs.slice(0, 3).map(([purpose, owner]) => {
+      const brief = renderWorkerBrief({ ...params, purpose, owner });
+      const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+      expect(bodyFile).toMatch(/^\/tmp\/we-scratch-[a-z0-9-]+_[0-9a-f]+\/body\.md$/);
+      return bodyFile;
+    });
+    expect(new Set(paths).size).toBe(paths.length);
+    expect(() => renderWorkerBrief({ ...params, purpose: pairs[3][0], owner: pairs[3][1] })).toThrow();
+  });
+
+  it.each(['Alice1', 'tok12345', 'A', 'a-b-', 'Z9-Worker', 'abc12345'])('admits the printed body path for accepted owner %s', owner => {
+    const brief = renderWorkerBrief({ ...params, owner });
+    const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    expect(bodyFile).toMatch(/^\/tmp\/we-scratch-[a-z0-9-]+_[0-9a-f]+\/body\.md$/);
+  });
+
+  it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
+    const dirs = ['abc12345', 'def67890'].map(owner => {
+      const brief = renderWorkerBrief({ ...params, owner });
+      const dir = `/tmp/we-scratch-${params.purpose}_${Buffer.from(owner).toString('hex')}`;
+      expect(brief).toContain(`**Scratch dir.** \`${dir}\``);
+      expect(brief).toContain(`mkdir -m 700 -p ${dir}`);
+      expect(brief).toContain(`--bodyFile=${dir}/body.md`);
+      expect(brief).toContain(`report file: \`${dir}/report.md\``);
+      expect(brief).toContain('ALL PR body and notes/report files go ONLY there');
+      expect(brief).toContain('never into the repo or committed');
+      expect(brief).toContain('never to a shared path like /tmp/body.md');
+      return dir;
+    });
+    expect(dirs[0]).not.toBe(dirs[1]);
+  });
+
+  it('creates an admissible private directory using the printed command with a permissive umask', () => {
+    const brief = renderWorkerBrief({ ...params, owner: randomUUID() });
+    const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    const command = /Run `(mkdir [^`]+)` first/.exec(brief)[1];
+    const scratch = path.dirname(bodyFile);
+    try {
+      const result = spawnSync('sh', ['-c', `umask 000; ${command}`], { encoding: 'utf8', timeout: 10000 });
+      expect(result.status).toBe(0);
+      expect(fs.statSync(scratch).mode & 0o777).toBe(0o700);
+    } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('runs the printed plateau-app check outside WE and reports JSON for the explicit target', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-brief-verify-'));
+    const target = path.join(root, 'plateau lane');
+    fs.mkdirSync(target);
+    try {
+      const brief = renderWorkerBrief({ ...params, repo: 'plateau-app' });
+      const command = /`(node [^`]*verify-lane\.mjs[^`]* check [^`]+)`/.exec(brief)[1]
+        .replace('<lane>', `'${target}'`);
+      const result = spawnSync(command, { shell: true, cwd: root, encoding: 'utf8', timeout: 10000 });
+      expect(result.error).toBeUndefined();
+      expect(result.stderr).not.toContain('MODULE_NOT_FOUND');
+      // A non-Git target must fail closed with JSON naming that target, not fail to locate WE's CLI.
+      expect(result.status).toBe(3);
+      expect(JSON.parse(result.stdout)).toMatchObject({ status: 'error', reason: 'no-head' });
+      expect(JSON.parse(result.stdout).detail).toContain(target);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['we', 'plateau-app'])('uses WE’s absolute verification CLI and an explicit lane for %s', repo => {
+    const brief = renderWorkerBrief({ ...params, repo });
+    const command = /`(node [^`]*verify-lane\.mjs[^`]* check [^`]+)`/.exec(brief)?.[1];
+    expect(command).toBeDefined();
+    expect(command).toContain(path.resolve('scripts/verify-lane.mjs'));
+    expect(command).toContain('check --wait=150000 --json --repo=<lane>');
+  });
+
+  it.skipIf(runnerDefinition === null)('keeps the runner verification CLI absolute and the lane explicit', () => {
+    expect(runnerDefinition).toContain('node "<WE checkout>/scripts/verify-lane.mjs" check --wait=150000 --json --repo=<lane>');
+    expect(runnerDefinition).toContain('absolute path');
+  });
+
   it('keeps the main-based lane and overlap-only stacking instructions in step 3', () => {
     const brief = renderWorkerBrief(params);
     const lane = brief.slice(brief.indexOf('3. **Lane.**'), brief.indexOf('4. **Codex'));
@@ -17,12 +186,104 @@ describe('renderWorkerBrief', () => {
       'ONLY when your declared files overlap', 'No overlap', '--files']) expect(lane).toContain(text);
   });
 
+  it('states the harness-tracked background rule in step 4', () => {
+    const brief = renderWorkerBrief(params);
+    const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
+    for (const text of ['timeout: 600000', "don't start a second copy", 'harness-tracked', '~180s',
+      'nohup', 'setsid']) expect(codex).toContain(text);
+  });
+
+  it('tells workers to detach Codex, repeat short waits, and never end the turn while a task runs', () => {
+    const brief = renderWorkerBrief(params);
+    const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
+    for (const text of ['--detach', 'wait --job=<id> --wait=150000', 'separate foreground calls',
+      'check --wait=150000', 'never end the turn while a task is running']) expect(brief).toContain(text);
+    expect(codex).not.toContain('SYNCHRONOUS');
+    expect(codex).not.toContain('never wrapped in a wait');
+  });
+
+  for (const source of ['worker', 'runner']) {
+    it.skipIf(source === 'runner' && runnerDefinition === null)(`stops polling on success or terminal failure in ${source} instructions`, () => {
+      const text = source === 'worker' ? renderWorkerBrief(params) : runnerDefinition;
+      expect(text).toContain('Repeat only on exit 75');
+      expect(text).toContain('exit 0 = success');
+      expect(text).toContain('status=failed is a terminal worker failure');
+      expect(text).toContain('status=wait-error');
+      expect(text).toContain('does not prove the worker stopped');
+      expect(text).toContain('retain the lane and scope');
+      expect(text).toContain('keep renewing leases');
+      expect(text).toContain('missing/unreadable JSON');
+      expect(text).toContain('retry the same job');
+      expect(text).toContain('confirmed terminal');
+      expect(text).toContain('supervised termination');
+      expect(text).toContain('confirm the worker stopped before cleanup');
+      expect(text).not.toContain('any other exit = stop and report the failure');
+      expect(text).not.toContain('until it exits 0');
+      expect(text).toContain('check --wait=150000 --json');
+      expect(text).toContain('Repeat only for a timeout with lastStatus=running');
+      expect(text).toContain('stop and report red, infrastructure-failure, or any other non-running result');
+      expect(text).toContain('If settled is not true');
+      expect(text).toContain('recover observation of the same verification');
+      expect(text).toContain('until verification is confirmed terminal');
+    });
+  }
+
+  it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
+    const brief = renderWorkerBrief(params);
+    expect(brief).toContain('Search the backlog before designing or building: `node scripts/capability-search.mjs "<concept>"`');
+    const speed = brief.slice(brief.indexOf('**Speed.**'), brief.indexOf('1. **Free-scope pre-check.**'));
+    for (const rule of [
+      'For Forge/remote work, do a real live Forge run in the first 15 minutes.',
+      'Narrow tests while iterating; ONE full verify at the end (re-run only if code changed after it).',
+      'Make small fixes (a few lines, a known finding) yourself; send Codex only larger builds.',
+      'For a Codex follow-up fix, pass `--resume=<threadId>` from its previous run, with the exact file, line range and finding in the task.',
+    ]) expect(speed).toContain(rule);
+    expect(brief).not.toContain('Codex for scoped coding');
+    expect(brief).not.toContain('single-file fix with clear');
+    const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
+    expect(codex).toContain('Do small fixes (a few lines, a known finding) yourself.');
+    expect(codex).toContain('--resume=<threadId>');
+    expect(brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'))).toContain('verify ONCE at the end');
+  });
+
+  it('requires the related-tests gate exactly once before the WE Codex audit', () => {
+    const brief = renderWorkerBrief({ ...params, repo: 'we' });
+    expect(brief.indexOf('related-tests gate')).toBeGreaterThan(-1);
+    expect(brief.indexOf('related-tests gate')).toBeLessThan(brief.indexOf('Codex audit'));
+    expect(brief.split('related-tests gate')).toHaveLength(2);
+    expect(brief).toContain('The related-tests gate (the verify-lane default diff-driven related-test selection, with no explicit `--gate` override) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.');
+  });
+
+  it('omits the WE related-tests gate requirement from the plateau-app brief', () => {
+    expect(renderWorkerBrief({ ...params, repo: 'plateau-app' })).not.toContain('related-tests gate');
+  });
+
+  it('puts a Codex audit requiring NOT WEAKENED between verify and open-pr (6a)', () => {
+    const brief = renderWorkerBrief(params);
+    const step = brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'));
+    const verify = step.indexOf('verify ONCE at the end');
+    const audit = step.indexOf('6a. **Codex audit.**');
+    const openPr = step.indexOf('operations/run.mjs open-pr');
+    expect(verify).toBeGreaterThan(-1);
+    expect(audit).toBeGreaterThan(verify);
+    expect(openPr).toBeGreaterThan(audit);
+    const text = step.slice(audit, openPr);
+    expect(text).toMatch(/node \S*scripts\/operations\/codex-audit\.mjs\S* --base=origin\/main --head=<40-hex sha of your lane HEAD>/);
+    expect(text).not.toContain('node scripts/operations/codex-audit.mjs');
+    expect(text).toContain('lane as the working directory');
+    expect(text).toContain('NOT WEAKENED');
+    expect(text).toContain('at most 2 repair rounds');
+    expect(text).toContain('do NOT open a PR; report the remaining findings');
+    expect(text).not.toContain('AUDIT: WEAKENED');
+    expect(text).toContain('verdict in your report');
+  });
+
   it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {
     // Pin the standard: the live platform preference deliberately selects related tests.
     const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: {} });
     const brief = renderWorkerBrief({ ...params, policy });
     const sections = ['## Standard worker rules', '**Scope.**', '1. **Free-scope pre-check.**',
-      '2. **Register your scope.**', '3. **Lane.**', '4. **Codex for scoped coding.**',
+      '2. **Register your scope.**', '3. **Lane.**', '4. **Codex for larger builds.**',
       '5. **Red-green tests through the heavy queue.**', '6. **One PR.**',
       '7. **Pre-push recheck.**', '**Proof.**', '**Waiting (rule 23).**',
       '**Processes.**', '**Git.**', '**Trust boundary.**', '**Times**', '**Report**'];
@@ -35,13 +296,14 @@ describe('renderWorkerBrief', () => {
     for (const text of [
       '- we:scripts/x.mjs', '- plateau-app:src/y.ts',
       `free-scope-cli.mjs check --files=${files}`,
-      `register --agent=fix-widget --owner=tok12345 --purpose="fix-widget" --files=${files}`,
+      `register --agent=fix-widget --owner=tok12345 --purpose="fix-widget" --files=${files} --heartbeat`,
       'free-scope-cli.mjs release --agent=fix-widget --owner=tok12345',
       'lane-pool.mjs acquire --purpose=fix-widget --adopt',
       'lane-pool.mjs release --lane=<N> --session=<holder slug it printed>',
       'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=full',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
+      'committed and its PR opened BEFORE you release the lane', '~/.claude/lane-salvage',
       `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,
       defaultProof, 'report it as PENDING', 'exact command', '10\nminutes',
       '`pkill`, `killall`', 'operator\'s dev server', 'No `--force`', 'no `--no-verify`',
@@ -65,6 +327,35 @@ describe('renderWorkerBrief', () => {
 
   it('tells the worker to stop and report when open-pr is refused by the PR limit, never to self-allow (xfaz7ho)', () => {
     expect(renderWorkerBrief(params)).toContain('If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.');
+  });
+
+  it('lists every daemon with what it runs when an edge clone is given', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep)');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)');
+    expect(brief).toContain('merge-watch: merge-watch helpers (pr-merge-watch, merge-orphan-sweep); NOT the merge-queue drain, use drain for that. Does not accept prototype loads (unsupported) [prototype load UNSUPPORTED]');
+    expect(brief).toContain('drain: merge-queue drain (drain-queue-safety, enqueue)\n');
+  });
+
+  it('warns instead of confirming when the edge clone matches a daemon that cannot adopt prototype loads', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-merge-daemon' });
+    expect(brief).toContain('WARNING: --edge-clone /ws/wev-merge-daemon matches daemon key merge-watch, which cannot adopt prototype loads');
+    expect(brief).not.toContain('matches daemon key merge-watch.');
+  });
+
+  it('confirms a supported daemon match without a warning', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/ws/wev-control' });
+    expect(brief).toContain('--edge-clone /ws/wev-control matches daemon key control.');
+    expect(brief).not.toContain('WARNING: --edge-clone');
+  });
+
+  it('warns when the edge clone matches no daemon clone', () => {
+    const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
+    expect(brief).toContain('WARNING: --edge-clone /tmp/edge matches no daemon clone');
+  });
+
+  it('omits the daemon list without an edge clone', () => {
+    expect(renderWorkerBrief({ ...params })).not.toContain('merge-queue drain (drain-queue-safety');
   });
 
   it('includes the optional edge section as the last numbered rule', () => {
@@ -146,14 +437,183 @@ describe('main', () => {
 });
 
 describe('per-dispatch owner token', () => {
+  // Run the printed commands through the real CLI and registry, with only PR IO and time injected.
+  const withRegistry = (window, check) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-brief-renewal-'));
+    const env = { WE_AGENT_SCOPES_PATH: path.join(root, 'agents.json'), WE_FREE_SCOPE_STALE_AFTER_MINUTES: String(window) };
+    const start = Date.parse('2026-11-01T00:00:00Z');
+    const brief = renderWorkerBrief({ ...params, freeScope: resolveFreeScopeSettings({ env, platform: {} }) });
+    const command = kind => new RegExp('`node scripts/operations/free-scope-cli.mjs (' + kind + '[^`]+)`').exec(brief)[1]
+      .replaceAll('"', '').split(' ');
+    const run = (argv, minute) => {
+      let out = '', err = '';
+      const now = () => start + minute * 60e3;
+      const code = freeScopeMain(argv, { env, now,
+        collect: ({ files }) => ({ files: files.split(','), nowMs: now(), unreadable: [], prs: [], agents: readRegistry(env.WE_AGENT_SCOPES_PATH) }),
+        stdout: { write: text => { out += text; } }, stderr: { write: text => { err += text; } },
+      });
+      return { code, out, err };
+    };
+    try { check({ brief, run, register: command('register'), heartbeat: command('check --files=[^`]+--exclude-agent='),
+      entries: () => readRegistry(env.WE_AGENT_SCOPES_PATH), start }); }
+    finally { fs.rmSync(root, { recursive: true, force: true }); }
+  };
+
+  it.each([45, 10])('printed %s-minute-window workflow renews ownership past the four-hour TTL', window => {
+    withRegistry(window, ({ brief, run, register, heartbeat, entries, start }) => {
+      const cadence = Number(/every ([\d.]+) minutes/.exec(brief)[1]);
+      expect(run(register, 0).code).toBe(0);
+      for (let minute = cadence; minute <= 260; minute += cadence) {
+        expect(partitionRegistry(entries(), start + minute * 60e3).live, `reservation at minute ${minute}`).toHaveLength(1);
+        expect(run(heartbeat, minute)).toMatchObject({ code: 0, err: '' });
+        // Follow the brief's renewal instruction when present, rather than assuming checks renew the TTL.
+        if (brief.includes('After every successful heartbeat check, re-run the exact register command above')) {
+          expect(run(register, minute)).toMatchObject({ code: 0, err: '' });
+        }
+        expect(run(['check', `--files=${files}`, '--exclude-agent=competitor', '--exclude-owner=other'], minute).code).toBe(1);
+      }
+    });
+  });
+
+  it('requires stopping on a lost-reservation warning even when the heartbeat exits zero, then re-registering', () => {
+    withRegistry(45, ({ brief, run, register, heartbeat }) => {
+      expect(run(register, 0).code).toBe(0);
+      for (let minute = 20; minute <= 240; minute += 20) {
+        const result = run(heartbeat, minute);
+        expect(result.code).toBe(0);
+        if (minute === 240) expect(result.err).toContain('reservation is gone');
+      }
+      expect(brief).toContain('reservation is gone');
+      expect(brief).toContain('stop editing even if the check exits 0');
+      expect(brief).toContain('Resume only after the exact register command above succeeds');
+      const prePush = brief.slice(brief.indexOf('7. **Pre-push recheck.**'));
+      expect(prePush).toContain("Apply step 2's lost-reservation warning and renewal rules before proceeding");
+      expect(fs.readFileSync('skills-src/worker-brief/SKILL.md', 'utf8')).toContain('same-owner TTL renewal');
+      expect(run(register, 240)).toMatchObject({ code: 0, err: '' });
+      expect(run(['check', `--files=${files}`], 240).code).toBe(1);
+    });
+  });
+
+  it('keeps renewal subject to owner and occupied-scope refusals after expiry', () => {
+    withRegistry(45, ({ brief, run, register }) => {
+      expect(run(register, 0).code).toBe(0);
+      const competitor = register.map(arg => arg === '--owner=tok12345' ? '--owner=other' : arg);
+      expect(run(competitor, 240).code).toBe(0);
+      expect(run(register, 240).code).toBe(2);
+      const otherSlug = register.map(arg => arg === '--agent=fix-widget' ? '--agent=other-worker' : arg);
+      expect(run(otherSlug, 240).code).toBe(1);
+      expect(brief).toContain('If renewal exits non-zero, stop and report');
+    });
+  });
+
   it('mints a different token per brief by default and rejects a malformed one', () => {
     const { owner, ...rest } = params;
     const token = (brief) => /--owner=(\S+) --purpose/.exec(brief)[1];
     expect(token(renderWorkerBrief(rest))).not.toBe(token(renderWorkerBrief(rest)));
     expect(() => renderWorkerBrief({ ...rest, owner: 'bad token' })).toThrow('--owner');
-    // the same token is used to register, release and exclude yourself at the pre-push recheck
+    // the same token is used to register, heartbeat, release and exclude yourself at the pre-push recheck
     const brief = renderWorkerBrief({ ...rest, owner: 'abc123' });
-    expect(brief.match(/--(?:exclude-)?owner=abc123/g)).toHaveLength(3);
+    expect(brief.match(/--(?:exclude-)?owner=abc123/g)).toHaveLength(4);
+  });
+
+  it('registers with --heartbeat and tells the worker to heartbeat with the same token every 20 minutes by default', () => {
+    const freeScope = resolveFreeScopeSettings({ env: {}, platform: {} });
+    const brief = renderWorkerBrief({ ...params, freeScope });
+    const step2 = brief.slice(brief.indexOf('2. **Register'), brief.indexOf('3. **Lane'));
+    expect(step2).toMatch(/register --agent=fix-widget --owner=tok12345 [^`]*--heartbeat`/);
+    expect(step2).toContain('reuse exactly this token');
+    expect(step2).toContain('keep the reservation alive');
+    expect(step2).toContain('every 20 minutes');
+    expect(step2).toContain('half the configured stale window, capped at 20 minutes');
+    expect(step2).toContain('Keep this cadence during long commands too');
+    expect(step2).toContain('if you cannot, stop work and release the scope');
+    for (const moment of ['after each Codex round', 'after each narrow-test round', 'before verify']) expect(step2).toContain(moment);
+    expect(step2).toContain(`check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`);
+    expect(step2).toContain('lastSeenAt');
+    expect(step2).toMatch(/OCCUPIED or UNKNOWN \(exit 2\), stop and report/);
+    // the pre-push recheck and the release stay
+    expect(brief).toContain('7. **Pre-push recheck.**');
+    expect(step2).toContain('free-scope-cli.mjs release --agent=fix-widget --owner=tok12345');
+  });
+
+  it.each([[10, 5], [0.5, 0.25], [45, 20], [120, 20]])(
+    'CLI cadence for a %s-minute window keeps the owner live at minute 11', async (window, cadence) => {
+      vi.stubEnv('WE_FREE_SCOPE_STALE_AFTER_MINUTES', String(window));
+      try {
+        const deps = io();
+        expect(await main(['--purpose=fix-widget', `--files=${files}`], deps)).toBe(0);
+        const brief = deps.stdout.write.mock.calls.flat().join('');
+        expect(brief).toContain(`stale about ${window} minutes`);
+        const match = /every ([\d.]+) minutes/.exec(brief);
+        expect(match).not.toBeNull();
+        const minutes = Number(match[1]);
+        expect(minutes).toBe(cadence);
+        expect(minutes).toBeLessThan(window);
+        const start = Date.parse('2026-11-01T00:00:00Z');
+        const at = minute => new Date(start + minute * 60e3).toISOString();
+        let entries = registerScope([], { agent: params.purpose, owner: params.owner,
+          files: params.files, staleAfterMinutes: window }, at(0));
+        for (let minute = minutes; minute <= 11; minute += minutes) {
+          expect(partitionRegistry(entries, start + minute * 60e3).live).toHaveLength(1);
+          const beat = heartbeatScope(entries, params.purpose, params.owner, at(minute));
+          expect(beat.refreshed).toBe(1);
+          entries = beat.entries;
+        }
+        expect(partitionRegistry(entries, start + 11 * 60e3).live).toHaveLength(1);
+        expect(() => registerScope(entries, { agent: params.purpose, owner: 'competitor',
+          files: params.files, staleAfterMinutes: window }, at(11))).toThrow('different owner');
+      } finally { vi.unstubAllEnvs(); }
+    });
+
+  it('uses the shared platform stale window for in-process briefs', () => {
+    const freeScope = resolveFreeScopeSettings({ env: {}, platform: { staleAfterMinutes: 3 } });
+    const brief = renderWorkerBrief({ ...params, freeScope });
+    expect(brief).toContain('stale about 3 minutes');
+    expect(brief).toContain('every 1.5 minutes');
+  });
+
+  it.each(['0', '-1', '', 'nope', 'Infinity', '5e-324', '1e-12', '0.000000000001',
+    String(1 / 60e3), String((2 / 60e3) * (1 - Number.EPSILON))])('refuses to print a cadence for unusable stale window %j', async value => {
+    vi.stubEnv('WE_FREE_SCOPE_STALE_AFTER_MINUTES', value);
+    try {
+      const deps = io();
+      expect(await main(['--purpose=fix-widget', `--files=${files}`], deps)).toBe(2);
+      expect(deps.stdout.write).not.toHaveBeenCalled();
+      expect(deps.stderr.write.mock.calls.flat().join('')).toMatch(/invalid staleAfterMinutes/i);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([1e-12, 1 / 60e3, (2 / 60e3) * (1 - Number.EPSILON)])(
+    'rejects a sub-millisecond cadence from injected settings (%s minutes)', staleAfterMinutes => {
+      expect(() => renderWorkerBrief({ ...params, freeScope: { staleAfterMinutes } }))
+        .toThrow(/invalid staleAfterMinutes/i);
+    });
+
+  it('refuses --out without writing a brief when the stale window is too small', async () => {
+    vi.stubEnv('WE_FREE_SCOPE_STALE_AFTER_MINUTES', '1e-12');
+    try {
+      const deps = io();
+      expect(await main(['--purpose=tiny', '--files=scripts/x.mjs', '--owner=token123', '--out=brief.md'], deps)).toBe(2);
+      expect(deps.writeFile).not.toHaveBeenCalled();
+      expect(deps.stdout.write).not.toHaveBeenCalled();
+      expect(deps.stderr.write.mock.calls.flat().join('')).toContain('at least 1 millisecond');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('keeps the minimum supported window live at registration and through printed-cadence renewals', () => {
+    withRegistry(2 / 60e3, ({ brief, run, register, heartbeat, entries, start }) => {
+      const cadence = Number(/every (\S+) minutes/.exec(brief)[1]);
+      expect(cadence * 60e3).toBe(1);
+      expect(run(register, 0)).toMatchObject({ code: 0, err: '' });
+      expect(partitionRegistry(entries(), start).live).toHaveLength(1);
+      for (let tick = 1; tick <= 3; tick++) {
+        const minute = tick * cadence;
+        expect(partitionRegistry(entries(), start + minute * 60e3).live).toHaveLength(1);
+        expect(run(heartbeat, minute)).toMatchObject({ code: 0, err: '' });
+        expect(run(register, minute)).toMatchObject({ code: 0, err: '' });
+        expect(run(['check', `--files=${files}`], minute).code).toBe(1);
+      }
+    });
   });
 });
 
@@ -194,5 +654,107 @@ describe('early PR-size guidance', () => {
     expect(brief).toContain('node scripts/operations/run.mjs pr-size --checkout=<lane>');
     expect(brief).toContain('If over the limit, stop and propose a split plan instead of finishing the build.');
     expect(brief.indexOf('pr-size --checkout=<lane>')).toBeLessThan(brief.indexOf('6. **One PR.**'));
+  });
+});
+
+describe('brief red-team before code (R469)', () => {
+  const redTeam = { status: 'ok', classes: [{ attack: 'symlink bypass', test: 'rejects symlinked path' }] };
+  it('renderWorkerBrief appends the red-team findings under the task, before the standard rules', () => {
+    const brief = renderWorkerBrief({ ...params, redTeam });
+    expect(brief).toContain('symlink bypass');
+    expect(brief).toContain('rejects symlinked path');
+  });
+  it('adds nothing when no red-team result is given', () => {
+    expect(renderWorkerBrief(params)).not.toMatch(/red-team/i);
+  });
+  it('main runs the red-team for a guard touch-set with --prep-file and puts the classes in the brief', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => redTeam);
+    const readText = vi.fn(() => 'prep and acceptance');
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText })).toBe(0);
+    expect(redTeamBrief).toHaveBeenCalledWith(expect.objectContaining({ prep: 'prep and acceptance' }));
+    expect(o.stdout.write.mock.calls[0][0]).toContain('symlink bypass');
+  });
+  it('main still prints the plain brief when the red-team result is failed (fail open)', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => ({ status: 'failed', classes: [] }));
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+  });
+  it('preserves the plain brief when red-team execution rejects', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => { throw new Error('rt boom'); });
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(o.stderr.write.mock.calls.join('')).toContain('rt boom');
+  });
+  it('preserves the plain brief when prep-file reading fails', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn();
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/missing.md'], { ...o, redTeamBrief, readText: () => { throw new Error('ENOENT'); } })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(redTeamBrief).not.toHaveBeenCalled();
+  });
+});
+
+describe('brief red-team prep reading is gated and bounded (blocking-read hang)', () => {
+  const GUARD_ARGS = ['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'];
+  const enabled = { enabled: true, timeoutMs: 20, maxClasses: 6 };
+  it('does not read the prep source when red-teaming is disabled', async () => {
+    const o = io();
+    const readText = vi.fn(() => 'x');
+    const redTeamBrief = vi.fn();
+    expect(await main(GUARD_ARGS, { ...o, redTeamBrief, readText, readPolicy: () => ({ ...enabled, enabled: false }) })).toBe(0);
+    expect(readText).not.toHaveBeenCalled();
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+  });
+  it('does not read the prep source outside the red-team touch-set', async () => {
+    const o = io();
+    const readText = vi.fn(() => 'x');
+    expect(await main(['--purpose=probe', '--files=scripts/lib/format-date.mjs', '--prep-file=/dev/stdin'],
+      { ...o, redTeamBrief: vi.fn(), readText, readPolicy: () => enabled })).toBe(0);
+    expect(readText).not.toHaveBeenCalled();
+  });
+  it('prints the plain brief when an async prep read never settles (bounded by the timeout)', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn();
+    const code = await main(GUARD_ARGS, { ...o, redTeamBrief, readText: () => new Promise(() => {}), readPolicy: () => enabled });
+    expect(code).toBe(0);
+    expect(redTeamBrief).not.toHaveBeenCalled();
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(o.stderr.write.mock.calls.join('')).toMatch(/timed out/);
+  });
+  it('real CLI: an open, never-closed stdin as --prep-file does not hang (disabled and non-FIFO-safe)', () => {
+    const cli = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'worker-brief.mjs');
+    for (const env of [{ WE_BRIEF_RED_TEAM_ENABLED: 'false' }, { WE_BRIEF_RED_TEAM_ENABLED: 'true', WE_BRIEF_RED_TEAM_TIMEOUT_MS: '50' }]) {
+      const fifo = path.join(os.tmpdir(), `we-prep-fifo-${randomUUID()}`);
+      spawnSync('mkfifo', [fifo]);
+      try {
+        const r = spawnSync(process.execPath, [cli, '--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', `--prep-file=${fifo}`],
+          { env: { ...process.env, ...env }, timeout: 8000, encoding: 'utf8' });
+        expect(r.error).toBeUndefined();
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('Standard worker rules');
+      } finally { fs.rmSync(fifo, { force: true }); }
+    }
+  });
+
+  describe('scope flags', () => {
+    const base = { purpose: 'flags', owner: 'abc12345' };
+    it('adds the soak line for daemon-soak scope', () => {
+      expect(renderWorkerBrief({ ...base, files: 'scripts/conveyor/x.mjs' })).toContain('soak-declaration');
+    });
+    it('adds the Forge line for bundled files', () => {
+      const allowed = readForgeAllowlist('allowed = {"forge-exec-run.mjs", "forge-warm-base.mjs"}');
+      expect([...allowed]).toEqual(['forge-exec-run.mjs', 'forge-warm-base.mjs']);
+      expect(renderScopeFlags(['we:scripts/readiness/forge-exec-run.mjs'], allowed)).toContain('ships to the Forge runner');
+      expect(renderScopeFlags(['scripts/readiness/other.mjs'], allowed)).toBe('');
+      expect(readForgeAllowlist('nothing here').size).toBe(0);
+    });
+    it('adds neither for unrelated files', () => {
+      const brief = renderWorkerBrief({ ...base, files: 'docs/x.md' });
+      expect(brief).not.toContain('soak-declaration');
+      expect(brief).not.toContain('ships to the Forge runner');
+    });
   });
 });

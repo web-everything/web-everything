@@ -43,3 +43,11 @@ failure hit at least 3 more times on different subagents afterward. The load-bea
 file confirmed to auto-load into every session and every Agent-tool subagent's context regardless of
 cwd (main checkout, lane clone, or VM). Keep the full story here; keep `CLAUDE.md` terse and pointing
 back to this file — don't let the two drift apart.
+
+**Update 2026-10-31 (Claude Code 2.1.316):** the harness-tracking line moved. A subagent's foreground Bash call
+that runs longer than ~180s is MOVED to the background by the harness, and the subagent IS resumed when it
+completes (proven 08:05:49 to 08:09:09 ET with a 200s sleep). So harness-moved calls and `run_in_background`
+calls are harness-tracked and wake the agent; it may end its turn on them. Only self-detached shell jobs
+(`&`, `nohup`, `setsid`) and untracked nested children do not wake it, and those stay forbidden as a passive
+wait. Unchanged: pass `timeout: 600000`; don't poll; don't start a second copy; `codex-direct-task.mjs` and
+`gemini-direct-task.mjs` are synchronous. The poll-blocking hook stays.

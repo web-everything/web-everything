@@ -4,6 +4,20 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 export const fixHandoffDir = () => process.env.WE_FIX_HANDOFF_DIR || join(homedir(), '.claude', 'conveyor', 'fix-handoff');
+export const verifyHandoffDir = () => process.env.WE_VERIFY_HANDOFF_DIR || join(homedir(), '.claude', 'conveyor', 'verify-handoff');
+/** Best-effort wake only: the running marker remains the verification authority. */
+export function signalVerifyRequest({ dir = verifyHandoffDir(), log = console.error } = {}) {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const temp = join(dir, `${randomUUID()}.tmp`);
+    writeFileSync(temp, JSON.stringify({ nonce: randomUUID() }));
+    renameSync(temp, join(dir, 'wake'));
+    return true;
+  } catch (e) {
+    try { log(`verify-handoff: signal failed: ${e.message}`); } catch { /* logging must not fail the request */ }
+    return false;
+  }
+}
 const read = dir => { try { return readFileSync(join(dir, 'wake'), 'utf8'); } catch { return ''; } };
 export function signalFixDispatch({ repo, pr, label }, { dir = fixHandoffDir(), log = console.error } = {}) {
   if (!['review:changes', 'ci:failed', 'status:ci-red'].includes(label)) return false;
@@ -15,16 +29,25 @@ export function signalFixDispatch({ repo, pr, label }, { dir = fixHandoffDir(), 
     return true;
   } catch (e) { log(`fix-handoff: signal failed: ${e.message}`); return false; }
 }
-export function createFixHandoffSleep({ dir = fixHandoffDir(), statPollMs = 1000, watchDir = watch } = {}) {
+export function createFixHandoffSleep({ dir = fixHandoffDir(), statPollMs = 1000, watchDir = watch, failOnWatchError = false } = {}) {
   mkdirSync(dir, { recursive: true });
   let seen = read(dir);
-  return ms => new Promise(resolve => {
-    let timer, watcher;
+  return ms => new Promise((resolve, reject) => {
+    let timer, watcher, settled = false;
     const file = join(dir, 'wake');
-    const finish = reason => { clearTimeout(timer); unwatchFile(file, check); try { watcher?.close(); } catch { /* already closed */ } resolve(reason); };
+    const finish = (reason, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unwatchFile(file, check);
+      try { watcher?.close(); } catch { /* already closed */ }
+      if (error) reject(error); else resolve(reason);
+    };
     const check = () => { const value = read(dir); if (value !== seen) { seen = value; finish('handoff'); } };
+    const watchError = error => { if (failOnWatchError) finish(null, error); };
     // Event-driven wake first; the stat poll (1s by default) stays as the fallback where fs.watch is unavailable.
-    try { watcher = watchDir(dir, check); watcher.on('error', () => {}); } catch { /* poll only */ }
+    try { watcher = watchDir(dir, check); watcher.on('error', watchError); } catch (error) { watchError(error); }
+    if (settled) return;
     watchFile(file, { interval: statPollMs }, check);
     timer = setTimeout(() => finish('interval'), ms);
     check(); // watch before read: includes events that arrived during the preceding tick

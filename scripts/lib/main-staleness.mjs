@@ -17,11 +17,21 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, realpathSync, writeSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, realpathSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { daemonEventsPath } from './daemon-events.mjs';
 import { lastGoodForClone, rebuildGraceForClone } from './daemon-last-good.mjs';
 import { readSettings as readOperatorSettings } from './settings-files.mjs';
+// Sparse copied-CLI fixtures may omit the launcher; only lane fallback needs it, and must refuse without it.
+const freshLauncher = await import('../run-fresh.mjs').catch(() => null);
+
+/** Sync append of one daemon event (the caller exits right after, so the async writer cannot be used). */
+function emitLaneReleaseFailedSync(event) {
+  const path = daemonEventsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), repo: 'web-everything', ...event })}\n`);
+}
 
 /** Default git runner — spawnSync (returns non-zero without throwing). */
 export function gitRun(args, opts = {}) {
@@ -141,6 +151,9 @@ export function staleRemedy(st, base) {
  *  only one place this string is written. (#3383 bug 1 — the fix-dispatch and review daemons need this to
  *  react to a mid-tick stale refusal immediately instead of wasting the rest of the tick.) */
 export const STALE_MAIN_REFUSAL_MARKER = 'STALE code from this checkout';
+
+/** Only throw before invoking a dispatch spawn; consumers may refund reserved start capacity. */
+export class PreStartDispatchRefusalError extends Error {}
 
 /** Does this tick-failure message look like {@link assertMainNotStale}'s own refusal? See
  *  {@link STALE_MAIN_REFUSAL_MARKER}. Accepts anything falsy/non-string as "no" (a null/undefined `why`/
@@ -322,7 +335,7 @@ export function assertMainNotStale(root, checkStaleness, {
       return { ...st, reexeced: true }; // only reached when `reexec` is injected (the real one exits)
     }
     if (action === 'refuse') {
-      throw new Error(
+      throw new PreStartDispatchRefusalError(
         `${label}: fast-forwarded the dispatching checkout ${st.behind} commit(s) to origin/${base}, but this process `
         + `had already loaded the pre-fast-forward code, so it would run ${STALE_MAIN_REFUSAL_MARKER}'s own import path `
         + '(the old copy in memory) — refusing to dispatch (xgqz204). '
@@ -333,7 +346,7 @@ export function assertMainNotStale(root, checkStaleness, {
     }
   }
   if (st && st.action === 'warn') {
-    throw new Error(
+    throw new PreStartDispatchRefusalError(
       `${label}: the dispatching checkout is ${st.behind} commit(s) behind origin/${base} — refusing to `
       + `dispatch a review that would run ${STALE_MAIN_REFUSAL_MARKER}'s own import path (#3439). `
       + (managedClone
@@ -361,13 +374,14 @@ export const OPERATOR_CLI_STALE_MARKER = 'run from an up-to-date lane';
  * Offline (fetch fails) or a root that is not a git checkout stays fail-soft, like the rest of this file.
  * Drain re-stamp (PR #4880, 2026-10-11): a held CODE clone can invoke this CLI with cwd in a fresh DATA
  * clone. Before refusing, re-run once from that checkout if its code is fresh and its working tree is clean.
+ * When CODE == DATA, lease through lane-pool instead and require HEAD exactly at freshly fetched origin/<base>.
  * @param {string} root the checkout the CLI's own code was loaded from
  * @param {{label?: string, base?: string, run?: typeof gitRun, listBehindFiles?: (root: string) => (string[]|null)}} [o]
  */
 export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'main', run = gitRun,
   listBehindFiles = (r) => behindFiles(r, base, run), env = process.env,
   cwd = process.cwd(), argv = process.argv, execArgv = process.execArgv,
-  exists = existsSync, readSettings = readOperatorSettings, spawn = spawnSync, exit = (code) => process.exit(code),
+  exists = existsSync, readSettings = readOperatorSettings, spawn = spawnSync, laneSpawn = spawnSync, emitEvent = emitLaneReleaseFailedSync, exit = (code) => process.exit(code),
   write = (s) => { try { writeSync(2, s); } catch { /* stderr closed */ } },
   skipUnderVitest = !!process.env.VITEST } = {}) {
   // A daemon-managed clone is kept current by its own gated rebuild (#4044); a unit test run drives the CLI from
@@ -399,6 +413,12 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
       + 'Nothing was changed.');
     let candidate;
     let entry;
+    let child;
+    let childCwd = cwd;
+    let lease;
+    const pool = resolve(root, 'scripts/lane-pool.mjs');
+    const laneOptions = { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024,
+      timeout: 360_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'inherit'] };
     let source = 'default';
     try {
       let value = env?.WE_OPERATOR_CLI_FRESH_FALLBACK;
@@ -411,23 +431,60 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
       if (value === 'off' || env?.WE_OPERATOR_CLI_FRESH_REEXEC === '1') throw refusal;
       const top = run(['rev-parse', '--show-toplevel'], { cwd, timeout: 60_000, killSignal: 'SIGKILL' });
       candidate = String(top.stdout ?? '').trim();
-      if (top.status !== 0 || !candidate || !isAbsolute(candidate) || isSameCheckout(candidate, root)) throw refusal;
+      if (top.status !== 0 || !candidate || !isAbsolute(candidate)) throw refusal;
       if (!argv[1]) throw refusal;
       const rel = relative(resolve(root), resolve(cwd, argv[1]));
       if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw refusal;
-      entry = resolve(candidate, rel);
-      if (!exists(entry) || !check(candidate, true)?.fresh || codeDirty(candidate, run)) throw refusal;
-    } catch {
-      throw refusal;
-    }
-    write(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it runs — re-running from the fresh checkout `
-      + `${candidate} (operator-cli fresh fallback, knob source: ${source}).\n`);
-    let child;
-    try {
-      child = spawn(process.execPath, [...execArgv, entry, ...argv.slice(2)], {
-        stdio: 'inherit', cwd, env: { ...env, WE_OPERATOR_CLI_FRESH_REEXEC: '1' },
-      });
-      if (child?.error) throw refusal;
+      try {
+        if (isSameCheckout(candidate, root)) {
+          if (!freshLauncher?.parseAcquire) throw refusal;
+          const acquired = laneSpawn(process.execPath,
+            [pool, 'acquire', '--purpose=operator-cli-fresh', '--json', '--wait-ms=300000', `--repo=${root}`], laneOptions);
+          lease = freshLauncher.parseAcquire(acquired?.stdout);
+          if (acquired?.error || acquired?.status !== 0 || !lease || !isAbsolute(lease.path)) throw refusal;
+          candidate = lease.path;
+          childCwd = candidate;
+          const git = (args) => run(args, { cwd: candidate, timeout: 60_000, killSignal: 'SIGKILL' });
+          const fetched = git(['fetch', '--quiet', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+          if (fetched.status !== 0) throw refusal;
+          const head = git(['rev-parse', 'HEAD']);
+          const main = git(['rev-parse', `refs/remotes/origin/${base}`]);
+          const sha = String(head.stdout ?? '').trim();
+          if (head.status !== 0 || main.status !== 0 || !/^[0-9a-f]{40}$/.test(sha)
+            || sha !== String(main.stdout ?? '').trim() || codeDirty(candidate, run)) throw refusal;
+        } else if (!check(candidate, true)?.fresh || codeDirty(candidate, run)) throw refusal;
+        entry = resolve(candidate, rel);
+        if (!exists(entry)) throw refusal;
+        write(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it runs — re-running from the fresh checkout `
+          + `${candidate} (operator-cli fresh fallback, knob source: ${source}).\n`);
+        child = spawn(process.execPath, [...execArgv, entry, ...argv.slice(2)], {
+          stdio: 'inherit', cwd: childCwd, env: { ...env, WE_OPERATOR_CLI_FRESH_REEXEC: '1' },
+        });
+        if (child?.error || (lease && (!Number.isInteger(child?.status) || child.status < 0))) throw refusal;
+      } finally {
+        // Release before exit (and on verification/spawn failure), using the pool-minted holder.
+        if (lease) {
+          const release = () => laneSpawn(process.execPath,
+            [pool, 'release', `--lane=${lease.lane}`, `--session=${lease.holder}`, `--repo=${root}`], laneOptions);
+          let released;
+          try { released = release(); } catch { released = { error: true }; }
+          if (released?.error || released?.status !== 0) {
+            try { released = release(); } catch { released = { error: true }; } // retry once
+          }
+          if (released?.error || released?.status !== 0) {
+            // Cleanup cannot undo a completed operation or replace its result: keep the child's status, be loud,
+            // and leave one structured event so health-watch and the lease reaper can see the leaked lease.
+            try {
+              write(`${label}: could not release lane-${lease.lane}; release it: node scripts/lane-pool.mjs release `
+                + `--lane=${lease.lane} --session=${lease.holder} --repo=${root}\n`);
+            } catch { /* A closed diagnostic stream must not discard the operation's result either. */ }
+            try {
+              emitEvent({ kind: 'lane-release-failed', daemon: 'operator-cli',
+                detail: { label, lane: lease.lane, session: lease.holder, repo: root } });
+            } catch { /* Best-effort event. */ }
+          }
+        }
+      }
     } catch {
       throw refusal;
     }

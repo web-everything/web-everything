@@ -1,4 +1,4 @@
-import { pidIdentity, pidIdentityStamp } from '../lib/pid-alive.mjs';
+import { pidIdentity, pidIdentityStamp, holderStartedBy } from '../lib/pid-alive.mjs';
 /**
  * @file scripts/conveyor/fix-dispatch-claim.mjs
  * @description #x0jphk5 (parent #4075, epic #3383) — THE REAL PER-(REPO, KIND, PR) CLAIM the fix-dispatch
@@ -86,8 +86,72 @@ import {
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
-import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
+import { readdirSync, statSync } from 'node:fs';
+import { dirname, join as joinPath, basename } from 'node:path';
+
+/** Newest activity (ms) of the holder: the SAME transcript-tail read the hung detector uses for the main transcript
+ *  (so a missing, unreadable or partly unparseable transcript is unknown, exactly as `readHungInfo` treats it), and the
+ *  newest mtime of any bound subagent transcript. Null = unknown; callers fail closed and keep the claim. */
+export function transcriptActivityMs(row, { tail = readTranscriptTailActivity, stat = statSync, list = readdirSync } = {}) {
+  let t;
+  try { t = tail(row, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 }); } catch { return null; }
+  if (!t || t.hadUnparseableLine || !Number.isFinite(t.lastActivityMs)) return null;
+  const file = t.file;
+  let newest = t.lastActivityMs;
+  const subDir = joinPath(dirname(file), basename(file, '.jsonl'), 'subagents');
+  let names;
+  try { names = list(subDir); } catch (e) {
+    if (e?.code === 'ENOENT' || e?.code === 'ENOTDIR') return newest; // no subagents were ever bound
+    return null; // unreadable child activity is unknown: fail closed
+  }
+  for (const f of names) {
+    if (!f.endsWith('.jsonl')) continue;
+    try { newest = Math.max(newest, stat(joinPath(subDir, f)).mtimeMs); } catch (e) {
+      if (e?.code === 'ENOENT') continue; // vanished between listing and stat
+      return null;
+    }
+  }
+  return newest;
+}
+import { readHungInfo, readTranscriptTailActivity, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
+import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+
+/** Resolve the idle-head release window and retain its effective policy provenance. */
+export function resolveIdleClaimRelease({ env = process.env, platform } = {}) {
+  if (platform === undefined) platform = readPlatformPreferences({ env }).prefs;
+  const rawMinutes = env?.WE_IDLE_CLAIM_RELEASE_MINUTES;
+  const rawEnabled = env?.WE_IDLE_CLAIM_RELEASE_ENABLED;
+  const c = cascadePolicy('fixLoop.idleClaimRelease', null, {
+    env, platform: platform?.fixLoop?.idleClaimRelease ?? null,
+    standard: { enabled: true, idleMinutes: 30 },
+    envValues: {
+      enabled: rawEnabled === '1' ? true : rawEnabled === '0' ? false : rawEnabled,
+      idleMinutes: typeof rawMinutes === 'string' && rawMinutes.trim() ? Number(rawMinutes) : rawMinutes,
+    },
+    valid: {
+      enabled: v => typeof v === 'boolean',
+      idleMinutes: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
+    },
+  });
+  return { ...c.value, sources: c.sources, invalid: c.invalid };
+}
+
+export function readPrHead({ repo, pr }) {
+  try {
+    const data = JSON.parse(execFileSyncThrottled('gh', [
+      'pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'headRefOid',
+    ], { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }));
+    return typeof data?.headRefOid === 'string' && data.headRefOid.trim() ? data.headRefOid : null;
+  } catch { return null; }
+}
+
+export function recordIdleRelease(event, recordEvent = appendDaemonEvent) {
+  try { void Promise.resolve(recordEvent(event)).catch(() => {}); } catch { /* event storage never interrupts the sweep */ }
+}
 
 // The light store helpers live in `fix-claim-store.mjs` (no dispatch graph — see its header); re-exported here so
 // every existing importer of this module is unchanged.
@@ -150,6 +214,17 @@ function readUnchangedClaim(lockRoot, resource, expected) {
   return current && current.owner === expected.owner
     && current.meta?.claimedAt === expected.meta?.claimedAt
     && current.meta?.runnerPid === expected.meta?.runnerPid ? current : null;
+}
+
+// A skipped observation breaks the idle window without renewing the lease. The store's rewrite accepts
+// an explicit timestamp: retain the freshly read heartbeat rather than recording this sweep's time.
+function clearClaimIdleHead(lockRoot, resource, expected) {
+  if (!Object.hasOwn(expected.meta ?? {}, 'idleHead')) return;
+  const current = readUnchangedClaim(lockRoot, resource, expected);
+  if (!current || !Object.hasOwn(current.meta ?? {}, 'idleHead')) return;
+  const meta = { ...current.meta };
+  delete meta.idleHead;
+  heartbeat(lockRoot, resource, current.owner, current.heartbeatAt, current.pid ?? null, meta);
 }
 
 /**
@@ -243,6 +318,10 @@ export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: na
  *  Well above any real fix/ci-heal run, and above `hung-session.mjs`'s own 30-min hung threshold. */
 export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
 
+/** Twenty minutes covers the observed 7–14 minute gaps between live daemon sweeps.
+ * A longer gap (daemon down or machine asleep) is unobserved time and must not count toward the idle release window. */
+export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
+
 /**
  * we:scripts/conveyor/fix-dispatch-claim.mjs#refreshLiveFixDispatchClaims — THE FIX for a claim outliving a
  * genuinely still-working session past its own TTL (see this file's own header). Called once per daemon tick
@@ -270,8 +349,17 @@ export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
  * Await records (we:scripts/conveyor/await-verify.mjs) keep deliberately ended turns live for their own
  * PR. They bypass terminal release but retain the owner re-read and four-hour refresh ceiling; successful
  * await heartbeats are also reported under `awaiting` (omitted when empty).
+ *
+ * When every non-terminal session row is idle, a readable PR head starts an `idleHead` clock in claim
+ * metadata. An unchanged head for the configured window releases the owner-checked claim and records an
+ * event. Head movement or an observation gap beyond 20 minutes restarts the clock; this bound covers the
+ * observed 7–14 minute live sweep cadence while excluding longer downtime or sleep gaps.
+ * Any sweep without an idle observation clears it without extending the lease on skipped claims, so recovery
+ * starts a full new window. Legacy clocks without
+ * `lastSeen` also restart. Runner-pid and awaiting-verify claims are exempt from idle release.
  * @param {{lockRoot?:string, listAgentsAll?:Function, hungInfoFor?:Function, hungThresholdMs?:number,
- *   awaitingVerifyFor?:Function|null, nowMs?:number, nowIso?:()=>string}} [o]
+ *   awaitingVerifyFor?:Function|null, idleRelease?:object, prHeadFor?:Function, recordEvent?:Function,
+ *   nowMs?:number, nowIso?:()=>string}} [o]
  * @returns {{checked:number, refreshed:Array<{repo:string, pr:number, kind:string, headSha:string|null, owner:string}>}}
  */
 export function refreshLiveFixDispatchClaims({
@@ -282,6 +370,10 @@ export function refreshLiveFixDispatchClaims({
   hungThresholdMs = resolveHungThresholdMs(),
   alive = isPidAlive,
   identity = pidIdentity,
+  activityMsFor = transcriptActivityMs,
+  idleRelease = resolveIdleClaimRelease(),
+  prHeadFor = readPrHead,
+  recordEvent = appendDaemonEvent,
   nowIso = () => new Date().toISOString(),
   nowMs = Date.parse(nowIso()),
 } = {}) {
@@ -296,16 +388,22 @@ export function refreshLiveFixDispatchClaims({
   const awaiting = [];
   for (const entry of claims) {
     const { repo, pr, kind, headSha = null, claimedAt = null } = entry.meta;
+    const resource = fixDispatchResource({ repo, pr, kind });
     const claimedMs = Date.parse(claimedAt ?? '');
-    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) continue;
+    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
     // fix-procedure (`kind:'fixing'`, `we:scripts/conveyor/fix-procedure.mjs`): the holder's session name is
     // `meta.who`, not a minted slug — minting one would THROW on the unknown kind and crash this whole sweep.
     // A claim whose name cannot be resolved is skipped (left to its own TTL), never thrown over.
     let name = null;
     if (kind === 'fixing') name = entry.meta.who ? String(entry.meta.who) : null;
     else { try { name = fixDispatchSessionName({ repo, pr, kind }); } catch { name = null; } }
-    if (!name) continue;
-    const resource = fixDispatchResource({ repo, pr, kind });
+    if (!name) {
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
     // A BORROWED (non-Claude) fix, or (117 S3b) a Claude fix / ci-heal run through the detached worker wrapper, has no
     // `claude agents` row: its liveness is its runner pid. Dead -> release now, with a reason; alive -> heartbeat.
     // (No pid stamped yet -> falls through to the plain TTL like any new claim.)
@@ -324,17 +422,33 @@ export function refreshLiveFixDispatchClaims({
         const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
         if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
       } else {
-        if (heartbeat(lockRoot, resource, cur.owner, heartbeatAt, cur.pid ?? null, cur.meta)) {
+        const meta = { ...cur.meta };
+        delete meta.idleHead;
+        if (heartbeat(lockRoot, resource, cur.owner, heartbeatAt, cur.pid ?? null, meta)) {
           refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
         }
       }
       continue;
     }
+    // Idle release only speaks for rows POSITIVELY bound to this claim (same sessionId, or — for a claim without
+    // one — started at/after the claim): an older same-named idle session must never release a newer dispatch.
+    const boundToClaim = (a) => (entry.meta.sessionId
+      ? a.sessionId === entry.meta.sessionId
+      : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
     const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && String(a.name ?? '') === name)
       .map((a) => {
         let info = null;
         try { info = hungInfoFor(a, nowMs, hungThresholdMs); } catch { info = null; }
-        return info?.hung === true ? { ...a, hung: true } : a;
+        if (info?.hung !== true) return a;
+        // The real hung detector flags a silent idle holder after the hung threshold (30 min by default), long
+        // before the idle-release quiet floor (90 min): marking it hung here would drop the row out of
+        // isClaimSessionLive and skip the idle-release code below forever. An idle row bound to THIS claim with no
+        // pending tool call is owned by that path (quietLongEnough, awaiting-verify and unchanged-head checks keep
+        // it fail closed). A hung verdict that names a pending call past its grace is kept as hung. The exemption defers
+        // to the idle-release path, so it only applies while that path is enabled: with it off (platform setting or
+        // WE_IDLE_CLAIM_RELEASE_ENABLED) a silent holder stays hung and its claim falls to the TTL, never held forever.
+        if (idleRelease.enabled && a.state === 'idle' && boundToClaim(a) && info.reason === 'stale-no-activity') return a;
+        return { ...a, hung: true };
       });
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
       try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
@@ -355,6 +469,7 @@ export function refreshLiveFixDispatchClaims({
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner });
         }
       }
+      clearClaimIdleHead(lockRoot, resource, entry);
       continue;
     }
     // A stale working row may point at a dead process, but reusable names alone cannot associate it with
@@ -366,7 +481,10 @@ export function refreshLiveFixDispatchClaims({
         || (!entry.meta.sessionId && Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs))
       && Number.isInteger(a.pid))) {
       const identities = nonTerminal.map((a) => {
-        try { return identity(a.pid); } catch { return null; }
+        // startedBy arms the pid-reuse guard (a process that launched after this row did is a different one);
+        // an unreadable start time passes null, which skips only that check — unknown identity still retains.
+        // (a wrapped worker's startedAt is its first launch, not its resumed child's: holderStartedBy returns null for it)
+        try { return identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) }); } catch { return null; }
       });
       if (identities.every((verdict) => verdict?.alive === false)) {
         if (readUnchangedClaim(lockRoot, resource, entry)) {
@@ -374,15 +492,58 @@ export function refreshLiveFixDispatchClaims({
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner,
             reason: `session-identity-dead (${identities[0].reason})` });
         }
+        clearClaimIdleHead(lockRoot, resource, entry);
         continue;
       }
+    }
+    // A holder whose transcript (or a bound subagent's) changed inside the idle window is working, however idle it
+    // reads at each sample; unreadable activity is unknown, so the claim is kept (fail closed).
+    const quietLongEnough = (a) => {
+      let at = null;
+      try { at = activityMsFor(a); } catch { at = null; }
+      // Minimum quiet = the hung detector's own pending-tool-call grace (threshold x multiplier, 90 min by default):
+      // a transcript is silent during a long foreground call, which is not idleness.
+      const quietMs = Math.max(idleRelease.idleMinutes * 60_000, hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER);
+      return Number.isFinite(at) && nowMs - at >= quietMs;
+    };
+    const isIdle = nonTerminal.length > 0
+      && nonTerminal.every((a) => a.state === 'idle' && boundToClaim(a) && quietLongEnough(a));
+    let idleHeadSha = null;
+    if (!isAwaiting && idleRelease.enabled && isIdle) {
+      try {
+        const sha = prHeadFor({ repo, pr });
+        if (typeof sha === 'string' && sha.trim()) idleHeadSha = sha;
+      } catch { /* unknown head: retain the claim and reset its idle clock below */ }
     }
     const heartbeatAt = nowIso();
     const current = readUnchangedClaim(lockRoot, resource, entry);
     if (!current) continue;
     // Write back the FRESHLY re-read entry (not the listing snapshot); a pre-`claimedAt` claim is stamped now so
     // the ceiling applies to it from here on.
-    const meta = current.meta?.claimedAt ? current.meta : { ...(current.meta ?? entry.meta), claimedAt: heartbeatAt };
+    const meta = { ...(current.meta ?? entry.meta), claimedAt: current.meta?.claimedAt || heartbeatAt };
+    if (idleHeadSha === null) delete meta.idleHead;
+    if (idleHeadSha !== null) {
+      const idleSince = meta.idleHead?.since;
+      const idleSinceMs = typeof idleSince === 'string' ? Date.parse(idleSince) : NaN;
+      const lastSeen = meta.idleHead?.lastSeen;
+      const lastSeenMs = typeof lastSeen === 'string' ? Date.parse(lastSeen) : NaN;
+      const restart = meta.idleHead?.sha !== idleHeadSha || !Number.isFinite(idleSinceMs)
+        || !Number.isFinite(lastSeenMs) || lastSeenMs < idleSinceMs || nowMs < lastSeenMs
+        || nowMs - lastSeenMs > MAX_IDLE_CLAIM_OBSERVATION_GAP_MS;
+      const observedAt = new Date(nowMs).toISOString();
+      meta.idleHead = { sha: idleHeadSha, since: restart ? observedAt : idleSince, lastSeen: observedAt };
+      if (!restart && nowMs - idleSinceMs >= idleRelease.idleMinutes * 60_000) {
+        const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+        if (result.released) {
+          released.push({ repo, pr, kind, owner: entry.owner,
+            reason: `idle-head-unmoved (${Math.floor((nowMs - idleSinceMs) / 60_000)}m, ${idleRelease.idleMinutes} from ${idleRelease.sources.idleMinutes})` });
+          recordIdleRelease({ kind: 'idle-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
+            detail: { kind, idleMinutes: idleRelease.idleMinutes, sources: idleRelease.sources,
+              headSha: idleHeadSha, idleSince, owner: entry.owner } }, recordEvent);
+        }
+        continue;
+      }
+    }
     if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
     if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
     refreshed.push({

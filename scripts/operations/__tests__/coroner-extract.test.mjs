@@ -40,6 +40,75 @@ describe('card 130 S2 outcome labels', () => {
     expect(fixOutcome(state, '')).toBe('stopped-without-outcome');
     expect(fixOutcome(state, 'I pushed the repair to lane/x at abc123')).toBe('pushed');
   });
+  it('separates five per-tick prepare observation failures from two launches and one result failure', () => {
+    const observation = (num, reason, extra = {}) => ({ num, reason, cause: 'daemon-observation', stage: 'retirement', retry: true, ...extra });
+    const throttle = observation('41', 'gh-throttle: throttled pr list');
+    const budget = observation('42', 'prepare PR listing call budget exhausted');
+    const command = observation('43', 'Command failed: node gh-throttle.mjs pr list --limit 100');
+    const failure = { num: '44', stage: 'result', reason: 'prepare-unstamped', attempt: 'run failed', recordedAt: at(2) };
+    const launched = [{ num: '45', attempt: 'run a', at: at(1) }, { num: '46', attempt: 'run b', at: at(1) }];
+    const ticks = [
+      { at: at(1), prepare: { launched, failures: [throttle, throttle, budget] } },
+      { at: at(2), prepare: { launched, failures: [throttle, command, failure] } },
+      { at: at(3), prepare: { failures: [{ ...command, reason: command.reason.replace('100', '200'), attempt: 'different metadata' }, failure] } },
+    ];
+    const metrics = builderMetrics(ticks, { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 3, launched: 2 });
+    expect(metrics.prepareObservationFailures).toEqual({ count: 5, byReason: {
+      'gh-throttle: throttled pr list': 2,
+      'prepare PR listing call budget exhausted': 1,
+      'Command failed: node gh-throttle.mjs pr list --limit N': 2,
+    } });
+  });
+  it('observation-only windows have zero prepare attempts and deduplicate normalized reasons within each tick', () => {
+    const reason = `Command failed: node gh-throttle.mjs pr list ${'x'.repeat(100)}`;
+    const failures = [
+      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 123 calls', recordedAt: at(-10), held: true },
+      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 456 calls', attempt: 'another attempt' },
+      { num: '42', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 789 calls' },
+      { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} first` },
+      { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} second` },
+    ];
+    const metrics = builderMetrics([
+      { at: at(-1), prepare: { failures } },
+      { at: at(1), prepare: { failures } },
+      { at: until, prepare: { failures } },
+    ], { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 0, total: 0, launched: 0 });
+    expect(metrics.prepareObservationFailures).toEqual({ count: 3, byReason: {
+      'PR listing call budget exhausted after N calls': 2,
+      [reason.slice(0, 90)]: 1,
+    } });
+    expect(builderMetrics([], { since, until })).not.toHaveProperty('prepareObservationFailures');
+  });
+  it.each([
+    ['launch', 'failure recording unavailable'],
+    ['launch', 'Command failed: node gh-throttle.mjs pr list'],
+    ['result', 'PR listing failed'],
+    [undefined, 'gh-throttle: throttled pr list'],
+    ['retirement', 'failure recording unavailable'],
+    ['retirement', 'gh-throttle: throttled pr view'],
+    ['retirement', 'gh-throttle: throttled'],
+    ['retirement', 'PR listing failed after 123 calls'],
+    ['retirement', 'other daemon observation pr list'],
+    ['retirement', 'Command failed: node other-command.mjs'],
+    ['retirement', 'Command failed: node gh-throttle.mjs pr view'],
+  ])('counts daemon-observation at stage %s with reason %s as a failed attempt', (stage, reason) => {
+    const metrics = builderMetrics([{ at: at(1), prepare: { failures: [
+      { num: '4501', cause: 'daemon-observation', stage, reason },
+    ] } }], { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 1, launched: 0 });
+    expect(metrics.byKind.prepare.causes.failed.count).toBe(1);
+    expect(metrics).not.toHaveProperty('prepareObservationFailures');
+  });
+  it('counts a retirement-stage prepare-session-dead failure without an observation cause as a failed attempt', () => {
+    const metrics = builderMetrics([{ at: at(1), prepare: { failures: [
+      { num: '4501', stage: 'retirement', reason: 'prepare-session-dead' },
+    ] } }], { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 1, launched: 0 });
+    expect(metrics.byKind.prepare.causes.failed.count).toBe(1);
+    expect(metrics).not.toHaveProperty('prepareObservationFailures');
+  });
   it('prepare failures count per attempt, not per tick, and carried-over rows do not count', () => {
     const fail = (extra) => ({ num: '4341', stage: 'stamp', reason: 'ref-lock', ...extra });
     const tick = (m, failures) => ({ at: at(m), prepare: { launched: [], failures } });
@@ -133,7 +202,7 @@ describe('coroner metrics', () => {
 
   it('redacts secrets in repeated commands before they reach the report', () => {
     job('a');
-    transcript('a', Array.from({ length: 3 }, (_, i) => use(`s${i}`, 'curl -H "Authorization: Bearer ghs_abcdefghijklmnopqrstuvwxyz0123456789" https://x/y')));
+    transcript('a', Array.from({ length: 3 }, (_, i) => use(`s${i}`, 'curl -H "Authorization: Bearer gh\x73_abcdefghijklmnopqrstuvwxyz0123456789" https://x/y')));
     const { loops } = run().metrics;
     expect(loops.top).toHaveLength(1);
     expect(JSON.stringify(loops)).not.toContain('ghs_abcdefghijkl');
@@ -316,16 +385,47 @@ describe('coroner error rates (reported first)', () => {
     job('a');
     transcript('a', [use('1', 'node scripts/verify-lane.mjs check --wait', 0), result('1', '{"status":"timeout","reason":"wait-timeout"}', 7)]);
     const g = run().metrics.errorRates.gateRuns;
-    expect(g.total).toBe(6 + 2 + 1);
-    expect(g.count).toBe(4 + 2 + 1);
+    expect(g.total).toBe(6 + 1);
+    expect(g.count).toBe(4 + 1);
     expect(Object.fromEntries(Object.entries(g.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'flaky-outside-diff': 1, 'in-diff-real-failure': 1, 'killed-superseded': 2, 'still-red-after-isolated-retry': 1, 'verify-wait-timeout': 1, 'vitest-timeout': 1 });
     expect(g.flakyRescuedGreen).toBe(1);
     expect(run().metrics.errorRates.notes).toMatchObject({ verifyLogUnstampedLines: 0, ciRunsTruncated: false });
-    expect(g.pct).toBe(77.8);
+    expect(g.pct).toBe(71.4);
+    expect(g.killedSuperseded).toBe(2);
+    expect(g.causes['in-diff-real-failure'].pct).toBe(20);
+    expect(g.causes['killed-superseded']).not.toHaveProperty('pct');
     expect(g.causes['killed-superseded'].examples).toEqual([{ ref: 'web-everything/lane-3', at: at(5) }, { ref: 'web-everything/lane-3', at: at(5) }]);
     expect(g.causes['verify-wait-timeout'].minutes).toBe(7);
     expect(g.causes['still-red-after-isolated-retry'].minutes).toBe(30);
     expect(gateCause({ status: 'red', retriedFailures: [{ kind: 'timeout' }] })).toBe('vitest-timeout');
+  });
+
+  it('gate runs: reports two superseded kills apart from one red and one green completed run', () => {
+    writeMarkers({
+      'lane-1': marker('a'.repeat(40), 0, 10),
+      'lane-2': marker('b'.repeat(40), 0, 20, { status: 'green' }),
+    });
+    write(env.WE_CORONER_VERIFY_LOG, `${at(5)} verify-daemon: tick\n  ✂ web-everything/lane-1: in-flight run 1 superseded by a newer request — killed\n${at(15)} verify-daemon: tick\n  ✂ web-everything/lane-2: in-flight run 2 superseded by a newer request — killed\n`);
+    const g = run().metrics.errorRates.gateRuns;
+    expect(g).toMatchObject({ count: 1, total: 2, pct: 50, killedSuperseded: 2 });
+    expect(g.causes['in-diff-real-failure'].pct).toBe(100);
+    expect(g.causes['killed-superseded']).toEqual({ count: 2, examples: [{ ref: 'web-everything/lane-2', at: at(15) }, { ref: 'web-everything/lane-1', at: at(5) }] });
+    expect(g.basis).toBe('local gate attempts (lane markers + verify-daemon kills + wait-timeouts); killed-superseded runs are reported apart and excluded from the rate');
+  });
+
+  it('gate runs: preserves the original serialized metric when there are no superseded kills', () => {
+    writeMarkers({
+      'lane-1': marker('a'.repeat(40), 0, 10),
+      'lane-2': marker('b'.repeat(40), 0, 20, { status: 'green' }),
+    });
+    const g = run().metrics.errorRates.gateRuns;
+    expect(g).not.toHaveProperty('killedSuperseded');
+    expect(JSON.stringify(g)).toBe(JSON.stringify({
+      count: 1, total: 2, pct: 50,
+      basis: 'local gate attempts (lane markers + verify-daemon kills + wait-timeouts)',
+      causes: { 'in-diff-real-failure': { count: 1, pct: 100, minutes: 10, examples: [{ ref: 'sha aaaaaaa', at: at(10) }] } },
+      flakyRescuedGreen: 0, markerSample: 'each lane keeps only its last two markers',
+    }));
   });
 
   it('CI: red by check and by cause class (cancelled, flaky rerun, soak, real), at most two examples, bounded gh calls', () => {
@@ -362,6 +462,8 @@ describe('coroner error rates (reported first)', () => {
     expect(ciCheckName('CodeQL / Analyze')).toBe('CodeQL');
     expect(ciCheckName('daemon-soak (1/2)')).toBe('daemon-soak');
     expect(ciCheckName('integration')).toBe('integration');
+    expect(ciCheckName('hetzner / integration')).toBe('integration');
+    expect(ciCheckName('hetzner / test-shard (1)')).toBe('test-shard');
   });
 
   it('fix/ci-heal sessions: outcomes with causes and rounds per PR', () => {

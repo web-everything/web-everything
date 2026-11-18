@@ -3,8 +3,8 @@
  * @file scripts/ci/quarantine-skip.mjs
  * @description CI's red-main QUARANTINE skip step (card xx7ckd6 N1; the rules are pure in
  *   we:scripts/lib/red-main-quarantine.mjs#decideCiSkip). Prints the vitest args that skip the quarantined test files
- *   for THIS job — `--exclude=<file> …` on one line, or an empty line — for the unit, integration and soak steps of
- *   we:.github/workflows/ci.yml to append to their `npm run` line.
+ *   for THIS job — one `--exclude=<file>` or `--exclude={a,b,…}` argument, or an empty line — for the unit,
+ *   integration and soak steps of we:.github/workflows/ci.yml to append to their `npm run` line.
  *
  *   The list is read FRESH from the `ops/quarantine` branch at job start (`git fetch` of that ref,
  *   we:scripts/lib/red-main-quarantine-io.mjs#readQuarantine), NEVER from the PR's own tree, so a PR cannot add an
@@ -41,13 +41,39 @@ const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', st
  */
 export const firstSet = (...vs) => { for (const v of vs) if (v != null && String(v).trim() !== '') return String(v).trim(); return null; };
 
-/** The files this PR changes against its base (`origin/<base>...HEAD`), or `null` when not provable. */
+/**
+ * The files this PR changes against its base (`origin/<base>...HEAD`), or `null` when not provable. Fails CLOSED under
+ * shallow history: the merge base must resolve, deepening the history (bounded, blobless) if it does not; if it still
+ * cannot be proven the caller gets `null` and runs every test instead of skipping.
+ */
 export function changedFilesOf({ board, base, run = git }) {
   if (!base) return null;
   try {
     run(['fetch', '--quiet', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`], board);
+    const hasBase = () => { try { return run(['merge-base', `origin/${base}`, 'HEAD'], board).trim() !== ''; } catch { return false; } };
+    if (!hasBase()) {
+      for (const depth of [200, 1000, 10000]) {
+        try { run(['fetch', '--quiet', '--no-tags', '--filter=blob:none', `--deepen=${depth}`, 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`], board); } catch { /* try next */ }
+        if (hasBase()) break;
+      }
+      if (!hasBase()) return null;
+    }
     return run(['diff', '--name-only', `origin/${base}...HEAD`], board).split('\n').map((s) => s.trim()).filter(Boolean);
   } catch { return null; }
+}
+
+/**
+ * Render one literal path or a brace union: Vitest 1.6's CLI rejects repeated --exclude options.
+ * Only plain repo-path characters are allowed, so glob syntax or shell word splitting cannot widen the set.
+ * Refused paths must run instead; the caller reports them. PURE.
+ * @returns {{line:string, refused:string[]}}
+ */
+export function renderExclude(files) {
+  const safe = [], refused = [];
+  for (const file of files) {
+    (file.length > 0 && !/[^\w./@-]/u.test(file) ? safe : refused).push(file);
+  }
+  return { line: safe.length === 0 ? '' : `--exclude=${safe.length === 1 ? safe[0] : `{${safe.join(',')}}`}`, refused };
 }
 
 /**
@@ -75,7 +101,13 @@ export function quarantineSkip({
       : (ctx.known && !ctx.onMain ? changedOf({ board, base }) : null);
   const d = decideCiSkip({ mode: mode.value, read: r, ctx, changedFiles, now, job: firstSet(flags.job) });
   const why = `${d.why}${d.unsupported?.length ? `; ${d.unsupported.length} name-qualified entr${d.unsupported.length === 1 ? 'y' : 'ies'} not skipped (vitest --exclude is per file)` : ''}`;
-  return { line: (flags.nonblocking ? d.skip : d.skip.map((f) => `--exclude=${f}`)).join(' '), why, skip: d.skip };
+  if (flags.nonblocking) return { line: d.skip.join(' '), why, skip: d.skip };
+  const { line, refused } = renderExclude(d.skip);
+  return {
+    line,
+    why: `${why}${refused.length ? `; ${refused.length} file(s) not skipped (unsafe exclude paths; running): ${JSON.stringify(refused)}` : ''}`,
+    skip: d.skip.filter((file) => !refused.includes(file)),
+  };
 }
 
 function flagsOf(argv) {

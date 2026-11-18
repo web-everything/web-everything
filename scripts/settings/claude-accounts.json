@@ -1,0 +1,10 @@
+{
+  "_doc": "Claude account split (auth-split PR1). accounts: Keychain items holding a long-lived token (type oauth -> CLAUDE_CODE_OAUTH_TOKEN, apikey -> ANTHROPIC_API_KEY); no secrets live in this file. daemons: launchd label (XPC_SERVICE_NAME) -> account id; EMPTY in PR1, so nothing changes. \"*\": the default for an unmapped com.we.* / com.plateau.* label: \"refuse\" (never fall back to /login), but it is only effective when enforce is true (false in PR1). Interactive and non-launchd sessions always resolve to none.",
+  "accounts": {
+    "a": { "service": "we.claude-code.oauth", "account": "acct-a", "type": "oauth" },
+    "b": { "service": "we.claude-code.oauth", "account": "acct-b", "type": "oauth" }
+  },
+  "daemons": {},
+  "*": "refuse",
+  "enforce": false
+}

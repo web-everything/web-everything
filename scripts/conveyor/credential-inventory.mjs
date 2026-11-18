@@ -23,9 +23,10 @@ export function normalizeInventory(input = {}) {
   for (const r of input.ciFindings || []) if (repoName(r?.repo) && Number.isSafeInteger(r.runId) && r.runId > 0 && Number.isSafeInteger(r.attempt) && r.attempt > 0 && typeof r.badCredentials === 'boolean' && timestamp(r.observedAt)) {
     findings.push({ repo: r.repo, runId: r.runId, attempt: r.attempt, workflow: text(r.workflow), runUrl: `https://github.com/${r.repo}/actions/runs/${r.runId}`, observedAt: timestamp(r.observedAt), badCredentials: r.badCredentials });
   }
+  const secrets = [...rows.values()].sort((a, b) => `${a.repo}/${a.name}`.localeCompare(`${b.repo}/${b.name}`));
   return { schemaVersion: 1, checkedAt: timestamp(input.checkedAt), lookbackHours: Number.isFinite(input.lookbackHours) && input.lookbackHours > 0 ? input.lookbackHours : 24,
     repositories: (input.repositories || []).filter((r) => repoName(r?.repo)).map((r) => ({ repo: r.repo, secrets: coverage(r.secrets), ci: coverage(r.ci) })),
-    secrets: [...rows.values()].sort((a, b) => `${a.repo}/${a.name}`.localeCompare(`${b.repo}/${b.name}`)), ciFindings: findings };
+    secrets, ciFindings: findings };
 }
 function errorCode(e) {
   if (e?.code === 'ETIMEDOUT' || e?.signal === 'SIGTERM') return 'timeout';

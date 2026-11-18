@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/dispatch-lane.mjs
  * @description THE `dispatch-lane` DECLARATION — the effect that STARTS rather than completes (#3037, epic #3029).
@@ -66,6 +67,10 @@ import { mintSessionSlug, PR_KINDS } from '../conveyor/session-slug.mjs';
 import { op } from './registry.mjs';
 // #3717 — the `taskType` derivation. PURE and import-free, which is why the DECLARATION may hold it.
 import { taskTypeFor } from '../lib/dispatch-task-type.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+// ONE glob-overlap rule shared with the backlog loader (`src/_data/backlog.js` normalizeScope): a drifted copy let
+// the loader leave dispatch-accepted entries unsplit, which hid them from planner lease/rival exclusion.
+import scopeGlobOverlap from '../lib/scope-glob-overlap.cjs';
 // #3224 — the raw invocation this operation declares over. Declared in ONE place and read by two
 // consumers: `op()` validates its shape here, and the skill-wiring scan reads the same map.
 import { DECLARED_HOMES } from './declared-homes.mjs';
@@ -409,6 +414,75 @@ export const BRIEF_VALUE_RE = /^[A-Za-z0-9_.,:/@#-]+$/;
  */
 export const BRIEF_SCOPE_VALUE_RE = /^[A-Za-z0-9_.,:/@#*-]+$/;
 
+// Mirror repo-profile's scope aliases without importing its filesystem-backed profile resolver into this
+// pure declaration. The dispatch tests pin these values against repoProfile(...).canonicalPrefix.
+export const SCOPE_PREFIX_ALIASES = Object.freeze({ webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau', pa: 'plateau' });
+const CANONICAL_SCOPE_REPOS = new Set(Object.values(SCOPE_PREFIX_ALIASES));
+function canonicalScopePrefix(value) {
+  const lower = String(value).toLowerCase();
+  const key = repoKeyForSlug(lower) ?? lower;
+  return Object.hasOwn(SCOPE_PREFIX_ALIASES, key) ? SCOPE_PREFIX_ALIASES[key] : key;
+}
+
+function refuseMultiPathGlobs(parts, dispatchRepo = 'we') {
+  // A file plus test globs (`a.mjs __tests__/a*.test.mjs`) is the normal card shape (#4701) and is accepted, in one
+  // entry or as separate entries, and so are several globs whose fixed leading paths cannot meet
+  // (`explore-io*` and `dispatch-lane-io*`). Only globs inside ONE authored entry that COULD overlap are refused:
+  // the lease matcher cannot judge glob-vs-glob overlap, and flattening would hide that behind a clean list.
+  // Cross-entry glob-vs-glob overlap is pre-existing (R412), carded; the lease matcher does not judge it.
+  // The rule itself lives in scripts/lib/scope-glob-overlap.cjs, shared with the backlog loader, which splits an
+  // entry into separate canonical entries exactly when this check passes.
+  if (scopeGlobOverlap.entryGlobsMayMeet(parts, (prefix) => canonicalScopePrefix(prefix || dispatchRepo))) {
+    throw new Error('dispatch-lane: unsafe scope entry — two globs in one multi-path scope entry could overlap for {{SCOPE}}; use explicit paths, globs with disjoint leading paths, or a directory scope.');
+  }
+}
+
+/**
+ * R372 — a card's `scope:` entry may name several paths in one string (`a.mjs b.mjs`): split every entry on
+ * whitespace or commas, so the lane-lease consumer still gets the comma-joined list it expects. Each piece is
+ * checked against {@link BRIEF_SCOPE_VALUE_RE}, then refused if it carries a `..` segment or is absolute (with or
+ * without a `repo:` prefix). FAIL CLOSED: one bad piece throws for the whole scope.
+ */
+export function normalizeBriefScope(raw, dispatchRepo = 'we') {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const entry of raw) {
+    // a piece with no `repo:` prefix inherits the nearest earlier prefix of the SAME entry, so `we:a.mjs b.mjs`
+    // is `we:a.mjs,we:b.mjs` and the lease overlap check sees both paths in the repo they belong to.
+    let inherited = '';
+    const parts = String(entry ?? '').split(/[\s,]+/).filter(Boolean);
+    refuseMultiPathGlobs(parts, dispatchRepo);
+    for (const raw0 of parts) {
+      const own = /^[A-Za-z][\w-]*:/.exec(raw0)?.[0] ?? '';
+      if (own) inherited = own;
+      const piece = own ? raw0 : inherited + raw0;
+      if (!BRIEF_SCOPE_VALUE_RE.test(piece)) {
+        throw new Error(
+          `dispatch-lane: the value for {{SCOPE}} (${JSON.stringify(piece)}) has characters the brief cannot carry `
+          + 'safely — it is pasted into a shell command the agent is told to run. Refusing.',
+        );
+      }
+      const prefix = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+      // Authored spelling stays on the card for display; scheduling and the brief receive a canonical prefix.
+      const segments = piece.slice(prefix.length).split('/');
+      if (segments.at(-1) === '') segments.pop(); // one trailing slash = "this directory"
+      // absolute, empty (`//`), `.` and `..` segments are refused: the lease matcher compares literal paths, so a
+      // non-canonical spelling would escape overlap exclusion.
+      if (!segments.length || segments.some((seg) => seg === '' || seg === '.' || seg === '..')) {
+        throw new Error(`dispatch-lane: unsafe scope entry ${JSON.stringify(piece)} — absolute, empty, \`.\` and \`..\` path segments are refused for {{SCOPE}}.`);
+      }
+      const repo = canonicalScopePrefix(prefix ? prefix.slice(0, -1) : dispatchRepo);
+      // Known aliases were canonicalized above; anything still outside the canonical set is an unknown prefix and
+      // is refused (an unqualified path never gets here with a foreign repo: it takes `dispatchRepo`, the locus).
+      if (!CANONICAL_SCOPE_REPOS.has(repo)) {
+        throw new Error(`dispatch-lane: unknown scope repo prefix ${JSON.stringify(prefix || dispatchRepo)} for {{SCOPE}} — use we:, fui: or plateau: (or a known alias).`);
+      }
+      out.push(`${repo}:${piece.slice(prefix.length)}`);
+    }
+  }
+  return out;
+}
+
 /**
  * What `{{GATE_COMMAND}}`/`{{ATTRIBUTION}}` (#3960) may contain — WIDER than {@link BRIEF_VALUE_RE} on
  * purpose, and for a different reason than that regex's own id/path/lane-number shape.
@@ -529,6 +603,15 @@ export function attemptTagFor(priorAttempts) {
   return String.fromCharCode(97 + Math.min(Math.trunc(n), 25));
 }
 
+/** Validate raw task text before policy or operator instructions can mask an empty template. */
+export function assertBriefTemplateContent(template) {
+  const text = String(template ?? '');
+  if (!text.trim()) {
+    throw new Error('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
+  }
+  return text;
+}
+
 /**
  * FILL an agent brief. PURE.
  *
@@ -596,10 +679,7 @@ export function fillBrief(
   optionalNames = OPTIONAL_BRIEF_PLACEHOLDERS,
   valuePatterns = {},
 ) {
-  const text = String(template ?? '');
-  if (!text.trim()) {
-    throw new Error('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
-  }
+  const text = assertBriefTemplateContent(template);
   for (const name of requiredNames) {
     const value = values[name];
     const blank = value === undefined || value === null || String(value).trim() === '';
@@ -1069,7 +1149,6 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   }
   const item = raw.item && typeof raw.item === 'object' ? raw.item : null;
   const specPath = String(item?.specPath || '').trim();
-  const itemScope = Array.isArray(item?.scope) ? item.scope.map(String).filter(Boolean) : [];
   if (blocked('item-spec', !specPath, specPath)) {
     throw new Error(`dispatch-lane.read: no backlog file resolved for #${resolvedNum} — the brief needs the item's spec path`);
   }
@@ -1097,6 +1176,10 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   // so that is the scope the lane ends up holding; this value is what the run record says was declared. The
   // card (#3165) sets one rule for both prepare kinds, so this is recorded rather than silently widened.
   const repairsExistingPr = launchKind === 'fix' || launchKind === 'ci-heal';
+  // Preparation/investigation lease the card itself and may be repairing its malformed scope.
+  // Validate item.scope only when it supplies the lane lease and the brief's SCOPE value.
+  const dispatchRepo = raw.repoTokens?.REPO ?? 'we';
+  const itemScope = launchKind === 'build' || repairsExistingPr ? normalizeBriefScope(item?.scope, dispatchRepo) : [];
   const scope = launchKind === 'build' || repairsExistingPr ? [...itemScope] : [`we:${specPath}`];
   if (launchKind === 'prepare-item' || launchKind === 'build') {
     for (const member of groupMembers) {
@@ -1107,10 +1190,13 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
       if (launchKind === 'prepare-item') scope.push(`we:${card.specPath}`);
       else {
         if (!Array.isArray(card.scope) || !card.scope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
-        for (const path of card.scope) if (!scope.includes(path)) scope.push(path);
+        const memberScope = normalizeBriefScope(card.scope, dispatchRepo);
+        if (!memberScope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
+        for (const path of memberScope) if (!scope.includes(path)) scope.push(path);
       }
     }
   }
+  // Each build/repair card was checked by normalizeBriefScope before flattening; the union has no entry boundaries.
   if (blocked('scope', (launchKind === 'build' || repairsExistingPr) && !itemScope.length, { launchKind, scope })) {
     // Unreachable through the core (`dispatch-plan` holds an unscoped item `unshaped-no-scope` and auto-prepares
     // it, so it never reaches `spawnBuilds`, `spawnFixes` or `spawnCiHeals`) — refused anyway, because an empty
@@ -1246,7 +1332,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
     // From the reader's card-record decision (planOperatorPostBuild), never a search of the filled prompt, which
     // card-influenced text can reach. A build only: no other kind composes post-build steps.
     operatorPostBuild: launchKind === 'build' && raw.operatorPostBuild === true,
-    prompt: brief.prompt,
+    prompt: renderNoPromptCommandRules(brief.prompt, launchKind),
     // REPORTED, never fatal — see `fillBrief`. Two of these are the brief's own prose today.
     briefUnknownTokens: brief.unknownTokens,
     // THE PR THIS DISPATCH REPAIRS, and (CI-heal only) WHY — riding the `read` finding so the effect payload

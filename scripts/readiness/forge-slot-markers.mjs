@@ -1,0 +1,578 @@
+// Remote slot execution markers (`slot-N.unconfirmed`): written BEFORE a Forge dispatch and removed only when the
+// remote run is confirmed finished. A client that dies mid-run leaves its marker behind, and the old code kept it
+// forever, so a few dead clients walled off the whole cap while Forge sat idle ("remote-full" with load ~0.5).
+// A marker is reaped here only on liveness evidence: its owner process is provably dead AND Forge's own fresh
+// telemetry cannot account for it as a still-running remote run. Nothing is ever reaped on age alone.
+import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
+import {randomBytes} from 'node:crypto';
+import {join} from 'node:path';
+import {readLockEntry, lockDirFor} from './file-locks.mjs';
+import {probePidLiveness} from './pid-liveness.mjs';
+
+export const MARKER_GRACE_MS = 120_000;
+// The Forge sample must be taken this long AFTER the owner was first seen dead: it covers Forge-vs-Mac clock skew and
+// a receipt created between Forge's receipt listing and its timestamp, so a sample can never predate a surviving run.
+export const DEATH_SAMPLE_MARGIN_MS = 90_000;
+// R1017: accepted observation grace for run-less dead-owner release with complete ownership-window evidence.
+export const RUNLESS_DEAD_GRACE_MS = 15 * 60_000;
+export const FINISH_RETRY_MS = 30_000;
+export const FINISH_TIMEOUT_MS = 10_000;
+const NAME = /^slot-(\d+)\.unconfirmed$/;
+const HELD_NAME = /^slot-(\d+)\.unconfirmed(?:\.held-[0-9a-f]{16})?$/;
+
+/**
+ * New markers carry their owner pid so a later client can prove the owner is dead. `run` (the Forge run id) is added once known.
+ * The trace tags (caller, lane, pr) are advisory: the writer drops any tag the reader would reject, because one rejected
+ * tag makes the whole marker unreadable and so never reaped (a slot stuck for good). The SAME predicates judge both sides.
+ */
+export function markerContent({owner, pid, nowMs, host, run, caller, lane, pr}) {
+  const tagCaller = normalizeCaller(caller);
+  // The core fields get the reader's own checks too: an omitted field is tolerated, a malformed one would make the marker unreadable.
+  return JSON.stringify({v: 1, note: 'remote termination unconfirmed',
+    ...(typeof host === 'string' ? {host} : {}), ...(typeof owner === 'string' ? {owner} : {}),
+    ...(Number.isInteger(pid) ? {pid} : {}), ...(Number.isFinite(nowMs) ? {at: nowMs} : {}),
+    ...(typeof run === 'string' && RUN.test(run) ? {run} : {}), ...(tagCaller ? {caller: tagCaller} : {}),
+    ...(validLane(lane) ? {lane} : {}), ...(validPr(pr) ? {pr} : {})}) + '\n';
+}
+
+const CLOCK_SKEW_MS = 60_000;
+const LEGACY_TEXT = 'remote termination unconfirmed';
+const RUN = /^r-[a-f0-9]{32}(?![\s\S])/;
+const NONCE = /^[a-f0-9]{32}(?![\s\S])/;
+const SLOT = /^forge-exec(?:-[1-9]\d*)?(?![\s\S])/;
+const NUMBERED_SLOT = /^forge-exec-[1-9]\d*(?![\s\S])/;
+const shortText = v => typeof v === 'string' && v.length > 0 && v.length <= 200 && !/[\x00-\x1f\x7f]/.test(v);
+// ppid is advisory provenance: 0 is real (the parent lives outside this PID namespace), so only a non-integer or negative is malformed.
+const CALLER_FIELDS = {kind: shortText, session: shortText, ppid: v => Number.isSafeInteger(v) && v >= 0,
+  cmd: v => shortText(v) && v.length <= 40 && !/[\s/\\]/.test(v)};
+const validCallerField = (k, value) => Object.hasOwn(CALLER_FIELDS, k) && CALLER_FIELDS[k](value);
+const validCaller = v => v && typeof v === 'object' && !Array.isArray(v)
+  && Object.entries(v).every(([k, value]) => validCallerField(k, value));
+const validLane = v => Number.isSafeInteger(v) && v >= 0 || shortText(v);
+const validPr = v => Number.isSafeInteger(v) && v > 0;
+/** The caller tag with every field the reader would reject dropped; undefined when nothing valid is left. */
+function normalizeCaller(caller) {
+  if (!caller || typeof caller !== 'object' || Array.isArray(caller)) return undefined;
+  const kept = Object.fromEntries(Object.entries(caller).filter(([k, value]) => validCallerField(k, value)));
+  return Object.keys(kept).length ? kept : undefined;
+}
+
+/** Synchronous, advisory crash evidence; owner binding prevents writing over a successor's evidence. */
+export function recordMarkerExit(file, {owner, code = null, signal = null, at}) {
+  try {
+    if (JSON.parse(readFileSync(file, 'utf8'))?.owner !== owner) return;
+    writeFileSync(`${file}.exit`, JSON.stringify({owner, code, signal, at}) + '\n', {mode: 0o600});
+  } catch { /* exit and signal handlers must never throw */ }
+}
+
+const exitWatchers = new WeakMap();
+/** Per remote root: finish attempt times, logged failures and finished run:nonce keys, shared by every reaper. */
+const sharedFinishState = new Map();
+const FINISH_STATE_MAX = 1024;
+/** One synchronous exit listener per client, including markers retained after an unconfirmed return. */
+export function watchMarkerExit({files, owner, clock = Date.now, client = process}) {
+  let registry = exitWatchers.get(client);
+  if (!registry) {
+    const entries = new Map();
+    const onExit = code => { for (const entry of entries.values()) entry.record(code); };
+    registry = {entries, onExit};
+    exitWatchers.set(client, registry);
+    client.on('exit', onExit);
+  }
+  let lastSignal = null;
+  const record = (code, signal = lastSignal) => {
+    try {
+      lastSignal = signal;
+      for (const file of files) recordMarkerExit(file, {owner, code, signal, at: clock()});
+    } catch { /* advisory, including in process exit */ }
+  };
+  const key = files[0];
+  const entry = {record};
+  registry.entries.set(key, entry);
+  return {record, stop() {
+    if (registry.entries.get(key) === entry) registry.entries.delete(key);
+    if (!registry.entries.size) {
+      client.removeListener('exit', registry.onExit);
+      exitWatchers.delete(client);
+    }
+  }};
+}
+
+function sidecarExit(file, owner) {
+  try {
+    const saved = JSON.parse(readFileSync(`${file}.exit`, 'utf8'));
+    if (saved?.owner === owner && Number.isFinite(saved.at)
+      && (saved.code === null || Number.isInteger(saved.code) && saved.code >= 0 && saved.code <= 255)
+      && (saved.signal === null || ['SIGTERM', 'SIGINT', 'SIGHUP'].includes(saved.signal))) return saved;
+  } catch { /* advisory only */ }
+  return 'no-exit-record';
+}
+
+/**
+ * Record the Forge run id beside this client's marker, in a sidecar bound to the marker's owner. The marker file itself is
+ * never rewritten (a reaper may be judging its inode), and a stale sidecar of another owner is ignored.
+ */
+export function recordMarkerRun(file, {owner, run, nonce, slot}) {
+  if (typeof run !== 'string' || !RUN.test(run) || (nonce !== undefined && (typeof nonce !== 'string' || !NONCE.test(nonce)))
+    || (slot !== undefined && (typeof slot !== 'string' || !SLOT.test(slot)))) return false;
+  const tmp = `${file}.run-${randomBytes(6).toString('hex')}`;
+  try {
+    if (JSON.parse(readFileSync(file, 'utf8'))?.owner !== owner) return false;
+    writeFileSync(tmp, JSON.stringify({owner, run, ...(nonce !== undefined ? {nonce} : {}), ...(slot !== undefined ? {slot} : {})}) + '\n', {flag: 'wx', mode: 0o600});
+    renameSync(tmp, `${file}.run`);
+    return true;
+  } catch { try { unlinkSync(tmp); } catch { /* none */ } return false; }
+}
+
+function sidecarRun(file, owner) {
+  try {
+    const saved = JSON.parse(readFileSync(`${file}.run`, 'utf8'));
+    return saved?.owner === owner && typeof saved.run === 'string' && RUN.test(saved.run)
+      && (saved.nonce === undefined || typeof saved.nonce === 'string' && NONCE.test(saved.nonce))
+      && (saved.slot === undefined || typeof saved.slot === 'string' && SLOT.test(saved.slot)) ? saved : null;
+  } catch { return null; }
+}
+
+/**
+ * What Forge's recent-run telemetry says about one run: `finished` (a settled result), `inflight` (listed
+ * without a code), `absent` (not listed, with no active runs) or `unknown` (incomplete evidence).
+ * The caller guarantees sample freshness (and the reaper also requires its owner-death margin).
+ */
+export function runVerdict(telemetry, run) {
+  const evidence = recentEvidence(telemetry, run);
+  if (!evidence) return 'unknown';
+  const entry = telemetry.recent.find(item => item?.runId === run);
+  // A normal result is published only after the worker tree exits and its receipt is written. The
+  // prepared/running state can linger until finish, so activeRunIds alone cannot override that result.
+  if (evidence.active && (!Number.isInteger(entry?.code) || entry.code === 97 || entry.code === 254)) return 'inflight';
+  if (!entry) return evidence.complete ? 'absent' : 'unknown';
+  // The install/supervisor catch paths publish 97/254 even when descendants may survive. Their executing lock
+  // and prepared/running state remain until finish confirms worker cleanup. Only zero active runs proves that
+  // cleanup through this telemetry schema; it has no per-run cleanup field. A normal exit using either code
+  // is deliberately treated conservatively too.
+  if ((entry.code === 97 || entry.code === 254) && !evidence.complete) return 'unknown';
+  if (Number.isInteger(entry.code)) return 'finished';
+  // R475: a run listed without a result is only 'inflight' while Forge reports some active run. With ZERO active runs
+  // (Forge's own count, sampled after the owner died) nothing is executing: the run was prepared and never started,
+  // and its dead owner can never send the `run` request. That is positive proof the slot is idle.
+  return evidence.complete ? 'idle' : 'inflight';
+}
+
+// Forge caps `recent` at the newest 50 receipts (forge-exec-run.mjs#parseTelemetry). An older run can still be
+// executing outside that window. A finished prepare can leave code:null in recent, so matching counts do not prove
+// membership. Without an authoritative list of active run IDs, only zero active runs can establish completeness.
+function recentEvidence(telemetry, run) {
+  if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0 || !Array.isArray(telemetry.recent)) return null;
+  const runs = new Set();
+  for (const item of telemetry.recent) {
+    if (!item || typeof item.runId !== 'string' || !RUN.test(item.runId)
+      || runs.has(item.runId) || typeof item.startedAtET !== 'string' || !Number.isFinite(Date.parse(item.startedAtET))
+      || !(item.code === null || (Number.isInteger(item.code) && item.code >= 0 && item.code <= 255))) return null;
+    runs.add(item.runId);
+  }
+  // R518: activeRunIds (optional; an older Forge omits it) is Forge's own list of active runs. When present it must be
+  // well formed and match the count, else the evidence is unknown. A run missing from it is not executing.
+  const ids = telemetry.activeRunIds;
+  if (ids === undefined) return {complete: telemetry.activeRuns === 0, byIds: false};
+  if (!Array.isArray(ids) || ids.length !== telemetry.activeRuns || new Set(ids).size !== ids.length
+    || ids.some(id => typeof id !== 'string' || !RUN.test(id))) return null;
+  const active = run !== undefined && ids.includes(run);
+  // no target run (run-less marker): only zero active runs proves completeness, as before
+  return {complete: run === undefined ? telemetry.activeRuns === 0 : !active, active, byIds: true};
+}
+
+/**
+ * Slot indices whose marker (or a held tombstone) is present: those slots are never handed out. A canonical marker
+ * that is listed but gone by the time it is examined was renamed by a reaper: the listing is retaken until stable,
+ * and an unstable listing fails closed. A canonical marker counts only if it resolves (a dangling link is refused
+ * later by exclusive creation); a held tombstone always counts; any listing error other than ENOENT throws.
+ */
+export function blockedSlots(root, cap, readdir = readdirSync, stat = statSync, lstat = lstatSync) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const blocked = new Set();
+    let names = [], raced = false;
+    try { names = readdir(root); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    for (const name of names) {
+      const m = HELD_NAME.exec(name);
+      if (!m || Number(m[1]) >= cap) continue;
+      if (name.includes('.held-')) { blocked.add(Number(m[1])); continue; }
+      try { lstat(join(root, name)); } catch (error) { if (error?.code === 'ENOENT') { raced = true; continue; } throw error; }
+      try { stat(join(root, name)); blocked.add(Number(m[1])); }
+      catch (error) { if (error?.code !== 'ENOENT') throw error; } // dangling link: not a resolvable marker
+    }
+    if (!raced) return blocked;
+  }
+  throw new Error('remote-marker-listing-unstable');
+}
+
+/** True when a held tombstone exists for this slot (fails closed: an unreadable directory counts as held). */
+export function heldTombstone(root, index, readdir = readdirSync) {
+  try { return readdir(root).some(name => { const m = HELD_NAME.exec(name); return m && name.includes('.held-') && Number(m[1]) === index; }); }
+  catch { return true; }
+}
+
+/**
+ * Parsed marker. `legacy` is a bare-text (non-JSON) marker that was READ successfully; it has no host/pid/run, so only
+ * the slot lock can attribute it. `unreadable` means the file could not be read or is neither valid JSON nor the known bare text: unknown, never a reason to reap.
+ */
+function readMarker(file) {
+  let text;
+  try { text = readFileSync(file, 'utf8'); } catch { return {unreadable: true, legacy: false, host: undefined, pid: null, run: null, at: null}; }
+  try {
+    const marker = JSON.parse(text);
+    if (marker && typeof marker === 'object' && !Array.isArray(marker)) {
+      // A field that is present must be well formed; a malformed structured marker is unknown evidence, never reapable.
+      const ok = (key, test) => marker[key] === undefined || test(marker[key]);
+      if (!ok('host', v => typeof v === 'string') || !ok('owner', v => typeof v === 'string') || !ok('pid', Number.isInteger)
+        || !ok('at', Number.isFinite) || !ok('run', v => typeof v === 'string' && RUN.test(v))
+        || !ok('caller', validCaller) || !ok('lane', validLane) || !ok('pr', validPr)) {
+        return {unreadable: true, legacy: false, host: undefined, pid: null, run: null, at: null};
+      }
+      const saved = marker.owner !== undefined ? sidecarRun(file, marker.owner) : null;
+      return {legacy: false, host: marker.host, owner: marker.owner, pid: marker.pid ?? null,
+        caller: marker.caller, lane: marker.lane, pr: marker.pr, exit: sidecarExit(file, marker.owner),
+        run: marker.run ?? saved?.run ?? null, nonce: saved && (!marker.run || marker.run === saved.run) ? saved.nonce : undefined,
+        slot: saved && (!marker.run || marker.run === saved.run) ? saved.slot : undefined,
+        at: marker.at ?? null};
+    }
+  } catch { /* not JSON: legacy only if it is exactly the known bare text */ }
+  if (text.trim() !== LEGACY_TEXT) return {unreadable: true, legacy: false, host: undefined, pid: null, run: null, at: null};
+  return {legacy: true, host: undefined, pid: null, run: null, at: null};
+}
+
+/** Slot-lock holder for a slot: `absent` only when the lock directory provably does not exist; unreadable metadata is `unknown`. */
+function slotHolder(root, index) {
+  const dir = lockDirFor(root, `slot-${index}`);
+  try { lstatSync(dir); } catch (error) { return error?.code === 'ENOENT' ? {state: 'absent'} : {state: 'unknown'}; }
+  let entry;
+  try { entry = readLockEntry(root, `slot-${index}`); } catch { return {state: 'unknown'}; }
+  return entry && Number.isInteger(entry.pid) ? {state: 'held', pid: entry.pid} : {state: 'unknown'};
+}
+
+function ownerPid(root, index, file) {
+  const marker = readMarker(file);
+  if (marker.unreadable) return null;
+  if (!marker.legacy && marker.pid !== null) return marker.pid;
+  const holder = slotHolder(root, index);
+  return holder.state === 'held' ? holder.pid : null;
+}
+
+/** True only on proof the owner is gone. A bare marker with provably no slot-lock holder has no live local owner. */
+function ownerGone(root, index, file, liveness, selfPid) {
+  const marker = readMarker(file);
+  if (marker.unreadable) return false;
+  if (marker.legacy) {
+    const holder = slotHolder(root, index);
+    if (holder.state === 'absent') return true;
+    return holder.state === 'held' && liveness(holder.pid, selfPid) === 'dead';
+  }
+  return liveness(ownerPid(root, index, file), selfPid) === 'dead';
+}
+
+/**
+ * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
+ * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
+ * Decided PER RUN; a matching settled receipt suffices even while Forge is busy, except ambiguous supervisor
+ * failure codes (97/254), which require zero active runs as cleanup evidence. With an injected finisher and a
+ * persisted nonce, a settled run still listed active is instead finished on the dead owner's behalf before release;
+ * 97/254 additionally require a persisted numbered slot, whose finish path proves descendant cleanup.
+ * A dead-owner,
+ * host-bound marker is reaped when it is past the grace window, the telemetry sample was taken at least
+ * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
+ * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
+ * a result keeps the marker; an absent run is unknown whenever Forge reports active runs. A marker whose run id
+ * was never recorded (the client died before prepare returned) needs either zero active runs, R1017's fresh
+ * 15-minute dead-owner sample and marker age, or the existing run-ceiling-plus-skew fallback. Both busy-host
+ * paths require receipts placing EVERY active run outside [at - skew, first-seen-dead + skew], with no
+ * unfinished or 97/254 receipt inside that window. R1017 accepts the late-dispatch risk documented below.
+ * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run binding: retain it
+ * until an operator confirms remote cleanup and removes it. Local owner death alone cannot settle remote work.
+ */
+export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
+  graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}, finishRun,
+  signal = () => {}, idleConfirmMs = 30_000, stuckMinSlots = 2, stuckAgeMs = 600_000, signalEveryMs = 600_000}) {
+  const signalledAt = new Map();
+  // Every runWithRemoteDecision call builds its own reaper, so per-run finish state is shared per remote root: in this
+  // process through a module map, across processes through a `.finish-<run>` stamp (newest wins). A missing, unreadable
+  // or future-dated stamp is ignored: it can only allow one extra attempt, never suppress the retry for good.
+  let shared = sharedFinishState.get(root);
+  if (!shared) { shared = {attempts: new Map(), logged: new Set(), finished: new Set(), cancel: new Set()}; sharedFinishState.set(root, shared); }
+  const {attempts: finishAttempts, logged: finishFailuresLogged, finished: finishedRuns, cancel: cancelRuns} = shared;
+  // Bounded: the oldest entries go first (insertion order); forgetting one can only allow one extra throttled attempt.
+  const trim = store => { while (store.size > FINISH_STATE_MAX) store.delete(store.keys().next().value); };
+  const finishStamp = run => join(root, `.finish-${run}`);
+  const lastFinishAt = (run, now) => {
+    let at = finishAttempts.get(run);
+    if (at !== undefined && at > now) at = undefined;
+    try {
+      const saved = JSON.parse(readFileSync(finishStamp(run), 'utf8'))?.at;
+      if (Number.isFinite(saved) && saved <= now && (at === undefined || saved > at)) at = saved;
+    } catch { /* none yet */ }
+    return at;
+  };
+  // The last-signalled time is shared through a stamp under the remote root, so every wait loop (one reaper each) on this
+  // host throttles together. A missing, unreadable or future-dated stamp is ignored: it can only cause an extra advisory
+  // event, never suppress one for good. The in-memory time still throttles this instance when writes fail.
+  const signalStamp = kind => join(root, `.signal-${kind}`);
+  const stampedAt = kind => {
+    let at = signalledAt.get(kind);
+    try { const saved = JSON.parse(readFileSync(signalStamp(kind), 'utf8')).at; if (Number.isFinite(saved) && (at === undefined || saved > at)) at = saved; } catch { /* none yet */ }
+    return at;
+  };
+  // R475: tell the health loop (and so the coroner) about a stuck pool; throttled per kind, never throws.
+  const raise = (kind, detail, now) => {
+    const last = stampedAt(kind);
+    if (last !== undefined && last <= now && now - last < signalEveryMs) return;
+    signalledAt.set(kind, now);
+    try { writeFileSync(signalStamp(kind), JSON.stringify({at: now}), {mode: 0o600}); } catch { /* advisory */ }
+    try { signal({kind, detail}); } catch { /* advisory */ }
+  };
+  const firstDead = new Map();
+  const sidecar = file => file + '.dead';
+  function stampFor(file, key) {
+    if (firstDead.has(key)) return firstDead.get(key);
+    let at;
+    try { const saved = JSON.parse(readFileSync(sidecar(file), 'utf8')); if (saved.key === key && Number.isFinite(saved.at)) at = saved.at; } catch { /* none yet */ }
+    if (at === undefined) {
+      at = clock(); // stamped after the death probe
+      try { writeFileSync(sidecar(file), JSON.stringify({key, at}), {mode: 0o600}); } catch { /* memory stamp still applies */ }
+    }
+    firstDead.set(key, at);
+    return at;
+  }
+  const idleFile = file => file + '.idle';
+  // The release decision rests ONLY on this reaper's own live samples (kept in memory). The `.idle` sidecar is written
+  // best-effort for the alarm and age reporting and is never read back as evidence, so a stale or unreadable stamp from
+  // any process, or failing writes, can never cause a release.
+  const firstIdle = new Map();
+  function resetIdle(entry) {
+    firstIdle.delete(entry.key);
+    try { unlinkSync(idleFile(entry.file)); } catch { /* advisory only */ }
+  }
+  function idleStamp(file, key, sampledAt) {
+    if (firstIdle.has(key)) return firstIdle.get(key);
+    firstIdle.set(key, sampledAt);
+    try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); } catch { /* advisory only */ }
+    return sampledAt;
+  }
+  function claimAndRemove(entry) {
+    const held = entry.index;
+    const tomb = `${entry.file}.held-${randomBytes(8).toString('hex')}`; // a held name still blocks its slot
+    try { renameSync(entry.file, tomb); } catch { return false; }
+    let judged = false;
+    try {
+      const seen = statSync(tomb);
+      judged = seen.ino === entry.ino && seen.mtimeMs === entry.mtimeMs
+        && ownerGone(root, held, tomb, liveness, selfPid);
+    } catch { /* unreadable claim: treat as not judged */ }
+    if (judged) {
+      // The tombstone still blocks the slot here, so no successor can have written its own sidecar yet.
+      try { if (entry.owner !== undefined && sidecarRun(entry.file, entry.owner) !== null) unlinkSync(`${entry.file}.run`); } catch { /* absent */ }
+      try { unlinkSync(`${entry.file}.exit`); } catch { /* absent */ }
+      let removed = false;
+      try { unlinkSync(tomb); removed = true; } catch { /* fall through and restore */ }
+      if (removed) {
+        if (entry.run) try { unlinkSync(finishStamp(entry.run)); } catch { /* absent */ }
+        return true;
+      }
+    }
+    try { linkSync(tomb, entry.file); unlinkSync(tomb); } catch { /* the held tombstone stays and keeps blocking its slot */ }
+    return false;
+  }
+  const forget = (file, key) => { firstDead.delete(key); firstIdle.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } try { unlinkSync(idleFile(file)); } catch { /* absent */ } };
+  return {
+    async step(getTelemetry, now = clock()) {
+      let names;
+      try { names = fs.readdirSync(root); } catch { return []; }
+      const dead = [], reaped = [], held = [], boundRuns = new Map();
+      let finishedStillActive = false;
+      for (const name of names) {
+        const m = NAME.exec(name);
+        if (!m) continue;
+        const file = join(root, name);
+        let mtimeMs, ino;
+        try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
+        const marker = readMarker(file), index = Number(m[1]);
+        if (marker.unreadable) continue;
+        if (marker.run && marker.owner !== undefined && host !== undefined && marker.host === host) { // only this Forge host's own markers claim runs
+          if (!boundRuns.has(marker.run)) boundRuns.set(marker.run, new Set());
+          boundRuns.get(marker.run).add(marker.owner);
+        }
+        const gone = ownerGone(root, index, file, liveness, selfPid);
+        // Only an old marker whose owner is provably gone is "stuck": a live owner is a long-running job, not a leak.
+        const trace = {pid: marker.pid, caller: marker.caller ?? null, lane: marker.lane ?? null, pr: marker.pr ?? null, exit: marker.exit ?? 'no-exit-record'};
+        if (gone && now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run, ...trace});
+        const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
+        if (marker.legacy) {
+          // Neither a missing/dead local lock holder nor this host's telemetry proves an unbound job stopped.
+          continue;
+        }
+        // Telemetry only speaks for its own Forge host: a marker not provably bound to this host is retained.
+        if (marker.host !== host || host === undefined) continue;
+        if (!gone) { forget(file, key); continue; }
+        stampFor(file, key);
+        dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, nonce: marker.nonce, slot: marker.slot, at: marker.at, owner: marker.owner, ...trace});
+      }
+      if (dead.length) {
+        let telemetry = null;
+        try { telemetry = await getTelemetry(); } catch { /* probe failed: unknown, fail closed */ }
+        const sampledAt = Date.parse(telemetry?.sampledAtET), evidence = recentEvidence(telemetry);
+        if (!Number.isFinite(sampledAt) || !evidence) {
+          // An unknown or failed probe interrupts any idle confirmation: the next idle sample starts a fresh window.
+          for (const entry of dead) resetIdle(entry);
+          raise('probe-unknown', {slots: dead.map(d => d.name)}, now);
+        }
+        if (Number.isFinite(sampledAt) && evidence) {
+          dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
+          for (const entry of dead) {
+            const diedBy = firstDead.get(entry.key);
+            const decisionAt = clock();
+            if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; }
+            let verdict = 'run-less';
+            if (entry.run) {
+              verdict = runVerdict(telemetry, entry.run);
+              const receipt = telemetry.recent.find(item => item?.runId === entry.run);
+              if (finishRun && entry.nonce && telemetry.activeRunIds?.includes(entry.run)
+                && Number.isInteger(receipt?.code) && receipt.code >= 0 && receipt.code <= 255
+                && (receipt.code !== 97 && receipt.code !== 254 || typeof entry.slot === 'string' && NUMBERED_SLOT.test(entry.slot))) {
+                // Fresh evidence and another local death probe precede the only remote mutation.
+                if (decisionAt - sampledAt < -CLOCK_SKEW_MS || decisionAt - sampledAt > 30_000
+                  || !ownerGone(root, entry.index, entry.file, liveness, selfPid)) continue;
+                const finishKey = `${entry.run}:${entry.nonce}`;
+                if (!finishedRuns.has(finishKey)) {
+                  const last = lastFinishAt(entry.run, decisionAt);
+                  if (last !== undefined && decisionAt - last < FINISH_RETRY_MS) continue;
+                  finishAttempts.delete(entry.run); finishAttempts.set(entry.run, decisionAt); trim(finishAttempts);
+                  try { writeFileSync(finishStamp(entry.run), JSON.stringify({at: decisionAt}), {mode: 0o600}); } catch { /* the in-memory time still throttles */ }
+                  const cancel = cancelRuns.has(finishKey);
+                  let timer;
+                  try {
+                    await Promise.race([Promise.resolve().then(() => finishRun({run: entry.run, nonce: entry.nonce, ...(cancel ? {cancel: true} : {})})),
+                      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('finish timeout')), cancel ? 100_000 : FINISH_TIMEOUT_MS); })]);
+                    finishedRuns.add(finishKey); trim(finishedRuns);
+                    // The stamp stays until the marker is released: another process's lagging sample may still list the run.
+                  } catch (error) {
+                    const reason = `${error?.stderr ?? ''} ${error?.message ?? error}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').trim();
+                    if (cancel) {
+                      raise(`slot-uid-unprovable-${entry.index}`, {slot: entry.index, run: entry.run, reason: reason.slice(0, 240),
+                        action: 'operator: stop forge uid forge-exec-<n> and remove its worker-active executing lock'}, decisionAt);
+                      if (!finishFailuresLogged.has(finishKey)) {
+                        finishFailuresLogged.add(finishKey); trim(finishFailuresLogged);
+                        log(`heavy-admission: slot-${entry.index} UID cleanup unprovable; marker retained; operator cleanup required\n`);
+                      }
+                    } else if (/execution unconfirmed/i.test(reason)) {
+                      cancelRuns.add(finishKey); trim(cancelRuns);
+                    }
+                    if (!finishFailuresLogged.has(entry.run)) {
+                      finishFailuresLogged.add(entry.run); trim(finishFailuresLogged);
+                      log(`heavy-admission: finish failed for ${entry.run}; marker retained; retry after ${FINISH_RETRY_MS}ms (operator cleanup if persistent)\n`);
+                    }
+                    continue;
+                  } finally { clearTimeout(timer); }
+                }
+                verdict = 'finished-on-behalf';
+              }
+              // A per-run verdict taken while Forge is busy rests on ONE directory listing, which can miss a prepared->running
+              // rename: 'absent' and the supervisor failure codes 97/254 need the second own sample too.
+              const code = telemetry.recent.find(item => item?.runId === entry.run)?.code;
+              const confirm = verdict === 'idle' || (evidence.byIds && telemetry.activeRuns > 0
+                && (verdict === 'absent' || (verdict === 'finished' && (code === 97 || code === 254))));
+              if (!confirm) resetIdle(entry);
+              if (!['finished', 'finished-on-behalf', 'absent', 'idle'].includes(verdict)) continue;
+              // 'idle' rests on Forge's active-run count, taken from a directory listing without a per-run cleanup
+              // receipt. So the run must also have existed for the whole death-sample margin before that sample (both
+              // stamps are Forge's clock): a run that old has its state on disk and would be counted if it were active.
+              if (confirm) {
+                if (verdict === 'idle') { // 'absent' by activeRunIds has no receipt; the two own samples below are its whole guard
+                  const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
+                  if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; } // not fully qualifying: restart the window
+                }
+                // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample,
+                // taken by THIS reaper, that still reports zero active runs before releasing.
+                const first = idleStamp(entry.file, entry.key, sampledAt);
+                if (sampledAt - first < idleConfirmMs) continue;
+              }
+            } else {
+              const at = entry.at ?? entry.mtimeMs;
+              // This entry is run-less, so every bound run belongs to another marker.
+              // A run also bound by a marker of the SAME owner may be this client's own multi-slot run: it never counts as foreign.
+              const foreign = new Set([...boundRuns].filter(([, owners]) => entry.owner !== undefined && !owners.has(entry.owner)).map(([run]) => run));
+              if (!evidence.complete && ((!runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, decisionAt, foreign)
+                && !boundedOrphan(telemetry, evidence, sampledAt, at, diedBy, foreign)) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
+              if (maybeOwnsInflight(telemetry, at, diedBy)) continue;
+            }
+            // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
+            // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
+            // dispatch marker is ever lost, whatever the timing and without any lease or lock.
+            if (!claimAndRemove(entry)) continue;
+            if (verdict === 'finished' && telemetry.activeRunIds?.includes(entry.run)) finishedStillActive = true;
+            forget(entry.file, entry.key);
+            reaped.push(entry.name);
+            // Keep the legacy five-key record byte-identical unless new provenance or finish evidence exists.
+            const releaseEvidence = Object.fromEntries(Object.entries({caller: entry.caller, lane: entry.lane, pr: entry.pr,
+              exit: entry.exit === 'no-exit-record' ? undefined : entry.exit,
+              finishedOnBehalf: verdict === 'finished-on-behalf' ? true : undefined}).filter(([, value]) => value != null));
+            if (Object.keys(releaseEvidence).length && entry.pid != null) releaseEvidence.pid = entry.pid;
+            log(`heavy-admission: released unconfirmed remote slot ${JSON.stringify({slot: entry.index, runId: entry.run ?? null, verdict, activeRuns: telemetry.activeRuns, sampledAtET: telemetry.sampledAtET, ...releaseEvidence})} activeRuns=${telemetry.activeRuns}${verdict === 'finished-on-behalf' ? " (finished on owner's behalf)" : ''}\n`);
+          }
+        }
+      }
+      const stuck = held.filter(h => !reaped.includes(h.name));
+      if (stuck.length >= stuckMinSlots) raise('stuck-slots', {slots: stuck.map(h => h.name), markers: stuck, minAgeMs: stuckAgeMs}, now);
+      if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished${finishedStillActive ? ' (still listed active)' : ''} or absent)\n`);
+      return reaped;
+    },
+  };
+}
+
+// R1017 accepts one residual case: a request dispatched by the dead client starts on Forge MORE than 15 minutes
+// after its death. Observed start lag is about one minute; client SSH calls are short and bounded by ConnectTimeout.
+// The dead client never issues `run`, so only a prepared run can exist. If the late-start case occurs, at most one
+// extra concurrent Forge run lasts until completion, within Forge's own cap. No run is killed and no result is lost:
+// the owner is dead and cannot collect one. This grace is an operator ruling, not an enforced remote start deadline.
+function runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, now, boundRuns) {
+  if (evidence.byIds !== true || !Number.isFinite(entry.at)
+    || now - entry.mtimeMs < RUNLESS_DEAD_GRACE_MS || sampledAt - entry.at < RUNLESS_DEAD_GRACE_MS
+    || sampledAt - diedBy < RUNLESS_DEAD_GRACE_MS
+    || now - sampledAt < -CLOCK_SKEW_MS || now - sampledAt > 30_000) return false;
+  const starts = new Map(telemetry.recent.map(item => [item.runId, Date.parse(item.startedAtET)]));
+  return telemetry.activeRunIds.every(run => {
+    if (boundRuns.has(run)) return true;
+    const started = starts.get(run);
+    return Number.isFinite(started) && (started < entry.at - CLOCK_SKEW_MS || started > diedBy + CLOCK_SKEW_MS);
+  });
+}
+
+// A run-less marker's owner died before it learned its run id. On a busy Forge the active-run count is never zero for long,
+// so count-only proof leaked the marker for good (a dozen of them walled off the cap while Forge sat idle). Owner death
+// does not enforce a remote start deadline, and a 97/254 supervisor failure can leave descendants past the run ceiling.
+// Its receipt may already have fallen out of `recent`, even before this reaper first observes the marker.
+// Past the ceiling plus skew, release only if another marker owns each authoritative active run or receipts place it
+// outside the ownership window. Missing receipts for unclaimed runs fail closed.
+export const ORPHAN_RUN_BOUND_MS = 120 * 60_000; // = heavy-admission DEFAULT_ADMISSION_CEILING_MS
+function boundedOrphan(telemetry, evidence, sampledAt, at, diedBy, boundRuns) {
+  if (evidence.byIds !== true || sampledAt - diedBy <= ORPHAN_RUN_BOUND_MS + CLOCK_SKEW_MS) return false;
+  const starts = new Map(telemetry.recent.map(item => [item.runId, Date.parse(item.startedAtET)]));
+  return telemetry.activeRunIds.every(run => {
+    if (boundRuns.has(run)) return true;
+    const started = starts.get(run);
+    return Number.isFinite(started) && (started < at - CLOCK_SKEW_MS || started > diedBy + CLOCK_SKEW_MS);
+  });
+}
+
+// Receipt-window guard shared by the zero-active, R1017 grace and existing orphan-bound paths.
+function maybeOwnsInflight(telemetry, atMs, diedByMs) {
+  return telemetry.recent.some(item => {
+    const started = Date.parse(item?.startedAtET);
+    return !Number.isInteger(item?.code) && (!Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs + CLOCK_SKEW_MS));
+  });
+}
+
+// 97/254 receipts may leave surviving descendants, so such a receipt inside the window keeps the marker even past the bound.
+function maybeSurvivingDescendants(telemetry, atMs, diedByMs) {
+  return telemetry.recent.some(item => {
+    if (item?.code !== 97 && item?.code !== 254) return false;
+    const started = Date.parse(item?.startedAtET);
+    return !Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs + CLOCK_SKEW_MS);
+  });
+}

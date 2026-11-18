@@ -289,3 +289,35 @@ describe('fix dispatch claim identity persistence and release', () => {
     expect(identity).toHaveBeenCalled();
   });
 });
+
+describe('pidIdentity — started-after-holder slack boundary (PID_START_SLACK_MS)', () => {
+  const HOLDER_MS = Date.parse('2026-10-24T12:00:00.000Z');
+  // ps launch stamps have whole-second resolution; the exec stub returns a process launched at `start`.
+  const probe = (start, startedBy) => pidAlive.pidIdentity(PID, { startedBy, exec: () => psRow('S', start, ARGV) });
+
+  it('pins the slack at two minutes', () => {
+    expect(pidAlive.PID_START_SLACK_MS).toBe(120_000);
+  });
+
+  it('a process launched exactly two minutes after the holder registered is still the holder (inclusive bound)', () => {
+    expect(probe('Sat Oct 24 12:02:00 2026', HOLDER_MS)).toEqual({ alive: true, reason: 'match' });
+  });
+
+  it('a process launched inside the slack, or before the holder registered, is the holder', () => {
+    expect(probe('Sat Oct 24 12:01:59 2026', HOLDER_MS).alive).toBe(true);
+    expect(probe('Sat Oct 24 11:59:00 2026', HOLDER_MS).alive).toBe(true);
+  });
+
+  it('a process launched one second past the slack is a different process that reused the pid', () => {
+    expect(probe('Sat Oct 24 12:02:01 2026', HOLDER_MS)).toEqual({ alive: false, reason: 'started-after-holder' });
+  });
+
+  it('the bound is exact to the millisecond: one ms past two minutes is already a reused pid', () => {
+    expect(probe('Sat Oct 24 12:02:00 2026', HOLDER_MS - 1)).toEqual({ alive: false, reason: 'started-after-holder' });
+  });
+
+  it('a non-finite startedBy skips the check entirely (legacy claims keep TTL recovery)', () => {
+    expect(probe('Sat Oct 24 12:30:00 2026', null).alive).toBe(true);
+    expect(probe('Sat Oct 24 12:30:00 2026', Number.NaN).alive).toBe(true);
+  });
+});

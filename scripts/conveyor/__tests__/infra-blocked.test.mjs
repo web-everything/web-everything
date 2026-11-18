@@ -8,9 +8,11 @@
  *   roundtrip is exercised at the boundary; the live gh/network/pr-land driver is the IO shell (not unit-tested).
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   classifyPrOpenFailure,
   correlateCause,
@@ -426,6 +428,49 @@ describe('fs roundtrip — atomic write, tolerant read, idempotent record-IO', (
     expect(ran).toBe(true);
     expect(existsSync(stale)).toBe(false);
   });
+
+  it('withInfraLock keeps mutual exclusion across processes — a waiter never unlinks a lock another process just took', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'ib-fs-'));
+    const path = join(dir, '.conveyor', 'store.json');
+    const libUrl = pathToFileURL(join(process.cwd(), 'scripts/conveyor/infra-blocked.mjs')).href;
+    const procs = 8; const perProc = 60;
+    const code = `import { withInfraLock } from ${JSON.stringify(libUrl)};
+      import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+      const p = ${JSON.stringify(path)};
+      for (let i = 0; i < ${perProc}; i++) withInfraLock(p, () => {
+        const a = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : [];
+        a.push(1); writeFileSync(p, JSON.stringify(a));
+      }, { requireLock: true });`;
+    await Promise.all(Array.from({ length: procs }, () => new Promise((done, fail) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code]);
+      let stderr = '';
+      child.stderr.on('data', (d) => { stderr += d; });
+      child.on('error', fail);
+      child.on('close', (status) => (status === 0 ? done() : fail(new Error(stderr))));
+    })));
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toHaveLength(procs * perProc);
+  }, 120_000);
+
+  it('withInfraLock waits by SLEEPING, not busy-spinning — a waiter must not burn the CPU the lock holder needs', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ib-fs-'));
+    const path = join(dir, '.conveyor', 'store.json');
+    mkdirSync(join(dir, '.conveyor'), { recursive: true });
+    writeFileSync(`${path}.lock`, String(process.pid)); // a fresh lock another process "holds" for the whole wait
+    // Measure in a CHILD process: `process.cpuUsage()` in the vitest worker counts every other thread's CPU (GC, other
+    // tests), which made a sleeping waiter read 157 ms of a 400 ms wait on a loaded CI shard. The child runs only the waiter.
+    const libUrl = pathToFileURL(join(process.cwd(), 'scripts/conveyor/infra-blocked.mjs')).href;
+    const code = `import { withInfraLock } from ${JSON.stringify(libUrl)};
+      const c0 = process.cpuUsage(); const t0 = Date.now(); let threw = false;
+      try { withInfraLock(${JSON.stringify(path)}, () => 1, { requireLock: true, timeoutMs: 400, staleMs: 60000 }); } catch (e) { threw = /could not acquire store lock/.test(String(e)); }
+      const u = process.cpuUsage(c0);
+      console.log(JSON.stringify({ wallMs: Date.now() - t0, cpuMs: (u.user + u.system) / 1000, threw }));`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 60_000 });
+    const out = JSON.parse(String(r.stdout || '').trim().split('\n').pop());
+    expect(out.threw).toBe(true);
+    expect(out.wallMs).toBeGreaterThanOrEqual(400);
+    // a spin loop burns ~a whole core for the wait; a sleeping wait uses ~0 (0.5 leaves ample margin for a loaded host)
+    expect(out.cpuMs).toBeLessThan(out.wallMs * 0.5);
+  }, 60_000);
 
   it('mutateInfraStore re-reads the CURRENT on-disk store (no stale snapshot) then applies the transform', () => {
     dir = mkdtempSync(join(tmpdir(), 'ib-fs-'));

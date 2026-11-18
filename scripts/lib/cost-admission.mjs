@@ -3,7 +3,7 @@
  * @description Card x60i0ie — COST-CLASS ADMISSION: the one pure rule every dispatching daemon shares for "may this
  *   job START now", split by what the job costs the Mac.
  *
- *   The Mac is the limit, not the model budget (2026-10-08: 12 cores, load 21–31, CPU idle at fix launch p50 41%,
+ *   The Mac is the limit, not the model budget (2026-10-08: load 21–31, CPU idle at fix launch p50 41%,
  *   min 5%; heavy test slots mostly free). Jobs fall in two classes:
  *   - HEAVY — runs tests or builds locally (build, fix, ci-heal, investigate, a review that runs tools). Heavy work
  *     keeps every cap and CPU guard it has today. This rule never loosens a heavy gate.
@@ -172,7 +172,9 @@ export function admitLaunch({ kind, settings, facts = {}, legacy = { admit: true
   }
   // x6nuodj — a shared resource decision (`facts.resource`, from admit({kind:'light'})) replaces the legacy CPU floor
   // and free-memory checks when it decided; the budget and the light cap above are not resource checks and stay.
-  const resource = facts.resource && typeof facts.resource === 'object' && facts.resource.decidedBy === 'admit' ? facts.resource : null;
+  // A gate-error refusal (enforce mode, shared decision unavailable) is decidedBy 'legacy' yet must still refuse (R559).
+  const res = facts.resource && typeof facts.resource === 'object' ? facts.resource : null;
+  const resource = res && (res.decidedBy === 'admit' || (res.admit === false && res.kind === 'gate-error')) ? res : null;
   if (resource) {
     if (!resource.admit) return { ...base, admit: false, reason: 'resource-admission', why: `${resource.why ?? 'held by admit()'}; light ${kind} deferred` };
     return { ...base, admit: true, reason: 'admitted',

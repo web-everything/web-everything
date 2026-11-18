@@ -10,6 +10,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, chmodSync, existsSync, readFileSync, utimesSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   readSharedOpenPrs, nextLimit, isServable, projectPrs, SNAPSHOT_FIELDS, MIN_LIMIT, DIRTY_REFRESH_FLOOR_MS,
   readShaCache, writeShaCache, snapshotOpenCount,
@@ -23,7 +25,7 @@ const PRS = Array.from({ length: 14 }, (_, i) => ({
   number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
   headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
-    startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build' }],
+    startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build', appSlug: 'github-actions', appId: 15368 }],
 }));
 
 const PAGING = { pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600, source: { pageSize: 'standard' } };
@@ -43,8 +45,8 @@ function fakeExec(prs = PRS) {
       const end = Math.min(start + size, prs.length);
       const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, ...p }) => ({
         ...p, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
-          nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
-            ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
+          nodes: statusCheckRollup.map(({ workflowName, appSlug, appId, ...c }) => c.__typename === 'CheckRun'
+            ? { ...c, checkSuite: { app: { slug: appSlug, databaseId: appId }, workflowRun: { workflow: { name: workflowName } } } }
             : { ...c, createdAt: c.startedAt }),
         } } } }] },
       }));
@@ -98,6 +100,38 @@ describe('pure helpers', () => {
 });
 
 describe('readSharedOpenPrs — one fetch serves the fleet', () => {
+  it('preserves bounded check-app lookup progress across separate snapshot refresh processes', () => {
+    const script = `
+      import { readSharedOpenPrs } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/pr-snapshot.mjs')).href)};
+      const [dir, count] = process.argv.slice(1);
+      const ids = Array.from({ length: Number(count) }, (_, i) => 777 + i);
+      const nodes = ids.map((id, i) => ({ number: i + 1, headRefOid: 'head-' + i,
+        updatedAt: 'unchanged', labels: { nodes: [] }, commits: { nodes: [{ commit: {
+          statusCheckRollup: { contexts: { nodes: [{ __typename: 'CheckRun', name: 'red-team',
+            databaseId: id, status: 'IN_PROGRESS', checkSuite: { app: null, workflowRun: null } }] } }
+        } }] } }));
+      let lookups = 0;
+      const exec = (_file, args) => {
+        if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: {
+          nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null }
+        } } } });
+        if (args[0] === 'pr') return JSON.stringify({ comments: [], body: '', files: [] });
+        lookups++;
+        return JSON.stringify({ app: { id: 5037855, slug: 'web-everything' } });
+      };
+      const rows = readSharedOpenPrs({ repo: 'starvation/processes', dir, exec, ttlMs: 0,
+        env: { VITEST: '1' }, fields: 'number,statusCheckRollup',
+        paging: { pageSize: 100, pageRetries: 0, heavyMaxAgeSeconds: 600 } });
+      console.log(JSON.stringify({ lookups, resolved: rows.filter(r => r.statusCheckRollup[0].appId === 5037855).length }));
+    `;
+    const refresh = count => JSON.parse(execFileSync(process.execPath,
+      ['--input-type=module', '-e', script, dir, String(count)], { encoding: 'utf8', timeout: 30_000 }));
+    expect(refresh(21)).toEqual({ lookups: 20, resolved: 20 });
+    expect(refresh(21)).toEqual({ lookups: 1, resolved: 21 });
+    // Prune identities when their checks disappear; a new check ID needs new provenance.
+    expect(refresh(0)).toEqual({ lookups: 0, resolved: 0 });
+    expect(refresh(1)).toEqual({ lookups: 1, resolved: 1 });
+  });
   it('preserves capped comments unchanged through fresh and cached projections (#5955)', () => {
     const comments = Array.from({ length: 100 }, (_, i) => ({ body: `comment ${i}`, author: { login: 'someone' } }));
     const { exec, calls } = fakeExec([{ ...PRS[0], comments }]);
@@ -149,7 +183,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
   });
 
   it('60 PRs at pageSize 20 use three GraphQL pages', () => {
-    const many = Array.from({ length: 60 }, (_, i) => ({ ...PRS[0], number: i }));
+    const many = Array.from({ length: 60 }, (_, i) => ({ ...PRS[0], number: i + 1 }));
     const { exec, calls } = fakeExec(many);
     const got = readSharedOpenPrs(opts({ fields: 'number', exec }));
     expect(got).toHaveLength(60);
@@ -192,8 +226,37 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(readSharedOpenPrs(opts({ fields: 'reviewDecision', exec }))).toEqual(PRS.map(p => ({ reviewDecision: p.reviewDecision })));
   });
 
+  it('a DECLARED WE_PR_SNAPSHOT_SAMPLE subset is marked sampled (not truncated); real truncation still fails closed', () => {
+    const { exec } = fakeExec();
+    const rows = readSharedOpenPrs(opts({ fields: 'number', exec, env: { VITEST: '1', WE_PR_SNAPSHOT_SAMPLE: '1' } }));
+    expect(rows.length).toBe(1);
+    expect(PRS.length).toBeGreaterThan(1);
+    expect(rows.sampled).toBe(true);
+    expect(rows.discoveryIncomplete).toBeUndefined();
+    const whole = readSharedOpenPrs(opts({ fields: 'number', exec }));
+    expect(whole.sampled).toBeUndefined();
+    expect(whole.discoveryIncomplete).toBeUndefined();
+  });
+  it('a snapshot truncated at its cap is incomplete even when a sample is declared', () => {
+    const { exec } = fakeExec(Array.from({ length: 3 }, (_, i) => ({ ...PRS[0], number: i + 1 })));
+    const first = readSharedOpenPrs(opts({ fields: 'number', exec }));
+    void first;
+    const snapFile = snapshotPath(dir, REPO);
+    const snap = JSON.parse(readFileSync(snapFile, 'utf8'));
+    writeFileSync(snapFile, JSON.stringify({ ...snap, truncated: true }));
+    const rows = readSharedOpenPrs(opts({ fields: 'number', exec, env: { VITEST: '1', WE_PR_SNAPSHOT_SAMPLE: '1' } }));
+    expect(rows.discoveryIncomplete).toBe(true);
+  });
+
+  it('a short inventory (fewer rows than totalCount) is never published as a complete snapshot', () => {
+    const exec = () => JSON.stringify({ data: { repository: { pullRequests: { nodes: [], totalCount: 7,
+      pageInfo: { hasNextPage: false, endCursor: null } } } } });
+    expect(() => readSharedOpenPrs(opts({ fields: 'number', exec }))).toThrow(/0 of 7/);
+    expect(readSharedOpenPrs(opts({ fields: 'number', exec: fakeExec().exec }))).toHaveLength(PRS.length);
+  });
+
   it.each([false, true])('failed pages never publish or update a snapshot (previous=%s)', previous => {
-    const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i }));
+    const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i + 1 }));
     const fake = fakeExec(many);
     const path = snapshotPath(dir, REPO);
     if (previous) readSharedOpenPrs(opts({ fields: 'number', exec: fake.exec }));
@@ -287,7 +350,7 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
 
   it.each([
     // `readCommits` stubbed: its default (`fetchPrCommits`) runs a real `git fetch origin` per unlabelled PR.
-    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs', { readCommits: () => [] }],
+    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs', { readCommits: () => [], readRest: () => ({ json: { user: { login: 'a', type: 'User' } } }) }],
     ['../../conveyor/advisory-label-sweep.mjs', 'defaultListPrs'],
     ['../../conveyor/ci-red-recovery-watch.mjs', 'defaultReadOpenPrs'],
     ['../../conveyor/parked-pr-conflict-watch.mjs', 'defaultListParkedPrs'],

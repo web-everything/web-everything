@@ -8,6 +8,8 @@
  *   `git merge-base --is-ancestor` check per repo); everything in THIS file is a pure function over that raw
  *   snapshot.
  *
+ * Remote fallback counts cover the last 24h of `<lockRoot>/remote-fallbacks.jsonl`.
+ *
  * WHY A PID'S OWN COMMAND LINE, NOT A STORED "kind" FIELD. `heavy-admission.mjs`'s lock entries carry no `meta`
  * for its `run` wrapper or for `verify-lane.mjs`'s direct acquire (see that module's own `tryAcquireSlot`/
  * `acquireSlotBlocking` call sites) — the ONE thing every holder/waiter really has is the real pid it acquired
@@ -158,6 +160,11 @@ export function assessHeavyQueue(read) {
     waitingCount: rows.filter((r) => r.state === 'WAIT').length,
     projectedWaitMinutesForNewJob: projected, rows, headline,
     queueAdmission: admission,
+    remoteFallbacks: read.remoteFallbacks ?? {total:0, byReason:{}},
+    // R497 — fail closed: no read means UNKNOWN, never a default share.
+    forgeShare: read.forgeShare?.current
+      ? { ...read.forgeShare.current, earlier: { status: read.forgeShare.earlier?.status ?? 'unknown', share: read.forgeShare.earlier?.share ?? null } }
+      : { status: 'unknown', share: null, belowTarget: null, unknownReason: 'not-collected' },
   };
 }
 
@@ -173,9 +180,12 @@ export function assessQueueAdmission(queue) {
   if (!queue) return null;
   if (queue.bypassed) return { bypassed: queue.bypassed, headline: `queue admission bypassed (${queue.bypassed})` };
   const byKind = {};
+  let fixAheadOnly = false;
   for (const [label, kind, size] of [['review', 'review', null], ['fix', 'fix', null], ['ci-heal', 'ci-heal', null], [`build (size ${DEFAULT_BUILD_SIZE})`, 'build', DEFAULT_BUILD_SIZE], ['build (size 8)', 'build', 8]]) {
     const d = createQueueBudget(queue).tryAdmit(kind, { size });
+    if (kind === 'fix') fixAheadOnly = d.aheadOnly === true;
     byKind[label] = { demandMinutes: d.demandMinutes, projectedMinutes: d.projectedMinutes, admit: d.admit, exempt: d.exempt };
+    if (kind === 'fix' || kind === 'ci-heal') byKind[label].excludedBehindCount = d.excludedBehindCount ?? 0;
   }
   const fix = byKind.fix;
   return {
@@ -191,7 +201,7 @@ export function assessQueueAdmission(queue) {
     standardMinutes: queue.standardMinutes, standardSource: queue.standardSource,
     byKind,
     headline: `projected wait if you start now: ~${queue.projectedWaitMinutes}m of ${queue.maxWaitMinutes}m max`
-      + ` (a fix → ~${fix.projectedMinutes}m, ${fix.admit ? 'admitted' : 'HELD queue-cap'})`
+      + ` (a fix → ~${fix.projectedMinutes}m counting ${fixAheadOnly ? 'only waiters ahead of it' : 'all waiters'}, ${fix.admit ? 'admitted' : 'HELD queue-cap'})`
       + (queue.heavyWaitMinutes != null ? `; a full suite → ~${queue.heavyWaitMinutes}m` : ''),
   };
 }

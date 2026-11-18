@@ -7,41 +7,417 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { decide } from '../guard-bash.mjs';
+import { decide, fullSuiteEscapeUsed, heavyRunHeads, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { classifyCommand } from '../operations/agent-command-audit.mjs';
 
 const queue = 'node scripts/readiness/heavy-admission.mjs run -- ';
+describe('executable heads behind redirections and command options', () => {
+  const redirectedRuns = [
+    '2>/dev/null npx vitest run scripts/__tests__/a.test.mjs',
+    '>/dev/null vitest run a',
+    '<in.txt 2>&1 npx vitest run a',
+  ];
+  it.each(redirectedRuns)('denies a test run after leading redirections: %s', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  it.each(redirectedRuns)('classifies a test run after leading redirections: %s', cmd => {
+    expect(classifyCommand(cmd)).toContainEqual(expect.objectContaining({ category: 'vitest', queued: false }));
+  });
+  it('denies the same test run with a trailing redirection', () => {
+    expect(decide('npx vitest run scripts/__tests__/a.test.mjs 2>/dev/null', {}))
+      .toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  const flockRuns = [
+    "flock -c 'npx vitest run a' /tmp/l",
+    "flock --command 'npx vitest run a' /tmp/l",
+    "flock --command='npx vitest run a' /tmp/l",
+    "flock -n -c 'npx vitest run a' /tmp/l",
+  ];
+  it.each(flockRuns)('denies flock command options before the lock path: %s', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  it.each(flockRuns)('classifies flock command options before the lock path: %s', cmd => {
+    expect(classifyCommand(cmd)).toContainEqual(expect.objectContaining({ category: 'vitest', queued: false }));
+  });
+  it('allows shell punctuation as echo arguments in an env split string', () => {
+    expect(decide("env -S 'echo ok; npx vitest run a'", {})).toBeNull();
+  });
+  it('does not classify echo arguments in an env split string as vitest', () => {
+    expect(classifyCommand("env -S 'echo ok; npx vitest run a'").some(row => row.category === 'vitest')).toBe(false);
+  });
+  it('still denies and classifies a real test run in an env split string', () => {
+    const cmd = "env -S 'npx vitest run a'";
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+    expect(classifyCommand(cmd)).toContainEqual(expect.objectContaining({ category: 'vitest', queued: false }));
+  });
+});
+
+const execVitestRuns = [
+  'npm x vitest run', 'npm x -- vitest run',
+  'npm exec vitest run', 'npm exec -- vitest run',
+  'pnpm exec vitest run', 'yarn exec vitest run', 'bun exec vitest run',
+];
+const separateNodeOptions = [
+  '--test-reporter spec.mjs',
+  '--test-reporter-destination results.mjs',
+  '--test-name-pattern example.mjs',
+  '--test-skip-pattern skipped.mjs',
+  '--test-shard 1/2',
+  '--test-concurrency 2',
+  '--test-timeout 1000',
+  '--import ./setup.mjs',
+  '--require ./setup.cjs',
+  '--loader ./loader.mjs',
+];
+const bypassRuns = [
+  'node --test scripts/__tests__/a.test.mjs',
+  'node --test',
+  ...['true', 'false', '', '1', 'anything'].map(value => `node --test=${value} scripts/x.test.mjs`),
+  'node --test-reporter=spec --test a.mjs',
+  ...separateNodeOptions.flatMap((options) => [
+    `node ${options} --test`,
+    `node ${options} --test a.mjs`,
+    `node ${options} node_modules/vitest/vitest.mjs run a.test.mjs`,
+  ]),
+  'node --test-reporter spec.mjs --test-name-pattern example.mjs --test',
+  'npm x vitest run a.test.mjs',
+  'npm x -- vitest run a',
+  'node --no-warnings node_modules/.bin/vitest run a.test.mjs',
+];
+
+const ordinarySessionRuns = [
+  'vitest', 'vitest run', 'vitest related scripts/a.mjs --run', 'vitest watch',
+  'vitest a.test.mjs', 'npx vitest run a.test.mjs b.test.mjs',
+  'npx --yes vitest run a.test.mjs', 'pnpm exec vitest run a.test.mjs',
+  'node_modules/.bin/vitest run a.test.mjs', './node_modules/.bin/vitest run a.test.mjs',
+  'bunx vitest run a.test.mjs', 'FOO=1 npx vitest run a.test.mjs',
+  'vitest --changed', 'WE_FULL_SUITE_OK=1 vitest run',
+  'npm test', 'npm t', 'npm tst', 'npm run test',
+  ...['npm', 'pnpm', 'yarn', 'bun'].flatMap((runner) =>
+    ['test', 't', 'tst', 'run test'].flatMap((script) =>
+      [`${runner} ${script}`, `${runner} ${script} -- a.test.mjs`])),
+  'node scripts/check-standards.mjs', 'node ../check-standards.mjs --local',
+  'node /tmp/lane/scripts/check-standards.mjs --local --files=a.mjs',
+  'WE_FULL_SUITE_OK=1 npm test -- a.test.mjs',
+  // alternate spellings of the same runs (advisory finding on #3932): runner flags before the subcommand,
+  // a pinned vitest version, exec wrappers, vitest's own entry script, separate-valued node options
+  'pnpm vitest run a.test.mjs', 'yarn vitest run a.test.mjs', 'bun vitest run a.test.mjs',
+  'npm -s test', 'npm --silent test -- a.test.mjs', 'npm --prefix . test', 'npm -w x test -- a.test.mjs',
+  // npm config options with a separate value before the subcommand (self-review #6461 round 3)
+  'npm --loglevel silent test', 'npm --tag x test -- a.test.mjs',
+  'npx vitest@latest run a.test.mjs', 'npx -y vitest@2 run a.test.mjs',
+  'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
+  'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
+  'env --version npx vitest run a', 'env --help npx vitest run a',
+  'timeout --version npx vitest run a', 'timeout --help npx vitest run a',
+  'node node_modules/vitest/vitest.mjs run a.test.mjs',
+  // other direct entry points of the same vitest install (advisory finding on #3932, round 2)
+  'node ./node_modules/vitest/dist/cli.js run a.test.mjs', 'node node_modules/vitest/dist/cli.js a.test.mjs',
+  'node node_modules/.bin/vitest run a.test.mjs', 'node ../node_modules/.bin/vitest run a.test.mjs',
+  'node --title standards scripts/check-standards.mjs --local',
+  'node --max-old-space-size 4096 scripts/check-standards.mjs',
+  'node --env-file .env scripts/check-standards.mjs',
+  'node --require ./setup.js scripts/check-standards.mjs',
+];
 
 describe('heavy-enforce — every direct test run requires admission', () => {
+  const controlBypasses = [
+    'for f in a b; do npx vitest run "$f"; done',
+    'while read f; do npx vitest run $f; done < l',
+    'if true; then npx vitest run a; fi',
+    'if false; then echo ok; else npx vitest run a; fi',
+    'if false; then echo ok; elif npx vitest run a; then echo ok; fi',
+    'until npx vitest run a; do echo ok; done',
+    '! npx vitest run a',
+    'gtimeout 5 npx vitest run a',
+    'env -i X=1 timeout 5 npx vitest run a',
+    'env -u NAME -- X=1 gtimeout 5 npx vitest run a',
+    'exec npx vitest run a',
+    'timeout 290 npx vitest run a.test.mjs 2>&1 | tail -15',
+    // Review #6461 round 2: nested shells, substitutions, subshells and chains (guard-bash's nested-command recursion).
+    "bash -c 'npx vitest run a'", 'sh -c "npx vitest run a"', "bash -lc 'npx playwright test a'",
+    'echo $(npx vitest run a)', 'echo `npx vitest run a`', 'x="$(node --test a.test.mjs)"',
+    '(npx vitest run a)', '(cd /tmp && node scripts/check-standards.mjs)',
+    'true && npx vitest run a', 'false || npx vitest run a', 'true; npx vitest run a',
+    // A command-text HELD assignment is not admission: only the wrapper itself sets it, in its child's env.
+    'WE_HEAVY_ADMISSION_HELD=1 npx vitest run a', 'export WE_HEAVY_ADMISSION_HELD=1; npx vitest run a',
+    'env WE_HEAVY_ADMISSION_HELD=1 npx vitest run a',
+    // Review #6461 round 3: env split strings, compound commands (brace groups, case arms, function bodies,
+    // coproc) and the remaining exec wrappers.
+    "env -S 'npx vitest run a'", 'env -S "npx vitest run a"', "env -S'npx vitest run a'",
+    "env --split-string='npx vitest run a'", "env --split-string 'npx vitest run a'", "env -iS 'npx vitest run a'",
+    "/usr/bin/env -S 'npx vitest run a'", "timeout 5 env -S 'npx vitest run a'", "env -S 'env -S \"npx vitest run a\"'",
+    '{ npx vitest run a; }', 'true && { npx vitest run a; }',
+    'case x in x) npx vitest run a;; esac', 'case x in (x) npx vitest run a;; esac',
+    'case x in a|b) npx vitest run a;; esac', 'case x in y) true;; x) npx vitest run a;; esac',
+    'case x in\n x) npx vitest run a;;\nesac', "case x in x) bash -c 'npx vitest run a';; esac",
+    'f() { npx vitest run a; }', 'function f { npx vitest run a; }', 'function f() { npx vitest run a; }',
+    'coproc npx vitest run a', 'coproc T { npx vitest run a; }',
+    // Self-review of round 3: env options that take a value, GNU long-option abbreviations, env -S's own `\_`
+    // escape, quoted case subjects, spaced arm patterns, `coproc NAME ( … )` and more exec wrappers.
+    "env -P /usr/bin -S 'npx vitest run a'", "env -U nobody -S 'npx vitest run a'", "env -L 0 -S 'npx vitest run a'",
+    "env -a x -S 'npx vitest run a'", "env --split 'npx vitest run a'", "env --split-str='npx vitest run a'",
+    "env -S 'npx\\_vitest run a'", 'case "a b" in *) npx vitest run a;; esac', 'case x in x ) npx vitest run a;; esac',
+    'coproc N ( npx vitest run a )', 'caffeinate -i npx vitest run a', 'unbuffer npx vitest run a',
+    'chrt -i 0 npx vitest run a', 'taskset -c 0 npx vitest run a',
+    ...['timeout', 'gtimeout'].flatMap(wrapper => [
+      `${wrapper} 5 npx playwright test a`,
+      `${wrapper} 5 node --test a.test.mjs`,
+      `${wrapper} 5 node scripts/check-standards.mjs`,
+      `${wrapper} 5 npm test -- a.test.mjs`,
+    ]),
+  ];
+  it.each(controlBypasses)('denies control/wrapper bypass `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  // Review #6461 round 3: every exec wrapper the guard peels, driven from one table, denies a heavy run behind it
+  // and still allows the admitted run behind it.
+  const execWrappers = ['time', 'time -p', 'time -f %e', 'command', 'builtin', 'nice', 'nice -n 5', 'sudo', 'sudo -u me',
+    'env', 'env -i', 'env X=1', 'timeout 5', 'gtimeout -s KILL 5', 'exec', 'stdbuf -oL', 'stdbuf -o L', 'ionice -c3',
+    'ionice -c 3 -n 7', 'nohup', 'setsid'];
+  it.each(execWrappers)('denies a heavy run behind the `%s` wrapper', wrapper => {
+    for (const run of ['npx vitest run a', 'npx playwright test a', 'node --test a.test.mjs', 'node scripts/check-standards.mjs']) {
+      expect(decide(`${wrapper} ${run}`, {}), `${wrapper} ${run}`).toMatch(/heavy-enforce|heavy-command admission queue/);
+    }
+  });
+  // Self-review of review #6461 round 6: a leading `--` ends eval's options, so `eval -- <heavy>` runs the heavy run.
+  it.each(['npx vitest run a', 'npm test', 'npx playwright test a', 'node --test a.test.mjs'])('denies `eval -- %s`', run => {
+    expect(decide(`eval -- ${run}`, {})).not.toBeNull();
+    expect(decide(`eval -- '${run}'`, {})).not.toBeNull();
+  });
+  // Operator send-back on #6461 round 7: a wrapper's command string is a whole command line, so a heavy run after
+  // another command in it (`npx --call "echo ok; npx vitest run a"`) is denied, and the admitted one is allowed.
   it.each([
-    'vitest', 'vitest run', 'vitest related scripts/a.mjs --run', 'vitest watch',
-    'vitest a.test.mjs', 'npx vitest run a.test.mjs b.test.mjs',
-    'npx --yes vitest run a.test.mjs', 'pnpm exec vitest run a.test.mjs',
-    'node_modules/.bin/vitest run a.test.mjs', './node_modules/.bin/vitest run a.test.mjs',
-    'bunx vitest run a.test.mjs', 'FOO=1 npx vitest run a.test.mjs',
-    'vitest --changed', 'WE_FULL_SUITE_OK=1 vitest run',
-    'npm test', 'npm t', 'npm tst', 'npm run test',
-    ...['npm', 'pnpm', 'yarn', 'bun'].flatMap((runner) =>
-      ['test', 't', 'tst', 'run test'].flatMap((script) =>
-        [`${runner} ${script}`, `${runner} ${script} -- a.test.mjs`])),
-    'node scripts/check-standards.mjs', 'node ../check-standards.mjs --local',
-    'node /tmp/lane/scripts/check-standards.mjs --local --files=a.mjs',
-    'WE_FULL_SUITE_OK=1 npm test -- a.test.mjs',
-    // alternate spellings of the same runs (advisory finding on #3932): runner flags before the subcommand,
-    // a pinned vitest version, exec wrappers, vitest's own entry script, separate-valued node options
-    'pnpm vitest run a.test.mjs', 'yarn vitest run a.test.mjs', 'bun vitest run a.test.mjs',
-    'npm -s test', 'npm --silent test -- a.test.mjs', 'npm --prefix . test', 'npm -w x test -- a.test.mjs',
-    'npx vitest@latest run a.test.mjs', 'npx -y vitest@2 run a.test.mjs',
-    'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
-    'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
-    'node node_modules/vitest/vitest.mjs run a.test.mjs',
-    // other direct entry points of the same vitest install (advisory finding on #3932, round 2)
-    'node ./node_modules/vitest/dist/cli.js run a.test.mjs', 'node node_modules/vitest/dist/cli.js a.test.mjs',
-    'node node_modules/.bin/vitest run a.test.mjs', 'node ../node_modules/.bin/vitest run a.test.mjs',
-    'node --title standards scripts/check-standards.mjs --local',
-    'node --max-old-space-size 4096 scripts/check-standards.mjs',
-    'node --env-file .env scripts/check-standards.mjs',
-    'node --require ./setup.js scripts/check-standards.mjs',
-  ])('denies %s in an ordinary session', (cmd) => {
+    'npx --call "echo ok; npx vitest run a"', 'npx -c "echo ok; npx vitest run a"', 'npx --call="echo ok; npx vitest run a"',
+    'flock /tmp/l -c "echo ok; npx vitest run a"', 'watch "echo ok; npx vitest run a"', 'npx -c "echo ok && npx playwright test a"',
+  ])('denies the nested heavy run of a wrapper command string `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it('allows an admitted run inside a wrapper command string', () => {
+    expect(decide(`npx -c "echo ok; ${queue}npx vitest run a"`, {})).toBeNull();
+  });
+  // Self-review of the round 7 send-back: an escaped quote in the string quotes its `;` (the inner shell sees
+  // `echo "x; …"`), and a shell `-c` or wrapper string behind a launcher, or in another shell, is read too.
+  it('allows a wrapper command string whose second command is only quoted text', () => {
+    expect(decide('npx -c "echo \\"x; npx vitest run b\\""', {})).toBeNull();
+  });
+  it.each([
+    'nohup bash -c "npx vitest run a"', 'setsid bash -c "npx vitest run a"', 'nohup npx -c "echo ok; npx vitest run a"',
+    'setsid -f sh -ec "npx vitest run a"', 'fish -c "npx vitest run a"', 'mksh -c "npx vitest run a"', 'tcsh -c "npx vitest run a"',
+  ])('denies a heavy run in a launched or other-shell command string `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it('allows an admitted run in a launched shell command string', () => {
+    expect(decide(`nohup bash -c "${queue}npx vitest run a"`, {})).toBeNull();
+  });
+  // Operator send-back on #6461 round 7: the shell's `-c` is read by the shared shellCString reader, so `-c` in any
+  // option cluster and options that take a value before it hide nothing.
+  it.each([
+    'bash -ce "npx vitest run a"', 'bash -o pipefail -c "npx vitest run a"', 'bash -O extglob -c "npx vitest run a"',
+    'bash --rcfile f -c "npx vitest run a"', 'bash -euo pipefail -c "npx vitest run a"', 'sh -ec "npx vitest run a"',
+    'busybox sh -ec "npx vitest run a"', "bash -o pipefail -c 'npx playwright test a'",
+  ])('denies a heavy run behind a shell `-c` with options `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it('allows an admitted run behind a shell `-c` with options, and a script file', () => {
+    expect(decide(`bash -o pipefail -c "${queue}npx vitest run a"`, {})).toBeNull();
+    expect(decide('bash -o pipefail script.sh', {})).toBeNull();
+  });
+  it.each(execWrappers.filter(wrapper => !/^(?:nohup|setsid)$/.test(wrapper)))('allows the admitted run behind `%s`', wrapper => {
+    expect(decide(`${wrapper} ${queue}npx vitest run a`, {})).toBeNull();
+  });
+  // Review #6461 round 4: every env option that takes a separate value (GNU -u/-C/-a, BSD/macOS -u/-P/-L/-U, the
+  // long forms and their abbreviations, a cluster ending in one) in front of a heavy run without -S.
+  const envValueOptions = ['-u NAME', '-C /tmp', '-a x', '-P /usr/bin', '-L 0', '-U nobody', '-iu NAME', '-ia x',
+    '--unset NAME', '--chdir /tmp', '--argv0 x', '--uns NAME', '--arg x', '-i -a x X=1'];
+  it.each(envValueOptions)('denies a heavy run behind `env %s`', opt => {
+    for (const run of ['npx vitest run a', 'npx playwright test a', 'node --test a.test.mjs', 'node scripts/check-standards.mjs']) {
+      expect(decide(`env ${opt} ${run}`, {}), `env ${opt} ${run}`).toMatch(/heavy-enforce|heavy-command admission queue/);
+    }
+  });
+  it.each(envValueOptions)('allows the admitted run behind `env %s` and keeps its value in the replacement', opt => {
+    expect(decide(`env ${opt} ${queue}npx vitest run a`, {})).toBeNull();
+    expect(decide(`env ${opt} npx vitest run a`, {})).toContain('`env ' + opt + ' ' + queue + 'npx vitest run a`');
+  });
+  // Self-review of round 4: options inside an env -S string, and the other peeled wrappers' value options.
+  // `@` stands for the heavy run.
+  const wrapperValueOptions = ['env -S "-i @"', 'env -S "-u X @"', 'env -S "-- @"', "env -S '-a x @'",
+    'sudo -p x @', 'sudo -D /tmp @', 'sudo -h h @', 'sudo -C 3 @', 'sudo -T 5 @', 'sudo --user x @', 'sudo --prompt=x @',
+    'nohup sudo -p x @', 'xargs -n 1 @', 'xargs -I {} @', 'xargs -a f @', 'xargs -P 2 -n1 @', 'command -p @', 'command -- @',
+    // Second self-review of round 4: BSD/macOS xargs -J/-R/-S, words after the env -S string, nice's value options.
+    'xargs -J % @', 'xargs -R 1 -I {} @', 'xargs -S 255 -I {} @', 'env -S "-u X" @', 'env -S "" @', 'env -S "-i" @',
+    'env --split-string=-i @', 'nice -n 5 @', 'nice -5 @', 'nice --adjustment 5 @', 'nice --adjustment=5 @', 'nice -n5 @'];
+  it.each(wrapperValueOptions)('denies a heavy run behind `%s`', template => {
+    for (const run of ['npx vitest run a', 'npx playwright test a', 'node --test a.test.mjs']) {
+      const cmd = template.replace('@', run);
+      expect(decide(cmd, {}), cmd).toMatch(/heavy-enforce|heavy-command admission queue/);
+    }
+  });
+  // Self-review of round 5: the env -S prefix, a nested env carrying -S, env -S's own escapes and comments, every
+  // other peeled wrapper's value options and path-qualified names, npx's command-line option and new launchers.
+  const round5Variants = ["env --s '@'", "env --s='@'", 'env -i env -S "@"', 'env -u X env -S "@"', 'env FOO=1 env -S "@"',
+    'env env -S "@"', 'env -i nice env -S "@"', "env -S '@\\c junk'", "env -S '#x' @", "env -S '${NOPE}@'",
+    'exec -la x @', 'caffeinate -it 5 @', 'timeout --sig KILL 5 @', 'timeout --k 5 10 @', 'stdbuf --output L @',
+    'ionice --class 3 @', 'time --f x @', '/usr/bin/time @', '/usr/bin/time -ao f @', '/usr/bin/caffeinate -i @',
+    'command -pp @', 'doas -u x @', 'flock /tmp/l @', 'flock -w 5 /tmp/l -c "@"', 'watch -n 5 @', 'chrt -T 1 -P 2 -D 3 -d 0 @',
+    'npx -c "@"', 'npx --call "@"', 'npx --call="@"', 'npm exec -c "@"'];
+  it.each(round5Variants)('denies a heavy run behind `%s`', template => {
+    for (const run of ['npx vitest run a', 'npx playwright test a']) {
+      const cmd = template.replace('@', run);
+      expect(decide(cmd, {}), cmd).toMatch(/heavy-enforce|heavy-command admission queue/);
+    }
+  });
+  it.each(['bun x vitest run a', 'pnpx vitest run a', "env -S 'npx vitest\\c junk' run a"])('denies `%s`', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  // Second self-review of round 5: a slash later in a command-line value must not cut the line to its last path
+  // segment, and env -S reads `\'` inside single quotes.
+  it.each(['npx -c "npx vitest run scripts/__tests__/a.test.mjs"', 'npx -c "vitest run scripts/a.test.mjs"',
+    'npx --call="npx vitest run scripts/a.test.mjs"', 'npx --call "npx vitest run scripts/a.test.mjs"',
+    'npx -c "node scripts/check-standards.mjs"', 'npx -c "npx playwright test e2e/a.spec.ts"',
+    'npx -c "./node_modules/.bin/vitest run scripts/a.test.mjs"', 'flock /tmp/l -c "npx vitest run scripts/a.test.mjs"',
+    'flock -w 5 /tmp/l -c "npx vitest run scripts/a.test.mjs"', 'watch "npx vitest run scripts/a.test.mjs"',
+    'watch "npm test -- scripts/a.test.mjs"', `env -S "X='\\\\' #' npx vitest run a"`])('denies the command line `%s`', cmd => {
+    expect(decide(cmd, {})).toMatch(/heavy-enforce|heavy-command admission queue/);
+  });
+  it('still guards a push inside a command-line value', () => {
+    expect(decide("npx -c 'git push --force origin refs/heads/main'", {})).not.toBeNull();
+  });
+  it.each(['env -i env -S "echo hi"', 'npx -c "echo hi"', 'flock /tmp/l echo hi', 'env -S "echo \\c npx vitest run a"',
+    "env -S 'echo #npx vitest run a'", 'npm exec -c "echo vitest"', 'bun x eslint .', 'timeout --sig KILL 5 echo hi'])('still allows `%s`', cmd => {
+    expect(decide(cmd, {})).toBeNull();
+  });
+  it.each(['env -S "-i git push --force origin main"', 'sudo -p x git push --force origin main',
+    'xargs -n 1 git push --force origin main', 'nice -n 5 git push --force origin main',
+    'env -S "-u X" git push --force origin main'])('the shared peel also reaches the push guard: `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it.each(['command -v npx', 'command -V vitest', 'sudo -p x ls', 'xargs -n 1 echo', 'env -S "-i ls"', 'sudo -h'])('still allows `%s`', cmd => {
+    expect(decide(cmd, {})).toBeNull();
+  });
+  // Review #6461 round 5: heavyRunHeads walks at most 16 launcher/env -S hops; past that it fails closed.
+  it.each(['nohup ', 'eval ', 'nohup eval '])('fails closed when wrapper unwrapping exhausts its hop budget (`%s`)', wrapper => {
+    const nest = n => wrapper.repeat(n).split(' ').filter(Boolean).slice(0, n).join(' ') + ' echo hi';
+    // 15 launchers + the command itself is 16 heads: within the bound, a harmless command stays harmless.
+    expect(heavyRunHeads(nest(15))).toHaveLength(16);
+    expect(ungatedHeavyRunKind(nest(15))).toBeNull();
+    expect(decide(nest(15), {})).toBeNull();
+    // One more launcher exhausts the budget: the walker gives up and every caller classifies the run as heavy.
+    for (const n of [16, 17, 40]) {
+      expect(heavyRunHeads(nest(n))).toBeNull();
+      expect(ungatedHeavyRunKind(nest(n))).toBe('test');
+      expect(decide(nest(n), {})).toContain('heavy-enforce');
+    }
+  });
+  it('names the command env -S and a launcher actually run in the replacement', () => {
+    for (const cmd of ["env -S 'npx vitest run a'", 'nohup npx vitest run a', 'case x in x) npx vitest run a;; esac']) {
+      expect(decide(cmd, {})).toContain('`' + queue + 'npx vitest run a`');
+    }
+  });
+  it('suggests a runnable single segment for a loop body', () => {
+    const reason = decide('for f in a b; do npx vitest run "$f"; done', {});
+    expect(reason).toContain('`' + queue + 'npx vitest run "$f"`');
+    expect(reason).not.toContain('run -- do ');
+  });
+  it.each([
+    'for f in a b; do ' + queue + 'npx vitest run "$f"; done',
+    'if true; then ' + queue + 'npx vitest run a; fi',
+    queue + 'npx vitest run a',
+    queue + 'gtimeout 5 npx vitest run a',
+    'env -i X=1 ' + queue + 'timeout 5 npx vitest run a',
+    'exec ' + queue + 'npx vitest run a',
+    "bash -c '" + queue + "npx vitest run a'", 'echo $(' + queue + 'npx vitest run a)',
+    '(' + queue + 'npx vitest run a)', 'true && ' + queue + 'npx vitest run a',
+    "env -S '" + queue + "npx vitest run a'", '{ ' + queue + 'npx vitest run a; }',
+    'case x in x) ' + queue + 'npx vitest run a;; esac', 'f() { ' + queue + 'npx vitest run a; }',
+    'env -S echo', 'echo case x in x', 'git commit -m "x) npx vitest run a"', 'echo "{ npx vitest run a; }"',
+    'nohup nohup nohup nohup nohup nohup echo hi', 'eval nohup eval nohup eval nohup echo hi',
+    "env -P /usr/bin -S 'echo hi'", 'case x in x ) echo hi;; esac', 'taskset -c 0 echo hi',
+    'grep vitest x', 'echo npx vitest run', 'npx vitest --version', 'vitest --help',
+    'git commit -m "document npx vitest run"',
+  ])('allows admitted control flow or harmless mention `%s`', cmd => {
+    expect(decide(cmd, {})).toBeNull();
+  });
+  it('keeps env options and assignments in a runnable replacement', () => {
+    expect(decide('env -i X=1 timeout 5 npx vitest run a', {}))
+      .toContain('`env -i X=1 ' + queue + 'timeout 5 npx vitest run a`');
+  });
+
+  it.each(execVitestRuns)('denies bare whole-suite `%s` both raw and admitted', (cmd) => {
+    for (const prefix of ['', queue]) {
+      expect(decide(prefix + cmd, {})).toBe(decide(prefix + 'npx vitest run', {}));
+      expect(decide(prefix + cmd, {})).toContain('bare FULL-SUITE');
+      expect(fullSuiteEscapeUsed(prefix + cmd)).toBe(false);
+    }
+  });
+
+  it.each(execVitestRuns)('allows an admitted file target for `%s` and still queues raw runs', (cmd) => {
+    expect(decide(queue + cmd + ' a.test.mjs', {})).toBeNull();
+    expect(decide(cmd + ' a.test.mjs', {})).toContain('heavy-enforce');
+    expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=1 ' + queue + cmd + ' a.test.mjs')).toBe(false);
+  });
+
+  it.each(execVitestRuns)('requires admission and detects the logged full-suite escape for `%s` like npx', (cmd) => {
+    expect(decide('WE_FULL_SUITE_OK=1 ' + cmd, {})).toContain('heavy-enforce');
+    expect(decide('WE_FULL_SUITE_OK=1 ' + queue + cmd, {})).toBeNull();
+    for (const prefix of ['', queue]) {
+      expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=1 ' + prefix + cmd)).toBe(true);
+      expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=0 ' + prefix + cmd)).toBe(false);
+    }
+  });
+
+  it.each(bypassRuns)('denies bypass `%s` with its exact admitted form', (cmd) => {
+    const result = decide(cmd, {});
+    expect(result).toContain('heavy-enforce');
+    expect(result).toContain('`' + queue + cmd + '`');
+  });
+
+  it.each(bypassRuns)('allows admitted bypass `%s`', (cmd) => {
+    expect(decide(queue + cmd, {})).toBeNull();
+  });
+
+  it.each(bypassRuns.flatMap((cmd) => [
+    `echo "${cmd}"`,
+    `grep -F '${cmd}' file`,
+    `git commit -m "document ${cmd}"`,
+    `node -e 'const command = "${cmd}"'`,
+  ]))('allows bypass text as data in `%s`', (cmd) => {
+    expect(decide(cmd, {})).toBeNull();
+  });
+
+  it.each([
+    'node --check scripts/__tests__/a.test.mjs', 'node --version',
+    'node --check --test a.mjs', 'node --version --test',
+    'node a.mjs --test', 'node --title --test a.mjs',
+    'node --test-reporter=spec x.mjs',
+    ...separateNodeOptions.flatMap((options) => [
+      `node ${options} x.mjs`,
+      `node ${options} --check --test a.mjs`,
+    ]),
+    'node --test-name-pattern --test x.mjs',
+    'npm run x -- vitest run a.test.mjs',
+  ])('allows non-run `%s`', (cmd) => expect(decide(cmd, {})).toBeNull());
+
+  // Reuse every direct Vitest spelling from the deny table, including Node-option bypasses.
+  const vitestHeads = [...new Set([...ordinarySessionRuns, ...bypassRuns, ...execVitestRuns]
+    .flatMap((cmd) => {
+      const entry = /(?:^|\s)(?:vitest(?:@[^\s]+)?|(?:\.\.?\/)?node_modules\/(?:\.bin\/vitest|vitest\/(?:vitest\.mjs|dist\/cli\.js)))(?=\s|$)/.exec(cmd);
+      if (!entry) return [];
+      return [cmd.slice(0, entry.index + entry[0].length).replace(/^WE_FULL_SUITE_OK=1\s+/, '')];
+    })), 'node --no-warnings node_modules/vitest/vitest.mjs'];
+
+  it.each(vitestHeads)('requires the full-suite escape for bare `%s run`, raw and admitted', (head) => {
+    for (const prefix of ['', queue]) {
+      const cmd = prefix + head + ' run';
+      expect(decide(cmd, {}), cmd).toContain('bare FULL-SUITE');
+      expect(decide(cmd, {}), cmd).toContain('WE_FULL_SUITE_OK');
+      expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=1 ' + cmd), cmd).toBe(true);
+    }
+    expect(decide(queue + head + ' run a.test.mjs', {})).toBeNull();
+    expect(decide('WE_FULL_SUITE_OK=1 ' + queue + head + ' run', {})).toBeNull();
+  });
+
+  it.each(ordinarySessionRuns)('denies %s in an ordinary session', (cmd) => {
     expect(decide(cmd, {})).not.toBeNull();
   });
 

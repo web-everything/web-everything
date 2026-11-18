@@ -1,0 +1,7 @@
+{
+  "prLandReady": {
+    "guardConfigPaths": [
+      "scripts/settings/prototype-load.json"
+    ]
+  }
+}

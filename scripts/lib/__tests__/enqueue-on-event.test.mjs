@@ -2,17 +2,21 @@
  * @file Event-driven enqueue eligibility, policy resolution, debounce, and injected fast-drain runs.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import ts from 'typescript';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
-  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readCatchUpCandidates, readyAtQuery, planCatchUp,
+  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
+import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
+import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -119,6 +123,54 @@ describe('pending marks', () => {
     });
   });
 
+  it.each([undefined, 30_000])('caps a three-minute burst from its first event (cap %s)', (cap) => {
+    const firstAt = 0;
+    const maxWait = cap ?? 60_000;
+    const options = { debounceSeconds: 15, ...(cap === undefined ? {} : { debounceMaxWaitMs: cap }) };
+    let pending = new Map();
+    for (let elapsed = 0; elapsed <= 180_000; elapsed += 10_000) {
+      pending = notePending(pending, [mark()], { localSlug: REPO, now: firstAt + elapsed });
+      expect(pending.get(`${REPO}#42`).firstAt).toBe(firstAt);
+      expect(duePending(pending, { ...options, now: firstAt + elapsed }).map(p => p.num))
+        .toEqual(elapsed < maxWait ? [] : [42]);
+      if (elapsed < maxWait) expect(duePending(pending, { ...options, now: firstAt + elapsed + 9_999 })).toEqual([]);
+    }
+  });
+
+  it('retains normal debounce before the max-wait cap is reached', () => {
+    let pending = notePending(new Map(), [mark()], { localSlug: REPO, now: 0 });
+    pending = notePending(pending, [mark()], { localSlug: REPO, now: 10_000 });
+    expect(duePending(pending, { now: 24_999, debounceSeconds: 15, debounceMaxWaitMs: 60_000 })).toEqual([]);
+    expect(duePending(pending, { now: 25_000, debounceSeconds: 15, debounceMaxWaitMs: 60_000 }).map(p => p.num)).toEqual([42]);
+  });
+
+  it('debounces a new event on retained catch-up work without changing its ordering stamp', () => {
+    const now = 120_000;
+    const key = `${REPO}#42`;
+    const retained = new Map([[key, {
+      repo: REPO, num: 42, firstAt: 0, lastAt: 0, causes: ['catch-up'], catchUp: true,
+    }]]);
+    const pending = notePending(retained, [mark()], { localSlug: REPO, now });
+    const due = (at) => duePending(pending, { now: at, debounceSeconds: 15 });
+    expect(due(now)).toEqual([]);
+    expect(due(now + 14_999)).toEqual([]);
+    expect(due(now + 15_000).map(p => p.num)).toEqual([42]);
+    expect(pending.get(key)).toMatchObject({ firstAt: 0, catchUp: true });
+    expect(retained.get(key)).toEqual({
+      repo: REPO, num: 42, firstAt: 0, lastAt: 0, causes: ['catch-up'], catchUp: true,
+    });
+    let burst = pending;
+    for (let elapsed = 10_000; elapsed <= 60_000; elapsed += 10_000) {
+      burst = notePending(burst, [mark()], { localSlug: REPO, now: now + elapsed });
+      expect(duePending(burst, { now: now + elapsed, debounceSeconds: 15 }).map(p => p.num))
+        .toEqual(elapsed < 60_000 ? [] : [42]);
+    }
+    const ordered = new Map(burst).set(`${REPO}#43`, {
+      repo: REPO, num: 43, firstAt: 1, lastAt: 0, causes: ['catch-up'], catchUp: true,
+    });
+    expect(duePending(ordered, { now: now + 60_000, debounceSeconds: 15 }).map(p => p.num)).toEqual([42, 43]);
+  });
+
   it('debounces from lastAt and orders due PRs by firstAt', () => {
     let pending = notePending(new Map(), [mark(42)], { localSlug: REPO, now: 1000 });
     pending = notePending(pending, [mark(43)], { localSlug: REPO, now: 2000 });
@@ -208,6 +260,32 @@ describe('fast drain helpers', () => {
 });
 
 describe('resolveEnqueueOnEventSetting', () => {
+  it('defaults the max-wait cap to 60000 and logs its source', () => {
+    expect(ENQUEUE_ON_EVENT_DEFAULTS.debounceMaxWaitMs).toBe(60_000);
+    const result = resolveSetting();
+    expect(result).toMatchObject({ debounceMaxWaitMs: 60_000, sources: { debounceMaxWaitMs: 'standard' } });
+    expect(result.line).toContain('debounceMaxWaitMs=60000 (standard)');
+  });
+
+  it.each([1000, 30_000, 600_000])('resolves valid max-wait %s through platform and tool layers', (value) => {
+    const platform = resolveSetting({}, { platform: { debounceMaxWaitMs: value } });
+    expect(platform).toMatchObject({ debounceMaxWaitMs: value, sources: { debounceMaxWaitMs: 'platform' } });
+    expect(platform.line).toContain(`debounceMaxWaitMs=${value} (platform)`);
+    const tool = resolveSetting({ debounceMaxWaitMs: value }, { platform: { debounceMaxWaitMs: 2000 } });
+    expect(tool).toMatchObject({ debounceMaxWaitMs: value, sources: { debounceMaxWaitMs: 'tool' } });
+    expect(tool.line).toContain(`debounceMaxWaitMs=${value} (tool)`);
+  });
+
+  it.each([0, 999, 600_001, 1000.5, '60000', null])('ignores invalid max-wait %s and logs the fallback', (value) => {
+    const result = resolveSetting({ debounceMaxWaitMs: value });
+    expect(result).toMatchObject({ debounceMaxWaitMs: 60_000, sources: { debounceMaxWaitMs: 'standard' } });
+    expect(result.invalid).toContain(`tool.debounceMaxWaitMs=${JSON.stringify(value)}`);
+    expect(result.line).toContain('debounceMaxWaitMs=60000 (standard)');
+    expect(result.line).toContain('ignored invalid:');
+    const platform = resolveSetting({ debounceMaxWaitMs: value }, { platform: { debounceMaxWaitMs: 20_000 } });
+    expect(platform).toMatchObject({ debounceMaxWaitMs: 20_000, sources: { debounceMaxWaitMs: 'platform' } });
+  });
+
   it('uses standard defaults when no tool or platform block is set', () => {
     const result = resolveSetting();
     expect(result).toMatchObject({
@@ -257,6 +335,27 @@ describe('resolveEnqueueOnEventSetting', () => {
 });
 
 describe('createEnqueueOnEvent', () => {
+  it.each([60_000, 30_000])('starts the first run at max-wait %s during a three-minute burst', async (maxWait) => {
+    const { handle, calls, advance } = setup({
+      resolveSetting: () => resolveSetting({ enabled: true, debounceMaxWaitMs: maxWait }),
+    });
+    let firstRunAt;
+    for (let elapsed = 0; elapsed <= 180_000; elapsed += 10_000) {
+      if (elapsed) advance(1);
+      handle.notePoll({ ok: true, marked: [mark()] });
+      await handle.tick();
+      if (calls.length && firstRunAt === undefined) firstRunAt = elapsed;
+      if (elapsed < maxWait) expect(calls).toHaveLength(0);
+      if (elapsed === maxWait) expect(calls).toHaveLength(1);
+      if (elapsed < 180_000) {
+        advance(9_999);
+        await handle.tick();
+        if (elapsed < maxWait) expect(calls).toHaveLength(0);
+      }
+    }
+    expect(firstRunAt).toBe(maxWait);
+  });
+
   it('waits for debounce, then runs the local fast drain and logs its verdict', async () => {
     const { handle, calls, lines, advance } = setup();
     handle.notePoll({ ok: true, marked: [mark()] });
@@ -561,6 +660,392 @@ describe('readCatchUpCandidates', () => {
   it('handles a synchronous exec exception', async () => {
     expect(await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: () => { throw new Error('spawn failed'); } }))
       .toEqual({ ok: false, error: 'spawn failed' });
+  });
+});
+
+describe('readPendingChangePaths', () => {
+  const base = { root: '/code', cwd: '/clone', overlays: () => [{ ref: 'lane/x', addedAt: '2026-11-05T00:00:00Z' }], rebuildState: () => ({ adopted: { at: '2026-11-04T00:00:00Z' } }) };
+  const TIP = 'c'.repeat(40);
+  const PROTECTED = 'scripts/lib/enqueue-on-event.mjs';
+  const gitErr = (status) => Object.assign(new Error(`git exited ${status}`), { status });
+  /** Fake git: `inHead` = is the overlay tip an ancestor of the code clone's HEAD; `tip` = rev-parse answer ('' = ref missing). */
+  const fakeGit = ({ inHead = false, tip = TIP, ancestorError = null } = {}, calls = []) => (_c, args) => {
+    calls.push(args);
+    if (args[0] === 'rev-parse') { if (!tip) throw gitErr(1); return `${tip}\n`; }
+    if (args[0] === 'merge-base') { if (ancestorError) throw ancestorError; if (inHead) return ''; throw gitErr(1); }
+    return args.some((a) => String(a).includes('...origin/lane/x')) ? `${PROTECTED}\0` : '';
+  };
+  const adoptedState = (applied) => () => ({ adopted: { at: '2026-11-06T00:00:00Z', applied } });
+  it('unions the main delta and each unadopted overlay diff', () => {
+    const exec = (_c, args) => (args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : args.includes('HEAD...origin/main') ? 'a.mjs\0' : 'b.mjs\0');
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec })).toMatchObject({ ok: true, paths: ['a.mjs', 'b.mjs'] });
+  });
+  it('skips an overlay whose current tip is already in the code clone HEAD', () => {
+    const calls = [];
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ inHead: true }, calls) });
+    expect(out).toMatchObject({ ok: true, paths: [] });
+    expect(calls.some((args) => args.some((a) => String(a).includes('...origin/lane/x')))).toBe(false);
+  });
+  it('still inspects an overlay registered before adoption whose branch advanced past HEAD', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: 'a'.repeat(40) }]), execFileSyncImpl: fakeGit({ inHead: false }) });
+    expect(out).toMatchObject({ ok: true, paths: [PROTECTED] });
+  });
+  it('does not trust the recorded adopted sha when HEAD does not carry the tip (held, rejected or rolled-back build)', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ inHead: false }) });
+    expect(out.paths).toContain(PROTECTED);
+  });
+  it('inspects an overlay with no adoption record at all', () => {
+    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+    expect(readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+    expect(readPendingChangePaths({ ...base, rebuildState: () => ({}), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+  });
+  it('fails closed when an overlay never applied has no resolvable tip', () => {
+    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: fakeGit({ tip: '' }) })).toMatchObject({ ok: false });
+  });
+  it('does not hold on a previously applied overlay whose branch was deleted', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ tip: '' }) });
+    expect(out).toMatchObject({ ok: true, paths: [] });
+  });
+  it('fails closed on a previously applied overlay when the tip lookup errors (timeout, exit 128) instead of reporting a missing ref', () => {
+    const state = adoptedState([{ ref: 'lane/x', sha: TIP }]);
+    for (const err of [gitErr(128), Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' })]) {
+      const exec = (_c, args) => { if (args[0] === 'rev-parse') throw err; return ''; };
+      expect(readPendingChangePaths({ ...base, rebuildState: state, execFileSyncImpl: exec })).toMatchObject({ ok: false });
+    }
+  });
+  it('fails closed when the ancestry check errors for a reason other than "not an ancestor"', () => {
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: fakeGit({ ancestorError: gitErr(128) }) })).toMatchObject({ ok: false });
+  });
+  it('reads NUL-separated paths so a quoted non-ASCII protected path still matches by name', () => {
+    const calls = [];
+    const exec = (_c, args) => { calls.push(args); return args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : 'scripts/lib/enqueue-on-event/é.mjs\0'; };
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec }).paths).toEqual(['scripts/lib/enqueue-on-event/é.mjs']);
+    expect(calls.filter((args) => args[0] === 'diff').every((args) => args.includes('-z'))).toBe(true);
+  });
+  it('disables rename detection so a moved protected file still shows its source path', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, execFileSyncImpl: fakeGit({}, calls) });
+    const diffs = calls.filter((args) => args[0] === 'diff');
+    expect(diffs).toHaveLength(2);
+    expect(diffs.every((args) => args.includes('--no-renames'))).toBe(true);
+  });
+  it('real git: a README-only tip adopted earlier, then advanced with a protected change, is inspected despite its old registration', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-change-'));
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8' });
+    try {
+      git('init', '-q', '-b', 'main');
+      mkdirSync(join(dir, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(dir, 'README.md'), 'a'); writeFileSync(join(dir, PROTECTED), 'x');
+      git('add', '-A'); git('commit', '-qm', 'base');
+      git('checkout', '-q', '-b', 'lane/existing'); writeFileSync(join(dir, 'README.md'), 'b'); git('commit', '-qam', 'readme only');
+      git('checkout', '-q', 'main'); git('merge', '-q', '--ff-only', 'lane/existing'); // HEAD adopted the README-only tip
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/existing', 'HEAD');
+      const probe = () => readPendingChangePaths({ root: dir, cwd: '/elsewhere', execFileSyncImpl: execFileSync, overlays: () => [{ ref: 'lane/existing', addedAt: '2026-11-04T00:00:00Z' }],
+        rebuildState: () => ({ adopted: { at: '2026-11-05T00:00:00Z', applied: [{ ref: 'lane/existing', sha: 'd'.repeat(40) }] } }) });
+      expect(probe()).toMatchObject({ ok: true, paths: [] });
+      git('checkout', '-q', 'lane/existing'); writeFileSync(join(dir, PROTECTED), 'y'); git('commit', '-qam', 'protected change'); // the same branch advances
+      git('update-ref', 'refs/remotes/origin/lane/existing', 'HEAD'); git('checkout', '-q', 'main');
+      expect(probe()).toMatchObject({ ok: true, paths: [PROTECTED] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('reads only what main gained since HEAD (three-dot), not files an already-merged overlay carries', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, overlays: () => [], execFileSyncImpl: fakeGit({}, calls) });
+    expect(calls.filter((args) => args[0] === 'diff').map((args) => args.find((a) => a.includes('origin/main')))).toEqual(['HEAD...origin/main']);
+  });
+  it('real git: a protected file carried by an overlay already merged into HEAD (not yet in main) is not pending', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-main-'));
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8' });
+    try {
+      git('init', '-q', '-b', 'main');
+      mkdirSync(join(dir, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(dir, PROTECTED), 'x'); writeFileSync(join(dir, 'README.md'), 'a');
+      git('add', '-A'); git('commit', '-qm', 'base'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(dir, PROTECTED), 'overlay'); git('commit', '-qam', 'overlay already merged into HEAD');
+      const probe = () => readPendingChangePaths({ root: dir, cwd: '/elsewhere', execFileSyncImpl: execFileSync, overlays: () => [], rebuildState: () => ({}) });
+      expect(probe()).toMatchObject({ ok: true, paths: [] });
+      git('checkout', '-q', '-b', 'side', 'origin/main'); writeFileSync(join(dir, 'README.md'), 'main moved'); git('commit', '-qam', 'main gains a file');
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD'); git('checkout', '-q', 'main');
+      expect(probe()).toMatchObject({ ok: true, paths: ['README.md'] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed when there is no separate code clone to read (missing root, or root equal to cwd)', () => {
+    for (const root of [undefined, '', '/clone']) {
+      expect(readPendingChangePaths({ ...base, root, execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
+    }
+  });
+  it('fails closed on a git error or an unsafe ref', () => {
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
+    expect(readPendingChangePaths({ ...base, overlays: () => [{ ref: '--evil' }], execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('catch-up during a daemon refresh (last-good enqueue)', () => {
+  const pendingRefresh = () => ({ pending: true, reason: 'unadopted-overlay' });
+  const warn = (lines) => lines.filter((line) => line.includes('refresh pending'));
+
+  /** Default readPendingChange wiring: real registry files in a temp dir, a fake git. */
+  const wired = ({ registry, git }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-wiring-'));
+    const env = { [WE_DAEMON_OVERLAY_DIR_ENV]: dir, [WE_DAEMON_STATE_DIR_ENV]: dir };
+    if (registry !== undefined) { mkdirSync(dir, { recursive: true }); writeFileSync(overlayFilePath('/code', env), registry); }
+    const gitCalls = [];
+    const execFileSyncImpl = (cmd, args, opts) => { gitCalls.push(args); return git ? git(args, opts) : ''; };
+    return { ...catchUpSetup({ refreshPending: pendingRefresh, env, execFileSyncImpl }), gitCalls, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  };
+
+  it('default wiring: a corrupt overlay registry pauses catch-up (fails closed) without running git', async () => {
+    const t = wired({ registry: '{not json' });
+    try {
+      await t.handle.catchUp();
+      expect(t.calls).toEqual([]);
+      expect(t.gitCalls).toEqual([]);
+      const paused = t.lines.filter((line) => line.includes('catch-up paused'));
+      expect(paused).toHaveLength(1);
+      expect(paused[0]).toMatch(/overlay registry unreadable.*failing closed/);
+    } finally { t.cleanup(); }
+  });
+  it('default wiring: a readable registry reads the pending change through git and continues on last-good when it is unrelated', async () => {
+    const t = wired({ registry: JSON.stringify({ clone: null, overlays: [] }), git: () => 'README.md\0' });
+    try {
+      await t.handle.catchUp();
+      expect(t.calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+      expect(t.gitCalls.some((args) => args[0] === 'diff' && args.includes('HEAD...origin/main'))).toBe(true);
+      expect(warn(t.lines)[0]).toMatch(/continuing on last-good/);
+    } finally { t.cleanup(); }
+  });
+  it('reads the pending change once per run, not once per candidate', async () => {
+    const reads = vi.fn(() => ({ ok: true, paths: ['README.md'], source: 'overlay lane/x' }));
+    const { handle, calls } = catchUpSetup({ refreshPending: pendingRefresh, readPendingChange: reads });
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(1);
+    expect(reads).toHaveBeenCalledTimes(1);
+  });
+  it('re-reads the pending change once the memo expires, so a newly registered protected change pauses a running catch-up', async () => {
+    let reads = 0;
+    let tick = () => {};
+    const t = catchUpSetup({
+      refreshPending: () => { tick(); return pendingRefresh(); },
+      readPendingChange: () => { reads += 1; return { ok: true, paths: reads === 1 ? ['README.md'] : ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }; },
+    });
+    tick = () => t.advance(31_000);
+    await t.handle.catchUp();
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(t.calls.length).toBeLessThan(2); // the stale "go" did not carry over to both candidates
+  });
+  it('keeps enqueuing on last-good while an unrelated overlay is pending, and logs the decision with provenance', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/unrelated.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+    expect(lines.filter((line) => line.includes('catch-up paused'))).toEqual([]);
+    const decision = warn(lines);
+    expect(decision).toHaveLength(1);
+    expect(decision[0]).toMatch(/continuing on last-good/);
+    expect(decision[0]).toContain('overlay lane/x');
+  });
+
+  it.each([
+    'scripts/lib/enqueue-on-event.mjs',
+    'scripts/lib/drain-queue-safety.mjs',
+    'scripts/merge-ai-prs.mjs',
+  ])('pauses when the pending change touches %s', async (path) => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['README.md', path], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    const pauses = lines.filter((line) => line.includes('catch-up paused'));
+    expect(pauses).toHaveLength(1);
+    expect(pauses[0]).toContain(path);
+  });
+
+  it('pauses when the pending diff cannot be read (fail closed)', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    expect(lines.filter((line) => line.includes('catch-up paused'))[0]).toContain('git diff failed');
+  });
+
+  it('keeps an unreadable-diff pause past maxPauseMinutes (fail closed)', async () => {
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    advance(30 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('a protected change after an unrelated one gets a fresh pause clock', async () => {
+    let change = { ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'a' };
+    const { handle, calls, advance } = catchUpSetup({ refreshPending: pendingRefresh, readPendingChange: () => change });
+    await handle.catchUp();
+    advance(8 * 60_000);
+    change = { ok: true, paths: ['README.md'], source: 'b' };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    advance(5 * 60_000);
+    change = { ok: true, paths: ['scripts/merge-ai-prs.mjs'], source: 'c' };
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('pauses when reading the pending diff throws', async () => {
+    const { handle, calls } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => { throw new Error('boom'); },
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('bounds a pause: after maxPauseMinutes it enqueues on last-good with a warning', async () => {
+    const { handle, calls, lines, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(9 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(2 * 60_000);
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    expect(lines.some((line) => /WARN/.test(line) && /max pause/.test(line))).toBe(true);
+  });
+
+  it('restarts the pause clock once the refresh clears', async () => {
+    let refresh = pendingRefresh();
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: () => refresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    advance(20 * 60_000);
+    refresh = { pending: false, reason: null };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    refresh = pendingRefresh();
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('resolves refreshPause with standard defaults', () => {
+    expect(resolveSetting().catchUp.refreshPause).toEqual({
+      paths: ['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event'],
+      maxPauseMinutes: 10,
+    });
+    expect(resolveSetting().sources['catchUp.refreshPause.maxPauseMinutes']).toBe('standard');
+  });
+
+  it('takes refreshPause from the tool layer and ignores invalid values', () => {
+    const ok = resolveSetting({ catchUp: { refreshPause: { paths: ['scripts/x'], maxPauseMinutes: 3 } } });
+    expect(ok.catchUp.refreshPause).toEqual({ paths: ['scripts/x'], maxPauseMinutes: 3 });
+    expect(ok.sources['catchUp.refreshPause.maxPauseMinutes']).toBe('tool');
+    const bad = resolveSetting({ catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } });
+    expect(bad.catchUp.refreshPause.maxPauseMinutes).toBe(10);
+    expect(bad.catchUp.refreshPause.paths.length).toBe(3);
+    for (const path of ['./scripts/x', 'scripts/./x', 'scripts//x', ' scripts/x', 'scripts/x ', '/scripts/x', 'scripts/../x']) {
+      expect(resolveSetting({ catchUp: { refreshPause: { paths: [path] } } }).catchUp.refreshPause.paths.length).toBe(3);
+    }
+  });
+
+  // A nested object in a leaf slot used to be flattened by the cascade and validated against the TOP-LEVEL key's
+  // validator, so `{prefixes:[…]}` passed as `paths` (then `.paths.join` threw and enqueue switched off).
+  const DEFAULT_PAUSE_PATHS = ['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event'];
+  it('a nested object in a refreshPause leaf is invalid: never throws, keeps the lower layer, names the leaf', () => {
+    const paths = resolveSetting({ enabled: true, catchUp: { enabled: true, refreshPause: { paths: { prefixes: ['scripts/custom'] } } } },
+      { platform: { catchUp: { refreshPause: { paths: ['scripts/plat'] } } } });
+    expect(paths.enabled).toBe(true);
+    expect(paths.catchUp.refreshPause.paths).toEqual(['scripts/plat']);
+    expect(paths.sources['catchUp.refreshPause.paths']).toBe('platform');
+    expect(paths.invalid).toContain('tool.catchUp.refreshPause.paths={"prefixes":["scripts/custom"]}');
+    expect(paths.line).toContain('catchUp.refreshPause.paths=scripts/plat (platform)');
+    const max = resolveSetting({ catchUp: { refreshPause: { maxPauseMinutes: { minutes: 3 } } } });
+    expect(max.catchUp.refreshPause.maxPauseMinutes).toBe(10);
+    expect(max.invalid).toContain('tool.catchUp.refreshPause.maxPauseMinutes={"minutes":3}');
+    const platformBad = resolveSetting({}, { platform: { catchUp: { refreshPause: { paths: { x: ['scripts/p'] }, maxPauseMinutes: { m: 2 } } } } });
+    expect(platformBad.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+    expect(platformBad.invalid).toEqual(expect.arrayContaining(['platform.catchUp.refreshPause.paths={"x":["scripts/p"]}', 'platform.catchUp.refreshPause.maxPauseMinutes={"m":2}']));
+    for (const shape of ['x', ['a'], 5, null]) {
+      const s = resolveSetting({ catchUp: { refreshPause: shape } });
+      expect(s.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+    }
+  });
+
+  it('a valid refreshPause is not reported as ignored-invalid', () => {
+    const s = resolveSetting({ catchUp: { refreshPause: { paths: ['scripts/custom'], maxPauseMinutes: 3 } } });
+    expect(s.catchUp.refreshPause).toEqual({ paths: ['scripts/custom'], maxPauseMinutes: 3 });
+    expect(s.invalid).toEqual([]);
+  });
+
+  it('the same nested-object shape in the sibling and scalar leaves falls to the lower layer', () => {
+    const ttl = resolveSetting({ catchUp: { missBackoff: { ttlMinutes: { x: 5 } } } }, { platform: { catchUp: { missBackoff: { ttlMinutes: 45 } } } });
+    expect(ttl.catchUp.missBackoff.ttlMinutes).toBe(45);
+    expect(ttl.invalid).toContain('tool.catchUp.missBackoff.ttlMinutes={"x":5}');
+    const scalar = resolveSetting({ enabled: true, debounceSeconds: { a: 5 } }, { platform: { debounceSeconds: 20 } });
+    expect(scalar).toMatchObject({ enabled: true, debounceSeconds: 20, sources: { debounceSeconds: 'platform' } });
+    expect(scalar.invalid).toContain('tool.debounceSeconds={"a":5}');
+    const enabled = resolveSetting({ enabled: { x: true } }, { platform: { enabled: true } });
+    expect(enabled.enabled).toBe(true);
+    expect(enabled.invalid).toContain('tool.enabled={"x":true}');
+    const catchUp = resolveSetting({ catchUp: { intervalMinutes: { m: 5 }, enabled: true } }, { platform: { catchUp: { intervalMinutes: 20 } } });
+    expect(catchUp.catchUp).toMatchObject({ intervalMinutes: 20, enabled: true });
+    expect(resolveSetting({ catchUp: 'x' }).invalid).toContain('catchUp="x"');
+  });
+
+  // Production passes no `platform`: the cascade reads the operator's preferences file itself, so that layer must be cleaned too.
+  describe('platform layer read from the preferences file (no platform argument)', () => {
+    const fromFile = (prefs, tool) => {
+      const dir = mkdtempSync(join(tmpdir(), 'enq-prefs-'));
+      const file = join(dir, 'platform-preferences.json');
+      writeFileSync(file, JSON.stringify(prefs));
+      try { return resolveEnqueueOnEventSetting({ tool, env: { WE_PLATFORM_PREFERENCES_FILE: file } }); } finally { rmSync(dir, { recursive: true, force: true }); }
+    };
+    const K = 'mergeQueue.enqueueOnEvent';
+    it.each([
+      ['enabled', { enabled: { x: true } }, { enabled: true }, (s) => expect(s.enabled).toBe(true)],
+      ['debounceSeconds', { debounceSeconds: { a: 5 } }, { enabled: true, debounceSeconds: 30 }, (s) => expect(s.debounceSeconds).toBe(30)],
+      ['catchUp.intervalMinutes', { catchUp: { intervalMinutes: { m: 5 } } }, { enabled: true, catchUp: { intervalMinutes: 20 } }, (s) => expect(s.catchUp.intervalMinutes).toBe(20)],
+      ['catchUp.enabled', { catchUp: { enabled: { x: true } } }, { enabled: true, catchUp: { enabled: true } }, (s) => expect(s.catchUp.enabled).toBe(true)],
+    ])('a nested object in the platform file %s does not override a valid tool value', (_leaf, platformBlock, tool, check) => {
+      const s = fromFile({ [K]: platformBlock }, tool);
+      check(s);
+      expect(s.invalid.length).toBeGreaterThan(0);
+    });
+    it('a nested object in a platform-file refreshPause / missBackoff leaf falls to the standard value and is named', () => {
+      const s = fromFile({ [`${K}.catchUp.refreshPause`]: { paths: { p: ['scripts/p'] }, maxPauseMinutes: { m: 2 } }, [`${K}.catchUp.missBackoff`]: { ttlMinutes: { x: 5 } } }, { enabled: true });
+      expect(s.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+      expect(s.catchUp.missBackoff.ttlMinutes).toBe(30);
+      expect(s.invalid).toEqual(expect.arrayContaining(['platform.catchUp.refreshPause.paths={"p":["scripts/p"]}', 'platform.catchUp.missBackoff.ttlMinutes={"x":5}']));
+    });
+    it('a valid platform-file refreshPause is applied', () => {
+      const s = fromFile({ [`${K}.catchUp.refreshPause`]: { paths: ['scripts/p'], maxPauseMinutes: 4 } }, { enabled: true });
+      expect(s.catchUp.refreshPause).toEqual({ paths: ['scripts/p'], maxPauseMinutes: 4 });
+      expect(s.sources['catchUp.refreshPause.paths']).toBe('platform');
+    });
+  });
+
+  it('rejects control characters in a pause path and bounds the logged invalid value', () => {
+    const s = resolveSetting({ catchUp: { refreshPause: { paths: ['a\nb · ignored invalid: x'] } } });
+    expect(s.catchUp.refreshPause.paths).toEqual(DEFAULT_PAUSE_PATHS);
+    expect(s.line).not.toContain('\n');
+    expect(resolveSetting({ debounceSeconds: { a: 'x'.repeat(500) } }).invalid[0].length).toBeLessThan(120);
+    const dup = resolveSetting({ catchUp: { order: 'x' } }, { platform: { catchUp: { order: 'x' } } });
+    expect(dup.invalid.filter((i) => i === 'catchUp.order="x"')).toHaveLength(1);
   });
 });
 
@@ -1873,4 +2358,531 @@ it.each(['', 'null', undefined, new Error('unreadable')])('defers without a reso
     expect(calls).toHaveLength(1);
     expect(execFileSyncImpl).toHaveBeenCalledTimes(2);
   } finally { handle.kill(); }
+});
+
+
+describe('catch-up miss backoff', () => {
+  const head = { ...READY_PR, headRefOid: 'miss-head' };
+  const persistentMiss = (num, reason = 'awaiting clearance') => ({
+    enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind: 'red-team-pending', reason }],
+  });
+  const fixture = (extra = {}) => catchUpSetup({
+    readPr: async () => head,
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0)] }),
+    drainResult: num => persistentMiss(num),
+    ...extra,
+  });
+  const attempts = f => f.calls.map(c => c.args[1]);
+  // Every recordEnqueue not-enqueued kind, including its delegated producers.
+  // Timers, queue/base state and unreadable evidence can recover without a head/label change.
+  const holdEligibility = [
+    ['batching-deferred', false], ['merge-lock-held', false], ['prestage', false],
+    ['branch-preparation', false], ['card-group-hold', false], ['card-grouped', false],
+    ['enqueue-backoff', false], ['live-state-unreadable', false], ['bornas-unreadable', false],
+    ['mq-same-head-failed', false],
+    ['conflict', false], ['unconfirmed', false], ['enqueue-error', false],
+    ['red-team-pending', true], ['sent-back', true], ['bornas-collision', true],
+  ];
+
+  it.each(holdEligibility)('classifies %s hold eligibility as %s and retries transient misses next catch-up', async (kind, eligible) => {
+    const f = fixture({ drainResult: num => ({ enqueueOutcomes: [
+      { num: 99, outcome: 'not-enqueued', kind: eligible ? 'batching-deferred' : 'red-team-pending' },
+      { num, outcome: 'not-enqueued', kind, reason: 'drain-reported gate' },
+    ] }) });
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(eligible ? 1 : 2);
+    expect(f.handle.missBackoff().size).toBe(eligible ? 1 : 0);
+    expect(enqueueModule.isMissBackoffHoldEligible(kind)).toBe(eligible);
+  });
+
+  it('lints recordEnqueue kinds and delegated producers against the classification table', () => {
+    const kinds = new Set();
+    const literals = node => {
+      if (ts.isStringLiteral(node)) kinds.add(node.text);
+      else if (ts.isConditionalExpression(node)) { literals(node.whenTrue); literals(node.whenFalse); }
+      else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.BarBarToken) literals(node.right);
+      else throw new Error(`Unclassified dynamic enqueue kind: ${node.getText()}`);
+    };
+    for (const file of ['../../merge-ai-prs.mjs', '../drain-merge-strategy.mjs', '../drain-poison-guard.mjs', '../card-group.mjs']) {
+      const source = ts.createSourceFile(file, readFileSync(new URL(file, import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      const visit = node => {
+        if (ts.isObjectLiteralExpression(node)) {
+          const props = node.properties.filter(ts.isPropertyAssignment);
+          const prop = name => props.find(p => p.name.text === name);
+          const kind = prop('kind');
+          const notEnqueued = prop('outcome')?.initializer.getText(source).includes('not-enqueued');
+          const enqueueReturn = prop('enqueued')?.initializer.kind === ts.SyntaxKind.FalseKeyword;
+          const failure = ts.isVariableDeclaration(node.parent) && node.parent.name.getText(source) === 'failure';
+          const grouped = file.endsWith('/card-group.mjs') && !prop('outcome');
+          if (kind && (notEnqueued || enqueueReturn || failure || grouped)) literals(kind.initializer);
+        }
+        // guardEnqueue returns its conditional kind through a shorthand property.
+        if (file.endsWith('/drain-poison-guard.mjs') && ts.isVariableDeclaration(node) && node.name.getText(source) === 'kind') literals(node.initializer);
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+    }
+    expect([...kinds].sort()).toEqual(holdEligibility.map(([kind]) => kind).sort());
+    expect(Object.keys(enqueueModule.MISS_BACKOFF_HOLD_ELIGIBILITY).sort()).toEqual([...kinds].sort());
+  });
+
+  it.each([undefined, 'new-unknown-kind', 'toString', '__proto__'])('never holds an unclassified kind: %s', async kind => {
+    const f = fixture({ drainResult: num => ({ enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind,
+      reason: 'red-team-pending: misleading text' }] }) });
+    await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(2);
+    expect(f.handle.missBackoff().size).toBe(0);
+    expect(enqueueModule.isMissBackoffHoldEligible(kind)).toBe(false);
+  });
+
+  it('retries a planned enqueue with no recorded outcome instead of inventing a hold', async () => {
+    const f = fixture({ drainResult: num => ({ toMerge: [{ num }], enqueueOutcomes: [] }) });
+    await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(2);
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+
+  it.each([
+    'merge-queue: wait (required check pending; read errors: HTTP 502)',
+    'merge-queue: refresh (base moved) → rerun failed: transient git error',
+    'merge-queue: refresh (base moved) → rebased',
+    'not mergeable (mergeable=UNKNOWN)',
+    'head moved since the pass-start decision (old-head → new-head) — the new head is re-judged next pass, review gate included',
+    'red-team-pending',
+  ].flatMap(reason => ['absent', 'empty', 'other PR'].map(outcomes => ({ reason, outcomes }))))(
+    'retries unclassified revalidation abort next catch-up ($outcomes outcomes): $reason', async ({ reason, outcomes }) => {
+      const f = fixture({ drainResult: num => ({ revalidationAborted: [{ num, reason }],
+        ...(outcomes === 'absent' ? {} : { enqueueOutcomes: outcomes === 'empty' ? []
+          : [{ num: 99, outcome: 'not-enqueued', kind: 'red-team-pending' }] }) }) });
+      await f.handle.catchUp();
+      expect(f.handle.missBackoff().size).toBe(0);
+      f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(2);
+    });
+
+  describe('code version', () => {
+    const V1 = 'a'.repeat(40), V2 = 'b'.repeat(40);
+    it('retries a held miss once after the drain code version changes', async () => {
+      let v = V1;
+      const f = fixture({ readCodeVersion: () => v });
+      await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(1);
+      v = V2;
+      f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(2);
+      expect(f.handle.missBackoff().get(42).codeVersion).toBe(V2);
+      f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(2);
+    });
+    it('stays backed off while the code version is unchanged', async () => {
+      const f = fixture({ readCodeVersion: () => V1 });
+      await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(1);
+    });
+    it.each([() => { throw new Error('nope'); }, () => 'not-a-sha', () => ''])('keeps today\'s behaviour when the version is unreadable', async (read) => {
+      const f = fixture({ readCodeVersion: read });
+      await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(1);
+    });
+  });
+
+  it('logs once for each renewed hold after TTL expiry', async () => {
+    const f = fixture();
+    const logs = () => f.lines.filter(l => l.includes('miss-backoff: skipped'));
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(logs()).toHaveLength(1);
+    f.advance(1_200_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(2);
+    f.advance(600_000); await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(logs()).toHaveLength(2);
+  });
+
+  it('renews the log when an event-bypassed hold expires while the drain runs', async () => {
+    let expireDuringDrain = false;
+    const f = fixture({ drainResult: num => {
+      if (expireDuringDrain) f.advance(5_000);
+      return persistentMiss(num);
+    } });
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    f.advance(1_180_000); f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(15_000); expireDuringDrain = true;
+    await f.handle.tick();
+    expect(attempts(f)).toHaveLength(2);
+    expect(f.handle.missBackoff().get(42).logged).toBe(false);
+    f.advance(600_000); await f.handle.catchUp();
+    expect(f.lines.filter(l => l.includes('miss-backoff: skipped'))).toHaveLength(2);
+  });
+
+  it('sanitises hostile control characters in the logged miss reason', async () => {
+    const reason = 'x\nSMELL enqueue-not-entering\r\x1b[31m\x00\x7f\x85';
+    const f = fixture({ drainResult: num => persistentMiss(num, reason) });
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    const lines = f.lines.filter(l => l.includes('miss-backoff: skipped'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('reason red-team-pending: x SMELL enqueue-not-entering  [31m');
+    expect(lines[0]).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+  });
+
+  it('resolves nested defaults, independent cascade leaves, sources and invalid bounds', () => {
+    expect(resolveSetting().catchUp.missBackoff).toEqual({ enabled: true, ttlMinutes: 30 });
+    const s = resolveSetting({ catchUp: { missBackoff: { enabled: false, ttlMinutes: 90 } } },
+      { platform: { catchUp: { missBackoff: { enabled: true, ttlMinutes: 45 } } } });
+    expect(s.catchUp.missBackoff).toEqual({ enabled: false, ttlMinutes: 90 });
+    expect(s.line).toContain('catchUp.missBackoff.enabled=false (tool)');
+    expect(s.line).toContain('catchUp.missBackoff.ttlMinutes=90 (tool)');
+    expect(resolveSetting({ catchUp: { missBackoff: { enabled: false } } },
+      { platform: { catchUp: { missBackoff: { ttlMinutes: 45 } } } }).catchUp.missBackoff).toEqual({ enabled: false, ttlMinutes: 45 });
+    for (const tool of [{}, { enabled: 'yes' }]) {
+      const platformDisabled = resolveSetting({ catchUp: { missBackoff: tool } },
+        { platform: { catchUp: { missBackoff: { enabled: false } } } });
+      expect(platformDisabled.catchUp.missBackoff.enabled).toBe(false);
+      expect(platformDisabled.sources['catchUp.missBackoff.enabled']).toBe('platform');
+      expect(platformDisabled.line).toContain('catchUp.missBackoff.enabled=false (platform)');
+    }
+    for (const ttlMinutes of [0, 1441, 1.5, '30', true]) {
+      const invalid = resolveSetting({ catchUp: { missBackoff: { ttlMinutes } } },
+        { platform: { catchUp: { missBackoff: { ttlMinutes: 45 } } } });
+      expect(invalid.catchUp.missBackoff.ttlMinutes).toBe(45);
+      expect(invalid.line).toContain('catchUp.missBackoff.ttlMinutes=45 (platform)');
+      expect(invalid.invalid.join(' ')).toContain('catchUp.missBackoff.ttlMinutes=');
+    }
+    for (const ttlMinutes of [1, 1440]) expect(resolveSetting({ catchUp: { missBackoff: { ttlMinutes } } }).catchUp.missBackoff.ttlMinutes).toBe(ttlMinutes);
+    expect(resolveSetting({ catchUp: { missBackoff: { enabled: 'yes' } } }).catchUp.missBackoff.enabled).toBe(true);
+  });
+
+  it('runs the first miss, records its identity, then skips and logs only once for unchanged head/labels/reason', async () => {
+    const f = fixture();
+    await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(f.handle.missBackoff().get(42)).toMatchObject({ pr: 42, headSha: 'miss-head', labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending: awaiting clearance', at: expect.any(Number) });
+    f.advance(600_000); await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(f.lines.filter(l => l.includes('miss-backoff: skipped'))).toEqual([
+      'enqueue-on-event: catch-up #42 — miss-backoff: skipped (reason red-team-pending: awaiting clearance) until head/labels change or TTL',
+    ]);
+    expect(f.lines.at(-1)).toContain('nothing runnable');
+  });
+
+  it('records an event-origin miss and skips a later catch-up for the same head and labels', async () => {
+    let catchUpEnabled = false;
+    const f = fixture({ resolveSetting: () => ({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, enabled: catchUpEnabled } }) });
+    f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(15_000);
+    const eventRan = await f.handle.tick();
+    expect(eventRan).toMatchObject([{ num: 42, what: 'not enqueued: red-team-pending: awaiting clearance' }]);
+    expect(eventRan[0].catchUp).toBeUndefined();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(f.handle.missBackoff().get(42)).toMatchObject({ pr: 42, headSha: 'miss-head',
+      labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending: awaiting clearance', at: expect.any(Number), logged: false });
+
+    catchUpEnabled = true;
+    f.advance(600_000);
+    const catchUpRan = await f.handle.catchUp();
+    expect(catchUpRan).toMatchObject([{ num: 42, catchUp: true, outcome: 'skipped',
+      what: 'miss-backoff: skipped (reason red-team-pending: awaiting clearance) until head/labels change or TTL' }]);
+    expect(attempts(f)).toEqual(['--only=42']);
+  });
+
+  it.each(['skipped', 'timeout', 'error', 'refused'])('an event-origin %s clears an earlier miss so only existing backoff rules govern catch-up', async outcome => {
+    vi.useFakeTimers();
+    try {
+      let result = persistentMiss(42);
+      const f = fixture({ manualFinish: true, timeoutMs: 1000, drainResult: () => result,
+        resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp,
+          blockedBackoffRounds: 1, timeoutBackoffRounds: 1 } }),
+      });
+      const finish = async (run, end) => {
+        await vi.advanceTimersByTimeAsync(0);
+        const child = f.children.at(-1);
+        if (end === 'timeout') {
+          child.kill = () => child.emit('close', null);
+          await vi.advanceTimersByTimeAsync(1000);
+        } else if (end === 'error') child.emit('error', new Error('spawn failed'));
+        else child.finish();
+        return run;
+      };
+      await finish(f.handle.catchUp(), 'not-enqueued');
+      expect(f.handle.missBackoff().has(42)).toBe(true);
+
+      result = outcome === 'refused' ? { ok: false, reason: 'unavailable' }
+        : { considered: 1, skipReasons: [{ num: 42, reason: 'merge state BLOCKED' }] };
+      f.handle.notePoll({ ok: true, marked: [mark(42)] }); f.advance(15_000);
+      const eventRan = await finish(f.handle.tick(), outcome);
+      expect(eventRan).toMatchObject([{ num: 42, outcome }]);
+      expect(eventRan[0].catchUp).toBeUndefined();
+      expect(f.handle.missBackoff().size).toBe(0);
+      expect(f.handle.blocked().size).toBe(0); // Events do not arm blocked/timeout backoff.
+
+      f.advance(600_000);
+      expect(await finish(f.handle.catchUp(), outcome)).toMatchObject([{ num: 42, catchUp: true, outcome }]);
+      expect(attempts(f)).toHaveLength(3);
+      expect(f.handle.missBackoff().size).toBe(0);
+      if (outcome === 'skipped' || outcome === 'timeout') {
+        expect(f.handle.blocked().get(42)).toMatchObject({ rounds: 1,
+          reason: outcome === 'timeout' ? 'timeout' : 'blocked' });
+        f.advance(600_000);
+        expect(await f.handle.catchUp()).toMatchObject([{ num: 42, outcome: 'skipped',
+          what: expect.stringMatching(/^backed off:/) }]);
+        expect(attempts(f)).toHaveLength(3);
+      }
+      result = { toMerge: [{ num: 42 }] };
+      f.advance(600_000);
+      expect(await finish(f.handle.catchUp(), 'enqueued')).toMatchObject([{ num: 42, outcome: 'enqueued' }]);
+      expect(attempts(f)).toHaveLength(4); // Retry before the original 30-minute miss TTL.
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['head', 'labels', 'TTL'])('re-picks after %s changes', async change => {
+    let pr = head;
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp();
+    if (change === 'head') pr = { ...head, headRefOid: 'new-head' };
+    if (change === 'labels') pr = { ...head, labels: [...head.labels, { name: 'review:accepted' }] };
+    f.advance(change === 'TTL' ? 1_800_000 : 600_000);
+    await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+  });
+
+  it('ignores label order and check-only changes', async () => {
+    let pr = { ...head, labels: [...head.labels, { name: 'review:accepted' }] };
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp();
+    pr = { ...pr, labels: [...pr.labels].reverse(), statusCheckRollup: [] };
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(1);
+  });
+
+  it('refills the freed slot with the next eligible candidate', async () => {
+    let prs = [candidate(42, 0)];
+    const f = fixture({ readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs }) });
+    await f.handle.catchUp();
+    prs = [candidate(42, 0), candidate(43, 1)];
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=43']);
+  });
+
+  it('enabled:false never skips or records misses', async () => {
+    const f = fixture({ resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, missBackoff: { enabled: false } } }) });
+    await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+
+  it('events bypass the hold and a new reason replaces the record on re-pick', async () => {
+    let reason = 'red-team-pending';
+    const f = fixture({ drainResult: num => persistentMiss(num, reason) });
+    await f.handle.catchUp();
+    reason = 'other-gate';
+    f.handle.notePoll({ ok: true, marked: [mark(42)] }); f.advance(15_000); await f.handle.tick();
+    expect(attempts(f)).toHaveLength(2);
+    f.advance(1_800_000); await f.handle.catchUp();
+    expect(f.handle.missBackoff().get(42).reason).toBe('red-team-pending: other-gate');
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(3);
+    expect(f.lines.some(l => l.includes('miss-backoff: skipped (reason red-team-pending: other-gate)'))).toBe(true);
+  });
+
+  it('an unclassified event-origin abort clears an earlier hold and retries next catch-up', async () => {
+    let result = persistentMiss(42);
+    const f = fixture({ drainResult: () => result });
+    await f.handle.catchUp();
+    expect(f.handle.missBackoff().has(42)).toBe(true);
+    result = { revalidationAborted: [{ num: 42, reason: 'not mergeable (mergeable=UNKNOWN)' }] };
+    f.handle.notePoll({ ok: true, marked: [mark(42)] }); f.advance(15_000);
+    await f.handle.tick();
+    expect(f.handle.missBackoff().size).toBe(0);
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(3);
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+
+  it.each(['absent', 'queued', 'closed', 'enqueued', 'not-listed'])('drops records when %s', async change => {
+    let prs = [candidate(42)]; let pr = head; let result;
+    const f = fixture({ readPr: async () => pr, readCandidates: async () => ({ ok: true, queued: 0, prs }),
+      drainResult: num => result ?? persistentMiss(num) });
+    await f.handle.catchUp();
+    if (change === 'absent') prs = [];
+    if (change === 'queued') prs = [candidate(42, 0, { inQueue: true })];
+    if (change === 'closed') pr = { ...head, state: 'CLOSED' };
+    if (change === 'enqueued') result = { toMerge: [{ num: 42 }] };
+    if (change === 'not-listed') result = { considered: 0 };
+    if (['closed', 'enqueued', 'not-listed'].includes(change)) f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(600_000); await f.handle.tick();
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+
+  it('unreadable labels cannot authorize a fast drain or a miss hold', async () => {
+    let pr = head;
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp(); pr = { ...head, labels: null };
+    f.advance(600_000); const ran = await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(1);
+    expect(ran[0].what).toContain('labels unreadable');
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+});
+
+
+describe('catch-up landable-first regression contracts', () => {
+  const head = { ...READY_PR, headRefOid: 'same-failed-head' };
+  const miss = (num, reason = 'same head previously failed required checks', kind = 'mq-same-head-failed') => ({
+    enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind, reason }],
+  });
+  const fixture = (extra = {}) => catchUpSetup({
+    readPr: async () => head,
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0)] }),
+    drainResult: num => miss(num),
+    ...extra,
+  });
+  const attempts = f => f.calls.map(c => c.args[1]);
+  const nextRound = async f => { f.advance(600_000); return f.handle.catchUp(); };
+  const expectHeld = (f, ran) => {
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(ran).toMatchObject([{ num: 42, catchUp: true, outcome: 'skipped',
+      what: expect.stringMatching(/backed off:|miss-backoff: skipped/) }]);
+    expect(f.lines.some(line => line.includes('#42') && /backed off:|miss-backoff: skipped/.test(line))).toBe(true);
+  };
+
+  it.each(['priority-then-first-accept', 'oldest-ready'])('planCatchUp partitions deprioritized candidates after landable candidates in run and later (%s)', order => {
+    const input = { queued: 0, capacity: 3, order, buildPriority: ['42'], prs: [
+      candidate(42, 0, { itemIds: ['42'] }), candidate(43, 100), candidate(44, 200),
+      candidate(45, 300), candidate(46, 400),
+    ] };
+    const baseline = planCatchUp(input);
+    const existingOrder = [...baseline.run.map(p => p.num), ...baseline.later];
+    // Exercise both an array and a generic iterable; preserve the existing order in each group.
+    for (const deprioritize of [[42, 44], new Set([44, 42])]) {
+      const plan = planCatchUp({ ...input, deprioritize });
+      const expected = [...existingOrder.filter(n => ![42, 44].includes(n)),
+        ...existingOrder.filter(n => [42, 44].includes(n))];
+      expect(plan.run.map(p => p.num)).toEqual(expected.slice(0, 3));
+      expect(plan.later).toEqual(expected.slice(3));
+      expect([...plan.run.map(p => p.num), ...plan.later].sort((a, b) => a - b)).toEqual([42, 43, 44, 45, 46]);
+      expect(plan.skipped).toEqual([]);
+    }
+  });
+
+  it('backs off an unchanged mq-same-head-failed miss without spawning or marking it enqueued', async () => {
+    const readMembership = vi.fn(async () => ({ ok: true, inQueue: true }));
+    const f = fixture({ readMembership });
+    const first = await f.handle.catchUp();
+    expect(first).toMatchObject([{ num: 42, outcome: 'not-enqueued', verified: null }]);
+    expectHeld(f, await nextRound(f));
+    expect(readMembership).not.toHaveBeenCalled();
+    expect(f.lines.some(line => line.includes('[outcome=enqueued]'))).toBe(false);
+  });
+
+  it.each(['head', 'labels', 'checks'])('retries an mq-same-head-failed hold after %s changes', async change => {
+    let pr = head;
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp();
+    expectHeld(f, await nextRound(f));
+    if (change === 'head') pr = { ...head, headRefOid: 'replacement-head' };
+    if (change === 'labels') pr = { ...head, labels: [...head.labels, { name: 'review:accepted' }] };
+    if (change === 'checks') pr = { ...head, statusCheckRollup: [...head.statusCheckRollup,
+      { __typename: 'CheckRun', name: 'retry-evidence', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    const ran = await nextRound(f);
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+    expect(ran).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+    await nextRound(f);
+    expect(attempts(f)).toHaveLength(2);
+  });
+
+  it.each(['retry evidence unreadable', 'retry evidence incomplete', 'timeline unreadable'])(
+    'retries %s next round while complete mq-same-head-failed evidence backs off', async reason => {
+      let pr = head;
+      let evidence = 'same head previously failed required checks';
+      const f = fixture({ readPr: async () => pr, drainResult: num => miss(num, evidence) });
+      await f.handle.catchUp();
+      expectHeld(f, await nextRound(f));
+      pr = { ...head, headRefOid: 'head-with-unreadable-evidence' };
+      evidence = reason;
+      expect(await nextRound(f)).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+      expect(await nextRound(f)).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+      expect(attempts(f)).toEqual(['--only=42', '--only=42', '--only=42']);
+    });
+
+  it('retries unchanged mq-same-head-failed evidence after the backoff bound expires', async () => {
+    const f = fixture({ resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, blockedBackoffRounds: 2,
+        missBackoff: { enabled: true, ttlMinutes: 30 } } }) });
+    await f.handle.catchUp();
+    expectHeld(f, await nextRound(f));
+    expectHeld(f, await nextRound(f));
+    const ran = await nextRound(f);
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+    expect(ran).toMatchObject([{ num: 42, outcome: 'not-enqueued' }]);
+  });
+
+  it('starts never-missed landable PRs before a higher-priority PR with a recorded recent miss', async () => {
+    let prs = [candidate(42, 0, { itemIds: ['42'] })];
+    const f = fixture({
+      readPriorities: () => ({ buildPriority: ['42'] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs }),
+      // A transient miss must remain a candidate, even though it has no hold-eligible kind.
+      drainResult: num => num === 42 ? miss(num, 'lock held', 'merge-lock-held') : { toMerge: [{ num }] },
+    });
+    await f.handle.catchUp();
+    expect(f.handle.misses().get(42)).toBe(1);
+    prs = [...prs, candidate(43, 100), candidate(44, 200)];
+    await nextRound(f);
+    expect(attempts(f)).toEqual(['--only=42', '--only=43', '--only=44', '--only=42']);
+  });
+
+  it('restores priority order for a missed PR once the default missBackoff TTL expires without permanent demotion', async () => {
+    let prs = [candidate(42, 0, { itemIds: ['42'] })];
+    const f = fixture({
+      readPriorities: () => ({ buildPriority: ['42'] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs }),
+      drainResult: num => num === 42 ? miss(num, 'lock held', 'merge-lock-held') : { toMerge: [{ num }] },
+    });
+    await f.handle.catchUp();
+    expect(f.handle.misses().get(42)).toBe(1);
+    prs = [...prs, candidate(43, 100), candidate(44, 200)];
+    f.advance(30 * 60_000);
+    await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=42', '--only=43', '--only=44']);
+  });
+
+  it('expires old event-marked pending work into this round while fresh event work stays already pending', async () => {
+    const f = fixture({
+      resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+        catchUp: { ...CATCH_UP_SETTING.catchUp, pendingExpiryMinutes: 15 } }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0), candidate(43, 100)] }),
+    });
+    f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    expect(f.handle.pending()).toMatchObject([{ num: 42, causes: ['check_suite.completed=success'] }]);
+    expect(f.handle.pending()[0].catchUp).toBeUndefined();
+    f.advance(16 * 60_000);
+    f.handle.notePoll({ ok: true, marked: [mark(43)] });
+    const ran = await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(ran).toMatchObject([{ num: 42, catchUp: true, outcome: 'not-enqueued' }]);
+    expect(f.handle.pending().map(p => p.num)).toEqual([43]);
+    expect(f.lines.some(line => line.includes('expired pending #42'))).toBe(true);
+    expect(f.lines.some(line => line.includes('#43') && line.includes('already pending'))).toBe(true);
+    expect(f.lines.some(line => line.includes('expired pending #43'))).toBe(false);
+  });
+});
+
+it('catch-up miss backoff uses a nondefault TTL from the resolved setting', async () => {
+  const f = catchUpSetup({
+    resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, missBackoff: { ttlMinutes: 1 } } }),
+    readPr: async () => ({ ...READY_PR, headRefOid: 'short-ttl' }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+    drainResult: num => ({ enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind: 'red-team-pending', reason: 'awaiting clearance' }] }),
+  });
+  await f.handle.catchUp();
+  f.advance(600_000); await f.handle.catchUp();
+  expect(f.calls).toHaveLength(2);
 });

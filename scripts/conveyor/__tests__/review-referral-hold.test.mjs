@@ -14,7 +14,7 @@ import { countFindings, planReconcile } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
-  GH_LIST_COMMENT_CAP, findResumableParkedRun,
+  GH_LIST_COMMENT_CAP, findResumableParkedRun, RESUME_MAX_ATTEMPTS,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
   resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_KIND, needsYouClaimRoot,
 } from '../review-referral-hold.mjs';
@@ -58,6 +58,139 @@ const pr = (overrides = {}) => ({ number: 3481, headRefOid: head, headRefName: '
   labels: [{ name: 'review:human' }], comments: [], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...overrides });
 const evidence = opts => reviewRunEvidence(run(opts));
+
+describe('retryable record effects', () => {
+  const saved = () => ({ ...run(), pending: { kind: 'effect', step: 'record', stepIndex: 13 },
+    findings: { ...run().findings, referralVerdict: { verdict: 'accept', pendingReferrals: [] } },
+    effects: [{ type: 'review.write-up', status: 'applied' },
+      { type: 'review.label-swap', status: 'pending', error: '--body-file=gone is unreadable (ENOENT)', unknownAttempts: 0 },
+      { type: 'verdict-ledger.append', status: 'declared' }, { type: 'review.notice', status: 'declared' }] });
+  const ciSaved = () => {
+    const r = saved();
+    r.effects[1] = { type: 'review.label-swap', status: 'failed',
+      error: 'review held: CI still pending on reviewed head', unknownAttempts: 1 };
+    return r;
+  };
+  it.each([false, true])('projects CI-held retry separately, incomplete=%s', incomplete => {
+    const r = ciSaved();
+    if (incomplete) r.stepTimings = r.stepTimings.filter(t => t.step !== 'advise');
+    const row = reviewRunEvidence(r);
+    expect(row.ciHeldRecordRetry).toEqual({ attempts: 1, resumeAttempts: 0 });
+    expect(row.retryableRecordEffect).toBeUndefined();
+    expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 1 })).toEqual({ id: r.id, head });
+    expect(findResumableParkedRun(pr(), [row], { repo })).toBeNull();
+    expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 0 })).toBeNull();
+    expect(findResumableParkedRun(pr(), [{ ...row, ciHeldRecordRetry: { attempts: 4, resumeAttempts: 0 } }],
+      { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    expect(findResumableParkedRun(pr({ headRefOid: 'b'.repeat(40) }), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    expect(findResumableParkedRun(pr({ comments: [comment('fresh review', row.startedAt + 1, 'chalbert')] }),
+      [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+  });
+  it.each([RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS, RESUME_MAX_ATTEMPTS + 1])(
+    'enforces the independent saved record resume budget (%s)', resumeAttempts => {
+      const r = { ...ciSaved(), recordEffectResumeAttempts: resumeAttempts };
+      const row = reviewRunEvidence(r);
+      expect(row.ciHeldRecordRetry).toEqual({ attempts: 1, resumeAttempts });
+      expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 }))
+        .toEqual(resumeAttempts < RESUME_MAX_ATTEMPTS ? { id: r.id, head } : null);
+    });
+  it.each([false, true])('selects saved CI-held record retries within both budgets, completed referral resume=%s', resumed => {
+    for (const attempts of [1, 3, 4]) {
+      for (const resumeAttempts of [0, RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS]) {
+        const r = { ...ciSaved(), recordEffectResumeAttempts: resumeAttempts };
+        if (resumed) r.resumeOf = { verdict: run().findings.referralVerdict,
+          mandatoryReferrals: run().findings.mandatoryReferrals, attempts: 1 };
+        r.effects[1].unknownAttempts = attempts;
+        const row = reviewRunEvidence(JSON.parse(JSON.stringify(r)));
+        expect(row.ciHeld).toBe(true);
+        expect(row.ciHeldRecordRetry).toEqual({ attempts, resumeAttempts });
+        expect(row.retryableRecordEffect).toBeUndefined();
+        expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 }))
+          .toEqual(attempts <= 3 && resumeAttempts < RESUME_MAX_ATTEMPTS ? { id: r.id, head } : null);
+        expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 0 })).toBeNull();
+      }
+    }
+  });
+  it.each([undefined, -1, '1', NaN, Infinity, 1.5])(
+    'refuses incomplete or invalid projected resume attempts (%s)', resumeAttempts => {
+      const row = reviewRunEvidence(ciSaved());
+      row.ciHeldRecordRetry.resumeAttempts = resumeAttempts;
+      expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    });
+  it('uses the largest outstanding CI-held attempt count', () => {
+    const r = ciSaved(); r.effects.push({ ...r.effects[1], unknownAttempts: 4 });
+    expect(reviewRunEvidence(r).ciHeldRecordRetry).toEqual({ attempts: 4, resumeAttempts: 0 });
+  });
+  it.each(['recordEffectResumeAttempts', 'unknownAttempts'].flatMap(field =>
+    ['corrupt', -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1].map(value => [field, value])))(
+    'refuses malformed saved %s=%s, including NaN persisted as null', (field, value) => {
+      const r = ciSaved();
+      if (field === 'unknownAttempts') r.effects[1][field] = value;
+      else r[field] = value;
+      const row = reviewRunEvidence(JSON.parse(JSON.stringify(r)));
+      expect(row.ciHeldRecordRetry).toBeDefined();
+      expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    });
+  it.each([undefined, '1', Infinity])('retains invalid label counter evidence for driver refusal (%s)', value => {
+    const r = ciSaved(); r.effects[1].unknownAttempts = value;
+    const row = reviewRunEvidence(r);
+    expect(row.ciHeldRecordRetry.attempts).toBeNull();
+    expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+  });
+  it.each([
+    ['non-CI failure', r => { r.effects[1].error = 'network timeout'; }],
+    ['pending effect', r => { r.effects[1].status = 'pending'; }],
+    ['mixed failure', r => { r.effects.push({ type: 'review.notice', status: 'failed' }); }],
+    ['other step', r => { r.pending.step = 'advise'; }],
+    ['empty effects', r => { r.effects = []; }],
+    ['unreadable effect', r => { r.effects.push(null); }],
+  ])('does not prove CI-held retry for %s', (_, mutate) => {
+    const r = ciSaved(); mutate(r);
+    const row = reviewRunEvidence(r);
+    expect(row?.ciHeldRecordRetry).toBeUndefined();
+    expect(findResumableParkedRun(pr(), row ? [row] : [], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+  });
+  it.each([0])('resumes only the pending body-file refusal with unknownAttempts=%s, without a ruling', unknownAttempts => {
+    const r = saved(); r.effects[1].unknownAttempts = unknownAttempts;
+    const row = reviewRunEvidence(r);
+    expect(row.retryableRecordEffect).toBe(true);
+    expect(findResumableParkedRun(pr(), [row], { repo })).toEqual({ id: r.id, head });
+    expect(findResumableParkedRun(pr({ headRefOid: 'b'.repeat(40) }), [row], { repo })).toBeNull();
+    expect(findResumableParkedRun(pr(), [row, { ...row, id: 'newer', startedAt: row.startedAt + 1, completedAt: row.completedAt + 1,
+      retryableRecordEffect: false }], { repo })).toBeNull();
+  });
+  // Operator send-back on PR #6784: a newer operator comment on the unchanged head asks for a fresh review, so the
+  // saved record-retry run is never resumed over it. An older operator comment, a ruling or the run's own
+  // automated write-up does not count.
+  it('starts a fresh review when the operator commented after the saved record-retry run began', () => {
+    const r = saved();
+    const row = reviewRunEvidence(r);
+    expect(row.retryableRecordEffect).toBe(true);
+    const fresh = comment('run a fresh review', row.startedAt + 1, 'chalbert');
+    expect(findResumableParkedRun(pr({ comments: [fresh] }), [row], { repo })).toBeNull();
+    expect(findResumableParkedRun(pr({ comments: [{ ...fresh, createdAt: iso(row.startedAt - 1) }] }), [row], { repo }))
+      .toEqual({ id: r.id, head });
+    expect(findResumableParkedRun(pr({ comments: [comment('🔁 review — changes requested', row.startedAt + 1)] }), [row], { repo }))
+      .toEqual({ id: r.id, head });
+  });
+  it.each([
+    ['unknown write', r => { r.effects[1].unknownAttempts = 1; }],
+    ['unknownAttempts absent', r => { delete r.effects[1].unknownAttempts; }],
+    ['other pending effect', r => { r.effects[2].status = 'pending'; }],
+    ['non-body-file error', r => { r.effects[1].error = 'network timeout'; }],
+    ['other pre-write refusal', r => { r.effects[1].error = 'invalid --repo'; }],
+    ['failed label swap', r => { r.effects[1].status = 'failed'; }],
+    ['resume', r => { r.resumeOf = {}; }],
+    ['missing effects', r => { delete r.effects; }],
+    ['empty effects', r => { r.effects = []; }],
+    ['unreadable effect', r => { r.effects.push(null); }],
+  ])('keeps %s held', (_, mutate) => {
+    const r = saved(); mutate(r);
+    const row = reviewRunEvidence(r);
+    expect(row?.retryableRecordEffect).not.toBe(true);
+    expect(findResumableParkedRun(pr(), row ? [row] : [], { repo })).toBeNull();
+  });
+});
 const hold = (p = pr(), runs = [evidence()], now = at + 1) => decideReferralHold(p, runs, { repo, now });
 
 function reconcile(p) {
@@ -400,6 +533,39 @@ describe('same-head review loop regression (live #202)', () => {
     expect(row).toMatchObject({ attempted: true, count: 1, parked: true });
     expect(hold(pr(), [row])).not.toBeNull();
   });
+
+  // PR #6465 round 2: every run-level reason `mandatoryReferralState` re-derives live is one shared set, so `attempted`
+  // and `count` skip it exactly as the refused-stage resume check does; failure tokens stay real (fail-closed) entries.
+  it.each(['malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject'])(
+    'counts %s as a reason, not a finding, and keeps the attempted referral held', token => {
+      const r = run();
+      r.findings.referralVerdict.pendingReferrals.unshift(token);
+      const row = reviewRunEvidence(r);
+      expect(PENDING_REASON_TOKENS.has(token)).toBe(true);
+      expect(row).toMatchObject({ attempted: true, count: 1, parked: true });
+      expect(hold(pr(), [row])).not.toBeNull();
+    });
+
+  it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result', 'referral-overflow'])(
+    'keeps the failure token %s out of the reason set', token => {
+      expect(PENDING_REASON_TOKENS.has(token)).toBe(false);
+    });
+
+  // Drift guard: a new run-level reason pushed by jury-core must be classified here (reason vs fail-closed failure),
+  // or a fully ruled refused run would silently never resume again.
+  it('classifies every literal reason token jury-core pushes onto the referral pending list', () => {
+    // Every file that builds a referral pending list, and every literal shape it uses: push/unshift, an object-literal
+    // `pending: ['…']`, and an assigned or defaulted `pending… = … ['…']` / `?? ['…']` (any quote style).
+    const sources = ['scripts/lib/jury-core.mjs', 'scripts/operations/review-pr-io.mjs', 'scripts/operations/review-pr.mjs'];
+    const token = String.raw`['"\x60]([a-z]+(?:-[a-z]+)+)['"\x60]`;
+    const shapes = new RegExp(String.raw`\bpending(?:Referrals)?\b(?:\.(?:push|unshift)\(|\s*:\s*\[|\s*=[^;\n]*?\[|\s*\?\?\s*\[)\s*${token}`, 'g');
+    const produced = new Set(sources.flatMap(file => [...readFileSync(join(process.cwd(), file), 'utf8').matchAll(shapes)]
+      .map(m => m[1])));
+    // `referral-overflow` is pushed after the live read (a ruling withheld for size), so nothing live re-derives it.
+    const failureTokens = new Set(['malformed-referral-record', 'referral-persistence-failed', 'unreadable-referral-result',
+      'referral-overflow']);
+    expect([...produced].sort()).toEqual([...PENDING_REASON_TOKENS, ...failureTokens].sort());
+  });
   it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])
     ('preserves the failure token %s', token => {
       const r = run();
@@ -583,6 +749,40 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   }));
   const oldWhy = count => `review paused: head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + " (no verdict ever landed on the PR for those runs, and the 2 automatic re-runs are spent: a person must look at why the review's write-back fails)";
+  it('does not spend no-verdict retries on four completed CI-held publishes', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(4);
+    const opts = { repo, env: {}, now: at + 30 * 60_000 };
+    expect(decideSameHeadHold(p, runs.map(r => ({ ...r, ciHeld: true })), opts)).toBeNull();
+    expect(decideSameHeadHold(p, runs, opts)).toMatchObject({ kind: 'same-head', count: 4,
+      retryAt: at + 7200_000, why: `${oldWhy(4)}; the next automatic re-run is due at ${iso(at + 7200_000)}` });
+  });
+  it('still reaches the hold when CI-held publishes never settle (bounded exemption)', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(8).map(r => ({ ...r, ciHeld: true }));
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 30 * 60_000 })).toMatchObject({ kind: 'same-head', count: 4 });
+  });
+  it('derives ciHeld from a failed label-swap waiting for CI on the reviewed head', () => {
+    const r = run();
+    r.effects = [{ type: 'review.label-swap', status: 'failed',
+      error: 'review held: CI still pending on reviewed head' }];
+    expect(reviewRunEvidence(r)).toMatchObject({ completedAt: at, ciHeld: true });
+  });
+  it.each([
+    undefined, null, {}, [null],
+    [{ type: 'review.label-swap', status: 'applied', error: 'CI still pending on reviewed head' }],
+    [{ type: 'review.comment', status: 'failed', error: 'CI still pending on reviewed head' }],
+    [{ type: 'review.label-swap', status: 'failed', error: 'GitHub unavailable' }],
+    [{ type: 'review.label-swap', status: 'failed', error: { message: 'CI still pending on reviewed head' } }],
+  ])('does not exempt missing, malformed or unrelated effect evidence (%j)', effects => {
+    const r = run();
+    r.effects = effects;
+    expect(reviewRunEvidence(r)?.ciHeld).not.toBe(true);
+  });
+  it('does not throw or exempt a publish when effect evidence is unreadable', () => {
+    const r = run();
+    Object.defineProperty(r, 'effects', { get() { throw new Error('unreadable effects'); } });
+    expect(reviewRunEvidence(r)).toMatchObject({ completedAt: at });
+    expect(reviewRunEvidence(r)?.ciHeld).not.toBe(true);
+  });
   it('holds three no-verdict runs under one hour with retryAt and the due-time text', () => {
     const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 60_000 });
     expect(VERDICT_COOLDOWN_BASE_MS).toBe(3600_000);

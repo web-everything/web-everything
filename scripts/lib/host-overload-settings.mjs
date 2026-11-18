@@ -5,7 +5,7 @@ import { openSync, readSync, closeSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveCascade, readPlatformPreferences } from './policy-cascade.mjs';
+import { resolveCascade, readPlatformPreferences, readOperatorPolicy } from './policy-cascade.mjs';
 export const hostStateRoot = () => join(userInfo().homedir, '.cache', 'we-host-overload');
 export function boundedText(path, maxBytes = 256 * 1024) {
   const fd = openSync(path, 'r');
@@ -19,7 +19,23 @@ export function boundedText(path, maxBytes = 256 * 1024) {
 }
 export const DEFAULT_HOST_MAX_WAIT_MS = 15 * 60 * 1000;
 export const DEFAULT_MIN_MEMORY_HEADROOM_MB = 2048;
+export const DEFAULT_SNAPSHOT_MAX_FRESH_MS = 20000;
+export const DEFAULT_SNAPSHOT_CLOCK_SKEW_MS = 2000;
+export const DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK = 2;
+const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
 const leaves = {
+  'host.capacitySignal': ['load', 'WE_HOST_CAPACITY_SIGNAL', (v) => ['load', 'cpu-mem'].includes(v)],
+  // R559: bound freshness independently of elapsed sampling time (2 × nominal 10s cadence).
+  'host.capacity.snapshotClockSkewMs': [DEFAULT_SNAPSHOT_CLOCK_SKEW_MS, 'WE_HOST_CAPACITY_SNAPSHOT_CLOCK_SKEW_MS', (v) => Number.isFinite(v) && v >= 0],
+  'host.capacity.snapshotMaxFreshMs': [DEFAULT_SNAPSHOT_MAX_FRESH_MS, 'WE_HOST_CAPACITY_SNAPSHOT_MAX_FRESH_MS', (v) => Number.isFinite(v) && v > 0],
+  // R528: which memory-free measurement the capacity gates use. available = free+inactive+purgeable+speculative; free = os.freemem.
+  'host.capacity.memoryMetric': ['available', 'WE_HOST_CAPACITY_MEMORY_METRIC', (v) => ['available', 'free'].includes(v)],
+  // R553: hard floor. No new fixer is admitted while available memory (under memoryMetric) is below this many MB.
+  'host.capacity.memAvailableFloorMb': [2048, 'WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB', (v) => Number.isFinite(v) && v > 0],
+  'host.capacity.cpuIdleLowPct': [15, 'WE_HOST_CAPACITY_CPU_IDLE_LOW_PCT', pct],
+  'host.capacity.memFreeLowPct': [15, 'WE_HOST_CAPACITY_MEM_FREE_LOW_PCT', pct],
+  'host.capacity.cpuIdleMediumPct': [30, 'WE_HOST_CAPACITY_CPU_IDLE_MEDIUM_PCT', pct],
+  'host.capacity.memFreeMediumPct': [30, 'WE_HOST_CAPACITY_MEM_FREE_MEDIUM_PCT', pct],
   'host.maxWaitMs': [DEFAULT_HOST_MAX_WAIT_MS, 'WE_HOST_MAX_WAIT_MS', (v) => Number.isSafeInteger(v) && v >= 0],
   'host.maxLoadPerCore': [2, 'WE_HOST_MAX_LOAD_PER_CORE', (v) => Number.isFinite(v) && v > 0],
   // verify-admission (2026-10-20) — memory-aware admission: free RAM (free + speculative + purgeable pages, NOT the
@@ -28,7 +44,7 @@ const leaves = {
   'host.minMemoryHeadroomMb': [DEFAULT_MIN_MEMORY_HEADROOM_MB, 'WE_HOST_MIN_MEMORY_HEADROOM_MB', (v) => Number.isFinite(v) && v > 0],
   // At most this many NEW review sessions per review-daemon tick while the host admits, so memory is re-sampled
   // between waves instead of one tick launching ten 600 MB review jobs at once. Owed reviews stay queued.
-  'host.maxReviewDispatchPerTick': [2, 'WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK', (v) => Number.isSafeInteger(v) && v >= 1],
+  'host.maxReviewDispatchPerTick': [DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, 'WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK', (v) => Number.isSafeInteger(v) && v >= 1],
   'lanes.transcripts.explicitScan': [true, 'WE_LANE_TRANSCRIPT_EXPLICIT_SCAN', (v) => typeof v === 'boolean'],
   'lanes.gc.schedule': [86400000, 'WE_LANES_GC_SCHEDULE_MS', (v) => Number.isSafeInteger(v) && v >= 60000],
 };
@@ -51,7 +67,7 @@ function flatten(obj, layer) {
   return values;
 }
 function expand(values) {
-  const settings = { host: {}, lanes: { transcripts: {}, gc: {} } };
+  const settings = { host: { capacity: {} }, lanes: { transcripts: {}, gc: {} } };
   for (const [key, value] of Object.entries(values)) {
     const parts = key.split('.'); let into = settings;
     for (const p of parts.slice(0, -1)) into = into[p];
@@ -62,12 +78,16 @@ function expand(values) {
 export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = process.env, log = (s) => process.stderr.write(`${s}\n`) } = {}) {
   const envValues = {};
   for (const [k, [, name]] of Object.entries(leaves)) if (env[name] !== undefined) {
-    envValues[k] = k.endsWith('explicitScan') ? (env[name] === 'true' ? true : env[name] === 'false' ? false : env[name]) : Number(env[name]);
+    envValues[k] = k === 'host.capacitySignal' || k === 'host.capacity.memoryMetric' ? env[name] : k.endsWith('explicitScan') ? (env[name] === 'true' ? true : env[name] === 'false' ? false : env[name]) : Number(env[name]);
   }
-  const r = resolveCascade({ standard: Object.fromEntries(Object.entries(leaves).map(([k, [v]]) => [k, v])), platform: flatten(platform, 'platform'), tool: flatten(tool, 'tool'), envValues,
+  const operator = readOperatorPolicy('host', { env, log });
+  const operatorOverride = operator === null ? null : Object.fromEntries(Object.entries(operator).map(([key, value]) => [`host.${key}`, value]));
+  const r = resolveCascade({ operatorOverride, capacityLeaves: ['host.maxReviewDispatchPerTick'], log, standard: Object.fromEntries(Object.entries(leaves).map(([k, [v]]) => [k, v])), platform: flatten(platform, 'platform'), tool: flatten(tool, 'tool'), envValues,
     valid: Object.fromEntries(Object.entries(leaves).map(([k, [, , valid]]) => [k, valid])) });
   if (r.invalid.length) throw Error(`host-overload invalid policy: ${r.invalid.join(', ')}`);
   const settings = expand(r.value);
+  const c = settings.host.capacity;
+  if (c.cpuIdleLowPct > c.cpuIdleMediumPct || c.memFreeLowPct > c.memFreeMediumPct) throw Error('host-overload invalid capacity bands');
   log(`policy-cascade · host-overload: ${Object.keys(leaves).map((k) => `${k}=${r.value[k]} (${r.sources[k]})`).join(', ')}`);
   return { settings, sources: r.sources };
 }

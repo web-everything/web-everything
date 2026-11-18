@@ -1,14 +1,17 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
+import { verifyFinishBody, verificationInfrastructureFailure } from '../../lib/lane-verify.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
-  classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
+  classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
+  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, AWAIT_LOAD_DEFER_MAX_MS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo, resolveDeliveredStaleMs, resolveDeliveredStale, resolveInfraFallbackToCi,
 } from '../await-verify-pass.mjs';
+import { classifyAwaitVerify } from '../await-verify.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
 const OTHER = 'b96574995e22b8d8087d4a28b7ba7615d4ec8c73';
@@ -88,7 +91,7 @@ it('findAwaitSession binds by session id, else the newest row with the who name'
 it('resume prompts never begin with "-" and the green one forbids a second push', () => {
   for (const kind of ['green', 'push-rejected', 'red', 'load-flake', 'escalate', 'infra', 'void', 'other']) {
     const p = buildAwaitVerifyResumePrompt({ kind, record: rec(), marker: marker('red', { failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } }) });
-    expect(p.startsWith('[harness verify verdict')).toBe(true);
+    expect(p.startsWith(`${NO_PROMPT_COMMAND_RULES}\n\n[harness verify verdict`)).toBe(true);
     expect(p).toContain(SHA);
   }
   expect(buildAwaitVerifyResumePrompt({ kind: 'green', record: rec() })).toMatch(/Do not push lane\/item-68b again/);
@@ -113,6 +116,116 @@ function harness({ records = [rec()], session = { sessionId: rec().sessionId, na
   };
   return { io, store, calls, state };
 }
+
+describe('delivered previous-head CI repair recovery', () => {
+  const repairHarness = (options) => {
+    const h = harness(options);
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    return h;
+  };
+  const pending = (over = {}) => rec({
+    previousCi: { failuresHandedOff: true, ready: { ciFailures: [{ name: 'test', conclusion: 'failure' }] } },
+    pendingResume: { kind: 'previous-ci', delivered: true, deliveredAt: new Date(T0).toISOString() },
+    ...over,
+  });
+  const wait = { action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' };
+  const tick = (h, nowMs = T0 + 60_000, extra = {}) => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, ...extra });
+
+  it.each([0, AWAIT_VERIFY_LIMITS.deliveredStaleMs + 1])('retires a delivered repair whose session is gone, age %s', async age => {
+    const record = pending();
+    const h = repairHarness({ records: [record], session: null });
+    const clear = h.io.clearRecord;
+    const cleared = [];
+    h.io.clearRecord = (key, expected) => { cleared.push([key, expected]); return clear(key); };
+    const { rows } = await tick(h, T0 + age);
+    expect(cleared).toEqual([[record.sessionId, record]]);
+    expect(h.store.size).toBe(0);
+    expect(rows[0]).toMatchObject({ action: 'resume', reason: 'delivered-repair-abandoned',
+      result: expect.stringContaining('delivered previous-head CI repair abandoned (session gone); record retired so a fresh fixer is admitted; fix.awaitDeliveredStaleMs=') });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.calls.push).toEqual([]);
+  });
+
+  it('keeps waiting for a busy session regardless of delivery age', async () => {
+    const h = repairHarness({ records: [pending()], session: { sessionId: rec().sessionId, status: 'working' } });
+    expect((await tick(h, T0 + 10 * AWAIT_VERIFY_LIMITS.deliveredStaleMs)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+  });
+
+  it('keeps an idle session waiting while the delivery is young, even if the request is old', async () => {
+    const h = repairHarness({ records: [pending({ requestedAt: new Date(T0 - TTL).toISOString() })] });
+    expect((await tick(h)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+  });
+
+  it('retires an idle stale repair using requestedAt for legacy records without deliveredAt', async () => {
+    const h = repairHarness({ records: [pending({ pendingResume: { kind: 'previous-ci', delivered: true } })] });
+    const { rows } = await tick(h, T0 + AWAIT_VERIFY_LIMITS.deliveredStaleMs + 1);
+    expect(rows[0]).toMatchObject({ action: 'resume', reason: 'delivered-repair-abandoned',
+      result: expect.stringContaining('abandoned (session idle past stale window); record retired so a fresh fixer is admitted; fix.awaitDeliveredStaleMs=') });
+    expect(h.store.size).toBe(0);
+  });
+
+  it('retires through compare-and-delete and keeps the wait when the record changed', async () => {
+    const h = harness({ records: [pending()], session: null });
+    const seen = [];
+    h.io.clearStoredRecordIf = (key, expected) => { seen.push([key, expected]); return { cleared: false }; };
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    expect((await tick(h)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(seen).toHaveLength(1);
+    expect(h.store.size).toBe(1);
+  });
+
+  it('keeps the old wait row when retiring the record fails', async () => {
+    const h = repairHarness({ records: [pending()], session: null });
+    h.io.clearRecord = () => ({ cleared: false });
+    expect((await tick(h)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+    const normal = harness({ session: null });
+    normal.state.marker = marker('green');
+    expect((await tick(normal)).rows[0].result).toBe('session-gone; not pushed');
+    expect(normal.store.size).toBe(0);
+  });
+
+  it('retains a delivered record when session evidence is incomplete', async () => {
+    const h = repairHarness({ records: [pending()] });
+    h.io.listSessions = () => ({ incomplete: [{ session: null, reason: 'listing failed' }] });
+    const { rows } = await tick(h);
+    expect(rows[0]).toMatchObject(wait);
+    expect(rows[0].result).toContain('session listing incomplete');
+    expect(h.store.size).toBe(1);
+  });
+
+  it('retains an idle record with an invalid delivery timestamp', async () => {
+    const h = repairHarness({ records: [pending({ pendingResume: { kind: 'previous-ci', delivered: true, deliveredAt: 'invalid' } })] });
+    expect((await tick(h, T0 + TTL)).rows[0]).toEqual(expect.objectContaining(wait));
+    expect(h.store.size).toBe(1);
+  });
+
+  it.each([undefined, '', '0', '-1', '1.5', 'no', 'Infinity', '9007199254740992'])('invalid stale setting %s uses the default', value => {
+    expect(resolveDeliveredStaleMs({ WE_AWAIT_VERIFY_DELIVERED_STALE_MS: value })).toBe(30 * 60_000);
+  });
+  it('resolves the stale window standard → platform → tool → env with its source', () => {
+    expect(resolveDeliveredStale({}, {})).toEqual({ ms: 30 * 60_000, source: 'standard' });
+    expect(resolveDeliveredStale({}, { platform: { awaitDeliveredStaleMs: 5 } })).toEqual({ ms: 5, source: 'platform' });
+    expect(resolveDeliveredStale({}, { platform: { awaitDeliveredStaleMs: 5 }, tool: { awaitDeliveredStaleMs: 6 } })).toEqual({ ms: 6, source: 'tool' });
+    expect(resolveDeliveredStale({ WE_AWAIT_VERIFY_DELIVERED_STALE_MS: '7' }, { tool: { awaitDeliveredStaleMs: 6 } })).toEqual({ ms: 7, source: 'env' });
+    expect(resolveDeliveredStale({}, { tool: { awaitDeliveredStaleMs: -1 } })).toEqual({ ms: 30 * 60_000, source: 'standard' });
+  });
+  it('parses a positive integer stale window override', () => {
+    expect(resolveDeliveredStaleMs({ WE_AWAIT_VERIFY_DELIVERED_STALE_MS: '12345' })).toBe(12345);
+  });
+
+  it('stamps deliveredAt when a previous-CI resume is delivered', async () => {
+    const h = repairHarness({ records: [pending({ pendingResume: { kind: 'previous-ci' } })] });
+    await tick(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect([...h.store.values()][0].pendingResume).toMatchObject({
+      kind: 'previous-ci', delivered: true, deliveredAt: new Date(T0 + 60_000).toISOString(),
+    });
+    expect(h.store.size).toBe(1);
+  });
+});
 
 describe('runAwaitVerifyPass', () => {
   it('green → pushes the exact sha to the recorded ref, then resumes the SAME session and clears the record', async () => {
@@ -298,7 +411,7 @@ describe('replay: fix-4115 through the harness-owned wait', () => {
     const resumes = [];
     let current = -1;
     let waits = 0;
-    h.io.resume = (a) => { resumes.push(a.prompt.split('\n')[2] ?? ''); return { resumed: true }; };
+    h.io.resume = (a) => { resumes.push(a.prompt.slice(NO_PROMPT_COMMAND_RULES.length + 2).split('\n')[2] ?? ''); return { resumed: true }; };
     for (let t = at('19:55:00'); t <= at('21:05:00'); t += 120_000) {
       // The fixer side: at each real request time it commits, requests and marks, then ends its turn.
       const next = requests[current + 1];
@@ -1089,7 +1202,7 @@ describe('default IO includes and resumes wrapped workers', () => {
   });
 });
 
-// #5233: infra-only verification never spends another fixer turn.
+// Infra recovery spends a fixer turn only for the terminal blocked-on-infra exit.
 describe('verify-only infra retries', () => {
   const retryPolicy = { value: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 } },
     sources: { 'infraRetry.maxAttempts': 'standard', 'infraRetry.backoffMinutes': 'platform' } };
@@ -1127,18 +1240,106 @@ describe('verify-only infra retries', () => {
     expect(h.calls.rerequest).toHaveLength(1);
     expect(h.calls.resume).toHaveLength(0);
   });
-  it('persists attempts across restarted passes and stops at the cap without waking a fixer', async () => {
+  const exhausted = (infraRetry = {}) => {
+    const h = blocked();
+    h.store.set(rec().sessionId, rec({ retries: 2, infraRetry: { attempts: 3, ...infraRetry } }));
+    h.state.marker = marker('infrastructure-failure', { infrastructure: {
+      reason: 'verify-unsettled', detail: 'x'.repeat(200),
+    } });
+    return h;
+  };
+  it('persists exhaustion before exactly one fresh verify, including historical exhausted state', async () => {
+    for (const previous of [{}, { exhausted: true }]) {
+      const h = exhausted(previous);
+      const request = h.io.rerequest;
+      h.io.rerequest = l => {
+        expect(h.store.get(rec().sessionId).infraRetry).toMatchObject({ exhausted: true,
+          freshVerify: { requestedAt: new Date(T0).toISOString() } });
+        return request(l);
+      };
+      const first = await tick(h, T0);
+      expect(first.rows[0].action).toBe('infra-fresh-verify');
+      expect(first.rows[0].reason).toContain(`step=verify-unsettled detail=${'x'.repeat(160)}`);
+      expect(first.rows[0].reason).not.toContain('x'.repeat(161));
+      await tick(h, T0 + 1);
+      await tick(h, T0 + 2);
+      expect(h.calls.rerequest).toEqual([rec().lane]);
+      expect(h.calls.resume).toEqual([]);
+    }
+  });
+  it.each(['infrastructure-failure', 'absent', 'corrupt', 'overdue'])('fresh %s ends the fix wait through the infra exit once', async status => {
+    const h = exhausted();
+    await tick(h, T0);
+    h.state.marker = status === 'absent' ? null : status === 'corrupt' ? { corrupt: true }
+      : marker(status === 'overdue' ? 'running' : status, { infrastructure: { reason: 'verify-unsettled', detail: 'capacity/wait' } });
+    const now = status === 'overdue' ? T0 + TTL + 1 : T0 + 1;
+    const result = await runAwaitVerifyPass({ io: h.io, nowMs: now, ttlMs: TTL, retryPolicy, allowResume: false });
+    const step = ['absent', 'corrupt'].includes(status) ? 'unknown' : 'verify-unsettled';
+    expect(result.rows[0]).toMatchObject({ action: 'infra-blocked', blocked: { at: new Date(now).toISOString(), step } });
+    expect(result.rows[0].reason).toContain(`step=${step}`);
+    expect(h.store.get(rec().sessionId)).toMatchObject({ infraRetry: { blocked: { step } }, pendingResume: { kind: 'infra' } });
+    await tick(h, now + 1);
+    await tick(h, now + 2);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('blocked-on-infra');
+    expect(h.calls.resume[0].prompt).toContain(`step=${step}`);
+    expect(h.calls.rerequest).toHaveLength(1);
+    expect(h.calls.push).toEqual([]);
+    expect(h.store.size).toBe(0);
+  });
+  it('fresh green follows the normal push and green resume', async () => {
+    const h = exhausted();
+    await tick(h, T0);
+    h.state.marker = marker('green');
+    await tick(h, T0 + 1);
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Verify is GREEN');
+    expect(h.store.size).toBe(0);
+  });
+  it('reports bounded step evidence on scheduled and retry rows, including missing markers', async () => {
+    const h = blocked(); h.state.marker = null;
+    expect((await tick(h, T0)).rows[0].reason).toContain('step=unknown');
+    h.state.marker = marker('infrastructure-failure', { infrastructure: { reason: 'verify-unsettled', detail: 'x'.repeat(200) } });
+    const row = (await tick(h, T0 + 15 * 60_000)).rows[0];
+    expect(row.action).toBe('infra-retry');
+    expect(row.reason).toContain(`step=verify-unsettled detail=${'x'.repeat(160)}`);
+    expect(row.reason).not.toContain('x'.repeat(161));
+  });
+  it('cannot request a fresh verify or deliver a blocked exit when persistence fails', async () => {
+    const h = exhausted(); h.io.writeRecord = () => ({ ok: false });
+    expect((await tick(h, T0)).rows[0].result).toContain('persist-failed');
+    expect(h.calls.rerequest).toEqual([]);
+    h.store.set(rec().sessionId, rec({ retries: 2, infraRetry: { attempts: 3, exhausted: true,
+      freshVerify: { requestedAt: new Date(T0).toISOString() } } }));
+    await tick(h, T0 + 1);
+    expect(h.calls.resume).toEqual([]);
+  });
+  it('keeps the backoff cap across passes, then requests just one final verify', async () => {
     const h = blocked();
     await tick(h, T0);
     for (let attempt = 1; attempt <= 3; attempt++) {
       await tick(h, T0 + attempt * 16 * 60_000);
+      expect(h.calls.rerequest).toHaveLength(attempt);
       h.state.marker = marker('infrastructure-failure');
       await tick(h, T0 + (attempt * 16 + 1) * 60_000);
     }
-    await tick(h, T0 + 100 * 60_000);
-    expect(h.calls.rerequest).toHaveLength(3);
-    expect(h.calls.resume).toHaveLength(0);
-    expect([...h.store.values()][0].infraRetry.exhausted).toBe(true);
+    expect(h.calls.rerequest).toHaveLength(4);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(rec().sessionId).infraRetry).toMatchObject({ attempts: 3, exhausted: true, freshVerify: {} });
+    await tick(h, T0 + 50 * 60_000);
+    expect(h.calls.rerequest).toHaveLength(4);
+  });
+  it('never repeats an unconfirmed fresh request, even with a historical lower retry count', async () => {
+    const h = exhausted();
+    h.io.rerequest = l => { h.calls.rerequest.push(l); return { ok: false, status: 'no-server' }; };
+    await tick(h, T0);
+    const record = h.store.get(rec().sessionId);
+    h.store.set(rec().sessionId, { ...record, retries: 0 });
+    h.state.marker = null;
+    const result = await tick(h, T0 + 1);
+    expect(result.rows[0].action).toBe('infra-blocked');
+    expect(h.calls.rerequest).toHaveLength(1);
+    expect(h.calls.resume).toHaveLength(1);
   });
   it('does not retry a moved head or a dirty lane; a failed store cannot enqueue', async () => {
     for (const state of [lane({ head: OTHER }), lane({ dirty: true })]) {
@@ -1157,5 +1358,411 @@ describe('verify-only infra retries', () => {
     await tick(h, T0);
     expect(h.calls.resume).toHaveLength(0);
     expect([...h.store.values()][0].pendingResume).toBeUndefined();
+  });
+});
+
+
+describe('timeout-only load recovery', () => {
+  const timeout = (over = {}) => marker('red', { redCause: 'test-timeout', failureDetails: {
+    tests: [{ file: 'a.test.mjs', name: 'slow', timeout: true }], summary: 'Error: Test timed out in 15000ms.', truncated: false,
+  }, ...over });
+  it('live shape A: third red defers, persists through ticks, then reruns at low load without spending retries', async () => {
+    const h = harness({ records: [rec({ attempt: 3, retries: 2 })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    expect((await tick(T0)).rows.find(row => row.action === 'load-deferred')).toMatchObject({ action: 'load-deferred', reason: expect.stringContaining('red-load-deferred') });
+    expect(h.store.get(rec().sessionId)).toMatchObject({ loadRetry: { attempts: 0, waiting: true, since: new Date(T0).toISOString() } });
+    await tick(T0 + 1);
+    expect(h.calls.resume).toEqual([]); expect(h.calls.rerequest).toEqual([]); expect(h.calls.push).toEqual([]);
+    h.io.loadHigh = () => false;
+    h.io.rerequest = () => {
+      expect(h.store.get(rec().sessionId)).toMatchObject({ retries: 2, loadRetry: { attempts: 1, waiting: false }, requestedAt: new Date(T0 + 2).toISOString() });
+      h.calls.rerequest.push('requested'); return { ok: true };
+    };
+    expect((await tick(T0 + 2)).rows.find(row => row.action === 'load-rerun')).toMatchObject({ action: 'load-rerun', reason: expect.stringContaining('red-load-shaped') });
+    expect(h.calls.rerequest).toHaveLength(1);
+  });
+  it('live shape B: exit 124 defers under load', () => {
+    expect(classify({ marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' });
+    expect(classify({ marker: marker('red', { exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' });
+  });
+  it('exit 124 with a recorded in-diff cause is a normal red, not a timeout', () => {
+    expect(classify({ marker: marker('red', { exitCode: 124, redCause: 'in-diff-failure' }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+  });
+  it('a load deferral that outlives the wait cap (or has no start time) follows the red ladder', () => {
+    const waiting = (since) => rec({ kind: 'fix', loadRetry: { attempts: 0, waiting: true, ...(since ? { since } : {}) } });
+    const old = new Date(T0 - 3 * 60 * 60_000).toISOString();
+    expect(classify({ record: waiting(old), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+    expect(classify({ record: waiting(null), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+    expect(classify({ record: waiting(new Date(T0).toISOString()), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred' });
+  });
+  it.each([
+    ['exit 124 with a recorded assertion before timeout', timeout({ exitCode: 124, failureDetails: {
+      tests: [{ file: 'a.test.mjs', name: 'slow', timeout: true }, { file: 'b.test.mjs', name: 'assertion' }],
+      summary: 'AssertionError: expected true; Test timed out in 15000ms.', truncated: false,
+    } })],
+    ['exit 124 with a truncated timeout inventory', timeout({ exitCode: 124, failureDetails: {
+      tests: [{ file: 'a.test.mjs', name: 'slow', timeout: true }], summary: 'Test timed out in 15000ms.', truncated: true,
+    } })],
+    ['exit 124 with an empty inventory', timeout({ exitCode: 124, failureDetails: { tests: [], summary: '', truncated: false } })],
+    ['assertion under load', timeout({ redCause: 'in-diff-failure', failureDetails: { tests: [{ file: 'a.test.mjs', name: 'assertion', timeout: false }] } })],
+    ['mixed assertion and timeout', timeout({ failureDetails: { tests: [{ file: 'a.test.mjs', name: 'timeout', timeout: true }, { file: 'b.test.mjs', name: 'assertion', timeout: false }], truncated: false } })],
+    ['truncated inventory', timeout({ failureDetails: { tests: [{ file: 'a.test.mjs', name: 'timeout', timeout: true }], truncated: true } })],
+    ['empty inventory', timeout({ failureDetails: { tests: [], truncated: false } })],
+    ['legacy summary without per-test evidence', timeout({ failureDetails: { tests: [{ name: 'slow' }], summary: 'Test timed out' } })],
+    ['test timeout plus standards red', timeout({ phases: { outcomes: { standards: { result: 'fail' } } } })],
+    ['standards phase', timeout({ redCause: 'standards' })],
+    ['scan phase even with exit 124', timeout({ redCause: 'scan', exitCode: 124 })],
+  ])('%s still resumes red or escalates', (_, m) => {
+    expect(isTimeoutOnlyRed(m)).toBe(false);
+    for (const waiting of [false, true]) for (const attempt of [1, 3]) {
+      expect(classify({ marker: m, loadHigh: true, record: rec({ attempt, loadRetry: { waiting, attempts: 0 } }) }))
+        .toMatchObject({ action: 'resume', resume: attempt === 3 ? 'escalate' : 'red' });
+    }
+  });
+  it('low load at first observation and exhausted load budgets retain the red ladder', () => {
+    for (const attempt of [1, 3]) for (const over of [{ loadHigh: false }, { loadHigh: true, loadRetry: { attempts: 3, waiting: true } }]) {
+      expect(classify({ marker: timeout(), loadHigh: over.loadHigh, record: rec({ attempt, loadRetry: over.loadRetry }) }))
+        .toMatchObject({ action: 'resume', resume: attempt === 3 ? 'escalate' : 'red' });
+    }
+  });
+  it.each(['delivery', 'prepare', 'ci-heal'])('never load-defers %s', kind => {
+    expect(classify({ marker: timeout(), loadHigh: true, record: rec({ kind }) }).action).not.toBe('wait');
+  });
+  it('caps same-head load reruns at the configured bound, then escalates the third red', async () => {
+    const h = harness({ records: [rec({ attempt: 3 })] });
+    const retryPolicy = { value: { loadRetry: { maxAttempts: 2 } }, sources: { 'loadRetry.maxAttempts': 'tool' } };
+    // Each re-run's red starts after its request, so the ladder counts it as a new verdict.
+    let now = T0;
+    const tick = () => runAwaitVerifyPass({ io: h.io, nowMs: now++, retryPolicy });
+    const freshRed = () => timeout({ startedAt: new Date(now).toISOString() });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      h.state.marker = freshRed(); h.io.loadHigh = () => true;
+      const deferred = await tick();
+      expect(deferred.rows[0].reason).toContain('verify.loadRetry.maxAttempts=2 (tool)');
+      h.io.loadHigh = () => false; await tick();
+    }
+    h.state.marker = freshRed(); h.io.loadHigh = () => true;
+    const exhausted = await tick();
+    expect(h.calls.rerequest).toHaveLength(2);
+    expect(exhausted.rows[0]).toMatchObject({ action: 'resume', reason: 'red on attempt 3' });
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it('a failed defer write keeps the original state and spends no effects', async () => {
+    const h = harness(); h.state.marker = timeout(); h.io.loadHigh = () => true;
+    h.io.writeRecord = () => ({ ok: false });
+    const result = await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(result.rows[0].result).toBe('persist-failed');
+    expect(h.store.get(rec().sessionId).loadRetry).toBeUndefined();
+    expect(h.calls.resume).toEqual([]); expect(h.calls.rerequest).toEqual([]); expect(h.calls.push).toEqual([]);
+  });
+  it('a timeout-only red takes precedence over a persisted no-op hand-back', async () => {
+    const h = harness({ records: [rec({ pendingResume: { kind: 'no-new-commit' } })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(h.store.get(rec().sessionId).pendingResume).toBeUndefined();
+    expect(h.store.get(rec().sessionId).loadRetry.waiting).toBe(true);
+    expect(h.calls.resume).toEqual([]);
+  });
+  it('failed persistence prevents a load rerun', async () => {
+    const h = harness({ records: [rec({ loadRetry: { attempts: 0, waiting: true } })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => false; h.io.writeRecord = () => ({ ok: false });
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(h.calls.rerequest).toEqual([]); expect(h.calls.resume).toEqual([]);
+  });
+  it('a throwing load probe is low load, retaining the red resume', async () => {
+    const h = harness(); h.state.marker = timeout(); h.io.loadHigh = () => { throw new Error('unknown'); };
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(h.calls.resume).toHaveLength(1); expect(h.calls.rerequest).toEqual([]);
+  });
+  it('red-team: a failed load re-request never escalates the original red; it re-requests, then exits blocked on infra', async () => {
+    const h = harness({ records: [rec({ attempt: 3 })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL });
+    await tick(T0 + 1);
+    h.io.loadHigh = () => false;
+    h.io.rerequest = l => { h.calls.rerequest.push(l); return { ok: false, status: 'no-server' }; };
+    expect((await tick(T0 + 2)).rows[0]).toMatchObject({ action: 'load-rerun', result: 'no-server' });
+    // The marker is still the red the re-run was meant to replace: no new verdict, so no red/escalate resume.
+    for (let n = 3; n < 13; n++) await tick(T0 + n * 60 * 60_000);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('blocked-on-infra');
+    expect(h.store.size).toBe(0);
+    expect(h.calls.rerequest.length).toBeGreaterThan(1);
+  });
+  it('self-review: a stale load red on an up-to-date early push re-requests instead of handing back a no-op', async () => {
+    const at = new Date(T0 + 2).toISOString();
+    const h = harness({ records: [rec({ attempt: 1, requestedAt: at, loadRetry: { attempts: 1, waiting: false, rerunAt: at },
+      earlyPush: { sha: SHA, ok: true, done: true, upToDate: true, attempts: 1, at } })] });
+    h.state.marker = timeout({ startedAt: new Date(T0).toISOString() }); h.io.loadHigh = () => false;
+    h.io.rerequest = l => { h.calls.rerequest.push(l); return { ok: false, status: 'no-server' }; };
+    const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    expect(rows[0]).toMatchObject({ action: 'rerequest', reason: 'red-load-rerun-unconfirmed', result: 'no-server' });
+    expect(h.calls.resume).toEqual([]); expect(h.calls.push).toEqual([]);
+    expect(h.store.get(rec().sessionId)).toMatchObject({ retries: 1 });
+    expect(h.store.get(rec().sessionId).pendingResume).toBeUndefined();
+  });
+  it('red-team: a crash between the re-run write and its request leaves a stale red that is re-requested', () => {
+    const record = rec({ attempt: 3, requestedAt: new Date(T0 + 2).toISOString(), loadRetry: { attempts: 1, waiting: false, rerunAt: new Date(T0 + 2).toISOString() } });
+    for (const loadHigh of [false, true]) {
+      expect(classify({ record, marker: timeout({ startedAt: new Date(T0).toISOString(), finishedAt: new Date(T0 + 1).toISOString() }), loadHigh }))
+        .toMatchObject({ action: 'rerequest', reason: 'red-load-rerun-unconfirmed' });
+      // A red without a readable time cannot prove it is the re-run's verdict.
+      expect(classify({ record, marker: timeout({ startedAt: null }), loadHigh })).toMatchObject({ action: 'rerequest' });
+    }
+    // The re-run's own red (started after the request) is a real verdict: the ladder escalates it at quiet load.
+    expect(classify({ record, marker: timeout({ startedAt: new Date(T0 + 3).toISOString() }), loadHigh: false }))
+      .toMatchObject({ action: 'resume', resume: 'escalate' });
+    // A legacy re-run record without rerunAt falls back to its requestedAt.
+    const legacy = rec({ attempt: 3, requestedAt: new Date(T0 + 2).toISOString(), loadRetry: { attempts: 1, waiting: false } });
+    expect(classify({ record: legacy, marker: timeout(), loadHigh: false })).toMatchObject({ action: 'rerequest' });
+    // A stale red is never handed back as a no-op either, even when the remote already had the sha.
+    expect(isLoadRedReason('red-load-rerun-unconfirmed')).toBe(true);
+    // A stale red is never pushed early.
+    expect(isEarlyPushOwed({ record, decision: { action: 'rerequest', reason: 'red-load-rerun-unconfirmed' }, policy: { pushBeforeGate: true } })).toBe(false);
+  });
+  it('red-team round 2: a running load retry keeps the known-red hold — no no-op hand-back, the retry red still resumes', async () => {
+    const at = new Date(T0).toISOString();
+    const h = harness({ records: [rec({ attempt: 1, earlyPush: { sha: SHA, ok: true, done: true, upToDate: true, attempts: 1, at } })] });
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await tick(T0 + 1);
+    h.io.loadHigh = () => false;
+    expect((await tick(T0 + 2)).rows[0]).toMatchObject({ action: 'load-rerun' });
+    // The retry is running: no verdict yet, and the sha is known red. Never a no-op hand-back.
+    for (let n = 3; n < 6; n++) expect((await tick(T0 + n)).rows[0]).toMatchObject({ action: 'wait', reason: 'running' });
+    expect(h.calls.resume).toEqual([]); expect(h.calls.push).toEqual([]);
+    expect(h.store.get(rec().sessionId).pendingResume).toBeUndefined();
+    // The retry's own red is observed and resumed as a red.
+    h.state.marker = timeout({ startedAt: new Date(T0 + 6).toISOString() });
+    await tick(T0 + 7);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('--attempt=2');
+    expect(h.calls.resume[0].prompt).not.toContain('already had this exact sha');
+  });
+  it('red-team round 2: a running load retry never pushes the known-red sha early', async () => {
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await tick(T0 + 1);
+    h.io.loadHigh = () => false;
+    await tick(T0 + 2);
+    for (let n = 3; n < 6; n++) await tick(T0 + n);
+    expect(h.calls.push).toEqual([]);
+    const record = h.store.get(rec().sessionId);
+    for (const decision of [{ action: 'wait', reason: 'running' }, { action: 'rerequest', reason: 'verify-overdue' }, { action: 'rerequest', reason: 'no-verdict' }]) {
+      expect(isEarlyPushOwed({ record, decision, policy: { pushBeforeGate: true } })).toBe(false);
+    }
+  });
+  it('red-team round 2: a load deferral keeps the session await exemption until its own deadline', async () => {
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const session = { sessionId: rec().sessionId, name: 'fix-4115' };
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    const deferAt = T0 + 40 * 60_000;
+    expect((await tick(deferAt)).rows[0]).toMatchObject({ action: 'load-deferred' });
+    // Every tick of the bounded deferral, the reaper still sees the fixer as awaiting verify.
+    for (let now = deferAt + 60_000; now < deferAt + AWAIT_LOAD_DEFER_MAX_MS; now += 10 * 60_000) {
+      expect((await tick(now)).rows[0]).toMatchObject({ action: 'load-deferred' });
+      expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: now, ttlMs: TTL })).toMatchObject({ awaiting: true });
+    }
+    // The red-team instant: T0 + TTL + 1 ms, 110 minutes into the deferral.
+    const instant = T0 + TTL + 1;
+    await tick(instant);
+    expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: instant, ttlMs: TTL })).toMatchObject({ awaiting: true });
+    // The deferral itself stays bounded by its start: past the cap the red ladder resumes the fixer.
+    await tick(deferAt + AWAIT_LOAD_DEFER_MAX_MS + 1);
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it('red-team round 2 (same class): a self-review hold on a late green keeps the session await exemption for the whole hold', async () => {
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const session = { sessionId: rec().sessionId, name: 'fix-4115' };
+    h.io.readSelfReview = () => ({ v: 1, repo: rec().repo, pr: rec().pr, sessionId: rec().sessionId, who: rec().who, state: 'pending', sha: SHA,
+      startedAt: new Date(T0 + 135 * 60_000).toISOString() });
+    h.state.marker = marker('green');
+    expect((await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 140 * 60_000, ttlMs: TTL })).rows[0]).toMatchObject({ action: 'self-review-hold' });
+    expect(h.calls.push).toEqual([]); expect(h.calls.resume).toEqual([]);
+    // 160 minutes after the request, still inside the 30-minute review bound: the fixer must not be reapable.
+    expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: T0 + 160 * 60_000, ttlMs: TTL })).toMatchObject({ awaiting: true });
+  });
+  it('red-team round 2: an await TTL shorter than the deferral cap is refreshed on every deferred tick', async () => {
+    const shortTtl = 60 * 60_000;
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const session = { sessionId: rec().sessionId, name: 'fix-4115' };
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: shortTtl });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await tick(T0);
+    for (let now = T0 + 10 * 60_000; now < T0 + AWAIT_LOAD_DEFER_MAX_MS; now += 10 * 60_000) {
+      expect((await tick(now)).rows[0]).toMatchObject({ action: 'load-deferred' });
+      expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: now, ttlMs: shortTtl })).toMatchObject({ awaiting: true });
+    }
+    expect(h.store.get(rec().sessionId).loadRetry.since).toBe(new Date(T0).toISOString());
+  });
+});
+
+// verify.infraFallbackToCi: an infrastructure-only local verify failure (no test verdict), retries spent, is settled by
+// the exact pushed head's green required `test` CI check. Anything else keeps today's infra ladder.
+describe('infra verify failure falls back to green CI on the pushed head', () => {
+  const run = (row) => ({ name: row[0], status: 'COMPLETED', conclusion: row[1] });
+  // Default: the infra retries are spent (attempts 3 = maxAttempts 3), the only state in which the fallback may run.
+  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live', pushResult, infraRetry = { attempts: 3 }, recOver = {}, earlyPushSha = SHA } = {}) => {
+    const h = harness({ pushResult, records: [rec({ retries: 2, ...(infraRetry ? { infraRetry } : {}), earlyPush: { ok: true, sha: earlyPushSha, upToDate: true, attempts: 1, at: new Date(T0).toISOString() }, ...recOver })] });
+    h.state.marker = mark ?? marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'SIGKILL after 1800000ms' } });
+    h.io.readPreviousHead = async () => head;
+    h.io.readPreviousRequired = async () => ({ checks: required, source });
+    h.io.readPreviousChecks = async () => (typeof checks === 'function' ? checks() : checks.map(run));
+    h.io.infraFallbackToCi = () => ({ enabled: fallback, source: 'standard' });
+    return h;
+  };
+  const tick = (h) => runAwaitVerifyPass({ io: h.io, nowMs: T0, ttlMs: TTL, retryPolicy: { value: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 } }, sources: {} } });
+
+  it('ends the round on the green required test check for the exact pushed head, without a second push (live #6693: push-refused)', async () => {
+    const h = ciHarness({ pushResult: { ok: false, reason: 'refusing to push lane/item-68b: the fix claim on web-everything/web-everything PR #4115 is not held by this session' } });
+    const { rows } = await tick(h);
+    expect(rows[0].action).not.toMatch(/^infra-/);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('before/after evidence comment');
+    expect(h.calls.rerequest).toHaveLength(0);
+  });
+  it.each([
+    ['the PR head is another sha', { head: OTHER }],
+    ['the test check failed', { checks: [['test', 'FAILURE']] }],
+    ['the test check is still running', { checks: [['test', '']] }],
+    ['test is not in the required set', { required: ['lint'], checks: [['lint', 'SUCCESS']] }],
+    ['another required check is red', { required: ['test', 'lint'], checks: [['test', 'SUCCESS'], ['lint', 'FAILURE']] }],
+    ['the CI read fails', { checks: () => { throw new Error('gh down'); } }],
+    ['the setting is off', { fallback: false }],
+    ['the infra reason is verify-unsettled, not a kill', { mark: marker('infrastructure-failure', { infrastructure: { reason: 'verify-unsettled', detail: 'x' } }) }],
+    ['the required set is a cache/fallback read', { source: 'fallback' }],
+    ['the test check was skipped', { checks: [['test', 'SKIPPED']] }],
+  ])('keeps the infra ladder when %s', async (_name, opts) => {
+    const h = ciHarness(opts);
+    const { rows } = await tick(h);
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+  });
+  it('keeps the void/refusal when the lane moved or is dirty', async () => {
+    for (const over of [{ head: OTHER }, { dirty: true }]) {
+      const h = ciHarness(); h.state.lane = lane(over);
+      const { rows } = await tick(h);
+      expect(h.calls.push).toHaveLength(0);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
+  });
+  it('keeps the ladder when the lane or verdict changes during the CI reads', async () => {
+    for (const change of [h => { h.state.lane = lane({ dirty: true }); }, h => { h.state.marker = marker('red'); }]) {
+      const h = ciHarness();
+      h.io.readPreviousChecks = async () => { change(h); return [run(['test', 'SUCCESS'])]; };
+      const { rows } = await tick(h);
+      // The fallback sets skipPush, so a push count of 0 holds with or without the re-check. What the re-check prevents is the
+      // hand-back itself: no resume, and no fallback reason on the row.
+      expect(h.calls.resume).toHaveLength(0);
+      expect(h.calls.push).toHaveLength(0);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
+  });
+  // Acceptance "retries spent": the fallback runs only once the infra ladder is spent (exhausted, or attempts >= maxAttempts).
+  // Before that, green CI does NOT short-circuit the ladder: the retry stays scheduled.
+  it.each([
+    ['no infra retry has run yet (attempts 0 < max 3)', undefined],
+    ['one retry has run (attempts 1 < max 3)', { attempts: 1, scheduled: true, nextAttemptAt: new Date(T0 + 60_000).toISOString() }],
+    ['two retries have run (attempts 2 < max 3)', { attempts: 2 }],
+  ])('keeps the ladder, even with green CI, when %s', async (_name, infraRetry) => {
+    const h = ciHarness({ infraRetry: infraRetry ?? false });
+    const { rows } = await tick(h);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    expect(rows[0].action).toMatch(/^(infra-retry|infra-retry-scheduled|wait)$/);
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.push).toHaveLength(0);
+  });
+  it.each([
+    ['retries are spent (attempts 3 = max 3)', { attempts: 3 }],
+    ['the ladder is marked exhausted', { attempts: 1, exhausted: true }],
+  ])('hands back on green CI when %s', async (_name, infraRetry) => {
+    const h = ciHarness({ infraRetry });
+    const { rows } = await tick(h);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.rerequest).toHaveLength(0);
+  });
+  it('keeps the ladder at either side of the retries boundary when CI is not green', async () => {
+    for (const infraRetry of [false, { attempts: 3 }]) {
+      const h = ciHarness({ infraRetry, checks: [['test', 'FAILURE']] });
+      const { rows } = await tick(h);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+      expect(rows[0].action).toMatch(/^infra-/);
+    }
+  });
+  // Both accepted kill reasons hand back (dropping either from the allowlist must redden one case).
+  it.each(['verify-timeout', 'verify-signal'])('hands back on green required CI after a spent %s failure', async (reason) => {
+    const h = ciHarness({ mark: marker('infrastructure-failure', { infrastructure: { reason, detail: 'killed' } }) });
+    const { rows } = await tick(h);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it.each([
+    ['the record is not a fix round', { recOver: { kind: 'build' } }],
+    ['the early push was another sha', { earlyPushSha: OTHER }],
+  ])('keeps the ladder when %s', async (_name, opts) => {
+    const h = ciHarness(opts);
+    const { rows } = await tick(h);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+  });
+  it('rejects the fallback when the PR head changes during the CI reads', async () => {
+    const h = ciHarness();
+    let head = SHA;
+    h.io.readPreviousHead = async () => head;
+    h.io.readPreviousChecks = async () => { head = OTHER; return [run(['test', 'SUCCESS'])]; };
+    const { rows } = await tick(h);
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+  });
+  it('keeps the ladder when the second PR head read fails or is empty', async () => {
+    for (const second of [async () => { throw new Error('gh down'); }, async () => '']) {
+      const h = ciHarness();
+      let n = 0;
+      h.io.readPreviousHead = async () => (n++ === 0 ? SHA : second());
+      const { rows } = await tick(h);
+      expect(h.calls.resume).toHaveLength(0);
+      expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    }
+  });
+  // The real resolver (the harness above injects the boolean): standard on, environment over tool, tool over standard.
+  it.each([
+    ['nothing configured → standard on', {}, undefined, { enabled: true, source: 'standard' }],
+    ['tool off', {}, { infraFallbackToCi: false }, { enabled: false, source: 'tool' }],
+    ['tool on', {}, { infraFallbackToCi: true }, { enabled: true, source: 'tool' }],
+    ['tool value not a boolean → standard on', {}, { infraFallbackToCi: 'no' }, { enabled: true, source: 'standard' }],
+    ['env 0 beats tool on', { WE_VERIFY_INFRA_FALLBACK_TO_CI: '0' }, { infraFallbackToCi: true }, { enabled: false, source: 'environment' }],
+    ['env false', { WE_VERIFY_INFRA_FALLBACK_TO_CI: 'false' }, undefined, { enabled: false, source: 'environment' }],
+    ['env OFF (case, spaces)', { WE_VERIFY_INFRA_FALLBACK_TO_CI: ' OFF ' }, undefined, { enabled: false, source: 'environment' }],
+    ['env 1 beats tool off', { WE_VERIFY_INFRA_FALLBACK_TO_CI: '1' }, { infraFallbackToCi: false }, { enabled: true, source: 'environment' }],
+    ['env true', { WE_VERIFY_INFRA_FALLBACK_TO_CI: 'true' }, undefined, { enabled: true, source: 'environment' }],
+    ['unrecognised env falls through to tool', { WE_VERIFY_INFRA_FALLBACK_TO_CI: 'maybe' }, { infraFallbackToCi: false }, { enabled: false, source: 'tool' }],
+  ])('resolveInfraFallbackToCi: %s', (_name, env, tool, expected) => {
+    expect(resolveInfraFallbackToCi({ env, tool })).toEqual(expected);
+  });
+  it('accepts the marker the real verifyFinishBody writes for a killed run, though it drops the failing tests', async () => {
+    const infrastructure = verificationInfrastructureFailure({ timedOutPhase: 'vitest', ceilingMs: 1800000 });
+    const real = verifyFinishBody({ startedAt: new Date(T0).toISOString() }, { finishedAt: new Date(T0).toISOString(), exitCode: null, sha: SHA, treeHash: TREE, infrastructure, failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } });
+    expect(real).toMatchObject({ status: 'infrastructure-failure', infrastructure: { reason: 'verify-timeout' } });
+    expect(real.failureDetails).toBeUndefined();
+    const h = ciHarness({ mark: real });
+    const { rows } = await tick(h);
+    expect(rows[0].reason).toContain('infra-ci-green-fallback');
+    expect(h.calls.push).toHaveLength(0);
+  });
+  it('never masks a real red verdict: red goes to the fixer, not to CI', async () => {
+    const h = ciHarness({ mark: marker('red') });
+    const { rows } = await tick(h);
+    expect(h.calls.push).toHaveLength(0);
+    expect(rows[0].reason ?? '').not.toContain('infra-ci-green-fallback');
+    expect(h.calls.resume[0].prompt).toContain('Verify is RED');
   });
 });

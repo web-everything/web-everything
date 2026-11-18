@@ -6,8 +6,10 @@
  *   resolve-at-drain}, and the retry-once-then-escalate ladder keyed on a TOTAL attempt counter.
  */
 import { describe, it, expect } from 'vitest';
+import { runInNewContext } from 'node:vm';
+import source from '../scope-lease.mjs?raw';
 import {
-  normScope, isSubtreeEntry, coversFile, scopeEntriesOverlap, scopesOverlap,
+  normScope, isSubtreeEntry, coversFile, globsMayIntersect, scopeEntriesOverlap, scopesOverlap,
   scopeLease, breachOf,
   overlapAtLaunch, OVERLAP_POLICIES,
   breachOutcome, BREACH_POLICIES, RETRY_BOUND, BREACH_ESCALATION_LADDER, ESCALATION_ROUTES,
@@ -101,6 +103,181 @@ describe('scopeEntriesOverlap / scopesOverlap — module-pattern overlap (mirror
     expect(scopesOverlap(['we:a', 'we:b'], ['we:c', 'we:b/x.ts'])).toBe(true);
     expect(scopesOverlap(['we:a', 'we:b'], ['we:c', 'we:d'])).toBe(false);
     expect(scopesOverlap([], ['we:a'])).toBe(false);
+  });
+});
+
+describe('glob intersection — conservative scope contention', () => {
+  it('single stars cannot cross path segments', () => {
+    expect(globsMayIntersect('src/*.mjs', 'src/x/*.mjs')).toBe(false);
+  });
+  it('question marks consume exactly one character', () => {
+    expect(globsMayIntersect('src/a?b.mjs', 'src/ac*.mjs')).toBe(true);
+    expect(globsMayIntersect('src/a?b.mjs', 'src/ab.mjs')).toBe(false);
+    expect(globsMayIntersect('src/a?b.mjs', 'src/a/x/b.mjs')).toBe(false);
+  });
+  it('globstars match zero or many segments on either side', () => {
+    expect(globsMayIntersect('src/**/a*b.mjs', 'src/ab*.mjs')).toBe(true);
+    expect(globsMayIntersect('src/ab*.mjs', 'src/**/a*b.mjs')).toBe(true);
+    expect(globsMayIntersect('src/**/a*b.mjs', 'src/x/y/ab*.mjs')).toBe(true);
+    expect(globsMayIntersect('src/**/a.mjs', 'other/**/a.mjs')).toBe(false);
+  });
+  it('bare and trailing-slash directory entries cover descendants of globbed parents', () => {
+    expect(globsMayIntersect('src/ab', 'src/a*/child.mjs')).toBe(true);
+    expect(globsMayIntersect('src/ab.v2/', 'src/a*/child.mjs')).toBe(true);
+    expect(globsMayIntersect('src/ab.mjs', 'src/a*/child.mjs')).toBe(false);
+  });
+  it.each([
+    ['src/*/lib/', 'src/a/lib/*.mjs'],
+    ['src/*/', 'src/x/y/*.mjs'],
+    ['src/*/', 'src/ab/x/*.mjs'],
+    ['src/a*/', 'src/a*/child.mjs'],
+    ['src/*.v2/', 'src/ab.v2/x/*.mjs'],
+    ['src/*.v2', 'src/ab.v2/x/*.mjs'],
+    ['src/a?.v2', 'src/ab.v2/x/*.mjs'],
+    ['src/*.d', 'src/a.d/*.mjs'],
+    ['.git*', '.github/*.yml'],
+    ['packages/*/foo.v2', 'packages/x/foo.v2/*.mjs'],
+    ['packages/*/v1.2', 'packages/a/v1.2/deep/*.mjs'],
+    ['src/*.mjs', 'src/a.mjs/child/*.mjs'],
+    ['*/lib/', 'src/lib/*.mjs'],
+    ['packages/*/src/', 'packages/app/src/deep/*.mjs'],
+    ['src/*/lib', 'src/a/lib/deep/*.mjs'],
+    ['src/a*', 'src/ab/deep/*.mjs'],
+    ['src/a?', 'src/ab/deep/*.mjs'],
+    ['src/a?/', 'src/ab/deep/*.mjs'],
+    ['src/*/lib/', 'src/a/lib/deep/file.mjs'],
+  ])('glob directory %s contends with descendant %s in both orders', (directory, descendant) => {
+    expect(globsMayIntersect(directory, descendant)).toBe(true);
+    expect(globsMayIntersect(descendant, directory)).toBe(true);
+    expect(scopeEntriesOverlap(`we:${directory}`, `we:${descendant}`)).toBe(true);
+    expect(scopeEntriesOverlap(`we:${descendant}`, `we:${directory}`)).toBe(true);
+  });
+  it('checks every pairing of file, bare dir, trailing-slash dir, glob and glob-dir entries', () => {
+    const entries = ['src/ab/a.mjs', 'src/ab', 'src/ab/', 'src/*/*.mjs', 'src/a*/'];
+    // Every entry contains the concrete witness src/ab/a.mjs, so none is provably disjoint.
+    for (const a of entries) for (const b of entries) {
+      expect(scopeEntriesOverlap(`we:${a}`, `we:${b}`), `${a} vs ${b}`).toBe(true);
+      expect(scopeEntriesOverlap(`we:${a}`, `other:${b}`), `${a} vs other:${b}`).toBe(false);
+    }
+  });
+  it('preserves every generated old ancestor relation unless an explicit disjointness proof exists', () => {
+    const oldRoot = (entry) => entry.match(/^[^*?]*/)[0].replace(/\/$/, '');
+    const oldRelated = (a, b) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/') || !a || !b;
+    let checked = 0;
+    // Construct entries from concrete paths, rather than using the new matcher as the oracle.
+    for (const root of ['src', 'packages', 'packages/app']) for (const name of ['a', 'ab', 'ab.v2', 'foo.v2', 'a.d', 'v1.2', 'a.mjs', '.github']) {
+      for (const depth of ['', '/lib', '/lib/deep']) {
+        const file = `${root}/${name}${depth}/a.mjs`;
+        const parents = [`${root}/${name}/`, `${root}/*/`, `${root}/${name[0]}*/`, `${root}/a?/`, `${root}/*`,
+          `${root}/${name[0]}*`, `${root}/*.v2`, `${root}/*.d`, `${root}/*.mjs`];
+        if (root === 'packages/app') parents.push(`packages/*/${name}`);
+        const entries = [file, `${root}/${name}${depth}/*.mjs`, `${root}/*${depth}/*.mjs`];
+        for (const parent of parents) for (const entry of entries) {
+          if (!oldRelated(oldRoot(parent), oldRoot(entry))) continue;
+          // For two globs, a concrete directory name can prove these parents disjoint. A wildcard
+          // directory can choose another name satisfying the parent's length or suffix constraint.
+          // Literal file entries retain the old ancestor fallback even when the glob cannot match.
+          const fixedName = !entry.startsWith(`${root}/*`);
+          const disjoint = entry.includes('*') && fixedName && (
+            (parent === `${root}/a?/` && (name.length !== 2 || !name.startsWith('a')))
+            || ['.v2', '.d', '.mjs'].some((suffix) => parent === `${root}/*${suffix}` && !name.endsWith(suffix))
+          );
+          checked++;
+          expect(scopeEntriesOverlap(`we:${parent}`, `we:${entry}`), `${parent} vs ${entry}`).toBe(!disjoint);
+          expect(scopeEntriesOverlap(`we:${entry}`, `we:${parent}`), `${entry} vs ${parent}`).toBe(!disjoint);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(50);
+  });
+  it.each([
+    ['src/a*/', 'src/b*/deep/*.mjs'],
+    ['src/a?', 'src/abc/deep/*.mjs'],
+    ['src/*.v2/', 'src/ab.v3/deep/*.mjs'],
+    ['src/*.v2', 'src/ab.v3/deep/*.mjs'],
+    ['src/a?.v2', 'src/abc.v2/deep/*.mjs'],
+    ['packages/*/foo.v2', 'packages/x/bar.v2/*.mjs'],
+    ['.git*', '.hg/*.yml'],
+    ['src/*/lib/', 'src/a/other/*.mjs'],
+  ])('keeps provably disjoint glob entries separate: %s vs %s', (a, b) => {
+    expect(scopeEntriesOverlap(`we:${a}`, `we:${b}`)).toBe(false);
+    expect(scopeEntriesOverlap(`we:${b}`, `we:${a}`)).toBe(false);
+  });
+  it('launch policy waits on a glob directory lease when a candidate edits its descendants', () => {
+    const decision = overlapAtLaunch(['we:packages/app/src/deep/*.mjs'], [
+      { id: 'directory-owner', scope: ['we:packages/*/src/'] },
+    ]);
+    expect(decision.outcome).toBe('wait');
+    expect(decision.waitOn).toEqual(['directory-owner']);
+  });
+  it.each(['we:src/*.v2', 'we:packages/*/foo.v2', 'we:.git*'])(
+    'launch policy waits on a bare dotted-directory lease %s', (directory) => {
+      const descendants = {
+        'we:src/*.v2': 'we:src/a.v2/x/*.mjs',
+        'we:packages/*/foo.v2': 'we:packages/x/foo.v2/*.mjs',
+        'we:.git*': 'we:.github/*.yml',
+      };
+      for (const [owner, candidate] of [[directory, descendants[directory]], [descendants[directory], directory]]) {
+        const decision = overlapAtLaunch([candidate], [{ id: 'directory-owner', scope: [owner] }]);
+        expect(decision.outcome).toBe('wait');
+        expect(decision.waitOn).toEqual(['directory-owner']);
+      }
+    },
+  );
+  it('budget exhaustion conservatively contends for disjoint patterns', () => {
+    // The final characters differ, so the exact languages cannot intersect. Their many star
+    // placements exhaust the shared state budget before the matcher can establish that fact.
+    const a = `src/${'*a'.repeat(160)}b.mjs`;
+    const b = `src/${'*a'.repeat(160)}c.mjs`;
+    expect(globsMayIntersect(a, b)).toBe(true);
+    expect(globsMayIntersect(b, a)).toBe(true);
+  });
+  it('the disjoint exhaustion regression rejects fail-open and raised-budget mutations', () => {
+    // Execute mutants only in memory: never weaken the working source to prove the guard.
+    const guard = 'if (--budget.remaining < 0) return true;';
+    const bound = 'remaining: 20000';
+    expect(source).toContain(guard);
+    expect(source).toContain(bound);
+    const loadMatcher = (code) => runInNewContext(code
+      .replace("import { disjoint } from './lane-partition.mjs';", '')
+      .replace(/^export /gm, '') + '\nglobsMayIntersect;', { disjoint });
+    const a = `src/${'*a'.repeat(160)}b.mjs`;
+    const b = `src/${'*a'.repeat(160)}c.mjs`;
+    expect(loadMatcher(source.replace(guard, 'if (--budget.remaining < 0) return false;'))(a, b)).toBe(false);
+    expect(loadMatcher(source.replace(bound, 'remaining: 2000000'))(a, b)).toBe(false);
+  });
+  it('long-star patterns finish within a bounded budget', () => {
+    const start = performance.now();
+    expect(scopeEntriesOverlap(`we:src/a${'*a'.repeat(200)}*b.mjs`, `we:src/ab${'*a'.repeat(200)}*.mjs`)).toBe(true);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+  it('oversized patterns conservatively contend instead of exhausting the matcher', () => {
+    expect(globsMayIntersect(`src/a${'*a'.repeat(3000)}.mjs`, 'other/b*.mjs')).toBe(true);
+  });
+  it('unrecognised embedded globstars conservatively contend', () => {
+    expect(globsMayIntersect('src/a**b.mjs', 'other/x.mjs')).toBe(true);
+  });
+  it('finds a common filename even when neither glob matches the other glob text', () => {
+    expect(scopeEntriesOverlap('we:src/a*b.mjs', 'we:src/ab*.mjs')).toBe(true);
+    expect(scopeEntriesOverlap('we:src/ab*.mjs', 'we:src/a*b.mjs')).toBe(true);
+  });
+  it('globstar covers nested files and zero intervening segments', () => {
+    expect(scopeEntriesOverlap('we:src/**', 'we:src/x/y.mjs')).toBe(true);
+    expect(scopeEntriesOverlap('we:src/**/a*b.mjs', 'we:src/ab*.mjs')).toBe(true);
+  });
+  it('two single-star globs under different depths are disjoint end to end', () => {
+    expect(scopeEntriesOverlap('we:src/*.mjs', 'we:src/x/*.mjs')).toBe(false);
+  });
+  it('keeps literal file equality and inequality unchanged', () => {
+    expect(scopeEntriesOverlap('we:src/a.mjs', 'we:src/a.mjs')).toBe(true);
+    expect(scopeEntriesOverlap('we:src/a.mjs', 'we:src/b.mjs')).toBe(false);
+  });
+  it('keeps repository boundaries even for intersecting or unsupported globs', () => {
+    expect(scopeEntriesOverlap('we:src/a*b.mjs', 'fui:src/ab*.mjs')).toBe(false);
+    expect(scopeEntriesOverlap('we:src/[ab].mjs', 'fui:src/a.mjs')).toBe(false);
+  });
+  it.each(['[ab]', '{a,b}', '!a', 'a\\b'])('fails closed for unsupported syntax %s', (syntax) => {
+    expect(scopeEntriesOverlap(`we:src/${syntax}.mjs`, 'we:other/z.mjs')).toBe(true);
   });
 });
 

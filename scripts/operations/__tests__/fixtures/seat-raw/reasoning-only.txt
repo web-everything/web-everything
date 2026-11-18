@@ -1,0 +1,1 @@
+I inspected avg and traced the sum. Two maximum finite numbers overflow during addition. I need to verify how the division handles the result before giving a verdict.

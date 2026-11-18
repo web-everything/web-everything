@@ -470,7 +470,7 @@ acknowledgement — and the resume message tells you which branch you are on:
 and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,
 `request`, `mark` again with `--attempt=<n+1>`, and end your turn; on the third red the message tells you to take
 the gate-red hard stop below. A red the gate classifies as load-only → the message tells you to take the load-flake
-exit below. `infrastructure-failure` or no verdict → the harness re-requests on its own; after repeated failures
+exit below. The harness defers timeout-only reds under high host load and re-verifies when quiet, up to `verify.loadRetry.maxAttempts`. `infrastructure-failure` or no verdict → the harness re-requests on its own; after repeated failures
 the message tells you to report the stalled request with the blocked-on-infra exit (the signal/ceiling evidence,
 without claiming a test failure). A moved or dirty lane → re-commit, `request`, `mark` again.
 
@@ -638,9 +638,17 @@ The bounce is repaired and re-pushed; now hand it back. This is **the one label 
 a script, so you cannot route around the invariant:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} && \
-  node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
-  node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}}
+```
+
+Run `rearm-review.mjs` as its OWN Bash call: the command must START with `node "{{WE_ROOT}}/…"`, never behind `cd`,
+never chained (`&&`, `;`, `|`, a second line) with the completion report, `fix-end` or a learnings drop. Your
+session is pre-granted exactly that one command shape; a chained or `cd`-prefixed line is not matched and the
+auto-mode classifier denies it (live on #6399). Only after it succeeds, run these as separate calls:
+
+```bash
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
 
 `rearm-review.mjs` swaps `review:changes → review:pending` (an independent re-review is owed) and posts a

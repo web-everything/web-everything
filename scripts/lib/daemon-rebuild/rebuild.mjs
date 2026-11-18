@@ -3,18 +3,24 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { checkPendingAdoptions } from '../overlay-adoption.mjs';
+import { execFileSync } from 'node:child_process';
+import { hostname } from 'node:os';
 import { basename } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
+import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { runForceWatchTick } from '../daemon-force-adopt.mjs';
+import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState } from './state.mjs';
+import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
@@ -29,13 +35,13 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
-  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
+  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-hold-marker-failed', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
-  'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
+  'reader-wait-timeout', 'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
   'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
   'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
   'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',
@@ -45,6 +51,32 @@ export const FAILURE_REASONS = new Set([
 
 // Array view for event-contract consumers, sharing the explicit failure classification.
 export const REBUILD_FAILURE_REASONS = Object.freeze([...FAILURE_REASONS]);
+
+/** Owners (`host:pid`) of this process's parent and ancestors, nearest first. Unreadable evidence yields fewer owners. */
+export function defaultSpawnerOwners({ pid = process.ppid, host = hostname(), exec = execFileSync, depth = 6 } = {}) {
+  const owners = [];
+  let cur = pid;
+  for (let i = 0; i < depth && Number.isSafeInteger(cur) && cur > 1; i++) {
+    owners.push(`${host}:${cur}`);
+    try {
+      cur = Number(String(exec('ps', ['-o', 'ppid=', '-p', String(cur)], {
+        encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] })).trim());
+    } catch { break; }
+  }
+  return owners;
+}
+
+function trustedIgnoreOwners(raw, spawnerOwners, log) {
+  const wanted = String(raw || '').split(',').map((owner) => owner.trim()).filter(Boolean);
+  if (!wanted.length) return [];
+  let allowed = [];
+  try { allowed = spawnerOwners() ?? []; } catch { /* unverifiable spawner: honour nothing */ }
+  const kept = wanted.filter((owner) => allowed.includes(owner));
+  const dropped = wanted.filter((owner) => !kept.includes(owner));
+  if (dropped.length) log?.error?.(`daemon-rebuild: ignored WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS entries that are not this process's spawner or an ancestor: ${dropped.join(', ')}`);
+  return kept;
+}
+
 
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
@@ -61,6 +93,7 @@ export const REBUILD_FAILURE_REASONS = Object.freeze([...FAILURE_REASONS]);
  * @returns {Promise<object>}
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
+  const startedAtMs = Date.now();
   const result = await rebuildCloneInternal(options);
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
@@ -77,15 +110,73 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, eventOptions);
     }
+    // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
+    await checkPendingAdoptions({
+      root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
+      emit: (event) => emitEvent(event, eventOptions),
+    });
   } catch { /* Event failures must never change the rebuild outcome. */ }
+  await forceWatch(options, emitEvent, startedAtMs);
   return result;
+}
+
+/** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
+ *  clone to the last-good build on a failed check or a crash loop. Never throws; the job process (readyOnly) skips it. */
+async function forceWatch(options, emitEvent, startedAtMs) {
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false } = options;
+  if (!root || readyOnly) return;
+  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  try {
+    await runForceWatchTick({
+      root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
+      probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
+      rollback: async (lastGood, { sha } = {}) => {
+        if (!lastGood?.head || !sha) return { ok: false }; // no watched build named: nothing proves it is still the one running, so never revert
+        const git = makeGit({ run, cwd: root, env });
+        // HEAD is read INSIDE the write lock and compared with the watched build: a sibling that adopted a newer build while the
+        // health probe ran must not be reset to last-good (finalize would accept the newer head as `prevHead` and revert it).
+        const fin = await withWriteLock(root, async () => {
+          const head = verifyRev(git, 'HEAD');
+          if (!head) return { ok: false }; // HEAD unreadable: unknown is not "superseded" — the rollback stays owed and is retried
+          if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
+          if (head !== sha) return { superseded: true, head };
+          clearReadyCandidate(root, stEnv);
+          const done = await finalizeRebuild({
+            root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
+            plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
+          });
+          return { ok: done?.adopted === true };
+        }, { now });
+        if (fin.ok !== true) return { ok: false };
+        return fin.value;
+      },
+    });
+  } catch { /* a watch failure never changes the rebuild outcome */ }
+}
+
+/** Default health probe: the clone's tracked tree is intact and its entry module still loads. A crash-loop signal
+ *  comes from the daemon's own restart count when the caller supplies `forceWatchProbe`. */
+function defaultForceWatchProbe(run, env) {
+  return async (root) => {
+    const status = run(['status', '--porcelain', '--untracked-files=no'], { cwd: root, env });
+    const dirty = String(status?.stdout ?? '').trim();
+    if (status?.status !== 0 || dirty) return { healthy: false };
+    try {
+      // The probe source is assembled from parts so this file carries no non-literal dynamic-import expression:
+      // the import-closure scanner (lib/import-closure.mjs) marks any closure containing one as incomplete,
+      // which makes every closure-gated dispatch/sync path fall back to "touched".
+      const probeSrc = ['await', ' import', '(process.argv[1])'].join('');
+      execFileSync(process.execPath, ['--input-type=module', '-e', probeSrc, './scripts/lib/daemon-rebuild.mjs'], { cwd: root, timeout: 60_000, stdio: 'ignore' });
+      return { healthy: true };
+    } catch { return { healthy: false }; }
+  };
 }
 
 async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs,
+  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -102,7 +193,17 @@ async function rebuildCloneInternal({
   // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
-  if (vctx) return versionedRebuild({ ctx: vctx, log });
+  if (vctx) {
+    // Versioned builds take no clone lease to renew while queued, but their live smoke
+    // shares the same host capacity and deadline as an unversioned candidate.
+    const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
+    try {
+      if (!slot.acquired) return { moved: false, reason: 'smoke-queue-timeout' };
+      return await versionedRebuild({ ctx: vctx, log });
+    } finally {
+      await slot.release();
+    }
+  }
   // daemonRebuild.skipUnrelated (default on): `skipCheck` is injectable; else built from the daemon's `entries`.
   // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
   // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.
@@ -123,6 +224,9 @@ async function rebuildCloneInternal({
   } else if (waitMs > baseWaitMs) log.error?.(`daemon-rebuild: starved for ${starvedCount} consecutive attempt(s) — waiting up to ${Math.round(waitMs / 1000)}s for in-flight ticks this time`);
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
+    // Only the ready-only job has prepare guards that make excluding its spawner safe.
+    // The env value is honoured only for this process's actual spawner or an ancestor; anything else is dropped.
+    ...(readyOnly ? { ignoreOwners: trustedIgnoreOwners(env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS, spawnerOwners, log) } : {}),
     now,
     waitMs,
     onBlocked: ({ blockers, waitMs: w }) => log.error?.(
@@ -148,7 +252,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {
@@ -189,10 +293,36 @@ async function rebuildCloneInternal({
 
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
   try {
-    return await smokeAndAdopt({
-      root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep,
+      onWait: async () => {
+        const renewed = await withWriteLock(root, () => {
+          const st = readRebuildState(root, stEnv);
+          if (st.building?.token !== lease.token) return;
+          st.building.startedAt = new Date(now()).toISOString();
+          writeRebuildState(root, st, stEnv);
+        }, finalLockOpts);
+        if (!renewed.ok) throw new Error(`daemon-rebuild: could not renew queued build lease (${renewed.reason}) — the next tick retries`);
+      },
     });
+    try {
+      if (!slot.acquired) {
+        try {
+          await withWriteLock(root, () => {
+            const st = readRebuildState(root, stEnv);
+            releaseBuildLease(st, lease);
+            writeRebuildState(root, st, stEnv);
+          }, finalLockOpts);
+        } catch { /* the owner's next call takes an unreleased lease back anyway */ }
+        return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
+      }
+      return await smokeAndAdopt({
+        root, env, stEnv, log, run, runSmoke,
+        stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
+        finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+      });
+    } finally {
+      await slot.release();
+    }
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.
     try {

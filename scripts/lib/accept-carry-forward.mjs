@@ -35,6 +35,8 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isManualPassNote, isProducerRefreshNote } from '../operations/operator-action-shape.mjs';
+import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
@@ -122,6 +124,39 @@ const KNOWN_MACHINE_SHAPE_RES = [
   /^\s*<!--\s*drain-(?!park-)[a-z0-9-]+-reason\s*-->/,
   /^\s*(?:🔀 conveyor rebase-onto-main|⏱️ conveyor CI-hung-recovery|🚦 conveyor missing-run-recovery|⏳ conveyor —|🔎 stuck-PR inspection)/, // conveyor recovery / queue notes
 ];
+// Operator-written notes that decide nothing about the review (R907). Trusted marker authors ONLY (`isKnownMachineBody`
+// gates this list on `isTrustedMarkerAuthor`); any other author's copy stays a possible hold.
+// PRODUCER-SHAPE recognition (R907, PR #6713 review): a note is recognised by its producer's FIXED FIELDS, never by its free
+// text (a vocabulary allow-list regressed the live #6381/#6595 notes; a hold-word blacklist is never exhaustive). The shapes are
+// defined once, beside the producers, in scripts/operations/operator-action-shape.mjs:
+//   - refresh note  = trusted author + a body opened by the `🛠 operator action — refresh` header that ENDS in the
+//     `<!-- operator-action: {json} -->` marker, whose JSON is EXACTLY the refresh record the producer writes (its key set, only
+//     bounded scalar values; an extra key or a nested value is not the producer's note)
+//   - manual R247   = trusted author + the whole body being the producer's template
+//     `Manual R247 pass — daemon: <name>; reason: <reason>; checkout sha: <sha>.` (scripts/operations/manual-daemon-pass-io.mjs)
+// The operator's own `reason` stays verbatim free text inside those fields (bounded); narrowing WHO may post such a note is the
+// follow-up card 8176 (residual #6714). The refresh note is further required to equal the producer's own rendering of its record.
+// A body with anything after the marker, any text that is not the template, a missing/malformed marker, or an untrusted author holds.
+// Every line terminator Markdown / the producers treat as a line break (`\r`, U+0085, U+2028/9, VT, FF as well as `\n`): a second
+// "line" smuggled behind any of them must not ride the header or the marker.
+const NL = '\\r\\n\\u0085\\u2028\\u2029\\v\\f';
+const OPERATOR_ACTION_HEADER = '🛠 operator action — ';
+const OPERATOR_ACTION_MARKER_RE = new RegExp(`\\n<!-- operator-action: (\\{[^${NL}]*\\}) -->\\s*$`); // on its OWN line, last in the body
+function isTrustedAuthorNote(text) {
+  const t = text.trim();
+  // The manual pass is the producer's fixed-field template, whole body (a free-text tail is not the producer's note).
+  if (isManualPassNote(t)) return true;
+  // The producer's header line opens the body and names the REFRESH op; text before the marker alone is not a note.
+  if (t.split(new RegExp(`[${NL}]`))[0] !== `${OPERATOR_ACTION_HEADER}refresh`) return false;
+  const marker = OPERATOR_ACTION_MARKER_RE.exec(t);
+  if (!marker) return false;
+  try {
+    // Only the producer's exact refresh note is exempt: the marker is the refresh record (op, exact key set, bounded scalar values)
+    // AND the producer's own renderer reproduces the whole body from it, so an extra key, a nested value, prose between header and
+    // marker or a duplicate JSON key is not the producer's note. Every other control note (unpark, rearm, ...) still counts as later.
+    return isProducerRefreshNote(t, marker[1]);
+  } catch { return false; }
+}
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
 const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\./;
 const ADVISORY_CHANGES_RE = /\*\*Advisory outcome:\*\*\s*`?changes`?/i;
@@ -171,7 +206,7 @@ function isNonBlockingRedTeamGate(text) {
   const gate = parseRedTeamGateMarker(text);
   if (!gate || ![GATE_OUTCOMES.NOTHING_TO_SEND, GATE_OUTCOMES.CARD_QUEUED].includes(gate.outcome)) return false;
   const lines = text.split('\n');
-  if (lines[0] !== redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds)
+  if (lines[0] !== redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds, gate.classCards)
     || lines[1] !== `**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${gate.rev.slice(0, 12)}\`:`) return false;
   // Only successful card/advisory action lines. Landing handles are machine tokens, never free prose.
   const card = /^- [1-9]\d* finding\(s\) filed as a follow-up card \(#[1-9]\d*(?:, #[1-9]\d*)*\) — landing job [A-Za-z0-9:._-]{0,120}\.$/;
@@ -181,8 +216,39 @@ function isNonBlockingRedTeamGate(text) {
     && (gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || actions.some(line => card.test(line)));
 }
 
+/**
+ * The carry writer's envelope (review-job.mjs): the carried marker, its fixed sentence, then optionally a non-blocking
+ * advisory re-bound to the carried-to head (its "Head" label keeps the carried-from head). Anything else is a possible hold.
+ */
+function isNonBlockingCarriedVerdict(text, comment, shownHead = null) {
+  if (comment === undefined || !isTrustedMarkerAuthor(comment)) return false;
+  const carried = parseVerdictCarriedMarker(text);
+  if (!carried) return false;
+  const marker = buildVerdictCarriedMarker(carried);
+  if (!text.startsWith(marker)) return false;
+  const sentence = 'Review verdict carried across an identical contribution.';
+  let rest = text.slice(marker.length);
+  if (!rest.startsWith(`\n${sentence}`)) return false;
+  rest = rest.slice(sentence.length + 1);
+  if (!rest.trim()) return true;
+  if (!rest.startsWith('\n') || !rest.trimStart().startsWith(RED_TEAM_COMMENT_MARKER)) return false;
+  rest = rest.trim();
+  const parsed = parseRedTeamComment(rest);
+  return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, shownHead ?? carried.fromSha.slice(0, 12));
+}
+
+// Resolve exactly the gate's live policy. Unknown policy requires a fresh review.
+function liveRedTeamAdvisoryPlan(parsed) {
+  try {
+    // A missing policy retains defaults; an unreadable policy cannot prove this advisory is non-blocking.
+    const setting = readConfirmedBreaks({ strict: true })?.value;
+    if (parsed.findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return null;
+    return planRedTeamActions(parsed, setting);
+  } catch { return null; }
+}
+
 /** Validate the rendered envelope and every finding line: the shared evidence parser skips malformed lines. */
-function isNonBlockingRedTeamAdvisory(text) {
+function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
   const parsed = parseRedTeamComment(text);
   if (!parsed) return false;
   const lines = text.split('\n');
@@ -191,26 +257,24 @@ function isNonBlockingRedTeamAdvisory(text) {
     ? `${findings.length} possible break(s), ${findings.filter(f => f.confirmed).length} confirmed by Claude's re-check`
     : 'no break found';
   const prefix = 'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
-    + `Head \`${parsed.rev.slice(0, 12)}\` · red team `;
+    + `Head \`${shownHead ?? parsed.rev.slice(0, 12)}\` · red team `;
   if (lines[0] !== redTeamMarker(parsed.pr, parsed.rev) || lines[1] !== `### Post-accept red team — ${heading}`
     || lines[2] !== '' || !lines[3]?.startsWith(prefix)
     || !/^[^\s`]+\/[^\s`]+(?: · re-check (?:ok|pending|not-needed|error))? · recorded verdict `(accept|changes|null)`\.$/.test(lines[3].slice(prefix.length))
     || lines[4] !== '') return false;
   if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.';
   if (lines.at(-2) !== '' || lines.at(-1) !== "A confirmed break is recorded as a miss for the accepting review and for the builder's model.") return false;
-  // Resolve exactly the gate's live policy: degraded (or any other class) can be configured for send-back.
-  // Unknown policy refuses the exemption; the existing later-verdict path requires a fresh review.
-  try {
-    const setting = readConfirmedBreaks()?.value;
-    if (findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return false;
-    if (planRedTeamActions(parsed, setting).sendBack.length) return false;
-  } catch { return false; }
+  const plan = liveRedTeamAdvisoryPlan(parsed);
+  if (!plan || plan.sendBack.length) return false;
   let count = 0;
   for (const line of lines.slice(5, -2)) {
     const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
     if (finding) {
       if (finding.index !== ++count || !finding.category || !finding.summary) return false;
-    } else if (!count || !/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)) return false;
+    } else if (!count || !(/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)
+      // The writer's classification sublines (review-extra-seats.mjs); same shapes the gate parser reads.
+      || /^ {3}- Class: [^\r\n]+? → (?:fix-now|defer-card)(?: \(basis: [^\r\n]*\))?$/.test(line)
+      || /^ {3}- Also class: [a-z-]+(?:, [a-z-]+)*$/.test(line))) return false;
   }
   return count === findings.length;
 }
@@ -225,10 +289,28 @@ export function isKnownMachineBody(body, comment = undefined) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
+  if (text.startsWith('<!-- review-verdict-carried ')) return isNonBlockingCarriedVerdict(text, comment);
   // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
   if (isTrustedMarkerAuthor(comment)) {
     if (text.startsWith(RED_TEAM_GATE_MARKER)) {
-      return isNonBlockingRedTeamGate(text);
+      if (isNonBlockingRedTeamGate(text)) return true;
+      const gate = parseRedTeamGateMarker(text);
+      // The provenance parser also accepts standalone records for the rebase path.
+      // Here only the combined carried envelope extends the strict gate shape.
+      const carried = parseVerdictCarriedMarker(text);
+      if (!gate || gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || !carried || carried.toSha !== gate.rev) return false;
+      // The gate part (a bare marker line, or the strict full gate comment) then the strict carried envelope.
+      const cut = text.indexOf(buildVerdictCarriedMarker(carried));
+      if (cut < 0) return false;
+      const gatePart = text.slice(0, cut).trim();
+      const bare = redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds, gate.classCards);
+      if (gatePart !== bare && !isNonBlockingRedTeamGate(gatePart)) return false;
+      const envelope = text.slice(cut);
+      if (!envelope.includes(RED_TEAM_COMMENT_MARKER)) return false;
+      // Both producer shapes retain the strict finding sequence/completeness checks:
+      // the original displayed head, or the advisory rendered for the current head.
+      return isNonBlockingCarriedVerdict(envelope, comment)
+        || isNonBlockingCarriedVerdict(envelope, comment, gate.rev.slice(0, 12));
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
       const parsed = parseRedTeamComment(text);
@@ -242,6 +324,7 @@ export function isKnownMachineBody(body, comment = undefined) {
     }
   }
   if (MECHANICAL_PARK_RE.test(text)) return true;
+  if (isTrustedMarkerAuthor(comment) && isTrustedAuthorNote(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
     || isDrainEnqueueClearance(text, comment)

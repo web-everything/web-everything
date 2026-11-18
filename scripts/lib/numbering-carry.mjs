@@ -12,9 +12,12 @@
  *   Live case #5608: drain numbering also rewrote ids in docs/agent/platform-decisions.md, voiding human clearance.
  */
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
+import { proveMixedMechanicalChain, submoduleStrictExec } from './carry-chain.mjs';
+import { isAutomationAuthored } from './marker-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { execFileSync } from 'node:child_process';
+import { laneGitHardeningEnv, scrubInheritedGitEnv } from './lane-git-hardening.mjs';
 import { BORN_AS_RE } from '../backlog/id.mjs';
 import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
 import { isKnownMachineBody, latestAcceptRecord, laterReviewHold, resolveAcceptCarryForward } from './accept-carry-forward.mjs';
@@ -43,7 +46,7 @@ export const MAX_NUMBERING_FILES = 256;
 export const MAX_NUMBERING_BLOB_BYTES = 1024 * 1024;
 export const MAX_NUMBERING_TOTAL_BYTES = 8 * 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
-const GIT_TIMEOUT_MS = 5000;
+export const GIT_TIMEOUT_MS = 5000;
 const canonicalNumber = (number) => number.replace(/^0+(?=\d)/, '');
 
 /** PURE: parse exact, unique hash→number pairs; malformed subjects and duplicate drops return null. */
@@ -96,11 +99,62 @@ export function isLedgerRewrite(before, after, map) {
 }
 
 const refuse = (reason) => ({ ok: false, reason });
+
+// A provisional id is a whole token only when no identifier character, Unicode included, touches either side (so `fooxf74q20`,
+// `my_x1b8hlo` and `x1b8hlobar` never count). A hyphen or slash may touch: ids sit in `backlog/xhash-slug.md` paths.
+// ID_Continue includes combining marks and connector punctuation; ECMAScript also permits $ and ZWNJ/ZWJ.
+// Keep the broader letter/number exclusions too, including Unicode numbers outside ID_Continue.
+const CODE_TOKEN_RE = /(?<![\p{ID_Continue}\p{L}\p{N}$\u200C\u200D])(x[0-9a-z]{6})(?![\p{ID_Continue}\p{L}\p{N}$\u200C\u200D])/gu;
+const ESC = String.raw`\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|u\{[0-9a-fA-F]+\}|N\{[^}]*\}|x[0-9a-fA-F]{2})`;
+const CODE_ESCAPE_END_RE = new RegExp(`${ESC}$`);
+const CODE_ESCAPE_START_RE = new RegExp(`^${ESC}`);
+
+/**
+ * PURE (R953): a line is a pure id swap when it differs from its old line ONLY by whole-token xHASH→NNNN
+ * replacements, each proven by `map` (subject pairs plus main's unambiguous `bornAs:`→number aliases).
+ * Any other provisional token may stay unchanged, whether mapped or not.
+ */
+function isCodeLineSwap(before, after, map) {
+  const segments = before.split(CODE_TOKEN_RE);
+  let cursor = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (i % 2 === 0 || after.startsWith(segment, cursor)) {
+      if (!after.startsWith(segment, cursor)) return false;
+      cursor += segment.length;
+    } else {
+      // Literal Unicode, named and hex escapes can extend identifiers: the backslash and the closing brace
+      // are not proven delimiters. Conservatively refuse adjacency without parsing file syntax.
+      // Scan only the neighbouring segments, keeping total work linear even with padded escapes.
+      if (CODE_ESCAPE_END_RE.test(segments[i - 1])
+        || CODE_ESCAPE_START_RE.test(segments[i + 1])) return false;
+      const number = map.get(segment);
+      if (typeof number !== 'string' || !after.startsWith(number, cursor)) return false;
+      cursor += number.length;
+    }
+  }
+  return cursor === after.length;
+}
+
+/**
+ * PURE (R953): every changed line of a non-backlog text file is a pure whole-token id swap. Same line count (so no
+ * added or deleted line), no NUL (binary never qualifies), `bornAs` lines never touched, and an unreadable main
+ * lookup refuses (fail closed). Work is linear in the blob size, which the IO shell already bounds.
+ */
+function isCodeIdRewrite(before, after, map, mainReadFailed) {
+  if (mainReadFailed || typeof before !== 'string' || typeof after !== 'string') return false;
+  if (before.includes('\0') || after.includes('\0')) return false;
+  const beforeLines = before.split('\n');
+  const afterLines = after.split('\n');
+  if (beforeLines.length !== afterLines.length) return false;
+  return beforeLines.every((line, i) => line === afterLines[i]
+    || (!/bornAs/.test(line) && !/bornAs/.test(afterLines[i]) && isCodeLineSwap(line, afterLines[i], map)));
+}
 const swap = (text, map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => map.get(hash) ?? hash);
 
 /**
  * PURE: verify one commit's entire diff, supplied as no-renames additions/deletions/modifications with blobs.
- * Allow backlog markdown and M-only top-level docs/agent markdown; every modification must be a ledger id rewrite.
+ * Renames stay in backlog markdown; modifications elsewhere must be whole-token id rewrites.
  * @param {{subject:string, parents:string[], changes:Array<{status:string,path:string,before?:string|null,after?:string|null}>,
  *   extraMap?:Map<string,string>}} o
  * @returns {{ok:true,pairs:Array<[string,string]>,renames:Array<{from:string,to:string}>}|{ok:false,reason:string}}
@@ -116,8 +170,9 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
     if (!['A', 'D', 'M'].includes(change.status)) return refuse(`unsupported change status ${change.status} at ${change.path}`);
     if (typeof change.path !== 'string' || paths.has(change.path)) return refuse(`invalid or repeated change path ${change.path}`);
     const backlogMarkdown = /^backlog\/(?:[^/]+\/)*[^/]+\.md$/.test(change.path);
-    const agentDocModification = change.status === 'M' && /^docs\/agent\/[^/]+\.md$/.test(change.path);
-    if ((!backlogMarkdown && !agentDocModification)
+    // R953: a MODIFICATION of any tracked text file may qualify, but only through the line-by-line id-swap proof below.
+    // Adds and deletes (renames) stay confined to backlog markdown.
+    if ((!backlogMarkdown && change.status !== 'M')
       || change.path.split('/').some((part) => part === '.' || part === '..')) return refuse(`id rewrite is outside backlog markdown at ${change.path}`);
     if (change.status === 'M' && change.beforeMode !== change.afterMode) return refuse(`file mode changed at ${change.path}`);
     paths.add(change.path);
@@ -156,9 +211,11 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   for (const change of changes.filter((c) => c.status === 'M')) {
     if (typeof change.before !== 'string' || typeof change.after !== 'string') return refuse(`missing content blob at ${change.path}`);
     if (change.before === change.after) return refuse(`modified path ${change.path} is unchanged`);
-    if (!isLedgerRewrite(change.before, change.after, referenceMap)) {
-      return refuse(`modification is not an id rewrite with every bornAs line kept at ${change.path}`);
-    }
+    const markdownScope = /^backlog\/(?:[^/]+\/)*[^/]+\.md$/.test(change.path) || /^docs\/agent\/[^/]+\.md$/.test(change.path);
+    const proven = markdownScope
+      ? isLedgerRewrite(change.before, change.after, referenceMap)
+      : isCodeIdRewrite(change.before, change.after, referenceMap, extraMap.readFailed === true);
+    if (!proven) return refuse(`modification is not an id rewrite with every bornAs line kept at ${change.path}`);
   }
   for (const hash of map.keys()) {
     if (!used.has(hash)) return refuse(`subject pair ${hash} renamed no backlog card`);
@@ -166,17 +223,8 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   return { ok: true, pairs: [...map], renames };
 }
 
-/** IO: a missing commit gets one fetch and re-check, with every failure handled by the outer refusal boundary. */
-function ensureReadable(git, sha) {
-  try { git(['cat-file', '-e', `${sha}^{commit}`]); }
-  catch {
-    git(['fetch', '--no-tags', '-q', 'origin', sha]);
-    git(['cat-file', '-e', `${sha}^{commit}`]);
-  }
-}
-
 /** IO: main's bornAs aliases are optional evidence; failed reads must not settle a refusal that needs them. */
-function readExtraMap(git, mainRef) {
+export function readExtraMap(git, mainRef) {
   const map = new Map();
   const ambiguous = new Set();
   let output;
@@ -207,39 +255,90 @@ function readExistingNumbers(git, ref) {
   return numbers;
 }
 
-/**
- * IO (read-only git proof, apart from fetching missing objects): verify every new commit is drain numbering
- * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
- * @param {{exec:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o
- * @returns {{ok:true,commits:string[],pairs:Array<[string,string]>,reason:string}|{ok:false,reason:string,retryable?:boolean}}
- */
-export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd } = {}) {
-  try {
-    if (typeof exec !== 'function' || !fromSha || !toSha) return refuse('no git reader or head');
-    if (fromSha === toSha) return refuse('no head move');
-    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
-    // dropping it would itself conceal a non-numbering byte change.
-    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-    const gitBytes = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
-      const output = exec('git', args, {
-        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
+/** Fatal decoding preserves a BOM and refuses lossy Git text evidence. */
+export const decodeNumberingGitText = bytes => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+
+/** Internal test seam for bounded local Git reads; the public proof never accepts a runner. */
+export function numberingGitRunner({ cwd, run = execFileSync } = {}) {
+  let readFailed = false;
+  const env = { ...laneGitHardeningEnv(scrubInheritedGitEnv()), GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent',
+    GIT_TERMINAL_PROMPT: '0' };
+  const pins = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false'];
+  const read = (args, options) => {
+    try {
+      const { maxBuffer, timeout } = options ?? {};
+      if (!Number.isSafeInteger(maxBuffer) || maxBuffer <= 0 || !Number.isSafeInteger(timeout) || timeout <= 0) throw Error('explicit Git read bounds required');
+      const output = run('git', [...pins, ...args], {
+        env,
+        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout,
         ...(cwd === undefined ? {} : { cwd }),
       }) ?? Buffer.alloc(0);
       if (!Buffer.isBuffer(output)) throw Error('git reader must return raw bytes');
       if (output.length > maxBuffer) throw Error('git output exceeds byte limit');
       return output;
-    };
-    const git = (args, maxBuffer) => decoder.decode(gitBytes(args, maxBuffer));
+    } catch (error) {
+      if (!(error?.status === 1 && (args[0] === 'grep'
+        || (args[0] === 'config' && args[1] === '--get-regexp')))) readFailed = true;
+      throw error;
+    }
+  };
+  let initialized = false;
+  const gitBytes = (args, options) => {
+    if (!initialized) {
+      // Discover every promisor before any object read. Config itself cannot lazy-fetch.
+      let promisors = '';
+      try { promisors = decodeNumberingGitText(read(['config', '--get-regexp', '^remote\\..*\\.promisor'],
+        { maxBuffer: MAX_GIT_OUTPUT_BYTES, timeout: GIT_TIMEOUT_MS })); }
+      catch (error) { if (error?.status !== 1) { readFailed = true; throw error; } }
+      for (const line of promisors.split('\n').filter(Boolean)) {
+        const key = /^(remote\..*\.promisor)\s/.exec(line)?.[1];
+        if (!key) { readFailed = true; throw Error('unreadable promisor config key'); }
+        pins.push('-c', `${key}=false`);
+      }
+      initialized = true;
+    }
+    return read(args, options);
+  };
+  return { gitBytes, get readFailed() { return readFailed; } };
+}
+
+/**
+ * IO (local-only, read-only git proof): verify every new commit is drain numbering
+ * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
+ * @param {{exec?:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o — exec is retained for compatibility only.
+ * @returns {{ok:boolean,reason:string,readFailed:boolean,commits?:string[],pairs?:Array<[string,string]>,retryable?:boolean}}
+ */
+export function proveNumberingOnlyMove(options = {}) {
+  let runner;
+  try {
+    runner = numberingGitRunner({ cwd: options.cwd });
+    return { ...proveNumberingWithRunner(options, runner), readFailed: runner.readFailed };
+  } catch (error) {
+    return { ...refuse(`numbering proof failed: ${String(error?.message ?? error).split('\n')[0]}`),
+      retryable: true, readFailed: true };
+  }
+}
+
+export function proveNumberingWithRunner({ fromSha, toSha, mainRef = 'origin/main' } = {}, runner) {
+  try {
+    if (!fromSha || !toSha) return refuse('no head');
+    if (fromSha === toSha) return refuse('no head move');
+    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
+    // dropping it would itself conceal a non-numbering byte change.
+    const { gitBytes } = runner;
+    const git = args => decodeNumberingGitText(gitBytes(args, { maxBuffer: MAX_GIT_OUTPUT_BYTES, timeout: GIT_TIMEOUT_MS }));
     // Blob content is compared as text only once its text re-encodes to the exact bytes git stored, so no decoding
     // step (a dropped BOM, a replaced byte, a normalisation) can make two different byte sequences compare equal.
     const blobText = (object) => {
-      const bytes = gitBytes(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
-      const text = decoder.decode(bytes);
+      const bytes = gitBytes(['cat-file', 'blob', object], { maxBuffer: MAX_NUMBERING_BLOB_BYTES, timeout: GIT_TIMEOUT_MS });
+      const text = decodeNumberingGitText(bytes);
       if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'NUMBERING_BYTES_NOT_EXACT' });
       return text;
     };
-    ensureReadable(git, fromSha);
-    ensureReadable(git, toSha);
+    // Missing commits/objects stay missing: the outer boundary returns a retryable refusal.
+    git(['cat-file', '-e', `${fromSha}^{commit}`]);
+    git(['cat-file', '-e', `${toSha}^{commit}`]);
     // rev-list prints full shas: compare the chain's first parent against the resolved accepted head, not its spelling.
     fromSha = git(['rev-parse', '--verify', `${fromSha}^{commit}`]).trim();
     const lines = git(['rev-list', `--max-count=${MAX_NUMBERING_COMMITS + 1}`, '--topo-order', '--reverse', '--parents', toSha, `^${fromSha}`]).trim().split('\n').filter(Boolean);
@@ -407,6 +506,7 @@ const staleReason = /^(?:is STALE|could NOT be re-verified this pass) —/;
 export function isNumberingTolerableLaterBody(body, comment = undefined) {
   if (isKnownMachineBody(body, comment)) return true;
   if (typeof body !== 'string') return false;
+  if (isAutomationAuthored({ ...comment, viewerDidAuthor: false }) && /^🔧 conveyor fix — re-armed for re-review\n\nThe previously accepted PR was re-pushed and its acceptance is being re-armed for review by [A-Za-z0-9 ._-]{1,100}; the PR is re-armed `review:pending` \(an independent re-review is owed\)\.\n\nThe fix agent did NOT clear the review — a human `\/review` \(or the drain AI-review convergence pass\) re-verdicts\.$/.test(body)) return true;
   // A withdrawal is not itself a hold: whatever caused it still stands on the thread and is judged on its own.
   if (isWithdrawnNotice(body)) return true;
   const park = stalePark.exec(body);
@@ -492,8 +592,7 @@ export function buildNumberingRestampBody({ fromSha, toSha, human, actor, headDi
   return [
     '📌 review — acceptance re-stamped after a rebase (no new review)', '',
     `Recorded by ${writer} via numbering-carry. The head moved from \`${fromSha.slice(0, 12)}\` to \`${toSha.slice(0, 12)}\` `
-      + `only by the drain's own card-numbering commit(s): ${proofReason}. Each commit was verified mechanically `
-      + '(backlog card renames to their assigned numbers, the bornAs stamp, and id-to-number rewrites; nothing else). '
+      + `only by a mechanically proven move: ${proofReason}. `
       + `The acceptance recorded on \`${fromSha.slice(0, 12)}\``
       + (human ? ` — the human clearance by ${name} —` : '')
       + ' is carried unchanged; any other change still needs a fresh review.', '',
@@ -660,8 +759,17 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   let proof = numberingOff ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
   if (!proof.ok && netSetting.value) {
     // An alternative proof cannot settle a head the first proof could not read: either retryable miss stays retryable.
-    const net = proveIdenticalNetPatch({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+    // Strict exec: a tracked ignore=all must not hide a submodule pointer change from the patch comparison.
+    const net = proveIdenticalNetPatch({ exec: submoduleStrictExec(exec), cwd, fromSha: plan.from, toSha: plan.to });
     proof = net.ok ? net : { ...net, retryable: Boolean(proof.retryable || net.retryable), reason: `${proof.reason}; net patch: ${net.reason}` };
+  }
+  if (!proof.ok && !plan.human) {
+    const chain = proveMixedMechanicalChain({ exec, cwd, fromSha: plan.from, toSha: plan.to,
+      numberingEnabled: numberingSetting.value, netPatchEnabled: netSetting.value });
+    proof = chain.ok ? chain : { ...chain, retryable: Boolean(proof.retryable || chain.retryable),
+      reason: `${proof.reason}; chain: ${chain.reason}` };
+  } else if (!proof.ok && plan.human) {
+    proof = { ...proof, reason: `${proof.reason}; human clearance cannot be carried across a mechanical chain; request a fresh human review` };
   }
   if (!proof.ok) {
     if (!proof.retryable && !numberingOff) settledRestamps.add(key);

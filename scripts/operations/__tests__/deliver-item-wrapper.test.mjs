@@ -16,7 +16,7 @@ afterBuildPolicy(() => buildPolicyVi.unstubAllEnvs());
  * assumed) verification trail behind the swap — a `--safe-mode` swap was tried FIRST and independently
  * REJECTED after a real smoke test showed a `--settings=<hooks file>` layered on top of it never fires.
  */
-import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll, onTestFinished } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -3886,6 +3886,23 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     });
   });
 
+  it.each([false, true])('refuses longshore build capability none before any lane acquisition (resume=%s)', async (resume) => {
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'longshore-build', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build' }, result: null, error: null }] });
+    const provider = { spawn: vi.fn(), vendor: 'codex' };
+    execFileSync.mockImplementation(() => { throw new Error('unexpected subprocess before build refusal'); });
+    await expect(deliverItem(
+      { item: '9999', lane: 7, scope: 'longshore:backlog/x.md', sessionSlug: 'conveyor-9999', resume,
+        runId: 'longshore-build', effectKey: 'dispatch:0:0' },
+      provider,
+      { newSessionId: () => 'uuid-fixed' },
+    )).rejects.toThrow(/longshore.*build.*none/);
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(provider.spawn).not.toHaveBeenCalled();
+  });
+
   it('build-path-codex-isolation-locus — refuses a genuine multi-repo "couple" scope (e.g. #2662, we + '
     + 'plateau-app together) BEFORE acquiring anything, rather than guessing at merge order', async () => {
     findItem.mockReturnValue({ num: '2662', slug: 'couple-thing', specPath: 'backlog/2662-couple-thing.md', scope: ['we:backlog/2662-couple-thing.md', 'plateau-app:src/y.tsx'] });
@@ -4239,7 +4256,16 @@ describe('deliverItem (#4349 — settles its run-store effect + releases/holds t
     telemetryFaults.failures = [];
     const real = await vi.importActual('node:child_process');
     const git = (args) => real.execFileSync('git', args, { cwd: lane, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-    git(['clone', '--shared', '--no-checkout', process.cwd(), '.']);
+    // Clone a hermetic two-commit source repo (the keep-ref check below resets to HEAD~1), never process.cwd():
+    // a remote runner's work tree (Forge /srv/forge-exec/slot-N/.../work) is a file copy without .git.
+    const source = mkdtempSync(join(tmpdir(), 'deliver-item-wrapper-source-'));
+    onTestFinished(() => rmSync(source, { recursive: true, force: true }));
+    real.execFileSync('git', ['init', '-q'], { cwd: source, stdio: 'ignore' });
+    for (const message of ['base', 'head']) {
+      real.execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false',
+        'commit', '--allow-empty', '-qm', message], { cwd: source, stdio: 'ignore' });
+    }
+    git(['clone', '--shared', '--no-checkout', source, '.']);
     const sha = git(['rev-parse', 'HEAD']);
     const store = seedInFlightRun('refusal-4357');
     acquireBuildDispatchClaim({ num: '9001', scope: [] });

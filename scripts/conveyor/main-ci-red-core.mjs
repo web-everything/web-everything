@@ -263,6 +263,10 @@ export function planMainCiRerun({ runs, tipSha, reruns = {}, flake = null, setti
     && (newest.attempt == null || newest.attempt === 1) && unseen(newest.databaseId)) {
     return { runId: newest.databaseId, sha: newest.headSha, kind: 'cancelled-tip', reason: 'latest main run was cancelled' };
   }
+  if (settings.mainCiRedRerunCancelledTip && newest?.headSha === tipSha && RED.has(newest?.conclusion)
+    && newest.infraOnly === true && (newest.attempt == null || newest.attempt === 1) && unseen(newest.databaseId)) {
+    return { runId: newest.databaseId, sha: newest.headSha, kind: 'infra-tip', reason: 'latest main run failed only through cancelled/never-started jobs' };
+  }
   // A flake rerun that finished with no verdict (cancelled / skipped / infra-only) settled nothing: try it once more, then
   // leave the hold to the owner. Only runs we ledgered as a flake rerun qualify, and only up to FLAKE_RERUN_ROUNDS tries.
   const again = runs.find((r) => r.rerunInconclusive === true

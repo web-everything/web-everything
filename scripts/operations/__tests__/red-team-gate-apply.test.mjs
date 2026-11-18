@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { pickSendBackError, applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, liveResultGateState, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
@@ -225,6 +225,26 @@ describe('applyRedTeamGate', () => {
     const { io, calls } = fakeIo({ comments: [comment([F()])], liveHead: OTHER });
     expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'head-moved', head: HEAD });
     expect(calls).toEqual([]);
+  });
+
+  // Card 8075: a push INSIDE the write window cannot be refused (the writer cannot pin), so it is verified after.
+  it('head unchanged across the write: label written, no wrong-head flag', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F()])] });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(kinds(calls)).toContain('sendBack');
+    expect(r.status).toBe('applied');
+    expect(r.headMovedAfterWrite).toBeUndefined();
+  });
+
+  it('head moved between judgement and write end: recorded against the judged head, logged, flagged', async () => {
+    const heads = [HEAD, OTHER];
+    const logs = [];
+    const { io, calls } = fakeIo({ comments: [comment([F()])], readHead: () => heads.shift() ?? OTHER, log: (l) => logs.push(l) });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(r).toMatchObject({ status: 'send-back-wrong-head', head: HEAD, headMovedAfterWrite: OTHER });
+    expect(gateExitCode(r)).toBe(1);
+    expect(calls.find((c) => c[0] === 'comment')[1].body).toContain(HEAD.slice(0, 12));
+    expect(logs.join('\n')).toMatch(/moved to 2{40} during the send-back write/);
   });
 
   it('unconfirmed → advisory: nothing written', async () => {
@@ -787,5 +807,47 @@ describe('red-team send-back queue removal (#5283)', () => {
     await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
     await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
     expect(removals).toBe(1);
+  });
+});
+
+describe('applyRedTeamGate: class-only card indices (writer → reader)', () => {
+  it('records class= on the card-queued marker, and revoking the deferral reopens the finding', async () => {
+    const comments = [comment([F({ findingClass: 'theoretical-race', classBasis: 'needs a concurrent writer' })])];
+    const { io, calls } = fakeIo({ comments });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied' });
+    expect(kinds(calls)).toEqual(['card', 'comment']);
+    expect(parseRedTeamGateMarker(calls[1][1].body)).toMatchObject({ outcome: 'card-queued', classCards: [1] });
+    const read = (findingClasses) => readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses }, env: {} });
+    expect(read({ 'theoretical-race': 'defer-card' })).toMatchObject({ sendBack: [], held: [] });
+    expect(read({ 'theoretical-race': 'fix-now' }).sendBack).toHaveLength(1);
+  });
+  it('an ordinary-policy card carries no class= and survives a policy flip', async () => {
+    const comments = [comment([F({ impactIfUnfixed: 'degraded', findingClass: 'live-reproduced', classBasis: 'seen' })])];
+    const { io, calls } = fakeIo({ comments });
+    await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(kinds(calls)).toEqual(['card', 'comment']);
+    expect(parseRedTeamGateMarker(calls[1][1].body).classCards).toBeUndefined();
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { ...CONFIRMED_BREAKS_DEFAULTS, degraded: 'send-back' }, env: {} }))
+      .toMatchObject({ sendBack: [], held: [] });
+  });
+});
+
+describe('pickSendBackError — the most informative send-back failure line', () => {
+  it('returns the error line, not a trailing git-transport warning', () => {
+    const stderr = 'error: label refused by policy\ngit-transport-branch: WARNING dirty stranded worktree wt-1; left untouched\n';
+    expect(pickSendBackError(stderr, '', 1)).toBe('error: label refused by policy');
+  });
+  it('falls back to stdout, then exit N, when stderr holds only warnings', () => {
+    const warn = 'warning: something\n(node:1) [DEP0040] DeprecationWarning: x\n(Use `node --trace-deprecation ...` to show where)';
+    expect(pickSendBackError(warn, 'plain stdout detail', 1)).toBe('plain stdout detail');
+    expect(pickSendBackError(warn, '', 3)).toBe('exit 3');
+  });
+  it('returns exit N when nothing was written', () => {
+    expect(pickSendBackError('', '', 7)).toBe('exit 7');
+    expect(pickSendBackError(undefined, undefined, 2)).toBe('exit 2');
+  });
+  it('never drops a line containing error, even with a warning prefix, and caps length', () => {
+    expect(pickSendBackError('warning: error while pushing\nhint: retry', '', 1)).toBe('warning: error while pushing');
+    expect(pickSendBackError('x'.repeat(500), '', 1).length).toBeLessThanOrEqual(300);
   });
 });

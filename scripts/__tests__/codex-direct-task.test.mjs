@@ -7,13 +7,15 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
@@ -27,6 +29,7 @@ import {
   CODEX_EFFORT_MAP,
   CODEX_MODEL,
   CODEX_TIER_EFFORT,
+  cleanupScratchClone, createScratchGuard,
   resolveCodexEffort,
   resolveCodexHome,
   findRolloutFile,
@@ -76,6 +79,28 @@ describe('defaultExecFn — real child-process output buffering', () => {
 });
 
 describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mode', () => {
+  it('omits the schema on resume in the builder while retaining schema validation', () => {
+    const options = { cwd: '/lane', resumeThreadId: 'thread-123', outputSchemaFile: 'seat.schema.json' };
+    const argv = buildCodexDirectTaskArgv(options);
+    expect(argv).not.toContain('--output-schema');
+    expect(argv).not.toContain(options.outputSchemaFile);
+    expect(argv.slice(-3)).toEqual(['resume', options.resumeThreadId, '-']);
+    for (const outputSchemaFile of ['', ' ', null, 3]) {
+      expect(() => buildCodexDirectTaskArgv({ ...options, outputSchemaFile })).toThrow(/outputSchemaFile/);
+    }
+  });
+  it('rejects a null resume thread as before (never an initial turn)', () => {
+    expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: null, outputSchemaFile: 'seat.schema.json' })).toThrow(/resumeThreadId/);
+  });
+  it('optionally forwards the schema file as a separate argv value without changing defaults', () => {
+    const outputSchemaFile = 'task with spaces.schema.json';
+    const argv = buildCodexDirectTaskArgv({ cwd: '/lane', review: true, outputSchemaFile });
+    expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
+    expect(buildCodexDirectTaskArgv({ cwd: '/lane' })).not.toContain('--output-schema');
+    for (const value of ['', ' ', null, 42]) {
+      expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', outputSchemaFile: value })).toThrow(/outputSchemaFile/);
+    }
+  });
   it('#4665 encodes exact edit roots and temp environment without shell interpolation', () => {
     const roots = ['/lane/.git', '/pool/.admission/heavy', '/tmp/a "quoted" \\ root'];
     const argv = buildCodexDirectTaskArgv({ cwd: '/lane', writableRoots: roots, tempRoot: roots[2] });
@@ -875,6 +900,25 @@ describe('runGate — none/standards/full, never commits', () => {
     expect(execFn).not.toHaveBeenCalled();
   });
 
+  it('standards gate goes through heavy-admission when the wrapper exists, direct when absent', () => {
+    const execFn = vi.fn(() => 'ok');
+    const wrapped = runGate({ dir: '/d', mode: 'standards', execFn, env: {}, existsFn: () => true });
+    expect(wrapped.steps[0].cmd).toBe('node scripts/readiness/heavy-admission.mjs run -- npm run check:standards');
+    const direct = runGate({ dir: '/d', mode: 'standards', execFn, env: {}, existsFn: () => false });
+    expect(direct.steps[0].cmd).toBe('npm run check:standards');
+    const held = runGate({ dir: '/d', mode: 'standards', execFn, env: { WE_HEAVY_ADMISSION_HELD: '1' }, existsFn: () => true });
+    expect(held.steps[0].cmd).toBe('npm run check:standards');
+  });
+
+  it('wrapped gate keeps failing, and exit 124 is gate-unconfirmed, never a pass', () => {
+    const fail = (status) => () => { throw Object.assign(new Error('x'), { status }); };
+    const r1 = runGate({ dir: '/d', mode: 'standards', execFn: fail(1), env: {}, existsFn: () => true });
+    expect(r1).toMatchObject({ pass: false });
+    expect(r1.unavailable).toBeUndefined();
+    const r124 = runGate({ dir: '/d', mode: 'standards', execFn: fail(124), env: {}, existsFn: () => true });
+    expect(r124).toMatchObject({ pass: false, unavailable: 'gate-unconfirmed' });
+  });
+
   it('mode "standards" runs only check:standards', () => {
     const execFn = vi.fn(() => 'ok');
     const r = runGate({ dir: '/d', mode: 'standards', execFn });
@@ -924,9 +968,11 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     return { fn, seen };
   }
 
-  it('awaits the async gate again after a self-review repair', async () => {
+  it('awaits the async gate again after a self-review repair and omits the output schema on resume', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-regate-'));
-    const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const { fn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const spawnFn = vi.fn(fn);
+    const outputSchemaFile = join(dir, 'seat.schema.json');
     const gateExecFn = vi.fn(async () => 'gate output');
     const selfReviewFn = vi.fn().mockResolvedValueOnce(['repair fixture']).mockResolvedValueOnce([]);
     const execFn = (bin, args) => {
@@ -935,11 +981,17 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     };
     try {
       const report = await codexDirectTask({ task: 'fixture', dir, gate: 'standards', selfReview: true,
-        stream: false, log: false, execFn, gateExecFn, spawnFn, selfReviewFn,
+        stream: false, log: false, execFn, gateExecFn, spawnFn, selfReviewFn, outputSchemaFile,
         readQuotaFn: () => ({ quota: null, rolloutFile: null }) });
       expect(gateExecFn).toHaveBeenCalledTimes(2);
       expect(report.selfReview.rounds).toBe(1);
       expect(report.gate).toMatchObject({ pass: true, steps: [{ output: 'gate output' }] });
+      expect(spawnFn).toHaveBeenCalledTimes(2);
+      const [initial, resumed] = spawnFn.mock.calls.map(([, argv]) => argv);
+      expect(initial.slice(initial.indexOf('--output-schema'), initial.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
+      expect(resumed).toContain('resume');
+      expect(resumed).toContain('builder');
+      expect(resumed).not.toContain('--output-schema');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1018,9 +1070,9 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(flagValue(seen.argv, '-o')).toBe(join(gitDir, 'codex-direct-task-last-message.txt'));
       const roots = JSON.parse(seen.argv.find((v) => v.startsWith('sandbox_workspace_write.writable_roots=')).split('=').slice(1).join('='));
       expect(roots[0]).toBe(gitDir);
-      expect(roots[2]).toBe(seen.opts.env.TMPDIR);
-      expect(statSync(roots[2]).isDirectory()).toBe(true);
-      rmSync(roots[2], { recursive: true, force: true });
+      expect(roots[3]).toBe(seen.opts.env.TMPDIR);
+      expect(statSync(roots[3]).isDirectory()).toBe(true);
+      rmSync(roots[3], { recursive: true, force: true });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1048,9 +1100,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
     const { fn, seen } = fakeSpawn(stdout);
     try {
-      const r = await runCodexDirectExec({ dir, task: 'do the thing', logFile, stream: false, spawnFn: fn });
+      const outputSchemaFile = join(dir, 'seat.schema.json');
+      const r = await runCodexDirectExec({ dir, task: 'do the thing', outputSchemaFile, logFile, stream: false, spawnFn: fn });
       expect(seen.cli).toBe(CODEX_CLI);
-      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
+      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
       expect(seen.stdin).toContain('do the thing');
       expect(seen.stdin).toMatch(/do not run `git commit`/);
       expect(r.stdout).toBe(stdout);
@@ -1134,7 +1187,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(Date.now() - started).toBeLessThan(300 + 2000);
       const pid = Number(readFileSync(pidFile, 'utf8'));
       await new Promise(resolveWait => setTimeout(resolveWait, 200));
-      expect(() => process.kill(pid, 0)).toThrow();
+      // Its parent exited, so a Linux subreaper (Forge's runner supervisor) may hold the killed straggler as an
+      // unreaped zombie, where kill(pid, 0) still succeeds. Dead means gone or zombie; unreadable is not dead.
+      const { pidIdentity } = await import('../lib/pid-alive.mjs');
+      expect(pidIdentity(pid)).toMatchObject({ alive: false });
     } finally {
       try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
       rmSync(dir, { recursive: true, force: true });
@@ -1162,8 +1218,38 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
           expect(statSync(root).isDirectory()).toBe(true);
           expect(seen.opts.env).toMatchObject({ LANE_POOL_ROOT: env.LANE_POOL_ROOT, TMP: root, TEMP: root });
           expect(seen.argv).toContain('sandbox_workspace_write.network_access=true');
-          expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission', 'heavy'), root])}`);
+          expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission', 'heavy'), join(env.LANE_POOL_ROOT, '.admission', 'remote'), root])}`);
           expect(seen.argv).toContain(`shell_environment_policy.set.TMPDIR=${JSON.stringify(root)}`);
+        }
+      }
+    } finally {
+      for (const root of allocated) rmSync(root, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('R295 lets edit runs reach the remote admission root heavy-admission derives, never review runs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-remote-admission-test-'));
+    weCheckout(dir);
+    const env = { ...process.env, LANE_POOL_ROOT: join(dir, 'pool') };
+    const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+    const heavyRoot = admissionLockRoot(dir, env);
+    const remoteRoot = join(dirname(heavyRoot), 'remote');
+    const allocated = [];
+    try {
+      for (const review of [false, true]) {
+        const { fn: spawnFn, seen } = fakeSpawn('{}\n');
+        await codexDirectTask({ dir, task: 't', review, env, execFn, spawnFn, stream: false });
+        const encoded = seen.argv.find((v) => v.startsWith('sandbox_workspace_write.writable_roots='));
+        if (review) {
+          expect(encoded).toBeUndefined();
+          expect(seen.argv.join('\n')).not.toContain(remoteRoot);
+        } else {
+          allocated.push(seen.opts.env.TMPDIR);
+          const roots = JSON.parse(encoded.split('=').slice(1).join('='));
+          expect(roots).toContain(heavyRoot);
+          expect(roots).toContain(remoteRoot);
+          expect(remoteRoot).toBe(join(env.LANE_POOL_ROOT, '.admission', 'remote'));
         }
       }
     } finally {
@@ -1489,6 +1575,46 @@ describe('direct task routes', () => {
 
 
 describe('direct CLI flags reach the actual spawn and JSON result', () => {
+  it.each(['--task', '--task-file'])('%s records the brief metadata and threads the schema through the task and exec spawn as a resolved path', taskFlag => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-schema-'));
+    const argvFile = join(dir, 'spawn-argv.json');
+    const task = `  Review café\n${'brief text '.repeat(30)}\n`;
+    const taskFile = join(dir, 'brief.txt');
+    writeFileSync(taskFile, task);
+    const taskArg = taskFlag === '--task-file' ? `${taskFlag}=${relative(process.cwd(), taskFile)}` : `${taskFlag}=${task}`;
+    const schemaFile = 'seat schema.json';
+    const preload = `import cp from 'node:child_process';
+      import { writeFileSync } from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
+      cp.spawn = (_bin, argv) => {
+        writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        child.stdin = { on() {}, end() { setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'turn.completed' }) + '\\n'));
+          child.emit('close', 0);
+        }, 0); } };
+        child.kill = () => {};
+        return child;
+      };
+      syncBuiltinESMExports();`;
+    try {
+      const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', taskArg, `--dir=${dir}`, `--output-schema-file=${schemaFile}`,
+        '--json', '--no-stream', '--review'], { encoding: 'utf8' });
+      const argv = JSON.parse(readFileSync(argvFile, 'utf8'));
+      expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', resolve(schemaFile)]);
+      expect(JSON.parse(stdout).argv).toEqual(argv);
+      expect(JSON.parse(stdout)).toMatchObject({
+        taskFile: taskFlag === '--task-file' ? resolve(taskFile) : null,
+        taskSha256: createHash('sha256').update(task).digest('hex'),
+        taskHead: task.slice(0, 200),
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([
     [['--task-kind=fix'], 'fix', 'gpt-6.1-sol', 'high', 'tool', 'tool'],
     [['--task-kind=prepare', '--size=8'], 'prepare-complex', 'gpt-6-astra', 'high', 'tool', 'tool'],
@@ -1585,6 +1711,24 @@ describe('detached jobs', () => {
   beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'codex-jobs-test-')); });
   afterEach(() => { rmSync(jobsDir, { recursive: true, force: true }); });
 
+  it('reads legacy job records without brief metadata', () => {
+    const record = { id: 'legacy', pid: 123, status: 'done', exitCode: 0, resultPath: 'legacy.result.json' };
+    writeJobRecord(record, { jobsDir });
+    expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+  });
+
+  it.each([
+    { taskFile: 123 },
+    { taskSha256: 'not-a-sha256' },
+    { taskSha256: 123 },
+    { taskHead: 123 },
+    { taskHead: 'x'.repeat(201) },
+  ])('rejects malformed persisted brief metadata %j', metadata => {
+    writeJobRecord({ id: 'bad-brief', pid: 123, status: 'done', exitCode: 0,
+      resultPath: 'bad-brief.result.json', ...metadata }, { jobsDir });
+    expect(() => readJobRecord('bad-brief', { jobsDir })).toThrow('incomplete job record');
+  });
+
   function fixture({ pid = 123 } = {}) {
     let time = 0;
     let record = { id: 'test-job', pid, status: 'running', startedAt: new Date(0).toISOString(),
@@ -1606,6 +1750,48 @@ describe('detached jobs', () => {
     f.child.emit('exit', 0);
     expect(await waitForJob(f.options)).toEqual({ status: 'done', exitCode: 0, resultPath: 'test-job.result.json', code: 0 });
     expect(f.sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['stat=', 'ETIMEDOUT'], ['stat=', 'EPERM'],
+    ['lstart=', 'ETIMEDOUT'], ['lstart=', 'EPERM'],
+  ])('wait CLI distinguishes %s/%s probe errors from a live detached worker failure, then recovers the same job after exit', async (probe, errorCode) => {
+    const worker = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 10000 })], {
+      detached: true, stdio: 'ignore',
+    });
+    const exited = new Promise(resolveExit => worker.once('exit', resolveExit));
+    try {
+      await new Promise((resolveSpawn, reject) => { worker.once('spawn', resolveSpawn); worker.once('error', reject); });
+      const record = { id: 'probe-error', pid: worker.pid, pidStart: 'fixture-start', status: 'running', exitCode: null, resultPath: 'result.json' };
+      writeJobRecord(record, { jobsDir });
+      const preload = `import cp from 'node:child_process';
+        import { syncBuiltinESMExports } from 'node:module';
+        const exec = cp.execFileSync;
+        cp.execFileSync = (bin, args, ...rest) => {
+          if (bin === 'ps' && args.includes('${probe}')) throw Object.assign(new Error('probe unavailable'), { code: '${errorCode}' });
+          if (bin === 'ps' && args.includes('stat=')) return 'S';
+          return exec(bin, args, ...rest);
+        };
+        syncBuiltinESMExports();`;
+      const wait = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', 'wait', `--job=${record.id}`, '--wait=1000'], {
+        env: { ...process.env, CODEX_JOBS_DIR: jobsDir }, encoding: 'utf8', timeout: 4000,
+      });
+      expect(wait.status, wait.stderr).toBe(2);
+      const result = JSON.parse(wait.stdout);
+      // Observe the real CLI and PID before asserting the distinguishing status.
+      expect(() => process.kill(worker.pid, 0)).not.toThrow();
+      expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+      expect(result).toEqual({ status: 'wait-error', exitCode: null, resultPath: record.resultPath });
+      worker.kill('SIGKILL');
+      await exited;
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+        .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+      expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
+    } finally {
+      worker.kill('SIGKILL');
+      await exited;
+    }
   });
 
   it.each([0, 20, 100, 249, 249.9, 'abc', -1, NaN, Infinity, ''])('rejects invalid maxMs=%s before any IO in the exported wait', async maxMs => {
@@ -1665,6 +1851,49 @@ describe('detached jobs', () => {
     expect(child.status, child.stderr).toBe(0);
     expect(child.stderr).toBe('');
     expect(JSON.parse(child.stdout)).toEqual({ status: 'done', exitCode: 0, resultPath: record.resultPath });
+  });
+
+  it.each([['--job=aliased', '--wait=150000'], ['--id=aliased', '--wait=250'], ['--id=aliased', '--max-ms=250']])(
+    'wait CLI accepts %s %s (short-call alias for agent callers) and reports a completed job', (idFlag, waitFlag) => {
+    const record = { id: 'aliased', pid: process.pid, status: 'done', exitCode: 0, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', idFlag, waitFlag], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024, env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'done', exitCode: 0, resultPath: record.resultPath });
+  });
+
+  it('wait CLI rejects a --wait below 250 as a usage error like --max-ms', () => {
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', '--job=x', '--wait=20'], {
+      encoding: 'utf8', timeout: 4000, env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.status).toBe(2);
+  });
+
+  it.each([250, 150000])('wait CLI uses --wait=%s as the actual job IO deadline', waitMs => {
+    // A completed record cannot expose an ignored alias. Stall a real CLI read
+    // and inspect the timer it arms, using a fixed clock to avoid host jitter.
+    const preload = `
+      import fs from 'node:fs/promises';
+      const readFile = fs.readFile;
+      fs.readFile = (...args) => String(args[0]).endsWith('/blocked.json')
+        ? new Promise(() => {}) : readFile(...args);
+      Date.now = () => 1000000;
+      const timer = globalThis.setTimeout;
+      globalThis.setTimeout = (callback, ms, ...args) => {
+        process.stderr.write('deadline-ms=' + ms + '\\n');
+        return timer(callback, 0, ...args);
+      };`;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      'scripts/codex-direct-task.mjs', 'wait', '--job=blocked', `--wait=${waitMs}`], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(75);
+    expect(child.stderr).toBe(`deadline-ms=${waitMs}\n`);
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'running', exitCode: null, resultPath: null });
   });
 
   it('bounds a never-resolving reader by the requested 250 ms deadline', async () => {
@@ -1851,7 +2080,8 @@ describe('detached jobs', () => {
     const record = { id: 'ps-state-hung', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
     const isAlive = rec => jobIsAlive(rec, { readState: () => { throw new Error('ps timed out'); } });
-    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 })).toMatchObject({ code: 2 });
+    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 }))
+      .toMatchObject({ status: 'wait-error', exitCode: null, code: 2 });
     expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
   });
 
@@ -1888,7 +2118,8 @@ describe('detached jobs', () => {
       exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
     const isAlive = rec => jobIsAlive(rec, { readStart: () => { throw new Error('ps timed out'); } });
-    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 })).toMatchObject({ code: 2 });
+    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 }))
+      .toMatchObject({ status: 'wait-error', exitCode: null, code: 2 });
     expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
   });
 
@@ -1947,21 +2178,52 @@ describe('detached jobs', () => {
     }
   });
 
+  it('a budget timer that fires before the clock reaches the deadline still stops a settling write from renaming', async () => {
+    // Timers can fire ~1ms before Date.now() reaches the deadline. A frozen clock models that: the budget
+    // timer fires (real 250ms) while now() never reaches the deadline, so only the timer says "spent".
+    const record = { id: 'early-timer', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    let settleWrite;
+    const write = vi.spyOn(fsPromises, 'writeFile').mockImplementation(() => new Promise(resolveWrite => { settleWrite = resolveWrite; }));
+    const rename = vi.spyOn(fsPromises, 'rename');
+    const rm = vi.spyOn(fsPromises, 'rm');
+    try {
+      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250, now: () => 1_000 }))
+        .toMatchObject({ status: 'running', code: 75 });
+      settleWrite();
+      await vi.waitFor(() => expect(rm).toHaveBeenCalledWith(write.mock.calls[0][0], { force: true }));
+      expect(rename).not.toHaveBeenCalled();
+      expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+    } finally {
+      settleWrite?.();
+      write.mockRestore();
+      rename.mockRestore();
+      rm.mockRestore();
+    }
+  });
+
   it('returns at the deadline during stuck tmp removal', async () => {
     const record = { id: 'stuck-cleanup', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
     let finishCleanup;
     const gate = new Promise(resolveCleanup => { finishCleanup = resolveCleanup; });
     const originalRm = fsPromises.rm;
+    // A frozen clock keeps the budget from being spent by real IO on a loaded host (the read, write and
+    // rename must all finish before the removal starts); it moves past the deadline only once the stuck
+    // removal begins, so the wait must return at that deadline while the removal is still pending.
+    let clock = 0;
+    let removalSettled = false;
     const rm = vi.spyOn(fsPromises, 'rm').mockImplementation(async (...args) => {
+      clock += 1000;
       await gate;
-      return originalRm(...args);
+      const removed = await originalRm(...args);
+      removalSettled = true;
+      return removed;
     });
-    const started = performance.now();
     try {
-      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250 }))
+      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250, now: () => clock }))
         .toMatchObject({ status: 'running', code: 75 });
-      expect(performance.now() - started).toBeLessThan(300);
+      expect(removalSettled).toBe(false);
       expect(rm).toHaveBeenCalledOnce();
       expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
     } finally {
@@ -1986,7 +2248,7 @@ describe('detached jobs', () => {
     expect(f.sleep).toHaveBeenCalledOnce();
   });
 
-  it.each([7, 0, null])('failed: propagates exit code %s with fallback 1', async exitCode => {
+  it.each([2, 7, 0, null])('failed: propagates exit code %s with fallback 1', async exitCode => {
     const f = fixture();
     f.child.emit('exit', exitCode);
     // A failed record with a legacy zero code must never report success.
@@ -2078,7 +2340,7 @@ describe('detached jobs', () => {
   it.each([
     ['EPERM', 'running', null, 75],
     ['ESRCH', 'failed', 1, 1],
-    ['EIO', 'failed', null, 2],
+    ['EIO', 'wait-error', null, 2],
   ])('default PID probe receiving %s returns %s with code %s/%s', async (errorCode, status, exitCode, code) => {
     // A real, live, non-zombie PID: the default state probe runs real ps after an EPERM, so a made-up PID
     // would (correctly) read as gone.
@@ -2103,7 +2365,7 @@ describe('detached jobs', () => {
     ['done', 0, { status: 'done', exitCode: 0, resultPath: 'result.json', code: 0 }],
     ['failed', 23, { status: 'failed', exitCode: 23, resultPath: 'result.json', code: 23 }],
     ['running', null, { status: 'running', exitCode: null, resultPath: 'result.json', code: 75 }],
-    ['missing', null, { status: 'failed', exitCode: null, resultPath: null, code: 2 }],
+    ['missing', null, { status: 'wait-error', exitCode: null, resultPath: null, code: 2 }],
   ])('max-ms=250 reports a %s job through the default async reader within the requested deadline', async (status, exitCode, expected) => {
     const record = { id: 'minimum-budget', pid: process.pid, status, exitCode, resultPath: 'result.json' };
     if (status !== 'missing') writeJobRecord(record, { jobsDir });
@@ -2169,7 +2431,7 @@ describe('detached jobs', () => {
       await vi.advanceTimersByTimeAsync(1);
       await waiting;
       expect(result).toEqual(status === 'missing'
-        ? { status: 'failed', exitCode: null, resultPath: null, code: 2 }
+        ? { status: 'wait-error', exitCode: null, resultPath: null, code: 2 }
         : { status, exitCode: status === 'done' ? 0 : 23, resultPath: 'test-job.result.json', code: status === 'done' ? 0 : 23 });
       expect(readRecord).toHaveBeenCalledOnce();
       expect(isAlive).not.toHaveBeenCalled();
@@ -2287,10 +2549,19 @@ describe('detached jobs', () => {
         maxMs: ${maxMs}, isAlive: () => false });
       process.stdout.write(JSON.stringify(result));
       process.exit(result.code);`;
-    const child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
-      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
-    });
+    // Exit 75 is the documented "wait again" signal: on a loaded CI host a cold child can spend its
+    // whole 250 ms budget on real IO before the dead-PID probe settles (red main @ d56edc4bd, shard 8).
+    // Honour that contract with a bounded re-wait. Every attempt keeps the sync-fs guard armed (a
+    // synchronous call still throws and exits 1 with a different result), and 75 never writes the record.
+    let child;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
+        encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+      });
+      if (child.status !== 75) break;
+      expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
+    }
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(1);
     expect(JSON.parse(child.stdout)).toEqual({ status: 'failed', exitCode: 1, resultPath: record.resultPath, code: 1 });
@@ -2354,7 +2625,7 @@ describe('detached jobs', () => {
       await vi.advanceTimersByTimeAsync(250);
       expect(await waiting).toMatchObject(outcome === 'timeout'
         ? { status: 'running', exitCode: null, code: 75 }
-        : { status: 'failed', exitCode: null, code: 2 });
+        : { status: 'wait-error', exitCode: null, code: 2 });
       expect(readRecord).toHaveBeenCalledTimes(2);
       expect(f.writeRecord).not.toHaveBeenCalled();
       if (outcome === 'timeout') {
@@ -2395,7 +2666,7 @@ describe('detached jobs', () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, maxMs: 250, now: Date.now, sleep: undefined,
       isAlive: () => false, [operation]: async () => { throw new Error('IO unavailable'); },
-    })).toMatchObject({ status: 'failed', exitCode: null, code: 2 });
+    })).toMatchObject({ status: 'wait-error', exitCode: null, code: 2 });
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
@@ -2403,7 +2674,7 @@ describe('detached jobs', () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, isAlive: () => false,
       updateRecord: () => { throw new Error('record unreadable'); },
-    })).toMatchObject({ status: 'failed', code: 2 });
+    })).toMatchObject({ status: 'wait-error', code: 2 });
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
@@ -2448,7 +2719,7 @@ describe('detached jobs', () => {
   it.each([250, undefined])('unknown and unreadable jobs fail closed with exit 2 at maxMs=%s', async maxMs => {
     for (const jobId of ['missing', '../escape', undefined]) {
       expect(await waitForJob({ jobId, jobsDir, maxMs }))
-        .toEqual({ status: 'failed', exitCode: null, resultPath: null, code: 2 });
+        .toEqual({ status: 'wait-error', exitCode: null, resultPath: null, code: 2 });
     }
     writeFileSync(join(jobsDir, 'broken.json'), '{');
     expect(await waitForJob({ jobId: 'broken', jobsDir, maxMs })).toMatchObject({ code: 2 });
@@ -2470,7 +2741,8 @@ describe('detached jobs', () => {
       nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {}, readStart });
     expect(readStart).toHaveBeenCalledWith(321);
     expect(job).toEqual({ id: '0-random', pid: 321, pidStart: 'Fri Oct 23 20:10:13 2026', status: 'running', startedAt: new Date(0).toISOString(),
-      resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json') });
+      resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json'),
+      taskFile: null, taskSha256: createHash('sha256').update('literal $(no-shell)').digest('hex'), taskHead: 'literal $(no-shell)' });
     const { recordPath, ...record } = job;
     expect(readJobRecord(job.id, { jobsDir })).toEqual(record);
     expect(child.unref).toHaveBeenCalledOnce();
@@ -2492,10 +2764,19 @@ describe('detached jobs', () => {
     { flags: [], runCode: 7 },
     { flags: [], runCode: 0, install: 'ci' },
     { flags: [], runCode: 0, install: 'install' },
-  ])('detached CLI writes one JSON report and logs events with $flags and exit $runCode and install $install', async ({ flags, runCode, install }) => {
+    { flags: [], runCode: 0, taskFromFile: true },
+  ])('detached CLI records brief metadata, writes one JSON report and logs events with $flags and exit $runCode and install $install and taskFromFile $taskFromFile', async ({ flags, runCode, install, taskFromFile }) => {
     const preload = join(jobsDir, 'result-preload.mjs');
     const logFile = join(jobsDir, 'events.jsonl');
     const installed = join(jobsDir, 'installed');
+    const task = `  Detached café\n${'brief text '.repeat(30)}\n`;
+    const taskFile = join(jobsDir, 'brief.txt');
+    writeFileSync(taskFile, task);
+    const metadata = {
+      taskFile: taskFromFile ? resolve(taskFile) : null,
+      taskSha256: createHash('sha256').update(task).digest('hex'),
+      taskHead: task.slice(0, 200),
+    };
     writeFileSync(preload, `
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
@@ -2536,7 +2817,7 @@ describe('detached jobs', () => {
       syncBuiltinESMExports();
     `);
     const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
-      '--task=fixture', ...(install ? [`--repo-root=${jobsDir}`] : [`--dir=${jobsDir}`]),
+      taskFromFile ? `--task-file=${taskFile}` : `--task=${task}`, ...(install ? [`--repo-root=${jobsDir}`] : [`--dir=${jobsDir}`]),
       '--gate=none', '--no-self-review', `--log=${logFile}`, ...flags], {
       encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
       env: { ...process.env, CODEX_JOBS_DIR: jobsDir, NODE_OPTIONS: `--import=${preload}` },
@@ -2545,14 +2826,19 @@ describe('detached jobs', () => {
     expect(launcher.status, launcher.stderr).toBe(0);
     const job = readJobRecord(JSON.parse(launcher.stdout).id, { jobsDir });
     try {
-      expect(await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000 })).toMatchObject({
+      // The launcher never reads a --task-file; the worker fills sha/head in once it starts.
+      expect(job).toMatchObject(taskFromFile ? { taskFile: metadata.taskFile } : metadata);
+      const outcome = await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000 });
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({
         status: runCode === 0 ? 'done' : 'failed', exitCode: runCode, code: runCode,
       });
       expect(readFileSync(logFile, 'utf8')).toContain('{"type":"turn.completed"}');
       const result = JSON.parse(readFileSync(job.resultPath, 'utf8'));
       expect(result).toMatchObject({
         exitCode: runCode, events: { terminal: 'turn.completed' },
+        ...metadata,
       });
+      expect(readJobRecord(job.id, { jobsDir })).toMatchObject(metadata);
       if (install) {
         expect(result.scratch.depsInstall.args).toEqual([install]);
         expect(readFileSync(installed, 'utf8')).toBe('installed');
@@ -2754,6 +3040,7 @@ describe('detached jobs', () => {
       expect(elapsed).toBeLessThan(4000);
       const running = readJobRecord(job.id, { jobsDir });
       expect(running).toMatchObject({ status: 'running', exitCode: null });
+      expect(running).toMatchObject({ taskFile: join(jobsDir, 'nonexistent-task.txt'), taskSha256: null, taskHead: null });
       expect(() => process.kill(running.pid, 0)).not.toThrow();
       const waiter = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait',
         `--job=${job.id}`, '--max-ms=20000'], { ...options, timeout: 25000 });
@@ -3022,5 +3309,580 @@ describe('detached jobs', () => {
     expect(fsDeps.renameSync).toHaveBeenCalledWith(temp, join(jobsDir, 'atomic.json'));
     writeJobRecord(record, { jobsDir });
     expect(readJobRecord('atomic', { jobsDir })).toEqual(record);
+  });
+});
+
+describe('R731 slice 1 — a scratch clone is deleted only when it is clean', () => {
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const roots = [];
+  function makeClone() {
+    const root = mkdtempSync(join(tmpdir(), 'we-r731-'));
+    roots.push(root);
+    const dir = join(root, 'clone');
+    mkdirSync(dir);
+    git(dir, 'init', '-q');
+    git(dir, 'config', 'user.email', 't@example.com');
+    git(dir, 'config', 'user.name', 't');
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    git(dir, 'add', 'a.txt');
+    git(dir, 'commit', '-q', '-m', 'init');
+    return { root, dir, sha: git(dir, 'rev-parse', 'HEAD').trim() };
+  }
+  afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+
+  it('a clean clone is deleted', () => {
+    const { dir, sha } = makeClone();
+    const r = cleanupScratchClone({ dir, startSha: sha });
+    expect(r.removed).toBe(true);
+    expect(() => statSync(dir)).toThrow();
+  });
+
+  it('an untracked file keeps the clone and reports its path', () => {
+    const { dir, sha } = makeClone();
+    writeFileSync(join(dir, 'new.bin'), Buffer.from([0, 1, 2, 255]));
+    const r = cleanupScratchClone({ dir, startSha: sha });
+    expect(r.removed).toBe(false);
+    expect(r.path).toBe(dir);
+    expect(statSync(join(dir, 'new.bin')).isFile()).toBe(true);
+  });
+
+  it('a modified tracked file keeps the clone', () => {
+    const { dir, sha } = makeClone();
+    writeFileSync(join(dir, 'a.txt'), 'two\n');
+    expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('two\n');
+  });
+
+  it('a mode-only change keeps the clone', () => {
+    const { dir, sha } = makeClone();
+    git(dir, 'config', 'core.fileMode', 'true');
+    execFileSync('chmod', ['+x', join(dir, 'a.txt')]);
+    expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+  });
+
+  describe('clone config that would make `git status` blind to a real edit (the clone is writable by Codex)', () => {
+    it('a mode-only change keeps the clone when core.fileMode=false hides it from status', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'config', 'core.fileMode', 'false');
+      execFileSync('chmod', ['+x', join(dir, 'a.txt')]);
+      // the premise: status run with the clone's own config sees nothing
+      expect(git(dir, 'status', '--porcelain', '--untracked-files=all').trim()).toBe('');
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(r.reason).toBe('uncommitted changes');
+      expect(statSync(join(dir, 'a.txt')).mode & 0o111).not.toBe(0);
+    });
+
+    it('a clean clone is still deleted with core.fileMode=false (the pin does not over-keep)', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'config', 'core.fileMode', 'false');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(true);
+    });
+  });
+
+  it('a commit made after the start sha keeps the clone even though status is empty', () => {
+    const { dir, sha } = makeClone();
+    writeFileSync(join(dir, 'a.txt'), 'three\n');
+    git(dir, 'commit', '-q', '-am', 'extra');
+    expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+  });
+
+  it('fails closed: no recorded baseline commit keeps even a clean clone', () => {
+    const { dir } = makeClone();
+    expect(cleanupScratchClone({ dir }).removed).toBe(false);
+    expect(statSync(dir).isDirectory()).toBe(true);
+  });
+
+  it('a signal before the baseline is recorded keeps the clone (setup phase)', () => {
+    const { dir } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir);
+    proc.emit('SIGTERM');
+    expect(statSync(dir).isDirectory()).toBe(true);
+  });
+
+  it('fails closed: an unreadable status keeps the clone', () => {
+    const rm = vi.fn();
+    const r = cleanupScratchClone({ dir: '/nonexistent/clone', startSha: 'x', execFn: () => { throw new Error('boom'); }, rmFn: rm });
+    expect(r.removed).toBe(false);
+    expect(rm).not.toHaveBeenCalled();
+  });
+
+  it('writes no patch file anywhere for a dirty clone', () => {
+    const { root, dir, sha } = makeClone();
+    writeFileSync(join(dir, 'a.txt'), 'two\n');
+    cleanupScratchClone({ dir, startSha: sha });
+    const leftovers = execFileSync('find', [root, '-name', '*.patch', '-o', '-name', '*.diff'], { encoding: 'utf8' }).trim();
+    expect(leftovers).toBe('');
+  });
+
+  it('a signal during the run keeps even a clean clone and removes its listeners', () => {
+    const { dir, sha } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir, sha);
+    proc.emit('SIGTERM');
+    expect(statSync(dir).isDirectory()).toBe(true);
+    expect(proc.listenerCount('SIGTERM')).toBe(0);
+    expect(proc.listenerCount('SIGINT')).toBe(0);
+  });
+
+  it('signal cleanup keeps the clone and reports its path', () => {
+    const { dir, sha } = makeClone();
+    for (const sig of ['SIGINT', 'SIGTERM']) {
+      const rm = vi.fn();
+      const written = [];
+      const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => { written.push(String(chunk)); return true; });
+      try {
+        // A live worker stand-in: its own signal listener (the real worker kill) is registered and still running.
+        const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+        const workerKill = vi.fn();
+        proc.on(sig, workerKill);
+        const guard = createScratchGuard({ proc, rmFn: rm });
+        guard.arm(dir, sha);
+        proc.emit(sig);
+        expect(workerKill).toHaveBeenCalledTimes(1);
+        expect(rm).not.toHaveBeenCalled();
+        expect(statSync(dir).isDirectory()).toBe(true);
+        expect(written.join('')).toContain(`scratch clone KEPT (interrupted by signal): ${dir}`);
+      } finally { spy.mockRestore(); }
+    }
+  });
+
+  it('finish() after a signal still keeps a clean clone (the KEPT line stays true)', () => {
+    const { dir, sha } = makeClone();
+    const rm = vi.fn();
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      // A host that embeds the run with its own non-exiting signal listener keeps the run alive past the signal.
+      const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+      proc.on('SIGINT', () => {});
+      const guard = createScratchGuard({ proc, rmFn: rm });
+      guard.arm(dir, sha);
+      proc.emit('SIGINT');
+      const r = guard.finish();
+      expect(r).toMatchObject({ removed: false, path: dir, reason: 'interrupted by signal' });
+      expect(rm).not.toHaveBeenCalled();
+      expect(statSync(dir).isDirectory()).toBe(true);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('a signal during the run keeps a dirty clone', () => {
+    const { dir, sha } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir, sha);
+    writeFileSync(join(dir, 'a.txt'), 'edited\n');
+    proc.emit('SIGINT');
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('edited\n');
+  });
+
+  it('finish() removes the listeners and applies the rule once', () => {
+    const { dir, sha } = makeClone();
+    const proc = new EventEmitter();
+    const guard = createScratchGuard({ proc });
+    guard.arm(dir, sha);
+    writeFileSync(join(dir, 'u.txt'), 'x');
+    const r = guard.finish();
+    expect(r.removed).toBe(false);
+    expect(proc.listenerCount('SIGTERM')).toBe(0);
+    expect(guard.finish()).toEqual(r);
+  });
+
+  it('finish() applies the cleanup rule exactly once: a second call runs no git commands', () => {
+    const { dir, sha } = makeClone();
+    const calls = [];
+    const execFn = (bin, args, opts) => { calls.push(args); return execFileSync(bin, args, { ...opts, encoding: 'utf8' }); };
+    const guard = createScratchGuard({ proc: new EventEmitter(), execFn });
+    guard.arm(dir, sha);
+    const first = guard.finish();
+    const seen = calls.length;
+    expect(seen).toBeGreaterThan(0);
+    expect(guard.finish()).toEqual(first);
+    expect(calls.length).toBe(seen);
+  });
+
+  it('an unreadable HEAD keeps a clean clone (status succeeds, rev-parse fails)', () => {
+    const { dir, sha } = makeClone();
+    const rm = vi.fn();
+    // Everything succeeds for real (top level, status, config) except resolving HEAD itself.
+    const execFn = (bin, args, opts) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) throw new Error('HEAD unreadable');
+      return execFileSync(bin, args, { ...opts, encoding: 'utf8' });
+    };
+    const r = cleanupScratchClone({ dir, startSha: sha, execFn, rmFn: rm });
+    expect(r.removed).toBe(false);
+    expect(r.reason).toBe('status unreadable');
+    expect(rm).not.toHaveBeenCalled();
+  });
+
+  describe('the cleanup reads are hardened against a clone Codex wrote to', () => {
+    it('a core.fsmonitor hook in the clone config never runs and the dirty clone is kept', () => {
+      const { root, dir, sha } = makeClone();
+      const marker = join(root, 'fsmonitor-ran');
+      const hook = join(root, 'hook.sh');
+      writeFileSync(hook, `#!/bin/sh\ntouch '${marker}'\nprintf '\\0'\n`, { mode: 0o755 });
+      git(dir, 'config', 'core.fsmonitor', hook);
+      writeFileSync(join(dir, 'a.txt'), 'edited\n');
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(() => statSync(marker)).toThrow();
+      expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('edited\n');
+    });
+
+    it('a filter driver in the clone config keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'config', 'filter.evil.clean', 'cat');
+      const rm = vi.fn();
+      const r = cleanupScratchClone({ dir, startSha: sha, rmFn: rm });
+      expect(r.removed).toBe(false);
+      expect(rm).not.toHaveBeenCalled();
+    });
+
+    it('an inherited GIT_DIR pointing at another repository cannot make the clone look clean', () => {
+      const { dir, sha } = makeClone();
+      const other = makeClone();
+      writeFileSync(join(dir, 'work.txt'), 'precious\n');
+      const prior = process.env.GIT_DIR;
+      process.env.GIT_DIR = join(other.dir, '.git');
+      try {
+        const r = cleanupScratchClone({ dir, startSha: sha });
+        expect(r.removed).toBe(false);
+        expect(readFileSync(join(dir, 'work.txt'), 'utf8')).toBe('precious\n');
+      } finally {
+        if (prior === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = prior;
+      }
+    });
+
+    it('a clone whose own .git is gone (git would walk up to a parent repo) is kept', () => {
+      const { dir: parent, sha } = makeClone();
+      const inner = join(parent, 'inner');
+      mkdirSync(inner);
+      writeFileSync(join(inner, 'work.txt'), 'precious\n');
+      const rm = vi.fn();
+      const r = cleanupScratchClone({ dir: inner, startSha: sha, rmFn: rm });
+      expect(r.removed).toBe(false);
+      expect(rm).not.toHaveBeenCalled();
+    });
+
+    it('every cleanup git call carries the lane pins and a scrubbed repository-location env', () => {
+      const { dir, sha } = makeClone();
+      const seen = [];
+      const execFn = (bin, args, opts) => { seen.push({ args, env: opts.env }); return execFileSync(bin, args, { ...opts, encoding: 'utf8' }); };
+      const prior = process.env.GIT_WORK_TREE;
+      process.env.GIT_WORK_TREE = '/elsewhere';
+      try {
+        expect(cleanupScratchClone({ dir, startSha: sha, execFn }).removed).toBe(true);
+      } finally {
+        if (prior === undefined) delete process.env.GIT_WORK_TREE; else process.env.GIT_WORK_TREE = prior;
+      }
+      expect(seen.length).toBeGreaterThan(5);
+      for (const { args, env } of seen) {
+        expect(args).toContain('core.fsmonitor=false');
+        expect(args).toContain('--no-optional-locks');
+        expect(env.GIT_WORK_TREE).toBeUndefined();
+      }
+    });
+  });
+
+  it('preserves untracked files when status.showUntrackedFiles is disabled', () => {
+    const { dir, sha } = makeClone();
+    git(dir, 'config', 'status.showUntrackedFiles', 'no');
+    writeFileSync(join(dir, 'secret-work.txt'), 'precious\n');
+    expect(git(dir, 'status', '--porcelain').trim()).toBe(''); // the config really hides it from plain status
+    const r = cleanupScratchClone({ dir, startSha: sha });
+    expect(r.removed).toBe(false);
+    expect(readFileSync(join(dir, 'secret-work.txt'), 'utf8')).toBe('precious\n');
+  });
+
+  describe('things `git status --porcelain` cannot see', () => {
+    it('a gitignored file keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'notes.txt\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      writeFileSync(join(dir, 'notes.txt'), 'codex wrote this\n');
+      const r = cleanupScratchClone({ dir, startSha: base });
+      expect(base).not.toBe(sha);
+      expect(r.removed).toBe(false);
+      expect(readFileSync(join(dir, 'notes.txt'), 'utf8')).toBe('codex wrote this\n');
+    });
+
+    it('an ignored node_modules (the installed dependencies) does not keep an otherwise clean clone', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore deps');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(dir, 'node_modules', 'pkg'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', 'pkg', 'index.js'), '');
+      expect(cleanupScratchClone({ dir, startSha: base }).removed).toBe(true);
+    });
+
+    it('a stash keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      writeFileSync(join(dir, 'a.txt'), 'stashed work\n');
+      git(dir, 'stash', 'push', '-q');
+      expect(git(dir, 'status', '--porcelain').trim()).toBe('');
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(git(dir, 'stash', 'list')).toContain('stash@{0}');
+    });
+
+    it('a side branch holding a commit, with HEAD reset back to the start, keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'checkout', '-q', '-b', 'side');
+      writeFileSync(join(dir, 'a.txt'), 'side work\n');
+      git(dir, 'commit', '-q', '-am', 'side commit');
+      git(dir, 'checkout', '-q', '--detach', sha);
+      expect(git(dir, 'rev-parse', 'HEAD').trim()).toBe(sha);
+      const r = cleanupScratchClone({ dir, startSha: sha });
+      expect(r.removed).toBe(false);
+      expect(git(dir, 'rev-parse', 'side').trim()).not.toBe(sha);
+    });
+  });
+
+  describe('more things `git status` cannot see', () => {
+    it('a commit on a custom ref (refs/codex/*) keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'checkout', '-q', '--detach', sha);
+      writeFileSync(join(dir, 'a.txt'), 'hidden commit\n');
+      git(dir, 'commit', '-q', '-am', 'on custom ref');
+      git(dir, 'update-ref', 'refs/codex/work', 'HEAD');
+      git(dir, 'checkout', '-q', '--detach', sha);
+      expect(git(dir, 'branch', '--contains', git(dir, 'rev-parse', 'refs/codex/work').trim()).trim()).toBe('');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    describe('submodules (their stashes, branches and objects live outside the parent repo reads)', () => {
+      function addSubmodule(root, dir) {
+        const lib = join(root, 'lib-src');
+        mkdirSync(lib);
+        git(lib, 'init', '-q');
+        git(lib, 'config', 'user.email', 't@example.com');
+        git(lib, 'config', 'user.name', 't');
+        writeFileSync(join(lib, 'l.txt'), 'lib\n');
+        git(lib, 'add', 'l.txt');
+        git(lib, 'commit', '-q', '-m', 'lib');
+        git(dir, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'lib');
+        git(dir, 'commit', '-q', '-m', 'add submodule');
+        return git(dir, 'rev-parse', 'HEAD').trim();
+      }
+
+      it('a submodule holding a stash keeps the clone even though every parent read is clean', () => {
+        const { root, dir } = makeClone();
+        const base = addSubmodule(root, dir);
+        const libDir = join(dir, 'lib');
+        git(libDir, 'config', 'user.email', 't@example.com');
+        git(libDir, 'config', 'user.name', 't');
+        writeFileSync(join(libDir, 'l.txt'), 'saved work in a submodule stash\n');
+        git(libDir, 'stash', 'push', '-q');
+        // the finding's premise: the parent sees nothing
+        expect(git(dir, 'status', '--porcelain', '--untracked-files=all').trim()).toBe('');
+        expect(git(dir, 'stash', 'list').trim()).toBe('');
+        expect(git(libDir, 'stash', 'list')).toContain('stash@{0}');
+        const r = cleanupScratchClone({ dir, startSha: base });
+        expect(r.removed).toBe(false);
+        expect(r.reason).toBe('submodule present');
+        expect(git(libDir, 'stash', 'list')).toContain('stash@{0}');
+      });
+
+      it('a submodule removed from the index but still holding .git/modules keeps the clone', () => {
+        const { root, dir } = makeClone();
+        addSubmodule(root, dir);
+        git(dir, 'rm', '-q', '-f', 'lib');
+        git(dir, 'commit', '-q', '-m', 'drop submodule');
+        const base = git(dir, 'rev-parse', 'HEAD').trim();
+        expect(statSync(join(dir, '.git', 'modules', 'lib')).isDirectory()).toBe(true);
+        const r = cleanupScratchClone({ dir, startSha: base });
+        expect(r.removed).toBe(false);
+        expect(r.reason).toBe('submodule present');
+      });
+
+      it('a clone with no submodule is still deleted (the guard does not over-keep)', () => {
+        const { dir, sha } = makeClone();
+        expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(true);
+      });
+    });
+
+    it('an assume-unchanged edit keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'update-index', '--assume-unchanged', 'a.txt');
+      writeFileSync(join(dir, 'a.txt'), 'edited behind status\n');
+      expect(git(dir, 'status', '--porcelain').trim()).toBe('');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('a skip-worktree edit keeps the clone', () => {
+      const { dir, sha } = makeClone();
+      git(dir, 'update-index', '--skip-worktree', 'a.txt');
+      writeFileSync(join(dir, 'a.txt'), 'edited behind status\n');
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('a linked worktree keeps the clone', () => {
+      const { root, dir, sha } = makeClone();
+      git(dir, 'worktree', 'add', '-q', '--detach', join(root, 'linked'), sha);
+      expect(cleanupScratchClone({ dir, startSha: sha }).removed).toBe(false);
+    });
+
+    it('an ignored REGULAR FILE named node_modules keeps the clone (the exception is directory-only)', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      writeFileSync(join(dir, 'node_modules'), 'codex notes, not dependencies\n');
+      expect(git(dir, 'status', '--porcelain', '--ignored=traditional')).toContain('!! node_modules\n');
+      const r = cleanupScratchClone({ dir, startSha: base });
+      expect(r.removed).toBe(false);
+      expect(r.reason).toBe('ignored files present');
+      expect(readFileSync(join(dir, 'node_modules'), 'utf8')).toBe('codex notes, not dependencies\n');
+    });
+
+    it('an ignored SYMLINK named node_modules keeps the clone (a link is not an installed dependency tree)', () => {
+      const { root, dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(root, 'elsewhere'));
+      symlinkSync(join(root, 'elsewhere'), join(dir, 'node_modules'));
+      const r = cleanupScratchClone({ dir, startSha: base });
+      expect(r.removed).toBe(false);
+      expect(r.reason).toBe('ignored files present');
+    });
+
+    it('a nested ignored node_modules DIRECTORY is still the accepted dependency exception', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore deps');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(dir, 'pkg', 'node_modules', 'x'), { recursive: true });
+      writeFileSync(join(dir, 'pkg', 'node_modules', 'x', 'index.js'), '');
+      writeFileSync(join(dir, 'pkg', 'index.js'), '');
+      git(dir, 'add', 'pkg/index.js');
+      git(dir, 'commit', '-q', '-m', 'pkg');
+      expect(cleanupScratchClone({ dir, startSha: git(dir, 'rev-parse', 'HEAD').trim() }).removed).toBe(true);
+    });
+
+    it('an ignored directory merely ending in node_modules still keeps the clone', () => {
+      const { dir } = makeClone();
+      writeFileSync(join(dir, '.gitignore'), 'foo_node_modules/\n');
+      git(dir, 'add', '.gitignore');
+      git(dir, 'commit', '-q', '-m', 'ignore');
+      const base = git(dir, 'rev-parse', 'HEAD').trim();
+      mkdirSync(join(dir, 'foo_node_modules'));
+      writeFileSync(join(dir, 'foo_node_modules', 'x'), '1');
+      expect(cleanupScratchClone({ dir, startSha: base }).removed).toBe(false);
+    });
+  });
+
+  describe('createScratchGuard signal re-raise', () => {
+    it('re-raises the signal on the process when nobody else is listening, and restores the default action', () => {
+      const { dir, sha } = makeClone();
+      const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+      const guard = createScratchGuard({ proc });
+      guard.arm(dir, sha);
+      proc.emit('SIGTERM');
+      expect(proc.kill).toHaveBeenCalledWith(4242, 'SIGTERM');
+    });
+
+    it('does not re-raise when another listener owns the signal', () => {
+      const { dir, sha } = makeClone();
+      const proc = Object.assign(new EventEmitter(), { pid: 4242, kill: vi.fn() });
+      proc.on('SIGINT', () => {});
+      const guard = createScratchGuard({ proc });
+      guard.arm(dir, sha);
+      proc.emit('SIGINT');
+      expect(proc.kill).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('codexDirectTask wiring (a real tiny git repo + a stub spawnFn)', () => {
+    /** A stub `codex exec`: optionally mutates its cwd (the scratch clone), then closes cleanly. */
+    function stubSpawn({ mutate, throwInstead } = {}) {
+      const seen = { cwd: null };
+      const fn = (cli, argv, opts) => {
+        seen.cwd = opts.cwd;
+        mutate?.(opts.cwd);
+        if (throwInstead) throw throwInstead;
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.stdin = { on: () => {}, end: () => {} };
+        child.kill = () => {};
+        setTimeout(() => { child.stdout.emit('data', Buffer.from('{"type":"thread.started","thread_id":"t1"}\n')); child.emit('close', 0); }, 0);
+        return child;
+      };
+      return { fn, seen };
+    }
+    const baseOpts = (repoRoot, extra = {}) => ({
+      task: 'fixture', repoRoot, gate: 'none', selfReview: false, stream: false, installDeps: false,
+      ephemeral: true, readQuotaFn: () => ({ quota: null, rolloutFile: null }), ...extra,
+    });
+
+    it('a clean run with an explicit log outside the clone marks the clone gone but the log kept', async () => {
+      const { root, dir: source } = makeClone();
+      const logFile = join(root, 'logs', 'events.jsonl');
+      const { fn } = stubSpawn();
+      const report = await codexDirectTask(baseOpts(source, { spawnFn: fn, logFile }));
+      expect(report.scratch.cleanup.removed).toBe(true);
+      expect(report.dirRemoved).toBe(true);
+      expect(report.logFileRemoved).toBe(false);
+      expect(statSync(logFile).isFile()).toBe(true);
+    });
+
+    it('a clean run deletes the scratch clone, reports it, and marks the deleted paths as gone', async () => {
+      const { root, dir: source } = makeClone();
+      const { fn, seen } = stubSpawn();
+      const report = await codexDirectTask(baseOpts(source, { spawnFn: fn }));
+      expect(report.scratch.created).toBe(true);
+      expect(report.scratch.cleanup).toMatchObject({ removed: true, reason: 'clean' });
+      expect(() => statSync(seen.cwd)).toThrow();
+      expect(report.scratch.cleanup.path).toBe(seen.cwd);
+      expect(report.dirRemoved).toBe(true);
+      expect(report.logFileRemoved).toBe(true);
+      expect(statSync(root).isDirectory()).toBe(true); // the source repo is never touched
+    });
+
+    it('a run that leaves a file keeps the clone and reports its path', async () => {
+      const { dir: source } = makeClone();
+      const { fn, seen } = stubSpawn({ mutate: (cwd) => writeFileSync(join(cwd, 'out.txt'), 'work\n') });
+      const report = await codexDirectTask(baseOpts(source, { spawnFn: fn }));
+      try {
+        expect(report.scratch.cleanup).toMatchObject({ removed: false, reason: 'uncommitted changes', path: seen.cwd });
+        expect(readFileSync(join(seen.cwd, 'out.txt'), 'utf8')).toBe('work\n');
+        expect(report.dir).toBe(seen.cwd);
+        expect(report.dirRemoved).toBeUndefined();
+        expect(report.logFileRemoved).toBeUndefined();
+        expect(statSync(report.logFile).isFile()).toBe(true);
+      } finally { rmSync(seen.cwd, { recursive: true, force: true }); }
+    });
+
+    it('a caller-supplied dir is never armed: it survives a clean run and gets no cleanup record', async () => {
+      const { dir } = makeClone();
+      const { fn } = stubSpawn();
+      const report = await codexDirectTask({ ...baseOpts(undefined, { spawnFn: fn }), repoRoot: undefined, dir });
+      expect(report.scratch).toEqual({ created: false });
+      expect(statSync(dir).isDirectory()).toBe(true);
+      expect(report.dir).toBe(dir);
+    });
+
+    it('an error after the clone keeps a dirty clone and names it in the error message', async () => {
+      const { dir: source } = makeClone();
+      let cwd;
+      const { fn } = stubSpawn({ mutate: (c) => { cwd = c; writeFileSync(join(c, 'half.txt'), 'x'); }, throwInstead: new Error('spawn exploded') });
+      try {
+        const error = await codexDirectTask(baseOpts(source, { spawnFn: fn })).then(() => null, (e) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toContain(`scratch clone KEPT (uncommitted changes): ${cwd}`);
+        expect(error.scratchCleanup).toMatchObject({ removed: false, path: cwd });
+        expect(readFileSync(join(cwd, 'half.txt'), 'utf8')).toBe('x');
+      } finally { if (cwd) rmSync(cwd, { recursive: true, force: true }); }
+    });
   });
 });

@@ -68,7 +68,7 @@ describe('validateEntry — the content scrub no longer runs here (#3015)', () =
     expect(r.ok).toBe(true);
   });
   it('ACCEPTS an entry carrying a TOKEN-shaped string — the pool is not the boundary any more', () => {
-    const r = validateEntry({ ...good, suggestion: 'rotate the leaked key ghp_ABCDEFabcdef0123456789ABCDEF01234567' });
+    const r = validateEntry({ ...good, suggestion: 'rotate the leaked key gh\x70_ABCDEFabcdef0123456789ABCDEF01234567' });
     expect(r.ok).toBe(true);
     expect(r.errors).toEqual([]);
   });
@@ -84,7 +84,7 @@ describe('validateEntry — the content scrub no longer runs here (#3015)', () =
   it('the detector itself still WORKS — it is unwired here, not broken', () => {
     // If this ever goes green-by-vacuity (the scrub deleted rather than relocated), the publish seam has
     // nothing to call. `scrubReasons` is still exported from this module for exactly that reason.
-    expect(scrubReasons('rotate ghp_ABCDEFabcdef0123456789ABCDEF01234567').length).toBeGreaterThan(0);
+    expect(scrubReasons('rotate gh\x70_ABCDEFabcdef0123456789ABCDEF01234567').length).toBeGreaterThan(0);
   });
   it('the SCHEMA half of the boundary is untouched — caps and allow-list still reject', () => {
     expect(validateEntry({ ...good, area: 'x'.repeat(FIELD_CAPS.area + 1) }).ok).toBe(false);
@@ -171,7 +171,7 @@ describe('scrub — domain vocabulary must NOT be rejected (must pass)', () => {
 describe('scrub — round-3 audited bypasses (must reject)', () => {
   const reject = (v) => expect(scrubReasons(v).length, `should reject: ${v}`).toBeGreaterThan(0);
   it('1. GitHub fine-grained PAT (internal _ defeated the base64 \\b; >40 chars skipped entropy)', () => {
-    reject('rotate github_pat_11ABCDEFG0aZ1bY2cX3dW4eV5fU6gT7hS8iR9jQ0kP1lO2mN3');
+    reject('rotate github_\x70at_11ABCDEFG0aZ1bY2cX3dW4eV5fU6gT7hS8iR9jQ0kP1lO2mN3');
   });
   it('2. absolute/home paths glued to a non-space char (=, quote, paren)', () => {
     reject('path=/Users/nic/workspace/foo');
@@ -209,7 +209,7 @@ describe('isHighEntropyToken — catches opaque keys, spares identifiers', () =>
   });
   it('rejects a non-pronounceable low-vowel token (shape b) and a long PAT (>40)', () => {
     expect(isHighEntropyToken('jbswy3dpehpk3pxpjbswy3dp')).toBe(true);  // base32 TOTP
-    expect(isHighEntropyToken('github_pat_11ABCDEFG0aZ1bY2cX3dW4eV5fU6gT7hS8iR9jQ0kP1lO2mN3')).toBe(true);
+    expect(isHighEntropyToken('github_\x70at_11ABCDEFG0aZ1bY2cX3dW4eV5fU6gT7hS8iR9jQ0kP1lO2mN3')).toBe(true);
   });
   it('passes ordinary single-case identifiers and short tokens', () => {
     expect(isHighEntropyToken('batch-backlog-items')).toBe(false); // single case / hyphen, pronounceable

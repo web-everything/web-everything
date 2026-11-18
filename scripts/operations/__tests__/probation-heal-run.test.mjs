@@ -590,6 +590,8 @@ describe('xp0lsdi wrapper terminal boundary', () => {
 
 import { selectProbationWorker } from '../../lib/provider-routing.mjs';
 import { readAgyHold, saveAgyHold } from '../../lib/antigravity-run-evidence.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 
 it('xp0lsdi: real backend holds expire independently, and selection preserves veto and simple-only rules', () => {
   const h = attemptHarness(), now = Date.parse('2026-10-02T12:00:00Z');

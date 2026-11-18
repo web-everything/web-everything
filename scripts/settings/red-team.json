@@ -1,4 +1,8 @@
 {
+  "redTeamGate": {
+    "$comment": "source: both (standard default), check-run (cutover), or drain-scan (rollback). Resolves standard -> platform -> tool -> WE_RED_TEAM_GATE_SOURCE; invalid values are ignored and logged. Check-run recovery waits drain.redTeamPendingMaxMin, then requests once per live head through requestRedTeam, durable before dispatch. Publication guarantee: a round starts only after its in_progress check posts; when a check post and its failure supersede both fail, the writer posts a head-bound commit status on the PR's own context ('red-team/publication #<pr>', so PRs sharing a head never clear each other's hold) that every merge-gate host reads; it is posted before the first check post and cleared only by that PR's confirmed publication, by a trusted author. If every GitHub write fails, only the drain-local hold binds, so CI can still see an older success until writes recover. appId (R905/R907): the trusted red-team check App id (today's WE App) every reader trusts and the writer authors as; resolves standard (none) -> platform -> tool -> WE_APP_ID. The WE_APP_ID repository variable holds the same value as documentation only: it is never read at runtime (every installed App gets HTTP 403 on Actions variables).",
+    "appId": 5037855
+  },
   "redTeam": {
     "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
     "confirmedBreaks": {
@@ -7,8 +11,8 @@
       "unconfirmed": "advisory"
     },
     "operatorRulings": {
-      "$comment": "anyState (default false; opt in with this setting or WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE=true): a human operator's record-red-team-ruling may rule card on any confirmed break of the live head's result (at the cap, sent back, or carded). Default = round-cap-only; pending round extensions remain owned by automation.",
-      "anyState": false
+      "$comment": "anyState (R903, 2026-11-11: true; set false or WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE=false for round-cap-only): a human operator's record-red-team-ruling may rule card on a confirmed break in any state, so non-regression breaks are carded without waiting for the round cap. Automation still cannot rule; pending round extensions remain owned by automation.",
+      "anyState": true
     }
   }
 }

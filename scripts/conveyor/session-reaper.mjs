@@ -128,6 +128,7 @@ import {
 import {
   deleteDeliveryReport, deliveryReportPath, listDeliveryReportSessions, resolveDeliveryReportsDir,
 } from '../operations/delivery-report-store.mjs';
+import { reapDeadReviewRuns } from '../lib/reap-dead-review-runs.mjs';
 import { pruneTerminalRuns } from '../operations/run-store.mjs';
 import {
   readHungInfo, resolveHungThresholdMs, readClaudeAuthExpiredInfo, readIdleFinishedInfo, resolveIdleFinishedThresholdMs,
@@ -2528,6 +2529,8 @@ export function runSessionReaperCli(argv, io = {}) {
   // calls {@link runRetentionSweepPass} directly (already fully daemon-usable, no CLI needed) rather than
   // relying on this flag. Shares this CLI's own `--dry-run`.
   const runRetention = !!flags['retention-sweep'];
+  // R755: opt in to the sweep; writing additionally requires explicit --apply.
+  const runDeadReviewRuns = !!flags['reap-dead-review-runs'];
   // `--dispatch-scratch-sweep` OPTS IN to the #4188 dispatch-scratch pass, same deliberate opt-in reasoning as
   // `--retention-sweep` immediately above (it deletes directories and edits `~/.claude.json`). A resident
   // daemon calls {@link runDispatchScratchSweepPass} directly. Shares this CLI's own `--dry-run`.
@@ -2554,6 +2557,9 @@ export function runSessionReaperCli(argv, io = {}) {
   const stop = ({ handle }) => stopSessionWithRetry({ handle, exec, sleep });
   const result = runSessionReaperPass({ listAgents, stop, log, groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor, rateSession });
   const retentionResult = runRetention ? runRetentionSweepPass({ dryRun }) : null;
+  const deadReviewRuns = runDeadReviewRuns
+    ? (io.reapDeadReviewRuns ?? reapDeadReviewRuns)({ apply: flags.apply === true && !dryRun, log }) : null;
+  if (deadReviewRuns) log(`session-reaper dead-review-runs: ${deadReviewRuns.scanned} scanned · ${deadReviewRuns.reaped.length} reaped · ${deadReviewRuns.wouldReap.length} would reap`);
   const dispatchScratchResult = runDispatchScratchSweep ? runDispatchScratchSweepPass({ dryRun }) : null;
 
   if (result.unreadable) {
@@ -2563,7 +2569,7 @@ export function runSessionReaperCli(argv, io = {}) {
   }
 
   if (flags.json) {
-    writeOut(JSON.stringify({ ...result, retention: retentionResult, dispatchScratch: dispatchScratchResult }, null, 2) + '\n');
+    writeOut(JSON.stringify({ ...result, retention: retentionResult, dispatchScratch: dispatchScratchResult, deadReviewRuns }, null, 2) + '\n');
   } else {
     const { scanned, stopped, alreadyGone, failures, anomalies, backstopWritten, wouldStop, wouldWriteBackstop, kept } = result;
     log(

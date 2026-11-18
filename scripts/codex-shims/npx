@@ -1,0 +1,25 @@
+#!/bin/sh
+# Shared by npx and npm shims. Gates heavy runners: vitest/playwright as a token (vitest, vitest@1, @playwright/test)
+# or inside --package=/--call= values. npm: only inspected when an `exec`/`x` arg is present.
+. "$(dirname "$0")/_guard.sh"
+self=$(basename "$0")
+inspect=1
+if [ "$self" = "npm" ]; then
+  inspect=0
+  for a in "$@"; do case "$a" in exec|x) inspect=1;; esac; done
+fi
+if [ "$inspect" = 1 ]; then
+  for a in "$@"; do
+    case "$a" in
+      --package=*|-p=*) v=${a#*=};;
+      --call=*|-c=*) for w in ${a#*=}; do case "$w" in vitest|vitest@*) we_guard vitest "$@";; playwright|playwright@*) we_guard playwright "$@";; esac; done; continue;;
+      *) v=$a;;
+    esac
+    case "$v" in
+      vitest|vitest@*|vitest\ *|*\ vitest|*\ vitest\ *) we_guard vitest "$@"; break;;
+      playwright|playwright@*|playwright\ *|*\ playwright|*\ playwright\ *|@playwright/test|@playwright/test@*) we_guard playwright "$@"; break;;
+    esac
+  done
+fi
+we_real "$self" || { echo "$self: real binary not found" >&2; exit 127; }
+exec "$WE_REAL" "$@"

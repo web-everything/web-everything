@@ -1,3 +1,14 @@
+
+const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+vi.mock('../../lib/operator-override-store.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  const inject = options => ({ ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}) });
+  return { ...actual,
+    readOperatorOverrides: options => actual.readOperatorOverrides(inject(options)),
+    writeOperatorOverride: options => actual.writeOperatorOverride(inject(options)),
+    clearOperatorOverride: options => actual.clearOperatorOverride(inject(options)),
+  };
+});
 /**
  * @file http-adapter.test.mjs — the HTTP caller, derived from a declaration (#3036).
  *
@@ -24,11 +35,11 @@
  */
 
 import { types } from 'node:util';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -39,7 +50,8 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { inFlight } from '../effect-executor.mjs';
 import { validateInput } from '../registry.mjs';
 import { buildCliSpec, judgeOutcome, parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
-import { OPERATIONS, resolveOperation } from '../run.mjs';
+import { OPERATIONS, CLI_ONLY_OPERATIONS, resolveOperation } from '../run.mjs';
+import * as auditIo from '../codex-audit-io.mjs';
 import { reviewPrOperation, REVIEW_PR_OP, REVIEW_EFFECTS } from '../review-pr.mjs';
 import { suggestNextOperation, SUGGEST_NEXT_OP } from '../suggest-next.mjs';
 import { GATE_HEALTH_OP } from '../gate-health.mjs';
@@ -53,6 +65,7 @@ import { CLOSE_ITEMS_OP } from '../close-items.mjs';
 import { REOPEN_ITEMS_OP } from '../reopen-items.mjs';
 import { SCAFFOLD_OP } from '../scaffold.mjs';
 import { FILE_ITEM_OP } from '../file-item.mjs';
+import { FILE_HELD_CARDS_OP } from '../file-held-cards.mjs';
 import { CLEAR_STUCK_SESSION_OP } from '../clear-stuck-session.mjs';
 import { DOCKET_REFRESH_OP } from '../docket-refresh.mjs';
 import { PERF_SNAPSHOT_OP } from '../perf-snapshot.mjs';
@@ -64,6 +77,7 @@ import { RECORD_VERDICT_OP } from '../record-verdict.mjs';
 import { RECORD_REFERRAL_RULING_OP } from '../record-referral-ruling.mjs';
 import { VERIFY_OP } from '../verify.mjs';
 import { PR_SIZE_OP } from '../pr-size.mjs';
+import { DELIVERY_FLOW_OP } from '../delivery-flow.mjs';
 import { MUTATION_CHECK_OP, REVERT_RED_CHECK_OP } from '../mutation-check.mjs';
 import { PR_STATUS_OP } from '../pr-status.mjs';
 import { JUDGE_SWEEP_FACTS_OP } from '../judge-sweep-facts.mjs';
@@ -76,7 +90,10 @@ import { PR_OWNERSHIP_OP } from '../pr-ownership.mjs';
 import { PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { DAEMON_STATUS_OP } from '../daemon-status.mjs';
 import { HEAVY_QUEUE_OP } from '../heavy-queue.mjs';
+import { HOST_CAPACITY_OP } from '../host-capacity.mjs';
+import { DELIVERY_CAPACITY_OP } from '../delivery-capacity.mjs';
 import { RESOURCE_STATUS_OP } from '../resource-status.mjs';
+import { WORKER_CAPACITY_OP } from '../worker-capacity.mjs';
 import { PRE_PR_CHECK_OP } from '../pre-pr-check.mjs';
 import { FREE_SCOPE_OP } from '../free-scope.mjs';
 import { MAINTENANCE_OP } from '../maintenance.mjs';
@@ -87,6 +104,7 @@ import { SESSIONS_OP } from '../sessions.mjs';
 import { ROUTE_PR_OUTCOME_OP } from '../route-pr-outcome.mjs';
 import { STALE_STATE_OP } from '../stale-state.mjs';
 import { AGENT_ACTIVITY_OP } from '../agent-activity.mjs';
+import { AI_ROUTING_OP } from '../ai-routing.mjs';
 import { ITEM_ACTIVITY_OP } from '../item-activity.mjs';
 import { STAGE_PR_VIEW_OP } from '../stage-pr-view.mjs';
 import { GAP_SWEEP_STATUS_OP } from '../gap-sweep-status.mjs';
@@ -103,6 +121,63 @@ import {
   runReadOnly,
   segmentsUnder,
 } from '../http-adapter.mjs';
+
+describe('codex-audit runner output', () => {
+  const cases = [
+    { name: 'passing verdict', answer: 'NOT WEAKENED', code: 0, stdout: 'NOT WEAKENED\n', stderr: '' },
+    { name: 'weakened verdict with quoted multiline findings', answer: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding', code: 1,
+      stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: '' },
+    { name: 'invalid answer', answer: 'incomplete', code: 3, stdout: '',
+      stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' },
+    { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
+      stderr: 'Audit record write failed; repair the record path and retry.\n' },
+    { name: 'unresolved ref', resolveError: true, code: 2, stdout: '',
+      stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+    { name: 'invalid audit arguments', head: 'invalid', code: 2, stdout: '',
+      stderr: 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+  ];
+  for (const json of [true, false]) {
+    it.each(cases)(`captures $name in ${json ? 'JSON' : 'text'} mode without leaking to process streams`, async (testCase) => {
+      // Exercise the production registration, audit main and CLI adapter; only external audit IO is replaced.
+      const deps = {
+        resolveSha: ref => {
+          if (testCase.resolveError) throw new Error('unknown ref');
+          return (ref === 'origin/main' ? 'a' : 'b').repeat(40);
+        },
+        runCodex: async () => testCase.answer,
+        appendRecord: vi.fn(() => { if (testCase.recordError) throw new Error('read-only store'); }),
+        now: () => '2026-11-02T12:00:00.000Z',
+        stdout: text => process.stdout.write(text), stderr: text => process.stderr.write(text),
+      };
+      let leakedOut = '', leakedErr = '';
+      const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(text => { leakedOut += text; return true; });
+      const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(text => { leakedErr += text; return true; });
+      const depsSpy = vi.spyOn(auditIo, 'createAuditDeps').mockReturnValue(deps);
+      let outcome, rendered;
+      try {
+        const { declaration, registry, sinks, finish } = resolveOperation('codex-audit', { json });
+        outcome = await runOperationCli({ declaration, registry, sinks, store: createMemoryRunStore(),
+          argv: ['--base=origin/main', `--head=${testCase.head ?? 'b'.repeat(40)}`, ...(json ? ['--json'] : [])],
+          newRunId: () => 'codex-audit-output',
+        });
+        rendered = finish({ ...outcome, json });
+      } finally {
+        depsSpy.mockRestore(); outSpy.mockRestore(); errSpy.mockRestore();
+      }
+      const output = `${leakedOut}${rendered.lines.join('\n')}\n`;
+      if (json) {
+        expect(JSON.parse(output).verdict).toEqual({ ok: testCase.code === 0, code: testCase.code,
+          stdout: testCase.stdout, stderr: testCase.stderr });
+      } else {
+        expect(output).toContain((testCase.stdout || testCase.stderr).trimEnd());
+      }
+      expect(leakedOut).toBe('');
+      expect(leakedErr).toBe('');
+      expect(rendered.code).toBe(testCase.code);
+      expect(deps.appendRecord).toHaveBeenCalledTimes(testCase.code === 0 || testCase.code === 1 || testCase.recordError ? 1 : 0);
+    });
+  }
+});
 
 // ── fixtures ────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -326,6 +401,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
    * that can act"); it is applied here to a strictly narrower claim.
    */
   const DECLARING_MODULE = Object.freeze({
+    // Compute-only inspection; the routing reader is injected by run.mjs.
+    [AI_ROUTING_OP]: 'ai-routing.mjs',
+    'manual-daemon-pass': 'manual-daemon-pass.mjs',
     'health-respond': 'health-respond.mjs',
     [REVIEW_PR_OP]: 'review-pr.mjs',
     [SUGGEST_NEXT_OP]: 'suggest-next.mjs',
@@ -357,7 +435,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // #4979 — `record-referral-ruling`'s `write` step posts a PR comment, so it is NOT read-only; listed here for
     // map coverage. The gh reads and the post live in `record-referral-ruling-io.mjs`.
     'extend-rounds': 'extend-rounds.mjs',
-    ...Object.fromEntries(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim'].map(name => [name, 'operator-controls.mjs'])),
+    ...Object.fromEntries(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset'].map(name => [name, 'operator-controls.mjs'])),
     [RECORD_REFERRAL_RULING_OP]: 'record-referral-ruling.mjs',
     // Card 334 — `land-human-only`'s `write` step labels, enqueues and comments, so it is NOT read-only; listed for map
     // coverage. Every gh call lives in `land-human-only-io.mjs`.
@@ -367,6 +445,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // through the `runChecks` its builder is handed in `../run.mjs`, which is what keeps this module pure.
     [VERIFY_OP]: 'verify.mjs',
     [PR_SIZE_OP]: 'pr-size.mjs',
+    [DELIVERY_FLOW_OP]: 'delivery-flow.mjs',
     // `stage-pr-view`'s `write` step puts a file on disk, so it is NOT read-only; listed here for map
     // coverage. Its own suite pins the property this list cannot express for a writing operation: the
     // DECLARING module reaches nothing that can act, and every write lives in `stage-pr-view-io.mjs`.
@@ -407,9 +486,14 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // declaring module imports only `registry.mjs` and `step-kinds.mjs`, and every `admissionStatus`/`ps`/
     // `git`/lane-lease read lives in `heavy-queue-io.mjs` behind the injected `collect` reader.
     [HEAVY_QUEUE_OP]: 'heavy-queue.mjs',
+    // Read-only compute declaration; host probes are injected by run.mjs.
+    [HOST_CAPACITY_OP]: 'host-capacity.mjs',
+    [DELIVERY_CAPACITY_OP]: 'delivery-capacity.mjs',
     // Card xkuflno — READ-ONLY: both steps are `compute`; the declaring module imports only `registry.mjs`,
     // `step-kinds.mjs` and the pure `../lib/resource-policy.mjs`. The snapshot/policy-file read is bound in run.mjs.
     [RESOURCE_STATUS_OP]: 'resource-status.mjs',
+    // R313/R349 — READ-ONLY shadow: compute-only; the history read and the jsonl log are bound in run.mjs.
+    [WORKER_CAPACITY_OP]: 'worker-capacity.mjs',
     // xcbwt4r — READ-ONLY: both steps are `compute`; the declaring module imports only `registry.mjs`, `step-kinds.mjs` and
     // the pure `../lib/pre-pr-commands.mjs`. The git/receipt read lives in `pre-pr-check-io.mjs` behind the injected `check` reader.
     [PRE_PR_CHECK_OP]: 'pre-pr-check.mjs',
@@ -418,6 +502,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // reads live in `free-scope-io.mjs` behind the injected `collect` reader.
     [FREE_SCOPE_OP]: 'free-scope.mjs',
     'prototype-load': 'prototype-load.mjs',
+    // Runs Codex and appends an audit record: effectful, never read-only.
+    'codex-audit': 'codex-audit.mjs',
     // Card 359 — READ-ONLY: snapshot reads are injected from operator-session-bootstrap-io.mjs.
     'operator-session-bootstrap': 'operator-session-bootstrap.mjs',
     // Card xvz55jf (epic #3931) — READ-ONLY and genuinely so: both steps are `compute`, the declaring module's
@@ -467,6 +553,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // reaches nothing that can act — both effects' sinks live in `file-item-io.mjs`, which reuses
     // `scaffold-io.mjs`'s own guarded write sink and adds only a `queue-store.mjs` sink beside it.
     [FILE_ITEM_OP]: 'file-item.mjs',
+    // `file-held-cards` files cards through `file-item` and appends a ledger: effects, NOT read-only; map coverage only.
+    [FILE_HELD_CARDS_OP]: 'file-held-cards.mjs',
     // #3690/#xd9xwtn — READ-ONLY and genuinely so: both steps are `compute`, the declaring module imports
     // only `registry.mjs` and `step-kinds.mjs`, and the `readStore()` call lives in
     // `graduation-progress-report-io.mjs` behind the injected `readScorecards` reader.
@@ -515,16 +603,27 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Card 105 — NOT read-only: its one `act` step is an effect (pause files, kill file, test session); the
     // declaring module is a leaf and every write lives in `maintenance-io.mjs`, behind the sink `../run.mjs` wires.
     [MAINTENANCE_OP]: 'maintenance.mjs',
+    // Writes: its one `act` step is an effect (GitHub update-branch); the host IO lives in `update-branch-io.mjs`.
+    'update-branch': 'update-branch.mjs',
+    // Writes operator routing preferences; listed here for module-map coverage only.
+    'routing-override': 'routing-override.mjs',
+    'operator-override-set': 'operator-override.mjs',
+    'operator-override-clear': 'operator-override.mjs',
+    'ruled-weakened-add': 'ruled-weakened-add.mjs',
+    'delivery-capacity-hold': 'delivery-capacity-override.mjs',
+    'delivery-capacity-pin': 'delivery-capacity-override.mjs',
+    'delivery-capacity-clear': 'delivery-capacity-override.mjs',
+    'operator-override-show': 'operator-override.mjs',
   });
 
   it('the module map covers every operation the repo declares — a new one cannot slip past this file', () => {
-    expect(Object.keys(DECLARING_MODULE).sort()).toEqual(Object.keys(OPERATIONS).sort());
+    expect(Object.keys(DECLARING_MODULE).sort()).toEqual(Object.keys({ ...OPERATIONS, ...CLI_ONLY_OPERATIONS }).sort());
   });
 
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
     const readOnly = Object.keys(OPERATIONS).filter((name) => isReadOnlyOperation(resolveOperation(name).declaration));
     // Pinned, not derived: adding a read-only operation must be a deliberate edit here.
-    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP].sort());
+    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', 'operator-override-show', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, AI_ROUTING_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, DELIVERY_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP, DELIVERY_FLOW_OP].sort());
     for (const name of readOnly) {
       const { external } = importGraph(resolvePath(OPS_DIR, DECLARING_MODULE[name]));
       expect(external, `\`${name}\` declares in ${DECLARING_MODULE[name]}, which must import nothing that can act`)
@@ -1024,5 +1123,91 @@ describe('effects applied over HTTP are attributed to an unidentifiable caller',
     expect(entry.lastAttemptBy).toBe('unknown');
     expect(entry.humanAttempts).toBe(0);
     expect(entry.unknownAttempts).toBe(1);
+  });
+});
+
+
+describe('capacity operator CLI declarations and real store wiring', () => {
+  const key = 'reviewConcurrency.maxLiveReviewRounds';
+  const flags = [`--key=${key}`, '--value=7', '--reason=capacity experiment', '--actor=on-call human'];
+  const invoke = async (name, argv) => {
+    const wiring = resolveOperation(name, { cli: true });
+    return runOperationCli({ ...wiring, argv, store: createMemoryRunStore(), newRunId: () => `override-${name}` });
+  };
+  it.each(['operator-override-set', 'operator-override-clear', 'operator-override-show'])('registers %s with generated flag help', name => {
+    const { declaration } = resolveOperation(name, { cli: true });
+    expect(declaration.name).toBe(name);
+    if (name !== 'operator-override-show') {
+      const usage = buildCliSpec(declaration).usage;
+      for (const flag of ['--key', '--reason', '--actor', ...(name.endsWith('-set') ? ['--value'] : [])]) expect(usage).toContain(flag);
+    }
+  });
+  it.each(['key', 'value', 'reason', 'actor'])('set requires --%s; no positional substitution', missing => {
+    const { declaration } = resolveOperation('operator-override-set', { cli: true });
+    const argv = flags.filter(flag => !flag.startsWith(`--${missing}=`));
+    expect(parseOperationArgv(declaration, argv).ok).toBe(false);
+    expect(parseOperationArgv(declaration, [key, '7', 'reason', 'actor']).ok).toBe(false);
+  });
+  it.each(['key', 'reason', 'actor'])('clear requires --%s', missing => {
+    const { declaration } = resolveOperation('operator-override-clear', { cli: true });
+    const argv = [`--key=${key}`, '--reason=over', '--actor=human'].filter(flag => !flag.startsWith(`--${missing}=`));
+    expect(parseOperationArgv(declaration, argv).ok).toBe(false);
+  });
+  it('set/clear round-trip the host file and record the OS-attested actor; show reads without writing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-cli-'));
+    const file = join(dir, 'operator-overrides.json');
+    operatorFixture.file = file;
+    try {
+      expect((await invoke('operator-override-set', flags)).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
+      const logFile = join(dir, 'operator-overrides.log.jsonl');
+      const before = readFileSync(logFile, 'utf8');
+      const row = JSON.parse(before.trim());
+      expect(row.actor).toBe('on-call human'); expect(row.osUser).toBe(userInfo().username);
+      expect(row).toMatchObject({ key, new: 7, old: null, reason: 'capacity experiment', source: 'operator-cli' });
+      const show = await invoke('operator-override-show', []);
+      expect(show.code).toBe(0);
+      expect(JSON.stringify(show)).toContain(key);
+      expect(readFileSync(logFile, 'utf8')).toBe(before);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
+      expect((await invoke('operator-override-clear', [`--key=${key}`, '--reason=over', '--actor=on-call human'])).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
+      const rows = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over', actor: 'on-call human', osUser: userInfo().username, source: 'operator-cli' });
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['reason', ''], ['reason', '   '], ['actor', ''], ['actor', '   '],
+    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '0'], ['value', '17'], // 17: just past the 1..16 range
+  ])('refuses unsafe CLI %s=%j before changing the host store', async (field, value) => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-cli-refusal-'));
+    const file = join(dir, 'operator-overrides.json');
+    operatorFixture.file = file;
+    try {
+      const argv = flags.map(flag => flag.startsWith(`--${field}=`) ? `--${field}=${value}` : flag);
+      const outcome = await invoke('operator-override-set', argv);
+      expect(outcome.code).not.toBe(0);
+      expect(existsSync(file)).toBe(false);
+      expect(existsSync(join(dir, 'operator-overrides.log.jsonl'))).toBe(false);
+      if (field === 'key') expect(JSON.stringify(outcome)).toMatch(/signed-attestation/);
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('capacity writers are CLI only', () => {
+  const deps = { resolve: resolveOperation, names: () => Object.keys(OPERATIONS), newRunId: () => 'must-not-run' };
+  it.each(['operator-override-set', 'operator-override-clear'])('%s has no HTTP routes or reachable writes', async name => {
+    expect(OPERATIONS).not.toHaveProperty(name);
+    expect(resolveOperation(name, { cli: true }).declaration.name).toBe(name);
+    for (const [method, suffix] of [['GET', ''], ['POST', '/runs'], ['GET', '/runs/old'], ['POST', '/runs/old/advance']]) {
+      const response = await handleOperationRequest({ method, url: `/operations/${name}${suffix}`, body: {} }, deps);
+      expect(response.status).toBe(404);
+    }
+  });
+  it('show remains HTTP allowed and read-only', async () => {
+    expect(isReadOnlyOperation(resolveOperation('operator-override-show').declaration)).toBe(true);
+    const response = await handleOperationRequest({ method: 'GET', url: '/operations/operator-override-show' }, deps);
+    expect(response.status).toBe(200);
+    expect(response.body.readOnly).toBe(true);
   });
 });

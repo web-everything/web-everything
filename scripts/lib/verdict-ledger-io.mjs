@@ -26,13 +26,15 @@
  * `WE_VERDICT_LEDGER_READ_MAX_BYTES`); the effective value and its source are logged once per process.
  */
 import { execFileSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
+import { withLedgerAppendLock } from './ledger-append-lock.mjs';
 import { readSettings } from './settings-files.mjs';
 import {
   assertPushRef,
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
-import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
+import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows, ledgerWriteErrorSummary } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
 import { LEDGER_DIR, ledgerGitPath } from './verdict-ledger-path.mjs';
 
@@ -113,7 +115,15 @@ const defaultLog = (line) => { try { process.stderr.write(`${line}\n`); } catch 
 
 export class LedgerAppendExhaustedError extends Error {
   constructor({ repo, attempts, errors }) {
-    super(`verdict-ledger-io: append to ${repo} FAILED after ${attempts} attempts; last error: ${errors.at(-1)?.message ?? 'unknown'}`);
+    const last = errors.at(-1);
+    // Keep the actionable Git line ahead of command/ref/repo boilerplate so the
+    // bounded F4 diagnostic retains e.g. "[rejected] ... (fetch first)".
+    const lines = `${last?.stderr ?? ''}\n${last?.message ?? ''}`.split(/\r?\n/)
+      .map((line) => line.trim());
+    const reason = lines.find((line) => /\[rejected\]/.test(line))
+      ?? lines.find((line) => /^hint:.*(?:Updates were rejected|non-fast-forward|fetch first|behind)/i.test(line))
+      ?? lines.find((line) => /^(fatal:|error:)/.test(line));
+    super(`verdict-ledger-io: append FAILED after ${attempts} attempts; last error: ${reason ?? last?.message ?? 'unknown'}; repo=${repo}`);
     this.name = 'LedgerAppendExhaustedError';
     this.repo = repo;
     this.attempts = attempts;
@@ -125,11 +135,16 @@ export class LedgerAppendExhaustedError extends Error {
  * Read one repo's ledger from the git transport.
  * NEVER THROWS. `unreadable` means "we do not know"; callers must hold, never treat it as empty.
  *
+ * FRESH BY DEFAULT. Ledger rows drive labels, human holds and merges, so any reader may be a decision reader
+ * (PR #6489: the label mirror named no flag and re-added a cleared review:human from a 30s-stale read). Only an
+ * explicit `fresh: false` may be served from the transport-branch TTL cache; any other value fetches.
+ *
  * @returns {{status: 'ok', records: object[], text: string} | {status: 'unreadable', reason: string, error: string}}
  */
 export function readLedgerFromGit({
-  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog,
+  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog, fresh,
 } = {}) {
+  fresh = fresh !== false;
   const path = ledgerGitPath(repo);
   let files;
   try {
@@ -140,7 +155,7 @@ export function readLedgerFromGit({
       if (!loggedCaps.has(line)) { loggedCaps.add(line); log(line); }
       run = sizedLedgerRun({ maxBytes: cap.maxBytes, source: cap.sources.maxBytes, ...(exec ? { exec } : {}) });
     }
-    files = readFromTransportBranch({ board, branch, paths: [path], run });
+    files = readFromTransportBranch({ board, branch, paths: [path], run, env, fresh });
   } catch (e) {
     const reason = e?.code === READ_CAP_CODE ? 'ledger-exceeds-read-cap' : 'transport-read-failed';
     return { status: 'unreadable', reason, error: String(e?.message ?? e) };
@@ -165,7 +180,9 @@ export function appendLedgerRows({
   message = `verdict-ledger: append ${repo}`,
   sleep = defaultSleep,
   random = Math.random,
+  clock = () => performance.now(),
   onRetry = null,
+  withAppendLock = withLedgerAppendLock, // tests can model remote contention with (_key, fn) => fn()
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
   if (!Array.isArray(records) || !records.length) throw new TypeError('verdict-ledger-io: `records` must be a non-empty array');
@@ -176,10 +193,12 @@ export function appendLedgerRows({
   const path = ledgerGitPath(repo);
   const errors = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const started = clock();
     try {
       let written = 0;
       let duplicates = 0;
-      stageOnTransportBranch({
+      let ran = false;
+      withAppendLock(JSON.stringify([repo, branch]), () => { stageOnTransportBranch({
         board,
         branch,
         message,
@@ -201,13 +220,20 @@ export function appendLedgerRows({
         }],
         ...seams,
         allowRef: LEDGER_PUSH_REF, // after the seams: a caller cannot loosen it
-      });
+      }); ran = true; });
+      if (!ran) throw new Error('verdict-ledger-io: append lock did not run the write; refusing to report appended');
       return { status: 'appended', attempts: attempt, rows: written, duplicates };
     } catch (e) {
       errors.push(e);
       if (attempt < attempts) {
         if (onRetry) onRetry({ attempt, error: e });
-        const cap = Math.min(100 * 2 ** (attempt - 1), 6400);
+        // A loaded checkout/parse/commit/push can take longer than the entire old
+        // backoff schedule. Yield at least one failed attempt's duration so rival
+        // writers can finish, retaining jitter and the eight-attempt fail-closed cap.
+        // Exhaustion still refuses the clearing row; the operator retries with the
+        // last Git cause reported rather than silently clearing without durability.
+        const duration = Math.max(0, clock() - started);
+        const cap = Math.max(Math.min(100 * 2 ** (attempt - 1), 6400), Math.min(2 * duration, 60_000));
         sleep(cap / 2 + random() * cap / 2);
       }
     }
@@ -227,7 +253,8 @@ export function appendGitRowsSync(rows, ctx = {}, { appendRows = appendLedgerRow
     const result = appendRows({ ...rest, repo: check.repo, records: check.records });
     return { ok: true, appended: result.rows ?? rows.length, duplicates: result.duplicates ?? 0 };
   } catch (e) {
-    return { ok: false, appended: 0, error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
+    // Redact BEFORE truncating so a cut can never strand a secret fragment.
+    return { ok: false, appended: 0, error: ledgerWriteErrorSummary(String(e?.message ?? e)).slice(0, 300) };
   }
 }
 

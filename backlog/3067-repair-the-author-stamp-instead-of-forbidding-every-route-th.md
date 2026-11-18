@@ -125,3 +125,7 @@ something** when it does fire — which requires it to stay silent when independ
 3. **Executable** — a case where the clearer's session id differs from a *restored* author stamp asserts
    the comment carries **no** ⚠️ independence line. It must RED today, where the absent stamp forces the
    warning regardless of who actually cleared it.
+
+## Progress (2026-11-07)
+
+PR #6409 adds daemon-side auto-repair from edit history, which appears to cover detect, restore and the web-UI route. Remains: verify "refuse when the opener is unrecoverable"; check related open 3135 (wire detection into review-set-label/auto-land-seam).

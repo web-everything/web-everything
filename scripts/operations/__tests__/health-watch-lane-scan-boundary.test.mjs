@@ -147,8 +147,9 @@ describe('health-watch destructive lane action call-site contract', () => {
       'scripts/conveyor/health-watch.mjs:tick:unlinkSync(overrunPath)',
     ];
     const violations = sites => sites.filter(({ site, guarded }) => !ALLOWLIST.includes(site) && !guarded);
-    const sites = scopedScanFiles(['scripts/lib/health-watch-lane-scan.mjs',
-      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs'])
+    // Full inventory on every run: the allowlist spans all three files, so a scoped scan cannot equal it.
+    const sites = ['scripts/lib/health-watch-lane-scan.mjs',
+      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs']
       .flatMap(file => scan(readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'), file));
     expect(sites.map(({ site }) => site).sort()).toEqual([...ALLOWLIST].sort());
     expect(violations(sites)).toEqual([]);
@@ -357,6 +358,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents",
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches",
       "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots",
+      "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync",
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs",
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot",
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath",
@@ -371,6 +373,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/lane-verify.mjs#readVerifyMarker:readVerifyMarker",
       "helper:../lib/ledger-readiness-daily.mjs#ledgerReadinessHistoryPath:ledgerReadinessHistoryPath",
       "helper:../lib/ledger-readiness-daily.mjs#runDailyReadinessCheck:runDailyReadinessCheck",
+      "helper:../lib/mirror-sync.mjs#mirrorSyncForTick:mirrorSyncForTick",
       "helper:../lib/pr-events.mjs#readPrEventsStatuses:readPrEventsStatuses",
       "helper:../lib/pr-limit.mjs#isGlobalOffNow:isGlobalOffNow",
       "helper:../lib/pr-limit.mjs#resolvePrLimit:resolvePrLimit",
@@ -385,6 +388,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../operations/needs-you-feed.mjs#publishAttention:publishAttention",
       "helper:../operations/review-extra-seats.mjs#readSeatCapUsage:readSeatCapUsage",
       "helper:../operations/run-store.mjs#daemonJobsRoot:daemonJobsRoot",
+      // Archive-only hook: handles run/session files, never lane actions. Keep its exact count below.
+      "helper:./archive-retention-tick.mjs#runArchiveRetentionTick:runArchiveRetentionTick",
       "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked",
       "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions",
       "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns",
@@ -392,6 +397,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./claude-jobs-archive.mjs#formatClaudeJobsArchiveLine:formatClaudeJobsArchiveLine",
       "helper:./credential-inventory.mjs#normalizeInventory:normalizeInventory",
       "helper:./fix-loop-ledger.mjs#readFixLoopRows:readFixLoopRows",
+      "helper:./forge-share-probe.mjs#probeForgeShareForWatch:probeForgeShareForWatch",
       "helper:./health-file-request.mjs#planFileRequests:planFileRequests",
       "helper:./health-file-request.mjs#readLedgerStrict:readLedgerStrict",
       "helper:./health-file-request.mjs#recordRequested:recordRequested",
@@ -419,6 +425,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./heavy-run-ungated.mjs#findUngatedHeavyRuns:findUngatedHeavyRuns",
       "helper:./heavy-run-ungated.mjs#readRecentSamples:readRecentSamples",
       "helper:./heavy-run-ungated.mjs#summarizeSample:summarizeSample",
+      "helper:./lane-checkout-probe.mjs#probeLaneCheckouts:probeLaneCheckouts",
       "helper:./main-ci-red-io.mjs#probeAndOwnMainCi:probeAndOwnMainCi",
       "helper:./needs-you-feed-job.mjs#superviseNeedsYouFeed:(deps.ensureNeedsYouFeedJob ?? superviseNeedsYouFeed)",
       "helper:./nightly-coroner-job.mjs#coronerNightDue:coronerNightDue",
@@ -467,10 +474,11 @@ describe('health-watch destructive lane action call-site contract', () => {
   const allowedHelperCounts = {
     "scripts/conveyor/health-watch.mjs": {
       "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards": 1,
-      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 8,
+      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 9,
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents": 1,
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches": 1,
-      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 5,
+      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 6,
+      "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync": 1,
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs": 2,
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot": 3,
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath": 2,
@@ -479,12 +487,13 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/lane-history.mjs#laneJournalPath:laneJournalPath": 1,
       "helper:../lib/lane-history.mjs#readLaneJournalTail:readLaneJournalTail": 1,
       "helper:../lib/lane-history.mjs#reconcileLaneJournalEntry:reconcileLaneJournalEntry": 1,
-      "helper:../lib/lane-pool-paths.mjs#defaultPoolRoot:defaultPoolRoot": 2,
+      "helper:../lib/lane-pool-paths.mjs#defaultPoolRoot:defaultPoolRoot": 3,
       "helper:../lib/lane-pool-scan.mjs#laneIndicesIn:laneIndicesIn": 1,
       "helper:../lib/lane-pool-scan.mjs#poolsWithLanes:poolsWithLanes": 1,
       "helper:../lib/lane-verify.mjs#readVerifyMarker:readVerifyMarker": 1,
       "helper:../lib/ledger-readiness-daily.mjs#ledgerReadinessHistoryPath:ledgerReadinessHistoryPath": 1,
       "helper:../lib/ledger-readiness-daily.mjs#runDailyReadinessCheck:runDailyReadinessCheck": 1,
+      "helper:../lib/mirror-sync.mjs#mirrorSyncForTick:mirrorSyncForTick": 1,
       "helper:../lib/pr-events.mjs#readPrEventsStatuses:readPrEventsStatuses": 1,
       "helper:../lib/pr-limit.mjs#isGlobalOffNow:isGlobalOffNow": 1,
       "helper:../lib/pr-limit.mjs#resolvePrLimit:resolvePrLimit": 1,
@@ -499,12 +508,15 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../operations/needs-you-feed.mjs#publishAttention:publishAttention": 1,
       "helper:../operations/review-extra-seats.mjs#readSeatCapUsage:readSeatCapUsage": 1,
       "helper:../operations/run-store.mjs#daemonJobsRoot:daemonJobsRoot": 1,
+      // Non-destructive to lanes; repeats still require review like every other maintenance helper.
+      "helper:./archive-retention-tick.mjs#runArchiveRetentionTick:runArchiveRetentionTick": 1,
       "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked": 4,
       "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions": 1,
       "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns": 1,
       "helper:./claude-jobs-archive.mjs#archiveClaudeJobs:archiveClaudeJobs": 2,
       "helper:./credential-inventory.mjs#normalizeInventory:normalizeInventory": 1,
       "helper:./fix-loop-ledger.mjs#readFixLoopRows:readFixLoopRows": 2,
+      "helper:./forge-share-probe.mjs#probeForgeShareForWatch:probeForgeShareForWatch": 1,
       "helper:./health-file-request.mjs#planFileRequests:planFileRequests": 1,
       "helper:./health-file-request.mjs#readLedgerStrict:readLedgerStrict": 1,
       "helper:./health-file-request.mjs#recordRequested:recordRequested": 1,
@@ -530,6 +542,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./heavy-run-ungated.mjs#findUngatedHeavyRuns:findUngatedHeavyRuns": 1,
       "helper:./heavy-run-ungated.mjs#readRecentSamples:readRecentSamples": 1,
       "helper:./heavy-run-ungated.mjs#summarizeSample:summarizeSample": 1,
+      "helper:./lane-checkout-probe.mjs#probeLaneCheckouts:probeLaneCheckouts": 1,
       "helper:./main-ci-red-io.mjs#probeAndOwnMainCi:probeAndOwnMainCi": 1,
       "helper:./needs-you-feed-job.mjs#superviseNeedsYouFeed:(deps.ensureNeedsYouFeedJob ?? superviseNeedsYouFeed)": 1,
       "helper:./nightly-coroner-job.mjs#coronerNightDue:coronerNightDue": 1,
@@ -660,7 +673,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     ];
     const allowedReader = [
       'run(bin, argv)', "run('git', hardenLaneGitArgs(argv))",
-      "exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'])",
+      "exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json', '--max-age-ms=0'])",
       'laneGit([...LANE_CONFIG_LIST_ARGS])',
       "laneGit(['rev-parse', '--verify', '--quiet', ref])",
       "laneGit(['rev-list', '--count', 'HEAD', '--not', ...tips])",
@@ -674,7 +687,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     // Repeating an already reviewed mutation must fail even though the distinct
     // module/export inventory is unchanged. Pin each occurrence in both readers.
     const repeatedHelpers = file === 'scripts/conveyor/health-watch.mjs'
-      ? ['writeFileSync', 'renameSync', 'unlinkSync', 'mkdirSync']
+      ? ['writeFileSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'runArchiveRetentionTick']
       : ['cachedLaneScan', 'laneRedirectConfig', 'hardenLaneGitArgs', 'laneProbeEnv', 'assertPushRef'];
     for (const callee of repeatedHelpers) {
       const call = Object.keys(allowedHelpers).find(key => key.endsWith(`:${callee}`));
@@ -714,7 +727,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     // Exact commands, not a blacklist of today's destructive verbs. Any added
     // action must change this contract and demonstrate its guardLaneAction gate.
     expect(run.mock.calls.map(([, argv]) => argv)).toEqual([
-      ['/fixture/scripts/lane-pool.mjs', 'status', '--json'],
+      ['/fixture/scripts/lane-pool.mjs', 'status', '--json', '--max-age-ms=0'],
       ['config', '--show-scope', '--list', '--includes', '-z'],
       ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/lane/fixture'],
       ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],

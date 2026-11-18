@@ -23,7 +23,7 @@ export function classifySkipReason(reason) {
   const r = String(reason ?? '');
   // All four card-group hold reasons (we:scripts/lib/card-group.mjs#cardGroupHold).
   if (/^grouped into | is reserved by open card group |^card-group state unreadable|^card-group repository identity missing/.test(r)) return 'card-grouped';
-  if (/^red-main-hold\b/.test(r)) return 'red-main-hold'; // we:scripts/lib/red-main-hold.mjs — main is red, only the fix PR lands
+  if (/^(?:red-main-hold|freeze-unreadable-hold)\b/.test(r)) return 'red-main-hold'; // Stable pass-level kind, including unreadable freeze evidence.
   if (/mergeable=UNKNOWN|merge state UNKNOWN/i.test(r)) return 'unknown-mergeability';
   if (/mergeable=CONFLICTING|DIRTY/.test(r) && !/BEHIND⇒/.test(r)) return 'conflicting';
   if (/\bBEHIND\b/.test(r)) return 'behind';
@@ -53,9 +53,10 @@ const keyOf = (x) => `${x?.repo ?? ''}#${x?.num}`;
  * @param {Array<{num,repo?,reason?,role?}>} [p.coupleHeld]
  * @param {Array<{num,repo?,waitOn?,overlapYield?}>} [p.deferred]
  * @param {Array<{num,repo?,reasons?}>} [p.parked]
+ * @param {Array<{num,repo?,outcome?,kind?,reason?}>} [p.enqueueOutcomes] real enqueue holds for ready PRs (#6222)
  * @returns {Array<{num:number,repo:string|null,kind:string,reason:string,source:string}>}
  */
-export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = [], revalidationAborted = [], pendingRebased = [], coupleHeld = [], deferred = [], parked = [] } = {}) {
+export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = [], revalidationAborted = [], pendingRebased = [], coupleHeld = [], deferred = [], parked = [], enqueueOutcomes = [] } = {}) {
   const landed = new Set(merged.map(keyOf));
   const rows = new Map();
   const put = (x, kind, reason, source) => {
@@ -82,8 +83,11 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   }
   // Listed ready at pass start but never landed and never reported by a bucket above. Name the cause: a couple
   // partner (same item) that did not land, else the pass simply ended before reaching it.
+  const heldAtEnqueue = new Map(enqueueOutcomes.filter((o) => o?.outcome === 'not-enqueued').map((o) => [keyOf(o), o]));
   for (const v of verdicts) {
     if (v.decision !== 'merge') continue;
+    const held = heldAtEnqueue.get(keyOf(v));
+    if (held) { put(v, String(held.kind || 'batching-deferred'), held.reason || 'admission deferred', 'enqueueOutcomes'); continue; }
     const partner = v.item == null ? null : verdicts.find((o) => o !== v && o.item != null && String(o.item) === String(v.item)
       && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)));
     if (partner) {

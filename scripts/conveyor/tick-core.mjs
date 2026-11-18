@@ -203,7 +203,7 @@ function laneNumFromOverlapReason(reason) {
 }
 
 /** Human-readable load reading for a #4076/#4343 `load-cap` note's `text` — e.g. `"cpu idle 12% (<15%)"`,
- *  `"mem pressure 2 (>=2)"`, or `"load1 60.00/12 cores (5.00 > backstop 4)"`. `../readiness/heavy-admission.mjs
+ *  `"mem pressure 2 (>=2)"`, or `"load1 60.00/host core count (5.00 > backstop 4)"`. `../readiness/heavy-admission.mjs
  *  #loadAdmissionDecision` already names the exact condition that held in its own `reason` field — this simply
  *  surfaces it rather than re-deriving the same decision a second time. Falls back to a bare threshold mention
  *  when the IO shell's `loadAdmission` carries no `reason` at all (e.g. a bypass reason, or a caller that only
@@ -632,6 +632,21 @@ export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = 
   return { live, retired };
 }
 
+export const PREPARE_REFUSAL_LIMIT = 2;
+export const PREPARE_REFUSAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function recentPrepareRefusals(timestamps, now) {
+  return Array.isArray(timestamps) ? timestamps.filter(at => Number.isFinite(at)
+    && at <= now && now - at <= PREPARE_REFUSAL_WINDOW_MS) : [];
+}
+
+function prepareRefusalSkipNote(num, prepareRefusals, guardNums, prs, now) {
+  if (guardNums.has(normNum(num)) || openPrForNum(prs, num)) return null;
+  const count = recentPrepareRefusals(prepareRefusals?.[normNum(num)], now).length;
+  return count >= PREPARE_REFUSAL_LIMIT ? { kind: 'prepare-refusal-skip', num,
+    text: `#${num} — ${count} prepare refusals within 24h; retry after the refusal window or request human review` } : null;
+}
+
 /**
  * PLAN the prepare-scope + prepare-decision spawns (SKILL §3b / §3e). For every unscoped held item
  * (`state.unshaped`) and every UNPREPARED decision (`state.decisions[].prepared === false`), spawn ONE prepare
@@ -641,10 +656,10 @@ export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = 
  * item HOLDS (a note, no spawn — atomic `acquire` would fail one race anyway). Pure — mutates nothing; returns
  * the spawns, the new guard entries, the lanes it consumed, and any hold notes.
  *
- * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], needsPrepare?:object[], prs?:object[], livePrepareGuards?:object[], availableLanes?:Array<*>, maxConcurrentItemPrepares?:number, tick:number, now?:number|null, trace?:boolean, dispatchPaused?:boolean, pausedKinds?:string[]|null }} ctx
+ * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], needsPrepare?:object[], prs?:object[], livePrepareGuards?:object[], availableLanes?:Array<*>, maxConcurrentItemPrepares?:number, prepareRefusals?:Record<string, number[]>, tick:number, now?:number|null, trace?:boolean, dispatchPaused?:boolean, pausedKinds?:string[]|null }} ctx
  * @returns {{ scopeSpawns:Array<{num:*, lane:*}>, decisionSpawns:Array<{num:*, lane:*}>, investigationSpawns:Array<{num:*, lane:*}>, itemPrepareSpawns:Array<{num:*, lane:*}>, newGuards:Array<object>, consumedLanes:Array<*>, notes:Array<{kind:string, num:*, text:string}> }}
  */
-export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], needsPrepare = [], prepareHeldNums = [], prs = [], livePrepareGuards = [], availableLanes = [], maxConcurrentItemPrepares = 2, itemPrepareAttempts = {}, itemPrepareRetryCap = DEFAULT_PREPARE_ITEM_RETRY_CAP, tick = 0, now = null, trace = false, dispatchPaused = false, pausedKinds = null } = {}) {
+export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], needsPrepare = [], prepareHeldNums = [], prs = [], livePrepareGuards = [], availableLanes = [], maxConcurrentItemPrepares = 2, itemPrepareAttempts = {}, prepareRefusals = {}, itemPrepareRetryCap = DEFAULT_PREPARE_ITEM_RETRY_CAP, tick = 0, now = null, trace = false, dispatchPaused = false, pausedKinds = null } = {}) {
   const prepareHeld = new Set(prepareHeldNums.map(normNum));
   livePrepareGuards = livePrepareGuards.filter((g) => g.kind !== 'prepare-item' || !prepareHeld.has(normNum(g.num)));
   const guardNums = new Set((Array.isArray(livePrepareGuards) ? livePrepareGuards : []).map((g) => normNum(g.num)));
@@ -700,7 +715,14 @@ export function planPrepareSpawns({ unshaped = [], decisions = [], investigation
     .map((p, i) => ({ p, i, n: attemptsOf(p.num) }))
     .sort((a, b) => (a.p.prepareWindowOrder ?? Infinity) - (b.p.prepareWindowOrder ?? Infinity) || a.n - b.n || a.i - b.i)
     .map(({ p }) => p);
+  const refusalNow = now ?? Date.now();
   for (const p of itemCandidates) {
+    // Only NEW candidates are held; live guards and already-running work are untouched.
+    const refusalNote = prepareRefusalSkipNote(p.num, prepareRefusals, guardNums, prs, refusalNow);
+    if (refusalNote) {
+      notes.push(refusalNote);
+      continue;
+    }
     if (!guardNums.has(normNum(p.num)) && attemptsOf(p.num) >= itemPrepareRetryCap) {
       if (!(dispatchPaused === true || (Array.isArray(pausedKinds) && pausedKinds.includes('prepare-item')))) notes.push({ kind: 'prepare-item-retry-cap', num: p.num, text: `⏸ #${p.num} — prepare-item produced no PR in ${attemptsOf(p.num)} attempt(s); left for a human` });
       continue;
@@ -1161,7 +1183,7 @@ export function buildStatusLine({ queue = [], lanes = [], prs = [], health = {},
  *   freeLanes?: Array<*>,                // free lane ids (lane-pool list --acquirable) — for prepare/fix assignment
  *   bookkeeping?: {                      // the conveyor's prior in-session process state (SKILL §5)
  *     tick?:number, buildGuards?:object[], prepareGuards?:object[], fixGuards?:object[],
- *     fixAttempts?:object, watched?:Array<number>, launchedNums?:Array<*>,
+ *     fixAttempts?:object, prepareRefusals?:Record<string, number[]>, watched?:Array<number>, launchedNums?:Array<*>,
  *   },
  *   signals?: { returnedBuildNums?:Array<*> },  // async events the shell folds in (Agent returns)
  *   prRearmCounts?: object,              // DURABLE per-PR re-arm-comment counts { [pr]: n } — the restart-surviving retry-cap floor (#2643); the IO shell derives it via `countRearmComments`
@@ -1250,6 +1272,11 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     verbose: config.verbose === true,
   };
   const tick = Number(bookkeeping.tick) || 0;
+  const refusalNow = now ?? Date.now();
+  // Persist only the rolling refusal window, including its exact lower boundary; never mutate the input.
+  const prepareRefusals = Object.fromEntries(Object.entries(bookkeeping.prepareRefusals ?? {})
+    .map(([num, timestamps]) => [num, recentPrepareRefusals(timestamps, refusalNow)])
+    .filter(([, timestamps]) => timestamps.length > 0));
   const { queue = [], unshaped = [], needsSlice = [], decisions = [], lanes = [], prs = [], health = {}, infraBlocked = [] } = state;
   // #3567 — the `needs-investigation` holds, read straight off THIS TICK's dispatch plan (not off `state`, the
   // way `unshaped`/`decisions` are): an investigation has no separate state-derivation step (no `prepared`
@@ -1293,34 +1320,6 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     config.prepareAutoSize === undefined && Array.isArray(config.launchKinds)
     && config.launchKinds.includes('prepare-item') && !config.launchKinds.includes('prepare')
     && readPreparePolicy().autoSize);
-  const prepareWindow = prepareAheadNums({
-    queue, launch: plan.launch,
-    held: prepareAutoSize && Array.isArray(plan.held)
-      ? plan.held.map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
-      : plan.held,
-    window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
-    skip: bookkeeping.prepareHeldNums ?? [],
-  });
-  const prepareCandidates = (Array.isArray(plan.held) ? plan.held : [])
-    .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale' || (prepareAutoSize && h.reason === 'no-size')) && h.num != null);
-  const readyOrder = new Map(queue.map((r, i) => [normNum(r.num), i]));
-  const stalePriority = new Map(queue
-    .filter(r => Number.isFinite(r.buildPriority))
-    .map(r => [normNum(r.num), r.buildPriority]));
-  const staleRank = h => h.reason === 'prepare-stale' ? stalePriority.get(normNum(h.num)) ?? Infinity : Infinity;
-  const needsPrepareHeld = prepareCandidates
-    .filter((h) => !prepareWindow || prepareWindow.has(normNum(h.num)))
-    // Stale operator-priority cards get the slots first, then fresh cards in ready order.
-    .sort((a, b) => prepareWindow ? staleRank(a) - staleRank(b)
-      || (readyOrder.get(normNum(a.num)) ?? Infinity) - (readyOrder.get(normNum(b.num)) ?? Infinity) : 0)
-    .map((h, i) => ({ num: h.num, ...(prepareWindow ? { prepareWindowOrder: i } : {}) }));
-  const prepareWindowNotes = prepareWindow
-    ? prepareCandidates.filter((h) => !prepareWindow.has(normNum(h.num))).map((h) => ({
-      kind: 'prepare-ahead-window', num: h.num,
-      text: `⏸ #${h.num} — prepare waits: not within the next ${config.prepareAheadWindow} to build`,
-    }))
-    : [];
-
   // #3849 — the `no-size` holds, read straight off THIS TICK's dispatch plan, same pattern as
   // `needs-investigation` just above (#3567): a no-size item has no separate `state` derivation step either.
   // Unless auto-size routes it to prepare-item above, it is folded into the SAME `prepare` candidate set
@@ -1350,6 +1349,39 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     unshaped: scopeOrSizeNeeded, decisions, investigations: heldGuardPending, needsPrepare: heldGuardPending, prs, tick, now, ttlTicks: cfg.prepareTtlTicks,
     lanes, itemPrepareTtlTicks: cfg.prepareItemTtlTicks,
   });
+  // Evaluate refusal skips against LIVE guards, then exclude them before taking the prepare-ahead window.
+  const prepareGuardNums = new Set(prepare.live.map(g => normNum(g.num)));
+  const prepareCandidates = (Array.isArray(plan.held) ? plan.held : [])
+    .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale' || (prepareAutoSize && h.reason === 'no-size')) && h.num != null);
+  const refusalNotes = prepareCandidates.filter(h => !prepareHeld.has(normNum(h.num)))
+    .map(h => prepareRefusalSkipNote(h.num, prepareRefusals, prepareGuardNums, prs, refusalNow)).filter(Boolean);
+  const refusalSkippedNums = new Set(refusalNotes.map(note => normNum(note.num)));
+  const eligiblePrepareCandidates = prepareCandidates.filter(h => !refusalSkippedNums.has(normNum(h.num)));
+  const prepareWindow = prepareAheadNums({
+    queue, launch: plan.launch,
+    held: prepareAutoSize && Array.isArray(plan.held)
+      ? plan.held.map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
+      : plan.held,
+    window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
+    skip: [...prepareHeld, ...refusalSkippedNums],
+  });
+  const readyOrder = new Map(queue.map((r, i) => [normNum(r.num), i]));
+  const stalePriority = new Map(queue
+    .filter(r => Number.isFinite(r.buildPriority))
+    .map(r => [normNum(r.num), r.buildPriority]));
+  const staleRank = h => h.reason === 'prepare-stale' ? stalePriority.get(normNum(h.num)) ?? Infinity : Infinity;
+  const needsPrepareHeld = eligiblePrepareCandidates
+    .filter((h) => !prepareWindow || prepareWindow.has(normNum(h.num)))
+    // Stale operator-priority cards get the slots first, then fresh cards in ready order.
+    .sort((a, b) => prepareWindow ? staleRank(a) - staleRank(b)
+      || (readyOrder.get(normNum(a.num)) ?? Infinity) - (readyOrder.get(normNum(b.num)) ?? Infinity) : 0)
+    .map((h, i) => ({ num: h.num, ...(prepareWindow ? { prepareWindowOrder: i } : {}) }));
+  const prepareWindowNotes = [...refusalNotes, ...(prepareWindow
+    ? eligiblePrepareCandidates.filter((h) => !prepareWindow.has(normNum(h.num))).map((h) => ({
+      kind: 'prepare-ahead-window', num: h.num,
+      text: `⏸ #${h.num} — prepare waits: not within the next ${config.prepareAheadWindow} to build`,
+    }))
+    : [])];
   // #4504 advisory — per-item prepare-item attempt tally (in-session, like `fixAttempts`). A TTL retirement is
   // one attempt that produced no PR; it feeds planPrepareSpawns' rotation + retry cap. An entry is dropped once
   // its item is no longer held at all (prepared, resolved, or re-shaped), so it never outlives its reason.
@@ -1551,6 +1583,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     availableLanes,
     maxConcurrentItemPrepares: cfg.maxConcurrentItemPrepares,
     itemPrepareAttempts,
+    prepareRefusals,
     itemPrepareRetryCap: cfg.prepareItemRetryCap,
     tick,
     now,
@@ -1853,6 +1886,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
       buildGuards: liveBuildGuards,
       prepareGuards: livePrepareGuards,
       itemPrepareAttempts,
+      prepareRefusals,
       fixGuards: liveFixGuards,
       fixAttempts: fixPlan.fixAttempts,
       ciHealGuards: liveCiHealGuards,

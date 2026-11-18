@@ -9,7 +9,8 @@
  *     seated inside the review pipeline. That module's argv/parsing pattern is mirrored here where it applies
  *     (the stdin-trap avoidance, JSONL-is-a-stream discipline, parent-imposed timeout wall), but the MODE is
  *     the opposite: this script runs Codex WITH tools, WITH write access, on an OPEN-ENDED prompt, and expects
- *     real file edits as the result — there is no `--output-schema`, no answer to parse out of the stream.
+ *     real file edits as the result. Review callers may optionally constrain the final answer with
+ *     `--output-schema-file=<path>` (forwarded to `codex exec --output-schema <path>`).
  *   - the `xu2pp2m` review/fix-dispatch minimal-context design — that work is about STRIPPING an agent's
  *     context down for a machine-owned production wrapper installed on someone else's box. This script has no
  *     such constraint: it runs on the OPERATOR'S OWN machine, for the OPERATOR'S OWN judgment call about
@@ -68,6 +69,8 @@
  * Runs inline by default. --detach launches a persistent background job with stdout/stderr files;
  * wait --job=<id>: poll until the requested deadline (exit 75 means still running).
  * A terminal task exit 75 is preserved in JSON but wait exits 1, so callers stop retrying.
+ * Waiter IO/probe errors return status=wait-error with exit 2, not a terminal worker verdict.
+ * Retain ownership and recover the same job; a waiter error never stops its worker.
  * Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.
  * Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.
  * All IO shares that single requested deadline; no floor or additional grace.
@@ -80,6 +83,7 @@
  *
  *   node scripts/codex-direct-task.mjs --task="…" --detach
  *   node scripts/codex-direct-task.mjs wait --job=<id> [--max-ms=540000]
+ *     Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms>.
  *
  * Flags: --detach (return a job id immediately), --task=<text> | --task-file=<path> (one required), --dir=<existing dir> (default: fresh scratch
  * clone), --repo-root=<path> (default: this script's own repo root — where a scratch clone is cloned FROM),
@@ -100,21 +104,22 @@
  * Detached job records preserve the task's nonzero code; timeout, a red gate or a failed transcript check falls back to 1.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-transcript-policy.mjs';
 import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
-import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
+import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
+  realpathSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -190,14 +195,68 @@ export {
  *   false — see file header for why this script's default differs from the judge role's.
  * @param {string[]} [opts.addDirs] - forwarded as repeated `--add-dir`, for a task that legitimately needs to
  *   touch more than one directory (rare; most callers leave this empty).
- * @param {string[]} [opts.writableRoots] - edit-only gitdir, admission lock root and private temp root.
+ * @param {string[]} [opts.writableRoots] - edit-only gitdir, heavy + remote admission roots and private temp root.
  * @param {string} [opts.tempRoot] - edit-only fixture temp directory, pinned in the child shell environment.
  * @param {string} [opts.resumeThreadId] - resume this session using the same exec-level configuration.
  * @returns {string[]} argv AFTER the `codex` binary name.
  */
+/**
+ * Validate a thread id to resume. Shared by the argv builder, `codexDirectTask` and the `--resume` CLI flag so all
+ * three refuse the same inputs.
+ * @param {unknown} resumeThreadId
+ * @param {{ephemeral?: boolean}} [opts]
+ */
+export function assertResumeThreadId(resumeThreadId, { ephemeral = false } = {}) {
+  if (typeof resumeThreadId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(resumeThreadId)) {
+    throw new TypeError('codex-direct-task: `resumeThreadId` must be a session id or thread name');
+  }
+  if (ephemeral) throw new TypeError('codex-direct-task: cannot resume an ephemeral task');
+}
+
+/**
+ * Parse the CLI's `--resume=<threadId>` flag (R302). Returns undefined when absent. A resumed thread continues the
+ * work in the checkout it already edited, so `--dir` is required (a fresh scratch clone would not hold that work), and
+ * `--output-schema-file` is refused because `codex exec resume` does not support `--output-schema`.
+ * @param {Record<string, string|boolean>} flags - parsed CLI flags.
+ * @returns {string|undefined}
+ */
+export function parseResumeFlag(flags) {
+  if (flags.resume === undefined) return undefined;
+  if (typeof flags.resume !== 'string' || !flags.resume) {
+    throw new TypeError('codex-direct-task: --resume needs a value: --resume=<threadId> from the previous run\'s report (events.threadId)');
+  }
+  assertResumeRequest({ resumeThreadId: flags.resume, ephemeral: Boolean(flags.ephemeral),
+    outputSchemaFile: flags['output-schema-file'], dir: typeof flags.dir === 'string' ? flags.dir : undefined });
+  return flags.resume;
+}
+
+/**
+ * The whole resume contract, shared by `codexDirectTask` and `--resume`: a valid id, not ephemeral, an explicit
+ * checkout, and no output schema (which `codex exec resume` would silently drop).
+ * @param {{resumeThreadId: unknown, ephemeral?: boolean, outputSchemaFile?: unknown, dir?: unknown}} request
+ */
+export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputSchemaFile, dir }) {
+  assertResumeThreadId(resumeThreadId, { ephemeral });
+  if (outputSchemaFile !== undefined) {
+    throw new TypeError('codex-direct-task: --resume cannot be combined with --output-schema-file (codex exec resume has no --output-schema)');
+  }
+  if (typeof dir !== 'string' || !dir) {
+    throw new TypeError('codex-direct-task: --resume requires --dir=<checkout> (the checkout the resumed thread already edited)');
+  }
+}
+
+/** R650: directory of refusing vitest/playwright/npx shims, prepended to PATH inside Codex runs only. */
+export const CODEX_SHIM_DIR = resolve(process.env.WE_CODEX_SHIM_DIR || join(dirname(new URL(import.meta.url).pathname), 'codex-shims'));
+/** PATH with the shim dir first (deduped). */
+export function codexShimPath(env = process.env) {
+  const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
+  return [CODEX_SHIM_DIR, ...rest].join(':');
+}
+
 export function buildCodexDirectTaskArgv({
   cwd,
   outputLastMessageFile,
+  outputSchemaFile,
   model, effort, tier, taskKind, size, epic, decision, care, mandatoryLens,
   env = process.env, route,
   ephemeral = false,
@@ -216,6 +275,13 @@ export function buildCodexDirectTaskArgv({
   // #4194 — REVIEW MODE runs Codex under its own `read-only` sandbox: a review seat reads the checkout and reports
   // findings; it must never edit anything. Every other caller keeps `workspace-write`, unchanged.
   const argv = ['exec', '--json', '-s', review ? 'read-only' : 'workspace-write', '--skip-git-repo-check', '-C', cwd];
+  if (outputSchemaFile !== undefined) {
+    if (typeof outputSchemaFile !== 'string' || !outputSchemaFile.trim()) {
+      throw new TypeError('codex-direct-task: `outputSchemaFile` must be a non-empty path when given');
+    }
+    // `exec resume` does not support --output-schema; validate the option on every path.
+    if (resumeThreadId === undefined) argv.push('--output-schema', outputSchemaFile);
+  }
   if (outputLastMessageFile) {
     if (typeof outputLastMessageFile !== 'string' || !outputLastMessageFile.trim()) {
       throw new TypeError('codex-direct-task: `outputLastMessageFile` must be a non-empty path when given');
@@ -247,6 +313,8 @@ export function buildCodexDirectTaskArgv({
     }
     argv.push('-c', 'sandbox_workspace_write.network_access=true');
     if (writableRoots.length) argv.push('-c', `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`);
+    // R650: shim dir first on the shell PATH so bare vitest/playwright/npx-vitest refuse (heavy-admission bypass).
+    argv.push('-c', `shell_environment_policy.set.PATH=${JSON.stringify(codexShimPath(env))}`);
     if (tempRoot) {
       for (const name of ['TMPDIR', 'TMP', 'TEMP']) {
         argv.push('-c', `shell_environment_policy.set.${name}=${JSON.stringify(tempRoot)}`);
@@ -256,10 +324,7 @@ export function buildCodexDirectTaskArgv({
   // Exec-level options precede the subcommand: resume itself does not accept -s/-C/--add-dir.
   // Reuse all routed configuration and grants rather than inheriting the user's defaults.
   if (resumeThreadId !== undefined) {
-    if (typeof resumeThreadId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(resumeThreadId)) {
-      throw new TypeError('codex-direct-task: `resumeThreadId` must be a session id or thread name');
-    }
-    if (ephemeral) throw new TypeError('codex-direct-task: cannot resume an ephemeral task');
+    assertResumeThreadId(resumeThreadId, { ephemeral });
     argv.push('resume', resumeThreadId, '-');
   }
   // Everything rides stdin, closed via `.end()`.
@@ -519,6 +584,123 @@ export function collectAndClearRolloutQuota({
   return { quota, rolloutFile, deleted: true };
 }
 
+// ── scratch-clone cleanup (R731 slice 1) ─────────────────────────────────────────────────────────
+/**
+ * Delete a scratch clone ONLY when nothing in it could be lost. Kept (and the path reported) when any of these
+ * holds: `git status` shows anything (untracked files are forced visible with `--untracked-files=all`, so a
+ * user's `status.showUntrackedFiles=no` cannot hide them), an ignored entry other than a `node_modules`
+ * DIRECTORY exists (the installed dependencies are expected; a gitignored `.env`, `coverage/`, notes file, or a
+ * file / symlink named `node_modules` is not), HEAD is not `startSha`, a stash exists, or a local branch holds a commit that `startSha` does not
+ * reach, or a submodule exists (its stashes and branches live in its own repository, invisible to every parent
+ * read). No patch is written: the clone itself is the preserved artifact. Fails closed: if any of those reads
+ * fails, the clone is kept. Every read runs with the shared lane git hardening (config pins such as
+ * `core.fsmonitor=false`, repository-location env scrubbed); a clone that defines a filter driver is kept; and
+ * `-C dir` must be the clone's own top level, else the clone is kept. Synchronous, so a signal handler can call it.
+ *
+ * Accepted gaps (recorded, not hidden): an annotated or lightweight TAG on a commit outside `startSha`'s history
+ * is not checked, because the clone copies the source repo's tags and many of those legitimately sit off-history;
+ * ignored files inside a `node_modules`-named directory are treated as dependencies; reflog-only commits are
+ * not checked. Refs checked: every ref except `refs/remotes/*` and `refs/tags/*` (plus the stash).
+ */
+export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmFn = rmSync } = {}) {
+  const keep = (reason) => ({ removed: false, path: dir, reason });
+  // Codex can write this clone's git config and the CLI may inherit GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE: run every
+  // read with the shared lane pins (`core.fsmonitor=false` — a hook could otherwise run on the host or report "clean"),
+  // no replace refs, no optional index lock, and the repository-location env scrubbed so `-C dir` cannot inspect another repo.
+  // `core.fileMode=true` is pinned for cleanup only: Codex (or the host) can set `core.fileMode=false` in the clone's
+  // config, which hides an executable-bit change from `status`. Forcing it on can only keep more clones (a filesystem
+  // that cannot hold the bit reports a change), never delete one that holds a mode edit.
+  const gitHardened = (args) => String(execFn('git', ['-C', dir, '--no-optional-locks', ...laneGitConfigArgs(), '-c', 'core.fileMode=true', '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: GIT_STEP_TIMEOUT_MS }));
+  const git = (...args) => gitHardened(args);
+  try {
+    // A filter driver would run on worktree content during `status`; refuse such a clone (kept, not deleted).
+    assertNoLaneFilterDrivers(gitHardened);
+    // `-C dir` must be the clone's own top level: with `.git` removed git would walk up and report on a parent repo.
+    if (realpathSync(git('rev-parse', '--show-toplevel').trim()) !== realpathSync(dir)) return keep('not the clone\'s own repository');
+    // Two reads: `--untracked-files=all` lists every changed/untracked file; `--ignored=traditional` (with
+    // `--untracked-files=normal`) lists ignored paths collapsed to their top directory, so `node_modules/`
+    // stays one line instead of thousands.
+    if (git('status', '--porcelain', '--untracked-files=all').trim() !== '') return keep('uncommitted changes');
+    const ignored = git('status', '--porcelain', '--untracked-files=normal', '--ignored=traditional')
+      .split('\n').filter((line) => line.startsWith('!! '));
+    // Directory-only exception: git prints an ignored directory with a trailing `/` and an ignored file or symlink
+    // without one, so a regular file (or link) named `node_modules` is NOT the installed dependencies and keeps the clone.
+    const isDependencyDir = (line) => line.endsWith('/') && line.slice(3).replace(/\/+$/, '').split('/').pop() === 'node_modules';
+    if (ignored.some((line) => !isDependencyDir(line))) return keep('ignored files present');
+    if (!startSha) return keep('no baseline commit recorded');
+    const head = git('rev-parse', 'HEAD').trim();
+    if (head !== startSha) return keep('HEAD moved');
+    if (git('stash', 'list').trim() !== '') return keep('stash present');
+    // Any ref except the source's remote-tracking refs and tags (see the accepted gaps above): local branches,
+    // custom refs such as `refs/codex/*`, notes, the stash.
+    if (git('rev-list', '--max-count=1', '--exclude=refs/remotes/*', '--exclude=refs/tags/*', '--all', '--not', startSha).trim() !== '') {
+      return keep('a ref holds commits outside the start');
+    }
+    // Linked worktrees would be orphaned by the delete and may hold a detached-HEAD commit.
+    if (git('worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length > 1) return keep('linked worktree present');
+    // A submodule is its own repository (its own stashes, branches, reflog, objects under `.git/modules`) that none
+    // of the parent reads above can see, so any submodule keeps the clone: a gitlink in the index, or a surviving
+    // `.git/modules` directory (a submodule removed from the index leaves its repository behind).
+    if (git('ls-files', '--stage').split('\n').some((l) => l.startsWith('160000 '))) return keep('submodule present');
+    if (existsSync(resolve(dir, git('rev-parse', '--git-path', 'modules').trim()))) return keep('submodule present');
+    // `git status` cannot see edits to files marked assume-unchanged (lowercase tag) or skip-worktree (`S`).
+    if (git('ls-files', '-v').split('\n').some((l) => /^[a-zS] /.test(l))) return keep('files hidden from status (assume-unchanged / skip-worktree)');
+  } catch {
+    return keep('status unreadable');
+  }
+  try {
+    rmFn(dir, { recursive: true, force: true });
+  } catch {
+    return keep('delete failed');
+  }
+  return { removed: true, path: dir, reason: 'clean' };
+}
+
+/**
+ * Applies `cleanupScratchClone` when the run ends normally (`finish()`). Created before the clone exists;
+ * `arm(dir, startSha)` binds it. `finish()` is idempotent and removes the listeners. The signal handler NEVER
+ * deletes (the worker may still be writing): it prints the `scratch clone KEPT (...)` line, removes its
+ * listeners, and — because listening swallowed the signal's default action — re-raises the same
+ * signal on `proc` when no other listener remains, so the process still terminates as it would have. When another
+ * listener (the CLI's own handler) exists, it is left to do the exiting.
+ */
+export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmFn = rmSync } = {}) {
+  let target = null;
+  let result = null;
+  let signaled = false;
+  const run = () => {
+    if (result) return result;
+    if (!target) return null;
+    // A signal already told the operator the clone is KEPT; a later finish() must not contradict that.
+    if (signaled) { result = { removed: false, path: target.dir, reason: 'interrupted by signal' }; return result; }
+    result = cleanupScratchClone({ ...target, execFn, rmFn });
+    return result;
+  };
+  const report = (r) => {
+    if (r && !r.removed) { try { process.stderr.write(`codex-direct-task: scratch clone KEPT (${r.reason}): ${r.path}\n`); } catch { /* best-effort */ } }
+  };
+  const handlers = {};
+  const off = () => { for (const sig of Object.keys(handlers)) proc.removeListener(sig, handlers[sig]); };
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    handlers[sig] = () => {
+      // A signal NEVER deletes: the worker may still be writing (its kill is a separate listener), so the
+      // clone is kept and its path reported. Only a normal run end (`finish()`) applies the delete rule.
+      signaled = true;
+      try { if (target) report({ removed: false, path: target.dir, reason: 'interrupted by signal' }); } catch { /* never throw from a signal handler */ }
+      off();
+      // We swallowed the default action by listening; restore it when nobody else is listening.
+      if (typeof proc.kill === 'function' && proc.listenerCount(sig) === 0) proc.kill(proc.pid, sig);
+    };
+    proc.prependListener(sig, handlers[sig]);
+  }
+  return {
+    arm(dir, startSha) { target = { dir, startSha }; },
+    setStart(startSha) { if (target) target.startSha = startSha; },
+    finish() { off(); return run(); },
+  };
+}
+
 // ── impure: scratch clone, diff capture, gate ────────────────────────────────────────────────────
 
 /** `execFileSync`-shaped default with room for large diffs and git/npm/gate output. */
@@ -558,7 +740,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
       const stdout = Buffer.concat(output.stdout).toString('utf8');
       const stderr = Buffer.concat(output.stderr).toString('utf8');
       if (failure || code !== 0 || signal) {
-        const error = failure ?? new Error(`gate exited ${signal ?? code}`);
+        const error = failure ?? Object.assign(new Error(`gate exited ${signal ?? code}`), { status: code });
         reject(Object.assign(error, { stdout, stderr: stderr || error.message }));
       } else resolveExec(stdout);
     };
@@ -807,11 +989,23 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
     ? [['node', ['scripts/verify-lane.mjs', 'run', '--gate=npm run test:unit && npm run check:standards']]]
     : mode === 'related' ? [['node', ['scripts/verify-lane.mjs', 'run']]]
       : [['npm', ['run', 'check:standards']]];
+  // Route the heavy standards gate through the target dir's own admission wrapper (so heavyAdmission.remote can
+  // offload it to Forge). Skipped when the wrapper is absent or we already hold admission (no double-wrapping);
+  // the wrapper passes the gate's exit code through unchanged.
+  const admissionCli = join('scripts', 'readiness', 'heavy-admission.mjs');
+  if (mode === 'standards' && !env.WE_HEAVY_ADMISSION_HELD && existsFn(join(dir, admissionCli))) {
+    plan[0] = ['node', [admissionCli, 'run', '--', ...plan[0].flat()]];
+  }
   const gateEnv = mode === 'related' ? { ...env, WE_BUILD_FINAL_GATE: 'related' } : env;
   const [bin, args] = plan[0];
   const result = (pass, output) => ({ ran: true, mode, pass,
     steps: [{ cmd: `${bin} ${args.join(' ')}`, pass, output }] });
-  const failed = e => result(false, `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`);
+  const failed = e => {
+    const r = result(false, `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`);
+    // Exit 124 from the admission wrapper = remote termination unconfirmed: never a pass, named distinctly.
+    if (e.status === 124 || e.code === 124) r.unavailable = 'gate-unconfirmed';
+    return r;
+  };
   if (asyncExecFn) {
     return Promise.resolve().then(() => asyncExecFn(bin, args, { cwd: dir, env: gateEnv }))
       .then(output => result(true, output), failed);
@@ -849,6 +1043,7 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
 export async function runCodexDirectExec({
   dir,
   task,
+  outputSchemaFile,
   model,
   effort, taskKind, size, epic, decision, care, mandatoryLens, route, log,
   ephemeral = false,
@@ -872,7 +1067,7 @@ export async function runCodexDirectExec({
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
   const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
-  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
+  const argv = buildCodexDirectTaskArgv({ env, route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
   const prompt = buildCodexPrompt(task, { review, policy });
   writeFileSync(logFile, '', { flag: resumeThreadId ? 'a' : 'w' });
   // A resumed turn that emits no final file must not reuse an earlier completion report.
@@ -882,7 +1077,7 @@ export async function runCodexDirectExec({
     let child;
     try {
       child = spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
-        env: !review && tempRoot ? { ...env, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : env });
+        env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } });
     } catch (e) {
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;
@@ -1011,9 +1206,42 @@ export async function runCodexDirectExec({
  * @param {Function} [opts.loadTranscriptCheck] - injectable lazy checker import.
  * @returns {Promise<object>} the full report — see the CLI's `--json` output for its exact shape.
  */
-export async function codexDirectTask({
+export async function codexDirectTask(opts = {}) {
+  if (opts.dir) return runCodexDirectTask(opts);
+  const guard = createScratchGuard({ execFn: opts.execFn });
+  let report;
+  try {
+    report = await runCodexDirectTask({ ...opts, scratchGuard: guard });
+  } catch (error) {
+    const cleanup = guard.finish();
+    if (cleanup && !cleanup.removed && error && typeof error === 'object') {
+      try { error.scratchCleanup = cleanup; error.message += ` [scratch clone KEPT (${cleanup.reason}): ${cleanup.path}]`; } catch { /* frozen error */ }
+    }
+    throw error;
+  }
+  const cleanup = guard.finish();
+  if (cleanup && report.scratch?.created) {
+    report.scratch.cleanup = cleanup;
+    if (cleanup.removed) {
+      // The clone (and the default Codex event log inside its `.git`) no longer exists: keep the paths for
+      // provenance but mark them gone, so a consumer does not follow them. A caller-supplied `--log` outside
+      // the clone is untouched.
+      const inside = (p) => typeof p === 'string' && (p === cleanup.path || p.startsWith(cleanup.path + sep));
+      report.dirRemoved = true;
+      // No caller `--log` → the log is the default one inside the clone's `.git`, gone by construction. (A
+      // path-prefix test alone is wrong on macOS: `tmpdir()` is `/var/...` but git reports `/private/var/...`.)
+      report.logFileRemoved = !opts.logFile || inside(report.logFile);
+    }
+  }
+  return report;
+}
+
+async function runCodexDirectTask({
+  scratchGuard,
   caller = 'codex-direct-task.mjs', repo, pr, card, usageTaskKind,
   task,
+  taskFile = null,
+  outputSchemaFile,
   dir,
   repoRoot,
   model,
@@ -1044,7 +1272,10 @@ export async function codexDirectTask({
   readQuotaFn = readRolloutQuota,
   collectQuotaFn = collectAndClearRolloutQuota,
   loadTranscriptCheck = () => import('./lib/codex-transcript-check.mjs'),
+  resumeThreadId,
 } = {}) {
+  // Fail before any clone, install or spawn work: a bad resume target must not cost a run.
+  if (resumeThreadId !== undefined) assertResumeRequest({ resumeThreadId, ephemeral, outputSchemaFile, dir });
   if (typeof task !== 'string' || !task.trim()) {
     throw new TypeError('codex-direct-task: `task` must be a non-empty string');
   }
@@ -1077,7 +1308,8 @@ export async function codexDirectTask({
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
     scratch = await setupScratchClone({
-      repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
+      repoRoot, mkTempDir: (prefix) => { const d = mkTempDir(prefix); scratchGuard?.arm(d); return d; },
+      execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
@@ -1090,6 +1322,7 @@ export async function codexDirectTask({
   }
 
   const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
+  scratchGuard?.setStart(startSha);
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
@@ -1103,10 +1336,14 @@ export async function codexDirectTask({
   // A private temp root isolates concurrent fixture repositories. Keep it for manual resume/debugging,
   // just like the persisted Codex session and log; review mode allocates no new writable roots.
   const tempRoot = review ? undefined : mkdtempSync(join(tmpdir(), 'we-codex-task-tmp-'));
-  const writableRoots = review ? [] : [gitDir, resolve(admissionLockRoot(resolve(targetDir), env)), tempRoot];
+  // The remote admission root sits beside the heavy lock root, exactly as heavy-admission derives it
+  // (`join(dirname(lockRoot), 'remote')`). Without it the sandbox cannot read remote health or take a
+  // remote slot, so every Codex-run gate silently fell back to local admission on this host.
+  const heavyLockRoot = review ? undefined : resolve(admissionLockRoot(resolve(targetDir), env));
+  const writableRoots = review ? [] : [gitDir, heavyLockRoot, join(dirname(heavyLockRoot), 'remote'), tempRoot];
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
-    dir: targetDir, task, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
-    gitDir, writableRoots, tempRoot, env, policy: briefPolicy,
+    dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
+    gitDir, writableRoots, tempRoot, env, policy: briefPolicy, resumeThreadId,
   }), { env });
   const events = parseJsonlEvents(run.stdout);
   let summary = summarizeEvents(events);
@@ -1169,6 +1406,7 @@ export async function codexDirectTask({
 
   return {
     model, effort, route,
+    ...taskMetadata(task, taskFile),
     dir: targetDir,
     scratch: scratch ? {
       created: true,
@@ -1205,6 +1443,14 @@ export async function codexDirectTask({
 }
 
 // ── detached jobs ────────────────────────────────────────────────────────────────────────────────
+function taskMetadata(task, taskFile = null) {
+  return {
+    taskFile: taskFile === null ? null : resolve(taskFile),
+    taskSha256: typeof task === 'string' ? createHash('sha256').update(task).digest('hex') : null,
+    taskHead: typeof task === 'string' ? task.slice(0, 200) : null,
+  };
+}
+
 export const MAX_JOB_WAIT_MS = 540000;
 const MIN_JOB_WAIT_MS = 250;
 function jobWaitBudget(maxMs = MAX_JOB_WAIT_MS) {
@@ -1237,6 +1483,10 @@ function validateJobRecord(record, id) {
     || !Number.isInteger(record.pid) || record.pid <= 0
     // Optional: records written before PID start times were captured carry none.
     || (record.pidStart != null && (typeof record.pidStart !== 'string' || !record.pidStart))
+    // Optional for older records and briefs the detached worker could not read.
+    || (record.taskFile != null && typeof record.taskFile !== 'string')
+    || (record.taskSha256 != null && (typeof record.taskSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.taskSha256)))
+    || (record.taskHead != null && (typeof record.taskHead !== 'string' || record.taskHead.length > 200))
     || (record.status === 'done' && record.exitCode !== 0)
     || (record.status === 'running' && record.exitCode !== null)
     || (record.status === 'failed' && record.exitCode !== null
@@ -1250,6 +1500,11 @@ export async function startDetachedJob({
   random = randomUUID, jobsDir = resolveJobsDir(), nodePath = process.execPath,
   scriptPath = fileURLToPath(import.meta.url), env = process.env, readStart = readPidStart,
 } = {}) {
+  const flags = parseFlags(args);
+  const taskFile = flags['task-file'] ? resolve(flags['task-file']) : null;
+  // The launcher never reads the brief (a large, stalled or FIFO file must not delay the job id); the worker fills sha/head.
+  const task = taskFile ? undefined : flags.task;
+  const metadata = taskMetadata(task, taskFile);
   const startedAt = new Date(now()).toISOString();
   const id = `${Date.parse(startedAt)}-${random()}`;
   const recordPath = jobRecordPath(jobsDir, id);
@@ -1268,7 +1523,7 @@ export async function startDetachedJob({
     });
     // The start time pins the PID to this child, so `wait` can tell a reused PID from a live job.
     const record = { id, pid: child.pid, pidStart: pidStartOrNull(readStart, child.pid), status: 'running', startedAt, resultPath,
-      exitCode: null };
+      exitCode: null, ...metadata };
     writeJobRecord(record, { jobsDir, fsDeps });
     child.unref();
     return { ...record, recordPath };
@@ -1340,10 +1595,15 @@ export async function waitForJob({
     JSON.parse(await jobAsyncFs.readFile(jobRecordPath(jobsDir, id), 'utf8')), id);
   const expired = Symbol('wait budget exhausted');
   // Every read, probe, mutation, cleanup and poll shares the requested deadline.
+  // A budget timer can fire up to a millisecond before `now()` reaches the deadline. Once ANY timer has
+  // declared the budget spent, every nested step must agree, or an inner step that still sees the clock
+  // short of the deadline would carry on (e.g. rename after the caller was already told 75).
+  let spent = false;
+  const pastDeadline = () => spent || now() >= deadline;
   const withinBudget = async operation => {
-    if (now() >= deadline) return expired;
+    if (pastDeadline()) return expired;
     const pending = operation();
-    if (!pending || typeof pending.then !== 'function') return now() >= deadline ? expired : pending;
+    if (!pending || typeof pending.then !== 'function') return pastDeadline() ? expired : pending;
     const remaining = deadline - now();
     if (remaining <= 0) {
       Promise.resolve(pending).catch(() => {});
@@ -1352,18 +1612,18 @@ export async function waitForJob({
     let timer;
     try {
       const value = await Promise.race([pending, new Promise(resolveTimer => {
-        timer = setTimeout(() => resolveTimer(expired), remaining);
+        timer = setTimeout(() => { spent = true; resolveTimer(expired); }, remaining);
       })]);
-      return now() >= deadline ? expired : value;
+      return pastDeadline() ? expired : value;
     } catch (error) {
-      if (now() >= deadline) return expired;
+      if (pastDeadline()) return expired;
       throw error;
     } finally {
       clearTimeout(timer);
     }
   };
   const budgeted = async operation => {
-    if (now() >= deadline) throw expired;
+    if (pastDeadline()) throw expired;
     const value = await withinBudget(operation);
     if (value === expired) throw expired;
     return value;
@@ -1396,6 +1656,9 @@ export async function waitForJob({
   };
   let record = { status: 'running', exitCode: null, resultPath: null };
   const result = () => ({ status: record.status, exitCode: record.exitCode, resultPath: record.resultPath });
+  // An observation/bookkeeping failure says nothing about worker completion.
+  // Never impersonate a terminal record or release the caller's ownership.
+  const waitError = () => ({ status: 'wait-error', exitCode: null, resultPath: record.resultPath, code: 2 });
   const terminalResult = () => {
     const code = record.status === 'done' ? 0 : record.exitCode || 1;
     // Exit 75 is exclusively the wait-again signal; retain the task code in JSON.
@@ -1404,14 +1667,14 @@ export async function waitForJob({
   for (;;) {
     let snapshot;
     try { snapshot = await withinBudget(() => readRecord(jobId)); }
-    catch { return { status: 'failed', exitCode: null, resultPath: null, code: 2 }; }
+    catch { return waitError(); }
     if (snapshot === expired) return { ...result(), code: 75 };
     record = snapshot;
     if (record.status !== 'running') return terminalResult();
     if (now() >= deadline) return { ...result(), code: 75 };
     let alive;
     try { alive = await withinBudget(() => isAlive(record)); }
-    catch { return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 }; }
+    catch { return waitError(); }
     if (alive === expired) return { ...result(), code: 75 };
     if (!alive) {
       if (now() >= deadline) return { ...result(), code: 75 };
@@ -1423,7 +1686,7 @@ export async function waitForJob({
         record = snapshot;
       } catch (e) {
         if (e === expired) return { ...result(), code: 75 };
-        return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 };
+        return waitError();
       }
     }
     if (record.status !== 'running') return terminalResult();
@@ -1485,10 +1748,15 @@ async function main() {
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
-      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json] [--detach]\n'
+      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--output-schema-file=<path>] [--resume=<threadId>] [--no-self-review] [--json] [--detach]\n'
+      + "  --resume=<threadId> (R302): continue a previous run's Codex thread (its report's events.threadId) so a follow-up\n"
+      + '    fix keeps its context. Requires --dir; not with --output-schema-file or --ephemeral.\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
+      + '    Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms> (same validation).\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
+      + '    Waiter IO/probe errors: status=wait-error, exit 2; the worker may still be running.\n'
+      + '    Retain lane/scope ownership, report the waiter error, and retry the same job after recovery.\n'
       + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
       + '    Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.\n'
       + '    All IO shares that single requested deadline; no floor or additional grace.\n'
@@ -1507,15 +1775,23 @@ async function main() {
   }
   if (isWaitInvocation(args)) {
     let maxMs;
-    try { maxMs = jobWaitBudget(flags['max-ms']); }
+    try { maxMs = jobWaitBudget(flags['max-ms'] ?? flags.wait); }
     catch (error) {
       writeLineSync(2, error.message);
       process.exit(2);
     }
-    const { code, ...result } = await waitForJob({ jobId: flags.job, maxMs });
+    const { code, ...result } = await waitForJob({ jobId: flags.job ?? flags.id, maxMs });
     // Pending filesystem requests must not keep a timed-out wait CLI alive.
     writeLineSync(1, JSON.stringify(result));
     process.exit(code);
+  }
+  // Before --detach: a bad resume must never create a job record or spawn a child.
+  let resumeThreadId;
+  try { resumeThreadId = parseResumeFlag(flags); }
+  catch (e) {
+    console.error(e.message);
+    process.exitCode = 2;
+    return;
   }
   if (flags.detach) {
     const job = await startDetachedJob({ args });
@@ -1523,11 +1799,16 @@ async function main() {
     process.exitCode = 0;
     return;
   }
-  const task = flags['task-file'] ? readFileSync(resolve(flags['task-file']), 'utf8') : flags.task;
+  const taskFile = flags['task-file'] ? resolve(flags['task-file']) : null;
+  const task = taskFile ? readFileSync(taskFile, 'utf8') : flags.task;
   if (!task || typeof task !== 'string' || !task.trim()) {
     console.error('codex-direct-task: pass --task=<text> or --task-file=<path>');
     process.exitCode = 2;
     return;
+  }
+  if (flags.job) {
+    const record = readJobRecord(flags.job);
+    writeJobRecord({ ...record, ...taskMetadata(task, taskFile) });
   }
   const dir = flags.dir ? resolve(flags.dir) : undefined;
   const repoRoot = flags['repo-root'] ? resolve(flags['repo-root']) : (dir ? undefined : repoRootFromCwd());
@@ -1537,8 +1818,10 @@ async function main() {
   try {
     report = await codexDirectTask({
       task,
+      taskFile,
       dir,
       repoRoot,
+      outputSchemaFile: flags['output-schema-file'] ? resolve(flags['output-schema-file']) : undefined,
       model: flags.model,
       effort: flags.effort,
       tier: flags.tier,
@@ -1560,6 +1843,7 @@ async function main() {
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),
+      resumeThreadId,
       ...(flags['no-self-review'] ? { selfReview: false } : {}),
     });
   } catch (e) {
@@ -1573,17 +1857,25 @@ async function main() {
     console.log(JSON.stringify(report, null, 2));
   } else {
     console.log('\n──────────────────────────────────────────────────────────');
-    console.log(`codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
-    if (report.scratch.created && report.scratch.realOrigin) {
+    const removed = Boolean(report.scratch.cleanup?.removed);
+    console.log(removed
+      ? `codex-direct-task: scratch clone (deleted) → ${report.scratch.cleanup.path}`
+      : `codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
+    if (!removed && report.scratch.created && report.scratch.realOrigin) {
       console.log(report.scratch.originWired
         ? `  origin wired to the real remote (--wire-origin-to-remote): ${report.scratch.realOrigin}`
         : `  origin left at the local clone source (#3782, not push-capable). Real remote: ${report.scratch.realOrigin}\n`
           + `    to push from here yourself: git -C ${report.dir} remote set-url origin ${report.scratch.realOrigin}`);
     }
+    if (report.scratch.cleanup) {
+      console.log(report.scratch.cleanup.removed
+        ? '  scratch clone was clean: deleted'
+        : `  scratch clone KEPT (${report.scratch.cleanup.reason}): ${report.scratch.cleanup.path}`);
+    }
     console.log(`  thread: ${report.events.threadId ?? '<none>'}  turns: ${report.events.turns}  terminal: ${report.events.terminal ?? '<none — timed out or killed>'}  timedOut: ${report.timedOut}  exit: ${report.exitCode}`);
     console.log(`  tool calls: ${report.events.commands.length}  files touched: ${report.events.filesChanged.length}`);
     for (const f of report.events.filesChanged) console.log(`    - ${f.kind} ${f.path}`);
-    console.log(`  log: ${report.logFile}`);
+    console.log(report.logFileRemoved ? `  log: ${report.logFile} (deleted with the clean scratch clone)` : `  log: ${report.logFile}`);
     if (report.quotaUsedPercent !== null) {
       console.log(`  quota: ${report.quotaUsedPercent}% used of a ${report.quotaWindowMinutes}min window (plan: ${report.quotaPlanType})${report.quotaRolloutCleared ? ' — rollout file cleared after read' : ''}`);
     }
@@ -1597,7 +1889,9 @@ async function main() {
       for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}${report.gate.unavailable ? ` — ${s.output}` : ''}`);
     }
     if (report.selfReview.notes.length) console.log(renderSelfReviewNotes(report.selfReview));
-    console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
+    console.log(removed
+      ? '\n  NOTHING WAS COMMITTED OR PUSHED. The scratch clone had no changes, so it was deleted.'
+      : '\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }
   if (flags.job) return jobExitCode(report);

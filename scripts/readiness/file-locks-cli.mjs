@@ -24,6 +24,7 @@ import {
   reserve, releaseLockDir, heartbeat, readLockEntry, wasReclaimed, DEFAULT_LEASE_MINUTES,
 } from './file-locks.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { probePidLiveness } from './pid-liveness.mjs';
 
 function parseArgs(argv) {
   const opts = { paths: [], pid: null };
@@ -40,15 +41,11 @@ function parseArgs(argv) {
 /**
  * Same-machine PID-liveness verdict (#1936 Fork-2 (b), layered NEVER primary because of PID reuse).
  * Returns 'dead' | 'alive' | 'unknown'. `kill(pid, 0)` throws ESRCH when no such process → provably gone
- * ('dead'); succeeds → a process with that PID exists, but the kernel REUSES PIDs so we cannot prove it's
+ * ('dead'); Linux zombie/dead states also prove death. Otherwise a process with that PID exists,
+ * but the kernel REUSES PIDs so we cannot prove it's
  * the SAME owner — report 'alive' (do NOT accelerate; fall through to the TTL floor). A null/own pid, or
  * any other errno (e.g. EPERM), is 'unknown' (TTL-only). The pure reclaimDecision only fast-paths 'dead'.
  */
-function probePidLiveness(pid, selfPid) {
-  if (!Number.isInteger(pid) || pid <= 0 || pid === selfPid) return 'unknown';
-  try { process.kill(pid, 0); return 'alive'; }
-  catch (e) { return e && e.code === 'ESRCH' ? 'dead' : 'unknown'; }
-}
 
 function emit(obj) { writeAllSync(1, JSON.stringify(obj) + '\n'); }
 

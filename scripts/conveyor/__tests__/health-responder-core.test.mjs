@@ -26,7 +26,7 @@ describe('health responder closed decision table', () => {
     for (const s of SMELLS) {
       const i = input(); i.episodes[0].smell = s.id; i.episodes[0].key = `${s.id}::${i.episodes[0].subject}`;
       i.config.smells = { [s.id]: true }; i.subjectFacts = {};
-      if (s.id === 'fix-loop-no-push' || s.id === 'load-flake-hold-no-pickup' || s.id === 'main-ci-red' || s.id === 'main-ci-red-owner-stalled' || s.id === 'overlay-dropped' || s.id === 'github-app-config' || s.id === 'operator-hold-aged') {
+      if (s.id === 'fix-loop-no-push' || s.id === 'load-flake-hold-no-pickup' || s.id === 'main-ci-red' || s.id === 'main-ci-red-owner-stalled' || s.id === 'overlay-dropped' || s.id === 'github-app-config' || s.id === 'operator-hold-aged' || s.id === 'daemon-build-stale' || s.id === 'load-over-target' || s.id === 'stale-code-service') {
         // Alert-only; this smell grants the responder no action authority.
         expect(s.action).toBe('alert');
         expect(Object.hasOwn(CATALOGUE, s.id)).toBe(false);
@@ -77,6 +77,42 @@ describe('health responder closed decision table', () => {
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
     i.subjectFacts = {};
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
+  });
+  it.each([true, false])('keeps launchd copy drift observation-only (subject facts: %s)', (withFacts) => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'launchd-ops-copy-drift'; e.subject = 'com.we.guard'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Refresh the ops copy and restart the launchd job';
+    facts.episodeKey = e.key;
+    i.subjectFacts = withFacts ? { [e.key]: facts } : {};
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
+  });
+  it('keeps Forge disk/prune alerts observation-only with or without a permitted action plan', () => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'forge-disk-prune'; e.subject = 'forge-disk-prune'; e.key = `${e.smell}::${e.subject}`;
+    e.escalation = { humanOnly: true, status: 'needs-you' };
+    e.recommendation = 'Run forge-cache-prune and free the cache';
+    facts.episodeKey = e.key;
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+    i.subjectFacts = {};
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+  });
+  it.each(Object.keys(ACTION_ALLOWLIST))('keeps stale pool checkout alerts observation-only despite a permitted %s plan', family => {
+    const i = input(replay.cases.find(c => c.name === 'LANE1'));
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'lane-stale-checkout'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Refresh or reclaim the pool lane immediately';
+    facts.episodeKey = e.key;
+    facts.plan = { kind: 'permitted', family };
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+    i.subjectFacts = {};
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
   });
   it('keeps quarantine repair alerts observation-only even with a permitted action plan', () => {
     const i = input();

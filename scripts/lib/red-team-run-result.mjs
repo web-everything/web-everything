@@ -22,11 +22,13 @@ export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
       && !Array.isArray(row.result.findings) && !row.result.provider && !row.result.model);
 }
 
-/** One failed execution may retry; absent counts and completed seats retain their existing guards. */
+/** One evidenced failed execution may retry. `ran` is the historical failure encoding; new writers use
+ * `failed`. Both require exactly one failed seat, no completed seat, and an unspent durable retry.
+ */
 export function failedRedTeamRetry(status, { failedSeatCount, completedRecorded } = {}) {
   const result = status?.result;
   return (status?.retryCount === undefined || status.retryCount === 0)
-    && status?.status === 'finished' && (typeof result === 'string' ? result : result?.status) === 'ran'
+    && status?.status === 'finished' && ['failed', 'ran'].includes(typeof result === 'string' ? result : result?.status)
     && completedRecorded === false && failedSeatCount === 1
     && (result?.comment?.status ?? result?.comment) !== 'posted';
 }

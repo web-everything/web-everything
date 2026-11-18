@@ -1,0 +1,8 @@
+Example of the expected answer:
+```JSON
+{"lenses": {"red-team": {"verdict": "accept", "findings": []}}}
+```
+After checking the implementation:
+```jsonc
+{"lenses": {"red-team": {"verdict": "changes", "findings": [{"summary": "avg overflows for finite inputs", "category": "failing-input", "file": "src/avg.mjs", "line": 3, "impactIfUnfixed": "broken", "failure_scenario": "Calling avg([Number.MAX_VALUE, Number.MAX_VALUE]) returns Infinity instead of Number.MAX_VALUE."}]}}}
+```

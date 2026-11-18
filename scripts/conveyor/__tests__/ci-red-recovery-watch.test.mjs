@@ -13,10 +13,15 @@ import { REPO_ROOT } from '../../operations/dispatch-lane-io.mjs';
 import {
   buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
-  cancelAndRerunHungRun, cancelHungRun, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
+  cancelAndRerunHungRun, cancelHungRun, defaultReadRunAttempt, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
-  sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels,
+  sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels, detectMainTransition, recordMainState,
+  resolveApplyBudgetMs, resolveMaxApplyPerTick, createFileApplyLedger, normalizeApplyLedger, main,
+  mergeApplyLedgers, pruneApplyLedger, APPLY_LEDGER_TTL_MS, APPLY_LEDGER_MAX_ENTRIES, APPLY_LEDGER_SEQ_REBASE,
 } from '../ci-red-recovery-watch.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
 import { spawnCiHealRearm } from '../ci-heal-mark.mjs';
 import { REVIEW_LABELS } from '../../lib/review-escalation.mjs';
@@ -38,6 +43,36 @@ const MAIN_RUNS = [
   { status: 'completed', conclusion: 'failure', updatedAt: '2026-09-25T01:30:55Z', workflowName: 'CI' },
   { status: 'completed', conclusion: 'success', updatedAt: '2026-09-25T02:31:25Z', workflowName: 'CI' },
 ];
+
+describe('ci-red-recovery-watch — production apply bounds', () => {
+  it('defaults the apply budget to 170000 ms when the environment setting is absent', () => {
+    expect(resolveApplyBudgetMs({})).toBe(170000);
+  });
+
+  it.each(['', ' ', '0', '-1', 'NaN', 'Infinity', '-Infinity', 'invalid'])(
+    'rejects invalid apply budget environment value %j with the 170000 ms fallback', (value) => {
+      expect(resolveApplyBudgetMs({ WE_RECOVERY_APPLY_BUDGET_MS: value })).toBe(170000);
+    },
+  );
+
+  it('accepts a positive finite apply budget environment override', () => {
+    expect(resolveApplyBudgetMs({ WE_RECOVERY_APPLY_BUDGET_MS: '2500' })).toBe(2500);
+  });
+
+  it('defaults the per-tick apply cap to 8 when the environment setting is absent', () => {
+    expect(resolveMaxApplyPerTick({})).toBe(8);
+  });
+
+  it.each(['', ' ', '0', '-1', '1.5', 'NaN', 'Infinity', '-Infinity', 'invalid'])(
+    'rejects invalid per-tick apply cap environment value %j with the 8 PR fallback', (value) => {
+      expect(resolveMaxApplyPerTick({ WE_RECOVERY_MAX_APPLY_PER_TICK: value })).toBe(8);
+    },
+  );
+
+  it('accepts a positive integer per-tick apply cap environment override', () => {
+    expect(resolveMaxApplyPerTick({ WE_RECOVERY_MAX_APPLY_PER_TICK: '3' })).toBe(3);
+  });
+});
 
 describe('ci-red-recovery-watch — buildCandidates', () => {
   it('only builds a candidate for a PR whose required check is currently failing, resolving how far behind main it is', () => {
@@ -223,6 +258,395 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(postComment).toHaveBeenCalledWith(2635, expect.objectContaining({
       headRefName: 'lane/xdzl6mb', ok: true, action: 'rebased',
     }));
+  });
+
+  // 2026-11-03 live: after main went green the first apply tick refreshed PRs one by one until the 300 s pass
+  // deadline SIGTERMed it mid-batch. The apply loop must stop STARTING refreshes once its time budget is spent
+  // (or the per-tick batch cap is hit) and leave the rest for the next tick, without posting a rebase comment
+  // (a comment burns the per-sha cap) for the ones it deferred.
+  it('stops starting refreshes once the tick time budget is spent, deferring the rest without burning their cap', () => {
+    const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/b${number}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 100; return { ok: true, action: 'rebased' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(2);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'rebased'], [2636, 'rebased'], [2637, 'deferred']]);
+    expect(result.applied[2]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
+  });
+
+  // Review of #6340: with a slow discovery phase (per-PR comment reads) the budget was already spent before the
+  // loop began, so every tick deferred everything and the queue never drained. The first refresh always starts.
+  it('still starts exactly one refresh when discovery alone exhausted the tick apply budget (no starvation)', () => {
+    const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/d${number}` }));
+    let t = 0;
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; },
+      readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10,
+    });
+    expect(result.dispatch.map((d) => d.prNumber)).toEqual([2635, 2636, 2637]);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'rebased'], [2636, 'deferred'], [2637, 'deferred']]);
+    expect(result.applied[1]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
+  });
+
+  // Review round 2 of #6340: `started` was bumped before the refresh ran, so a refresh that came back deferred
+  // (no work done) still spent the floor and the cap, and every later PR in the tick was starved.
+  it.each([
+    ['refresh reports deferred', () => ({ deferred: true, ok: false, error: 'cross-repository PR' })],
+  ])('a free deferral (%s) first in line spends neither the progress floor nor the per-tick cap', (_name, firstResult) => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/g${number}` }));
+    let t = 0;
+    const refresh = vi.fn((branch) => (branch === 'lane/g2635' ? firstResult() : { ok: true, action: 'rebased' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 1,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
+  });
+
+  // Review round 3 of #6340: deferrals do no writes but their verification calls cost real time. 12 PRs whose
+  // refresh each takes 35 s then defers must stop at the 170 s budget, not run until the 300 s pass deadline.
+  it('slow deferred refreshes still honour the time budget (no run past the pass deadline)', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 2700 + i, headRefName: `lane/s${i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(5);
+    expect(t).toBeLessThanOrEqual(175_000);
+    expect(postComment).not.toHaveBeenCalled();
+    expect(result.applied).toHaveLength(12);
+    expect(result.applied.slice(5).every((a) => a.budgetExhausted && a.deferred)).toBe(true);
+  });
+
+  it('slow discovery plus slow deferrals only gets a bounded grace to find one refresh that does work', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 2750 + i, headRefName: `lane/q${i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
+    sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200_000; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2); // 60 s grace: attempts at +0 s and +35 s, stopped at +70 s
+  });
+
+  // Self-review of the round-3 repair: a count cap on deferrals let a stable run of instant (free) deferrers at the
+  // head of the queue starve every later PR on every tick. Instant deferrals cost no time, so they are never capped.
+  it('a long run of instant deferrals at the head of the queue never starves the refreshable PR behind them', () => {
+    const prs = Array.from({ length: 21 }, (_, i) => ({ ...PR_2635, number: 2800 + i, headRefName: `lane/a${i}` }));
+    const refresh = vi.fn((branch) => (branch === 'lane/a20' ? { ok: true, action: 'rebased' } : { deferred: true, ok: false, error: 'not same-repo' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, maxApplyPerTick: 2,
+    });
+    expect(refresh).toHaveBeenCalledTimes(21);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.at(-1)).toMatchObject({ prNumber: 2820, ok: true, action: 'rebased' });
+    expect(result.applied.some((a) => a.budgetExhausted)).toBe(false);
+  });
+
+  // Review round 4 of #6340: ticks used to be stateless, so five slow free deferrals at the front of a stable queue
+  // spent every tick's whole budget and the refreshable sixth PR was never tried (three ticks, same result).
+  const memoryLedger = () => {
+    let state = null;
+    return { read: () => state, write: vi.fn((s) => { state = JSON.parse(JSON.stringify(s)); }) };
+  };
+  const slowQueueTick = ({ prs, ledger, refreshable }) => {
+    let t = 0;
+    const tried = [];
+    const refresh = vi.fn((branch) => {
+      tried.push(branch);
+      if (branch === refreshable) return { ok: true, action: 'rebased' };
+      t += 35_000;
+      return { deferred: true, ok: false, error: 'verification unknown' };
+    });
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8, applyLedger: ledger,
+    });
+    return { tried, result };
+  };
+
+  it('slow free deferrals at the queue head cannot starve the refreshable PR behind them on later ticks', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 7100 + i, headRefName: `lane/h${i}` }));
+    const ledger = memoryLedger();
+    const first = slowQueueTick({ prs, ledger, refreshable: 'lane/h5' });
+    expect(first.tried).toEqual(['lane/h0', 'lane/h1', 'lane/h2', 'lane/h3', 'lane/h4']); // 175 s, h5 budget-deferred untried
+    expect(first.result.applied.at(-1)).toMatchObject({ prNumber: 7105, deferred: true, budgetExhausted: true });
+    const second = slowQueueTick({ prs, ledger, refreshable: 'lane/h5' });
+    expect(second.tried[0]).toBe('lane/h5'); // never-attempted leads
+    expect(second.result.applied.find((a) => a.prNumber === 7105)).toMatchObject({ ok: true, action: 'rebased' });
+  });
+
+  it('with no ledger the plan order is unchanged (the reviewer\'s scenario starves, which is why the CLI wires one)', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 7100 + i, headRefName: `lane/h${i}` }));
+    const first = slowQueueTick({ prs, ledger: null, refreshable: 'lane/h5' });
+    const second = slowQueueTick({ prs, ledger: null, refreshable: 'lane/h5' });
+    expect(second.tried).toEqual(first.tried);
+    expect(second.tried).not.toContain('lane/h5');
+  });
+
+  it('when every PR is a slow deferrer the queue still rotates: each PR is tried within ceil(n/k) ticks', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 7200 + i, headRefName: `lane/r${i}` }));
+    const ledger = memoryLedger();
+    const seen = new Set();
+    for (let tick = 0; tick < 3; tick += 1) slowQueueTick({ prs, ledger, refreshable: null }).tried.forEach((b) => seen.add(b));
+    expect(seen.size).toBe(12); // 5 + 5 + 2 across three ticks
+  });
+
+  // Self-review of the round-4 repair: pruning to the current queue (and keying on the head sha) reset a slow
+  // deferrer's place whenever it dropped out for one tick or its head moved, re-creating the head-of-line burn.
+  it('a PR that drops out of the plan for a tick, or whose head moves, keeps its place in the rotation', () => {
+    const ledger = memoryLedger();
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 7400 + i, headRefName: `lane/m${i}` }));
+    slowQueueTick({ prs, ledger, refreshable: 'lane/m5' }); // m0..m4 tried, m5 untried
+    const flapped = [...prs.slice(0, 2), ...prs.slice(3)]; // m2 missing this tick (transient read failure)
+    const moved = flapped.map((p) => (p.number === 7400 ? { ...p, headRefOid: 'f'.repeat(40) } : p)); // m0's head moved
+    const tick = slowQueueTick({ prs: moved, ledger, refreshable: 'lane/m5' });
+    expect(tick.tried[0]).toBe('lane/m5'); // m0's moved head did not make it "never attempted" again (it would lead m5)
+    expect(ledger.read().at['7402']).toBe(3); // m2 was absent this tick and kept its tick-1 stamp
+    const third = slowQueueTick({ prs, ledger, refreshable: null }); // m2 is back and is now the least recently tried
+    expect(third.tried[0]).toBe('lane/m2');
+  });
+
+  it('entries expire only after the TTL, and the file stays bounded by it', () => {
+    const ledger = memoryLedger();
+    const a = [{ ...PR_2635, number: 7500, headRefName: 'lane/t0' }, { ...PR_2635, number: 7501, headRefName: 'lane/t1' }];
+    slowQueueTick({ prs: a, ledger, refreshable: null });
+    expect(Object.keys(ledger.read().at).sort()).toEqual(['7500', '7501']);
+    const t = APPLY_LEDGER_TTL_MS + 100_000;
+    sweepCiRedRecovery({
+      readOpenPrs: () => [a[0]], readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: () => ({ deferred: true, ok: false, error: 'x' }), postComment: vi.fn(), apply: true, now: () => t, applyLedger: ledger,
+    });
+    expect(Object.keys(ledger.read().at)).toEqual(['7500']); // 7501's record was older than the TTL
+  });
+
+  it('overlapping sweeps merge: a stamp another writer added while this tick ran is not lost', () => {
+    const ledger = memoryLedger();
+    const prs = [{ ...PR_2635, number: 7600, headRefName: 'lane/w0' }, { ...PR_2635, number: 7601, headRefName: 'lane/w1' }];
+    sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: (branch) => {
+        if (branch === 'lane/w0') { // a concurrent sweep stamps PR 7999 (and a higher seq) while w0 refreshes
+          const cur = ledger.read();
+          ledger.write({ seq: cur.seq + 5, at: { ...cur.at, 7999: cur.seq + 5 }, ts: { ...cur.ts, 7999: 1 } });
+        }
+        return { ok: true, action: 'rebased' };
+      },
+      postComment: vi.fn(), apply: true, now: () => 1, applyLedger: ledger,
+    });
+    const end = ledger.read();
+    expect(end.at['7999']).toBeDefined();
+    expect(end.at['7601']).toBeGreaterThan(end.at['7999']); // seq kept advancing past the other writer's
+  });
+
+  it('the attempt is recorded BEFORE the refresh runs, so a sweep killed mid-refresh still rotates the PR back', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/x${number}` }));
+    const ledger = memoryLedger();
+    const kill = () => sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: () => { throw new Error('SIGTERM at the pass deadline'); }, postComment: vi.fn(), apply: true, applyLedger: ledger,
+    });
+    expect(kill).toThrow('SIGTERM');
+    const tried = [];
+    sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: (b) => { tried.push(b); return { ok: true, action: 'rebased' }; }, postComment: vi.fn(), apply: true, applyLedger: ledger,
+    });
+    expect(tried).toEqual(['lane/x2636', 'lane/x2635']);
+  });
+
+  it('a claim-held PR is not recorded as attempted (it cost nothing)', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/c${number}` }));
+    const ledger = memoryLedger();
+    sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: () => ({ ok: true, action: 'rebased' }), postComment: vi.fn(), apply: true, applyLedger: ledger,
+      checkClaim: ({ branch }) => (branch === 'lane/c2635' ? { message: 'held' } : null),
+    });
+    expect(Object.keys(ledger.read().at)).toHaveLength(1);
+  });
+
+  it.each([
+    ['read', { read: () => { throw new Error('EACCES'); }, write: vi.fn() }],
+    ['write', { read: () => null, write: () => { throw new Error('ENOSPC'); } }],
+  ])('a failing ledger %s never stops the sweep; it is reported as applyLedgerError', (kind, ledger) => {
+    const prs = [{ ...PR_2635, number: 2635, headRefName: 'lane/e1' }];
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, applyLedger: ledger,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(result.applyLedgerError).toMatch(new RegExp(`^${kind}:`));
+  });
+
+  it('without --apply the ledger is neither read nor written', () => {
+    const ledger = { read: vi.fn(), write: vi.fn() };
+    sweepCiRedRecovery({ readOpenPrs: () => [PR_2635], readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [], apply: false, applyLedger: ledger });
+    expect(ledger.read).not.toHaveBeenCalled();
+    expect(ledger.write).not.toHaveBeenCalled();
+  });
+
+  it.each([[['sweep', '--apply'], true], [['sweep'], false]])('main(%j) wires a file-backed apply ledger into the main-red sweep only with --apply', async (argv, wired) => {
+    const seen = [];
+    const empty = () => ({ dispatch: [], refusals: [], applied: [] });
+    const prevExit = process.exitCode;
+    await main(argv, {
+      sweepOptions: { exhaustedRetrySettings: {} },
+      sweepMainRed: (args) => { seen.push(args.applyLedger); return { ...empty(), mainGreen: null }; },
+      sweepExhausted: empty, sweepHung: empty, sweepMissingRun: empty, sweepMainCancelled: empty,
+      writeLine: () => {}, writeAll: () => {},
+    });
+    process.exitCode = prevExit;
+    expect(seen).toHaveLength(1);
+    if (wired) expect(seen[0]).toEqual({ read: expect.any(Function), write: expect.any(Function) });
+    else expect(seen[0]).toBeNull();
+  });
+
+  describe('apply ledger file + normalization', () => {
+    it.each([
+      ['null', null], ['string', 'x'], ['array at', { at: [1] }], ['bad stamps', { seq: 'a', at: { 11: -1, 12: 1.5, 13: '4' } }],
+      ['__proto__ key', JSON.parse('{"at":{"__proto__":7}}')],
+    ])('a malformed ledger (%s) normalizes to empty', (_n, raw) => {
+      expect(normalizeApplyLedger(raw)).toEqual({ seq: 0, at: {}, ts: {} });
+    });
+
+    it('keeps valid stamps and never lets seq fall below the highest stamp', () => {
+      expect(normalizeApplyLedger({ seq: 1, at: { 11: 5, 12: 3 }, ts: { 11: 100 } })).toEqual({ seq: 5, at: { 11: 5, 12: 3 }, ts: { 11: 100, 12: 0 } });
+    });
+
+    it('caps the ledger at APPLY_LEDGER_MAX_ENTRIES, keeping the most recently stamped', () => {
+      const at = Object.fromEntries(Array.from({ length: APPLY_LEDGER_MAX_ENTRIES + 20 }, (_, i) => [String(i + 1), i + 1]));
+      const n = normalizeApplyLedger({ seq: APPLY_LEDGER_MAX_ENTRIES + 20, at });
+      expect(Object.keys(n.at)).toHaveLength(APPLY_LEDGER_MAX_ENTRIES);
+      expect(n.at['1']).toBeUndefined();
+      expect(n.at[String(APPLY_LEDGER_MAX_ENTRIES + 20)]).toBe(APPLY_LEDGER_MAX_ENTRIES + 20);
+    });
+
+    it('re-ranks a near-saturated sequence so new stamps keep advancing (no permanent ties)', () => {
+      const big = APPLY_LEDGER_SEQ_REBASE + 5;
+      const n = normalizeApplyLedger({ seq: big, at: { 1: big, 2: big - 1, 3: big - 2 } });
+      expect(n).toMatchObject({ seq: 3, at: { 1: 3, 2: 2, 3: 1 } });
+    });
+
+    it('merge keeps the max stamp per PR from both writers; prune drops only entries past the TTL', () => {
+      const a = normalizeApplyLedger({ seq: 4, at: { 1: 4, 2: 1 }, ts: { 1: 1000, 2: 1000 } });
+      const b = normalizeApplyLedger({ seq: 6, at: { 1: 2, 2: 6, 3: 5 }, ts: { 1: 900, 2: 2000, 3: 2000 } });
+      const m = mergeApplyLedgers(a, b);
+      expect(m).toMatchObject({ seq: 6, at: { 1: 4, 2: 6, 3: 5 }, ts: { 1: 1000, 2: 2000, 3: 2000 } });
+      const p = pruneApplyLedger(m, 2000 + APPLY_LEDGER_TTL_MS, APPLY_LEDGER_TTL_MS);
+      expect(Object.keys(p.at).sort()).toEqual(['2', '3']);
+    });
+
+    it('round-trips through a file; a missing or corrupt file reads as nothing', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'apply-ledger-'));
+      try {
+        const path = join(dir, 'ledger.json');
+        const ledger = createFileApplyLedger({ path });
+        expect(ledger.read()).toBeNull();
+        ledger.write({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
+        expect(normalizeApplyLedger(ledger.read())).toEqual({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
+        writeFileSync(path, '{not json');
+        expect(ledger.read()).toBeNull();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('is hermetic inside a test run unless given a path: it never touches the live handoff record', () => {
+      const ledger = createFileApplyLedger({ repo: null });
+      ledger.write({ seq: 9, at: { '1:a': 9 } });
+      expect(ledger.read()).toEqual({ seq: 0, at: {} });
+    });
+  });
+
+  it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/k${number}` }));
+    let t = 0;
+    const refresh = vi.fn((branch) => (branch === 'lane/k2635' ? { ok: false, error: 'push rejected' } : { ok: true, action: 'rebased' }));
+    let reads = 0;
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/k2635' && ++reads === 2 ? { message: 'held' } : null));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 1, checkClaim,
+    });
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
+  });
+
+  it('a claim-held PR first in line does not use up the progress floor', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/f${number}` }));
+    let t = 0;
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/f2635' ? { message: 'held' } : null));
+    sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10, checkClaim,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledWith('lane/f2636', expect.anything());
+  });
+
+  it('never refreshes more than maxApplyPerTick PRs in one tick (post-green storm bound)', () => {
+    const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/c${number}` }));
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, maxApplyPerTick: 1,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(result.applied.filter((a) => a.budgetExhausted).map((a) => a.prNumber)).toEqual([2636, 2637]);
+  });
+
+  it('persists main state across ticks and reports the transition exactly once', async () => {
+    const { mkdtempSync, readFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const path = `${mkdtempSync(`${tmpdir()}/rr-`)}/state.json`;
+    expect(recordMainState({ mainGreen: false, path })).toBe(false);
+    expect(JSON.parse(readFileSync(path, 'utf8')).green).toBe(false);
+    expect(recordMainState({ mainGreen: true, path })).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8')).green).toBe(true);
+    expect(recordMainState({ mainGreen: true, path })).toBe(false);
+  });
+
+  it('held PRs do not consume the per-tick apply cap, and a failed state write never reports a transition', async () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/h${number}` }));
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/h2635' ? { message: 'held' } : null));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, maxApplyPerTick: 1, checkClaim,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledWith('lane/h2636', expect.anything());
+    expect(result.applied.find((a) => a.prNumber === 2635)).toMatchObject({ deferred: true });
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(`${tmpdir()}/rr-`);
+    writeFileSync(`${dir}/state.json`, JSON.stringify({ green: false }));
+    expect(recordMainState({ mainGreen: true, path: `${dir}/state.json/nope/x.json` })).toBe(false);
+  });
+
+  it('detects the main red→green transition from the persisted previous state', () => {
+    expect(detectMainTransition({ prevGreen: false, mainGreen: true })).toBe(true);
+    expect(detectMainTransition({ prevGreen: true, mainGreen: true })).toBe(false);
+    expect(detectMainTransition({ prevGreen: null, mainGreen: true })).toBe(false);
+    expect(detectMainTransition({ prevGreen: false, mainGreen: false })).toBe(false);
   });
 
   // x5uqim1 follow-up (#4075/#3383) part (c) — "check the owed-ci-rerun path for frontierui/plateau-app too":
@@ -515,6 +939,85 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
+  const completed409 = (conclusion, jobs = 'cancelled\nsuccess\nskipped\n') => {
+    const calls = [];
+    const exec = vi.fn((file, args) => {
+      calls.push(args);
+      if (args[args.length - 1].endsWith('/cancel')) throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)');
+      if (args.some((a) => /\/jobs\?per_page=100$/.test(String(a)))) {
+        if (typeof jobs === 'function') return jobs(args);
+        return jobs;
+      }
+      if (typeof conclusion === 'function') return conclusion(args);
+      if (args.includes('--jq')) return `${conclusion}\n`;
+      return '';
+    });
+    return { calls, exec };
+  };
+  const jobsRead = (calls) => calls.filter((a) => a.some((x) => /\/jobs\?per_page=100$/.test(String(x))));
+  const rerunWrites = (calls) => calls.filter((a) => a.some((x) => /rerun/.test(String(x))));
+
+  it.each(['cancelled', 'timed_out'])('409 completed + conclusion %s: reads the conclusion, then re-runs only the failed jobs', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    const sleepSync = vi.fn();
+    const result = cancelAndRerunHungRun(43093913029, { repo: 'web-everything/web-everything', exec, sleepSync });
+    expect(result).toEqual({ ok: true, action: 'rerun-failed-jobs-after-completed' });
+    expect(calls[1]).toEqual(['api', 'repos/web-everything/web-everything/actions/runs/43093913029', '--jq', '.conclusion']);
+    expect(calls[2]).toEqual(['api', '--paginate', 'repos/web-everything/web-everything/actions/runs/43093913029/jobs?per_page=100', '--jq', '.jobs[].conclusion']);
+    expect(calls[3]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/43093913029/rerun-failed-jobs']);
+    expect(exec).toHaveBeenCalledTimes(4);
+    expect(sleepSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancelled', 'timed_out'])('409 completed + conclusion %s but one job genuinely FAILED: never re-runs, hands to ci-red/ci-heal', (conclusion) => {
+    const { calls, exec } = completed409(conclusion, 'success\nfailure\ncancelled\n');
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: true, action: 'already-completed' });
+    expect(jobsRead(calls)).toHaveLength(1);
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it.each([
+    ['empty job list', () => ''],
+    ['whitespace-only job list', () => '\n \n'],
+  ])('409 completed + cancelled + %s: fails closed with no rerun write', (_name, jobs) => {
+    const { calls, exec } = completed409('cancelled', jobs);
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toMatchObject({ ok: false, action: 'jobs-unreadable' });
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it('409 completed + cancelled + job-list read throws: fails closed with no rerun write', () => {
+    const { calls, exec } = completed409('cancelled', () => { throw new Error('gh: HTTP 502'); });
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: false, action: 'jobs-unreadable', error: 'gh: HTTP 502' });
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it.each(['failure', 'success', 'skipped', 'startup_failure'])('409 completed + conclusion %s: never re-runs, hands to ci-red/ci-heal', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: true, action: 'already-completed' });
+    expect(calls.some((a) => a.some((x) => /rerun/.test(String(x))))).toBe(false);
+  });
+
+  it.each(['', 'null', 'surprise'])('409 completed + unreadable conclusion %j: fails closed with no rerun write', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result).toMatchObject({ ok: false, action: 'conclusion-unreadable' });
+    expect(calls.some((a) => a.some((x) => /rerun/.test(String(x))))).toBe(false);
+  });
+
+  it('409 completed + conclusion read throws: fails closed with no rerun write', () => {
+    const { calls, exec } = completed409(() => { throw new Error('gh: HTTP 502'); });
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result).toEqual({ ok: false, action: 'conclusion-unreadable', error: 'gh: HTTP 502' });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('does not treat any other 409 cancel refusal as completed', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Conflict (HTTP 409)'); });
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result.action).toBe('cancel-failed');
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
   it('reports a failed rerun distinctly from a failed cancel', () => {
     let n = 0;
     const exec = vi.fn(() => { n += 1; if (n === 2) throw new Error('gh: rerun rejected'); return ''; });
@@ -528,7 +1031,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const readOpenPrs = () => [PR_2636_HUNG];
     const readComments = vi.fn(() => []);
     const cancelAndRerun = vi.fn();
-    const result = sweepHungCiRecovery({ readOpenPrs, readComments, cancelAndRerun, now: NOW });
+    const result = sweepHungCiRecovery({ readOpenPrs, readComments, cancelAndRerun, now: NOW, readRunAttempt: () => 1 });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, runId: 36161558017, kind: 'hung-cancel-rerun' })]);
     expect(result.applied).toEqual([]);
     expect(cancelAndRerun).not.toHaveBeenCalled();
@@ -537,6 +1040,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
   it('never reads comments for a PR that is not yet hung — pay for it only when needed', () => {
     const readComments = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, now: Date.parse('2026-09-25T16:40:00Z'),
     });
     expect(readComments).not.toHaveBeenCalled();
@@ -550,6 +1054,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const postComment = vi.fn();
     const trigger = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs, readComments, cancelAndRerun, trigger, postComment, now: NOW, apply: true,
     });
     expect(trigger).not.toHaveBeenCalled();
@@ -573,6 +1078,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const postComment = vi.fn();
     const trigger = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments: () => [], cancelAndRerun, trigger, postComment, now: NOW, apply: true,
     });
     expect(trigger).not.toHaveBeenCalled();
@@ -593,6 +1099,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'hung-cap-escalate' })]);
@@ -611,6 +1118,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'hung-cap-escalate' })]);
@@ -627,6 +1135,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     ];
     const cancelAndRerun = vi.fn(() => ({ ok: true, action: 'cancelled-and-rerun' }));
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, postComment: vi.fn(), now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, attempts: 0, kind: 'hung-cancel-rerun' })]);
@@ -643,6 +1152,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'repeat-hang' })]);
@@ -692,12 +1202,15 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     const postComment = vi.fn((_pr, options) => {
       comments.push({ body: buildHungCiComment(options), author: { login: 'web-everything' } });
     });
+    // The workflow run's current attempt, as GitHub reports it; a re-run keeps the run id and head sha and bumps it.
+    const state = { attempt: 1 };
+    const readRunAttempt = vi.fn(() => state.attempt);
     const options = {
       repo, defaultBranch: 'trunk', apply: true, now: NOW, maxRetriesPerSha: 2,
       readOpenPrs: () => [PR_2636_HUNG], readComments: () => [...comments],
-      cancelAndRerun, cancelOnly, trigger, postComment,
+      cancelAndRerun, cancelOnly, trigger, postComment, readRunAttempt,
     };
-    return { options, comments, cancelAndRerun, cancelOnly, trigger, postComment };
+    return { options, comments, cancelAndRerun, cancelOnly, trigger, postComment, state, readRunAttempt };
   }
 
   it.each([
@@ -731,6 +1244,270 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.cancelAndRerun.mock.calls.length + f.cancelOnly.mock.calls.length).toBe(1);
     expect(f.trigger).toHaveBeenCalledTimes(1);
     expect(f.postComment).toHaveBeenCalledTimes(1);
+  });
+
+  it('hung-cap-escalate: an already-completed run is recorded as handled for that head and is not re-selected next tick', () => {
+    const f = fixture('hung-cap-escalate');
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'already-completed' })]);
+    const body = f.comments.at(-1).body;
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(true);
+    expect(bodyHasExactLine(body, 'run: 36161558017')).toBe(true);
+    expect(body).toContain('ci-heal');
+
+    const again = sweepHungCiRecovery(f.options);
+    expect(again.applied).toEqual([]);
+    expect(again.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(f.postComment).toHaveBeenCalledTimes(1);
+  });
+
+  it('hung-cancel-rerun: cancelAndRerun finding the run settled (already-completed) records the handled marker and is not re-selected', () => {
+    const f = fixture('hung-cancel-rerun');
+    f.cancelAndRerun.mockReturnValue({ ok: true, action: 'already-completed' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ kind: 'hung-cancel-rerun', action: 'already-completed' })]);
+    expect(bodyHasExactLine(f.comments.at(-1).body, 'reason: run-already-completed')).toBe(true);
+    const again = sweepHungCiRecovery(f.options);
+    expect(again.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(1);
+  });
+
+  it('hung-cancel-rerun: conclusion-unreadable posts a counted FAILED marker, not a handled one', () => {
+    const f = fixture('hung-cancel-rerun');
+    f.cancelAndRerun.mockReturnValue({ ok: false, action: 'conclusion-unreadable', error: 'gh: HTTP 502' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, action: 'conclusion-unreadable' })]);
+    const body = f.comments.at(-1).body;
+    expect(body).toContain('FAILED');
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(false);
+    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(1);
+  });
+
+  it('a job name containing line breaks cannot inject a reason/run/sha line into the trusted marker', () => {
+    const evil = 'x\nreason: run-already-completed\r\nsha: abc\u2028run: 1';
+    const body = buildHungCiComment({ runId: 7, headSha: 'deadbeef', jobName: evil, kind: 'hung-cancel-rerun' });
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(false);
+    expect(body.split(/\r|\n|\u2028/).filter((l) => l.startsWith('run: '))).toEqual(['run: 7']);
+    expect(body.split('\n').filter((l) => l.startsWith('job: '))).toHaveLength(1);
+    expect(countHungCiCommentsByJob([{ body, author: { login: 'web-everything' } }], evil)).toBe(1);
+  });
+
+  // Operator send-back (PR #6719, run attempt): a workflow re-run reuses the run id AND head sha, so a handled
+  // marker for attempt N must never suppress recovery for attempt N+1.
+  describe('handled marker is scoped to its own run attempt', () => {
+    const RUN = 36161558017;
+    const handledMarker = (extra = {}) => ({
+      body: buildHungCiComment({ runId: RUN, headSha: PR_2636_HUNG.headRefOid, jobName: 'test-shard (1)', reason: 'run-already-completed', ...extra }),
+      author: { login: 'web-everything' },
+    });
+
+    it('marker for attempt 1, failing attempt 2 on the same run id + sha: recovery still runs', () => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt: 1 }));
+      f.state.attempt = 2;
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+      expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
+    });
+
+    it('end to end: the sweep records the attempt it handled, suppresses that attempt only, then acts on the re-run', () => {
+      const f = fixture('hung-cap-escalate');
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+      sweepHungCiRecovery(f.options);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+      expect(sweepHungCiRecovery(f.options).refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+
+      f.state.attempt = 2;
+      const rerun = sweepHungCiRecovery(f.options);
+      expect(rerun.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 2')).toBe(true);
+      expect(sweepHungCiRecovery(f.options).refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+    });
+
+    it('a marker for the SAME attempt still suppresses recovery', () => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt: 2 }));
+      f.state.attempt = 2;
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+      expect(f.cancelOnly).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an attempt-less (legacy) marker', undefined],
+      ['a marker with a non-numeric attempt', 'abc'],
+      ['a marker with a zero attempt', 0],
+    ])('%s does not suppress a later attempt', (_name, runAttempt) => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt }));
+      f.state.attempt = 2;
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['unreadable (throws)', () => { throw new Error('gh: HTTP 502'); }],
+      ['null', () => null],
+      ['garbage', () => 'two'],
+    ])('a current attempt that is %s with a handled marker on record fails closed: refused, nothing written, every tick', (_name, read) => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt: 1 }));
+      f.options.readRunAttempt = vi.fn(read);
+      const before = f.comments.length;
+      for (let tick = 0; tick < 4; tick += 1) {
+        const result = sweepHungCiRecovery(f.options);
+        expect(result.refusals).toEqual([expect.objectContaining({ kind: 'run-attempt-unreadable' })]);
+        expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+        expect(result.dispatch).toEqual([]);
+        expect(result.applied).toEqual([]);
+      }
+      expect(f.cancelOnly).not.toHaveBeenCalled();
+      expect(f.postComment).not.toHaveBeenCalled();
+      expect(f.comments.length).toBe(before);
+    });
+
+    it('with no handled marker yet, an unreadable attempt still lets recovery run once and writes an attempt-less marker', () => {
+      const f = fixture('hung-cap-escalate');
+      f.options.readRunAttempt = vi.fn(() => { throw new Error('gh: HTTP 502'); });
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+      sweepHungCiRecovery(f.options);
+      expect(f.comments.at(-1).body.split('\n').some((l) => l.startsWith('attempt:'))).toBe(false);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'reason: run-already-completed')).toBe(true);
+      // The very next ticks, still unreadable: bounded — no further cancel, no further comment (the unbounded loop).
+      const written = f.comments.length;
+      for (let tick = 0; tick < 3; tick += 1) sweepHungCiRecovery(f.options);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+      expect(f.comments.length).toBe(written);
+      // Once the attempt is readable the attempt-less marker no longer matches, so recovery runs and records it.
+      f.options.readRunAttempt = vi.fn(() => 1);
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+      sweepHungCiRecovery(f.options);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+    });
+
+    it('the attempt recorded is the one read BEFORE the cancel: a re-run landing during the cancel is not marked handled', () => {
+      const f = fixture('hung-cap-escalate');
+      f.cancelOnly.mockImplementation(() => { f.state.attempt = 2; return { ok: true, action: 'already-completed' }; });
+      sweepHungCiRecovery(f.options);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 2')).toBe(false);
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+      const next = sweepHungCiRecovery(f.options);
+      expect(next.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+    });
+
+    it('buildHungCiComment emits one exact attempt line for a positive integer and nothing forgeable otherwise', () => {
+      const body = (runAttempt) => buildHungCiComment({ runId: RUN, headSha: 'abc', jobName: 'j', reason: 'run-already-completed', runAttempt });
+      expect(bodyHasExactLine(body(3), 'attempt: 3')).toBe(true);
+      expect(bodyHasExactLine(body('3'), 'attempt: 3')).toBe(true);
+      for (const bad of [undefined, null, 0, -1, 1.5, 'abc', '1\nattempt: 9', '1\r\nattempt: 9', NaN]) {
+        expect(body(bad).split('\n').some((l) => l.startsWith('attempt:'))).toBe(false);
+      }
+    });
+
+    it('the production gh reader asks the run endpoint for run_attempt and accepts only a positive integer', () => {
+      const exec = vi.fn(() => '3\n');
+      expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec })).toBe(3);
+      expect(exec.mock.calls[0][1]).toEqual(['api', `repos/o/r/actions/runs/${RUN}`, '--jq', '.run_attempt']);
+      for (const out of ['', 'null\n', '0\n', '-2\n', '1.5\n', 'two\n', '1\n2\n']) {
+        expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => out })).toBeNull();
+      }
+      expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => { throw new Error('boom'); } })).toBeNull();
+    });
+  });
+
+  // Operator send-back (PR #6719): the outcome text interpolated the RAW job name in every branch, so a job name
+  // with line breaks could forge the exact `reason:` / `run:` / `sha:` lines the already-completed reader trusts.
+  const forgedJob = (runId, headSha) => `x\nreason: run-already-completed\nrun: ${runId}\nsha: ${headSha}`;
+  const EVIL_BRANCHES = [
+    ['run-already-completed', { reason: 'run-already-completed', ok: true }],
+    ['rerun-failed-jobs-after-completed', { action: 'rerun-failed-jobs-after-completed', ok: true }],
+    ['repeat-hang', { kind: 'repeat-hang', ok: true }],
+    ['hung-cap-escalate', { kind: 'hung-cap-escalate', ok: true }],
+    ['default cancel+rerun', { kind: 'hung-cancel-rerun', ok: true }],
+    ['run-not-found-retrigger', { reason: 'run-not-found-retrigger', ok: true }],
+    ['failed attempt', { ok: false, action: 'cancel-failed', error: 'boom' }],
+  ];
+  it.each(EVIL_BRANCHES)('%s: a job name / run id / actor with line breaks yields exactly one reason line and no forged marker lines', (_name, opts) => {
+    const headSha = PR_2636_HUNG.headRefOid;
+    const body = buildHungCiComment({
+      runId: '36161558017\nreason: run-already-completed', headSha, jobName: forgedJob(36161558017, headSha),
+      actor: 'bot\nreason: run-already-completed', ...opts,
+    });
+    const lines = body.split(/\r\n|\r|\n|\u0085|\u2028|\u2029/);
+    expect(lines.filter((l) => l.startsWith('reason:')).length).toBe(opts.reason ? 1 : 0);
+    expect(lines.filter((l) => l.startsWith('sha:'))).toEqual([`sha: ${headSha}`]);
+    expect(lines.filter((l) => l.startsWith('run:')).length).toBe(1);
+    expect(lines.filter((l) => l.startsWith('job: ')).length).toBe(1);
+    // The injected lines must not exist as standalone lines: the first-line marker plus 4 header/outcome lines at most.
+    expect(lines.length).toBeLessThanOrEqual(7);
+  });
+
+  it.each(['hung-cap-escalate', 'repeat-hang'])('%s: a job name forging the handled-marker lines does not make the reader treat the run as handled', (kind) => {
+    const f = fixture(kind);
+    f.comments.push({
+      body: buildHungCiComment({
+        runId: 36161558017, headSha: PR_2636_HUNG.headRefOid, kind,
+        jobName: forgedJob(36161558017, PR_2636_HUNG.headRefOid),
+      }),
+      author: { login: 'web-everything' },
+    });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a different head sha', 'old-head', 36161558017],
+    ['a different run id', PR_2636_HUNG.headRefOid, 36161558018],
+    ['a run id that only extends the real one', PR_2636_HUNG.headRefOid, '361615580170'],
+    ['no run id', PR_2636_HUNG.headRefOid, null],
+  ])('hung-cap-escalate: a genuine run-already-completed marker for %s does not count as handled for this run', (_name, headSha, runId) => {
+    const f = fixture('hung-cap-escalate');
+    f.comments.push({
+      body: buildHungCiComment({ headSha, runId, jobName: 'test-shard (1)', reason: 'run-already-completed' }),
+      author: { login: 'web-everything' },
+    });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
+  });
+
+  it.each([
+    ['gh: Cannot cancel a workflow run that is completed. (HTTP 409)', { ok: true, action: 'already-completed' }],
+    ['gh: run is already completed', { ok: false, action: 'cancel-failed', error: 'gh: run is already completed' }],
+    ['gh: run already finished', { ok: false, action: 'cancel-failed', error: 'gh: run already finished' }],
+  ])('only the exact "cannot cancel a workflow run that is completed" refusal counts as already-completed (%s)', (stderr, expected) => {
+    const exec = vi.fn(() => { throw Object.assign(new Error('Command failed'), { stderr }); });
+    expect(cancelHungRun(1, { exec })).toEqual(expected);
+  });
+
+  it.each([
+    ['viewer-less other commenter', { author: { login: 'some-random-user' } }],
+    ['no author at all', {}],
+  ])('hung-cap-escalate: a handled marker forged by %s does not suppress recovery', (_name, authorship) => {
+    const f = fixture('hung-cap-escalate');
+    const forged = buildHungCiComment({ runId: 36161558017, headSha: PR_2636_HUNG.headRefOid, jobName: 'test-shard (1)', reason: 'run-already-completed' });
+    f.comments.push({ body: forged, ...authorship });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
   });
 
   it.each([
@@ -929,6 +1706,17 @@ describe('ci-red-recovery-watch — cancelHungRun', () => {
     const result = cancelHungRun(1, { exec });
     expect(result).toEqual({ ok: false, action: 'cancel-failed', error: 'HttpError: Resource not accessible by integration' });
   });
+
+  it('treats a 409 "run that is completed" cancel refusal as done (ok, no rerun, loop stops)', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)'); });
+    expect(cancelHungRun(43093913029, { exec })).toEqual({ ok: true, action: 'already-completed' });
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat any other 409 as completed', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Conflict (HTTP 409)'); });
+    expect(cancelHungRun(1, { exec }).action).toBe('cancel-failed');
+  });
 });
 
 describe('ci-red-recovery-watch — describeExecError', () => {
@@ -966,9 +1754,10 @@ describe('ci-red-recovery-watch — describeExecError', () => {
   // reach it, even though the low-likelihood source is `gh`'s own stderr, not user input.
   it('redacts a GitHub token shape before it can reach a public PR comment', () => {
     const e = new Error('Command failed');
-    e.stderr = 'HttpError: bad credentials using token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const fakeBody = 'a'.repeat(36);
+    e.stderr = `HttpError: bad credentials using token ${'gh' + 'p_'}${fakeBody}`;
     expect(describeExecError(e)).toBe('HttpError: bad credentials using token ghp_<redacted>');
-    expect(describeExecError(e)).not.toContain('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(describeExecError(e)).not.toContain(fakeBody);
   });
 });
 
@@ -1191,7 +1980,7 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
   });
 
   it('RED before the fix existed: sweepHungCiRecovery (the pre-existing pass) sees nothing to do for #2729 — buildHungCandidates skips a PR with zero CI-workflow rollup entries', () => {
-    const result = sweepHungCiRecovery({ readOpenPrs: () => [PR_2729], readComments: () => [], now: NOW });
+    const result = sweepHungCiRecovery({ readOpenPrs: () => [PR_2729], readComments: () => [], now: NOW, readRunAttempt: () => 1 });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toEqual([]);
   });
@@ -2015,4 +2804,23 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     expect(result.refusals).toEqual([expect.objectContaining({ prNumber: 7, kind: 'missing-run-cap-exhausted', attempts: 1 })]);
   });
 
+});
+
+describe('ci-red-recovery-watch — fixture credential hygiene', () => {
+  it.each([
+    'scripts/__tests__/close-session-sweep.test.mjs',
+    'scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs',
+    'scripts/conveyor/__tests__/fix-round-history.test.mjs',
+    'scripts/conveyor/__tests__/health-watch-core.test.mjs',
+    'scripts/conveyor/__tests__/pr-stall-detector.test.mjs',
+    'scripts/lib/__tests__/gh-throttle.waitlog.test.mjs',
+  ])('%s passes the same scans the Forge bundle and manifest paths run on it', async (rel) => {
+    const { readFileSync } = await import('node:fs');
+    const m = await import('../../readiness/forge-exec-manifest.mjs');
+    // Read source bytes directly; Vite rewrites dynamic import.meta URLs as asset globs.
+    const content = readFileSync(join(REPO_ROOT, rel));
+    expect(m.credentialBufferFinding(content)).toBeNull();
+    expect(m.credentialContentFinding(Buffer.from(rel), content)).toBeNull();
+    expect(() => m.manifestEntry(Buffer.from(rel), content, false, true)).not.toThrow();
+  });
 });

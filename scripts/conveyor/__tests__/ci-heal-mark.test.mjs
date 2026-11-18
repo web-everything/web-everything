@@ -229,7 +229,7 @@ describe('CI-heal acceptance replay through the actual CLI', () => {
       git('remote', 'add', 'origin', dir);
       const { buildVerdictComment } = reviewLabel;
       const state = { state: 'OPEN', headRefOid: healedHead, headRefName: 'lane', labels: [{ name: 'review:accepted' }],
-        comments: [{ author: AUTOMATION, body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: reviewedHead, reviewedDiff, ...(scenario === 'human' ? { to: 'clear-human', clearerId: 'operator' } : {}) }) }] };
+        comments: [{ id: 'IC_review', author: scenario === 'human' ? { login: 'chalbert' } : AUTOMATION, body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: reviewedHead, reviewedDiff, ...(scenario === 'human' ? { to: 'clear-human', clearerId: 'operator' } : {}) }) }] };
       if (scenario === 'missing') state.comments = [];
       writeFileSync(join(dir, 'state.json'), JSON.stringify(state));
       mkdirSync(join(dir, 'bin'));
@@ -284,7 +284,9 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       expect(calls.filter(c => c[1] === 'edit')).toHaveLength(rearmed ? 1 : 0);
       // The formal-reviews GET (a carried operator clearance, PR #4631 round 11) names the repo inside its endpoint path.
       expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything')
-        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews')))).toBe(true);
+        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews'))
+        // The post-restamp merge-gate refresh's check-run read (fake gh returns nothing usable; the refresh fails closed, loudly).
+        || (c[0] === 'api' && c.some(a => String(a).startsWith('repos/web-everything/web-everything/commits/') && String(a).includes('/check-runs'))))).toBe(true);
       if (carried) expect(calls.filter(c => c[0] === 'api').length).toBeGreaterThanOrEqual(1);
       if (scenario === 'unchanged') console.info('CI-heal proven replay', JSON.stringify(proof));
       if (scenario === 'soak') {
@@ -575,7 +577,7 @@ describe('PR #3577 review: failure detail is neutralised before it reaches a pub
     ['JSON-quoted key', '{"token": "abc123def456"}', 'abc123def456'],
     ['JSON password', '"password":"hunter2"', 'hunter2'],
     ['JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r', 'dBjftJeZ4CVP'],
-    ['PEM body', '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo\n-----END RSA PRIVATE KEY-----', 'MIIEowIBAAKC'],
+    ['PEM body', '-----BEG\x49N RSA PRIVATE\x20KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo\n-----\x45ND RSA PRIVATE\x20KEY-----', 'MIIEowIBAAKC'],
     ['gitlab / npm token', 'glpat-abcdefghij0123456789 npm_abcdefghijklmnopqrst0123', 'abcdefghij0123456789'],
     ['quoted value with spaces', 'GH_TOKEN="abc def ghi"', 'def ghi'],
     ['flag form', 'run --password hunter2 --api-key=zzzz1111', 'hunter2'],

@@ -36,7 +36,9 @@ import { execFileSync } from 'node:child_process';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { REVIEWED_SHA_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, REVIEW_PR_CHANNEL, normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
+import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 export const MECHANICAL_ROUNDS_SETTING = 'mechanicalRoundsCountTowardCap';
 export const MECHANICAL_ROUNDS_ENV = 'WE_REVIEW_MECHANICAL_ROUNDS_COUNT_TOWARD_CAP';
@@ -267,7 +269,7 @@ function latestMechanicalRoundAt(comments) {
   for (const c of comments) {
     if (!isTrustedMarkerAuthor(c)) continue;
     const mechanical = isMechanicalRoundMarker(c);
-    const ordinary = isRearmMarker(c);
+    const ordinary = isFixRoundRearmComment(c);
     if (!mechanical && !ordinary && !isReviewVerdictComment(c)) continue;
     const at = timeOf(c);
     if (!Number.isFinite(at)) return null;
@@ -453,10 +455,6 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
   } catch { return fail('git-read-failed'); }
 }
 
-// Same leading-line/authorship match as countRearmComments; avoid importing its label CLI dependency.
-// Pinned to REARM_COMMENT_MARKER by the enrichment regression in mechanical-rebase-rounds.test.mjs.
-const isRearmMarker = (c) => isTrustedMarkerAuthor(c) && bodyOf(c).trimStart().startsWith('🔧 conveyor fix — re-armed for re-review');
-
 /** The cheap pre-filter: a trusted mechanical-round marker is the latest round event after the latest verdict. */
 export function hasPendingMechanicalRound(pr) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
@@ -466,24 +464,18 @@ export function hasPendingMechanicalRound(pr) {
   return roundAt > (verdicts.length ? Math.max(...verdicts) : -Infinity);
 }
 
-// Keep in sync with reconcile-core.mjs#resolveRoundCap; importing it here would create a cycle.
-function resolveRoundCap(env = process.env) {
-  const value = env.WE_REVIEW_ROUND_CAP;
-  return typeof value === 'string' && /^\d+$/.test(value.trim())
-    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : 5;
-}
 
 /** IO: attach `mechanicalRound` facts to each PR whose latest round was mechanical. Never throws. */
 export function enrichPrsWithMechanicalRound(prs, {
   defaultBranch = 'main', readFacts = readMechanicalRoundFacts, readRoundCommits: readCommits = readRoundCommits,
-  roundCap = resolveRoundCap(),
+  roundCap = resolveRoundCap(process.env),
 } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
     let enriched = pr;
     if (hasPendingMechanicalRound(pr)) {
       try { enriched = { ...enriched, mechanicalRound: readFacts({ pr, defaultBranch }) }; } catch { /* preserve existing behavior */ }
     }
-    if (Array.isArray(pr?.comments) && pr.comments.filter(isRearmMarker).length >= roundCap) {
+    if (Array.isArray(pr?.comments) && pr.comments.filter(isFixRoundRearmComment).length >= roundCap) {
       try { enriched = { ...enriched, roundCommits: readCommits({ pr, defaultBranch }) }; }
       catch { enriched = { ...enriched, roundCommits: { head: lc(pr?.headRefOid), ok: false, reason: 'git-read-failed' } }; }
     }

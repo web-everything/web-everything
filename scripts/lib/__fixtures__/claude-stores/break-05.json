@@ -1,0 +1,47 @@
+{
+  "break": 5,
+  "title": "an unreadable store B keeps the owner unknown and refuses the stop",
+  "input": {
+    "home": "/home/test",
+    "env": {
+      "XPC_SERVICE_NAME": "com.we.worker"
+    },
+    "map": {
+      "accounts": {
+        "a": {
+          "configDir": "/home/test/.claude"
+        },
+        "b": {
+          "configDir": "/home/test/claude-b"
+        }
+      },
+      "daemons": {
+        "com.we.worker": "b"
+      },
+      "routing": {
+        "accountB": true
+      }
+    },
+    "existing": [
+      "/home/test/.claude",
+      "/home/test/claude-b"
+    ],
+    "listings": {
+      "/home/test/.claude": [
+        {
+          "sessionId": "abcdef01-1234-4567-89ab-123456789abc",
+          "id": "job-a"
+        }
+      ],
+      "/home/test/claude-b": {
+        "bad": "listing"
+      }
+    },
+    "handle": "abcdef01-1234-4567-89ab-123456789abc"
+  },
+  "expect": {
+    "kind": "unknown",
+    "action": "refuse",
+    "reason": "unknown"
+  }
+}
