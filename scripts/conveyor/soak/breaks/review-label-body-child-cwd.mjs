@@ -8,6 +8,32 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const SOURCE = 'scripts/operations/review-pr-io.mjs';
 
+export async function probeChildCwd(sourceRoot) {
+  const fixture = mkdtempSync(join(tmpdir(), 'review-label-cwd-probe-'));
+  try {
+    const { createReviewPrSinks } = await import(pathToFileURL(join(sourceRoot, SOURCE)).href);
+    const { REVIEW_EFFECTS } = await import(pathToFileURL(join(sourceRoot, 'scripts/operations/review-pr.mjs')).href);
+    const root = join(fixture, 'staging'), cwd = join(fixture, 'child');
+    mkdirSync(root);
+    mkdirSync(cwd);
+    const runId = 'cwd-probe', bodyFile = 'probe.md', body = 'Capability probe';
+    const head = 'a'.repeat(40);
+    let childCwd;
+    const sinks = createReviewPrSinks({ root, cwd,
+      runStore: { read: () => ({ id: runId, effects: [
+        { type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile, body } },
+      ] }) },
+      readPublishHead: () => head,
+      publishGate: () => ({ allowed: true, headSha: head, checks: [] }),
+      runNode: (_argv, opts) => { childCwd = opts.cwd; return '{"ok":true}'; },
+    });
+    await sinks[REVIEW_EFFECTS.LABEL]({ pr: 7100, repo: 'example/review', to: 'accepted',
+      actor: 'reviewer', bodyFile, reviewedHead: head }, { runId });
+    return childCwd === cwd;
+  } catch { return false; }
+  finally { rmSync(fixture, { recursive: true, force: true }); }
+}
+
 export async function replay(sourceRoot = ROOT) {
   const fixture = mkdtempSync(join(tmpdir(), 'review-label-cwd-'));
   const violations = [];
@@ -58,12 +84,11 @@ export default {
   card: 'review-job --pr=7100 body-file refusal',
   fixedBy: { sha: 'HEAD', where: 'review-label-body-child-cwd', paths: [SOURCE, 'scripts/operations/run.mjs'] },
   fixPresent(root) {
-    // The harness needs a synchronous answer. Probe the real sink in a bounded, hermetic child;
-    // no marker text can turn an unfixed implementation into a required pass.
+    // Detect cwd support only. Body-file regression assertions belong to replay so their
+    // failure cannot turn a required pass into an expected failure.
     const result = spawnSync(process.execPath, ['--input-type=module', '-e',
-      `import { replay } from ${JSON.stringify(import.meta.url)};
-       const report = await replay(process.argv[1]);
-       process.exitCode = report.violations.length ? 1 : 0;`, root],
+      `import { probeChildCwd } from ${JSON.stringify(import.meta.url)};
+       process.exitCode = await probeChildCwd(process.argv[1]) ? 0 : 1;`, root],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
     return !result.error && result.status === 0;
   },
