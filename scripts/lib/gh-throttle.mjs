@@ -1094,6 +1094,11 @@ export const GH_OUTER_KILL_SIGNAL_ENV = 'WE_GH_THROTTLE_OUTER_KILL_SIGNAL';
 /** Env var beside {@link GH_OUTER_INV_ENV}: the pool label ('shared' or an installation id) the outer call was
  *  admitted to. A nested passthrough rides the outer slot only when it resolves the SAME pool. */
 export const GH_OUTER_BUCKET_ENV = 'WE_GH_THROTTLE_OUTER_BUCKET';
+/** Env var beside {@link GH_OUTER_INV_ENV}: the slot owner the outer call holds. A nested passthrough that resolves
+ *  a DIFFERENT pool takes its own slot there, but must not count its own waiting parent against perCallerMax (the
+ *  parent cannot release until the child returns — PR #7018 red team). Deliberately NOT `WE_GH_THROTTLE_OWNER`:
+ *  the CLI adopts that value as its own owner, so its release would free the parent's slot. */
+export const GH_OUTER_OWNER_ENV = 'WE_GH_THROTTLE_OUTER_OWNER';
 /** The outer timeout options a nested passthrough must honour, or null (un-nested, absent or unparseable → its own
  *  default). An unknown signal is dropped (spawn would throw on it) and the node default applies. */
 function outerExecLimits(outer, env) {
@@ -1209,11 +1214,12 @@ export function acquireGhSlotSync({
   pollMs = DEFAULT_ACQUIRE_POLL_MS, timeoutMs = DEFAULT_ACQUIRE_TIMEOUT_MS,
   now = () => Date.now(), sleep = sleepSyncMs,
   meta = ghHolderMeta({ caller: 'unknown', args: [], pid }), policy = ghHolderPolicy(), logPath, warn, bucket = 'shared', callerLockRoot = lockRoot,
+  excludeOwner = null,
 }) {
   mkdirSync(lockRoot, { recursive: true });
   const label = /^\d+$/.test(bucket) ? bucket : 'shared';
   let contended = false;
-  const result = acquireGhHolderSlot({ lockRoot, callerLockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy,
+  const result = acquireGhHolderSlot({ lockRoot, callerLockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, excludeOwner,
     trySlot: (opts) => tryAcquireSlot({ ...opts, leaseMinutes: ADMISSION_LEASE_MINUTES }),
     onWait: () => { contended = true; },
     onReap: (holder) => {
@@ -2007,7 +2013,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const exec = throttle.exec || ((a, o) => {
     if (throttle.execOptions) o = throttle.execOptions(o);
     const held = ghExecOptions(o, a, ghHolderPolicy(env));
-    const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_BUCKET_ENV]: outerBucketLabel, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
+    const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_BUCKET_ENV]: outerBucketLabel, [GH_OUTER_OWNER_ENV]: owner, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
       ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
     if (!capture) return (throttle.execFileSync || execFileSync)(bin, a, childOpts);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
@@ -2391,12 +2397,16 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // call that resolved an installation pool still takes its own slot there.
     const outerBucket = env[GH_OUTER_BUCKET_ENV] || process.env[GH_OUTER_BUCKET_ENV] || (outer ? 'shared' : null);
     const ridesOuter = !!outer && outerBucket === (/^\d+$/.test(String(bucket)) ? String(bucket) : 'shared');
+    // Moving pools, the parent still holds its slot and waits on this child: count the pair ONCE against the
+    // caller bound by excluding exactly that one holder (matched by its raw lock owner, so a value naming no
+    // holder excludes nothing). Only a nested call carries it; a parent on older code publishes none.
+    const outerOwner = outer ? (env[GH_OUTER_OWNER_ENV] || process.env[GH_OUTER_OWNER_ENV] || null) : null;
     const acq = gated && !ridesOuter ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
-      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ ...pool, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ ...pool, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn, excludeOwner: outerOwner });
     }, { ...gateOpts, fallback: reserved ? RESERVED_CLOSED : { ok: false } }) : (reserved ? RESERVED_CLOSED : { ok: false });
     const throttledMessage = slotTimeoutMessage(logPath, acq, { bucket, op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, reserved ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {

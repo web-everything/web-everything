@@ -205,7 +205,7 @@ export function describeLegacyHolders(holders, ps = (pid) => execFileSync('ps', 
 }
 
 /** Each poll snapshots and checks attribution before attempting the existing atomic slot primitive. */
-export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, trySlot, onReap = () => {}, onWait = () => {}, callerLockRoot = lockRoot }) {
+export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, trySlot, onReap = () => {}, onWait = () => {}, callerLockRoot = lockRoot, excludeOwner = null }) {
   const startedAt = now();
   const safe = sanitizeGhHolder(meta);
   const slotMeta = { caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}) };
@@ -226,8 +226,16 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
       if (!entry || entry.owner !== snapshot.owner || entry.heartbeatAt !== snapshot.heartbeatAt || !overAge(holder(slot, entry, nowMs))) return;
       if (releaseLockDirIf(root, slotPath(slot), entry)) onReap({ ...holder(slot, entry, nowMs), ...(bucket ? { bucket } : {}) });
     };
-    // The caller bound counts every alive holder across the shared and installation pools.
-    const capped = () => policy.perCallerMax > 0 && readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs }).filter(h => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
+    // The caller bound counts every alive holder across the shared and installation pools, except the ONE slot a
+    // nested call's own parent holds (`excludeOwner`, matched on the raw lock owner): the pair is one invocation.
+    const isOuter = h => typeof excludeOwner === 'string' && excludeOwner !== '' && excludeOwner !== owner
+      && readLockEntry(h.bucket ? join(callerLockRoot, 'installations', h.bucket) : callerLockRoot, slotPath(h.slot))?.owner === excludeOwner;
+    const capped = () => {
+      if (!(policy.perCallerMax > 0)) return false;
+      const mine = readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs }).filter(h => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta));
+      const outerIdx = mine.findIndex(isOuter);
+      return mine.length - (outerIdx >= 0 ? 1 : 0) >= policy.perCallerMax;
+    };
     let r = capped() ? { ok: false } : trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     if (!r.ok && (capped() || holders.length >= cap) && policy.maxHoldSeconds > 0) {
       for (const h of holders) reap(lockRoot, h.slot, entries[h.slot]);

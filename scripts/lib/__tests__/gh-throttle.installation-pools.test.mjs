@@ -279,6 +279,51 @@ console.log(result);`;
     expect(actual.trim()).toBe('executed');
     expect(rows('calls.jsonl').find(r => r.outcome === 'call')).toMatchObject({ id: 'app-installation-101' });
   });
+  // PR #7018 red team: the parent holds a shared slot while its shim-routed child resolves installation 101. The
+  // child must not count its own parent against perCallerMax (the parent cannot release until the child returns).
+  describe('a nested call moving to another pool counts its parent once against perCallerMax', () => {
+    const nestedRun = ({ perCallerMax, before = () => {}, parentEnv = {}, childBucket = '101', parentCap = 1 }) => {
+      const env = { ...baseEnv(), ...parentEnv, GH_CALLER: 'review-pr.mjs', WE_GH_THROTTLE_PER_CALLER_MAX: String(perCallerMax) };
+      const child = vi.fn(ok);
+      let nested = null;
+      const execFileSync = vi.fn((bin, a, o) => {
+        before(o.env);
+        nested = runGhCliPassthrough(a, { throttle: { lockRoot: root, cap: 20, env: o.env, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000,
+          shimRouted: true, resolveSlotBucket: () => ({ bucket: childBucket }) }, spawn: child });
+        return Buffer.from('[]');
+      });
+      runGhSync(args, { env, throttle: { lockRoot: root, cap: parentCap, env, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000, execFileSync } });
+      return { nested, child, execFileSync };
+    };
+    it('runs the child in installation 101 although the waiting shared parent is the caller\'s only holder', () => {
+      const { nested, child, execFileSync } = nestedRun({ perCallerMax: 1 });
+      expect(execFileSync).toHaveBeenCalledTimes(1);
+      expect(nested).toMatchObject({ status: 0 });
+      expect(nested.throttled).toBeUndefined();
+      expect(child).toHaveBeenCalledTimes(1);
+      expect(rows('calls.jsonl').find(r => r.outcome === 'call' && r.outer)).toMatchObject({ bucket: '101' });
+    });
+    it('the reverse move (parent admitted to installation 101, child resolves shared) also counts the parent once', () => {
+      const { nested, child } = nestedRun({ perCallerMax: 1, parentEnv: appEnv('101'), childBucket: null, parentCap: 20 });
+      expect(readGhSlotHolders({ lockRoot: root, cap: 20 }).length).toBe(0); // both released after the call
+      expect(nested).toMatchObject({ status: 0 });
+      expect(child).toHaveBeenCalledTimes(1);
+      expect(rows('calls.jsonl').find(r => r.outcome === 'call' && r.outer)).toMatchObject({ bucket: 'shared' });
+      expect(rows('calls.jsonl').find(r => r.outcome === 'call' && !r.outer)).toMatchObject({ bucket: '101' });
+    });
+    it('still refuses the child when ANOTHER live holder of the same caller fills the bound (only the parent is excluded)', () => {
+      const { nested, child } = nestedRun({ perCallerMax: 1, before: () => {
+        expect(acquire('202', 'sibling', { policy: { ...policy, perCallerMax: 0 }, meta: ghHolderMeta({ caller: 'review-pr.mjs', args }) }).ok).toBe(true);
+      } });
+      expect(nested).toMatchObject({ status: 1, throttled: true });
+      expect(child).not.toHaveBeenCalled();
+    });
+    it('a forged outer owner that names no holder of this caller excludes nothing', () => {
+      const { nested, child } = nestedRun({ perCallerMax: 1, before: env => { env.WE_GH_THROTTLE_OUTER_OWNER = 'not-the-parent'; } });
+      expect(nested).toMatchObject({ status: 1, throttled: true });
+      expect(child).not.toHaveBeenCalled();
+    });
+  });
   it('fails closed on absent caches and unknown owners', () => {
     expect(resolveGhSlotBucket({ identity: 'default', args, readFresh: () => null }).bucket).toBeNull();
     expect(resolveGhSlotBucket({ identity: 'default', args, env: { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' }, readFresh: () => null })).toEqual({ bucket: null, reason: 'unresolved' });
