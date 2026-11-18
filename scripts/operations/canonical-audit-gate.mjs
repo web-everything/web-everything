@@ -1,7 +1,9 @@
 /** Canonical codex-audit admission shared by every PR producer. No docs-only exemption. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { canonicalAuditEvidence, mergeRuledWeakened, validSha } from './prototype-load.mjs';
+import { homedir } from 'node:os';
+import { canonicalAuditEvidence, validSha } from './prototype-load.mjs';
+import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
@@ -40,11 +42,16 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
     // these scripts, never <repo>/scripts/settings — a sibling-repo target has none (#7011).
     const tool = readAuditSettings(readFile);
-    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) throw new Error('audit settings malformed');
     const platform = readPlatformPreferences({ env, readFile, warn });
     if (platform.errors.length) throw new Error('platform preferences unreadable');
-    config = { ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, warn) };
-    const contents = readFile(resolveAuditRecordPath(tool, { home: env.HOME, cwd: repo }), 'utf8');
+    // Same waiver layers as prototype-load (tool, platform, then the operator ops store), so an operator
+    // `ruled-weakened-add` ruling admits here too (#7011 round 3; the ops store needs HOME, else refuse).
+    // The writer resolves `~` with os.homedir(); an unset/blank HOME falls back to it too (never a
+    // relative join), so both resolve the same record file and the ops store stays readable.
+    const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();
+    config = { ruledWeakened: loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened,
+      tool: tool.ruledWeakened, fs: { readFileSync: readFile }, env: { ...env, HOME: home }, warn }) };
+    const contents = readFile(resolveAuditRecordPath(tool, { home, cwd: repo }), 'utf8');
     try {
       records = String(contents).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
     } catch {

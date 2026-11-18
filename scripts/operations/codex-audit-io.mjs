@@ -18,8 +18,12 @@ export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/protot
  * the open-PR gate so both resolve the same audit record file for any audited checkout (#7011).
  */
 export function readAuditSettings(readFile = realFs.readFileSync) {
-  try { return JSON.parse(readFile(AUDIT_SETTINGS_PATH, 'utf8')); }
+  let settings;
+  try { settings = JSON.parse(readFile(AUDIT_SETTINGS_PATH, 'utf8')); }
   catch (error) { if (error?.code !== 'ENOENT') throw error; return {}; }
+  // A JSON null/array/scalar is malformed for writer and gate alike, never a silent default.
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('audit settings malformed');
+  return settings;
 }
 
 /** Resolve the audit record path exactly as appendRecord writes it: `~` = home, relative = the audited cwd. */
