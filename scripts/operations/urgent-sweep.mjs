@@ -94,7 +94,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       if (!Array.isArray(recovery?.pending) || recovery.pending.length) throw new Error('unsettled overlay drops; run recover-drops for the clone before retrying');
       return retire({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
         expectedEntry, mode: 'urgent-failed', trackingId: r.trackingId, by: 'urgent-sweep', env,
-        deps: { readUrgentLoads: () => read('urgent-loads') } });
+        deps: { readUrgentLoads: () => read('urgent-loads'), readUrgentDecisions: () => read('urgent-sweep-state') } });
     },
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
     escalate: packet => writeEscalationPacket(packet, { dir: join(home, 'workspace/.operations/escalations'), fs: io }),
@@ -127,7 +127,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
   };
   try {
     const settlements = deps.state();
-    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-ci', 'monitoring-unregistered', 'monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
+    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['unload-decision', 'monitoring-ci', 'monitoring-unregistered', 'monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
     // Historical time-based green receipts never prove an overlay is no longer registered.
     // Old unload receipts prove removal only; resume them through the adoption check too.
@@ -256,6 +256,12 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           continue;
         }
         if (unload) {
+          // Commit negative evidence before the guarded mutation; a write failure keeps the overlay.
+          const failed = Array.isArray(data?.check_runs) ? data.check_runs.find(c => failedCheck(c, r.sha)) : undefined;
+          await deps.settle({ id, status: 'unload-decision', at: deps.now(), trackingId: r.trackingId,
+            clone: r.clone, ref: r.ref, sha: r.sha, registration: r.registration,
+            reason: unloadReason ? 'ci-expired' : 'ci-failed',
+            ...(unloadReason ? {} : { check: { head_sha: failed.head_sha, status: failed.status, conclusion: failed.conclusion } }) });
           const removal = await deps.remove(r, overlay.overlays.find(e => e.ref === r.registration.ref));
           if (!removal || removal.refused || (removal.retired !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };

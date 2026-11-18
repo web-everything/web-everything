@@ -139,7 +139,7 @@ fi
 // Pin the complete with mapping: additions, removals and option changes require a mirror review.
 const siblingActions = [
   { name: 'Checkout WE', uses: 'actions/checkout@v4', with: { path: 'web-everything', 'fetch-depth': 50 } },
-  { name: 'Mint FUI read token (GitHub App)', uses: 'actions/create-github-app-token@v2', with: {
+  { name: 'Mint FUI read token (GitHub App)', if: "vars.WE_APP_ID != ''", uses: 'actions/create-github-app-token@v2', with: {
     'app-id': '${{ vars.WE_APP_ID }}', 'private-key': '${{ secrets.WE_APP_PRIVATE_KEY }}',
     owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read',
   } },
@@ -153,12 +153,13 @@ const siblingActions = [
 const mirroredActions = {
   changes: [{ name: undefined, uses: 'actions/checkout@v4', with: { 'fetch-depth': 50 } }],
   standards: siblingActions,
-  integration: siblingActions,
-  'test-shard': [...siblingActions,
-    { name: 'Upload shard coverage', uses: 'actions/upload-artifact@v4', with: {
+  integration: siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
+  'test-shard': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)'
+    ? "${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}" : "${{ needs.changes.outputs.light != 'true' }}" })),
+    { name: 'Upload shard coverage', if: "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'coverage-shard-${{ matrix.shard }}', path: 'web-everything/coverage/coverage-final.json', 'if-no-files-found': 'error',
     } },
-    { name: 'Upload shard timings', uses: 'actions/upload-artifact@v4', with: {
+    { name: 'Upload shard timings', if: "${{ needs.changes.outputs.light != 'true' && (always()) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'timing-unit-${{ matrix.shard }}', path: 'web-everything/coverage/timing-unit-${{ matrix.shard }}.json', 'if-no-files-found': 'ignore',
     } },
   ],
@@ -233,8 +234,8 @@ export function ciGatePlan(workflow) {
     if (!Array.isArray(steps) || steps.some(s => !s || typeof s !== 'object' || ('run' in s &&
       (typeof s.run !== 'string' || !allowed.has(runText(s.run))))))
       throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run or uses steps`);
-    const actualActions = steps.filter(s => 'uses' in s).map(s => ({ name: s.name, uses: s.uses, with: s.with }));
-    if (!isDeepStrictEqual(actualActions, mirroredActions[job]))
+    const actualActions = steps.filter(s => 'uses' in s).map(s => ({ name: s.name, uses: s.uses, with: s.with, if: s.if, env: s.env, 'continue-on-error': s['continue-on-error'] }));
+    if (!isDeepStrictEqual(actualActions, mirroredActions[job].map(s => ({ if: undefined, env: undefined, 'continue-on-error': undefined, ...s }))))
       throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} uses steps`);
     // Every accepted command must belong to the local mirror, exactly once.
     const actualRuns = steps.filter(s => 'run' in s).map(s => runText(s.run));

@@ -4677,6 +4677,23 @@ the loader writes a registration-failed note only after the shared overlay reade
 absence, and the sweep honors that note only after confirming absence again. Present or unreadable
 registrations retain monitoring. Keep these paths in `prototype-load.test.mjs` and `urgent-sweep.test.mjs`.
 
+Action signatures also pin exact `if`, `env` and `continue-on-error` values, including their absence.
+A changed checkout condition or action environment refuses with `unreadable-ci-gates`; update the
+mirror or wait for passing CI. The real workflow and every action's context mutations are covered
+in `urgent-verify.test.mjs`.
+
+Urgent retirement requires both the matching load and a persisted `unload-decision` from
+`urgent-sweep-state`, read under the overlay lock. The sweep writes this decision before removal;
+write failure leaves the registration intact. Decisions bind tracking ID, clone, source ref/SHA
+and registration ref/SHA, with either an exact-source-SHA completed failure or a `ci-expired`
+decision at least 24 hours after loading. A load record alone never authorizes withdrawal.
+Missing, unreadable, mismatched, future or incomplete decisions refuse; inspect CI and repair the
+ledger or unload manually. The production decision reader shares the 4 MiB ledger bound and
+archive fallback. Decisions are authorization records, not unload settlements: refused removals
+retain the decision without emitting an unload event. Historical settlements retain their existing
+adoption handling. Keep these guarantees in `urgent-sweep.test.mjs` and
+`daemon-overlay-replace-retire.test.mjs`.
+
 The CI mirror also pins each run step's directory, environment, shell, condition and error policy,
 and refuses job run defaults, environments and containers. A context change requires updating the
 mirror or waiting for passing CI; command equality alone cannot authorize an urgent receipt.

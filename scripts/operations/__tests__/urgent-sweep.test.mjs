@@ -35,6 +35,24 @@ describe('urgent CI sweep', () => {
     f.d.containsOverlay.mockReturnValue(false);
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-adopted' }] });
   });
+  it.each(['ci-failed', 'ci-expired'])('persists %s evidence before guarded removal', async reason => {
+    const f = fixture(reason === 'ci-failed' ? [check('test', 'failure')] : []);
+    if (reason === 'ci-expired') f.d.now = () => '2026-11-19T12:00:00Z';
+    f.d.remove.mockImplementation(() => {
+      expect(f.state.at(-1)).toMatchObject({ status: 'unload-decision', reason, trackingId: load.trackingId,
+        clone: load.clone, sha: load.sha, registration: load.registration });
+      if (reason === 'ci-failed') expect(f.state.at(-1).check).toMatchObject({ head_sha: sha, conclusion: 'failure' });
+      return { retired: true };
+    });
+    expect((await f.run()).ok).toBe(true);
+  });
+  it('keeps the registration when persisting the unload decision fails', async () => {
+    const f = fixture([check('test', 'failure')]);
+    const settle = f.d.settle;
+    f.d.settle = vi.fn(r => { if (r.status === 'unload-decision') throw new Error('ledger write failed'); return settle(r); });
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
   it('escalates a 7h pending load once per tracking id and keeps it loaded', async () => {
     const f = fixture([check('test', null, { status: 'in_progress' })]);
     f.loads[0] = { ...load, at: '2026-11-18T05:00:00Z' };
@@ -569,11 +587,11 @@ describe('urgent CI sweep', () => {
   });
   it('does not settle or emit unloaded when the expected-tip guard refuses', async () => {
     const f = fixture([check('test', 'failure')]); f.d.remove.mockReturnValue({ removed: false, refused: 'tip-moved' });
-    expect((await f.run()).ok).toBe(false); expect(f.events).toEqual([]); expect(f.settlements()).toEqual([]); expect(f.d.escalate).toHaveBeenCalled();
+    expect((await f.run()).ok).toBe(false); expect(f.events).toEqual([]); expect(f.settlements()).toEqual([expect.objectContaining({ status: 'unload-decision', reason: 'ci-failed' })]); expect(f.d.escalate).toHaveBeenCalled();
   });
   it('refuses an unsuccessful removal that still lists the overlay', async () => {
     const f = fixture([check('test', 'failure')]); f.d.remove.mockReturnValue({ removed: false, list: [{ ref: load.registration.ref }] });
-    expect((await f.run()).ok).toBe(false); expect(f.events).toEqual([]); expect(f.settlements()).toEqual([]);
+    expect((await f.run()).ok).toBe(false); expect(f.events).toEqual([]); expect(f.settlements()).toEqual([expect.objectContaining({ status: 'unload-decision', reason: 'ci-failed' })]);
   });
   it('escalates an unknown persisted settlement status before reading CI', async () => {
     const f = fixture(); f.state.push({ id: 'a'.repeat(64), status: 'pending' });
@@ -682,8 +700,19 @@ describe('production sweep storage and removal guards', () => {
     expect(recover.mock.invocationCallOrder[1]).toBeLessThan(retire.mock.invocationCallOrder[1]);
     expect(retire).toHaveBeenCalledWith({ root: load.clone, ref: load.registration.ref,
       expectedTip: load.registration.sha, expectedEntry: entry, mode: 'urgent-failed', trackingId: load.trackingId,
-      by: 'urgent-sweep', env, deps: { readUrgentLoads: expect.any(Function) } });
+      by: 'urgent-sweep', env, deps: { readUrgentLoads: expect.any(Function), readUrgentDecisions: expect.any(Function) } });
     expect(retire.mock.calls[0][0].deps.readUrgentLoads()).toEqual([load]);
+    expect(retire.mock.calls[0][0].deps.readUrgentDecisions()).toEqual([]);
+  });
+  it('refuses oversized unload-decision storage with an archive fallback', async () => {
+    const retire = vi.fn(async args => {
+      expect(() => args.deps.readUrgentDecisions()).toThrow('ledger exceeds 4 MiB; archive settled records and retry');
+      return { retired: false, refused: 'urgent-decision-unreadable' };
+    });
+    const deps = createSweepDeps({ retire, recover: () => ({ pending: [] }),
+      io: { statSync: () => ({ size: 4 * 1024 * 1024 + 1 }) } });
+    expect(await deps.remove(load, { ref: load.registration.ref })).toMatchObject({ retired: false });
+    expect(retire).toHaveBeenCalledTimes(1);
   });
   it('retrieves failures before the production workflow and required-job readers', async () => {
     const exec = vi.fn((cmd, args) => {
@@ -729,7 +758,7 @@ describe('production sweep storage and removal guards', () => {
     expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: 'corrupt drop intent' }] });
     expect(retire).not.toHaveBeenCalled();
     expect(f.events).toEqual([]);
-    expect(f.settlements()).toEqual([]);
+    expect(f.settlements()).toEqual([expect.objectContaining({ status: 'unload-decision', reason: 'ci-failed' })]);
   });
   it('rejects a moved or unreadable tip before mutation', () => {
     const remove = vi.fn();

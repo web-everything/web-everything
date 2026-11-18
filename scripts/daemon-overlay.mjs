@@ -459,7 +459,8 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
  * Runs under the add-guard lock (no guarded add can interleave) with a durable drop intent (see settlePendingDrops).
  * Library-only `mode: 'urgent-failed'` permits a failed/expired urgent CI load to withdraw even when
  * retirement proof says unique-commits-not-on-main or pr-open. Requires an explicit entry snapshot, exact live tip,
- * and a matching trackingId in the coordination urgent-loads ledger via deps.readUrgentLoads.
+ * a matching trackingId in the coordination urgent-loads ledger, and a durable negative
+ * unload decision from the bounded sweep ledger via deps.readUrgentDecisions.
  * Other keep verdicts still refuse. This mode never supplies operator retirement evidence.
  * `deps.readUrgentLoads` reads the bounded coordination ledger; {prove, tip, afterDrop} are test seams.
  * Same race class as the rebuild's own auto-drop (`daemon-rebuild/prepare.mjs` removes `in-main`/`pr-merged` decisions by
@@ -484,10 +485,24 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       let records;
       try { records = await deps.readUrgentLoads?.(); } catch { return refuse('urgent-tracking-unreadable'); }
       if (!Array.isArray(records)) return refuse('urgent-tracking-unreadable');
-      if (typeof trackingId !== 'string' || !trackingId.trim() || !records.some(r =>
+      const load = records.find(r =>
         r?.type === 'prototype-load.urgent' && r.trackingId === trackingId
         && r.clone === root && r.registration?.clone === root
-        && r.registration.ref === ref && r.registration.sha === expectedTip)) return refuse('urgent-tracking-required');
+        && r.registration.ref === ref && r.registration.sha === expectedTip);
+      if (typeof trackingId !== 'string' || !trackingId.trim() || !load) return refuse('urgent-tracking-required');
+      let decisions;
+      try { decisions = await deps.readUrgentDecisions?.(); } catch { return refuse('urgent-decision-unreadable'); }
+      if (!Array.isArray(decisions)) return refuse('urgent-decision-unreadable');
+      const decision = decisions.filter(r => r?.status === 'unload-decision' && r.trackingId === trackingId).at(-1);
+      const at = Date.parse(decision?.at), loadedAt = Date.parse(load.at);
+      const matches = decision?.clone === root && decision.ref === load.ref && decision.sha === load.sha
+        && isDeepStrictEqual(decision.registration, load.registration);
+      const negative = decision?.reason === 'ci-failed'
+        ? decision.check?.head_sha === load.sha && decision.check.status === 'completed'
+          && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(decision.check.conclusion)
+        : decision?.reason === 'ci-expired' && Number.isFinite(loadedAt) && at - loadedAt >= 24 * 60 * 60 * 1000;
+      if (!matches || !/^[a-f0-9]{40}$/.test(load.sha ?? '') || typeof load.ref !== 'string'
+        || !Number.isFinite(loadedAt) || !Number.isFinite(at) || at < loadedAt || at > Date.now() || !negative) return refuse('urgent-decision-required');
     }
     let proof = prove(entry);
     if (proof.action === 'keep' && ['unique-commits-not-on-main', 'pr-open'].includes(proof.reason) && mode === 'urgent-failed') {

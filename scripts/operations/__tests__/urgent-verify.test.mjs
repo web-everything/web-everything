@@ -245,6 +245,15 @@ describe('CI gate mirroring fails closed', () => {
       expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
     }
   });
+  it.each(actionSteps)('pins condition, environment and error policy in %s action %i', (job, index) => {
+    for (const [key, value] of [['if', '${{ false }}'], ['if', undefined], ['env', { NODE_OPTIONS: '--require=unexpected' }], ['env', {}], ['continue-on-error', true], ['continue-on-error', false]]) {
+      const changed = yaml.safeLoad(workflow), step = changed.jobs[job].steps[index];
+      if (step[key] === value) continue;
+      if (value === undefined) delete step[key];
+      else step[key] = value;
+      expect(() => ciGatePlan(yaml.safeDump(changed)), key).toThrow('unreadable-ci-gates');
+    }
+  });
   it.each(mirroredJobs.filter(job => actionSteps.filter(([name]) => name === job).length > 1))(
     'refuses reordered uses steps in %s', job => {
       const changed = yaml.safeLoad(workflow), steps = changed.jobs[job].steps;

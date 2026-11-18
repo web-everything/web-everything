@@ -293,8 +293,13 @@ describe.each(['unique-commits-not-on-main', 'pr-open'])('guarded urgent-failed 
         readUrgentLoads: () => {
           expect(readdirSync(f.env.WE_DAEMON_OVERLAY_DIR).some(n => n.endsWith('.add-guard.lock'))).toBe(true);
           return [{ type: 'prototype-load.urgent', trackingId: 'urgent-attempt',
+            at: '2026-01-01T00:00:00Z', ref: entry.ref, sha: tip,
             clone: f.clone, registration: { clone: f.clone, ref: entry.ref, sha: tip } }];
         },
+        readUrgentDecisions: () => [{ status: 'unload-decision', trackingId: 'urgent-attempt',
+          at: '2026-01-02T00:00:00Z', reason: 'ci-failed', clone: f.clone, ref: entry.ref, sha: tip,
+          registration: { clone: f.clone, ref: entry.ref, sha: tip },
+          check: { head_sha: tip, status: 'completed', conclusion: 'failure' } }],
         tip: () => {
           if (dropped && outcome === 'post-drop-moved') return 'f'.repeat(40);
           if (outcome === 'unreadable') throw new Error('offline');
@@ -316,6 +321,37 @@ describe.each(['unique-commits-not-on-main', 'pr-open'])('guarded urgent-failed 
     expect(readPendingDrops(f.clone, f.env)).toEqual([]);
     expect(f.events().at(-1)).toMatchObject({ reason: 'urgent-failed', evidence: { urgentUnload: true } });
     expect(f.events().at(-1).operatorReason).toBeUndefined();
+  });
+  it.each(['missing-reader', 'unreadable', 'incomplete', 'absent', 'trackingId', 'clone', 'ref', 'sha', 'registration', 'reason', 'pending', 'green', 'check-sha', 'timestamp', 'future', 'early-expiry'])(
+    'refuses %s negative unload evidence even with a matching load', async kind => {
+      const { f, args } = await urgent();
+      const decision = args.deps.readUrgentDecisions()[0];
+      if (kind === 'missing-reader') delete args.deps.readUrgentDecisions;
+      else if (kind === 'unreadable') args.deps.readUrgentDecisions = () => { throw new Error('corrupt ledger; repair manually'); };
+      else if (kind === 'incomplete') args.deps.readUrgentDecisions = () => null;
+      else {
+        if (['trackingId', 'clone', 'ref', 'sha', 'reason'].includes(kind)) decision[kind] = 'other';
+        if (kind === 'registration') decision.registration.sha = 'f'.repeat(40);
+        if (kind === 'pending') decision.check.status = 'in_progress';
+        if (kind === 'green') decision.check.conclusion = 'success';
+        if (kind === 'check-sha') decision.check.head_sha = 'f'.repeat(40);
+        if (kind === 'timestamp') decision.at = 'invalid';
+        if (kind === 'future') decision.at = '2099-01-01T00:00:00Z';
+        if (kind === 'early-expiry') { decision.reason = 'ci-expired'; decision.at = '2026-01-01T23:59:59Z'; }
+        args.deps.readUrgentDecisions = () => kind === 'absent' ? [] : [decision];
+      }
+      expect(await retireRegistration(args)).toMatchObject({ retired: false,
+        refused: ['missing-reader', 'unreadable', 'incomplete'].includes(kind) ? 'urgent-decision-unreadable' : 'urgent-decision-required' });
+      expect(f.list()).toEqual(['lane/urgent']);
+      expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+    });
+  it('accepts a durable exact-load expiry decision at the 24h boundary', async () => {
+    const { f, args } = await urgent();
+    const decision = { ...args.deps.readUrgentDecisions()[0], reason: 'ci-expired' };
+    delete decision.check;
+    args.deps.readUrgentDecisions = () => [decision];
+    expect(await retireRegistration(args)).toMatchObject({ retired: true });
+    expect(f.list()).toEqual([]);
   });
   it('preserves the keep verdict without urgent-failed mode', async () => {
     const { f, args } = await urgent();
