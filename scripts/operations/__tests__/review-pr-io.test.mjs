@@ -1,5 +1,6 @@
 import { buildOperatorRulingComment, referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
   readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals, REFERRAL_CARRY_REASON } from '../../lib/jury-core.mjs';
+import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
 /**
@@ -4419,12 +4420,12 @@ describe('pending label swap observation', () => {
   const comment = { author: { login: 'web-everything' },
     body: `<!-- review-attempt: ${entry.key} -->\nRecorded by reviewer.\n\n${body.replace(/\r\n/g, '\n').trim()}\n\n<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->`, createdAt: '2026-11-18T19:16:30Z' };
   const observer = (options = {}) => {
-    const readPrState = async () => ({ state: 'OPEN', body: '', headRefOid: entry.payload.reviewedHead,
+    const readPrState = async () => ({ state: 'OPEN', body: '<!-- authored-by-actor: other-author -->', headRefOid: entry.payload.reviewedHead,
       labels: await (options.readLabels ?? (() => live))('o/n', 7109) });
     if (options.labelProvider) options = { ...options, labelProvider: { readPrState, ...options.labelProvider } };
-    const observe = createReviewPrSinks({ root,
+    const observe = createReviewPrSinks({ root, clearerId: 'observer',
       readHead: async () => entry.payload.reviewedHead, readLabels: async () => live,
-      labelProvider: { readPrState, readComments: () => [comment] }, ...options,
+      labelProvider: { readPrState }, readComments: () => [comment], ...options,
     })[REVIEW_EFFECTS.LABEL].observeOutcome;
     return (entry, record = run) => observe(entry, record);
   };
@@ -4433,10 +4434,10 @@ describe('pending label swap observation', () => {
     const readHead = vi.fn(() => entry.payload.reviewedHead);
     const readLabels = vi.fn(() => live.map(name => ({ name })));
     const readComments = vi.fn(() => [comment]);
-    await expect(observer({ readHead, readLabels, labelProvider: { readComments } })(entry)).resolves.toBe('applied');
+    await expect(observer({ readHead, readLabels, readComments })(entry)).resolves.toBe('applied');
     expect(readHead).toHaveBeenCalledWith({ repo: 'o/n', pr: 7109 });
     expect(readLabels).toHaveBeenCalledWith('o/n', 7109);
-    expect(readComments).toHaveBeenCalledWith('o/n', 7109);
+    expect(readComments).toHaveBeenCalledWith(7109, { repo: 'o/n' });
   });
 
   it.each([
@@ -4452,16 +4453,30 @@ describe('pending label swap observation', () => {
     ['unreadable comments', null],
     ['incomplete comments result', { comments: [comment], complete: false }],
   ])('keeps matching labels unknown with %s', async (_name, comments) => {
-    await expect(observer({ labelProvider: { readComments: () => comments } })(entry)).resolves.toBeNull();
+    await expect(observer({ readComments: () => comments })(entry)).resolves.toBeNull();
+  });
+
+  it.each([1, 2])('requires a complete validated thread (total=%s)', async totalCount => {
+    const readComments = (pr, options) => readCompletePrComments(pr, { ...options,
+      gh: args => args[1] === 'graphql'
+        ? { data: { repository: { pullRequest: { comments: { totalCount } } } } }
+        : [{ ...comment, id: 1, node_id: 'IC_1', user: comment.author }],
+    });
+    await expect(observer({ readComments })(entry)).resolves.toBe(totalCount === 1 ? 'applied' : null);
+  });
+
+  it('keeps stamp-lost unknown even with a complete marked thread', async () => {
+    await expect(observer({ labelProvider: { readPrState: () => ({ state: 'OPEN',
+      body: '<!-- author-stamp-lost: unrecoverable -->', headRefOid: entry.payload.reviewedHead, labels: live }) } })(entry)).resolves.toBeNull();
   });
 
   it('keeps a settled marked swap unknown when the mandatory-referral pipeline refuses', async () => {
     const malformed = { author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' };
-    await expect(observer({ labelProvider: { readComments: () => [comment, malformed] } })(entry)).resolves.toBeNull();
+    await expect(observer({ readComments: () => [comment, malformed] })(entry)).resolves.toBeNull();
   });
 
   it.each([null, {}, { state: 'CLOSED', headRefOid: entry.payload.reviewedHead }])('keeps unreadable or inert PR state unknown: %j', async state => {
-    await expect(observer({ labelProvider: { readPrState: () => state, readComments: () => [comment] } })(entry)).resolves.toBeNull();
+    await expect(observer({ labelProvider: { readPrState: () => state } })(entry)).resolves.toBeNull();
   });
 
   it('keeps a failed live preflight read unknown', async () => {
@@ -4477,12 +4492,12 @@ describe('pending label swap observation', () => {
   });
 
   it('fails closed without a complete comments reader', async () => {
-    await expect(observer({ labelProvider: {} })(entry)).resolves.toBeNull();
+    await expect(observer({ readComments: null })(entry)).resolves.toBeNull();
   });
 
   it('fails closed when the complete comments reader throws or rejects', async () => {
     for (const readComments of [() => { throw new Error('unreadable'); }, async () => { throw new Error('unreadable'); }]) {
-      await expect(observer({ labelProvider: { readComments } })(entry)).resolves.toBeNull();
+      await expect(observer({ readComments })(entry)).resolves.toBeNull();
     }
   });
 

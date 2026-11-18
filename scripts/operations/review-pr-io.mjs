@@ -61,6 +61,7 @@ import { currentActorId, parseAuthorActorId } from '../lib/review-independence.m
 // always couples a comment with a label swap — #2644 — and this step swaps no label). `createGhProvider`'s
 // `postComment` is the SAME primitive that single home already uses, imported rather than re-implemented.
 import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // The `advisory:accepted` / `advisory:changes` label the `advise` step's SECOND effect applies — the pure plan
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
@@ -1128,6 +1129,8 @@ export function createReviewPrSinks({
   readLabels = createGhProvider().readLabels,
   // Read-only recovery of a pending label swap; same forge transport as the publish barrier.
   readHead = readReviewHead,
+  readComments = readCompletePrComments,
+  clearerId = currentActorId(),
   setLabels = createGhProvider().setLabels,
   // Card 5469 — the scoped re-review shadow's reads and writes, injectable so the sink is testable with no git/ledger.
   shadowGitExec = execFileIn(root),
@@ -2071,19 +2074,18 @@ export function createReviewPrSinks({
     const nonempty = value => typeof value === 'string' && value.trim().length > 0;
     if (!isValidReviewAttemptId(entry?.key) || !payload || !Number.isInteger(payload.pr) || payload.pr <= 0
       || !nonempty(payload.repo) || !nonempty(payload.reviewedHead) || !nonempty(payload.to)
-      || typeof labelProvider.readComments !== 'function') return null;
+      || typeof readComments !== 'function') return null;
     try {
       const head = await readHead({ repo: payload.repo, pr: payload.pr });
       if (head !== payload.reviewedHead) return null;
       // Both reads must be complete: the attempt marker is not a substitute for current guard evidence.
-      const comments = await labelProvider.readComments(payload.repo, payload.pr);
-      if (!Array.isArray(comments) || !comments.some(comment => isTrustedMarkerAuthor(comment)
-        && parseReviewAttempt([comment]) === entry.key
+      const comments = await readComments(payload.pr, { repo: payload.repo });
+      if (!Array.isArray(comments) || !comments.filter(isTrustedMarkerAuthor).some(comment => parseReviewAttempt([comment]) === entry.key
         && parseReviewedSha([comment]) === payload.reviewedHead)) return null;
       const state = await labelProvider.readPrState(payload.repo, payload.pr);
       const result = reviewSetLabelPreflight({
         state: { ...state, comments }, repo: payload.repo, pr: payload.pr,
-        to: payload.to, expectedHead: payload.reviewedHead,
+        to: payload.to, expectedHead: payload.reviewedHead, clearerId,
       });
       if (result.settled) return 'applied';
       return null;

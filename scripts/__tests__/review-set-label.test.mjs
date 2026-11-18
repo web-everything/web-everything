@@ -1580,7 +1580,7 @@ verb="$1 $2"
 printf '%s\\n' "$verb" >> "$GH_CALL_LOG"
 if [ "$verb" = 'pr view' ]; then
   if [ -f "$GH_EDIT_FLAG" ]; then labels="$GH_LABELS_AFTER"; else labels="$GH_LABELS_BEFORE"; fi
-  printf '{"labels":%s,"comments":[],"headRefOid":"%s","state":"OPEN"}' "$labels" "$GH_HEAD_SHA"
+  printf '{"labels":%s,"comments":[],"headRefOid":"%s","state":"OPEN","body":"<!-- authored-by-actor: fixture-author -->"}' "$labels" "$GH_HEAD_SHA"
   exit 0
 fi
 if [ "$verb" = "$GH_FAIL_ON" ]; then
@@ -1635,6 +1635,7 @@ exit 0
     GH_LABELS_BEFORE: JSON.stringify(before.map((name) => ({ name }))),
     GH_LABELS_AFTER: JSON.stringify(after.map((name) => ({ name }))),
     GH_HEAD_SHA: headSha,
+    CLAUDE_CODE_SESSION_ID: 'fixture-reviewer',
     GH_FAIL_ON: failOn,
   });
   const argvFor = (opts) => ['1099', '--repo=o/n', `--to=${opts.to || 'accepted'}`, `--actor=${ACTOR}`,
@@ -1953,34 +1954,19 @@ process.exit(0);
   // stripped an hour ago. These drive the REAL CLI end to end and assert the recorded status differs.
   const STAMPLESS = 'Resolve #1: something real.\n';
 
-  it('records STAMP-LOST for a post-regime PR whose stamp is missing (#3067)', () => {
+  // Intentional tightening: stamp-lost now refuses before any write. The shared guard
+  // also refuses every other independent:false result, including legacy unknown authors.
+  it.each([
+    ['STAMP LOST', '2026-08-20T00:00:00Z'],
+    ['no authored-by-actor stamp', '2026-07-01T00:00:00Z'],
+    ['no authored-by-actor stamp', ''],
+  ])('refuses unproven independence (%s, createdAt=%s)', (reason, createdAt) => {
     const r = runCli(['--to=accepted', '--actor=an agent'],
-      { sessionId: 'clearer-x', prBody: STAMPLESS, createdAt: '2026-08-20T00:00:00Z' });
-    expect(r.status).toBe(0); // it still CLEARS — only self-clear refuses here; the RECORD is what changed
-    // Asserted on the durable comment, which is where the operator actually reads this.
-    const note = readFileSync(join(dir, 'comment.md'), 'utf8');
-    expect(note).toMatch(/STAMP LOST/);
-    expect(note).toMatch(/at\/after the #2844 stamp regime began/);
-  });
-
-  it('still records UNKNOWN-AUTHOR for a PR that predates the regime (#3067 — the tolerance is kept)', () => {
-    // The other half. Without it, "call everything stamp-lost" passes the case above and strands every PR
-    // opened before the stamp existed — the exact failure #2844's tolerance was written to avoid.
-    const r = runCli(['--to=accepted', '--actor=an agent'],
-      { sessionId: 'clearer-x', prBody: STAMPLESS, createdAt: '2026-07-01T00:00:00Z' });
-    expect(r.status).toBe(0);
-    const note = readFileSync(join(dir, 'comment.md'), 'utf8');
-    expect(note).not.toMatch(/STAMP LOST/);
-    expect(note).toMatch(/no authored-by-actor stamp/);
-  });
-
-  it('a caller that supplies no createdAt sees the OLD behaviour exactly (#3067 opt-in)', () => {
-    const r = runCli(['--to=accepted', '--actor=an agent'],
-      { sessionId: 'clearer-x', prBody: STAMPLESS, createdAt: '' });
-    expect(r.status).toBe(0);
-    const note = readFileSync(join(dir, 'comment.md'), 'utf8');
-    expect(note).not.toMatch(/STAMP LOST/);
-    expect(note).toMatch(/no authored-by-actor stamp/);
+      { sessionId: 'clearer-x', prBody: STAMPLESS, createdAt });
+    expect(r.status).toBe(1);
+    expect(JSON.parse(r.stdout.trim().split('\n').filter(Boolean).pop()).error).toContain(reason);
+    expect(ghCalls()).toEqual(['pr view']);
+    expect(existsSync(join(dir, 'comment.md'))).toBe(false);
   });
 
   it('ADVERSARIAL: the PR\'s own author clearing it to accepted is REFUSED, and nothing is written', () => {
@@ -2004,17 +1990,6 @@ process.exit(0);
     const comment = readFileSync(join(dir, 'comment.md'), 'utf8');
     expect(comment).toContain(`<!-- cleared-by-actor: ${REVIEWER} -->`);
     expect(comment).not.toMatch(/Independence NOT established/);
-  });
-
-  it('an UNSTAMPED PR (opened before #2844) still clears, but the record SAYS independence is unproven', () => {
-    // Refusing here would strand every pre-#2844 PR with no way for a human to clear it. The mitigation is that
-    // the record cannot stay silent — a reader must not infer independence from the absence of a note.
-    const r = run(REVIEWER, 'Resolve #1: an older PR with no author stamp.\n');
-    expect(r.status).toBe(0);
-    const comment = readFileSync(join(dir, 'comment.md'), 'utf8');
-    expect(comment).toMatch(/Independence NOT established/);
-    expect(comment).toMatch(/authored-by-actor/);
-    expect(comment).toContain(`<!-- cleared-by-actor: ${REVIEWER} -->`);
   });
 
   it('a `changes` BOUNCE is never blocked by the independence bar — a bounce lands nothing', () => {
@@ -2180,6 +2155,9 @@ describe('runReviewLabelCli — a changes verdict must carry its findings (#xd6m
  * staleness gate disarmed.
  */
 describe('the write arc and its #2964 ordering', () => {
+  // Acceptance fixtures prove independence so these tests still reach their write/ledger guards.
+  beforeEach(() => vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'fixture-reviewer'));
+  afterEach(() => vi.unstubAllEnvs());
   const CFG = {
     // Memory-store tests must never commit/push the running checkout. Real git tests override this.
     defaultActor: 'test',
@@ -2190,7 +2168,7 @@ describe('the write arc and its #2964 ordering', () => {
   };
 
   /** Records the ORDER of port calls. Reads answer from `labels`, so a test picks the branch by state. */
-  function stubProvider({ labels = [], body = '', title = '', readPrFiles } = {}) {
+  function stubProvider({ labels = [], body = '<!-- authored-by-actor: fixture-author -->', title = '', readPrFiles } = {}) {
     const calls = [];
     return {
       calls,
@@ -4264,6 +4242,9 @@ describe('#3334 — bounceEvidenceFromWriteUp reads both inputs off the body tha
  * refused the swap would leave a durable "Decision: `changes`" on a PR carrying no `review:changes`.
  */
 describe('#3334 route 1/3 — the direct CLI refuses a reasonless bounce and writes NOTHING', () => {
+  // Acceptance fixtures prove independence so these tests still reach their write/ledger guards.
+  beforeEach(() => vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'fixture-reviewer'));
+  afterEach(() => vi.unstubAllEnvs());
   const CFG = {
     defaultActor: 'test',
     usage: 'usage: test',
@@ -4280,7 +4261,7 @@ describe('#3334 route 1/3 — the direct CLI refuses a reasonless bounce and wri
       currentRepo: () => 'o/n',
       readPrState: () => {
         calls.push('readPrState');
-        return { labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '' };
+        return { labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '<!-- authored-by-actor: fixture-author -->' };
       },
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },
@@ -4368,6 +4349,9 @@ describe('#3334 route 1/3 — the direct CLI refuses a reasonless bounce and wri
  * would meet it: the operator NAMES the `dual` store and no git board resolves.
  */
 describe('F4 — review-set-label honours a clearing ledger write miss', () => {
+  // Acceptance fixtures prove independence so these tests still reach their write/ledger guards.
+  beforeEach(() => vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'fixture-reviewer'));
+  afterEach(() => vi.unstubAllEnvs());
   const CFG = {
     defaultActor: 'test',
     usage: 'usage: test',
@@ -4396,7 +4380,7 @@ describe('F4 — review-set-label honours a clearing ledger write miss', () => {
       calls,
       name: 'stub',
       currentRepo: () => 'o/n',
-      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '' }),
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '<!-- authored-by-actor: fixture-author -->' }),
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },
       postComment: () => { calls.push('postComment'); },
@@ -4842,7 +4826,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
 
   function run({ livehead = head, expectHead = head, expectFingerprint = normalizeDiffFingerprint(diff), race, extra = [] } = {}) {
     writeFileSync(join(dir, 'state.json'), JSON.stringify({
-      number: 42, title: 'a stacked top', body: '', state: 'OPEN', isDraft: false, headRefOid: livehead, headRefName: 'lane',
+      number: 42, title: 'a stacked top', body: '<!-- authored-by-actor: fixture-author -->', state: 'OPEN', isDraft: false, headRefOid: livehead, headRefName: 'lane',
       labels: [{ name: 'review:pending' }], comments: [], race, racedHead: pushedHead,
     }));
     const r = spawnSync(process.execPath, [script, '42', '--repo=web-everything/web-everything', '--to=accepted', '--actor=carry',
@@ -4919,6 +4903,9 @@ describe('xe8y12n missing-only rearm boundary', () => {
 
 /** #5649 part 1 — `clear-human` writes an `approval` ledger row beside its clearing verdict; nothing else does. */
 describe('#5649 — approval rows at the label home', () => {
+  // Acceptance fixtures prove independence so these tests still reach their write/ledger guards.
+  beforeEach(() => vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'fixture-reviewer'));
+  afterEach(() => vi.unstubAllEnvs());
   const CFG = {
     defaultActor: 'test',
     usage: 'usage: test',
@@ -4946,7 +4933,7 @@ describe('#5649 — approval rows at the label home', () => {
     return {
       calls, name: 'stub', currentRepo: () => 'o/n',
       readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
-      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '' }),
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '<!-- authored-by-actor: fixture-author -->' }),
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },
       postComment: () => { calls.push('postComment'); },

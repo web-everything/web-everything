@@ -19,6 +19,7 @@ export default {
     const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
     const { applyPendingEffects } = await load(PATHS[0]);
     const { createReviewPrSinks } = await load(PATHS[1]);
+    const { readCompletePrComments } = await load('scripts/conveyor/pr-comments-complete.mjs');
     const { REVIEW_EFFECTS } = await load('scripts/operations/review-pr.mjs');
     const { createMemoryRunStore } = await load('scripts/operations/run-store.mjs');
     const { createRegistry, op } = await load('scripts/operations/registry.mjs');
@@ -36,7 +37,7 @@ export default {
       { type: REVIEW_EFFECTS.WRITE_UP, payload: { bodyFile: payload.bodyFile, body } },
     ] }) }));
 
-    for (const state of ['same-head', 'unmarked-comment', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'later-changes', 'ruling-hold', 'pipeline-refusal', 'not-applied']) {
+    for (const state of ['same-head', 'unmarked-comment', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'later-changes', 'ruling-hold', 'pipeline-refusal', 'incomplete-thread', 'stamp-lost', 'not-applied']) {
       const store = createMemoryRunStore();
       const run = advance(startRun({ op: 'observe-label', id: `observe-${state}`, registry }), { registry });
       Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: response lost',
@@ -49,10 +50,18 @@ export default {
         : state === 'later-changes' ? [...labels, 'review:changes']
         : state === 'ruling-hold' ? [...labels, 'advisory:ruling-needed']
         : state === 'source-labels-still-present' ? ['review:pending', 'ready-to-merge'] : labels;
-      const sinks = createReviewPrSinks({ root, runStore: store,
-        labelProvider: { readPrState: () => ({ state: 'OPEN', body: '', headRefOid: HEAD, labels: readLabels() }), readComments: () => state === 'no-comment' ? [] : [{
-          author: { login: 'web-everything' }, body: `${state === 'unrelated-comment' ? 'Unrelated review.' : body}\n\n<!-- reviewed-sha: ${HEAD} -->${!['unmarked-comment', 'unrelated-comment'].includes(state) ? `\n<!-- review-attempt: ${run.effects[0].key} -->` : ''}`, createdAt: '2026-11-18T19:16:30Z',
-        }, ...(state === 'pipeline-refusal' ? [{ author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' }] : [])] },
+      const comments = state === 'no-comment' ? [] : [{
+        id: 'IC_attempt',
+        author: { login: 'web-everything' }, body: `${state === 'unrelated-comment' ? 'Unrelated review.' : body}\n\n<!-- reviewed-sha: ${HEAD} -->${!['unmarked-comment', 'unrelated-comment'].includes(state) ? `\n<!-- review-attempt: ${run.effects[0].key} -->` : ''}`, createdAt: '2026-11-18T19:16:30Z',
+      }, ...(state === 'pipeline-refusal' ? [{ id: 'IC_referral', author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' }] : [])];
+      const sinks = createReviewPrSinks({ root, runStore: store, clearerId: 'soak-observer',
+        labelProvider: { readPrState: () => ({ state: 'OPEN',
+          body: state === 'stamp-lost' ? '<!-- author-stamp-lost: unrecoverable -->'
+            : '<!-- authored-by-actor: other-author -->', headRefOid: HEAD, labels: readLabels() }) },
+        readComments: (pr, options) => readCompletePrComments(pr, { ...options, gh: args =>
+          args[1] === 'graphql' ? { data: { repository: { pullRequest: { comments: {
+            totalCount: comments.length + (state === 'incomplete-thread' ? 1 : 0),
+          } } } } } : comments }),
         readHead: () => state === 'moved-head' ? 'b'.repeat(40) : HEAD,
         readLabels,
         runNode: () => { writes++; throw new Error('sink replayed'); },

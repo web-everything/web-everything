@@ -4746,4 +4746,9 @@ same-head refusal and marked recovery without replaying the write.
 Keep live review-label eligibility in `scripts/lib/review-set-label-preflight.mjs`, shared by
 the writer and the unknown-outcome observer. A trusted exact attempt marker proves identity;
 only a passing preflight with `settled: true` proves completion. Keep the malformed referral
-thread case in the direct, observer and soak tests: matching labels alone cannot clear it.
+thread case in the direct, observer and soak tests: matching labels alone cannot clear it. Read
+observer comments through `readCompletePrComments`, proving total count, unique IDs and comment
+shape before using that same thread for both the attempt marker and preflight. Incomplete
+threads remain unknown. Ordinary acceptance refuses every `independent: false` result
+(including stamp-lost and unknown identities); the explicit human ceremony remains exempt.
+Keep complete/incomplete thread and stamp-lost cases in the observer and soak probes.

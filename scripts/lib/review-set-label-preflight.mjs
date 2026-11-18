@@ -1,7 +1,7 @@
 /** Read-only live-state evaluation shared by the label writer and outcome observer. */
 import { decideSetLabel, assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { classifyPrLiveness, inertPrMessage } from './pr-liveness.mjs';
-import { currentActorId, parseAuthorActorId, decideClearerIndependence, hasStampLostMarker, INDEPENDENCE } from './review-independence.mjs';
+import { currentActorId, parseAuthorActorId, decideClearerIndependence, hasStampLostMarker } from './review-independence.mjs';
 import { hasReviewLabel } from './review-escalation.mjs';
 
 export function reviewSetLabelPreflight({ state, repo, pr, to, expectedHead,
@@ -18,7 +18,7 @@ export function reviewSetLabelPreflight({ state, repo, pr, to, expectedHead,
     // #3067 WIRED HERE — the module's own header named this as the owed follow-up: the pure decider grew
     // `prCreatedAt` and `stampLostMarked` as OPT-IN inputs, and until a live caller passed them a stripped
     // stamp stayed indistinguishable from an absent one. Both are supplied now, so a post-regime PR with no
-    // stamp resolves to STAMP_LOST (refused) instead of UNKNOWN_AUTHOR (tolerated).
+    // stamp resolves to STAMP_LOST instead of UNKNOWN_AUTHOR; neither proves independence.
     ? decideClearerIndependence({
       authorId: parseAuthorActorId(state.body),
       clearerId,
@@ -26,7 +26,7 @@ export function reviewSetLabelPreflight({ state, repo, pr, to, expectedHead,
       stampLostMarked: hasStampLostMarker(state.body),
     })
     : null;
-  if (to === 'accepted' && independence && independence.status === INDEPENDENCE.SELF_CLEAR) {
+  if (to === 'accepted' && independence && independence.independent === false) {
     // THE MESSAGE NAMES ONLY ROUTES THAT ACTUALLY WORK (PR #1100 review). The first cut inherited the decider's
     // "…or let a human clear it", which pointed at a door this same refusal had shut. There is deliberately NO
     // `--force` and no flag on this command: an agent recording an accept on its own session's PR is not an

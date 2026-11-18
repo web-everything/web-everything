@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { reviewSetLabelPreflight } from '../review-set-label-preflight.mjs';
 
 const head = 'a'.repeat(40);
-const state = { state: 'OPEN', headRefOid: head, body: '', comments: [], labels: ['review:accepted'] };
+const state = { state: 'OPEN', headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:accepted'] };
 const evaluate = (patch = {}, options = {}) => reviewSetLabelPreflight({
   state: { ...state, ...patch }, repo: 'o/r', pr: 7, to: 'accepted', expectedHead: head,
   clearerId: 'reviewer', referralOptions: { readRuns: () => [] }, ...options,
@@ -55,6 +55,18 @@ describe('review label read-only preflight', () => {
 
   it('refuses a proven self-clear', () => {
     expect(() => evaluate({ body: '<!-- authored-by-actor: reviewer -->' })).toThrow(/nothing was changed/);
+  });
+
+  it.each([
+    ['stamp-lost', { body: '<!-- author-stamp-lost: unrecoverable -->' }],
+    ['post-regime missing stamp', { body: '', createdAt: '2026-08-20T00:00:00Z' }],
+    ['unknown author', { body: '' }],
+  ])('refuses %s even with settled labels', (_name, patch) => {
+    expect(() => evaluate(patch)).toThrow(/nothing was changed/);
+  });
+
+  it('refuses an unknown clearer', () => {
+    expect(() => evaluate({}, { clearerId: '' })).toThrow(/nothing was changed/);
   });
 
   it('uses the target decision and refuses unknown targets', () => {
