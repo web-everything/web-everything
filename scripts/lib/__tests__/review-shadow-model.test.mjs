@@ -268,8 +268,6 @@ describe('shadow rows', () => {
     { summary: 42, findings: [] },
     { summary: 'reviewed', findings: {} },
     { summary: 'reviewed' },
-    { summary: 'Unable to review this diff', findings: [] },
-    { summary: 'Reviewer could not access the files.', findings: [] },
     { summary: 'reviewed', findings: [null] },
     { summary: 'reviewed', findings: [[]] },
     { summary: 'reviewed', findings: [{}] },
@@ -277,7 +275,7 @@ describe('shadow rows', () => {
     { summary: 'reviewed', findings: [{ summary: 'defect', file: 42 }] },
     { summary: 'reviewed', findings: [{ summary: 'defect', line: -1 }] },
   ])('malformed raw answer %j is invalid promotion evidence on either side', malformed => {
-    const valid = { summary: 'reviewed', findings: [] };
+    const valid = { summary: 'reviewed', findings: [finding] };
     const makeRow = (claude, agy, lens) => buildShadowRow({
       repo: 'o/r', pr: 1, head: 'head-a', lens, model: 'gemini-4-carbon-high',
       agyRun: { ...ok, servedModel: 'gemini-4-carbon-high' }, claudeAnswer: claude, agyAnswer: agy,
@@ -291,6 +289,23 @@ describe('shadow rows', () => {
     const validRows = ['correctness', 'security'].map(lens => makeRow(valid, valid, lens));
     expect(validRows[0]).toMatchObject({ claudeValid: true, agyValid: true });
     expect(summarizeCarbonPromotion(validRows).agree).toBe(1);
+  });
+  it.each([
+    'reviewed',
+    'Review not performed: diff omitted.',
+    'Unable to review this diff',
+    'Reviewer could not access the files.',
+  ])('a Carbon answer with zero findings is invalid, never agree, regardless of summary: %s', summary => {
+    const agy = { summary, findings: [] };
+    for (const claude of [{ summary: 'reviewed', findings: [] }, claudeAnswer]) {
+      const row = buildShadowRow({
+        repo: 'o/r', pr: 1, head: 'head-a', lens: 'correctness', model: 'gemini-4-carbon-high',
+        agyRun: { ...ok, servedModel: 'gemini-4-carbon-high' }, claudeAnswer: claude, agyAnswer: agy,
+        comparison: compareShadowAnswers({ claude, agy }),
+      });
+      expect(row).toMatchObject({ claudeValid: true, agyValid: true, overlap: { agyCount: 0 } });
+      expect(summarizeCarbonPromotion([row])).toEqual({ agree: 0, disagree: 0, invalid: 1, prs: 1, threshold: 10 });
+    }
   });
   it('stores only bounded anchors and counts with one-to-one matches', () => {
     const agyAnswer = { findings: Array.from({ length: 35 }, () => ({ ...finding, claim: 'secret', message: 'secret' })) };

@@ -96,10 +96,7 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
 function validShadowAnswer(answer) {
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const text = value => typeof value === 'string' && value.trim().length > 0;
-  // An abstention ("unable to review ...") with no findings is NOT an accept: it is invalid evidence.
-  const abstains = object(answer) && Array.isArray(answer.findings) && answer.findings.length === 0
-    && /\b(unable|cannot|can't|could not|couldn't|not able|failed|no access|insufficient|abstain|unavailable)\b/i.test(String(answer.summary));
-  return object(answer) && text(answer.summary) && Array.isArray(answer.findings) && !abstains
+  return object(answer) && text(answer.summary) && Array.isArray(answer.findings)
     && Array.from(answer.findings).every(finding => object(finding) && text(finding.summary)
       && ['file', 'path', 'category', 'failure_scenario', 'disposition', 'impactIfUnfixed'].every(
         key => finding[key] == null || typeof finding[key] === 'string')
@@ -216,7 +213,8 @@ export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
     if (!`${row?.servedModel ?? ''} ${row?.model ?? ''}`.toLowerCase().includes('carbon')
       || row.repo == null || row.pr == null) continue;
     const key = `${row.repo}#${row.pr}`;
-    const valid = row.status === 'ok' && Boolean(row.overlap)
+    // A Carbon answer with no findings cannot be told from an abstention, so it is never agreement evidence: invalid.
+    const valid = row.status === 'ok' && Boolean(row.overlap) && row.overlap.agyCount > 0
       && typeof row.servedModel === 'string' && row.servedModel.toLowerCase().includes('carbon')
       && row.claudeValid === true && row.agyValid === true
       && !Object.hasOwn(row, 'fellBackTo') && !Object.hasOwn(row, 'fallbackFrom');
