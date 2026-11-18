@@ -22,7 +22,7 @@ import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, P
 
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
-  number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
+  rowsHead: null, rowsComplete: false, number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
   headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
     startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build', appSlug: 'github-actions', appId: 15368 }],
@@ -408,4 +408,12 @@ it('cache-only planner reads never wait for or initiate a snapshot refresh', () 
     expect(readSharedOpenPrs({ repo: REPO, fields: 'number', dir, exec, cacheOnly: true })).toEqual([{ number: 42 }]);
     expect(calls).toBe(0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+it('snapshot v2 projects check evidence metadata without losing completeness', () => {
+  expect(PR_SNAPSHOT_VERSION).toBe(2);
+  expect(SNAPSHOT_FIELDS).toEqual(expect.arrayContaining(['rowsHead', 'rowsComplete']));
+  const pr = { number: 1, rowsHead: 'a'.repeat(40), rowsComplete: true };
+  expect(projectPrs([pr], SNAPSHOT_FIELDS)).toEqual([pr]);
 });

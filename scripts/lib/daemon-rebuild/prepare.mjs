@@ -543,6 +543,18 @@ export async function prepareRebuild({
       for (const d of plan.decisions) {
         if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
       }
+      const wantedTips = new Map();
+      const wantedTip = (ref) => {
+        if (!wantedTips.has(ref)) wantedTips.set(ref, verifyRev(git, `refs/remotes/origin/${ref}^{commit}`));
+        return wantedTips.get(ref);
+      };
+      const stillWanted = (ref, sha) => {
+        if (!wantedRefs.has(ref)) return false;
+        if (!sha) return true; // fallback registration check
+        const tip = wantedTip(ref);
+        return tip ? tip === sha || git(['merge-base', '--is-ancestor', sha, tip]).status === 0
+          : !registeredRefs.has(ref) && tipInMain(git, plan.mainSha, sha);
+      };
       const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
       let overlayEvents;
       const readOverlayEvents = () => {
@@ -556,7 +568,7 @@ export async function prepareRebuild({
         plan,
         prevHead,
         treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
-        stillWanted: (ref) => wantedRefs.has(ref),
+        stillWanted,
         verifyBuilt: (adopt) => readyBuildVerified({
           git, adopt, mainTip: plan.mainSha, prevHead,
           approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
@@ -639,6 +651,11 @@ export async function prepareRebuild({
             : undefined,
         });
         const { alerts: finAlerts = [], ...finResult } = fin;
+        if (finResult.adopted && ready.kind !== 'fallback') {
+          const pending = [...registeredRefs].filter((ref) => wantedRefs.has(ref)
+            && !m.adopt.applied?.some((a) => a.ref === ref && a.sha === wantedTip(ref)));
+          if (pending.length) alert('ready-candidate-adopted-partial', { target: m.adopt.finalSha, pending });
+        }
         return {
           terminal: true,
           result: { ...finResult, ...(finResult.adopted ? { reason: 'ready-adopted', readyMatch: m.match } : {}) },

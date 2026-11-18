@@ -102,6 +102,15 @@ describe('recordLocalSlotFallback', () => {
   });
 });
 
+describe('refinedFallbackKind (FB1)', () => {
+  it('refines other from the holder label like the slot row, and keeps named kinds', async () => {
+    const { refinedFallbackKind } = await import('../remote-fallback-log.mjs');
+    expect(refinedFallbackKind('other', ['node', '/x/verify-lane.mjs'])).toBe('verify');
+    expect(refinedFallbackKind('files', ['node', '/x/verify-lane.mjs'])).toBe('files');
+    expect(refinedFallbackKind('other', ['node', '/x/unknown.mjs'])).toBe('other');
+  });
+});
+
 describe('recordLocalSlotFallback detail', () => {
   it('records a bounded detail and keeps null when absent', () => {
     const root = mkdtempSync(join(tmpdir(), 'rfl-detail-'));
