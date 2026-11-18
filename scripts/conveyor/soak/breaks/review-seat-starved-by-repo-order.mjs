@@ -9,7 +9,7 @@ const SOURCE = 'skills-src/conveyor/review-daemon.mjs';
 // Inject only the per-repo work; ordering and the shared host budget belong to the real daemon.
 // Both repos keep owing work, and the previous review completes before the next tick frees one seat.
 function exercise(runAll) {
-  const repos = ['web-everything/web-everything', 'plateauapp/plateau-app'];
+  const repos = ['fixture/first-repo', 'fixture/second-repo'];
   const ticks = [], violations = [];
   for (let i = 0; i < 2; i++) {
     let admissionCalls = 0;
