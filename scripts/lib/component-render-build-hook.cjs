@@ -30,7 +30,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
-const { execFileSync } = require('node:child_process');
+const { runCliToFile, isOutputLimitError } = require('./run-cli-batch.cjs');
 
 /**
  * The pinned FUI build-artifact — a FIXED relative path resolved from the WE repo root against the
@@ -72,7 +72,7 @@ const EXPECTED_PRODUCER = 'frontierui/component-render-build-harness/1';
  * build error when the artifact is absent (the ratified ordering means FUI built it first) or the process
  * fails — a missing/mis-emitted artifact must NOT silently skip (non-reproducible build).
  */
-function runBuildBatch(entries, repoRoot, runner = execFileSync) {
+function runBuildBatch(entries, repoRoot, runner = runCliToFile) {
   const cliPath = path.join(resolveFuiRoot(repoRoot), FUI_CLI_RELATIVE);
   if (!fs.existsSync(cliPath)) {
     throw new Error(
@@ -102,17 +102,18 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
  * `{ key, component: 'card'|'badge'|'tag', config }`. A per-entry error is surfaced to the build log and
  * that key is omitted from the map (keyed-batch isolation — one bad spec never poisons the others).
  */
-function renderComponents(specs, repoRoot, runner = execFileSync) {
+function renderComponents(specs, repoRoot, runner = runCliToFile) {
   if (!Array.isArray(specs) || specs.length === 0) return new Map();
   let batch;
   try {
     batch = runBuildBatch(specs, repoRoot, runner);
   } catch (e) {
-    // The whole-site batch's stdout can outgrow the subprocess `maxBuffer` as the site grows (red main @
-    // f5aa5b111: `spawnSync node ENOBUFS` in the deploy-smoke docs build). Halve the batch and retry rather
-    // than chase a bigger constant; keys are globally unique so the halves merge losslessly. A single spec
-    // that overflows alone (or any other failure) is still a hard error.
-    if (!(e && e.code === 'ENOBUFS') || specs.length < 2) throw e;
+    // The whole-site batch's stdout can outgrow one call's output limit as the site grows (red main @
+    // f5aa5b111: `spawnSync node ENOBUFS` in the deploy-smoke docs build; the default runner now throws the
+    // typed `output-limit` CliBatchError at MAX_OUTPUT_BYTES). Halve the batch and retry rather than chase a
+    // bigger constant; keys are globally unique so the halves merge losslessly. A single spec that overflows
+    // alone (or any other failure) is still a hard error, with the typed error preserved.
+    if (!isOutputLimitError(e) || specs.length < 2) throw e;
     const mid = Math.ceil(specs.length / 2);
     const merged = renderComponents(specs.slice(0, mid), repoRoot, runner);
     for (const [k, v] of renderComponents(specs.slice(mid), repoRoot, runner)) merged.set(k, v);
@@ -213,7 +214,7 @@ function intentTileSpecs(intent, i) {
  * in the template (they are page chrome, not the card block); this only emits the SSR card frame each
  * anchor wraps — the same division of labour the prior `<we-card>`-in-template markup had.
  */
-function renderIntentGrid(intents, repoRoot, runner = execFileSync) {
+function renderIntentGrid(intents, repoRoot, runner = runCliToFile) {
   const list = Array.isArray(intents) ? intents : [];
 
   // Pass 1 — batch every tile's leaf badge + tags in a single subprocess call.
@@ -305,7 +306,7 @@ function projectHeaderIconHtml(project) {
  * links standard/protocol tiles to `/projects/{id}/` but the impls tile to an external URL, so the caller
  * supplies it). `gridClass` is the wrapping grid's class list (e.g. `project-grid project-grid--centered`).
  */
-function renderProjectGrid(projects, { repoRoot, hrefFor, gridClass = 'project-grid', external = false }, runner = execFileSync) {
+function renderProjectGrid(projects, { repoRoot, hrefFor, gridClass = 'project-grid', external = false }, runner = runCliToFile) {
   const input = Array.isArray(projects) ? projects : [];
   // SSR default grouping (#2088 Fork 4 / #2133): stable-sort the tiles core → contextual → exploratory so
   // the grid GROUPS by importance out of the box (client re-sortable via the `data-tier` facet below). A
@@ -422,7 +423,7 @@ function renderProjectGrid(projects, { repoRoot, hrefFor, gridClass = 'project-g
  * parts. The client `<we-card>`/`<we-badge>` CE upgrade (base.njk) is a pure enhancement over this
  * JS-off-correct baseline.
  */
-function renderStageGrid(stages, repoRoot, runner = execFileSync) {
+function renderStageGrid(stages, repoRoot, runner = runCliToFile) {
   const list = Array.isArray(stages) ? stages : [];
 
   // Pass 1 — batch every stage's marker badge in one subprocess call.
@@ -491,7 +492,7 @@ function renderStageGrid(stages, repoRoot, runner = execFileSync) {
  * rendered with a unique sentinel body, and the trusted macro HTML is string-spliced into it verbatim —
  * bypassing the happy-dom body round-trip entirely, so the escaping the template already did is preserved.
  */
-function renderBacklogGrid(tiles, repoRoot, runner = execFileSync) {
+function renderBacklogGrid(tiles, repoRoot, runner = runCliToFile) {
   const list = Array.isArray(tiles) ? tiles : [];
 
   // ONE subprocess batch: every tile's card SHELL, with a unique sentinel standing in for its body. The
@@ -639,7 +640,7 @@ function findComponentPlaceholders(html) {
  * subprocesses per full build; this batches a whole page's cards/badges into one — the same subprocess
  * economy the `spliceDataTables` transform gives the data-table surface.
  */
-function spliceComponents(content, repoRoot, runner = execFileSync) {
+function spliceComponents(content, repoRoot, runner = runCliToFile) {
   if (typeof content !== 'string' || content.indexOf('data-we-spec') === -1) return content;
   const placeholders = findComponentPlaceholders(content);
   if (placeholders.length === 0) return content;
@@ -684,7 +685,7 @@ function spliceComponents(content, repoRoot, runner = execFileSync) {
  * Same subprocess boundary + pinned-artifact/missing-artifact hard error + keyed-batch per-entry isolation
  * as the per-page path. Returns `{ pages, components }` for the caller to log.
  */
-function spliceComponentsBatch(results, repoRoot, runner = execFileSync, writeFile = fs.writeFileSync) {
+function spliceComponentsBatch(results, repoRoot, runner = runCliToFile, writeFile = fs.writeFileSync) {
   if (!Array.isArray(results) || results.length === 0) return { pages: 0, components: 0 };
 
   // Pass 1 — collect every placeholder across every written HTML page into ONE globally-keyed batch.
