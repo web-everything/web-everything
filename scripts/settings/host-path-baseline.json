@@ -4,8 +4,6 @@
     ".claude/commands/continue.md": 2,
     ".claude/commands/handoff.md": 2,
     "PLUG_MIGRATION.md": 1,
-    "agent-memory-src/118-project_bootstrap_patches_inject_footgun.md": 1,
-    "agent-memory-src/keep-prototype-branch-synced-after-each-merge.md": 1,
     "audits/2026-09-06-open-story-staleness/batch-08.md": 1,
     "backlog/133-plugged-trait-regression-guard.md": 1,
     "backlog/2379-fork-2-endgame-flip-the-a11y-gate-to-enforce-by-default-at-t.md": 1,

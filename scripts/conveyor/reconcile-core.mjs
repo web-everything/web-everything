@@ -134,6 +134,7 @@ import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
+import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
@@ -664,7 +665,8 @@ export function startedAtMs(startedAt) {
 /**
  * we:scripts/conveyor/reconcile-core.mjs#countFindings — how many comments on this PR are a REVIEWER speaking,
  * rather than the conveyor talking to itself. A comment whose LEADING line is one of
- * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Pure.
+ * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Note comments additionally
+ * require the same trusted-author gate as `hasPostedNoteComment` and a valid episode-key line. Pure.
  *
  * The leading-line narrowing matches `countRearmComments`'s, and for the same reason: a human who QUOTES a
  * marker comment in their reply is raising a finding, not posting a marker, and must not be discounted.
@@ -679,6 +681,8 @@ export function countFindings(comments) {
     if (typeof body !== 'string') continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
+    if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
+      && /^<!-- conveyor-note-key: [a-z][a-z0-9-]*:(?:\d+|unknown)(?::[^\r\n<>]*)? -->$/m.test(body)) continue;
     n += 1;
   }
   return n;
@@ -2625,6 +2629,12 @@ export function planReconcile({
         standDowns: stoodDown,
         why: `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,
       });
+      // Use the shared operator-note publisher: its trusted episode marker posts once,
+      // while the refusal continues to hold until an explicit answer. Count all historical
+      // stand-downs so a later question on the same head starts a new episode.
+      notes.push({ kind: 'stood-down', prNumber,
+        text: `PR #${prNumber}: needs your decision — unanswered stand-down on head ${pr.headRefOid ?? 'unknown'}`
+          + ` (question ${standDownComments(pr.comments).length}). Record an explicit operator answer with stand-down-answer.mjs.` });
       continue;
     }
 
@@ -2790,7 +2800,9 @@ export function planReconcile({
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
     const phase = classifyPr({
-      state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
+      // The planner accepts strings and GraphQL label objects; the board classifier
+      // accepts objects only. Never let a live send-back disappear behind an older accept.
+      state: pr?.state, labels: labelNames(pr?.labels).map(name => ({ name })), mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
     }, requiredChecks);
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
@@ -3978,6 +3990,7 @@ export function planReconcile({
     // floor below, which a PR can independently have already exhausted on real review negotiation (CONFIRMED
     // LIVE: `web-everything/web-everything#2549`, `review-round:5` against the shared cap of 5, zero conflict-fix
     // rounds ever run). See that constant's own docblock for the full incident.
+    // DIRTY alone stays on the ordinary review-repair path and consumes its shared allowance.
     const isConflictBounce = phase === 'bounced' && withPhase.labels.includes(CONFLICT_LABEL);
     if (isConflictBounce) {
       // #2787-live-incident — `currentRef` is `defaultBranch` (this population is, by definition, a main-base

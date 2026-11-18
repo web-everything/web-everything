@@ -43,6 +43,8 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
         const input = [`${spelling}:src/a.mjs src/b.mjs`];
         const expected = ['src/a.mjs', 'src/b.mjs'].map((path) => `${profile.canonicalPrefix}:${path}`);
         expect(normalizeScope(input), spelling).toEqual(expected);
+        // longshore is routable by the loader but never dispatched to a lane (no capabilities): fail closed.
+        if (profile.key === 'longshore') { expect(() => normalizeBriefScope(input), spelling).toThrow(/unknown scope repo prefix/); continue; }
         expect(normalizeBriefScope(input), spelling).toEqual(expected);
         expect(normalizeBriefScope(normalizeScope(input)), spelling).toEqual(expected);
       }
