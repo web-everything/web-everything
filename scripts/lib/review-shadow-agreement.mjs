@@ -96,7 +96,10 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
 function validShadowAnswer(answer) {
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const text = value => typeof value === 'string' && value.trim().length > 0;
-  return object(answer) && text(answer.summary) && Array.isArray(answer.findings)
+  // An abstention ("unable to review ...") with no findings is NOT an accept: it is invalid evidence.
+  const abstains = object(answer) && Array.isArray(answer.findings) && answer.findings.length === 0
+    && /\b(unable|cannot|can't|could not|couldn't|not able|failed|no access|insufficient|abstain|unavailable)\b/i.test(String(answer.summary));
+  return object(answer) && text(answer.summary) && Array.isArray(answer.findings) && !abstains
     && Array.from(answer.findings).every(finding => object(finding) && text(finding.summary)
       && ['file', 'path', 'category', 'failure_scenario', 'disposition', 'impactIfUnfixed'].every(
         key => finding[key] == null || typeof finding[key] === 'string')

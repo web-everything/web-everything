@@ -268,6 +268,8 @@ describe('shadow rows', () => {
     { summary: 42, findings: [] },
     { summary: 'reviewed', findings: {} },
     { summary: 'reviewed' },
+    { summary: 'Unable to review this diff', findings: [] },
+    { summary: 'Reviewer could not access the files.', findings: [] },
     { summary: 'reviewed', findings: [null] },
     { summary: 'reviewed', findings: [[]] },
     { summary: 'reviewed', findings: [{}] },
