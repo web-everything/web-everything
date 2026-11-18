@@ -8,7 +8,13 @@
 the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
 Admission reads complete comments and live head/labels; missing or unreadable evidence retains
 the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
-exceeding either limit asks the operator to re-approve the current head or queue it.
+exceeding either limit asks the operator to re-approve the current head or queue it. The shared numbering
+proof owns its hardened Git runner (caller `exec` is ignored); its `readFailed` flag blocks
+license fallback even when optional alias reads fail. Only grep status 1 and config
+`--get-regexp` status 1 mean absent optional evidence. Keep the real-repo failures and
+no-match success in the license suite, and the internal runner factory's exact 5-second,
+8 MiB output / 1 MiB blob bounds, hardened environment and pins in numbering/carry-chain
+tests. Real Git overflow and a blocked object read exercise the closed paths.
 `drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
 Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
 

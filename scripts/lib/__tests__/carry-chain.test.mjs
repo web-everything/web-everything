@@ -1,10 +1,10 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { proveMixedMechanicalChain } from '../carry-chain.mjs';
-import { MAX_NUMBERING_COMMITS, planNumberingRestamp, restampAfterNumbering, _resetNumberingRestampMemo } from '../numbering-carry.mjs';
+import { numberingGitRunner, MAX_NUMBERING_COMMITS, planNumberingRestamp, restampAfterNumbering, _resetNumberingRestampMemo } from '../numbering-carry.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); _resetNumberingRestampMemo(); });
@@ -52,14 +52,41 @@ it('proves numbering then clean merge with ordered, SHA-bound hops', () => {
     { kind: 'numbering', from: r.from, to: numbered }, { kind: 'merge', from: numbered, to },
   ] });
 });
-it('caps caller-executed merge Git reads at 5 seconds and 8 MiB', () => {
+it('caps numbering and merge Git reads in the mixed chain at 5 seconds and their byte limits', () => {
   const r = repo(); r.number(); const to = r.merge(), calls = [];
   const exec = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     return execFileSync(cmd, args, opts);
   };
-  expect(proveMixedMechanicalChain({ exec, cwd: r.cwd, fromSha: r.from, toSha: to })).toMatchObject({ ok: true });
-  // Numbering owns its runner; exercise the merge delegates, including net-patch's larger requested bounds.
+  const trace = join(r.cwd, 'mixed-proof-trace.json');
+  const previous = process.env.GIT_TRACE2_EVENT;
+  process.env.GIT_TRACE2_EVENT = trace;
+  try {
+    expect(proveMixedMechanicalChain({ exec, cwd: r.cwd, fromSha: r.from, toSha: to })).toMatchObject({ ok: true });
+  } finally {
+    if (previous === undefined) delete process.env.GIT_TRACE2_EVENT;
+    else process.env.GIT_TRACE2_EVENT = previous;
+  }
+  const run = vi.fn(execFileSync);
+  const runner = numberingGitRunner({ cwd: r.cwd, run });
+  const commands = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    .filter(event => event.event === 'start' && event.argv.includes('protocol.allow=never'));
+  // The trace supplies the numbering reads actually used by the mixed chain; replay through its factory spy.
+  for (const { argv } of commands) {
+    const args = argv.slice(1);
+    while (args[0] === '-c') args.splice(0, 2);
+    try { runner.gitBytes(args); }
+    catch (error) { if (!(error.status === 1 && ['grep', 'config'].includes(args[0]))) throw error; }
+  }
+  const numberingReads = run.mock.calls;
+  expect(numberingReads.some(([, args]) => args.includes('blob'))).toBe(true);
+  for (const [cmd, args, opts] of numberingReads) {
+    expect(cmd).toBe('git');
+    expect(opts).toMatchObject({ cwd: r.cwd, timeout: 5000,
+      maxBuffer: args.includes('blob') ? 1024 * 1024 : 8 * 1024 * 1024,
+      env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' } });
+    expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false']);
+  }
   expect(calls.some(({ args }) => args[0] === 'diff')).toBe(true);
   expect(calls.find(({ args }) => args[0] === 'patch-id')?.opts).toMatchObject({
     timeout: 5000, maxBuffer: 8 * 1024 * 1024,

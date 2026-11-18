@@ -46,19 +46,12 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
     if (!SHA.test(approved ?? '')) return refuse('trusted operator clear-human approval missing');
     if (approved === headSha) return { licensed: true, tier: 'exact', reason: 'operator approved the exact current head' };
     if (!cwd) return refuse('no checkout for successor proof');
-    let gitReadFailed = false;
     const boundedExec = (cmd, args, options) => {
-      try {
-        // The shared numbering reader can fetch missing objects; this admission proof is read-only.
-        if (cmd !== 'git' || args[0] === 'fetch') throw Error('local git evidence required');
-        const output = exec(cmd, args, { ...options, cwd, timeout: 5000, maxBuffer: Math.min(options?.maxBuffer ?? MAX_BYTES, MAX_BYTES) });
-        if (!(typeof output === 'string' || Buffer.isBuffer(output)) || Buffer.byteLength(output) > Math.min(options?.maxBuffer ?? MAX_BYTES, MAX_BYTES)) throw Error('git evidence unreadable or oversized');
-        return output;
-      } catch (error) {
-        // `git grep` exit 1 proves no optional numbering aliases; every other read failure blocks fallback.
-        if (!(args[0] === 'grep' && error?.status === 1)) gitReadFailed = true;
-        throw error;
-      }
+      if (cmd !== 'git' || args[0] === 'fetch') throw Error('local git evidence required');
+      const limit = Math.min(options?.maxBuffer ?? MAX_BYTES, MAX_BYTES);
+      const output = exec(cmd, args, { ...options, cwd, timeout: 5000, maxBuffer: limit });
+      if (!(typeof output === 'string' || Buffer.isBuffer(output)) || Buffer.byteLength(output) > limit) throw Error('git evidence unreadable or oversized');
+      return output;
     };
     const git = args => {
       const output = boundedExec('git', args, { encoding: null, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -68,8 +61,8 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
     git(['cat-file', '-e', `${approved}^{commit}`]);
     git(['cat-file', '-e', `${headSha}^{commit}`]);
     git(['merge-base', '--is-ancestor', approved, headSha]);
-    const numbering = proveNumberingOnlyMove({ exec: boundedExec, fromSha: approved, toSha: headSha, cwd });
-    if (gitReadFailed) return refuse('numbering git evidence unreadable');
+    const numbering = proveNumberingOnlyMove({ fromSha: approved, toSha: headSha, cwd });
+    if (numbering.readFailed) return refuse('numbering git evidence unreadable');
     if (numbering.ok) {
       return { licensed: true, tier: 'numbering', reason: 'shared proof confirms a numbering-only successor' };
     }

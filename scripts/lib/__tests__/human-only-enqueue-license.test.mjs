@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { proveNumberingOnlyMove } from '../numbering-carry.mjs';
 import { proveHumanOnlyLicense, resolveApprovalLicensesEnqueue } from '../human-only-enqueue-license.mjs';
 
 const roots = [];
@@ -47,6 +48,26 @@ describe('human-only enqueue license', () => {
     r.git(['mv', 'backlog/xabc123-example.md', 'backlog/7001-example.md']);
     r.write('backlog/7001-example.md', '---\nbornAs: xabc123\nkind: story\n---\ncard\n');
     r.setHead(r.commit('drain: JIT-number xabc123→#7001 at land (#2288)'));
+    expect(r.prove()).toMatchObject({ licensed: true, tier: 'numbering' });
+  });
+  it.each(['missing main', 'failed alias grep'])('refuses unreadable owned numbering evidence: %s', failure => {
+    const r = fixture();
+    r.git(['mv', 'backlog/xabc123-example.md', 'backlog/7001-example.md']);
+    r.write('backlog/7001-example.md', '---\nbornAs: xabc123\nkind: story\n---\ncard\n');
+    const head = r.commit('drain: JIT-number xabc123→#7001 at land (#2288)');
+    r.setHead(head);
+    if (failure === 'missing main') r.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+    else r.git(['config', 'grep.threads', '-1']);
+    expect(proveNumberingOnlyMove({ cwd: r.cwd, fromSha: r.approved, toSha: head }).readFailed).toBe(true);
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringContaining('numbering git evidence unreadable') });
+  });
+  it('keeps grep status 1 and absent promisor config readable and licenses numbering', () => {
+    const r = fixture();
+    r.git(['mv', 'backlog/xabc123-example.md', 'backlog/7001-example.md']);
+    r.write('backlog/7001-example.md', '---\nbornAs: xabc123\nkind: story\n---\ncard\n');
+    const head = r.commit('drain: JIT-number xabc123→#7001 at land (#2288)'); r.setHead(head);
+    expect(() => r.git(['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'])).toThrowError(expect.objectContaining({ status: 1 }));
+    expect(proveNumberingOnlyMove({ cwd: r.cwd, fromSha: r.approved, toSha: head })).toMatchObject({ ok: true, readFailed: false });
     expect(r.prove()).toMatchObject({ licensed: true, tier: 'numbering' });
   });
   it.each(['.github/workflows/ci.yml', '.github/actions/setup/action.yml', 'scripts/merge-ai-prs.mjs'])('refuses an unapproved sensitive successor: %s', path => {

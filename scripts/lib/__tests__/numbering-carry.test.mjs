@@ -12,7 +12,7 @@ import {
   resolveNumberingHumanClearanceSetting, MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
   planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering as restampWithoutGuard,
   _resetNumberingRestampMemo, numberingWithdrawalOwed, strandedNumberingRecords, MAX_WITHDRAWALS_PER_PASS,
-  readExtraMap,
+  readExtraMap, numberingGitRunner,
 } from '../numbering-carry.mjs';
 import { decideDrainReviewGate } from '../../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
@@ -410,6 +410,88 @@ function proofReader({ changes = live().changes, commitSubject = subject, subjec
   };
   return { calls, exec, from, head, cwd, git, prove };
 }
+
+describe('owned numbering Git runner bounds', () => {
+  it('applies exact timeout, byte caps, hardened environment and pins to every proof read', () => {
+    const r = proofReader();
+    r.git(['config', 'remote.secondary.promisor', 'true']);
+    expect(r.prove()).toMatchObject({ ok: true, readFailed: false });
+    const run = vi.fn(execFileSync);
+    const runner = numberingGitRunner({ cwd: r.cwd, run });
+    // Replay every actual proof read through the factory's IO seam. The public proof still owns its IO.
+    for (const args of r.calls) {
+      try { runner.gitBytes(args); }
+      catch (error) {
+        expect(args[0]).toBe('grep');
+        expect(error.status).toBe(1);
+      }
+      if (args[0] === 'config') runner.pins.push('-c', 'remote.secondary.promisor=false');
+    }
+    expect(runner.readFailed).toBe(false);
+    const calls = run.mock.calls;
+    expect(calls.some(([, args]) => args.includes('blob'))).toBe(true);
+    for (const [cmd, args, options] of calls) {
+      expect(cmd).toBe('git');
+      expect(options).toMatchObject({ cwd: r.cwd, timeout: 5000, encoding: null,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        maxBuffer: args.includes('blob') ? MAX_NUMBERING_BLOB_BYTES : 8 * 1024 * 1024,
+        env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent', GIT_TERMINAL_PROMPT: '0' } });
+      expect(options.env.GIT_CONFIG_PARAMETERS).toBeUndefined();
+      const config = Object.fromEntries(Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(config).toMatchObject({ 'core.hooksPath': '/dev/null', 'core.fsmonitor': 'false',
+        'credential.helper': '', 'core.askPass': '', 'log.showSignature': 'false' });
+      expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false']);
+      if (!args.includes('--get-regexp')) expect(args.slice(6, 8)).toEqual(['-c', 'remote.secondary.promisor=false']);
+    }
+  });
+  it('exposes the same bounds through the internal factory run spy, with a blob-specific default', () => {
+    const run = vi.fn(() => Buffer.from('read'));
+    const runner = numberingGitRunner({ cwd: 'checkout', run });
+    runner.gitBytes(['ls-tree', 'HEAD']);
+    runner.gitBytes(['cat-file', 'blob', 'object']);
+    expect(run).toHaveBeenCalledTimes(2);
+    for (const [, args, options] of run.mock.calls) {
+      expect(options).toMatchObject({ cwd: 'checkout', timeout: 5000,
+        maxBuffer: args.includes('blob') ? MAX_NUMBERING_BLOB_BYTES : 8 * 1024 * 1024,
+        env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1' } });
+      expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false']);
+    }
+    expect(runner.readFailed).toBe(false);
+  });
+  it.each([['grep', 1, false], ['config', 1, false], ['ls-tree', 1, true], ['grep', 128, true], ['config', 128, true]])(
+    'records %s status %s as readFailed=%s', (command, status, failed) => {
+      const runner = numberingGitRunner({ run: () => { throw Object.assign(Error('read error'), { status }); } });
+      expect(() => runner.gitBytes([command, ...(command === 'config' ? ['--get-regexp', 'remote'] : [])])).toThrow('read error');
+      expect(runner.readFailed).toBe(failed);
+    });
+  it('fails closed on real Git buffer overflow and refuses oversized proof blobs before reading them', () => {
+    const changes = live().changes;
+    changes[1].before = 'x'.repeat(8 * 1024 * 1024 + 1);
+    const r = proofReader({ changes });
+    const oid = r.git(['rev-parse', `${r.from}:${changes[1].path}`]);
+    for (const args of [['cat-file', 'blob', oid], ['cat-file', '-p', oid]]) {
+      const runner = numberingGitRunner({ cwd: r.cwd });
+      expect(() => runner.gitBytes(args)).toThrow();
+      expect(runner.readFailed).toBe(true);
+    }
+    expect(r.prove()).toMatchObject({ ok: false, reason: expect.stringMatching(/byte.*limit/) });
+    expect(r.calls.some(args => args[0] === 'cat-file' && args[1] === 'blob' && args[2] === oid)).toBe(false);
+  });
+  it('fails closed with readFailed on a real Git timeout at the catch boundary', () => {
+    const r = proofReader();
+    const oid = r.git(['rev-parse', 'origin/main^{tree}']);
+    const objectPath = join(r.cwd, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+    rmSync(objectPath);
+    execFileSync('mkfifo', [objectPath]);
+    expect(r.prove()).toMatchObject({ ok: false, retryable: true, readFailed: true,
+      reason: expect.stringMatching(/ETIMEDOUT/) });
+  }, 15000);
+  it('returns readFailed=false for refusals before any Git read', () => {
+    expect(proveNumberingOnlyMove()).toMatchObject({ ok: false, readFailed: false });
+  });
+});
 
 describe('proveNumberingOnlyMove read-only regressions', () => {
   const codeChanges = (hash = 'x1b8hlo', number = '5726') => [...live().changes,

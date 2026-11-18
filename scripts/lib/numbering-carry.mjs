@@ -255,26 +255,16 @@ function readExistingNumbers(git, ref) {
   return numbers;
 }
 
-/**
- * IO (local-only, read-only git proof): verify every new commit is drain numbering
- * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
- * @param {{exec?:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o — exec is retained for compatibility only.
- * @returns {{ok:true,commits:string[],pairs:Array<[string,string]>,reason:string}|{ok:false,reason:string,retryable?:boolean}}
- */
-export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd } = {}) {
-  try {
-    if (!fromSha || !toSha) return refuse('no head');
-    if (fromSha === toSha) return refuse('no head move');
-    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
-    // dropping it would itself conceal a non-numbering byte change.
-    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-    // The proof owns its runner: caller IO/env must never turn an object read into a lazy fetch.
-    const env = { ...laneGitHardeningEnv(scrubInheritedGitEnv()), GIT_NO_REPLACE_OBJECTS: '1',
-      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent',
-      GIT_TERMINAL_PROMPT: '0' };
-    const pins = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false'];
-    const gitBytes = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
-      const output = execFileSync('git', [...pins, ...args], {
+/** Internal test seam for bounded local Git reads; the public proof never accepts a runner. */
+export function numberingGitRunner({ cwd, run = execFileSync } = {}) {
+  let readFailed = false;
+  const env = { ...laneGitHardeningEnv(scrubInheritedGitEnv()), GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent',
+    GIT_TERMINAL_PROMPT: '0' };
+  const pins = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false'];
+  const gitBytes = (args, maxBuffer = args[0] === 'cat-file' && args[1] === 'blob' ? MAX_NUMBERING_BLOB_BYTES : MAX_GIT_OUTPUT_BYTES) => {
+    try {
+      const output = run('git', [...pins, ...args], {
         env,
         encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
         ...(cwd === undefined ? {} : { cwd }),
@@ -282,7 +272,40 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
       if (!Buffer.isBuffer(output)) throw Error('git reader must return raw bytes');
       if (output.length > maxBuffer) throw Error('git output exceeds byte limit');
       return output;
-    };
+    } catch (error) {
+      if (!(error?.status === 1 && (args[0] === 'grep'
+        || (args[0] === 'config' && args[1] === '--get-regexp')))) readFailed = true;
+      throw error;
+    }
+  };
+  return { gitBytes, pins, get readFailed() { return readFailed; } };
+}
+
+/**
+ * IO (local-only, read-only git proof): verify every new commit is drain numbering
+ * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
+ * @param {{exec?:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o — exec is retained for compatibility only.
+ * @returns {{ok:boolean,reason:string,readFailed:boolean,commits?:string[],pairs?:Array<[string,string]>,retryable?:boolean}}
+ */
+export function proveNumberingOnlyMove(options = {}) {
+  let runner;
+  try {
+    runner = numberingGitRunner({ cwd: options.cwd });
+    return { ...proveNumberingWithRunner(options, runner), readFailed: runner.readFailed };
+  } catch (error) {
+    return { ...refuse(`numbering proof failed: ${String(error?.message ?? error).split('\n')[0]}`),
+      retryable: true, readFailed: true };
+  }
+}
+
+function proveNumberingWithRunner({ fromSha, toSha, mainRef = 'origin/main' } = {}, runner) {
+  try {
+    if (!fromSha || !toSha) return refuse('no head');
+    if (fromSha === toSha) return refuse('no head move');
+    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
+    // dropping it would itself conceal a non-numbering byte change.
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    const { gitBytes, pins } = runner;
     const git = (args, maxBuffer) => decoder.decode(gitBytes(args, maxBuffer));
     // Blob content is compared as text only once its text re-encodes to the exact bytes git stored, so no decoding
     // step (a dropped BOM, a replaced byte, a normalisation) can make two different byte sequences compare equal.
