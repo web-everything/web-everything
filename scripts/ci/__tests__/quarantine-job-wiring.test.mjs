@@ -22,7 +22,7 @@ function skip(job, file, overrides = {}) {
 
 describe('CI consumes quarantine for every automatically quarantined suite', () => {
   it.each([
-    ['integration', 'Real-git integration suite', 'test:integration:vitest', 'integration', integrationFile],
+    ['integration-part', 'Real-git integration suite', 'test:integration:vitest', 'integration', integrationFile],
     ['soak-shard', 'Soak shard', 'test:soak:shard', 'soak-shard (${{ matrix.shard }})', soakFile],
   ])('%s passes job-specific exclusions to its runner', (id, name, script, job, file) => {
     const step = jobs[id].steps.find((s) => s.name?.startsWith(name));

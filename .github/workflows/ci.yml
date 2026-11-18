@@ -402,28 +402,27 @@ jobs:
             exit 1
           fi
 
-  # Real-git integration suite as its OWN job, parallel with the shards (card 6, perf sweep 2026-10-07). It used
-  # to be the last step of `test`, which `needs: test-shard`, so its 5.8-8.4 min started only after every shard
-  # finished. It never used the shards' output (only the coverage merge does), so it now needs just `changes` and
-  # runs beside them: the critical path drops from shards + (merge + standards + integration) to
-  # max(shards + merge, standards, host-paths, integration).
-  #
-  # The real-git/real-subprocess tier `vitest.config.ts` excludes (see its `test.exclude` comment) is split out
-  # so `npm run test:unit` (and everything that shells it locally) no longer pays real git/subprocess cost per lane.
-  #
-  # Check names: `integration` is its own check and is meant to be REQUIRED in branch protection alongside `test`,
-  # `smoke` and `daemon-soak`. `test` ALSO still fails when this job fails (see its "Gate on shard results" step),
-  # so nothing that is required today became skippable.
-  #
-  # Card-only PRs: like `test`/`smoke`, it stays a REAL running job (not job-level skipped) that passes in
-  # seconds, because a SKIPPED required check is not read as success by the drain's `reviewCiGate`. Fail closed:
-  # if `changes` did not succeed, the first step fails the job.
-  integration:
+  # TT3: split the real-git/real-subprocess tier into three parallel integration parts.
+  # Each retains its existing pool settings and card-only handling. The shell aggregator's
+  # check name `integration` is unchanged, so branch protection needs no change; `test`
+  # still requires it. Failed, cancelled or skipped parts fail the aggregator closed.
+  integration-part:
     needs: changes
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    # Measured 5.8-8.4 min (perf sweep 2026-10-07); ~2.5x the worst case.
-    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [scan-chain, sim-scenarios, parallel]
+        include:
+          - group: scan-chain
+            timeout: 20
+          - group: sim-scenarios
+            timeout: 20
+          - group: parallel
+            timeout: 20
+    # 2x headroom over the ~10 minute target per part.
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - name: Gate on changes
         id: gate
@@ -495,7 +494,26 @@ jobs:
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
+        env:
+          WE_INTEGRATION_GROUP: ${{ matrix.group }}
         run: npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")
+
+  integration:
+    needs: [changes, integration-part]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate on integration results
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "changes did not succeed - failing closed."
+            exit 1
+          fi
+          if [ "${{ needs.integration-part.result }}" != "success" ]; then
+            echo "integration-part did not succeed - failing closed."
+            exit 1
+          fi
 
   # #4075 DAEMON SOAK HARNESS (card x0zg44l) — `npm run test:soak`: the REAL review + fix daemons, the real
   # rebuild/self-sync + live smoke gate, a real bare remote with main moving, fake GitHub + fake sessions, the
