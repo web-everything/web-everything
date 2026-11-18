@@ -40,13 +40,23 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
  * `inputs`   = paths that define the scanner's RULE; a change to one runs the scanner full.
  */
 
+/** Shared inventory for the launch guard and its changed-file selector. Patterns match filenames. */
+export const RUNTIME_ADMISSION_SPAWN_SCAN = Object.freeze([
+  'skills-src/conveyor/build-dispatch-daemon.mjs',
+  'scripts/conveyor/tick-core.mjs',
+  'scripts/conveyor/infra-blocked.mjs',
+  'scripts/operations/ci-heal-pr-dispatch.mjs',
+  { directory: 'scripts/operations', files: /^dispatch-lane[^/]*\.mjs$/ },
+  { directory: 'scripts/conveyor', files: /^build-dispatch-[^/]*\.mjs$/ },
+]);
+
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
     test: 'scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', scope: 'files',
     why: 'every conveyor work launch must pass the fresh runtime admission boundary',
-    matches: f => /^scripts\/conveyor\/(?:build-dispatch-.*|tick-core)\.mjs$/.test(f)
-      || ['skills-src/conveyor/build-dispatch-daemon.mjs', 'scripts/operations/dispatch-lane-io.mjs'].includes(f),
+    matches: f => RUNTIME_ADMISSION_SPAWN_SCAN.some(entry => typeof entry === 'string' ? f === entry
+      : f.startsWith(`${entry.directory}/`) && entry.files.test(f.slice(entry.directory.length + 1))),
     inputs: ['scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', 'scripts/lib/runtime-admission.mjs'],
   },
   {

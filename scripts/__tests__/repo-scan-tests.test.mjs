@@ -7,12 +7,12 @@
  */
 import { describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  DEFERRED_SCAN_TESTS, REPO_SCAN_TESTS, SCAN_FILES_ENV, SCAN_ROOT_ENV, SCAN_TEST_TAG,
+  DEFERRED_SCAN_TESTS, REPO_SCAN_TESTS, RUNTIME_ADMISSION_SPAWN_SCAN, SCAN_FILES_ENV, SCAN_ROOT_ENV, SCAN_TEST_TAG,
   scanCommands, scanRoot, scanScope, scopedScanFiles, selectScanTests,
 } from '../lib/repo-scan-tests.mjs';
 import { resolveDefaultGate } from '../lib/verify-lane-gate.mjs';
@@ -21,6 +21,16 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it('selects the runtime admission spawn guard for every file in its shared scan inventory', () => {
+    const files = RUNTIME_ADMISSION_SPAWN_SCAN.flatMap(entry => typeof entry === 'string' ? [entry]
+      : readdirSync(join(root, entry.directory)).filter(f => entry.files.test(f)).map(f => `${entry.directory}/${f}`));
+    expect(files).toEqual(expect.arrayContaining(['scripts/conveyor/infra-blocked.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs']));
+    for (const file of [...files, 'scripts/conveyor/build-dispatch-future.mjs', 'scripts/operations/dispatch-lane-future.mjs']) {
+      const { scoped, scopedFiles } = selectScanTests({ changedFiles: [file] });
+      expect(scoped.map(e => e.test), file).toContain('scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs');
+      expect(scopedFiles, file).toContain(file);
+    }
+  });
   it.each(['mjs', 'cjs', 'js', 'mts', 'cts', 'ts', 'sh', 'bash', 'py'])('ruling-label reference guard covers new production .%s scripts', ext => {
     const { full } = selectScanTests({ changedFiles: [`scripts/new-writer.${ext}`] });
     expect(full.map(e => e.test)).toContain('scripts/conveyor/__tests__/pr-label-mirror.test.mjs');

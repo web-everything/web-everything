@@ -5,6 +5,12 @@ export { decideRuntimeAdmission };
 const ticks = new AsyncLocalStorage();
 const key = num => String(num ?? '').replace(/^#/, '');
 
+/** Absent means no group; malformed persisted evidence requires operator repair. */
+export function validRuntimeGroupMembers(members) {
+  return members === undefined || (Array.isArray(members) && Array.from(members).every(member =>
+    ['string', 'number'].includes(typeof member) && /^(?:\d+|x[0-9a-z]{6,})(?![\s\S])/.test(key(member))));
+}
+
 /** Fresh IO at every boundary. A refusal is data, never an exception escaping a tick. */
 export function assertRuntimeAdmitted(card, kind, { readSettings } = {}) {
   const tick = ticks.getStore();
@@ -67,9 +73,8 @@ export function withRuntimeAdmission(card, kind, effect, { readSettings } = {}) 
   for (const lead of cards) {
     const members = lead?.groupMembers === undefined ? [] : lead.groupMembers;
     const persisted = tick?.cards.get(key(lead?.num))?.groupMembers;
-    const malformed = !Array.isArray(members) || members.some(member =>
-      !['string', 'number'].includes(typeof member) || !String(member).trim())
-      || (persisted !== undefined && (!Array.isArray(persisted)
+    const malformed = !validRuntimeGroupMembers(members)
+      || (persisted !== undefined && (!validRuntimeGroupMembers(persisted)
         || persisted.some(member => !members.some(num => key(num) === key(member)))));
     invalid ||= malformed;
     identities.push({ card: lead, kind });

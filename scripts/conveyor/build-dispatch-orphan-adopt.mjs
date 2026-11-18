@@ -80,7 +80,7 @@ import { readBuildDelivery } from './build-delivery-evidence.mjs';
 import { recordBuildFailure, clearBuildFailure, dispatchAttemptKey, claimAttemptKeys } from './build-dispatch-failures.mjs';
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
-import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
+import { assertRuntimeAdmitted, validRuntimeGroupMembers, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
 // Through the REGISTRY, never `dispatch-providers/build.mjs` directly: `detached-dispatch.mjs` imports the
 // registry, which imports `build.mjs` — entering that cycle at `build.mjs` (or at `detached-dispatch.mjs` first)
@@ -593,10 +593,15 @@ export async function adoptOrphanedBuildClaims({
       // reached `in-flight`) — there is nothing to resume FROM in that case (no lane, no sessionSlug), so
       // resumability resolves to `no-lane-or-session` and this always falls straight to RELEASE.
       const payload = row?.entry?.payload || {};
+      if (!validRuntimeGroupMembers(payload.groupMembers)) {
+        const refusal = withRuntimeAdmission({ ...payload, num }, 'resume', () => null, { readSettings });
+        results.push({ num, action: refusal.outcome, reason: refusal.reason, runtimeRefused: refusal.runtimeRefused });
+        continue;
+      }
       const attempts = Number(liveness.marker?.meta?.attempts) || 0;
       const resumability = resolveResumability({
         num, lane: payload.lane, sessionSlug: payload.sessionSlug, scope: payload.scope ?? null,
-        groupMembers: payload.groupMembers ?? [],
+        groupMembers: payload.groupMembers,
         rowStartedAt: row?.entry?.startedAt ?? null,
       });
       const decision = decideOrphanAction({ resumable: resumability.resumable, attempts, maxAttempts, allowResume, frozenReason });
@@ -607,7 +612,7 @@ export async function adoptOrphanedBuildClaims({
         const admission = assertRuntimeAdmitted({ num, bornAs: payload.bornAs }, 'resume', { readSettings });
         if (!admission.admitted) { results.push({ num, action: 'runtime-refused', reason: admission.reason }); continue; }
         const runtimeRefused = [];
-        const groupMembers = payload.groupMembers ?? [];
+        const groupMembers = payload.groupMembers === undefined ? [] : payload.groupMembers;
         const allMembersAdmitted = groupMembers.map(member => {
           const admission = assertRuntimeAdmitted({ num: member }, 'resume', { readSettings });
           if (!admission.admitted) runtimeRefused.push({ num: String(member), kind: 'resume', reason: admission.reason });

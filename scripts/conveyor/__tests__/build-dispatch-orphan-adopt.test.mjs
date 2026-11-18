@@ -372,6 +372,26 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     runId: 'dispatch-lane-x',
     entry: { key: 'step:1:0', status, handle, result, payload: { num, launchKind: 'build', lane, sessionSlug, scope: [] } },
   });
+  it.each([null, '12', {}, [null], ['12', {}], ['not-a-card']].map(groupMembers => [groupMembers]))('refuses malformed persisted roster %j before resumability or spawning', async groupMembers => {
+    acquireBuildDispatchClaim({ num: '12', pid: 98761, lockRoot });
+    const claims = listBuildDispatchClaims({ lockRoot, ignoreExpiry: true });
+    const row = buildRow({ num: '12', handle: 'pid:74142' });
+    row.entry.payload.groupMembers = groupMembers;
+    const originalRow = structuredClone(row);
+    const spawnResume = vi.fn(), markResume = vi.fn(), resolveResumability = vi.fn(() => ({ resumable: true }));
+    const result = await adoptFixtureClaims({
+      listClaims: () => claims, isPidAlive: () => false, findRow: () => row,
+      readResumeMarker: () => null, resolveResumability, spawnResume, markResume,
+      readSettings: () => ({ mode: 'lift' }),
+    });
+    expect(result).toEqual([{ num: '12', action: 'runtime-refused', reason: 'runtime-malformed',
+      runtimeRefused: [{ num: '12', kind: 'resume', reason: 'runtime-malformed' }] }]);
+    expect(resolveResumability).not.toHaveBeenCalled();
+    expect(spawnResume).not.toHaveBeenCalled();
+    expect(markResume).not.toHaveBeenCalled();
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true })).toEqual(claims);
+    expect(row).toEqual(originalRow);
+  });
   it.each(['default', 'injected', 'fresh refusal'])('refuses a persisted group without changing claims, markers or attempts (%s)', async mode => {
     acquireBuildDispatchClaim({ num: '12', pid: 98761, lockRoot });
     markBuildDispatchResume({ num: '12', pid: 999, runId: 'dispatch-lane-x', rowKey: 'step:1:0', attempts: 1, lockRoot: resumeRoot });

@@ -172,11 +172,16 @@ it('launch admission reads once for the whole group and never partially launches
   expect(withRuntimeAdmission({ num: 12, groupMembers: [12, 13] }, 'draft-recovery', effect, { readSettings: () => only(['12', '13']) })).toBe('launched');
   expect(effect).toHaveBeenCalledTimes(1);
 });
-it.each([null, {}, '13', [null], [undefined], ['']].map(groupMembers => [groupMembers]))('malformed group %j refuses with operator-repair evidence', groupMembers => {
+it.each([null, {}, '13', [null], [undefined], [''], ['12', {}], ['not-a-card'], ['xBAD'], [NaN], [Infinity], [1.5], ['12\n'], Array(1)].map(groupMembers => [groupMembers]))('malformed group %j refuses with operator-repair evidence', groupMembers => {
   const effect = vi.fn();
   expect(withRuntimeAdmission({ num: 12, groupMembers }, 'build', effect, { readSettings: () => ({ mode: 'lift' }) }))
     .toMatchObject({ outcome: 'runtime-refused', reason: 'runtime-malformed' });
   expect(effect).not.toHaveBeenCalled();
+});
+it.each([undefined, [], ['12', 13, 'xabc123']].map(groupMembers => [groupMembers]))('valid or absent group %j launches exactly once', groupMembers => {
+  const effect = vi.fn(() => 'launched');
+  expect(withRuntimeAdmission({ num: 12, groupMembers }, 'build', effect, { readSettings: () => ({ mode: 'lift' }) })).toBe('launched');
+  expect(effect).toHaveBeenCalledTimes(1);
 });
 it('infra publish rechecks after git reads revoke the whole allowlist', () => {
   const sha = 'a'.repeat(40);

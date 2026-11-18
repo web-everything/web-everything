@@ -3,7 +3,7 @@ import { it, expect } from 'vitest';
 import ts from 'typescript';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanRoot, scopedScanFiles } from '../repo-scan-tests.mjs';
+import { RUNTIME_ADMISSION_SPAWN_SCAN, scanRoot, scopedScanFiles } from '../repo-scan-tests.mjs';
 
 const root = scanRoot(process.cwd());
 const launches = /^(?:spawnDetached|defaultSpawnDetached|startDetachedLaunch|spawnResume|spawnLand|spawnPreventionLandingJob|dispatchCiHeal|sinks\[DISPATCH_EFFECT\]|provider|effects\.(?:dispatch|routeHeldItems|stampPrepare)|io\.dispatch)$/;
@@ -122,9 +122,8 @@ const reviewedReads = new Map([
   ['scripts/operations/dispatch-lane-io.mjs#fetch', 'Lists existing Claude agents; starts no agent.'],
 ]);
 it('inventories every conveyor process site and rejects unguarded or stale exceptions', () => {
-  const files = ['skills-src/conveyor/build-dispatch-daemon.mjs', 'scripts/conveyor/tick-core.mjs', 'scripts/conveyor/infra-blocked.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs',
-    ...readdirSync(join(root, 'scripts/operations')).filter(f => /^dispatch-lane.*\.mjs$/.test(f)).map(f => `scripts/operations/${f}`),
-    ...readdirSync(join(root, 'scripts/conveyor')).filter(f => /^build-dispatch-.*\.mjs$/.test(f)).map(f => `scripts/conveyor/${f}`)];
+  const files = RUNTIME_ADMISSION_SPAWN_SCAN.flatMap(entry => typeof entry === 'string' ? [entry]
+    : readdirSync(join(root, entry.directory)).filter(f => entry.files.test(f)).map(f => `${entry.directory}/${f}`));
   let count = 0;
   const found = new Set();
   for (const file of scopedScanFiles(files)) {
