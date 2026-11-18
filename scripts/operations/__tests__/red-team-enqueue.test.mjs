@@ -534,14 +534,15 @@ it('enqueue refuses an enriched snapshot for another head instead of borrowing i
   expect(f.post).not.toHaveBeenCalled();
 });
 
-it('nomination safety drops wrong-head reruns before required-check matching too', async () => {
+it('nomination safety preserves wrong-head refusals when reruns shadow current success', async () => {
   const raw = live();
   raw.statusCheckRollup[0] = check('test', 'success', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' });
   raw.statusCheckRollup.push(check('test', 'failure', { head_sha: 'b'.repeat(40), id: 2, completedAt: '2026-11-17T11:00:00Z' }));
   const result = plan(raw), row = result.plannerRows[0];
-  expect(row.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate'], nonReviewOwned: [] });
-  expect(row.nominationSafety.hold).toBeNull();
+  expect(row.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate'], nonReviewOwned: ['test'], onlyRed: false,
+    ci: { allowed: false, affected: [{ name: 'test', reason: 'wrong-head' }, { name: 'review-gate', reason: 'failure' }] } });
+  expect(row.nominationSafety.hold).toBe('review-ci');
   const f = fixture({ readLive: () => raw, readPlan: () => result });
-  expect(await f.run()).toMatchObject({ status: 'requested', head });
-  expect(f.post).toHaveBeenCalledOnce();
+  await expect(f.run()).rejects.toThrow('planner safety hold: review-ci');
+  expect(f.post).not.toHaveBeenCalled();
 });

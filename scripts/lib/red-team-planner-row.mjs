@@ -1,7 +1,7 @@
 /** Read-only reconciliation evidence and nomination eligibility; no dispatch or effects. */
 import { redTeamForHead } from './red-team-gate.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
-import { FAILED_CHECK_CONCLUSIONS } from './rollup-collapse.mjs';
+import { FAILED_CHECK_CONCLUSIONS, isFailedCheckRow } from './rollup-collapse.mjs';
 import { repoKeyForSlug } from './constellation-repos.mjs';
 import { splitFailingChecks, reviewHoldGatesOnlyRed, reviewHoldOnlyRed, refuseUnreviewable, planReconcile } from '../conveyor/reconcile-core.mjs';
 
@@ -32,19 +32,21 @@ export function readPlannerRow({ repo, pr, plan, refusals = plan?.refusals ?? []
   const refusal = refusals.find(row => row && Object.is(Number(row.prNumber), Number(pr)));
   if (!refusal) return { absent: true };
   const rawPr = rawPrs?.find(row => Object.is(Number(row?.number), Number(pr)));
-  // Exclude other heads before matching, implication or latest-run selection. Unheaded rollup
-  // rows retain reviewCiGate's existing assumption that they belong to the fetched PR head.
-  const rollup = rawPr?.statusCheckRollup;
-  const checks = Array.isArray(rollup)
-    ? rollup.filter(row => !row?.head_sha || row.head_sha === rawPr?.headRefOid) : rollup;
+  const checks = rawPr?.statusCheckRollup;
   const failing = splitFailingChecks(checks, requiredChecks);
-  const ci = reviewCiGate({ headSha: rawPr?.headRefOid, requiredChecks, checks });
+  const fullCi = reviewCiGate({ headSha: rawPr?.headRefOid, requiredChecks, checks });
+  // Preserve wrong-head refusals, and independently require current-head implication evidence.
+  // Unheaded rollup rows retain the gate's assumption that they belong to the fetched PR head.
+  const currentCi = reviewCiGate({ headSha: rawPr?.headRefOid, requiredChecks,
+    checks: Array.isArray(checks) ? checks.filter(row => !row?.head_sha || row.head_sha === rawPr?.headRefOid) : checks });
+  const ci = fullCi.allowed ? currentCi : { ...fullCi, affected: [...fullCi.affected,
+    ...currentCi.affected.filter(row => !fullCi.affected.some(full => full.name === row.name))] };
   // Classify pending owners with the same hold classifier; CI evidence itself stays pending.
   const pending = ci.affected.filter(check => check.reason === 'pending').map(check => check.name);
   const ownershipChecks = Array.isArray(checks) ? checks.map(check => pending.includes(check?.name ?? check?.context)
     ? { ...check, status: 'completed', conclusion: 'failure', state: 'failure' } : check) : checks;
-  // Ask the existing normal-path classifier separately for each failing required check. In particular,
-  // a plain merge-gate (or red-team) failure is not silently promoted to a review-owned hold.
+  // Ask the existing normal-path classifier separately for each failing or pending required check.
+  // A plain merge-gate (or red-team) failure is not silently promoted to a review-owned hold.
   const reviewOwned = [...new Set([...failing.required, ...pending])].filter(name => reviewHoldGatesOnlyRed(ownershipChecks, [name]));
   const reviewOwnedCi = ci.allowed === false && ci.affected.length > 0 && ci.affected.every(check =>
     reviewOwned.includes(check.name) && !['missing', 'wrong-head', 'malformed'].includes(check.reason)
@@ -52,12 +54,15 @@ export function readPlannerRow({ repo, pr, plan, refusals = plan?.refusals ?? []
   // The SAME head-aware classification must prove that only failed review holds need excusing.
   const onlyFailures = ci.affected.length > 0 && ci.affected.every(({ name, reason }) =>
     reviewOwned.includes(name) && FAILED_CHECK_CONCLUSIONS.includes(reason.toUpperCase()));
+  const noOtherRed = Array.isArray(checks) && checks.every(row => !isFailedCheckRow(row)
+    || (Array.isArray(requiredChecks) && requiredChecks.includes(row?.name || row?.context)
+      && reviewHoldGatesOnlyRed([row], [row?.name || row?.context])));
   return { absent: false, refusal, nominationSafety: { head: rawPr?.headRefOid,
     hold: nominationSafety({ ...rawPr, statusCheckRollup: checks }, { repo, ...plan?.plannerOptions, requiredChecks }, reviewOwnedCi, reviewOwned) ?? (ci.allowed === false && !reviewOwnedCi ? 'review-ci' : null) }, reviewOwnedChecks: {
     ci,
     ...failing, reviewOwned, nonReviewOwned: failing.required.filter(name => !reviewOwned.includes(name)),
     gatesOnlyRed: reviewHoldGatesOnlyRed(checks, requiredChecks),
-    onlyRed: onlyFailures && reviewHoldOnlyRed(checks, requiredChecks),
+    onlyRed: onlyFailures && noOtherRed && reviewHoldOnlyRed(checks, requiredChecks),
   } };
 }
 
