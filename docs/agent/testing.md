@@ -4614,3 +4614,12 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+### Builder runtime-only candidate admission
+
+`build-dispatch-runtime-only.test.mjs` drives the daemon with the real pure tick core and
+also with older planner output. Pass the once-per-tick `buildPriority` snapshot through
+`config.buildPriority`: filter new build/prepare candidates before cost admission, but keep
+the original queues for retiring existing guards. Filter the prepare group pool too: members
+are new work even when their lead is allowed. The runtime top ID obeys the configured prepare concurrency, light concurrency guard,
+and prepare-ahead window; listing it grants no additional capacity. Malformed runtime evidence holds new work and logs the
+operator fallback (repair or remove the runtime file). Lift/no-file output stays unchanged.
