@@ -3394,6 +3394,10 @@ Verification marker authorship stays in the Mac gate driver and requires a
 confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
 never execute setup in a development lane.
 
+Forge's `.forge-tmp` directory is runtime scratch inside the work tree, created after
+snapshot validation and removed with the run. Exclude it from `digestInput` so worker
+probes in `forge-offload.test.mjs` can recheck reconstructed inputs before install.
+
 The run-scoped temp allocator canonicalizes its base before creating fixtures: macOS's
 `/var` alias must not reach descriptor-relative snapshot copies, which reject symlink
 ancestors. Preserve those production no-follow guards; test the allocator with an explicit

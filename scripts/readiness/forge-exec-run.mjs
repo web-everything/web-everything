@@ -459,6 +459,9 @@ export async function digestInput(root, files) {
       budget += path.length + 1;
       if (budget > LIMIT) throw new Error('Input inventory limit exceeded; use local fallback');
       const absolute = bytePath(root,path), st = await lstat(absolute);
+      // Runtime scratch is created only after verifyManifest validates the snapshot.
+      // Keep it out of the input binding when consumers recheck the materialized tree.
+      if (!prefix.length && name.equals(Buffer.from('.forge-tmp')) && st.isDirectory()) continue;
       seen.add(key); field(path);
       if (st.isSymbolicLink()) throw new Error('Input symlink');
       if (st.isDirectory()) {field('dir'); await walk(path, depth + 1);}
