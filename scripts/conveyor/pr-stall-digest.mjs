@@ -135,7 +135,8 @@ export function publishStalledDigest(pass, { now = Date.now(), env = process.env
   try { mkdirSync(stateDir, { recursive: true }); return withFileLock(join(stateDir, 'digest.lock'), () => deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes })); }
   catch (e) { errors.push(`digest lock: ${String(e?.message ?? e).split('\n')[0]}`); return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
   } finally {
-    // Detached post-delivery stage: no subprocess reads in the digest or under test.
+    // Every pass, including empty/unchanged items, drains the shared watcher queue.
+    // Detached best effort; never spawn operations under test.
     if (!isUnderTest(env) && !isUnderTest()) {
       void Promise.resolve().then(() => drain({ stateDir: traceStateDir, now, max: 2, env })).catch(() => {});
     }

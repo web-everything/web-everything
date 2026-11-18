@@ -150,34 +150,28 @@ test('reads both direct and wrapped verdict shapes for each operation', async t 
   }
 });
 
-test('unknown direct shapes deliver an INCOMPLETE note', async t => {
-  const f = fixture(t);
-  await traceStuckPr({ ...f.options, run: async () => ({ owner: 17, likelyBlocker: null }) });
-  assert.match(f.events[0].detail.note, /INCOMPLETE/);
-  assert.equal(queue(f)[key].state, 'done');
-});
-
-test('empty wrapped verdicts in either or both layers deliver an INCOMPLETE note', async t => {
+test('invalid or missing layers retry twice then deliver one INCOMPLETE note on attempt three', async t => {
   for (const failed of [['why'], ['pr-trace'], ['why', 'pr-trace']]) {
-    const f = fixture(t); f.trace.unavailable = [];
-    await traceStuckPr({ ...f.options, run: args => failed.includes(args[0])
-      ? { verdict: {} } : f.options.run(args) });
-    assert.match(f.events[0].detail.note, /INCOMPLETE/);
-    assert.equal(queue(f)[key].state, 'done');
+    for (const invalid of [undefined, null, {}, { owner: 17, likelyBlocker: null }, { owner: 'operator' }, []]) {
+      for (const wrapped of [false, true]) {
+        const f = fixture(t); enqueueStuckTrace(f.options);
+        const run = args => failed.includes(args[0])
+          ? (wrapped ? { verdict: invalid } : invalid) : f.options.run(args);
+        for (const attempt of [1, 2, 3]) {
+          await drainStuckTraces({ ...f.options, run, now: Date.parse(now) + (attempt - 1) * 600_000 });
+          assert.equal(queue(f)[key].attempts, attempt);
+          assert.equal(queue(f)[key].state, attempt < 3 ? 'queued' : 'done');
+          assert.equal(f.events.length, attempt < 3 ? 0 : 1);
+        }
+        assert.match(f.events[0].detail.note, /INCOMPLETE/);
+        await drainStuckTraces({ ...f.options, now: Date.parse(now) + 1800_000 });
+        assert.equal(f.events.length, 1);
+      }
+    }
   }
 });
 
-test('why verdict requires string owner and array sections in direct and wrapped shapes', async t => {
-  for (const wrapped of [false, true]) for (const verdict of [{ owner: 'operator' }, { owner: 17, sections: [] }]) {
-    const f = fixture(t); f.trace.unavailable = [];
-    await traceStuckPr({ ...f.options, run: args => args[0] === 'why'
-      ? (wrapped ? { verdict } : verdict) : f.options.run(args) });
-    assert.match(f.events[0].detail.note, /INCOMPLETE/);
-    assert.equal(f.events[0].detail.owner, 'unavailable');
-  }
-});
-
-test('persistent failure of either evidence read never delivers duplicate incomplete notes', async t => {
+test('persistent read failure delivers only one INCOMPLETE note at the final attempt', async t => {
   for (const failedOp of ['why', 'pr-trace']) {
     const f = fixture(t); enqueueStuckTrace(f.options);
     let calls = 0;
@@ -190,8 +184,33 @@ test('persistent failure of either evidence read never delivers duplicate incomp
       now: Date.parse(now) + minutes * 60_000 });
     assert.equal(calls, 6);
     assert.equal(queue(f)[key].attempts, 3);
-    assert.equal(queue(f)[key].state, 'queued');
+    assert.equal(queue(f)[key].state, 'done');
+    assert.equal(f.events.length, 1);
+    assert.match(f.events[0].detail.note, /INCOMPLETE/);
+  }
+});
+
+test('live head changes in either layer supersede queued SHAs without emitting; a new head re-arms', async t => {
+  const next = 'b'.repeat(40);
+  for (const layer of ['trace', 'why', 'why-state']) {
+    const f = fixture(t); enqueueStuckTrace(f.options);
+    f.trace.head = head;
+    const run = async args => {
+      // Change evidence only when the queued entry is actually being drained.
+      if (layer === 'trace') f.trace.head = next;
+      else if (layer === 'why') f.why.head = next;
+      else f.why.state = { head: next };
+      return f.options.run(args);
+    };
+    await drainStuckTraces({ ...f.options, run });
+    assert.equal(queue(f)[key].state, 'done');
+    assert.equal(queue(f)[key].reason, 'superseded');
     assert.equal(f.events.length, 0);
+    f.trace.head = next;
+    enqueueStuckTrace({ ...f.options, head: next });
+    await drainStuckTraces(f.options);
+    assert.equal(f.events.length, 1);
+    assert.equal(f.events[0].detail.head, next);
   }
 });
 
@@ -250,6 +269,7 @@ test('unreadable queue fails closed without subprocess IO', async t => {
 
 test('unknown head re-arms once per PR per day', async t => {
   const f = fixture(t), options = { ...f.options, head: 'unknown-head' };
+  f.trace.head = 'b'.repeat(40); f.why.head = 'c'.repeat(40);
   await traceStuckPr(options); await traceStuckPr(options);
   await traceStuckPr({ ...options, now: '2026-11-11T12:00:00Z' });
   assert.equal(f.events.length, 2);
@@ -289,6 +309,23 @@ test('digest enqueues every unchanged operator head and drains detached after al
   publishStalledDigest(pass, { ...options, env: { WE_UNDER_TEST: '1' } });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(order.filter(x => x === 'drain').length, 2);
+});
+
+test('empty digest passes drain watcher-enqueued entries, two per pass, even with no feed writes', async t => {
+  const f = fixture(t);
+  for (const pr of [17, 18, 19]) enqueueStuckTrace({ ...f.options, pr });
+  const drains = [];
+  const options = { stateDir: join(f.root, 'digest'), traceStateDir: f.root, feedPath: join(f.root, 'feed.jsonl'),
+    now: Date.parse(now), env: {}, notify: () => assert.fail('no alerts expected'),
+    drain: args => { assert.equal(args.max, 2); drains.push(drainStuckTraces({ ...f.options, ...args })); } };
+  for (const count of [2, 3]) {
+    const result = publishStalledDigest({ items: [], incomplete: false }, options);
+    assert.deepEqual(result.lines, []);
+    await new Promise(resolve => setImmediate(resolve));
+    await Promise.all(drains);
+    assert.equal(f.events.length, count);
+  }
+  assert.equal(f.calls.length, 6);
 });
 
 test('digest still alerts when queue writing and post-pass drain throw', async t => {

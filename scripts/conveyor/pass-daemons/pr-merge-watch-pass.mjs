@@ -7,7 +7,7 @@
  */
 import { runReadyStuck } from './pr-ready-stuck.mjs';
 import { runMergeWatchSignals } from './pr-merge-watch-signals.mjs';
-import { enqueueStuckTrace, drainStuckTraces, TRACE_TRIGGERS } from '../stuck-trace.mjs';
+import { enqueueStuckTrace, TRACE_TRIGGERS } from '../stuck-trace.mjs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -41,7 +41,7 @@ export function resolveMergeWatchSettings({ env = process.env, log = console.err
 
 export async function runMergeWatch({ repos = [], gh, now = new Date().toISOString(),
   stateDir = join(handoffHome(), 'pr-merge-watch'), settings, emitEvent = appendDaemonEvent,
-  log = console.error, signalLogs, readyStuck = {}, enqueue = enqueueStuckTrace, drain = drainStuckTraces } = {}) {
+  log = console.error, signalLogs, readyStuck = {}, enqueue = enqueueStuckTrace } = {}) {
   // Load the analysis graph after the shared gate graph has finished evaluating.
   const { atomicJson, readOptionalJson, ghJson, repoFilenameKey } = await import('../../operations/coroner-pr-postmortem.mjs');
   const { defaultListPrComments } = await import('../pr-comments-list.mjs');
@@ -50,7 +50,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
   const config = settings ? { ...defaults, ...settings } : resolveMergeWatchSettings({ log });
   const stamp = Date.parse(now);
   if (!Number.isFinite(stamp) || Object.entries(config).some(([k, v]) => !minutesValid(v) || (k === 'ciJobOverdueFactor' && v <= 0) || (k === 'readyStuckMinutes' && v > 1440))) throw Error('invalid merge-watch time/settings');
-  let calls = 0, delivered = 0, incomplete = false, budgetExhausted = false, completed = false;
+  let calls = 0, delivered = 0, incomplete = false, budgetExhausted = false;
   const read = args => {
     if (calls >= 128) { budgetExhausted = true; throw Error('GitHub evidence tick budget exceeded'); }
     calls++;
@@ -63,7 +63,6 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
   };
   // A single durable cursor covers repositories and both kinds of PR work. A partial
   // subject restarts with a fresh budget; bounded readers fit within that budget.
-  try {
   const cursorFile = join(stateDir, 'cursor.json');
   let cursor;
   try {
@@ -202,11 +201,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
     }
   }
   if (cursor !== null && repoOrder.length) atomicJson(cursorFile, { repo: repoOrder[0], number: null });
-  completed = true;
   return { delivered, incomplete };
-  } finally {
-    try { if (completed && calls < 128) await drain({ stateDir, now, max: 2 }); } catch { /* post-pass best effort */ }
-  }
 }
 
 export async function runMergeWatchCli(values, { runPass = runMergeWatch, sleep: wait = sleep,

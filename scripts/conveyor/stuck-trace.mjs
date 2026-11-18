@@ -1,11 +1,11 @@
 /** Layered, read-only stuck-PR evidence, once per repo/PR/head. EVENT ONLY:
  * PR comments notify watchers and retrigger comment/label daemons; the existing
  * daemon event feed is queryable and already carries ready-stuck/needs-you signals.
- * Hooks only enqueue; failures never escape into alert delivery. Share stateDir.
- * The drain is a separate, explicitly capped (2 x 2 read-only ops per call)
- * post-pass stage outside the watch tick's 128-read guard BY DESIGN. This declared
- * exception never runs inside the alert loop: it is bounded, and per-head dedupe
- * plus a three-attempt cap bounds total reads. Failed/crashed attempts stay queued
+ * Queue shared via the watcher state directory: the watcher only enqueues;
+ * failures never escape into alert delivery or spend its 128-read budget.
+ * Only the stall digest drains, detached and best effort on every pass, capped
+ * at two entries (two read-only ops each). Per-head dedupe and a three-attempt
+ * cap bound total reads. Failed/crashed attempts stay queued
  * and retry after 10 minutes; delivered heads never repeat. Unknown heads re-arm daily.
  */
 import { execFile } from 'node:child_process';
@@ -55,7 +55,8 @@ function readQueue(stateDir) {
   for (const [key, entry] of Object.entries(saved)) {
     if (entry?.state === 'done') continue;
     try {
-      if (readObject(doneFile(stateDir, key)).state === 'done') entry.state = 'done';
+      const completion = readObject(doneFile(stateDir, key));
+      if (completion.state === 'done') Object.assign(entry, completion);
     } catch { throw Error('invalid completion'); }
   }
   return saved;
@@ -125,25 +126,26 @@ export async function drainStuckTraces({ stateDir, max = 2, now = Date.now(), ru
       if (!subject) { report(); continue; }
       const [, repo, pr, head] = subject;
       const result = claim.attempts > 1 && wasDelivered(key, env) ? { posted: true }
-        : await traceStuckPr({ repo, pr: Number(pr), head, kind: claim.kind, run, emit, env });
-      if (!result.posted) continue;
+        : await traceStuckPr({ repo, pr: Number(pr), head, kind: claim.kind, attempts: claim.attempts, run, emit, env });
+      if (!result.posted && result.skipped !== 'superseded') continue;
+      const completion = { state: 'done', ...(result.skipped === 'superseded' ? { reason: 'superseded' } : {}) };
       try {
         withFileLock(`${file}.lock`, () => {
           const saved = readQueue(stateDir);
           if (saved[key]?.attemptedAt === claim.attemptedAt && saved[key]?.attempts === claim.attempts)
-            writeJsonAtomic(file, { ...saved, [key]: { ...claim, state: 'done' } });
+            writeJsonAtomic(file, { ...saved, [key]: { ...claim, ...completion } });
         }, { timeoutMs: 0 });
       } catch {
-        // Delivery succeeded: preserve completion without the contended queue lock.
+        // Preserve delivery or supersession without the contended queue lock.
         // readQueue merges this subject-specific marker before selecting retries.
-        writeJsonAtomic(doneFile(stateDir, key), { state: 'done' });
+        writeJsonAtomic(doneFile(stateDir, key), completion);
       }
     }
   } catch { report(); }
   return { processed };
 }
 
-async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
+async function traceStuckPr({ repo, pr, head, kind, attempts, run, emit, env }) {
   try {
     // Both layers share one wall-clock budget, including a misbehaving injected runner.
     let timer;
@@ -153,7 +155,7 @@ async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
         const verdict = result && Object.hasOwn(result, 'verdict') ? result.verdict : result;
         const field = op === 'pr-trace' ? 'likelyBlocker' : 'owner';
         if (!verdict || Array.isArray(verdict) || typeof verdict[field] !== 'string'
-          || (op === 'why' && !Array.isArray(verdict.sections))) { report(); return undefined; }
+          || (op === 'why' && !Array.isArray(verdict.sections))) { report(); return null; }
         return verdict;
       } catch { report(); return null; }
     }));
@@ -163,9 +165,13 @@ async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
         timer = setTimeout(() => resolve([null, null]), 59_000);
       })]);
     } finally { clearTimeout(timer); }
+    // A queued head can move while awaiting either operation; stale evidence emits nothing.
+    if (/^[a-f0-9]{40}$/i.test(head) && [trace?.head, why?.head, why?.state?.head].some(
+      live => typeof live === 'string' && /^[a-f0-9]{40}$/i.test(live) && live.toLowerCase() !== head.toLowerCase()))
+      return { posted: false, skipped: 'superseded' };
     // Retry failed reads without delivering a note that would then be repeated.
-    // Valid verdicts may still describe incomplete evidence; a delivered note is final.
-    if (why === null || trace === null) { report(); return { posted: false, skipped: 'incomplete' }; }
+    // On the final attempt, deliver one INCOMPLETE note even if a layer is missing.
+    if ((why === null || trace === null) && attempts < 3) { report(); return { posted: false, skipped: 'incomplete' }; }
     const section = name => why?.sections?.find(s => s.name === name)?.lines;
     const headline = clean(trace?.likelyBlocker ?? 'unavailable root cause; inspect why/pr-trace manually');
     const owner = clean(why?.owner), waitingFor = clean(why?.waitingFor);
@@ -185,7 +191,7 @@ async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
     const note = status + fields.map(([name, value]) => `${name}: ${clean(value, name === 'daemon logs + times' ? 700 : 130)}`).join('\n');
     const bounded = Buffer.byteLength(note) > 2900
       ? `${Buffer.from(note).subarray(0, 2800).toString('utf8')}\n[bounded; inspect full why/pr-trace JSON manually]` : note;
-    // Bound the event sink too; a slow filesystem must not wedge the watch pass.
+    // Bound the event sink too; a slow filesystem must not wedge the drain.
     try {
       const delivered = await Promise.race([
         Promise.resolve().then(() => emit({ kind: 'stuck-trace', repo, pr,
