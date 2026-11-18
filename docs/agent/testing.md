@@ -4567,3 +4567,12 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Red-team repair hand-back accounting
+
+`fix-run` hands accepted red-team repairs to the pinned `conveyor/rearm-review.mjs`
+wrapper with `--expect-head` and `--round=red-team`; the public label CLI rejects
+`--to=rearm`. The red-team hand-back uses its own marker because dispatch already
+spent the repair round, even if execution fails. Keep the argv, real CLI parsing,
+shared-cap accounting, and missing/stale conflict-fallback finding cases in
+`fix-run`, `rearm-review`, and `reconcile-core` tests.

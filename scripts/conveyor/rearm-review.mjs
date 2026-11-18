@@ -309,6 +309,13 @@ export function buildRearmComment({ actor, decision }) {
   ].join('\n');
 }
 
+// Red-team repairs spend their round at dispatch, including failed/no-change runs. Their hand-back
+// must still wake review, but must not emit an ordinary counted re-arm marker.
+export const RED_TEAM_REARM_COMMENT_MARKER = '<!-- conveyor-red-team-fix-rearmed -->';
+export function buildRedTeamRearmComment(input) {
+  return buildRearmComment(input).replace(REARM_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER);
+}
+
 // we:scripts/conveyor/rearm-review.mjs — allow importing the pure decider without running the CLI (the test file
 // imports this module). The standard main check used across the conveyor scripts.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
@@ -363,7 +370,7 @@ if (IS_CLI) {
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
-    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
+    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict|red-team] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
     // The DURABLE re-arm comment — a readable record that the bounce was repaired and re-armed (not a silent
     // flip), AND the durable tally the matching counter reads back to survive a restart (#2643). Its first line
     // MUST be the matching marker (single-sourced) so posting and counting can never drift.
@@ -388,8 +395,8 @@ if (IS_CLI) {
           // `conflict-fix-round-count.mjs#countStaleConflictFixRounds`'s own docblock. Omitted (no trailer at
           // all) when the local sha is unresolvable — see `resolveLocalRefSha`'s own docblock.
         ].join('\n') + conflictFixTargetTrailer(mainRefArg, resolveLocalRefSha(mainRefArg))
-      : buildRearmComment,
-    successResult: ({ pr, labels }) => ({ ok: true, pr, rearmed: true, labels, round: isConflictRound ? 'conflict' : 'ordinary' }),
+      : roundArg === 'red-team' ? buildRedTeamRearmComment : buildRearmComment,
+    successResult: ({ pr, labels }) => ({ ok: true, pr, rearmed: true, labels, round: isConflictRound ? 'conflict' : roundArg === 'red-team' ? 'red-team' : 'ordinary' }),
     refusalResult: ({ pr, decision }) => ({ ok: false, pr, reason: decision.reason }),
   });
 }

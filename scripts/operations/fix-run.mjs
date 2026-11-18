@@ -770,7 +770,7 @@ export async function runFixCli(argv = [], {
         withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
         throw new LauncherError('repeated finding: operator scope-baseline required');
       }
-      prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
+      prContext = target && !hasRedTeamSentBackLabels(prHead) && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
         : renderPrContext({ ...prHead, number: Number(pr), comments, commentsComplete: true });
     }
@@ -844,11 +844,11 @@ export async function runFixCli(argv = [], {
     before = checkLane(prHeadSha).laneHead;
     const rearmReview = head => {
       if (redTeamRepair) {
-        // Use the sanctioned writer, pinned to the repaired head. The separate red-team marker already
-        // counts this repair; an ordinary rearm-review marker would charge the shared cap twice.
+        // The pinned wrapper accepts rearm; its red-team hand-back marker does not charge a second round.
+        // The dispatch marker already charged this repair before execution.
         // Keep this outside the ordinary nothing-to-rearm no-op policy: a failed hand-back remains owed.
-        return run('node', [resolve(weRoot, 'scripts', 'review-set-label.mjs'), pr,
-          ...(launch.repo ? [`--repo=${launch.repo}`] : []), '--to=rearm', `--expect-head=${head}`], { cwd: weRoot });
+        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr,
+          ...(launch.repo ? [`--repo=${launch.repo}`] : []), '--round=red-team', `--expect-head=${head}`], { cwd: weRoot });
       }
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });

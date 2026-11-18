@@ -12,14 +12,32 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { buildRedTeamRearmComment, RED_TEAM_REARM_COMMENT_MARKER, decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 
+import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
+
 const lbl = (...names) => names.map((name) => ({ name }));
+
+describe('red-team re-arm round accounting', () => {
+  it('records accepted-to-pending hand-back without double charging its dispatch', () => {
+    const decision = decideRearm({ currentLabels: lbl('review:accepted', 'ready-to-merge', 'red-team:blocked') });
+    expect(decision).toMatchObject({ allowed: true, rearmFrom: 'review:accepted', addLabel: 'review:pending' });
+    expect(decision.removeLabels).toContain('review:accepted');
+    expect(decision.removeLabels).toContain('ready-to-merge');
+    const body = buildRedTeamRearmComment({ actor: 'fix agent', decision });
+    expect(body.startsWith(RED_TEAM_REARM_COMMENT_MARKER)).toBe(true);
+    expect(body).toContain('re-armed `review:pending`');
+    const comments = [RED_TEAM_FIX_COMMENT_MARKER, body].map(body => ({ author: { login: 'web-everything' }, body }));
+    expect(countRedTeamFixComments(comments)).toBe(1);
+    expect(countRearmComments(comments)).toBe(0);
+    expect(countRearmComments([{ ...comments[1], body: buildRearmComment({ actor: 'fix agent', decision }) }])).toBe(1);
+  });
+});
 
 describe('decideRearm — the pure re-arm swap (#2630)', () => {
   it('re-arms a plain review:changes bounce → review:pending, dropping review:changes', () => {
@@ -453,6 +471,18 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     return { ...r, log, calls, wrote, out: r.stdout.trim().split('\n').filter(Boolean).pop() ?? '' };
   };
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
+
+  it('the red-team hand-back argv reaches the real pinned CLI without the public CLI target rejection', () => {
+    const args = ['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`];
+    expect(hasUnexpectedPositionals(args)).toBe(false);
+    expect(hasInvalidArgs(args)).toBe(false);
+    const r = run(args, { head: H0, comments: [] });
+    expect(r.status).not.toBe(2);
+    expect(`${r.stdout}\n${r.stderr}`).not.toContain('invalid --to');
+    // The fake refuses the shared harness's PR read. Reaching that read proves fixedTo:rearm
+    // survived parsing; this fixture never contacts GitHub or writes labels.
+    expect(r.calls.some(c => c[0] === 'pr' && c[1] === 'view' && !c.includes('headRefOid'))).toBe(true);
+  });
 
   it.each([{ login: 'chalbert' }, BOT, { login: 'web-everything[bot]', type: 'Bot' }])('passes a REST operator answer posted by $login with a GraphQL target through to the shared label CLI', (user) => {
     const stop = { id: 4242, node_id: 'IC_stop', user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };

@@ -1,3 +1,4 @@
+import { buildRedTeamRearmComment } from '../rearm-review.mjs';
 import { decideSetLabel } from '../../review-set-label.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
@@ -155,6 +156,20 @@ describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
     expect(plan(pr).dispatch[0].attempts).toBe(0);
     pr.comments.push({ author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRepair pushed.` });
     expect(plan(pr).dispatch[0]).toMatchObject({ mode: 'red-team-sent-back', attempts: 1 });
+  });
+  it('charges one shared-cap attempt per red-team dispatch plus its completed hand-back across heads', () => {
+    const pr = makePr();
+    for (let round = 1; round <= 3; round += 1) {
+      pr.comments.push({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER });
+      pr.comments.push({ author: AUTOMATION, body: buildRedTeamRearmComment({ actor: 'fix agent',
+        decision: decideSetLabel({ to: 'rearm', currentLabels: pr.labels }) }) });
+      if (round < 3) expect(plan(pr, { roundCap: 3 }).dispatch[0]).toMatchObject({ attempts: round });
+    }
+    // A later ordinary bounce on a new head retains all three dispatch charges, not six.
+    pr.headRefOid = 'b'.repeat(40);
+    pr.labels = lbl('review:changes');
+    pr.comments.push({ body: '🔁 human review — changes requested\n\nRepair the remaining break.' });
+    expect(plan(pr, { roundCap: 3 }).refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 3, cap: 3 }));
   });
   it.each([3, 4])('refuses cap-exhausted after %i recorded red-team repairs on the same head/result', n => {
     const pr = makePr();
