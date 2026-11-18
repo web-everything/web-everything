@@ -2697,9 +2697,8 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       // A failed log read aborts recovery, as the raw `gh` throw did before: never fall back to a stale
       // published "No error detail" and keep dispatching repair on evidence that could not be read.
       if (!result.ok) throw new Error(`job ${job} log unreadable (${result.reason}): ${result.detail ?? ''}`);
-      let metadata;
-      try { metadata = api(`actions/jobs/${job}`); } catch { /* Preserve the published diagnostic. */ }
-      firstError = firstFailedStepError(metadata, result.text) || firstError;
+      // Step metadata that cannot be read aborts for the same reason: no attributable failed step, no repair.
+      firstError = firstFailedStepError(api(`actions/jobs/${job}`), result.text) || firstError;
     }
     candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
       scope: (pr.files ?? []).map(f => `we:${f.path}`), isDraft: true, builderAuthored: true,

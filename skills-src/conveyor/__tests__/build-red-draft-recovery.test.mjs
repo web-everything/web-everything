@@ -193,7 +193,6 @@ describe('abandoned builder draft recovery', () => {
     { evidence: 'missing step metadata', metadata: {}, expectedError: noDetail },
     { evidence: 'published check detail', metadata: {}, summary: 'AssertionError: failed check summary', expectedError: 'AssertionError: failed check summary' },
     { evidence: 'malformed step metadata', metadata: { steps: [null, steps[1]] }, expectedError: noDetail },
-    { evidence: 'unreadable step metadata', metadata: null, expectedError: noDetail },
     { evidence: 'missing failed-step time', metadata: { steps: [steps[0], { conclusion: 'failure' }] }, expectedError: noDetail },
     { evidence: 'invalid failed-step time', metadata: { steps: [steps[0], { ...steps[1], started_at: 'invalid' }] }, expectedError: noDetail },
     { evidence: 'reversed failed-step times', metadata: { steps: [steps[0], { ...steps[1], completed_at: steps[1].started_at, started_at: steps[1].completed_at }] }, expectedError: noDetail },
@@ -212,7 +211,6 @@ describe('abandoned builder draft recovery', () => {
       isPidAlive: () => authorLive, listAgents: () => [],
       api: vi.fn(path => {
         if (path === 'actions/jobs/456') {
-          if (metadata === null) throw new Error('unreadable step metadata');
           return metadata;
         }
         return path.startsWith('pulls/')
@@ -310,6 +308,35 @@ describe('abandoned builder draft recovery', () => {
     const args = { rawOpenPrs: [{ repo: 'we', prs: [{ ...candidate, number: 3033, headRefName: candidate.laneRef, files: [{ path: 'scripts/a.mjs' }] }] }], allowResume: true };
     try {
       await expect(cliRecoverBuilderDrafts(args, io)).rejects.toThrow(/log unreadable/);
+      expect(io.dispatch).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it('aborts recovery when the failed job step metadata is unreadable instead of dispatching on stale detail', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
+    const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
+      payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
+    const io = {
+      stateRoot: dir, store: { list: () => ['dispatch-lane-test'], read: () => ({ effects: [row] }) },
+      isPidAlive: () => false, listAgents: () => [],
+      api: vi.fn(path => {
+        if (path === 'actions/jobs/456') throw new Error('unreadable step metadata');
+        return path.startsWith('pulls/')
+          ? { draft: true, state: 'open', updated_at: new Date().toISOString(),
+            head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
+          : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+          : { check_runs: [
+            { id: 1, name: 'review-gate', conclusion: 'failure' },
+            { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
+          ] };
+      }),
+      paged: vi.fn(() => []), gh: vi.fn(() => '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: x\n'),
+      freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
+      dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
+    };
+    const args = { rawOpenPrs: [{ repo: 'we', prs: [{ ...candidate, number: 3033, headRefName: candidate.laneRef, files: [{ path: 'scripts/a.mjs' }] }] }], allowResume: true };
+    try {
+      await expect(cliRecoverBuilderDrafts(args, io)).rejects.toThrow(/unreadable step metadata/);
       expect(io.dispatch).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
