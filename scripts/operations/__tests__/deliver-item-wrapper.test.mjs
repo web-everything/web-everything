@@ -3886,6 +3886,23 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     });
   });
 
+  it.each([false, true])('refuses longshore build capability none before any lane acquisition (resume=%s)', async (resume) => {
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'longshore-build', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build' }, result: null, error: null }] });
+    const provider = { spawn: vi.fn(), vendor: 'codex' };
+    execFileSync.mockImplementation(() => { throw new Error('unexpected subprocess before build refusal'); });
+    await expect(deliverItem(
+      { item: '9999', lane: 7, scope: 'longshore:backlog/x.md', sessionSlug: 'conveyor-9999', resume,
+        runId: 'longshore-build', effectKey: 'dispatch:0:0' },
+      provider,
+      { newSessionId: () => 'uuid-fixed' },
+    )).rejects.toThrow(/longshore.*build.*none/);
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(provider.spawn).not.toHaveBeenCalled();
+  });
+
   it('build-path-codex-isolation-locus — refuses a genuine multi-repo "couple" scope (e.g. #2662, we + '
     + 'plateau-app together) BEFORE acquiring anything, rather than guessing at merge order', async () => {
     findItem.mockReturnValue({ num: '2662', slug: 'couple-thing', specPath: 'backlog/2662-couple-thing.md', scope: ['we:backlog/2662-couple-thing.md', 'plateau-app:src/y.tsx'] });
