@@ -42,7 +42,9 @@
 #       commit. The required status checks are restricted to the GitHub Actions integration id
 #       (requiredStatusCheckIntegrationId 15368) so no other app/token can post a green `merge-gate`. Print the
 #       ruleset suggestion with `node scripts/merge-gate-check.mjs --print-ruleset`. A test fails when a workflow
-#       defining a required check is not in that pin.
+#       defining a required check is not in that pin. At enqueue time, enqueuePr calls verifyEnqueueRulesets
+#       on LIVE rulesets and refuses unless active rules covering main enforce the merge-gate workflow pin
+#       and its integration-id restriction; unreadable evidence fails closed and stays retryable.
 # HONEST LIMITS: (a) the drain does not call enqueuePr yet; (b) an entry added by hand (the UI,
 # `gh pr merge --auto`, a raw API call) bypasses enqueuePr — layer (1) still holds a workflow edit in the PR run, but a NEW workflow that posts its own
 # green `merge-gate` on the PR is closed only by the ruleset pin (4). Keep that pin in place before making

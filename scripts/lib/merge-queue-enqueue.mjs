@@ -309,13 +309,15 @@ function readBaseTip({ base, cwd, exec }) {
  * retryable), the workflow-edit refusal reads the change list OF `headSha` (`readPinnedChangedFiles`), and the
  * mutation carries `expectedHeadOid: headSha`, so GitHub refuses the entry if the head moves after the read. The
  * refusal and the queue entry therefore always describe the same commit.
- * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function, humanOnlyLicense?:Function}} o
+ * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function, readRulesets?:Function, humanOnlyLicense?:Function}} o
  *   `cwd`: a clone of `repo`. `humanOnlyLicense(hold)` may authorize a human-only hold with a proven tier;
  *   absent, unreadable or unlicensed evidence retains the hold. Successful results carry `licensedBy`.
  *   `sameHeadAdmission()` revalidates the drain's timeline admission immediately before a fresh mutation;
  *   already-queued bookkeeping skips it, and unreadable decisions retain the hold.
+ *   `readRulesets({repo, exec})` supplies fresh live ruleset details for `verifyEnqueueRulesets` immediately
+ *   before a mutation. Missing pins or unreadable evidence hold retryably; there is no waiver or cache.
  */
-export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null, humanOnlyLicense, sameHeadAdmission }) {
+export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, readRulesets = readLiveEnqueueRulesets, preparedSurface = null, humanOnlyLicense, sameHeadAdmission }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (repo or PR number is malformed)' };
   }
@@ -359,6 +361,10 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
     if (decision?.hold !== false) return { ok: false, held: true, reason: 'mq-same-head-failed',
       error: decision?.line || 'mq-same-head-failed: unreadable fresh merge-queue admission; inspect timeline before retrying' };
   }
+  let protection;
+  try { protection = verifyEnqueueRulesets(readRulesets({ repo, exec: exec === execFileSync ? execFileSyncThrottled : exec })); }
+  catch (e) { protection = verifyEnqueueRulesets({ error: errText(e) }); }
+  if (!protection.ok) return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'ruleset-pin', paths: [], error: protection.reason };
   try {
     const out = JSON.parse(exec('gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
     const errs = out?.errors;
@@ -436,8 +442,59 @@ export function rulesetSuggestion(policy, requiredChecks = ['test', 'smoke', 'da
     },
     requiredStatusChecks: requiredChecks,
     requiredStatusCheckIntegrationId: GITHUB_ACTIONS_INTEGRATION_ID,
-    requiredWorkflows: REQUIRED_WORKFLOW_PATHS.map((path) => ({ path, ref: 'refs/heads/main' })),
+    requiredWorkflows: REQUIRED_WORKFLOW_PATHS.map((path) => ({ path, ref: 'refs/heads/main', repository_id: 1142650361 })),
   };
+}
+
+/** Fresh, bounded evidence on every mutation. A full page is incomplete evidence, never a partial success. */
+export function readLiveEnqueueRulesets({ repo, exec = execFileSyncThrottled }) {
+  const read = endpoint => JSON.parse(exec('gh', ['api', endpoint], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
+  }));
+  const listed = read(`repos/${repo}/rulesets?includes_parents=true&per_page=100`);
+  if (!Array.isArray(listed) || listed.length >= 100) throw new Error('ruleset list incomplete; operator must inspect repository/parent rulesets and reduce below 100 before retrying');
+  return listed.map(row => {
+    if (!Number.isSafeInteger(row?.id) || row.id < 1) throw new Error('ruleset id unreadable');
+    const detail = read(`repos/${repo}/rulesets/${row.id}`);
+    if (detail?.id !== row.id) throw new Error('ruleset detail unreadable');
+    return detail;
+  });
+}
+
+/** Pure: unknown scope cannot prove main is protected. Expected bindings come from the operator suggestion. */
+export function verifyEnqueueRulesets(rulesets) {
+  const expected = rulesetSuggestion({});
+  const pin = expected.requiredWorkflows.find(w => w.path === '.github/workflows/merge-gate.yml');
+  const no = why => ({ ok: false, reason: `missing enforced pin ${pin.path}@${pin.ref} and merge-gate integration ${expected.requiredStatusCheckIntegrationId}: ${why}; operator must restore active main rulesets before retrying` });
+  if (!Array.isArray(rulesets)) return no(`rulesets unreadable${rulesets?.error ? ` (${String(rulesets.error).slice(0, 300)})` : ''}`);
+  let workflow = false, check = false;
+  for (const rs of rulesets) {
+    if (!rs || typeof rs !== 'object' || !['active', 'disabled', 'evaluate'].includes(rs.enforcement)) return no('ruleset detail unreadable');
+    if (rs.enforcement !== 'active' || rs.target !== 'branch') continue;
+    const scope = rs.conditions?.ref_name;
+    // Main is this repository's default branch; explicit main, default, or all branches proves inclusion.
+    if (!Array.isArray(scope?.include) || !Array.isArray(scope?.exclude) || scope.exclude.length
+      || !scope.include.some(ref => ref === pin.ref || ref === '~DEFAULT_BRANCH' || ref === '~ALL')) continue;
+    // No acting-identity evidence is available here, so no configured bypass can be ruled out.
+    if (!Array.isArray(rs.bypass_actors)) return no('ruleset bypass actors unreadable');
+    if (rs.bypass_actors.length) return no('ruleset bypass applicability to the acting identity is not excluded');
+    if (!Array.isArray(rs.rules)) return no('rules unreadable');
+    for (const rule of rs.rules) {
+      if (rule?.type === 'workflows') {
+        const entries = rule.parameters?.workflows;
+        if (!Array.isArray(entries)) return no('workflow entries unreadable');
+        workflow ||= entries.some(w => w?.path === pin.path && w.ref === pin.ref && w.repository_id === pin.repository_id);
+      }
+      if (rule?.type === 'required_status_checks') {
+        const bindings = rule.parameters?.required_status_checks;
+        if (!Array.isArray(bindings)) return no('required status checks unreadable');
+        const matching = bindings.filter(c => c?.context === 'merge-gate');
+        if (matching.some(c => c.integration_id !== expected.requiredStatusCheckIntegrationId)) return no('merge-gate integration id is not restricted');
+        check ||= matching.length > 0;
+      }
+    }
+  }
+  return workflow && check ? { ok: true } : no('active main workflow repository/path/ref pin or required status-check binding absent');
 }
 
 function errText(e) {

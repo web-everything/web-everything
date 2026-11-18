@@ -26,6 +26,8 @@
  * The PR leg runs on `pull_request`. The repository ruleset "web-everything main: pinned CI workflows" pins
  * this required workflow to refs/heads/main (layer 4), closing YAML edits that never reach this script (`exit 0`
  * or a new workflow posting `merge-gate`), together with the GitHub Actions integration-id restriction.
+ * Layer 4 is enforced at enqueue time: enqueuePr calls verifyEnqueueRulesets on LIVE rulesets, requiring
+ * active main workflow and integration-id pins; missing or unreadable evidence refuses enqueue, retryably.
  * Layer 1 holds workflow/action edits at the PINNED head for a HUMAN (`facts.gatePaths` → `workflowEditFact`);
  * layer 2 compares the RUNNING workflow byte-for-byte with main (`verifyRunningWorkflow`; fail closed even
  * at refs/pull/N/merge); layer 3 refuses enqueue of workflow/action edits outside the human-only clearance.

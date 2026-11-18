@@ -7,7 +7,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { evaluatePrGates, evaluateGroup, groupPrNumbers, groupMembership, asQueuedPr, resolveMergeGateMode, loadMergeGateMode, applyGateMode, runGate, STANDARD_MERGE_GATE_MODE } from '../merge-gate-ci.mjs';
 import { DRAIN_GATES } from '../merge-gate-inventory.mjs';
-import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+import { rulesetSuggestion, verifyEnqueueRulesets } from '../merge-queue-enqueue.mjs';
 import { scoreEscalation } from '../review-escalation.mjs';
 import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
@@ -852,7 +852,13 @@ describe('merge-gate workflow structure', () => {
   it('has no pull_request_target trigger and keeps the pull_request leg read-only on main', () => {
     expect(Object.keys(triggersOf(wf))).not.toContain('pull_request_target');
     expect(triggersOf(wf).pull_request.branches).toEqual(['main']);
-    expect(rulesetSuggestion({}).requiredWorkflows).toContainEqual({ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main' });
+    expect(rulesetSuggestion({}).requiredWorkflows).toContainEqual({ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main', repository_id: 1142650361 });
+    // The external dependency is enforced outside PR workflows before enqueue, not just suggested.
+    expect(verifyEnqueueRulesets([])).toMatchObject({ ok: false, reason: expect.stringContaining('.github/workflows/merge-gate.yml@refs/heads/main') });
+    const enqueueSource = readFileSync(new URL('../merge-queue-enqueue.mjs', import.meta.url), 'utf8');
+    expect(enqueueSource).toMatch(/protection = verifyEnqueueRulesets\(readRulesets/);
+    expect(enqueueSource).toMatch(/if \(!protection.ok\) return[\s\S]*?buildEnqueueArgs\(\{ nodeId, headSha \}\)/);
+
     for (const [scope, level] of Object.entries(wf.permissions)) expect(level, scope).toBe('read');
     expect(job.permissions).toBeUndefined();
     for (const step of job.steps) {
@@ -1218,7 +1224,7 @@ describe('--print-ruleset (the operator ruleset steps come from rulesetSuggestio
     const rs = JSON.parse(out);
     expect(rs.requiredStatusCheckIntegrationId).toBe(15368);
     expect(rs.requiredStatusChecks).toEqual(expect.arrayContaining(['merge-gate', 'test', 'smoke']));
-    expect(rs.requiredWorkflows).toEqual(expect.arrayContaining([{ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main' }]));
+    expect(rs.requiredWorkflows).toEqual(expect.arrayContaining([{ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main', repository_id: 1142650361 }]));
     for (const w of rs.requiredWorkflows) expect(w.ref).toBe('refs/heads/main');
   });
   it('the workflow header names both the workflows pin and the integration-id restriction, and the self-check', () => {

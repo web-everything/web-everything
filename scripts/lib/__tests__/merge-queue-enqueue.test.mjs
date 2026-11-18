@@ -4,7 +4,7 @@ import { closeSync, openSync, readdirSync, readFileSync, mkdtempSync, mkdirSync,
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
+import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, verifyEnqueueRulesets, readLiveEnqueueRulesets, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
 import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath, handleRequiredWorkflowsRefusal, isRequiredWorkflowsUnsatisfiedError, REQUIRED_WORKFLOWS_UNSATISFIED } from '../merge-queue-enqueue.mjs';
 import { refreshStalePr as refreshRealStalePr } from '../merge-queue-hook.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
@@ -428,11 +428,41 @@ describe('startup-failure stale merge-gate refresh', () => {
   });
 });
 
+const protectedRuleset = () => ({
+  id: 1, target: 'branch', enforcement: 'active', bypass_actors: [],
+  conditions: { ref_name: { include: ['refs/heads/main'], exclude: [] } },
+  rules: [
+    { type: 'workflows', parameters: { workflows: [{ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main', repository_id: 1142650361 }] } },
+    { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'merge-gate', integration_id: 15368 }] } },
+  ],
+});
+// Live rulesets 24930207 and 24883772 use the default-branch selector for main.
+const liveDefaultBranchRulesets = () => [
+  {
+    id: 24930207, target: 'branch', enforcement: 'active', bypass_actors: [],
+    conditions: { ref_name: { exclude: [], include: ['~DEFAULT_BRANCH'] } },
+    rules: [{ type: 'workflows', parameters: { workflows: [
+      { path: '.github/workflows/ci.yml', ref: 'refs/heads/main', repository_id: 1142650361 },
+      { path: '.github/workflows/soak-replay-gate.yml', ref: 'refs/heads/main', repository_id: 1142650361 },
+      { path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main', repository_id: 1142650361 },
+    ] } }],
+  },
+  {
+    id: 24883772, target: 'branch', enforcement: 'active', bypass_actors: [],
+    conditions: { ref_name: { exclude: [], include: ['~DEFAULT_BRANCH'] } },
+    rules: [{ type: 'required_status_checks', parameters: {
+      required_status_checks: [{ context: 'merge-gate', integration_id: 15368 }],
+    } }],
+  },
+];
+const rulesetResponse = args => args[1].includes('?') ? JSON.stringify([{ id: 1 }]) : JSON.stringify(protectedRuleset());
+
 // A fake `gh` + `git`: the PR read (live head), the pinned git diff of HEAD (NUL-separated paths), the mutation.
 // `--no-renames` means a rename arrives as two paths (old + new), so the fakes list both.
 // `liveBase: null` = the PR read carries no usable base; `baseTip` = the base branch's tip as git reports it.
 const execFor = ({ files, liveHead = HEAD, liveBase = 'main', baseTip = '', mutation = '{}', calls = [], filesError }) => (cmd, args) => {
   calls.push([cmd, args]);
+  if (cmd === 'gh' && args[0] === 'api' && args[1].startsWith('repos/')) return rulesetResponse(args);
   if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: liveBase });
   if (cmd === 'git') {
     if (args[0] === 'diff') {
@@ -447,6 +477,160 @@ const execFor = ({ files, liveHead = HEAD, liveBase = 'main', baseTip = '', muta
   return mutation;
 };
 const CWD = '/clone';
+
+describe('enqueue live ruleset enforcement', () => {
+  const entry = { id: 'E' };
+  const attempt = readRulesets => {
+    const calls = [];
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, readRulesets,
+      exec: execFor({ files: ['a.txt'], calls, mutation: JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: entry } } }) }) });
+    return { result, calls };
+  };
+  it('proceeds with the live pin and integration binding and reads again on each enqueue', () => {
+    const readRulesets = vi.fn(() => [protectedRuleset()]);
+    expect(attempt(readRulesets).result).toEqual({ ok: true, entry });
+    readRulesets.mockReturnValue([]);
+    const { result, calls } = attempt(readRulesets);
+    expect(result).toMatchObject({ ok: false, retryable: true });
+    expect(readRulesets).toHaveBeenCalledTimes(2);
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it.each([
+    ['missing pin', r => { r.rules[0].parameters.workflows = []; }],
+    ['disabled enforcement', r => { r.enforcement = 'disabled'; }],
+    ['evaluate enforcement', r => { r.enforcement = 'evaluate'; }],
+    ['wrong ref', r => { r.rules[0].parameters.workflows[0].ref = 'refs/heads/pr'; }],
+    ['wrong path', r => { r.rules[0].parameters.workflows[0].path = '.github/workflows/other.yml'; }],
+    ['wrong integration id', r => { r.rules[1].parameters.required_status_checks[0].integration_id = 42; }],
+    ['missing integration id', r => { delete r.rules[1].parameters.required_status_checks[0].integration_id; }],
+    ['missing required check', r => { r.rules.pop(); }],
+    ['wrong branch', r => { r.conditions.ref_name.include = ['refs/heads/other']; }],
+    ['excluded main', r => { r.conditions.ref_name.exclude = ['refs/heads/main']; }],
+    ['unreadable scope', r => { delete r.conditions; }],
+    ['unreadable rules', r => { delete r.rules; }],
+  ])('refuses %s without sending an enqueue mutation', (_name, change) => {
+    const rs = protectedRuleset(); change(rs);
+    const { result, calls } = attempt(() => [rs]);
+    expect(result).toMatchObject({ ok: false, held: true, humanOnly: false, retryable: true, reason: 'ruleset-pin',
+      error: expect.stringContaining('.github/workflows/merge-gate.yml@refs/heads/main') });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it.each([undefined, null, {}, [], [null]])('refuses unreadable or empty rulesets %j without mutation', evidence => {
+    const { result, calls } = attempt(() => evidence);
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin' });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it('refuses a thrown ruleset read without mutation', () => {
+    const { result, calls } = attempt(() => { throw Error('offline'); });
+    expect(result).toMatchObject({ ok: false, retryable: true, error: expect.stringContaining('rulesets unreadable') });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it('accepts the exact live default-branch workflow pins and merge-gate integration binding', () => {
+    const rulesets = liveDefaultBranchRulesets();
+    expect(verifyEnqueueRulesets(rulesets)).toEqual({ ok: true });
+    expect(attempt(() => rulesets).result).toEqual({ ok: true, entry });
+  });
+  it('refuses a wrong merge-gate pin ref in the live default-branch rulesets without mutation', () => {
+    const rulesets = liveDefaultBranchRulesets();
+    rulesets[0].rules[0].parameters.workflows.find(w => w.path.endsWith('/merge-gate.yml')).ref = 'refs/heads/pr';
+    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false });
+    const { result, calls } = attempt(() => rulesets);
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin' });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it.each([
+    ['foreign', 1142650362], ['missing', undefined], ['null', null], ['string', '1142650361'],
+  ])('refuses a %s workflow repository_id in live default-branch rulesets without mutation', (_name, repositoryId) => {
+    const rulesets = liveDefaultBranchRulesets();
+    const workflow = rulesets[0].rules[0].parameters.workflows.find(w => w.path.endsWith('/merge-gate.yml'));
+    if (repositoryId === undefined) delete workflow.repository_id;
+    else workflow.repository_id = repositoryId;
+    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false });
+    const { result, calls } = attempt(() => rulesets);
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin',
+      error: expect.stringContaining('operator must restore active main rulesets before retrying') });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it.each([0, 1])('refuses matching pins when the acting integration bypasses enforcement in ruleset %i', index => {
+    const rulesets = liveDefaultBranchRulesets();
+    rulesets[index].bypass_actors = [{ actor_id: 5037855, actor_type: 'Integration', bypass_mode: 'always' }];
+    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false,
+      reason: expect.stringContaining('bypass applicability to the acting identity is not excluded') });
+    const { result, calls } = attempt(() => rulesets);
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin',
+      error: expect.stringContaining('operator must restore active main rulesets before retrying') });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it.each([
+    ['missing', undefined], ['null', null], ['object', {}],
+    ['unknown actor', [{}]],
+    ['repository role', [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }]],
+    ['pull-request bypass', [{ actor_id: 5037855, actor_type: 'Integration', bypass_mode: 'pull_request' }]],
+  ])('refuses matching pins with %s bypass evidence without mutation', (_name, bypassActors) => {
+    const rulesets = liveDefaultBranchRulesets();
+    if (bypassActors === undefined) delete rulesets[0].bypass_actors;
+    else rulesets[0].bypass_actors = bypassActors;
+    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false, reason: expect.stringContaining('bypass') });
+    const { result, calls } = attempt(() => rulesets);
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin' });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it.each([0, 1])('refuses nonempty exclusions on live default-branch ruleset %i without mutation', index => {
+    const rulesets = liveDefaultBranchRulesets();
+    rulesets[index].conditions.ref_name.exclude = ['refs/heads/other'];
+    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false });
+    const { result, calls } = attempt(() => rulesets);
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin' });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it('derives the pure verifier expected pin and integration from rulesetSuggestion', () => {
+    const expected = rulesetSuggestion({});
+    const rs = protectedRuleset();
+    rs.rules[0].parameters.workflows = expected.requiredWorkflows;
+    rs.rules[1].parameters.required_status_checks = [{ context: 'merge-gate', integration_id: expected.requiredStatusCheckIntegrationId }];
+    expect(verifyEnqueueRulesets([rs])).toEqual({ ok: true });
+    const pin = expected.requiredWorkflows.find(w => w.path.endsWith('/merge-gate.yml'));
+    expect(verifyEnqueueRulesets([]).reason).toContain(`${pin.path}@${pin.ref}`);
+  });
+  it('reads the live list then each detail before the mutation using injected exec', () => {
+    const { result, calls } = attempt(undefined);
+    expect(result).toEqual({ ok: true, entry });
+    const list = calls.findIndex(([, a]) => a[1] === 'repos/o/r/rulesets?includes_parents=true&per_page=100');
+    const detail = calls.findIndex(([, a]) => a[1] === 'repos/o/r/rulesets/1');
+    const mutation = calls.findIndex(([, a]) => a.includes(`query=${ENQUEUE_MUTATION}`));
+    expect(list).toBeGreaterThan(-1);
+    expect(detail).toBeGreaterThan(list);
+    expect(mutation).toBeGreaterThan(detail);
+  });
+  it.each(['list failure', 'detail failure', 'malformed JSON', 'incomplete page', 'invalid id', 'mismatched detail'])('default reader fails closed on %s without mutation', kind => {
+    const calls = [];
+    const fake = execFor({ files: ['a.txt'], calls });
+    const exec = (cmd, args) => {
+      if (cmd === 'gh' && args[1]?.startsWith('repos/')) {
+        calls.push([cmd, args]);
+        const list = args[1].includes('?');
+        if (kind === 'list failure' || (kind === 'detail failure' && !list)) throw Error('offline');
+        if (kind === 'malformed JSON') return 'not JSON';
+        if (kind === 'incomplete page' && list) return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: i + 1 })));
+        if (kind === 'invalid id' && list) return '[{}]';
+        if (kind === 'mismatched detail' && !list) return '{}';
+        return rulesetResponse(args);
+      }
+      return fake(cmd, args);
+    };
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec });
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin', error: expect.stringContaining('operator must') });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+    if (kind === 'incomplete page') expect(calls.filter(([, a]) => a[1]?.startsWith('repos/'))).toHaveLength(1);
+  });
+  it('reads every listed detail rather than trusting the list summary', () => {
+    const exec = vi.fn((_cmd, args) => args[1].includes('?') ? '[{"id":1},{"id":2}]' : JSON.stringify({ ...protectedRuleset(), id: Number(args[1].split('/').pop()) }));
+    expect(readLiveEnqueueRulesets({ repo: 'o/r', exec })).toHaveLength(2);
+    expect(exec.mock.calls.map(([, args]) => args[1])).toEqual([
+      'repos/o/r/rulesets?includes_parents=true&per_page=100', 'repos/o/r/rulesets/1', 'repos/o/r/rulesets/2',
+    ]);
+  });
+});
 
 describe('merge queue enqueue', () => {
   it.each([
@@ -547,9 +731,9 @@ describe('rulesetSuggestion pins the required workflows to main', () => {
 
   it('requires merge-gate.yml, ci.yml and soak-replay-gate.yml from refs/heads/main', () => {
     const byPath = Object.fromEntries(result.requiredWorkflows.map((w) => [w.path, w]));
-    expect(result.requiredWorkflows).toContainEqual({ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main' });
+    expect(result.requiredWorkflows).toContainEqual({ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main', repository_id: 1142650361 });
     for (const path of ['.github/workflows/merge-gate.yml', '.github/workflows/ci.yml', '.github/workflows/soak-replay-gate.yml']) {
-      expect(byPath[path], path).toMatchObject({ ref: 'refs/heads/main' });
+      expect(byPath[path], path).toMatchObject({ ref: 'refs/heads/main', repository_id: 1142650361 });
     }
   });
 
@@ -738,7 +922,8 @@ describe('the workflow-edit refusal reads the change list of the exact enqueued 
   // gh answers with the given live head; git runs for real in the clone.
   const realExec = (liveHead, calls) => (cmd, args, opts) => {
     calls.push([cmd, args]);
-    if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: 'main' });
+    if (cmd === 'gh' && args[0] === 'api' && args[1].startsWith('repos/')) return rulesetResponse(args);
+  if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: 'main' });
     if (cmd === 'gh' && args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: calls.some(([, a]) => a.includes(`query=${ENQUEUE_MUTATION}`)), headRefOid: liveHead } } } });
     if (cmd === 'gh') return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } });
     return execFileSync(cmd, args, opts);
