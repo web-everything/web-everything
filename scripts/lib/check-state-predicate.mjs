@@ -4,7 +4,8 @@
  * STARTUP_FAILURE are red. CANCELLED and STALE stay pending: a re-run is
  * expected, and neither outcome can ever establish successful admission.
  * Missing/empty completed conclusions and unknown evidence fail closed (red).
- * An absent status with a conclusion is treated as completed. Only an explicit
+ * Only an explicit string status can establish completion; absent/non-string
+ * statuses are unknown evidence (red), regardless of conclusion. Only an explicit
  * required === false changes non-green outcomes to ignore.
  */
 export const CHECK_STATE_TABLE = Object.freeze({
@@ -53,8 +54,7 @@ const nameSet = (names, option) => {
  * @example classifyCheck({ status: 'COMPLETED', conclusion: 'SUCCESS' }); // green
  */
 export function classifyCheck(check = {}, { optionalNames = [] } = {}) {
-  const status = check.status == null && check.conclusion != null
-    ? 'completed' : normalize(check.status);
+  const status = normalize(check.status);
   const state = status === 'completed'
     ? ownValue(CHECK_STATE_TABLE.completed, normalize(check.conclusion))
     : ownValue(CHECK_STATE_TABLE, status);

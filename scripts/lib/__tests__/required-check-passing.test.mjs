@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
+import { withoutImpliedRequiredChecks } from '../required-check-implication.mjs';
 import { requiredCheckPassing, summarize } from '../check-state-predicate.mjs';
 import { defaultReadHeadCheckState } from '../../operations/promote-draft-pr-dispatch.mjs';
 import { requiredCheckStates, gateOnlyRedStates } from '../../conveyor/ci-heal-verdict-recheck.mjs';
-import { reviewHoldOnlyRed } from '../../conveyor/reconcile-core.mjs';
+import { reviewHoldOnlyRed, reviewHoldGatesOnlyRed } from '../../conveyor/reconcile-core.mjs';
 import { needsHumanGateOnlyRefusal } from '../../conveyor/ci-heal-escalation-mark.mjs';
 
 const check = (conclusion, extra = {}) => ({ name: 'test', status: 'completed', conclusion, ...extra });
@@ -12,6 +13,46 @@ const hold = { name: 'merge-gate', status: 'completed', conclusion: 'failure',
 const read = rows => defaultReadHeadCheckState({ repoSlug: 'owner/repo', sha: 'a'.repeat(40),
   runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
   getRequiredChecks: () => ({ checks: ['test', 'merge-gate'] }), mergeGateSetting: { value: 'off' } });
+
+describe('success conclusions need explicit completion evidence', () => {
+  const incomplete = [{ name: 'test', conclusion: 'success' }];
+
+  it('requiredCheckPassing refuses a status-less success', () => {
+    expect(requiredCheckPassing(incomplete, 'test')).toBe(false);
+  });
+
+  it('summarize refuses green and gate-only red beside a status-less success', () => {
+    expect(summarize(incomplete).allRequiredGreen).toBe(false);
+    expect(summarize([...incomplete, hold])).toMatchObject({
+      redSet: new Set(['test', 'merge-gate']), gateOnlyRed: false, allRequiredGreen: false,
+    });
+  });
+
+  it('reviewHoldOnlyRed refuses draft-promotion evidence with a status-less success', () => {
+    for (const required of [undefined, ['test', 'merge-gate']]) {
+      expect(reviewHoldOnlyRed([...incomplete, hold], required)).toBe(false);
+      expect(reviewHoldGatesOnlyRed([...incomplete, hold], required)).toBe(false);
+    }
+  });
+
+  it('defaultReadHeadCheckState keeps a status-less success pending beside a review hold', () => {
+    expect(read([...incomplete, hold])).toMatchObject({
+      state: 'pending', reviewHoldOnly: false, waitingOnReview: false,
+      counts: { running: 1, succeeded: 0 },
+    });
+  });
+
+  it.each([undefined, null, 0, false, {}, []])(
+    'all strict consumers refuse non-string status %j', status => {
+      const rows = [check('success', { status })];
+      expect(requiredCheckPassing(rows, 'test')).toBe(false);
+      expect(summarize(rows).allRequiredGreen).toBe(false);
+      expect(reviewHoldOnlyRed([...rows, hold], ['test', 'merge-gate'])).toBe(false);
+      expect(read([...rows, hold])).toMatchObject({ reviewHoldOnly: false, waitingOnReview: false });
+      expect(requiredCheckStates({ rollup: rows, requiredChecks: ['test'] }).green).toEqual([]);
+      expect(gateOnlyRedStates({ rollup: [...rows, hold], requiredChecks: ['test', 'merge-gate'] }).gateOnlyRed).toBe(false);
+    });
+});
 
 describe('required checks need proven latest success', () => {
   it.each(['skipped', 'neutral', null])('required %s never passes alone or after failure', conclusion => {
@@ -111,6 +152,12 @@ describe('review holds do not escalate as CI failures', () => {
       readPrLabels: () => ['review:pending'], readMergeGateVerdict: () => ({ num: 7, head_sha: 'a'.repeat(40),
         ok: false, results: [{ id: 'review-acceptance', status: 'hold', reason: 'review pending' }] }) });
     expect(result).toMatchObject({ state: 'red', reviewHoldOnly: false, waitingOnReview: false });
+  });
+
+  it('implication evidence needs an explicit completed status', () => {
+    const rows = [{ name: 'test', conclusion: 'success' }];
+    expect(withoutImpliedRequiredChecks(['integration'], rows)).toEqual(['integration']);
+    expect(withoutImpliedRequiredChecks(['integration'], [{ ...rows[0], status: 'completed' }])).toEqual([]);
   });
 
   it('an unreadable merge-gate verdict remains ordinary CI red', () => {

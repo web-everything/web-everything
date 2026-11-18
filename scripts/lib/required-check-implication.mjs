@@ -26,7 +26,7 @@ export function withoutImpliedRequiredChecks(requiredChecks, rows, { checkPassin
     if (checkPassing) return checkPassing(list, name);
     const mine = list.filter(row => nameOf(row) === name);
     return mine.length > 0 && mine.every(row => String(row.conclusion ?? '').toLowerCase() === 'success'
-      && String(row.status ?? 'completed').toLowerCase() === 'completed');
+      && typeof row.status === 'string' && row.status.toLowerCase() === 'completed');
   };
   return requiredChecks.filter(name => {
     const impliers = REQUIRED_CHECK_IMPLIED_BY[name];

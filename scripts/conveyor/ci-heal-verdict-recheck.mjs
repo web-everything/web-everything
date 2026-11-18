@@ -90,7 +90,12 @@ const normalizeRollupCheck = row => {
   const check = { ...row, name: row?.name || row?.context };
   if (row?.status == null && row?.state != null) {
     if (['pending', 'expected'].includes(lowerState(row.state))) check.status = 'pending';
-    else check.conclusion = row.state;
+    else {
+      // Legacy StatusContext has a state instead of CheckRun status/conclusion.
+      // Normalize its explicit string state at the boundary, never infer from a conclusion.
+      if (typeof row.state === 'string') check.status = 'completed';
+      check.conclusion = row.state;
+    }
   }
   return check;
 };

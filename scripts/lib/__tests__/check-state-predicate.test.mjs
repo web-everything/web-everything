@@ -146,7 +146,7 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
   );
 
   it.each(['constructor', 'toString', '__proto__'])(
-    'fails closed on prototype-key conclusion %s with explicit or inferred completion',
+    'fails closed on prototype-key conclusion %s with explicit or missing completion',
     (conclusion) => {
       for (const statusFlag of [{ status: 'completed' }, {}, { status: null }, { status: undefined }]) {
         expect(classifyCheck({ ...statusFlag, conclusion })).toBe('red');
@@ -229,11 +229,13 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
   );
 
   it.each(conclusions.filter((conclusion) => conclusion !== null))(
-    'treats missing status with conclusion=%s as completed',
+    'treats missing or non-string status with conclusion=%s as unknown evidence',
     (conclusion) => {
-      for (const statusFlag of [{}, { status: undefined }, { status: null }]) {
+      for (const statusFlag of [{}, { status: undefined }, { status: null },
+        { status: false }, { status: 1 }, { status: {} }, { status: ['completed'] },
+        { status: new String('completed') }]) {
         expect(classifyCheck({ name: 'ci', conclusion, ...statusFlag }))
-          .toBe(completedOutcomes[conclusion]);
+          .toBe('red');
       }
     },
   );
