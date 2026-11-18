@@ -30,7 +30,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
-const { runCliToFile } = require('./run-cli-batch.cjs');
+const { runCliToFile, isOutputLimitError } = require('./run-cli-batch.cjs');
 
 /**
  * The pinned FUI build-artifact — a FIXED relative path resolved from the WE repo root against the
@@ -108,11 +108,12 @@ function renderComponents(specs, repoRoot, runner = runCliToFile) {
   try {
     batch = runBuildBatch(specs, repoRoot, runner);
   } catch (e) {
-    // The whole-site batch's stdout can outgrow the subprocess `maxBuffer` as the site grows (red main @
-    // f5aa5b111: `spawnSync node ENOBUFS` in the deploy-smoke docs build). Halve the batch and retry rather
-    // than chase a bigger constant; keys are globally unique so the halves merge losslessly. A single spec
-    // that overflows alone (or any other failure) is still a hard error.
-    if (!(e && e.code === 'ENOBUFS') || specs.length < 2) throw e;
+    // The whole-site batch's stdout can outgrow one call's output limit as the site grows (red main @
+    // f5aa5b111: `spawnSync node ENOBUFS` in the deploy-smoke docs build; the default runner now throws the
+    // typed `output-limit` CliBatchError at MAX_OUTPUT_BYTES). Halve the batch and retry rather than chase a
+    // bigger constant; keys are globally unique so the halves merge losslessly. A single spec that overflows
+    // alone (or any other failure) is still a hard error, with the typed error preserved.
+    if (!isOutputLimitError(e) || specs.length < 2) throw e;
     const mid = Math.ceil(specs.length / 2);
     const merged = renderComponents(specs.slice(0, mid), repoRoot, runner);
     for (const [k, v] of renderComponents(specs.slice(mid), repoRoot, runner)) merged.set(k, v);

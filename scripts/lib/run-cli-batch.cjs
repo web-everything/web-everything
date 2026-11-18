@@ -15,6 +15,9 @@ const { spawnSync } = require('node:child_process');
 /** Generous explicit ceiling on the child's stdout (read back into memory); exceeding it is a typed error. */
 const MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
 
+/** `CliBatchError.reason` for the stdout-over-limit failure (distinguishes it from exit/spawn failures). */
+const OUTPUT_LIMIT_REASON = 'output-limit';
+
 /** Typed failure so callers/CI can tell a child failure from a parse failure. */
 class CliBatchError extends Error {
   constructor(message, details) {
@@ -57,7 +60,7 @@ function runCliToFile(cmd, args, opts = {}) {
     if (size > MAX_OUTPUT_BYTES) {
       throw new CliBatchError(
         `[cli-batch] ${cmd} wrote ${size} bytes of stdout, over the ${MAX_OUTPUT_BYTES}-byte limit (MAX_OUTPUT_BYTES)`,
-        { size, limit: MAX_OUTPUT_BYTES },
+        { reason: OUTPUT_LIMIT_REASON, size, limit: MAX_OUTPUT_BYTES },
       );
     }
     return fs.readFileSync(outPath, 'utf8');
@@ -68,4 +71,15 @@ function runCliToFile(cmd, args, opts = {}) {
   }
 }
 
-module.exports = { runCliToFile, CliBatchError, MAX_OUTPUT_BYTES };
+/**
+ * True when `e` means "the child's stdout was too big for ONE call" — this runner's typed limit error, or
+ * the native `ENOBUFS` a pipe-buffered runner (e.g. `execFileSync`) throws. Callers that can shrink the
+ * request (split a batch) use this to recover instead of aborting; any other failure stays a hard error.
+ * @param {unknown} e
+ * @returns {boolean}
+ */
+function isOutputLimitError(e) {
+  return !!e && typeof e === 'object' && (e.reason === OUTPUT_LIMIT_REASON || e.code === 'ENOBUFS');
+}
+
+module.exports = { runCliToFile, CliBatchError, MAX_OUTPUT_BYTES, isOutputLimitError };
