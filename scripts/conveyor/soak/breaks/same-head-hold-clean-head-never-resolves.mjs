@@ -26,7 +26,7 @@ const runs = [{ id: 'review-pr-7012', repo, pr: 7012, head, startedAt,
   completedAt: startedAt + 10 * 60000, parked: false, pending: [], attempted: true,
   persistenceFailed: false, count: 0, rulings: [] }];
 const advisory = { author: { login: 'web-everything' }, createdAt: '2026-11-18T12:10:00Z',
-  body: ['ADVISORY REVIEW, NOT A RECORDED VERDICT', '**Verdict:** accept',
+  body: ['**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**','**Verdict:** accept',
     'Net basis: \u0060' + base + '..' + head + '\u0060', '**Advisory outcome:** \u0060accept\u0060'].join('\\n') };
 const scenario = comments => {
   const pr = { number: 7012, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefName: 'lane/clean-head',
@@ -51,7 +51,10 @@ export default {
   fixedBy: { sha: 'pending', where: 'main', paths: [HOLD_PATH] },
   fixPresent(root) {
     try {
-      return readFileSync(join(root, HOLD_PATH), 'utf8').includes("return noFinding('no referral record names the live head')");
+      const src = readFileSync(join(root, HOLD_PATH), 'utf8');
+      // Every guard of the fix must be present: a tree with only part of it is still the broken tree for this break.
+      return ["return noFinding('no referral record names the live head')", 'no clean advisory accept names the full live head',
+        'reviewStartedAt', 'hold.attemptsSinceWake === 1'].every(marker => src.includes(marker));
     } catch { return false; }
   },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {
