@@ -1030,14 +1030,18 @@ describe('#verify-phase-admission', () => {
 
 // #5128 — graph reads and tracked-file discovery stay injected; no real repository graph.
 describe('#5128 — bounded related-test selection', () => {
-  function boundedGate(maxTests = 3, withReader = true) {
+  function boundedGate(maxTests = 3, withReader = true, unreadableGraph = 0) {
     const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'",
       'scripts/direct.test.mjs': "import './hub.mjs'" };
     for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
     const git = fakeGit(['scripts/hub.mjs']);
+    let hubReads = 0;
     return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: maxTests, relatedDepth: 2 },
       runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
-      ...(withReader ? { readRepoFile: path => files[path] } : {}),
+      ...(withReader ? { readRepoFile: path => {
+        if (path === 'scripts/hub.mjs' && ++hubReads === unreadableGraph) throw new Error('injected read error');
+        return files[path];
+      } } : {}),
     });
   }
 
@@ -1047,6 +1051,13 @@ describe('#5128 — bounded related-test selection', () => {
     expect(gate.decision.selection.status).toBe('selection-truncated');
     expect(gate.decision.targets).toEqual(['scripts/hub.mjs']);
     expect(describeGate(gate)).toContain('selection-truncated');
+  });
+
+  it.each([1, 2])('keeps plain vitest related with no selection when graph %s has an unreadable source', unreadableGraph => {
+    const gate = boundedGate(3, true, unreadableGraph);
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision).not.toHaveProperty('selection');
+    expect(gate.decision.partial).toBe(false);
   });
 
   it('recognizes a requester without the limit (older base) as the default gate, not a whole-gate fallback', () => {
@@ -1544,5 +1555,30 @@ describe('related gate routing in a sibling checkout without the WE admission wr
       expect(run.status).toBe(0);
       expect(readFileSync(join(dir, 'wrapper-args'), 'utf8')).toBe('run -- npx vitest run src/a.test.ts --passWithNoTests');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('S1 static selection composition', () => {
+  const gate = (files, env = TODAY) => {
+    const git = fakeGit(['scripts/child.mjs']);
+    return resolveDefaultGate({ env, fileConfig: { relatedMaxTests: 1000, relatedDepth: 2 },
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
+      readRepoFile: p => files[p] });
+  };
+  it('adds a transitive spawn importer to local related targets without changing its local cap', () => {
+    const files = { 'scripts/child.mjs': '', 'scripts/helper.mjs': "spawn('node', ['scripts/child.mjs'])",
+      'scripts/consumer.test.mjs': "import './helper.mjs'" };
+    const result = gate(files);
+    expect(result.testCommand).toContain("'scripts/consumer.test.mjs'");
+    expect(result.decision.selection).toMatchObject({ partial: false, maxTests: 1000 });
+    expect(gate(files, { ...TODAY, CI: 'true' }).decision.selection).toMatchObject({ partial: false, maxTests: 0 });
+  });
+  it('blocks oversized supplemental static targets with an explicit operator fallback', () => {
+    const files = { 'scripts/child.mjs': '' };
+    for (let i = 0; i < 500; i++) files[`scripts/${'x'.repeat(90)}${i}.test.mjs`] = "readFileSync('scripts/child.mjs')";
+    const result = gate(files);
+    expect(result.decision.reasons.join(' ')).toMatch(/static selection exceeds command bounds.*explicit affected-test/);
+    expect(result.command).toBeNull();
   });
 });
