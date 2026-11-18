@@ -4975,6 +4975,9 @@ async function runCli() {
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
+    // Admission must precede same-head recovery, which can update the branch.
+    const refusal = assertCapability(c.repo ?? localSlug, 'review');
+    if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
     const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
       approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
@@ -5025,8 +5028,6 @@ async function runCli() {
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
     const shown = { line: guard.reason ?? guard.line };
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
-    const refusal = assertCapability(c.repo ?? localSlug, 'review');
-    if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
@@ -7454,6 +7455,8 @@ async function runCli() {
             if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }, approvedHeadHold); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
+            const refusal = assertCapability(c.repo ?? localSlug, 'review');
+            if (refusal) throw Object.assign(new Error(refusal.why), { enqueueFailure: refusal });
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
           }, (mergeStrategy.enqueues(c.repo) || cardGrouping.mayHold()) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; xym8nt4 — nor may a direct merge's group re-check (a group claim holds this lock); a refused lock retries next pass

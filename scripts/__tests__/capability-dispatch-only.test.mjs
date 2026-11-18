@@ -10,7 +10,7 @@ const allowlist = new Set([
   'scripts/conveyor/load-flake-reverify.mjs', // Redispatch and saved-fix push only.
   'scripts/operations/review-dispatch.mjs', // S1 independent review admission.
   'skills-src/conveyor/review-daemon.mjs', // Ordinary and recovery review starts.
-  'scripts/merge-ai-prs.mjs', // Lander enqueue only.
+  'scripts/merge-ai-prs.mjs', // Lander enqueue and direct merge dispatch only.
   'scripts/operations/promote-draft-pr-dispatch.mjs', // Draft promotion only.
   'scripts/operations/ci-heal-pr-dispatch.mjs', // S1 CI-heal dispatch admission.
 ]);
@@ -52,4 +52,24 @@ describe('capabilities admit dispatch only', () => {
     'Object.keys(CONSTELLATION_REPOS).map(repo => assertCapability(repo, "review"))',
     'repos.flatMap(repo => repo.capabilities?.fix ? [repo] : [])',
   ])('detects a capability roster regression: %s', source => expect(rosterFilters(source)).toHaveLength(1));
+
+  it('allows lander admission only at enqueue and direct merge dispatch, leaving lifecycle paths unguarded', () => {
+    const source = readFileSync(resolve(root, 'scripts/merge-ai-prs.mjs'), 'utf8');
+    const file = ts.createSourceFile('merge-ai-prs.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const sites = [];
+    function visit(node) {
+      if (ts.isCallExpression(node) && node.expression.getText(file) === 'assertCapability') {
+        let owner = node.parent;
+        while (owner && !ts.isFunctionDeclaration(owner) && !ts.isArrowFunction(owner)) owner = owner.parent;
+        if (owner && ts.isFunctionDeclaration(owner)) sites.push(owner.name?.text);
+        else if (owner && ts.isArrowFunction(owner) && ts.isCallExpression(owner.parent)
+          && owner.parent.expression.getText(file) === 'withLandWriteLock'
+          && ts.isVariableDeclaration(owner.parent.parent)) sites.push(owner.parent.parent.name.getText(file));
+        else sites.push('unapproved');
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(file);
+    expect(sites).toEqual(['enqueueWithSameHeadGuard', 'landLock']);
+  });
 });
