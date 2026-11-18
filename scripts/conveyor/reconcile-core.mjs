@@ -389,7 +389,7 @@ export function concurrentAuthorPauseState({ comments, headRefOid = null, now = 
  */
 export const BOOKKEEPING_MARKERS = Object.freeze([
   '<!-- mq-failure-recovery:',
-  REFERRAL_HOLD_MARKER, NOTE_COMMENT_MARKER,
+  REFERRAL_HOLD_MARKER,
   REARM_COMMENT_MARKER, CI_HEAL_COMMENT_MARKER, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, OPERATOR_ANSWER_MARKER,
   // #xkmu3gv — the two new completed-round markers. Neither is a reviewer speaking, so neither may ever count as
   // a finding (`countFindings`) or the pass would read its OWN handback comment as fresh work to fix.
@@ -665,7 +665,8 @@ export function startedAtMs(startedAt) {
 /**
  * we:scripts/conveyor/reconcile-core.mjs#countFindings — how many comments on this PR are a REVIEWER speaking,
  * rather than the conveyor talking to itself. A comment whose LEADING line is one of
- * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Pure.
+ * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Note comments additionally
+ * require the same trusted-author gate as `hasPostedNoteComment` and a valid episode-key line. Pure.
  *
  * The leading-line narrowing matches `countRearmComments`'s, and for the same reason: a human who QUOTES a
  * marker comment in their reply is raising a finding, not posting a marker, and must not be discounted.
@@ -680,6 +681,8 @@ export function countFindings(comments) {
     if (typeof body !== 'string') continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
+    if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
+      && /^<!-- conveyor-note-key: [a-z][a-z0-9-]*:(?:\d+|unknown)(?::[^\r\n<>]*)? -->$/m.test(body)) continue;
     n += 1;
   }
   return n;

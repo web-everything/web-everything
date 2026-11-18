@@ -277,6 +277,26 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(countFindings([{ body: `> ${publication.body}\nThis still needs repair.` }])).toBe(1);
   });
 
+  it('does not count a trusted published note as a finding', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Needs a decision.' }, []);
+    expect(countFindings([{ author: AUTOMATION, body }])).toBe(0);
+  });
+
+  it('counts an untrusted note lookalike containing a repair request even with a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    expect(countFindings([{ author: { login: 'stranger' }, body }])).toBe(1);
+    expect(countFindings([{ body }])).toBe(1);
+    expect(countFindings([body])).toBe(1);
+  });
+
+  it('counts a trusted note lookalike containing a repair request without a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    const withoutKey = body.replace(/^<!-- conveyor-note-key: .* -->$/m, '');
+    expect(countFindings([{ author: AUTOMATION, body: withoutKey }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: -->` }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: invalid -->` }])).toBe(1);
+  });
+
   it('TERMINAL — a week later the answer is byte-identical: no decay, no clock', () => {
     const a = planReconcile({ prs: [stoodDown], agents: [], durableCounts: {}, now: NOW });
     const b = planReconcile({ prs: [stoodDown], agents: [], durableCounts: {}, now: NOW + 7 * 24 * HOUR });
