@@ -16,7 +16,7 @@ import { readGh } from '../../lib/proc-read.mjs';
 import { spawnSync } from 'node:child_process';
 import { reviewCiGate } from '../../lib/review-ci-gate.mjs';
 import { defaultCachePath } from '../../lib/required-status-checks.mjs';
-import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, PR_STATUS_DESCRIPTIONS, operatorQueueNeedsYou } from '../pr-status-label.mjs';
+import { deriveReviewBlockStatus, derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, PR_STATUS_DESCRIPTIONS, operatorQueueNeedsYou } from '../pr-status-label.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } from '../review-status-tag.mjs';
 import { evaluatePr } from '../../operations/operator-queue.mjs';
@@ -44,6 +44,32 @@ describe('derivePrStatusLabel', () => {
     expect(derive({ pr: pr(['review:changes']), rows: [{ kind: 'fix', mode: 'takeover' }] })).toBe('at-round-limit');
     expect(derive({ pr: pr(['review:pending']), rows: [{ kind: 'review', takeoverReview: { ok: true } }] })).toBe('at-round-limit');
     expect(derive({ pr: pr(['review:changes']), rows: [{ kind: 'takeover-awaiting-review' }] })).toBe('at-round-limit');
+  });
+  it('a current-head changes advisory blocks a stale accepted label', () => {
+    expect(derive({ pr: pr(['review:accepted'], [{ author: BOT, createdAt: at(8), body: `**Verdict:** changes\n**Advisory outcome:** changes\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`` }]) })).toBe('sent-back-review');
+  });
+  it('an untrusted accept after a trusted changes advisory does not unblock ready-to-merge', () => {
+    const body = (o) => `**Verdict:** ${o}\n**Advisory outcome:** ${o}\nNet basis: \`${'0'.repeat(40)}..${HEAD}\``;
+    const comments = [{ author: BOT, createdAt: at(8), body: body('changes') }, { author: { login: 'stranger' }, createdAt: at(9), body: body('accept') }];
+    expect(derive({ pr: pr(['review:accepted'], comments) })).toBe('sent-back-review');
+  });
+  describe('ready-to-merge is bound to evidence for the current head', () => {
+    const body = (o, head = HEAD) => `**Verdict:** ${o}\n**Advisory outcome:** ${o}\nNet basis: \`${'0'.repeat(40)}..${head}\``;
+    const OTHER = 'b'.repeat(40);
+    it('an accept for another head does not mask changes on this head', () => {
+      const comments = [{ author: BOT, createdAt: at(8), body: body('changes') }, { author: BOT, createdAt: at(9), body: body('accept', OTHER) }];
+      expect(derive({ pr: pr(['review:accepted'], comments) })).toBe('sent-back-review');
+    });
+    it('an inconclusive advisory on this head is not ready', () => {
+      const comments = [{ author: BOT, createdAt: at(8), body: body('inconclusive') }];
+      expect(derive({ pr: pr(['review:accepted'], comments) })).toBe('sent-back-review');
+    });
+    it('a stale review:accepted label with changes on the head is not ready', () => {
+      expect(derive({ pr: pr(['review:accepted', 'review:changes']) })).toBe('sent-back-review');
+    });
+    it('a trusted accept on this head stays ready', () => {
+      expect(derive({ pr: pr(['review:accepted'], [{ author: BOT, createdAt: at(8), body: body('accept') }]) })).toBe('ready-to-merge');
+    });
   });
   it('a live fixer on an unjudged takeover is takeover-running; once judged, plain fixing', () => {
     expect(derive({ pr: pr(['review:changes'], [marker(7)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('takeover-running');
@@ -519,5 +545,43 @@ describe('status tagger resolves required checks and settings at the IO boundary
       vi.unstubAllEnvs();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('status is derived from negative review evidence', () => {
+  it.each([
+    ['review:changes', 'sent-back-review'],
+    ['red-team:blocked', 'sent-back-red-team'],
+  ])('replaces contradictory readiness and queued statuses without clearing %s', (blocker, expected) => {
+    const labels = ['review:accepted', 'ready-to-merge', 'review:pending', blocker,
+      'status:ready-to-merge', 'status:awaiting-review'];
+    const snapshot = pr(labels, [], { statusCheckRollup: [check('test')] });
+    expect(deriveReviewBlockStatus(snapshot.labels)).toBe(expected);
+    expect(derive({ pr: snapshot, rows: [{ kind: 'review' }], reviewStatus: { role: 'review', state: 'reviewing' } })).toBe(expected);
+    const setLabels = vi.fn();
+    const result = tagReviewStatus({ pr: 7, repo: 'web-everything/web-everything', agents: [],
+      prState: snapshot, currentLabels: snapshot.labels, planRows: [{ kind: 'review' }],
+      readFixClaim: () => null, legacyReviewStatus: false,
+      provider: { ensureLabel: vi.fn(), setLabels } });
+    expect(result.prStatus).toBe(`status:${expected}`);
+    expect(setLabels).toHaveBeenCalledWith('web-everything/web-everything', 7,
+      { add: `status:${expected}`, remove: ['status:ready-to-merge', 'status:awaiting-review'] });
+    expect(setLabels.mock.calls.flatMap(([, , change]) => change.remove)).not.toContain(blocker);
+    expect(snapshot.labels.map(l => l.name)).toEqual(labels);
+  });
+  it('fails closed on blocked evidence even when head comments are missing', () => {
+    expect(derive({ pr: pr(['review:accepted', 'red-team:blocked'], undefined) })).toBe('sent-back-red-team');
+    expect(deriveReviewBlockStatus(['review:changes', 'red-team:blocked'])).toBe('sent-back-red-team');
+  });
+  it('preserves human review evidence while removing stale readiness', () => {
+    const snapshot = pr(['review:changes', 'review:human', 'status:ready-to-merge']);
+    expect(derive({ pr: snapshot })).not.toBe('ready-to-merge');
+    const plan = planPrStatusLabel({ state: derive({ pr: snapshot }), currentLabels: snapshot.labels });
+    expect(plan.remove).toEqual(['status:ready-to-merge']);
+  });
+  it('keeps accepted readiness when there is no blocking evidence', () => {
+    expect(deriveReviewBlockStatus(['review:accepted', 'red-team:clear'])).toBeNull();
+    expect(derive({ pr: pr(['review:accepted', 'red-team:clear']) })).toBe('ready-to-merge');
   });
 });
