@@ -1691,7 +1691,9 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
               await directory(container,true,operator);
               const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
               if(reaped.code!==0)throw new Error('uid cleanup unconfirmed');
-              // The writer lease excludes a new controller; only proven UID emptiness permits removing this guard.
+              // UID emptiness cannot see a root supervisor paused before dropping identity.
+              // Require the hard runtime bound too, when the old controller must be dead.
+              if(!(clock()-(await lstat(join(worker.active,'executing'))).mtimeMs>=PAST_MAX_RUNTIME_MS))throw new Error('execution age unconfirmed');
               await rmdir(join(worker.active,'executing'));
             } catch {
               throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');

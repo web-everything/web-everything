@@ -1094,7 +1094,7 @@ describe('standards input parity', () => {
     } finally {time?.mockRestore();}
   });
 
-  it.each(['ok', 'nonzero', 'throws'])('stale executing cancellation requires proven UID cleanup: %s', async outcome => {
+  it.each([[-1,'ok'], [0,'ok'], [1,'ok'], [1,'nonzero'], [1,'throws']])('stale executing cancellation requires hard max runtime (offset %s ms) and proven UID cleanup: %s', async (offset, outcome) => {
     const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-stale-')); auxiliary.push(root);
     mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
     const cleanup = vi.fn(async () => {
@@ -1102,17 +1102,20 @@ describe('standards input parity', () => {
       if (outcome === 'throws') throw new Error('uid cleanup unconfirmed');
       return {code:outcome === 'ok' ? 0 : 1};
     });
-    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup});
+    const now = Date.now(), maxRuntimeMs = 3*1_740_000+15*60*1000;
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup, clock:()=>now});
     const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
     const active = join(root, 'receipts/worker-active-1'), executing = join(active, 'executing');
     mkdirSync(executing);
+    const started = new Date(now-maxRuntimeMs-offset);
+    utimesSync(executing, started, started);
     await expect(runner.finish({...prepared, nonce})).rejects.toThrow('Worker execution unconfirmed');
     expect(cleanup).not.toHaveBeenCalled();
     let tick = 0n;
     const time = vi.spyOn(process.hrtime, 'bigint').mockImplementation(() => (tick += 25000000000n));
     try {
       const finishing = runner.finish({...prepared, nonce, cancel:true});
-      if (outcome === 'ok') {
+      if (outcome === 'ok' && offset >= 0) {
         await expect(finishing).resolves.toMatchObject({run:prepared.run, cancelAck:true});
         expect(existsSync(executing)).toBe(false);
         expect(existsSync(active)).toBe(false);
