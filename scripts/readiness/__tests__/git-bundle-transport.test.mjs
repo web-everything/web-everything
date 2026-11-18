@@ -73,6 +73,54 @@ const run = async ({ head = tip, bundle, runnerBase = runnerMain, sharedClone = 
 };
 
 describe('R593 bundle ingest on the runner', () => {
+  it('stages only safe HEAD symlinks with non-tracked projected aliases, without writing worktree links', async () => {
+    // Store arbitrary targets as Git blobs so even NUL/newline refusals are
+    // tested without ever creating or following a filesystem symlink.
+    const links = [
+      ['.claude/agent-memory', '../agent-memory-src', false],
+      ['absolute', '/outside', false],
+      ['escaping', '../outside', false],
+      ['nested/escaping', '../../outside', false],
+      ['newline', 'agent-memory-src\n', false],
+      ['nul', 'agent-memory-src\0suffix', false],
+      ['no-alias', 'agent-memory-src', null],
+      ['prefix-only', 'agent-memory-src', null],
+      ['tracked-alias', 'agent-memory-src', true],
+    ];
+    const entries = [{ path: Buffer.from('tracked.txt'), sha256: hash('changed'), executable: false, tracked: true }];
+    const oids = new Map();
+    for (const [name, target, tracked] of links) {
+      const oid = (await exec({ file: 'git', args: ['hash-object', '-w', '--stdin'], cwd: lane, input: target })).stdout.toString().trim();
+      oids.set(name, oid);
+      git(lane, 'update-index', '--add', '--cacheinfo', `120000,${oid},${name}`);
+      if (tracked === null) continue;
+      const alias = `${name}/file.md`;
+      await fs.mkdir(join(work, name), { recursive: true });
+      await fs.writeFile(join(work, alias), 'projected');
+      entries.push({ path: Buffer.from(alias), sha256: hash('projected'), executable: false, tracked });
+    }
+    await fs.writeFile(join(work, 'prefix-only-extra'), 'projected');
+    entries.push({ path: Buffer.from('prefix-only-extra'), sha256: hash('projected'), executable: false, tracked: false });
+    git(lane, ...ident, 'commit', '-qm', 'HEAD links');
+    const head = git(lane, 'rev-parse', 'HEAD');
+    // Seed a local mirror with this verified HEAD; mode=none avoids widening
+    // the bundle-range policy, which continues to refuse new symlinks.
+    await fs.rm(join(root, 'repo.git'), { recursive: true, force: true });
+    git(root, 'clone', '--bare', lane, join(root, 'repo.git'));
+    git(join(root, 'repo.git'), 'update-ref', 'refs/remotes/origin/main', runnerMain);
+    entries.sort((a, b) => Buffer.compare(a.path, b.path));
+    const manifest = { ...manifestWire({ entries, excluded: [] }), git: { head } };
+    await materializeWorktree({ work, root, head, manifest, manifestDigest: digestManifest(manifest),
+      bundle: { mode: 'none', maxMainAgeMs: 600000 } });
+    expect(git(work, 'ls-files', '--stage', '--', '.claude/agent-memory'))
+      .toBe(`120000 ${oids.get('.claude/agent-memory')} 0\t.claude/agent-memory`);
+    for (const [name] of links.slice(1)) {
+      const staged = git(work, 'ls-files', '--stage', '--', name);
+      expect(staged, name).not.toMatch(/^120000 /m);
+    }
+    expect((await fs.lstat(join(work, '.claude/agent-memory'))).isDirectory()).toBe(true);
+    expect(await fs.readFile(join(work, '.claude/agent-memory/file.md'), 'utf8')).toBe('projected');
+  });
   it('fetches a verified incremental bundle into a per-run clone and checks out the exact tip', async () => {
     const plan = await run();
     expect(plan.mode).toBe('incremental');
