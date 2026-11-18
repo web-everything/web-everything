@@ -143,7 +143,11 @@ export function launchAgent(descriptor, primitive, ...args) {
     const flag = argv.findIndex(w => typeof w === 'string' && /^-[a-z]*c[a-z]*$/.test(w));
     if (typeof argv[flag + 1] === 'string' && flag >= 0) nativeIds.push(...shellResumeIds(argv[flag + 1]));
   }
-  if (nativeIds.some(id => descriptor.resumeId !== id)) refuse('resumeId must equal the native resume id in argv', descriptor, log);
+  // A resume flag with no value reads as an empty native id: that is a MISSING id, never one an empty/blank
+  // descriptor resumeId can "equal". Every native id must be a non-blank string and match descriptor.resumeId.
+  if (nativeIds.some(id => typeof id !== 'string' || id.trim() === '' || descriptor.resumeId !== id)) {
+    refuse('resumeId must equal the native resume id in argv', descriptor, log);
+  }
   if ('launchGuard' in descriptor) {
     if (typeof descriptor.launchGuard !== 'function') refuse('launchGuard must be a function', descriptor, log);
     let allowed;

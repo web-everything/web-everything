@@ -307,6 +307,33 @@ describe('codex resume id is the positional session id, never an option', () => 
   });
 });
 
+// A resume flag with no value reads as an empty native id. An empty descriptor resumeId must not "match" it.
+describe('an empty descriptor resumeId never satisfies a missing native id', () => {
+  const missing = [
+    ['claude', ['--resume']], ['claude', ['-r']], ['claude', ['--session-id']], ['claude', ['--session-id=']],
+    ['claude', ['--resume=']], ['claude', ['-r=']], ['claude', ['--resume', '--', 'prompt']],
+    ['claude', ['--resume', '']], ['claude', ['--resume', ' ']], ['claude', ['--resume=  ']],
+    ['codex', ['exec', 'resume']], ['codex', ['exec', 'resume', '--last']], ['codex', ['exec', 'resume', '--json']],
+    ['claude', '--resume'], ['claude', 'claude -r ""'],
+    ['sh', ['-c', 'claude --resume']], ['sh', ['-c', 'codex exec resume --last']], ['bash', ['-lc', 'claude --session-id=']],
+    ['sh -c "claude --resume"', []],
+  ];
+  it.each(missing.map(c => [JSON.stringify(c), c]))('refuses %s with resumeId empty, null, undefined or whitespace', (_label, [command, argv]) => {
+    for (const resumeId of ['', ' ', null, undefined]) {
+      const primitive = vi.fn(), log = vi.fn();
+      expect(() => launchAgent({ mode: 'claude-resume', resumeId, log }, primitive, command, argv)).toThrow('native resume id');
+      expect(primitive).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
+    }
+  });
+  it('still launches a real native id, and a fresh launch with an empty resumeId', () => {
+    const primitive = vi.fn();
+    launchAgent({ mode: 'claude-resume', resumeId: SID }, primitive, 'claude', ['--resume', SID]);
+    launchAgent({ mode: 'claude-print', resumeId: '' }, primitive, 'claude', ['-p', 'hello']);
+    expect(primitive).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('an async launchGuard is refused without leaking its rejection', () => {
   it('consumes a rejected guard promise so the caller can handle the refusal', async () => {
     const unhandled = vi.fn();
