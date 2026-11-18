@@ -885,3 +885,12 @@ it('refuses an enrolled repo with review:false before checkout access', () => {
   expect(() => planReviewDispatch({ pr: 1, repo: 'frontierui', checkoutExists, resolveProfile: () => ({ capabilities: { review: false } }) })).toThrow(/not a constellation repo/);
   expect(checkoutExists).not.toHaveBeenCalled();
 });
+
+
+it.each(['false', 1, {}])('denies malformed review capability %j before checking a checkout', (review) => {
+  const checkoutExists = vi.fn(() => true);
+  expect(() => planReviewDispatch({ pr: 1, repo: 'frontierui', checkoutExists,
+    resolveProfile: () => ({ capabilities: { review } }),
+  })).toThrow(/not a constellation repo/);
+  expect(checkoutExists).not.toHaveBeenCalled();
+});

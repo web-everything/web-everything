@@ -64,7 +64,7 @@ import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { assertMainNotStale } from './review-dispatch.mjs';
 import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
-import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
+import { repoHasCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit } from '../conveyor/pr-work-unit.mjs';
 import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
@@ -518,7 +518,7 @@ export async function runReconcileCiHealDispatch({
   // knows nothing about — and replace only its own `ci-heal` rows with what THIS pass just computed.
   const otherRows = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action !== 'ci-heal');
 
-  if (!profile?.capabilities?.ciHeal) {
+  if (!repoHasCapability(repoKey, 'ciHeal', { resolveProfile: () => profile })) {
     const refusals = ciHealEntries.map((entry) => ({
       kind: 'unsupported-repo', repo: repoKey, prNumber: entry.prNumber, action: 'ci-heal',
       why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',

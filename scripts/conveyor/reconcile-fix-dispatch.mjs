@@ -85,7 +85,7 @@ import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
-import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
+import { repoHasCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
@@ -1774,7 +1774,7 @@ export function classifyEnvFaultRefusals(refusals) {
  * (`docs/agent/platform-decisions.md#conveyor-multi-repo-model` clause 1). This function reads `repo`'s profile
  * ONCE and asks two INDEPENDENT questions of it — `fix` and `ci-heal` are separate stages/capabilities, each
  * with its own on/off switch, not one "is this repo supported at all" bit:
- *   - `!profile.capabilities.fix` → this whole pass is a no-op for the repo: every `fix` entry `reconcile-pass`
+ *   - `profile.capabilities.fix !== true` → this whole pass is a no-op for the repo: every `fix` entry `reconcile-pass`
  *     offered is recorded `unsupported-repo` (never touching the lane pool or a dispatch sink), exactly as
  *     EVERY non-WE repo behaved before this slice. Only `we` was ever missing this bit before; frontierui and
  *     plateau-app both flip it on in `repo-profile.mjs` as part of this same slice, so in practice this branch
@@ -1782,7 +1782,7 @@ export function classifyEnvFaultRefusals(refusals) {
  *     takes it for a real constellation repo, but the check itself must stay capability-shaped so the NEXT repo
  *     this constellation ever grows (with `fix` genuinely off) is refused for the right reason, not silently
  *     let through because it happens to resolve to *some* profile.
- *   - `!profile.capabilities.ciHeal` → independently of the above, any `ci-heal` entry in the SAME
+ *   - `profile.capabilities.ciHeal !== true` → independently of the above, any `ci-heal` entry in the SAME
  *     `reconcile-pass` reading is recorded `unsupported-repo` too (CI-heal was its own stage, held off `fix`'s
  *     switch, until multi-repo slice 7, `we:backlog/3967-*.md`, turned it on for frontierui/plateau-app too —
  *     both now resolve `ciHeal: true` in `repo-profile.mjs`, so a real call takes this branch only via an
@@ -1952,11 +1952,11 @@ export function runReconcileFixDispatch({
 
   // CI-heal is a capability of its own — refused independently of whatever `fix` decides below (see this
   // function's own docblock).
-  const ciHealRefusals = profile?.capabilities?.ciHeal ? [] : unsupportedFor(
+  const ciHealRefusals = repoHasCapability(repoKey, 'ciHeal', { resolveProfile: () => profile }) ? [] : unsupportedFor(
     'ci-heal', 'ci-heal', 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
   );
 
-  if (!profile?.capabilities?.fix) {
+  if (!repoHasCapability(repoKey, 'fix', { resolveProfile: () => profile })) {
     // This repo's fix stage is off entirely: every `fix` entry is unsupported, never touching the lane pool or
     // a dispatch sink. Durable ledger write mirrors the pre-slice-5 blanket branch exactly — preserve any
     // already-recorded `review` rows for this repo (a DIFFERENT stage this file knows nothing about), replace
@@ -2454,7 +2454,7 @@ export function planFixDispatchClaimStatus({
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
-  if (!profile?.capabilities?.fix) return { repo: repoKey, entries: [] };
+  if (!repoHasCapability(repoKey, 'fix', { resolveProfile: () => profile })) return { repo: repoKey, entries: [] };
   const { planned } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
   const entries = planned.map((entry) => ({
     pr: entry.pr, itemNum: entry.itemNum, headRefOid: entry.headRefOid,

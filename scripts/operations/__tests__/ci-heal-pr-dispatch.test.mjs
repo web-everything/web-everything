@@ -327,7 +327,7 @@ describe('dispatchCiHeal (#3852)', () => {
 // composition (read the reconcile plan → capability-gate → lane → dispatch), same durable `unsupported-repo`
 // ledger, one dispatch kind over.
 describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo slice 7)', () => {
-  it('a repo whose profile has `ciHeal:false` refuses every planned ci-heal `unsupported-repo`, never touching a lane or dispatch sink', async () => {
+  it.each([false, 'false', 1, {}])('denies ciHeal capability %j without touching a lane or dispatch sink', async (ciHeal) => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusals-'));
     const unsupportedPath = join(dir, 'rows.json');
     const calls = [];
@@ -340,7 +340,7 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
         resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
         // Real constellation repos now ALL have `ciHeal:true` (this slice's own point) — inject a profile
         // resolver reporting it off, exercising the branch for whatever repo the constellation grows next.
-        resolveProfile: () => ({ capabilities: { fix: true, ciHeal: false }, lanePoolRepo: '/nonexistent' }),
+        resolveProfile: () => ({ capabilities: { fix: true, ciHeal }, lanePoolRepo: '/nonexistent' }),
         checkStaleness: FRESH,
       };
       const result = await runReconcileCiHealDispatch(options);

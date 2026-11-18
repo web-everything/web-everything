@@ -1760,7 +1760,7 @@ it('tryResumeFix no longer throws for a sibling repo — a non-conflict entry st
 });
 
 describe('runReconcileFixDispatch — repo capability gate (#x33jgwt multi-repo slice 5)', () => {
-  it('a repo whose profile has `fix:false` still refuses `unsupported-repo`, never touching a lane or dispatch sink', async () => {
+  it.each([false, 'false', 1, {}])('denies fix and independent ciHeal capabilities %j without touching a lane or dispatch sink', async (capability) => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -1778,7 +1778,7 @@ describe('runReconcileFixDispatch — repo capability gate (#x33jgwt multi-repo 
         // #x33jgwt — every REAL constellation repo now has `fix:true` (this slice's own point); inject a
         // profile resolver reporting `fix:false` to exercise the refusal branch, which stays capability-shaped
         // for whatever repo the constellation grows next with the capability genuinely off.
-        resolveProfile: () => ({ capabilities: { fix: false, ciHeal: false }, lanePoolRepo: '/nonexistent' }),
+        resolveProfile: () => ({ capabilities: { fix: capability, ciHeal: capability }, lanePoolRepo: '/nonexistent' }),
       };
       const result = runReconcileFixDispatch(options);
       expect(result.dispatched).toEqual([]);
@@ -2474,4 +2474,16 @@ describe('fix pass PR metadata snapshot', () => {
     expect(() => createFixPassPrReader({ exec })(7)).toThrow('unreadable PR');
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
   });
+});
+
+
+it.each(['false', 1, {}])('claim-status planner denies malformed fix capability %j before planning or reading claims', async (fix) => {
+  const { planFixDispatchClaimStatus } = await import('../reconcile-fix-dispatch.mjs');
+  const unexpected = () => { throw new Error('denied capability reached claim planning'); };
+  expect(planFixDispatchClaimStatus({
+    repo: 'we', root: '/repo', checkStaleness: () => ({ fresh: true }),
+    reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 49 }], refusals: [] }),
+    resolveProfile: () => ({ capabilities: { fix } }),
+    findItemFn: unexpected, loadItems: unexpected, readClaim: unexpected,
+  })).toEqual({ repo: 'we', entries: [] });
 });
