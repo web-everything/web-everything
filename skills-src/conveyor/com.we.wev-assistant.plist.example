@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- /** report-only, no actions, no GitHub writes. */
+  EXAMPLE ONLY: inert until deliberately installed by an operator.
+  Replace placeholders with node, checkout and existing log directory paths.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.we.wev-assistant</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>NODE_PATH</string>
+    <string>CHECKOUT_PATH/scripts/conveyor/assistant-babysit-pass.mjs</string>
+    <string>--loop</string>
+  </array>
+  <key>WorkingDirectory</key><string>CHECKOUT_PATH</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>LOG_DIRECTORY/wev-assistant.log</string>
+  <key>StandardErrorPath</key><string>LOG_DIRECTORY/wev-assistant.log</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>NODE_DIRECTORY:GH_DIRECTORY:/usr/bin:/bin</string></dict>
+</dict>
+</plist>
