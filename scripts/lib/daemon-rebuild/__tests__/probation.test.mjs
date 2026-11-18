@@ -114,7 +114,9 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     Object.defineProperty(evidence.boot, 'pid', { enumerable: true, get: () => ++reads === 1 ? 101 : 999 });
     input.records.worker = evidence;
     const next = recordProof(input, 'worker', evidence, now);
-    expect(next).not.toBe(input);
+    // Vitest's negated object identity matcher deep-compares for diagnostic hints,
+    // invoking the input getter again. Compare identity before entering the matcher.
+    expect(next === input).toBe(false);
     expect(reads).toBe(1);
     expect(evaluateProbation(next, now)).toEqual({ action: 'pending', owed: ['review'] });
   });
