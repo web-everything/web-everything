@@ -1,0 +1,205 @@
+{
+  "api": {
+    "repos/fixture/repo/pulls/7100": {
+      "state": "open",
+      "head": {
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "base": {
+        "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "changed_files": 1
+    },
+    "repos/fixture/repo/pulls/7100/files?per_page=100&page=1": [
+      {
+        "filename": "other.mjs"
+      }
+    ],
+    "repos/fixture/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs?per_page=100&page=1&filter=latest": {
+      "total_count": 1,
+      "check_runs": [
+        {
+          "id": 411,
+          "name": "test",
+          "status": "completed",
+          "conclusion": "failure",
+          "started_at": "2026-01-01T00:00:00Z",
+          "completed_at": "2026-01-01T00:00:06Z",
+          "details_url": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "repos/fixture/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/status": {
+      "total_count": 0
+    },
+    "repos/fixture/repo/actions/jobs/411": {
+      "id": 411,
+      "name": "test",
+      "run_id": 410,
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/fixture/repo/actions/runs/410/job/411",
+      "runner_id": 1
+    },
+    "repos/fixture/repo/actions/runs/410": {
+      "id": 410,
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "run_attempt": 1,
+      "repository": {
+        "full_name": "fixture/repo"
+      },
+      "path": ".github/workflows/ci.yml"
+    },
+    "repos/fixture/repo/actions/jobs/411/logs": " FAIL unit.test.mjs > suite > timeout\nError: Test timed out in 5000ms.\n Test Files 1 failed\n Tests 1 failed\n Duration 5.2s\n",
+    "repos/fixture/repo/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?recursive=1": {
+      "truncated": false,
+      "tree": [
+        {
+          "type": "blob",
+          "path": "vitest.config.ts",
+          "sha": "blob0"
+        },
+        {
+          "type": "blob",
+          "path": "unit.test.mjs",
+          "sha": "blob1"
+        },
+        {
+          "type": "blob",
+          "path": "leaf.mjs",
+          "sha": "blob2"
+        }
+      ]
+    },
+    "repos/fixture/repo/git/blobs/blob0": {
+      "encoding": "base64",
+      "content": "ZXhwb3J0IGRlZmF1bHQge3Rlc3Q6e319Ow=="
+    },
+    "repos/fixture/repo/git/blobs/blob1": {
+      "encoding": "base64",
+      "content": "aW1wb3J0ICIuL2xlYWYubWpzIjsgaW1wb3J0IHtpdH0gZnJvbSAidml0ZXN0Ijs="
+    },
+    "repos/fixture/repo/git/blobs/blob2": {
+      "encoding": "base64",
+      "content": "ZXhwb3J0IGNvbnN0IHZhbHVlID0gMTs="
+    }
+  },
+  "cases": [
+    {
+      "case": "eligible timeout",
+      "overrides": {},
+      "expected": {
+        "eligible": true,
+        "failures": [
+          {
+            "path": "unit.test.mjs",
+            "name": "suite > timeout",
+            "kind": "test-timeout"
+          }
+        ]
+      }
+    },
+    {
+      "case": "infra-cancelled job",
+      "overrides": {
+        "repos/fixture/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs?per_page=100&page=1&filter=latest": {
+          "total_count": 1,
+          "check_runs": [
+            {
+              "id": 411,
+              "name": "test",
+              "status": "completed",
+              "conclusion": "cancelled",
+              "started_at": "2026-01-01T00:00:00Z",
+              "completed_at": "2026-01-01T00:00:06Z",
+              "details_url": "https://github.com/fixture/repo/actions/runs/410/job/411"
+            }
+          ]
+        },
+        "repos/fixture/repo/actions/jobs/411": {
+          "id": 411,
+          "name": "test",
+          "run_id": 410,
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "run_attempt": 1,
+          "status": "completed",
+          "conclusion": "cancelled",
+          "html_url": "https://github.com/fixture/repo/actions/runs/410/job/411",
+          "runner_id": null
+        }
+      },
+      "expected": {
+        "eligible": true,
+        "infraCancelled": true
+      }
+    },
+    {
+      "case": "mixed real and infra failure",
+      "overrides": {
+        "repos/fixture/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs?per_page=100&page=1&filter=latest": {
+          "total_count": 2,
+          "check_runs": [
+            {
+              "id": 411,
+              "name": "test",
+              "status": "completed",
+              "conclusion": "failure",
+              "started_at": "2026-01-01T00:00:00Z",
+              "completed_at": "2026-01-01T00:00:06Z",
+              "details_url": "https://github.com/fixture/repo/actions/runs/410/job/411"
+            },
+            {
+              "id": 421,
+              "name": "smoke",
+              "status": "completed",
+              "conclusion": "cancelled",
+              "started_at": "2026-01-01T00:00:00Z",
+              "completed_at": "2026-01-01T00:00:06Z",
+              "details_url": "https://github.com/fixture/repo/actions/runs/420/job/421"
+            }
+          ]
+        },
+        "repos/fixture/repo/actions/jobs/421": {
+          "id": 421,
+          "name": "smoke",
+          "run_id": 420,
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "run_attempt": 1,
+          "status": "completed",
+          "conclusion": "cancelled",
+          "html_url": "https://github.com/fixture/repo/actions/runs/420/job/421",
+          "runner_id": null
+        },
+        "repos/fixture/repo/actions/runs/420": {
+          "id": 420,
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "run_attempt": 1,
+          "repository": {
+            "full_name": "fixture/repo"
+          },
+          "path": ".github/workflows/ci.yml"
+        }
+      },
+      "expected": {
+        "eligible": false,
+        "reason": "mixed-infra-cancelled-and-real-failure"
+      }
+    },
+    {
+      "case": "dependency-impact refusal",
+      "overrides": {
+        "repos/fixture/repo/pulls/7100/files?per_page=100&page=1": [
+          {
+            "filename": "leaf.mjs"
+          }
+        ]
+      },
+      "expected": {
+        "eligible": false,
+        "reason": "changed-dependency:leaf.mjs"
+      }
+    }
+  ]
+}

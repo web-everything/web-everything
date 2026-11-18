@@ -63,6 +63,8 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
 
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
 export function legacyFindAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
   if (typeof base !== 'string' || typeof head !== 'string' || !SHA.test(base) || !SHA.test(head) || questionHash !== QUESTION_HASH) return null;
   let latest = null, prior = null, sawCurrent = false;
@@ -74,8 +76,13 @@ export function legacyFindAudit(records, { head, base, questionHash, priorQuesti
     if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
-    if (isCurrent && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
-    if (!isCurrent && (!prior || Date.parse(record.at) >= Date.parse(prior.at))) prior = record;
+    // A self-reported time more than FUTURE_SKEW_MS ahead of now is untrustworthy: unusable (and, for a current-question
+    // record, still blocks the prior fallback above). Among usable records the LATER-WRITTEN (ledger order) one wins, never
+    // the later self-reported timestamp, so a forged far-future pass cannot outrank a subsequently appended WEAKENED.
+    // A future-dated WEAKENED still counts (fail closed): only a future-dated pass is distrusted.
+    if (record.verdict === 'NOT WEAKENED' && Date.parse(record.at) > now + FUTURE_SKEW_MS) continue;
+    if (isCurrent) latest = record;
+    else prior = record;
   }
   // A current-question record always decides; a prior-question record only speaks when no current-question record exists (even an unusable one blocks the fallback).
   return sawCurrent ? latest : prior;
