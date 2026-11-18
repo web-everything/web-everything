@@ -752,15 +752,33 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
   const failures = events.filter(event => event && typeof event === 'object' && !Array.isArray(event)
     && (event.type === 'error' || event.is_error
       || (event.type === 'result' && 'subtype' in event && event.subtype !== 'success')));
-  const priority = event => event?.is_error
-    && ((event.stop_reason === 'tool_use' && budget !== null)
-      || (typeof event.result === 'string' && quotaHoldRow({ provider: 'claude', error: event.result }))) ? 1 : 0;
+  const failureText = event => [event?.result, event?.message, event?.error, event?.error?.message]
+    .find(text => typeof text === 'string' && quotaHoldRow({ provider: 'claude', error: text }))
+    ?? [event?.result, event?.message, event?.error, event?.error?.message]
+      .find(text => typeof text === 'string') ?? '';
+  const budgetFailure = event => (budget !== null && event?.stop_reason === 'tool_use')
+    || [event?.subtype, event?.code, event?.error?.code, event?.error?.type]
+      .some(code => ['error_max_budget_usd', 'budget_exceeded', 'budget_exhausted'].includes(code))
+    || /\bbudget (?:exhausted|exceeded)\b/i.test(failureText(event));
+  const priority = event => event && (budgetFailure(event)
+    || quotaHoldRow({ provider: 'claude', error: failureText(event) })) ? 1 : 0;
   const failure = failures.reduce((worst, event) => priority(event) > priority(worst) ? event : worst, failures[0]);
   // Inspect the whole stream before choosing a failure. Spending-limit evidence outranks malformed
   // output; judgeSpawn then ranks either result against its wall-clock timeout before considering retries.
   if (malformedError && priority(failure) === 0) throw malformedError;
   if (failure) {
-    if (failure.is_error) parsed = failure; // Preserve CLI and budget diagnostics below.
+    if (priority(failure)) {
+      // A failure envelope is sufficient evidence; is_error is optional. Keep the
+      // shared quota classifier strict, and retain the declared ceiling and spend.
+      const text = failureText(failure);
+      if (budgetFailure(failure)) {
+        throw new JudgeBudgetError({ budget,
+          costUsd: typeof failure.total_cost_usd === 'number' ? failure.total_cost_usd : 0,
+          stopReason: failure.stop_reason ?? '', result: text, stderr });
+      }
+      throw markQuotaFailure(new Error(`judge-spawn: the juror failed: ${text}`), text);
+    }
+    if (failure.is_error) parsed = failure; // Preserve CLI diagnostics below.
     else {
       const error = new Error('judge-spawn: the juror emitted a JSON error event or unsuccessful result.');
       error.unparseableStdout = true;
@@ -781,33 +799,6 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
   }
 
   if (parsed?.is_error) {
-    // THE BUDGET KILL, CHECKED FIRST — because it is the one case where the CLI's own error text (below) does
-    // not explain what happened, and the branch that would otherwise swallow it is the verbatim-passthrough.
-    //
-    // THE PREDICATE, and why each conjunct is load-bearing:
-    //   `is_error`        — we are already inside it; a CONFORMING run also stops for `tool_use` (header
-    //                       guarantee 2: `--json-schema` is a FORCED TOOL CALL), so the error flag is the only
-    //                       thing separating a budget kill from a successful answer.
-    //   `stop_reason`     — `"tool_use"` is how the CLI surfaces a mid-turn budget termination. An `is_error`
-    //                       with any other stop reason is a different failure and keeps its existing message
-    //                       (the `end_turn` empty-result case below is a real one, reproduced twice).
-    //   `budget !== null` — with no ceiling declared there is no ceiling to have been killed by, and the
-    //                       message would have to invent a number. Both declared operations run this way.
-    //
-    // DELIBERATELY NOT PART OF THE PREDICATE: any comparison of `total_cost_usd` against `budget`. The
-    // observed kills straddle it — $0.596 against a 0.5 ceiling is over, and a kill recorded at or just under
-    // its ceiling is equally possible since the CLI stops the turn rather than the billing. Gating on an
-    // inequality that is not guaranteed would silently drop the case back into the unlabelled branch, which is
-    // the exact failure this exists to end. The two numbers are REPORTED, not used as the test.
-    if (parsed.stop_reason === 'tool_use' && budget !== null) {
-      throw new JudgeBudgetError({
-        budget,
-        costUsd: typeof parsed.total_cost_usd === 'number' ? parsed.total_cost_usd : 0,
-        stopReason: parsed.stop_reason,
-        result: parsed.result ?? '',
-        stderr,
-      });
-    }
     if (parsed.result) {
       // The CLI's OWN error text, verbatim — never reworded.
       const error = new Error(`judge-spawn: the juror failed: ${parsed.result}`);
@@ -1034,6 +1025,7 @@ export async function judgeSpawn({
         const error = new Error(`juror process failed (exit ${code ?? 'none'}, signal ${signal ?? 'none'})`);
         error.unparseableStdout = true;
         error.verdictIntegrity = true;
+        error.processFailed = true;
         throw error;
       }
     } catch (error) {
@@ -1047,14 +1039,14 @@ export async function judgeSpawn({
         stdoutBytes: stdout.length, stderrTail: stderr.trim().slice(-1000), wallMs: thisAttemptMs,
         ...(reason ? { reason } : {}),
       });
-      if (attempt < total) {
+      if (!error.processFailed && attempt < total) {
         const snippet = stderrSnippet(stderr);
         const nextSid = retrySessionId(sid, attempt + 1);
         log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
         continue;
       }
       throw new JudgeUnparseableError({
-        attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts, reason,
+        attempt, attempts: error.processFailed ? attempt : total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts, reason,
       });
     }
     return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
