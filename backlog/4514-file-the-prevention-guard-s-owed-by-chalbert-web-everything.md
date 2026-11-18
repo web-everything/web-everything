@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "42f196507bc96376405269b0b7b192e31777eab7"
+preparedDate: "2026-11-18"
+preparedAgainstSha: "0a352384aeb4e89efbe57fbf54c2c7230bab7e00"
 tags: []
 ---
 
@@ -15,56 +15,65 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs` — Add deterministic CLI coverage with fresh positive and negative cached verdicts: bypass ignores both, refreshes at most two pending IDs per tick, rotates through the stale population, persists successful fresh results, and replays them on a later ordinary tick. Preserve unrelated cache entries. See the premise correction below.
+1. `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs` — Add deterministic CLI coverage with fresh positive and negative cached verdicts: bypass ignores both, refreshes at most two pending IDs per tick, rotates through the stale population, preserves the seeded verdict store during bypass, and replays it on a later ordinary tick. Separately prove ordinary refresh persists successful fresh results while preserving unrelated cache entries. See the premise correction below.
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2969@8463550d6c465421ffda6fc27904cd2ee6d97f9c
 
 ## Progress
 
-Preparation research found factual drift; the prevention goal remains seeded-cache bypass regression coverage.
-
-- **Old premise/scope:** the cited test at line 163 was expected to prove all stale IDs are queried inline, fresh results affect that invocation, and bypass leaves the whole store unchanged. Scope was the single integration test file.
-- **Corrected premise/scope:** commit `230098d70c6e0e3cdd602f1268c8610f2a416f46` replaced inline enrichment with bounded background refresh. Bypass skips cache reads, not worker writes; successful results affect a subsequent non-bypass tick. Every eligible unknown ID is reached across successive settled refreshes, not within one invocation. Scope remains test-only in `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs`; its local fixture helpers can change in the same file. No production source edit is required or included, so no source/test pairing is missing from scope.
-- **Evidence:** `we:scripts/readiness/dispatch-plan.mjs:901` begins the local-first enrichment; the bypass condition at line 919 suppresses cached verdicts and line 932 starts background refresh. `we:scripts/readiness/already-done-refresh.mjs` defines the two-check ceiling, round-robin selection by attempts, and successful cache writes in `refreshAlreadyDone`. `we:scripts/readiness/already-done-cache.mjs` merges checked verdicts while preserving other entries.
-- **Remaining gap:** `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs:142` starts bypass coverage with an empty store and also sets negative cooldown to zero. The positive replay test starts at line 154; the old line 163 citation now points inside that different test. Neither tests bypass against fresh positive AND negative seeds with normal cooldowns. The existing guard therefore does not deliver this item's corrected goal.
-
-- **Observed baseline:** the targeted Vitest run of `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs` passed all six existing tests during preparation. This establishes the current baseline, not coverage of the missing seeded-bypass case.
+- **Old premise/scope:** the prior preparation specified write-through bypass refreshes and subsequent replay of reversed verdicts, in one integration test file. Its earlier all-ID inline premise was already obsolete.
+- **Corrected premise/scope:** commit `a3654f7046` (PR #3215) made bypass read-only for verdict storage. The current caller passes `readOnly: Boolean(flags['no-already-done-cache'])` at `we:scripts/readiness/dispatch-plan.mjs:1052`; the worker suppresses writes at `we:scripts/readiness/already-done-refresh.mjs:106`. Preserve the original seeded-cache prevention goal, but assert unchanged verdict storage during bypass. Exercise persistence separately through ordinary refresh with expired seeds. Scope remains solely `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs`.
+- **Current source evidence:** cache reads are bypassed at `we:scripts/readiness/dispatch-plan.mjs:1039`. Selection is capped at two and ordered by last attempt at `we:scripts/readiness/already-done-refresh.mjs:11` and `we:scripts/readiness/already-done-refresh.mjs:16`; attempts are recorded even in read-only mode at `we:scripts/readiness/already-done-refresh.mjs:104`. Unknown shallow history returns no verdict at `we:scripts/readiness/already-done-refresh.mjs:51`. Successful ordinary writes merge entries through `we:scripts/readiness/already-done-cache.mjs:62`.
+- **Remaining gap:** `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs:142` combines an empty cache with zero negative cooldown. The read-only bypass test at `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs:154` also starts empty. Positive replay now starts at `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs:171`. None combines fresh positive and negative seeds, both queue populations, contradictory remote results, rotation, and preservation. This goal is not already delivered.
+- **Estimate:** retain story size 3 (old 3 → new 3). One file, approximately 120–170 changed lines for fixture parameters, seed/assertion helpers and two integration scenarios, grounded in the fixture at `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs:50`, CLI wrapper at `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs:106`, and existing refresh tests. No production touch set or dependency change is needed.
+- **Verification provenance:** the earlier preparation recorded six passing tests. That is historical evidence, not a current run; the current file has eight generated cases. This preparation inspects source and authors the card only; execution and mutation proof below belong to implementation. Existing preparation stamps are left for the runner.
 
 ## Design
 
-Extend `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs` using its real CLI, local shallow git repository, fake GitHub host, isolated cache, and refresh-lock settlement helpers. Parameterize the fixture locally to create two ready IDs (8000, 8001) and two blocked/not-ready IDs (8100, 8101), retaining current defaults for existing tests. Shallow history deliberately prevents local negative evidence from short-circuiting the network scenario.
+Extend only `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs`. Parameterize `buildFixture` with ready and not-ready counts, preserving its defaults of 60 and 10 and the existing callers. Use two ready IDs (8000, 8001) and two blocked IDs (8100, 8101), shallow history, the real CLI, isolated fake host/throttle state, and the existing bounded lock-settlement helper. Keep scratch fixtures under the task's `TMPDIR`.
 
-Seed fresh positives for 8000 and 8100 and fresh negatives for 8001 and 8101, with normal positive and negative cooldowns explicitly supplied to avoid inherited environment overrides. Add an unrelated sentinel cache entry outside the fixture queue. Use valid merged PR responses for 8001 and 8101 and no matches for 8000 and 8100: fresh results deliberately reverse both signs in both populations. The existing host can return both PRs; production title filtering selects the matching ID. Include matching numeric titles, merged state, implementation branch names, URLs and non-documentation changed-file metadata accepted by `we:scripts/operations/dispatch-lane-io.mjs`'s `filterAlreadyDoneCandidates`.
+Seed fresh positives for 8000 and 8100 and fresh negatives for 8001 and 8101, plus an unrelated sentinel. Pin the production cooldown values explicitly through both environment overrides: positive 86400000 ms and negative 1800000 ms, as defined at `we:scripts/readiness/already-done-cache.mjs:16`. Validate freshness with `getCachedVerdict` before the first invocation. Return merged implementation PRs for 8001 and 8101 and no matching PRs for 8000 and 8100. Provide numeric titles, URLs, implementation branch names and non-documentation file metadata accepted by `filterAlreadyDoneCandidates` at `we:scripts/operations/dispatch-lane-io.mjs:3260`.
 
-Invoke the CLI through `fixtureRun` with `--no-already-done-cache`. Assert `groundTruth.cached` is zero, all four IDs remain pending with shallow history, and neither seeded positive creates an `already-done` hold. After each invocation await `waitRefresh` before inspecting calls or cache state. Two successive bypass ticks must select two disjoint pairs and make exactly one metered search per fixture ID overall. Refreshed results are persisted even in bypass mode; retain the sentinel exactly and preserve unselected entries until their refresh occurs. Run a final ordinary tick to prove the new positives hold both ready and not-ready rows, the former positives lose their already-done holds, and no further search is needed. Other readiness holds are allowed: absence of `already-done` does not imply dispatch eligibility.
+Run two settled bypass ticks. Each must report zero cached verdicts, four pending IDs, no already-done holds, and exactly two selected/search IDs. The pairs must be disjoint and together equal the four fixture IDs. Inspect actual GraphQL search arguments, not only call counts. Compare the entire verdict file byte-for-byte with the seed after each settled tick. Attempts and diagnostic sidecars may change. An ordinary third tick must replay the original positives for both populations, consume all four cached verdicts, and issue no searches: bypass results were deliberately not persisted.
 
-No new interface, schema, policy or migration is involved. Deliver as one test-only change; retained size 3 covers asynchronous fixture orchestration and mutation proof.
+Use a separate ordinary-refresh scenario with the same contradictory results but expired seeds. Two settled ordinary ticks refresh all four IDs; selected entries reverse signs, unselected entries and the sentinel remain deeply equal, and fresh results replay on the third tick without more searches. Results belong to subsequent plans, never the initiating plan. Absence of an already-done hold does not promise dispatch eligibility.
+
+No production defaults, interfaces or fail-closed policy change. Retain the existing unavailable-cache test: it reports an error and pending checks without inline network IO. Incomplete local evidence remains unknown; this story must not invent a dispatch-blocking policy.
 
 ## MVP
 
-1. **Must 1:** Seed genuinely fresh positive and negative verdicts for both ready and not-ready populations, plus an unrelated sentinel; use normal nonzero cooldowns.
-2. **Must 2:** Prove bypass ignores both signs and preserves the two-search ceiling while successive settled ticks cover every eligible fixture ID exactly once.
-3. **Must 3:** Prove successful refresh overwrites selected verdicts, preserves unselected/unrelated entries, and an ordinary subsequent tick applies the reversed results to both populations without new searches.
-4. **Must 4:** Retain existing integration coverage and isolate all subprocesses, throttle state, git fixtures and cache files; await refresh settlement before cleanup even on assertion failure.
+1. Add the fresh mixed-seed bypass regression across both queue populations with nonzero cooldowns, exact bounded rotation, unchanged verdict bytes and ordinary replay of original seeds.
+2. Add the expired mixed-seed ordinary-refresh regression covering successful replacement, unrelated/unselected preservation and later replay.
+3. Preserve fixture defaults and all eight existing cases. Await refresh settlement before inspections and cleanup, including assertion-failure cleanup; nest cleanup in `finally` so host/fixture cleanup still occurs if settlement throws.
 
-## Done when
+## Acceptance
 
-1. Musts 1–3 are asserted by a named seeded-bypass regression in `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs`, including exact queried-ID sets and cache contents rather than only total call counts.
-2. Must 4 and the full targeted suite pass. From the WE checkout, run `npx vitest run` with `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs` as the target (strip the `we:` repository marker for the shell argument).
-3. The new regression fails when the bypass cache-read suppression is removed, then passes after restoring production code; record the failing assertion and restored passing command. This is a test-debt item: unchanged production code should already satisfy the new assertions, so an unmodified-before/after red-to-green claim would be misleading.
+For every executable line below, the named test lives in `we:scripts/readiness/__tests__/dispatch-plan-already-done-bounded-spawn.test.mjs`. Define command T as the host-queued targeted Vitest run: invoke `node` on `we:scripts/readiness/heavy-admission.mjs` with `run --wait-ms=60000 -- npx vitest run` and that test file. Repository markers identify paths; strip `we:` when supplying shell arguments. If admission stays busy after this one wait, stop and report it.
+
+The executable acceptance probe first requires the named new test to exist (`rg -q -F` with its exact name and the scoped file), then runs T. This presence check fails before the guard is built and the combined probe must pass afterward. Production behavior already exists; no claim is made that unchanged production should fail the new tests. Mutation proof below establishes regression sensitivity.
+
+- [A1] Executable: presence probe for `fresh mixed seeds bypass reads and preserve verdict bytes across bounded rotation`, then T. Assert freshness, zero cached/four pending, no seeded-positive holds, two searches per settled tick, exact disjoint ID sets, and unchanged complete verdict bytes including sentinel. Shallow history must stay unknown rather than being fabricated into a local negative.
+- [A2] Executable: the A1 presence probe, then T. In that named test assert a subsequent ordinary tick caches all four original seeds, holds the original positive IDs in both populations, excludes negative IDs from already-done holds, and adds zero searches.
+- [A3] Executable: presence probe for `ordinary mixed seeds refresh persists replacements and preserves unrelated entries`, then T. Assert expired seeds are refreshed two at a time, successful results reverse both signs, untouched entries remain equal, and later ordinary replay uses all four fresh results with no additional searches.
+- [A4] Executable: both new-test presence probes, then T over the entire scoped file. Retain the eight existing cases, including `unwritable cache exposes pending checks without crashing or doing inline network IO` and `--no-ground-truth makes zero gh spawns and starts no refresh`. Existing callers retain 60/10 defaults and the 70-pending assertion. New cases use isolated state and settle workers before cleanup.
 
 ## Test plan
 
-Implement the fixture sizing and seeded scenario in the scoped test file, then run its full Vitest suite. Verify fresh timestamps through `getCachedVerdict` from `we:scripts/readiness/already-done-cache.mjs` or equivalent explicit freshness assertions before invoking the CLI. Parse the fake host's actual GraphQL search arguments to compare queried IDs against each reported refresh pair and the complete four-ID set. Inspect cache JSON only after lock settlement; compare verdict signs and PR identities and verify timestamps remain valid. Compare untouched entries deeply, rather than requiring byte-identical whole-file serialization after a legitimate write.
+Implement the named cases and local helpers in the scoped test file. Run only command T through the host heavy queue. Compare per-tick queried IDs with reported refresh IDs, and compare final ID sets exactly. Read cache state only after worker settlement. Validate PR identity as well as verdict signs and timestamps; compare parsed entries for legitimate ordinary writes, byte equality for bypass. Keep existing large-queue and zero-cooldown coverage intact. Use no external GitHub or shared conveyor state.
 
-Use contradictory seeds/results to expose accidental replay. Avoid timing sleeps as correctness evidence, external GitHub, real conveyor state, or assumptions that worker results appear in the initiating plan. Keep the existing large-queue and zero-cooldown tests.
+For the ordinary scenario, make seed ages exceed the respective production cooldowns explicitly. Keep the sentinel outside the queue and unchanged throughout. Verify the first plan has pending evidence and the final plan replays all refreshed entries, without assuming asynchronous work completed before CLI output.
 
 ## Proof plan
 
-During implementation, capture the new named test passing on the actual CLI. Temporarily remove only the bypass conditional in `we:scripts/readiness/dispatch-plan.mjs` so fresh cache entries are read despite the flag; the seeded regression must fail on cache count, pending count or stale positive holds. Restore immediately. Separately suppress the cache write in `we:scripts/readiness/already-done-refresh.mjs`; the new regression must fail on refreshed cache contents or subsequent replay. Restore immediately; these mutation targets are proof-only and must not enter the delivered diff.
+During implementation, capture the acceptance presence checks failing before adding the new tests and passing afterward with command T. Then use temporary, separately restored mutations to prove assertions detect regressions:
 
-Record the failing assertions and final clean targeted-suite result. Runner-owned preparation checks and independent parked review remain separate from this implementation proof; this preparation does not stamp or claim build completion.
+1. Remove bypass cache-read suppression at `we:scripts/readiness/dispatch-plan.mjs:1039`: A1 must fail on cache counts, pending IDs or positive holds.
+2. Force `readOnly: false` at `we:scripts/readiness/dispatch-plan.mjs:1052`: A1 must fail on verdict bytes and A2 on original-seed replay.
+3. Change the selection ceiling at `we:scripts/readiness/already-done-refresh.mjs:11` to three, then separately ignore attempts in selection at `we:scripts/readiness/already-done-refresh.mjs:16`: A1 must reject the oversized pair and repeated IDs respectively.
+4. Suppress successful writes at `we:scripts/readiness/already-done-refresh.mjs:106`: A3 must fail on replacement/replay. Separately replace the merge input with an empty cache: A3 must fail on sentinel/unselected preservation.
+
+Run the affected named test through command T with Vitest's test-name filter for each mutation; restore before the next mutation. Record exact failed assertions and the final restored full-file result. Mutations are implementation-time proof only, never part of the delivered diff or this preparation. Use the host queue for every run and respect its single-wait rule. Runner-owned checks and independent review remain separate.
 
 ## Follow-ups
 
-None required for the corrected prevention guard. Restoring all-ID inline queries or read-only bypass storage would change the currently shipped contract and is outside this test-only story. If implementation reveals a production defect, report the exact failed invariant and amend scope with matching source/test paths before changing production behavior.
+None required. Reintroducing write-through bypass or all-ID inline queries would change shipped behavior and is outside this test-only guard. If implementation finds a production defect, report the failed invariant and revise the touch set with matching source/test coverage before expanding the implementation. No blockedBy changes are proposed.
