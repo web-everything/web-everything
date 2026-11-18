@@ -395,6 +395,14 @@ describe('overlay main sync', () => {
 
   it.each([
     [1, remoteUnconfirmed],
+    [75, 'host overloaded; 480s wait exhausted'],
+    [1, 'heavy-admission timed-out'],
+    [1, 'heavy-admission timed out'],
+    [1, 'heavy-command admission: run exceeded 480000ms and was stopped.'],
+    [1, 'FAIL worker0.test.mjs > rejects remote-timeout response'],
+    [1, 'FAIL worker0.test.mjs > heavy-admission: remote-timeout'],
+    [1, '', 'heavy-admission: remote-timeout'],
+    [1, '', 'FAIL worker0.test.mjs > rejects remote-timeout response'],
   ])('keeps test failure handling for other status/stderr combinations (%s, %s)', async (status, stderr, stdout = '') => {
     const f = fixture({ exhausted: true });
     f.deps.testRunner = async () => ({ status, stderr, stdout });
@@ -408,22 +416,25 @@ describe('overlay main sync', () => {
     [124, 'ordinary timeout'],
     [124, '', remoteUnconfirmed],
     [1, 'heavy-admission: remote-timeout'],
-    [75, 'host overloaded; 480s wait exhausted'],
-    [1, 'heavy-admission timed-out'],
-    [1, 'heavy-admission timed out'],
-    [1, 'heavy-command admission: run exceeded 480000ms and was stopped.'],
-  ])('records admission timeout without consuming persisted failure state (%s, %s)', async (status, stderr, stdout = '') => {
+    [75, 'queue diagnostics\nheavy-admission: 480s wait exhausted'],
+    [1, 'heavy-admission: timed-out'],
+    [1, 'heavy-admission: timed out'],
+    [1, 'heavy-admission: run exceeded 480000ms and was stopped.'],
+    [null, '', '', Object.assign(new Error('spawn timed out'), { code: 'ETIMEDOUT' })],
+  ])('records admission timeout through persisted failure state (%s, %s)', async (status, stderr, stdout = '', error) => {
     const f = fixture({ exhausted: true }), outcomes = [];
     ageFailure(f);
-    const before = json(sidecar(f));
+    const firstFailureAt = json(sidecar(f)).firstFailureAt[ref];
     f.deps.appendDaemonEvent = e => outcomes.push(e);
-    f.deps.testRunner = vi.fn(async () => ({ status, stderr, stdout }));
+    f.deps.testRunner = vi.fn(async () => ({ status, stderr, stdout, error }));
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-    expect(await job(f)).toEqual({ pushed: false, step: 'tests', status: 'timeout' });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', status: 'timeout' });
     expect(f.deps.testRunner).toHaveBeenCalledOnce();
-    expect(json(sidecar(f))).toEqual(before);
-    expect(f.pushes).toEqual([]); expect(alerts(f)).toEqual([]);
-    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
+    attempted(f);
+    expect(json(sidecar(f)).firstFailureAt[ref]).toBe(firstFailureAt);
+    expect(json(sidecar(f)).failureReason[ref]).toContain('heavy-admission timeout');
+    expect(f.pushes).toEqual([]); expect(alerts(f)).toHaveLength(1);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
     expect(outcomes).toEqual([{ kind: 'overlay-main-sync-timeout', detail: expect.objectContaining({ step: 'tests', status: 'timeout' }) }]);
     expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-chunk-timing',
       chunkIndex: 1, files: 2, wallMs: expect.any(Number), outcome: 'timeout', attempt: 'initial' }));
@@ -438,6 +449,21 @@ describe('overlay main sync', () => {
     attempted(f);
     expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-chunk-timing',
       outcome: 'failure', files: 2, chunkIndex: 1, wallMs: expect.any(Number) }));
+  });
+
+  it.each([[1, 480000], [11, 720000], [24, 1200000]])('bounds the default admission budget for %s dependent tests at %s ms', async (count, expected) => {
+    const f = fixture({ count });
+    delete f.env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS;
+    await job(f);
+    expect(f.deps.testRunner.mock.calls[0][0].env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS).toBe(String(expected));
+  });
+
+  it('ignores timeout phrases in an error message without ETIMEDOUT', async () => {
+    const f = fixture({ exhausted: true });
+    f.deps.testRunner = async () => ({ status: 1, stdout: '', stderr: '', error: new Error('heavy-admission: remote-timeout') });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', message: expect.stringContaining('operator review required') });
+    attempted(f);
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-chunk-timing', outcome: 'failure' }));
   });
 
   it.each([undefined, '2400000', '1000'])('preserves the operator admission timeout override %s and a consistent wait', async override => {
@@ -803,12 +829,14 @@ describe('overlay main sync', () => {
     expect(fs.existsSync(marker(f))).toBe(false); unchanged(f);
   });
 
-  it('non-conflict failures schedule exactly three retries at 10, 20 and 30 minutes then remember main', async () => {
+  it.each(['test failure', 'admission timeout'])('%s schedules exactly three retries at 10, 20 and 30 minutes then remembers main and alerts', async kind => {
     const f = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
-    f.deps.testRunner = vi.fn(async () => ({ status: 1, stdout: '', stderr: 'temporary failure' }));
+    const timeout = kind === 'admission timeout';
+    const reason = timeout ? /heavy-admission timeout/ : /command failed/;
+    f.deps.testRunner = vi.fn(async () => ({ status: timeout ? 124 : 1, stdout: '', stderr: 'temporary failure' }));
     const spawnFn = spawner();
     for (const [index, delay] of [10, 20, 30].entries()) {
-      await expect(job(f)).rejects.toThrow(/command failed/);
+      await expect(job(f)).rejects.toThrow(reason);
       const retry = json(sidecar(f));
       expect(retry.attemptedMain[ref]).toBeUndefined();
       expect(retry.retryMain[ref]).toBe(f.mainSha);
@@ -821,8 +849,10 @@ describe('overlay main sync', () => {
       expect(tick(f, { spawnFn }).started).toEqual([ref]);
       fs.unlinkSync(marker(f));
     }
-    await expect(job(f)).rejects.toThrow(/command failed/);
+    await expect(job(f)).rejects.toThrow(reason);
     attempted(f);
+    expect(json(sidecar(f)).firstFailureAt[ref]).toBe(1_800_000_000_000);
+    expect(json(sidecar(f)).failureReason[ref]).toMatch(reason);
     expect(f.deps.testRunner).toHaveBeenCalledTimes(4);
     expect(spawnFn).toHaveBeenCalledTimes(3);
     expect(tick(f, { spawnFn }).started).toEqual([]);

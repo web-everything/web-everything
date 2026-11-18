@@ -348,6 +348,19 @@ describe('overlay main sync failed-file reruns', () => {
     noPublication(f);
   });
 
+  it('a main-comparison admission timeout retains the observed overlay test failure and attention', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed']);
+    f.deps.mainTestRunner = vi.fn(async () => ({ status: 124, stdout: '', stderr: 'heavy-admission: remote-timeout' }));
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    expect(f.outcomes).toContainEqual(expect.objectContaining({ kind: 'overlay-main-sync-failed',
+      detail: expect.objectContaining({ step: 'tests', reason: expect.stringContaining(failure) }) }));
+    expect(f.outcomes.map(event => event.kind)).not.toContain('overlay-main-sync-timeout');
+    expect(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain('needs-you');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    noPublication(f);
+  });
+
   it.each(['missing', 'empty'])('not-executed evidence on rerun (%s) is not a pass', async evidence => {
     const f = fixture(); runners(f, ['failed', evidence]);
     await expect(job(f)).rejects.toThrow(failure);

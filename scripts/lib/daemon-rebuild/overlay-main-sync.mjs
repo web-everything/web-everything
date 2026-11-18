@@ -557,6 +557,7 @@ export function overlayRelatedTestCap(env = {}) {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 150;
 }
 const TEST_LIST_MAX_BUFFER = 8 * 1024 * 1024;
+const SYNC_CHUNK_TIMEOUT_CEILING_MS = 20 * 60_000;
 async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
   let result;
   try {
@@ -581,10 +582,11 @@ async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
 }
 
 function buildSyncHeavyTestInvocation({ root, scratch, selected, testReport, env, io }) {
-  // Include contention headroom per file, capped at twenty minutes. The operator can
-  // override this through admission's existing environment setting.
+  // The previous fixed eight-minute budget also covered queue wait. Include
+  // contention headroom per file, capped at twenty minutes; the existing
+  // operator environment override takes precedence over this default ceiling.
   const timeoutMs = env[FAST_RUN_TIMEOUT_ENV] !== undefined ? resolveFastRunTimeoutMs(env)
-    : Math.min(20 * 60_000, Math.max(DEFAULT_FAST_RUN_TIMEOUT_MS, selected.length * 60_000));
+    : Math.min(SYNC_CHUNK_TIMEOUT_CEILING_MS, Math.max(DEFAULT_FAST_RUN_TIMEOUT_MS, selected.length * 60_000));
   const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport,
     env: { ...env, [FAST_RUN_TIMEOUT_ENV]: env[FAST_RUN_TIMEOUT_ENV] ?? String(timeoutMs) }, io });
   invocation.args = invocation.args.map(arg => arg.startsWith('--wait-ms=') ? `--wait-ms=${Math.max(540_000, timeoutMs)}` : arg);
@@ -598,8 +600,8 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   const result = await (runner ?? (options => runHeavyTests(options, { io })))(invocation);
   if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
   if (result?.status === 124 || result?.error?.code === 'ETIMEDOUT'
-    || ((result?.status !== 0 || result?.error) && /remote-timeout|wait exhausted|(?:heavy-admission|heavy-command admission)[^\r\n]*(?:timed[ -]?out|run exceeded \d+ms)/i.test(
-      `${result?.stdout ?? ''}\n${result?.stderr ?? ''}\n${result?.error?.message ?? ''}`))) {
+    || ((result?.status !== 0 || result?.error)
+      && /^heavy-admission:[^\r\n]*(?:remote-timeout|wait exhausted|timed[ -]?out|run exceeded \d+ms)/im.test(result?.stderr ?? ''))) {
     throw Object.assign(new Error('heavy-admission timeout; retry on a later sync tick'),
       { step: 'tests', status: 'timeout', stderrTail: testStderrTail(result) });
   }
@@ -702,7 +704,8 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
   };
   const failureEvent = async error => {
     const detail = { ref, step: error.step ?? step, stderrTail: error.stderrTail ?? '', main: main ?? null };
-    await outcome(root, env, ref, 'failed', { ...detail, reason: error.message }, deps);
+    await outcome(root, env, ref, error.status === 'timeout' ? 'timeout' : 'failed',
+      { ...detail, ...(error.status === 'timeout' ? { status: 'timeout' } : {}), reason: error.message }, deps);
   };
   const lock = marker(root, env, ref);
   const clone = cloneLock(root, env);
@@ -883,8 +886,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
           && evidence.failedAssertions.every(identity => identity !== null)
           && comparison.complete && comparison.failedAssertions.every(identity => identity !== null)
           && coveredWithMultiplicity(evidence.failedAssertions, comparison.failedAssertions);
-      } catch (error) {
-        if (error.status === 'timeout') throw error;
+      } catch {
         // Unknown main evidence must retain the ordinary operator-review failure.
       }
       setStep('tests');
@@ -940,15 +942,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     return { pushed: true, ref, from, to, tests };
   } catch (cause) {
     if (cause.transientGit && !mergeConflict) return await skip('transient-git');
-    if (cause.status === 'timeout') {
-      await outcome(root, env, ref, 'timeout', { step: 'tests', status: 'timeout', main,
-        reason: cause.message, stderrTail: cause.stderrTail }, deps);
-      return { pushed: false, step: 'tests', status: 'timeout' };
-    }
     const failedStep = cause.step ?? step;
     const message = cleanText(cause.message ?? cause);
     const error = Object.assign(new Error(message.startsWith(`${failedStep}: `) ? message : `${failedStep}: ${message}`),
-      { step: failedStep, stderrTail: cause.stderrTail ?? '' });
+      { step: failedStep, stderrTail: cause.stderrTail ?? '',
+        ...(cause.status === 'timeout' ? { status: 'timeout' } : {}) });
     try {
       // Publication has its own retry path; conflicts require a human immediately.
       if (main && !publicationStarted) {

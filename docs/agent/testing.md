@@ -2852,12 +2852,17 @@ in the retry helper tests.
 
 Overlay main-sync chunks already use heavy admission. Their timeout defaults to
 60 seconds per file, with an eight-minute floor and twenty-minute ceiling;
-`WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS` retains operator precedence. The queue
-wait budget must be at least that timeout. Each attempt emits
+`WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS` retains operator precedence, including above
+the default ceiling. The previous fixed eight-minute budget also covered queue
+wait. The queue wait budget must be at least that timeout. Each attempt emits
 `overlay-main-chunk-timing` with its chunk index, file count, wall time and outcome.
-Admission timeouts stop the sync with test-step status `timeout`, preserving failure
-memory and attention budgets; they never trigger flake reruns. Remote termination
-unconfirmed retains its separate skip path. Empty-origin test fixtures can emit
+Classify admission timeouts only from exit 124, `error.code === ETIMEDOUT`, or a
+timeout phrase on a stderr line beginning `heavy-admission:`; stdout and test
+titles are never timeout evidence. Timeouts fail the tests step with status
+`timeout` through the ordinary failure memory, three-retry limit, cooldowns and
+delayed attention path; they never trigger flake reruns. A main-comparison error,
+including timeout, retains the already-observed overlay test failure. Remote
+termination unconfirmed retains its separate skip path. Empty-origin test fixtures can emit
 harmless Git warnings; successful sibling-clone stderr is captured separately.
 Cover these paths in `daemon-rebuild-overlay-main-sync.test.mjs` through heavy admission.
 
