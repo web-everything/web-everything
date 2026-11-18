@@ -8,7 +8,9 @@ const fixturePrimitives = ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile',
 export function findAgentLaunches(sources) {
   return scanAgentLaunches(Object.fromEntries(Object.entries(sources).map(([name, text]) => {
     const file = ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    const declared = new Set();
+    const declared = new Set(), used = new Set();
+    const collect = node => { if (ts.isIdentifier(node) && !(ts.isPropertyAccessExpression(node.parent) && node.parent.name === node)) used.add(node.text); ts.forEachChild(node, collect); };
+    collect(file);
     const names = node => {
       if (!node) return;
       if (ts.isIdentifier(node)) declared.add(node.text);
@@ -26,9 +28,9 @@ export function findAgentLaunches(sources) {
         if (bindings && ts.isNamedImports(bindings)) for (const s of bindings.elements) names(s.name);
       }
     }
-    const implicit = fixturePrimitives.filter(n => !declared.has(n));
+    const implicit = fixturePrimitives.filter(n => used.has(n) && !declared.has(n));
     const imports = implicit.length ? `import {${implicit.map(n => /^(?:run|runFn|spawnFn)$/.test(n) ? `spawn as ${n}` : n).join(',')}} from 'node:child_process';\n` : '';
-    const namespaces = ['cp', 'child_process', 'childProcess'].filter(n => !declared.has(n))
+    const namespaces = ['cp', 'child_process', 'childProcess'].filter(n => used.has(n) && !declared.has(n))
       .map(n => `import * as ${n} from 'node:child_process';\n`).join('');
     return [name, imports + namespaces + text];
   })));

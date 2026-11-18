@@ -5,10 +5,10 @@ import { findAgentLaunches } from './fixtures/agent-launch-source.mjs';
 import { AGENT_LAUNCH_ALLOWLIST, findAgentLaunches as scanAgentLaunches, readAgentLaunchTree } from '../lib/agent-launch-structure.mjs';
 
 
-// Conservative may-execute scan, paired with the runtime assertion in agent-launch.mjs.
+// Capability boundary, paired with the runtime assertion in agent-launch.mjs.
 const root = resolve(import.meta.dirname, '../..');
-// Production migration evidence pins each file's complete sorted call inventory and exact count.
-// Hashing keeps opaque-callee evidence reviewable in size; there is no filename-only exemption.
+// Production migration evidence pins each approved file's whole-module fingerprint.
+// Membership is separate: a snapshot update cannot approve another capability-bearing file.
 function migrationEvidence(findings) {
   const grouped = new Map();
   for (const row of launchInventory(findings)) {
@@ -22,8 +22,8 @@ function migrationEvidence(findings) {
 }
 
 function launchInventory(findings) {
-  // Parse failures have no call kind and must never be exempted.
-  expect(findings.filter(f => !f.kind), 'scanner must establish every call kind').toEqual([]);
+  // Parse failures have no inventory kind and must never be exempted.
+  expect(findings.filter(f => !f.kind), 'scanner must establish complete module evidence').toEqual([]);
   const counts = new Map();
   for (const finding of findings) {
     expect(finding).toMatchObject({ classification: expect.stringMatching(/^(resolved|unresolved)$/), fingerprint: expect.any(String) });
@@ -36,7 +36,7 @@ function launchInventory(findings) {
 }
 function assertAllowlist(findings, allowlist) {
   const inventory = launchInventory(findings);
-  expect(inventory, 'update the migration allowlist: new bypass or stale exemption').toEqual(allowlist);
+  expect(inventory, 'approved module changed: complete source review required').toEqual(allowlist);
 }
 
 describe('single agent launch boundary', () => {
@@ -45,8 +45,8 @@ describe('single agent launch boundary', () => {
       "spawn('custom-wrapper', ['claude'])", "spawn('echo x; claude', [], {shell:true})",
       "exec('echo x; claude')", "execSync('echo x; codex')",
       "spawn('custom', ['echo x; codex'], {shell:true})"].map(source => ({ name: `R37.6 literal agent word: ${source}`, source, refused: true })),
-    { name: 'R37.6 unrelated literal wrapper control', source: "spawn('npx', ['unrelated-tool'])" },
-    { name: 'R37.6 agent name substring control', source: "spawn('custom', ['claude-tools', 'mycodex'], {shell:true})" },
+    { name: 'R37.6 unrelated literal wrapper now requires boundary', source: "spawn('npx', ['unrelated-tool'])", refused: true },
+    { name: 'R37.6 agent name substring now requires boundary', source: "spawn('custom', ['claude-tools', 'mycodex'], {shell:true})", refused: true },
     ...["clau'de'", 'co"dex"', 'clau\\de', 'cla*de', 'co?ex', 'cla[up]de', 'co{d,d}ex',
       '$tool', '${tool}', '$(printf tool)', '`printf tool`'].flatMap(command => {
       const script = JSON.stringify(`${command} --resume unchecked-id`);
@@ -60,9 +60,9 @@ describe('single agent launch boundary', () => {
       ].map(source => ({ name: `R37.12 shell text: ${source}`, source, refused: true }));
     }),
     { name: 'R37.12 wholly quoted agent command', source: 'spawn("sh", ["-c", "\\"claude\\" --resume unchecked-id"])', refused: true },
-    { name: 'R37.12 literal unrelated shell command control', source: "spawn('sh', ['-c', 'git status --short'])" },
-    { name: 'R37.12 wholly quoted unrelated shell command control', source: 'exec("\\"git\\" status")' },
-    { name: 'R37.12 shell syntax in direct argv control', source: 'spawn("git", ["$tool", "*", "{a,b}", "clau\\\'de\\\'"])' },
+    { name: 'R37.12 literal unrelated shell command now requires boundary', source: "spawn('sh', ['-c', 'git status --short'])", refused: true },
+    { name: 'R37.12 wholly quoted unrelated shell command now requires boundary', source: 'exec("\\"git\\" status")', refused: true },
+    { name: 'R37.12 shell syntax in direct argv now requires boundary', source: 'spawn("git", ["$tool", "*", "{a,b}", "clau\\\'de\\\'"])', refused: true },
     ...[
       "import {spawn as start} from 'node:child_process'; start('claude',[])",
       "import {spawn} from 'child_process'; const start=spawn; start('claude',[])",
@@ -81,7 +81,6 @@ describe('single agent launch boundary', () => {
       "function factory(){return spawn} factory()('claude',[])",
       "function factory(){return () => spawn} const start=factory()(); start('git',[])",
       "function invoke(start){start('git',[])} invoke(spawn)",
-      "const start = opaque(); start('git',[])",
       "function factory(){return spawn}",
       "function store(){ const saved=spawn; }",
       "function store(){ const {spawn:start}=cp; }",
@@ -89,24 +88,21 @@ describe('single agent launch boundary', () => {
       "export const start=spawn",
       "export {spawn as start} from 'node:child_process'",
       "function invoke(){ const saved={start:spawn}; return saved; }",
-      "function relay(start){ return () => start('git',[]) }",
       "const registry={}; registry.start=spawn; registry.start('git',[])",
       "import cp from 'node:child_process'; const other=cp; other.spawn=opaque; cp.spawn('git',[])",
       "const start=flag?spawn:console.log; function factory(){return start}",
-      "function invoke(start=console.log){start('git',[])}",
       "(flag ? spawn : opaque())('git',[])",
       "function invoke(start=spawn){start('git',[])}",
       "const start=spawn; export function factory(){return start}",
-      "function pure(){return 'ok'} const start=opaque(pure); start('git',[])",
     ].map(source => ({ name: `R37.10 opaque callee or primitive escape: ${source}`, source, refused: true })),
     { name: 'R37.10 factory and returned callee each require review even for git',
       source: "function factory(){return spawn} const start=factory(); start('git',[])",
-      potentialKinds: ['factory', 'start'], escape: true, refused: true },
+      refused: true },
     { name: 'R37.10 passed parameter callee requires review even for git',
       source: "function invoke(start){start('git',[])} invoke(spawn)",
-      potentialKinds: ['start', 'invoke'], escape: true, refused: true },
+      refused: true },
     { name: 'R37.10 passing a reference is itself a finding',
-      source: "function pass(){console.log(spawn)}", escape: true, refused: true },
+      source: "function pass(){console.log(spawn)}", refused: true },
     { name: 'R37.10 unbound primitive-name callee', source: "spawn('git',[])", bare: true, refused: true },
     { name: 'R37.10 unbound namespace-name callee', source: "cp.spawn('git',[])", bare: true, refused: true },
     { name: 'R37.10 local unrelated function control', source: "function start(){return 'ok'} start('claude',[])" },
@@ -139,8 +135,8 @@ describe('single agent launch boundary', () => {
       "import launch from 'unknown-package'; launch('git'); launch('claude')",
     ].map(source => ({ name: `R37.15 imported agent argument: ${source}`, source, refused: true })),
     { name: 'R37.15 benign builtin positive control', source: "import {basename} from 'node:path'; basename('claude')" },
-    { name: 'R37.15 unknown package without agent arguments control', source: "import launch from 'unknown-package'; launch('git',[])" },
-    { name: 'R37.15 agent substring control', source: "import launch from 'unknown-package'; launch('claude-tools',['mycodex'])" },
+    { name: 'R37.15 unknown package without agent arguments now requires boundary', source: "import launch from 'unknown-package'; launch('git',[])", refused: true },
+    { name: 'R37.15 agent substring now requires boundary', source: "import launch from 'unknown-package'; launch('claude-tools',['mycodex'])", refused: true },
     ...[
       `const options={shell:true}; spawn(${JSON.stringify('clau\\de')},[],options)`,
       `const options={shell:true}; const alias=options; spawn(${JSON.stringify('clau\\de')},[],alias)`,
@@ -154,175 +150,18 @@ describe('single agent launch boundary', () => {
       `const options={shell:false,...other}; spawn(${JSON.stringify('clau\\de')},[],options)`,
       `const options={shell:false,[key]:true}; spawn(${JSON.stringify('clau\\de')},[],options)`,
     ].map(source => ({ name: `R37.16 bound or unknown shell options: ${source}`, source, refused: true })),
-    { name: 'R37.16 bound shell:false keeps escaped executable literal positive control',
-      source: `const options={shell:false}; spawn(${JSON.stringify('clau\\de')},[],options)` },
-    { name: 'R37.16 bound shell:false keeps argv shell syntax literal control',
-      source: `const options={shell:false}; spawn('git',[${JSON.stringify("clau'de'")}],options)` },
-    { name: 'R37.16 known empty options positive control', source: "const options={}; spawn('git',['$tool'],options)" },
-    { name: 'R37.16 literal unrelated shell command control', source: "const options={shell:true}; spawn('git',['status'],options)" },
-  ])('$name', ({ source, refused, bare, potentialKinds = [], escape }) => {
+    { name: 'R37.16 bound shell:false keeps escaped executable literal now requires boundary',
+      source: `const options={shell:false}; spawn(${JSON.stringify('clau\\de')},[],options)`, refused: true },
+    { name: 'R37.16 bound shell:false keeps argv shell syntax literal now requires boundary',
+      source: `const options={shell:false}; spawn('git',[${JSON.stringify("clau'de'")}],options)`, refused: true },
+    { name: 'R37.16 known empty options now requires boundary', source: "const options={}; spawn('git',['$tool'],options)", refused: true },
+    { name: 'R37.16 literal unrelated shell command now requires boundary', source: "const options={shell:true}; spawn('git',['status'],options)", refused: true },
+  ])('$name', ({ source, refused, bare }) => {
     const findings = (bare ? scanAgentLaunches : findAgentLaunches)({ 'scripts/r37-structure.mjs': source });
-    if (refused) expect(findings.length).toBeGreaterThan(0);
-    else expect(findings).toEqual([]);
-    for (const kind of potentialKinds) expect(findings.some(f => f.kind === kind && /opaque callee/.test(f.reason))).toBe(true);
-    if (escape) expect(findings.some(f => /primitive reference escapes/.test(f.reason))).toBe(true);
-  });
-
-  it.each([
-    ['R37.15 inspected local function positive control', "export function launch(){return 'ok'}", false],
-    ['R37.15 inspected local re-export of benign builtin positive control', "export {log as launch} from 'node:console'", false],
-    ['R37.15 inspected re-export cannot hide an uninspected launcher', "export {launch} from './missing.mjs'", true],
-    ['R37.15 inspected re-export cannot hide a process-exec module', "export {execa as launch} from 'execa'", true],
-  ])('%s', (_name, implementation, refused) => {
-    const findings = scanAgentLaunches({
-      'scripts/local.mjs': implementation,
-      'scripts/consumer.mjs': "import {launch} from './local.mjs'; launch('claude',[])",
-    });
-    if (refused) expect(findings.some(f => f.file.endsWith('/consumer.mjs') && f.kind === 'launch')).toBe(true);
-    else expect(findings).toEqual([]);
-  });
-
-  it.each([
-    { name: 'R37.8 unresolved mutable initializer', before: "let command='git'; spawn(command,argv)", after: "let command='claude'; spawn(command,argv)" },
-    { name: 'R37.8 unresolved assignment', before: "let command; command='git'; spawn(command,argv)", after: "let command; command='claude'; spawn(command,argv)" },
-    { name: 'R37.8 transitive initializer', before: "let binary='git'; const command=binary; spawn(command,argv)", after: "let binary='claude'; const command=binary; spawn(command,argv)" },
-    { name: 'R37.8 mutable argv initializer', before: "let argv=['git']; spawn(command,argv)", after: "let argv=['claude']; spawn(command,argv)" },
-    { name: 'R37.8 member assignment', before: "const cfg={}; cfg.command='git'; spawn(cfg.command,argv)", after: "const cfg={}; cfg.command='claude'; spawn(cfg.command,argv)" },
-    { name: 'R37.8 third argument binding', before: "let opts={shell:false}; spawn(command,argv,opts)", after: "let opts={shell:true}; spawn(command,argv,opts)" },
-    { name: 'R37.8 shorthand argument binding', before: "let shell=false; spawn(command,argv,{shell})", after: "let shell=true; spawn(command,argv,{shell})" },
-    ...[
-      ["'git',[]", "'claude',['--resume','unchecked-id']"],
-      ["command,[]", "command,['--resume','unchecked-id']"],
-      ["'git',argv", "'claude',argv"],
-    ].map(([before, after]) => ({name: `R37.11 generic wrapper caller inputs: ${before}`,
-      before: `function invoke(command,argv){spawn(command,argv)} invoke(${before})`,
-      after: `function invoke(command,argv){spawn(command,argv)} invoke(${after})`, generic: true})),
-    { name: 'R37.11 generic wrapper caller binding definition',
-      before: "function invoke(command,argv){spawn(command,argv)} let command='git'; invoke(command,[])",
-      after: "function invoke(command,argv){spawn(command,argv)} let command='claude'; invoke(command,[])", generic: true },
-    { name: 'R37.11 unchanged generic wrapper positive control',
-      before: "function invoke(command,argv){spawn(command,argv)} invoke('git',[])",
-      after: "\nfunction invoke(command,argv){spawn(command,argv)} invoke('git',[])", generic: true, same: true },
-    { name: 'R37.8 unchanged binding positive control', before: "let command='git'; spawn(command,argv)", after: "\n\nlet command='git'; spawn(command,argv)", same: true },
-    { name: 'R37.8 unrelated binding positive control', before: "let other='git'; spawn(command,argv)", after: "let other='claude'; spawn(command,argv)", same: true },
-  ])('$name', ({ before, after, same, generic }) => {
-    const allowed = launchInventory(findAgentLaunches({ 'scripts/r37-fingerprint.mjs': before }));
-    expect(allowed).toHaveLength(generic ? 2 : 1);
-    if (generic) expect(allowed.some(row => row.kind === 'invoke')).toBe(true);
-    const changed = findAgentLaunches({ 'scripts/r37-fingerprint.mjs': after });
-    if (same) assertAllowlist(changed, allowed);
-    else {
-      expect(changed[0].classification).toBe(allowed[0].classification);
-      expect(() => assertAllowlist(changed, allowed)).toThrow();
-    }
-  });
-
-  it('R37.11 pins transitive imported argument-builder inputs', () => {
-    const consumer = "import {build} from './builder.mjs'; spawn(build(),argv)";
-    const before = { 'scripts/builder.mjs': "let command='git'; export function build(){return command}",
-      'scripts/consumer.mjs': consumer };
-    const allowed = launchInventory(findAgentLaunches(before));
-    expect(allowed).toHaveLength(1);
-    const after = { ...before, 'scripts/builder.mjs': "let command='claude'; export function build(){return command}" };
-    expect(() => assertAllowlist(findAgentLaunches(after), allowed)).toThrow();
-  });
-
-  it('R37.7 follows a renamed imported primitive through a local module', () => {
-    expect(findAgentLaunches({ 'scripts/process.mjs': 'export const start = spawn;',
-      'scripts/consumer.mjs': "import {start as go} from './process.mjs'; go('claude',[])" }).filter(f => f.kind === 'go')).toHaveLength(1);
-    expect(findAgentLaunches({ 'scripts/process.mjs': 'export default spawn;',
-      'scripts/consumer.mjs': "import go from './process.mjs'; go('claude',[])" }).filter(f => f.kind === 'go')).toHaveLength(1);
-  });
-
-  it.each(["import * as cp from './process.mjs'; const go=cp.start; go('claude',[])",
-    "import {start as go} from './process.mjs'; go('claude',[])"])
-  ('R37.7 resolves re-exported primitive provenance: %s', consumer => {
-    expect(findAgentLaunches({ 'scripts/process.mjs': "export {spawn as start} from 'node:child_process';",
-      'scripts/consumer.mjs': consumer }).filter(f => f.file.endsWith('/consumer.mjs') && f.kind === 'go')).toHaveLength(1);
-  });
-
-  it('R37.7 resolves a default-imported object member primitive', () => {
-    expect(findAgentLaunches({ 'scripts/process.mjs': 'export default {start:spawn};',
-      'scripts/consumer.mjs': "import cp from './process.mjs'; const go=cp['start']; go('claude',[])" }).filter(f => f.kind === 'go')).toHaveLength(1);
-  });
-
-  it('R37.8 pins imported unresolved binding definitions', () => {
-    const consumer = "import {command} from './command.mjs'; spawn(command,argv)";
-    const before = { 'scripts/command.mjs': "export let command='git'", 'scripts/consumer.mjs': consumer };
-    const after = { ...before, 'scripts/command.mjs': "export let command='claude'" };
-    const allowed = launchInventory(findAgentLaunches(before));
-    expect(allowed).toHaveLength(1);
-    expect(() => assertAllowlist(findAgentLaunches(after), allowed)).toThrow();
-  });
-
-  it.each(["import * as cli from './command.mjs'; spawn(cli.command,argv)",
-    "import * as cli from './command.mjs'; spawn(cli[flag ? 'other' : 'command'],argv)",
-    "import cli from './command.mjs'; spawn(cli['command'],argv)"])
-  ('R37.8 pins namespace/default member definitions: %s', consumer => {
-    const before = { 'scripts/command.mjs': "export let command='git'; export default {command}", 'scripts/consumer.mjs': consumer };
-    const allowed = launchInventory(findAgentLaunches(before));
-    expect(allowed).toHaveLength(1);
-    expect(() => assertAllowlist(findAgentLaunches({ ...before, 'scripts/command.mjs': "export let command='claude'; export default {command}" }), allowed)).toThrow();
-  });
-
-  it('R37.8 pins a default object literal definition', () => {
-    const consumer = "import cli from './command.mjs'; spawn(cli.command,argv)";
-    const before = { 'scripts/command.mjs': "export default {command:'git'}", 'scripts/consumer.mjs': consumer };
-    const allowed = launchInventory(findAgentLaunches(before));
-    expect(allowed).toHaveLength(1);
-    expect(() => assertAllowlist(findAgentLaunches({ ...before,
-      'scripts/command.mjs': "export default {command:'claude'}" }), allowed)).toThrow();
-  });
-
-  it('permits exactly the unmigrated allowlist throughout scripts/ and skills-src/', () => {
-    expect(AGENT_LAUNCH_ALLOWLIST).toEqual(['scripts/lib/agent-launch.mjs']);
-    expect(migrationEvidence(scanAgentLaunches(readAgentLaunchTree(root)))).toMatchSnapshot();
-  }, 60_000);
-
-  const baseline = [{ file: 'scripts/legacy.mjs', kind: 'spawn', classification: 'resolved', fingerprint: JSON.stringify([['claude'], [], "'claude'", '[]']), count: 1 }];
-  const dynamicBaseline = [{ ...baseline[0], classification: 'unresolved', fingerprint: JSON.stringify([[null], [null], 'command', 'argv']) }];
-  it('accepts an exact call classification, fingerprint and count match despite line shifts', () => {
-    assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': "spawn('claude', [])" }), baseline);
-    assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': "\n\nspawn( 'claude', [] )" }), baseline);
-  });
-  it.each([
-    ['resolved replacement', "spawn('claude', [])"],
-    ['unresolved replacement', 'spawn(other, argv)'],
-  ])('refuses an exempt unresolved call changed to a %s', (_name, source) => {
-    expect(() => assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': source }), dynamicBaseline)).toThrow();
-  });
-  it('refuses changed command classification even when the command expression is unchanged', () => {
-    const original = "const command = unknown; spawn(command, [])";
-    const allowed = launchInventory(findAgentLaunches({ 'scripts/legacy.mjs': original }));
-    expect(() => assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': "const command = 'claude'; spawn(command, [])" }), allowed)).toThrow();
-  });
-  it('refuses changed resolved command text while file, kind, classification and count stay fixed', () => {
-    expect(() => assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': "spawn('codex', [])" }), baseline)).toThrow();
-  });
-  it('refuses changed wrapper argv even when the wrapper command is unchanged', () => {
-    const allowed = launchInventory(findAgentLaunches({ 'scripts/legacy.mjs': "spawn('env', unknownArgs)" }));
-    expect(() => assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': "spawn('env', ['claude'])" }), allowed)).toThrow();
-  });
-  it.each([
-    ["const command = 'claude'; spawn(command, [])", "const command = 'codex'; spawn(command, [])"],
-    ["const args = ['claude']; spawn('env', args)", "const args = ['codex']; spawn('env', args)"],
-  ])('refuses changed resolved constants despite unchanged call expressions: %s', (before, after) => {
-    const allowed = launchInventory(findAgentLaunches({ 'scripts/legacy.mjs': before }));
-    expect(() => assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': after }), allowed)).toThrow();
-  });
-  it('classifies mutable member-derived command evidence as unresolved', () => {
-    expect(findAgentLaunches({ 'scripts/mutated.mjs': "const config = {cmd: 'node'}; config.cmd = 'claude'; spawn(config.cmd, [])" }))
-      .toMatchObject([{ classification: 'unresolved', reason: expect.stringContaining('unresolved command') }]);
-  });
-  it.each([
-    ['new file', { 'skills-src/task/run.mjs': "spawn('claude', [])" }],
-    ['new call kind', { 'scripts/legacy.mjs': "exec('claude -p hello')" }],
-    ['increased call count', { 'scripts/legacy.mjs': "spawn('claude', []); spawn('codex', [])" }],
-    ['removed allowlisted entry', {}],
-    ['decreased call count', { 'scripts/legacy.mjs': "spawn('claude', [])" }, [{ ...baseline[0], count: 2 }]],
-    ['unparseable source', { 'scripts/broken.mjs': "spawn('claude', [" }],
-  ])('fails closed on %s', (_name, sources, allowed = baseline) => {
-    expect(() => assertAllowlist(findAgentLaunches(sources), allowed)).toThrow();
+    if (refused) {
+      expect(findings.length).toBeGreaterThan(0);
+      expect(findings[0].reason).toContain('outside approved boundary');
+    } else expect(findings).toEqual([]);
   });
 
   const forbidden = {
@@ -365,102 +204,176 @@ describe('single agent launch boundary', () => {
     expect(findAgentLaunches({ 'scripts/forbidden.mjs': source })).not.toEqual([]);
   });
 
-  it('resolves command constants imported from another file', () => {
-    expect(findAgentLaunches({ 'scripts/cli.mjs': "export const CLI = 'claude';",
-      'skills-src/task/run.mjs': "import { CLI as bin } from '../../scripts/cli.mjs'; import {spawn as s} from 'node:child_process'; s(bin, [])" })).toHaveLength(1);
-  });
-  it.each([
-    "const start = spawn.bind(null); start('claude', [])",
-    "const start = cp.execFile.bind(null); start('codex', [])",
-    "const start = exec.bind(null); start('claude -p hi')",
-    "const start = spawn.call; start(null, 'claude', [])",
-    "const start = execFile.apply; start(null, ['codex', []])",
-    "const start = spawn['bind'](null); const next = start; next('claude', [])",
-    "spawn.call(null, 'claude', [])",
-    "execFile.apply(null, ['codex', []])",
-    "const start = spawn.bind(null); start(command, argv)",
-  ])('detects method-derived execution primitives (%s)', source => {
-    const findings = findAgentLaunches({ 'scripts/derived.mjs': source });
-    expect(findings.some(f => /^(?:start|next|spawn.call|execFile.apply)$/.test(f.kind))).toBe(true);
-  });
-  it('R37.10 refuses computed logging methods without proof of an unrelated callee', () => {
-    expect(findAgentLaunches({ 'scripts/log.mjs': 'originals[m].call(target, msg)' }))
-      .toMatchObject([{ reason: expect.stringContaining('opaque callee') }]);
-  });
-  it('fails closed when a source cannot be parsed', () => {
-    expect(findAgentLaunches({ 'scripts/broken.mjs': "spawn('claude', [" })).toMatchObject([{ reason: expect.stringContaining('unparseable') }]);
-  });
-  it.each([
-    ['reassigned command', "let cmd = 'node'; cmd = 'claude'; spawn(cmd, [])"],
-    ['uninitialized command', "let cmd; cmd = 'codex'; spawn(cmd, [])"],
-    ['function parameter', "function f(cmd) { spawn(cmd, []) } f('claude')"],
-    ['parameter with safe default', "function f(cmd = 'node') { spawn(cmd, []) } f('claude')"],
-    ['unknown constant', "const cmd = process.env.AGENT; cp.execFile(cmd, [])"],
-    ['partially resolved conditional', "const cmd = flag ? 'node' : process.env.AGENT; spawn(cmd, [])"],
-    ['dynamic template', 'exec(`echo safe; ${process.env.AGENT}`)'],
-    ['unresolved shell script', "spawn('sh', ['-c', script])"],
-    ['destructured dynamic command', "const { cmd } = config; spawn(cmd, [])"],
-    ['reassigned destructured command', "let { cmd } = { cmd: 'node' }; cmd = 'codex'; spawn(cmd, [])"],
-    ['destructured parameter with safe default', "function f({cmd = 'node'}) { spawn(cmd, []) }"],
-    ['dynamic destructured primitive', "const { spawn: start } = cp; start(cmd, [])"],
-    ['reassigned regexp receiver', "let runner = /agent/; runner = cp; runner.exec(cmd)"],
-    ['mutated const object property', "const config = {cmd: 'node'}; config.cmd = 'claude'; spawn(config.cmd, [])"],
-    ['computed mutated object property', "const config = {cmd: 'node'}; config['cmd'] = 'codex'; spawn(config['cmd'], [])"],
-    ['aliased member command', "const config = {cmd: 'node'}; config.cmd = 'claude'; const cmd = config.cmd; spawn(cmd, [])"],
-    ['destructured mutated object', "const config = {cmd: 'node'}; config.cmd = 'claude'; const {cmd} = config; spawn(cmd, [])"],
-    ['object passed as command', "const config = {cmd: 'node'}; config.cmd = 'claude'; spawn(config, [])"],
-    ['member command without mutation proof', "const config = {cmd: 'node'}; spawn(config.cmd, [])"],
-  ])('fails closed on %s', (_name, source) => {
-    expect(findAgentLaunches({ 'scripts/dynamic.mjs': source }).some(f => f.kind)).toBe(true);
-  });
-  it.each([
-    ['ESM alias', "import * as cp from 'node:child_process'; cp[process.env.METHOD]('claude', [])"],
-    ['default alias', "import cp from 'child_process'; cp[method]('codex', [])"],
-    ['require alias', "const cp = require('child_process'); cp[process.env.METHOD](command, [])"],
-    ['alias chain', "import * as cp from 'child_process'; const runner = cp; runner[method]('claude', [])"],
-    ['unknown argv', "import * as cp from 'child_process'; cp[method]('node', argv)"],
-    ['agent in argv', "import * as cp from 'child_process'; cp[method]('env', ['claude'])"],
-  ])('flags unresolved computed primitive names on a %s', (_name, source) => {
-    expect(findAgentLaunches({ 'scripts/computed.mjs': source }).filter(f => /\]$/.test(f.kind))).toHaveLength(1);
-  });
-  it.each(['env', 'nohup', 'command', 'exec', 'xargs', 'sudo', 'time', 'nice', 'setsid', 'stdbuf', 'arch', 'caffeinate', 'sh', 'bash', 'zsh', 'node'])
-  ('flags %s wrappers with agent tokens, script text or unresolved arguments', command => {
-    for (const argv of ["['claude', '-p', 'hello']", "['/tools/codex', 'exec']", "['-c', 'claude -p hello']",
-      "['-e', `require('child_process').spawn('codex', [])`]", 'unknownArgs']) {
-      expect(findAgentLaunches({ 'scripts/wrapper.mjs': `spawn('/usr/bin/${command}', ${argv})` })).toHaveLength(1);
+
+  const approvedFile = 'scripts/lib/agent-launch.mjs';
+  const inventoryFor = source => launchInventory(scanAgentLaunches({ [approvedFile]: source }));
+  const probes = [
+    { name: 'R37 argv element mutation',
+      before: "import {spawn} from 'node:child_process'; function launch(){const argv=['git']; spawn('env',argv)}",
+      after: "import {spawn} from 'node:child_process'; function launch(){const argv=['git']; argv[0]='claude'; spawn('env',argv)}" },
+    { name: 'R37 shell option alias mutation with escaped clau\\de',
+      before: String.raw`import {spawn} from 'node:child_process'; function launch(){const options={shell:false}; const alias=options; spawn('clau\\de',[],options)}`,
+      after: String.raw`import {spawn} from 'node:child_process'; function launch(){const options={shell:false}; const alias=options; alias.shell=true; spawn('clau\\de',[],options)}` },
+    { name: 'R37 unknown package with dynamic process.env.AGENT',
+      before: "import launch from 'unknown-package'; function run(){launch('git',[])}",
+      after: "import launch from 'unknown-package'; function run(){launch(process.env.AGENT,[])}" },
+    { name: 'R37 Worker eval containing a child-process Claude launch',
+      before: `import {Worker} from 'node:worker_threads'; function launch(){new Worker('./worker.mjs',{eval:false})}`,
+      after: `import {Worker} from 'node:worker_threads'; function launch(){new Worker("require('child_process').spawn('claude',[])",{eval:true})}` },
+  ];
+  it.each(probes)('$name refuses outside the boundary regardless of argv', ({ before, after }) => {
+    for (const source of [before, after]) {
+      expect(scanAgentLaunches({ 'scripts/unapproved.mjs': source }))
+        .toMatchObject([{ kind: 'module', reason: expect.stringContaining('outside approved boundary') }]);
     }
   });
-  it.each(["spawn('env', ['node', 'script.mjs'])", "spawn('node', ['-e', 'console.log(1)'])", "spawn('nohup', ['claude-tools'])",
-    "import * as cp from 'child_process'; cp['spawn']('git', [])"])
-  ('permits wrapper and computed calls proven unrelated: %s', source => {
-    expect(findAgentLaunches({ 'scripts/safe-wrapper.mjs': source })).toEqual([]);
+  it.each(probes)('$name invalidates the approved whole-module fingerprint', ({ before, after }) => {
+    const baseline = inventoryFor(before);
+    expect(baseline).toHaveLength(1);
+    expect(baseline[0].fingerprint).toMatch(/^module-sha256-v2:[a-f0-9]{64}$/);
+    expect(() => assertAllowlist(scanAgentLaunches({ [approvedFile]: after }), baseline)).toThrow();
   });
-  it('retains the central launcher exemption for dynamic commands', () => {
-    expect(findAgentLaunches({ 'scripts/lib/agent-launch.mjs': 'spawn(command, argv)' })).toEqual([]);
+  it.each(probes)('$name unchanged approved file positive control', ({ before }) => {
+    assertAllowlist(scanAgentLaunches({ [approvedFile]: before }), inventoryFor(before));
   });
-  it('counts dynamic calls against the exact migration allowlist', () => {
-    assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': 'spawn(command, argv)' }), dynamicBaseline);
-    expect(() => assertAllowlist(findAgentLaunches({ 'scripts/legacy.mjs': 'spawn(command, argv); spawn(other, [])' }), dynamicBaseline)).toThrow();
+
+  it.each([
+    ...['child_process', 'node:child_process', 'worker_threads', 'node:worker_threads', 'vm', 'node:vm',
+      'cluster', 'node:cluster', 'process', 'node:process', 'module', 'node:module',
+      'execa', 'cross-spawn', 'shelljs', 'zx', 'node-pty', 'tinyexec', 'nano-spawn',
+      'foreground-child', '@npmcli/promise-spawn', 'future-exec-package', 'execa/subpath']
+      .flatMap(module => [`import * as capability from '${module}';`,
+        `export * from '${module}';`, `const capability=require('${module}');`, `import('${module}');`]),
+    "process.binding('spawn_sync')", "process['binding']('spawn_sync')", 'const alias=process; alias.dlopen(m,path)',
+    'const {binding:alias}=process', 'process.dlopen(m,path)', 'const load=require; load(name)',
+    'import(name)', 'require(name)', 'require(`node:${name}`)', "require('node:'+'child_process')",
+    'eval(code)', 'const execute=eval', 'new Function(code)', 'const Construct=Function; new Construct(code)',
+    'new Worker(code,{eval:true})', 'const Construct=Worker; new Construct(code,{eval:true})',
+    'const evaluate=globalThis.eval; evaluate(code)', 'globalThis[name](code)', "(() => {}).constructor(code)()",
+    "(() => {})['constructor'](code)()", 'const get=Reflect.get; get(target,key)',
+    'import capability = require("child_process")',
+  ])('refuses the capability reference even without a launch: %s', source => {
+    expect(scanAgentLaunches({ 'scripts/unapproved.ts': source }).length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    "import {basename} from 'node:path'; basename('claude')",
+    "const {basename}=require('node:path'); basename('claude')",
+    "import('node:path')", "export {basename} from 'node:path'",
+    "const env=process.env; const pid=process.pid; module.exports={env,pid}",
+    "const key='a'; const data={a:'hello'}; console.log(data[key])",
+    "function launch(){return 'claude'} launch()",
+    "const launch=console.log; launch('claude')",
+    "const pattern=/claude/; pattern.exec('hello')",
+    "const start = opaque(); start('git',[])",
+    "function relay(start){ return () => start('git',[]) }",
+    "function invoke(start=console.log){start('git',[])}",
+    "function pure(){return 'ok'} const start=opaque(pure); start('git',[])",
+    "// spawn('claude')\nconst help=\"require('child_process')\"",
+  ])('keeps source without a capability clear: %s', source => {
+    expect(scanAgentLaunches({ 'scripts/benign.mjs': source })).toEqual([]);
+  });
+
+  it.each([
+    ['local function', "export function launch(){return 'ok'}", false],
+    ['benign re-export', "export {log as launch} from 'node:console'", false],
+    ['missing re-export', "export {launch} from './missing.mjs'", true],
+    ['execution re-export', "export {execa as launch} from 'execa'", true],
+    ['returned primitive', "import {spawn} from 'child_process'; export function launch(){return spawn}", true],
+    ['default primitive object', "import {spawn} from 'child_process'; export default {start:spawn}", true],
+    // Trade-off: imported modules are checked independently, without tracing their exports.
+    ['importing a flagged module from an unflagged one is not itself a finding', "import 'child_process'; export const text='hello'", true],
+    ['malformed source', 'export const launch = (', true],
+  ])('judges %s by its own source without propagating to its importer', (_name, implementation, refused) => {
+    const findings = scanAgentLaunches({
+      'scripts/local.mjs': implementation,
+      'scripts/consumer.mjs': "import * as local from './local.mjs'; console.log(local)",
+    });
+    expect(findings.some(f => f.file.endsWith('/local.mjs'))).toBe(refused);
+    expect(findings.filter(f => f.file.endsWith('/consumer.mjs'))).toEqual([]);
+  });
+  it('checks only direct references amid cyclic imports and renamed re-exports', () => {
+    const findings = scanAgentLaunches({
+      'scripts/a.mjs': "export * from './b.mjs'; export * from './c.mjs'",
+      'scripts/b.mjs': "export * from './a.mjs'",
+      'scripts/c.mjs': "export {spawn as launch} from 'node:child_process'",
+      'scripts/consumer.mjs': "import {launch as run} from './b.mjs'; run('git',[])",
+    });
+    expect(findings.map(f => f.file)).toEqual([resolve('scripts/c.mjs')]);
+  });
+  it('importing an approved module is not itself a capability reference', () => {
+    const findings = scanAgentLaunches({ [approvedFile]: "import {spawn as launch} from 'child_process'; export {launch}",
+      'scripts/consumer.mjs': "import {launch as run} from './lib/agent-launch.mjs'; run('git',[])" });
+    expect(findings.map(f => f.file)).toEqual([resolve(approvedFile)]);
+  });
+  it('a direct capability binding still flags the importer of an approved module', () => {
+    const findings = scanAgentLaunches({ [approvedFile]: "import {spawn} from 'child_process'; export {spawn}",
+      'scripts/consumer.mjs': "import {spawn as launch} from './lib/agent-launch.mjs'; launch('git',[])" });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs')).reason).toContain('outside approved boundary');
+  });
+  it('fails closed for missing local source and an unknown package even with git arguments', () => {
+    for (const specifier of ['./missing.mjs', 'unknown-package']) {
+      expect(scanAgentLaunches({ 'scripts/unapproved.mjs': `import launch from '${specifier}'; launch('git',[])` }))
+        .toMatchObject([{ reason: expect.stringContaining('uninspected') }]);
+    }
+  });
+  it('fails closed on malformed source even on the approved boundary', () => {
+    for (const file of [approvedFile, 'scripts/unapproved.mjs']) {
+      expect(scanAgentLaunches({ [file]: "spawn('claude',[" }))
+        .toMatchObject([{ reason: expect.stringContaining('unparseable') }]);
+      expect(scanAgentLaunches({ [file]: "spawn('claude',[" })[0].kind).toBeUndefined();
+    }
+  });
+  it('fails closed when the production source tree is unreadable or incomplete', () => {
+    expect(() => readAgentLaunchTree(resolve(root, 'scripts/__tests__/missing-source-root'))).toThrow();
+  });
+
+  it.each([
+    ["const value='git'; function launch(){spawn(value,[])}", "const value='claude'; function launch(){spawn(value,[])}"],
+    ["function launch(){spawn(command,argv)} launch('git',[])", "function launch(){spawn(command,argv)} launch('claude',[])"],
+    ["let unrelated='git'; spawn(command,argv)", "let unrelated='claude'; spawn(command,argv)"],
+    ["const launch=() => {spawn(command,argv)}", "const launch=() => {audit(); spawn(command,argv)}"],
+    ["class Runner {launch(){spawn(command,argv)}}", "class Runner {launch(){argv[0]='claude'; spawn(command,argv)}}"],
+    ["const runner={launch(){spawn(command,argv)}}", "const runner={launch(){options.shell=true; spawn(command,argv)}}"],
+    ["function launch(){return () => spawn(command,argv)}", "function launch(){return () => {options.shell=true; return spawn(command,argv)}}"],
+    ["spawn(command,argv)", "spawn(command,argv); spawn(command,argv)"],
+    ["spawn(command,argv)", "exec(command)"],
+    ["spawn(command,argv)", "spawn(command,argv);"],
+    ["spawn(command,argv)", ""],
+  ])('pins every module edit, including surrounding definitions: %s', (before, after) => {
+    expect(inventoryFor(before)).not.toEqual(inventoryFor(after));
+  });
+  it('normalises whitespace and comments while keeping unchanged approved code valid', () => {
+    const before = "import {spawn} from 'child_process'; function launch(){const argv=['git']; spawn('env',argv)}";
+    const after = "\n// comment\nimport { spawn } from 'child_process';\n\nfunction launch( ) {\n /* comment */ const argv = [ 'git' ];\n spawn( 'env', argv )\n}\n";
+    expect(inventoryFor(after)).toEqual(inventoryFor(before));
   });
   it.each([
-    "spawn('node', [])",
-    "const cmd = 'git'; cp.execFile(cmd, [])",
-    "const cmd = flag ? 'node' : 'git'; spawn(cmd, [])",
-    "cp.spawn('node', [])",
-    "const { cmd } = { cmd: 'git' }; spawn(cmd, [])",
-    "const { nested: { cmd } } = { nested: { cmd: 'git' } }; spawn(cmd, [])",
-    "const pattern = /agent/; pattern.exec(input); /claude/.exec(input); new RegExp('agent').exec(input)",
-  ])('permits a command proven to be unrelated (%s)', source => {
-    expect(findAgentLaunches({ 'scripts/safe.mjs': source })).toEqual([]);
+    ["const text='a b'; spawn(text,[])", "const text='ab'; spawn(text,[])"],
+    ["const text='a/*b*/'; spawn(text,[])", "const text='a'; spawn(text,[])"],
+    ['const text=`a b`; spawn(text,[])', 'const text=`ab`; spawn(text,[])'],
+    ['const text=/a b/; spawn(text,[])', 'const text=/ab/; spawn(text,[])'],
+    ['function launch(){return\nspawn(command,argv)}', 'function launch(){return spawn(command,argv)}'],
+  ])('normalisation preserves literal contents and ASI semantics: %s', (before, after) => {
+    expect(inventoryFor(before)).not.toEqual(inventoryFor(after));
   });
-  it('allows unrelated processes, shadowed constants, comments, and launcher calls', () => {
-    expect(findAgentLaunches({ 'scripts/ok.mjs': `
-      import {launchAgent} from './lib/agent-launch.mjs';
-      const CLI = 'claude';
-      function f() { const CLI = 'node'; spawn(CLI, ['script.mjs']); }
-      // cp.spawn('claude', [])
-      const help = "run('codex', ['exec'])";
-      launchAgent({mode: 'claude-print', resumeId: null}, spawn, CLI, ['-p', 'hi']);
-    ` })).toEqual([]);
+  it('membership cannot be expanded by recording an unapproved capability fingerprint', () => {
+    const findings = scanAgentLaunches({ 'scripts/new-launcher.mjs': "import {spawn} from 'child_process'" });
+    expect(findings).toHaveLength(1);
+    expect(AGENT_LAUNCH_ALLOWLIST).not.toContain('scripts/new-launcher.mjs');
+    expect(findings[0].reason).toContain('outside approved boundary');
   });
+  it('pins the original migration membership independently of fingerprints', () => {
+    expect(AGENT_LAUNCH_ALLOWLIST).toHaveLength(1857);
+    expect(new Set(AGENT_LAUNCH_ALLOWLIST).size).toBe(1857);
+    expect(createHash('sha256').update(JSON.stringify(AGENT_LAUNCH_ALLOWLIST)).digest('hex')).toBe('459d30e7bbc103ef4fe3ac70db57c2c4d964888c12ac17e581da8494b285dd06');
+  });
+  it('permits exactly the unmigrated allowlist throughout scripts/ and skills-src/', () => {
+    const findings = scanAgentLaunches(readAgentLaunchTree(root));
+    expect.soft(findings.filter(f => !AGENT_LAUNCH_ALLOWLIST.includes(relative(root, f.file).replaceAll('\\', '/'))),
+      'new capability file needs boundary review, never a snapshot-only approval').toEqual([]);
+    const inventory = migrationEvidence(findings.filter(f => AGENT_LAUNCH_ALLOWLIST.includes(relative(root, f.file).replaceAll('\\', '/'))));
+    expect(inventory.map(row => row.file).sort()).toEqual([...AGENT_LAUNCH_ALLOWLIST].sort());
+    expect(inventory).toMatchSnapshot();
+  }, 60_000);
 });

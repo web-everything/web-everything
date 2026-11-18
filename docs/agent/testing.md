@@ -4579,29 +4579,46 @@ form. Unsupported shell syntax/expansions and excessive wrapper nesting refuse w
 literal-argv fallback. Guards receive a frozen view; guarded launches forward validated argv
 snapshots and refuse mutation of the caller's argv or shell execution option.
 
-The continued R37 rows require native resume evidence whenever a descriptor supplies an id or
+The continued R37 runtime rows require native resume evidence whenever a descriptor supplies an id or
 selects a resume mode. Bound/native/proxy callables expose no inspectable bound arguments or
-receiver, so refuse them with the explicit unbound-primitive/literal-argv fallback. The structural
-table covers agent words in any invocation argument, imported and conditional primitive aliases,
-and migration fingerprints over all argument bindings. Fingerprints hash complete initializer,
-assignment and import text (including transitive initializer dependencies); unresolved values do
-not exempt edits to those definitions. Keep matching resume, safe-alias and unchanged-binding
-controls beside the refusal rows. Migration snapshots pin exact historical calls and counts.
+receiver, so refuse them with the explicit unbound-primitive/literal-argv fallback.
 
-R37.9–11 refuse fresh as well as resumed launches without a non-empty inspectable command.
-The structural gate clears calls only with a literal primitive/boundary binding or a structural
-proof that the callee is unrelated. Opaque call results, parameters, closures and recursive or
-unmodelled callees require review; primitive references escaping direct calls are findings too.
-The operator fallback is to use the approved launch boundary with explicit literal argv, or
-provide a locally inspectable unrelated function/import. Migration evidence includes each generic
-wrapper caller and its argument definitions, so changing caller inputs invalidates the inventory.
-Production migration snapshots pin sorted per-file inventories with exact counts and SHA-256
-digests over every call kind, classification and fingerprint; line movement remains irrelevant.
-Audit snippets declare their shorthand primitive imports through the shared fixture helper.
-Unbound names and mutable default/require namespaces provide no literal-binding exemption.
+The structural gate uses a coarse capability boundary, not semantic JS data-flow analysis.
+`agent-launch-approved.json` freezes the previous 1,856-file migration membership plus the central
+launcher. Unknown packages, missing local modules, non-literal loaders, execution builtins,
+process execution/loader/evaluator/Worker references and capability containers require an approved file,
+regardless of arguments or whether a call occurs. Exact syntactic process data reads (`env`, `pid`,
+`argv`, etc.) and `module.exports` expose no execution entry point; taking either container or
+using another/computed member still requires review. Shadowing and unused imports grant no exemption.
+Detection is direct-only: importing/re-exporting an inspected local module is not itself a finding,
+even when that module is flagged or approved. Each module is judged on its own contents, including
+direct capability bindings; cycles do not propagate findings. The structural table documents the
+trade-off: an otherwise capability-free importer can call an imported wrapper without a finding
+of its own. No export, callee, argument, initializer or option value is resolved. Audit shorthand imports are added only
+when the snippet references them, so capability-free positive controls stay meaningful.
 
-R37.12 shares conservative shell-text evidence between the structural gate and the single runtime
-normaliser: inspect raw and de-quoted agent words; refuse mid-word quote concatenation, escapes,
+Every approved module has one `module-sha256-v2` fingerprint over its complete syntax/token tree,
+including all launching functions, callers, constructors, aliases and surrounding definitions.
+This deliberately includes unrelated edits and modules currently without launches. The hash ignores whitespace/comments while retaining exact literal/token contents and
+automatic-semicolon-insertion structure. The migration snapshot intentionally changes from per-call counts/argument hashes to
+one whole-module fingerprint per approved file (including the formerly exempt central launcher).
+Membership is pinned separately: adding an unapproved source to the snapshot cannot approve it.
+Parse failures remain uninventoryable, and unreadable source trees throw. The operator fallback is
+to use an existing approved boundary, or request human review of the complete module and its
+membership/fingerprint changes; unknown evidence never clears the gate.
+
+The R37 structural table retains historical bypass inputs with the new capability expectations.
+The four continued probes cover argv element mutation, aliased shell-option mutation with an
+escaped executable, dynamic environment arguments to an unknown package, and Worker eval code
+containing a child-process launch. Each has an unapproved-file refusal, an approved whole-module
+edit refusal, and an unchanged approved-file positive control. Additional rows pin capability
+references without invocation, package/subpath/loader forms, dependency cycles, missing source,
+malformed approved source, whole-module edits, literal preservation and formatting-only controls.
+
+R37.9–11 runtime rows refuse fresh as well as resumed launches without a non-empty inspectable
+command. Production migration checks and runtime checks remain separate guarantees.
+
+R37.12 runtime normalisation checks conservative shell-text evidence: inspect raw and de-quoted agent words; refuse mid-word quote concatenation, escapes,
 expansions and globbing even when the raw text hides the executable. Whole-word literal quotes
 remain supported; direct argv treats shell characters as data. The fallback is direct literal argv.
 R37.13 includes Codex's top-level `resume` and `fork`, after global options and before session
@@ -4613,13 +4630,6 @@ all invocation forms, and option-value/delimited-prompt controls in the R37 tabl
 R37.14 refuses Claude's implicit continuation (`--continue`, `-c`, `--fork-session`) in all
 current modes: the selected session cannot be proven. The diagnostic directs callers to explicit
 `--resume <native-id>`; option values and delimited prompt data remain literal controls.
-R37.15 treats unresolved imported callees with raw or de-quoted agent arguments as potential
-launchers, including aliases and uninspected local modules. Known process-exec packages require
-review for any arguments. Node's child_process/worker_threads/cluster/vm/process modules cannot
-establish benign import proof for agent arguments.
-Only benign Node builtins or inspected local definitions establish unrelated imported bindings
-with agent arguments. Route findings through the approved boundary or supply inspectable source.
-R37.16 resolves constant options bindings before inspecting shell capability; unknown, mutable,
-spread or computed options conservatively permit shell execution. Inspect executable and argv
-with shared de-quoting/de-escaping evidence. Bound `shell:false`, unrelated shell commands, and
-benign/inspected imports are positive controls beside the refusal rows.
+R37.15–16 historical structural controls with execution imports, literal unrelated commands or
+`shell:false` now refuse outside the approved boundary. Those argument-based exemptions were
+removed intentionally: a capability reference is sufficient, independent of argument semantics.

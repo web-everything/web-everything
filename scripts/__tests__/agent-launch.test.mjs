@@ -146,7 +146,7 @@ it.each([
     }, invoke, ...(noArgs ? [] : closureArg ? [() => primitive('claude', ['--resume', 'unchecked-id'])] : [command, argv, ...(options ? [options] : [])]));
   };
   if (refused) {
-    if (source) expect(findings.some(finding => /^(?:start|go)$/.test(finding.kind))).toBe(true);
+    if (source) expect(findings).toMatchObject([{ kind: 'module', reason: expect.stringContaining('outside approved boundary') }]);
     expect(execute).toThrow(reason ?? /refused/);
     expect(primitive).not.toHaveBeenCalled();
   } else {
