@@ -448,8 +448,12 @@ describe('preflight CLI IO hooks', () => {
     for (const [command, args, options] of calls) {
       expect(command).toBe('gh');
       expect(args[0]).toBe('api');
-      expect(options).toMatchObject({ env: ENV, timeout: 15000, maxBuffer: 1024 * 1024 });
+      // The child timeout is the read deadline still remaining (never above 15 s), so it is no longer a fixed 15000.
+      expect(options).toMatchObject({ env: ENV, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+      expect(options.timeout).toBeGreaterThan(14000);
+      expect(options.timeout).toBeLessThanOrEqual(15000);
     }
+    expect(calls[1][2].timeout).toBeLessThanOrEqual(calls[0][2].timeout);
   });
 
   it('cliIO.which finds executables on PATH and rejects directories and non-executables', () => {
