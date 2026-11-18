@@ -215,6 +215,8 @@ describe('pinned caller evidence', () => {
     git(['init', '-q']);
     git(['config', 'color.diff', 'always']);
     git(['config', 'color.ui', 'always']);
+    git(['config', 'diff.noprefix', 'true']);
+    git(['config', 'diff.mnemonicPrefix', 'true']);
     writeFileSync(join(dir, 'a.txt'), 'one\n');
     git(['add', '.']); git(['commit', '-q', '-m', 'one']);
     const first = git(['rev-parse', 'HEAD']);
@@ -223,5 +225,6 @@ describe('pinned caller evidence', () => {
     const text = pinnedGit((cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir }), ['diff', '--end-of-options', first, 'HEAD']);
     expect(text).toContain('+two');
     expect(text).not.toContain('\u001b[');
+    expect(text).toContain('diff --git a/a.txt b/a.txt');
   });
 });
