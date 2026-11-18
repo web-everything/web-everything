@@ -221,7 +221,9 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
       const failedChecks = requiredRollup.filter((check) => ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR', 'STARTUP_FAILURE'].includes(String(check.conclusion || check.state).toUpperCase()))
         .map((check) => ({ name: check.name ?? check.context, conclusion: String(check.conclusion || check.state).toUpperCase(),
           runId: /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(check.detailsUrl ?? '')?.[1] ?? null }));
-      const snapshot = { repo, number: pr.number, inMergeQueue: queueFallback ? pr.mergeStateStatus === 'QUEUED' && (pr.autoMergeRequest != null || labels.includes('status:ready-to-merge')) : pr.isInMergeQueue, labels, isDraft: pr.isDraft, mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus, failedChecks,
+      const snapshot = { repo, number: pr.number, inMergeQueue: queueFallback ? pr.mergeStateStatus === 'QUEUED' && (pr.autoMergeRequest != null || labels.includes('status:ready-to-merge')) : pr.isInMergeQueue, labels, isDraft: pr.isDraft, mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus,
+        // Without a trustworthy required-check list no run id is offered, so no rerun would-act can be decided.
+        failedChecks: required.names === null ? failedChecks.map((check) => ({ ...check, runId: null })) : failedChecks,
         headSha: pr.headRefOid, nowMs, requiredGreen, ciFailing: failedChecks.length > 0,
         claims: claims.filter((claim) => claim.pr === pr.number && matchesRepo(claim, repo)) };
       const { owed } = classifyPr(snapshot);

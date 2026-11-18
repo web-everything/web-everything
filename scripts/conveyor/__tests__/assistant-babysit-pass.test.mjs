@@ -169,6 +169,23 @@ describe('precision and explanation budgets', () => {
     expect(w.tick({ nowMs: nowMs + 60000 }).reports.map((report) => report.rule)).toEqual(['gate-red-stalled', 'gate-red-stalled']);
     expect(apiReads(w)).toHaveLength(2);
   });
+  it('fails closed on rerun-failed when ruleset lookup is unavailable, while healthy requirements allow the same timed-out PR', () => {
+    const unavailable = fixture();
+    const healthy = fixture();
+    const pr = { ...unavailable.prs[0], updatedAt: old, labels: [{ name: 'status:ci-red' }],
+      statusCheckRollup: [{ name: 'checks', conclusion: 'TIMED_OUT', detailsUrl: 'https://github.com/org/repo/actions/runs/123' }] };
+    unavailable.prs = [pr];
+    healthy.prs = [{ ...pr }];
+    unavailable.rules = new Error('HTTP 403');
+
+    unavailable.tick();
+    expect(decisions(unavailable).filter((decision) => decision.type === 'would-act' && decision.action === 'rerun-failed')).toEqual([]);
+    expect(unavailable.files.get(join('output', 'digest.md'))).toContain('required checks unavailable for web-everything/web-everything; using all checks (ruleset lookup failed: 403)');
+
+    healthy.tick();
+    expect(decisions(healthy)).toContainEqual(expect.objectContaining({ type: 'would-act', action: 'rerun-failed',
+      argv: ['gh', 'run', 'rerun', '123', '--failed', '--repo=web-everything/web-everything'] }));
+  });
   it.each([
     { version: 2, at: nowMs, names: ['classic'] },
     { version: 2, at: nowMs, names: null },
