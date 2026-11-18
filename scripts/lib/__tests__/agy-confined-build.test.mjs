@@ -414,6 +414,10 @@ describe('escape evidence', () => {
     [tool('write_to_file', { TargetFile: '/dev/null' })],
     [tool('write_to_file', { CodeContent: 'opaque' })],
     [tool('view_file', { AbsolutePath: '/dev/null' })],
+    // Real agy 1.5.11 tool names (`edit_file`, `read_file`) use a `Path` parameter and must stay clone-contained.
+    [tool('edit_file', { Path: '/dev/null' })],
+    [tool('read_file', { Path: '/etc/passwd' })],
+    [tool('read_file', {})],
   ])('voids git, shell, unknown tools and outside paths %#', async event => {
     const f = fixture();
     expect((await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'changed\n'), {

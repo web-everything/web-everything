@@ -18,7 +18,10 @@ import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false',
   '-c', 'core.attributesFile=/dev/null', '-c', 'core.pager=cat', '-c', 'diff.external='];
 const DEFAULTS = { allowedKinds: ['doc-fix', 'test-fix'], maxSize: 1, kindMaxSize: 3 };
-const WRITE_TOOLS = new Set(['write_to_file', 'replace_file_content', 'multi_replace_file_content']);
+// Measured live 2026-11-18 (agy 1.5.11): the native edit tool is `edit_file` and the plain read is `read_file`, both with a `Path` parameter.
+const WRITE_TOOLS = new Set(['write_to_file', 'replace_file_content', 'multi_replace_file_content', 'edit_file']);
+// `read_file` needs the same required, clone-contained path as a write, so it takes the same rewrite-and-audit route.
+const PATH_CHECKED_READS = new Set(['read_file']);
 const inScope = (p, scope) => scope.some(s => p === s || p.startsWith(`${s}/`));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -120,13 +123,13 @@ function auditTranscript(text, clone) {
     const name = s.tool_name ?? s.tool_info?.name;
     if (/git/i.test(name ?? '') || /\bgit\b/i.test(JSON.stringify(s.tool_info?.parameters ?? {}))
       && /command|shell|exec/i.test(name ?? '')) throw new Error('agy git call');
-    if (!WRITE_TOOLS.has(name) && !READ_ONLY_AGY_TOOLS.includes(name))
+    if (!WRITE_TOOLS.has(name) && !PATH_CHECKED_READS.has(name) && !READ_ONLY_AGY_TOOLS.includes(name))
       throw new Error('tool call outside the permitted native file tools');
     // Status never exempts a tool update from the containment audit.
     delete s.tool_info?.error;
     delete s.status;
     delete s.state;
-    if (!WRITE_TOOLS.has(name)) continue;
+    if (!WRITE_TOOLS.has(name) && !PATH_CHECKED_READS.has(name)) continue;
     const params = typeof s.tool_info?.parameters === 'string'
       ? JSON.parse(s.tool_info.parameters) : s.tool_info?.parameters;
     if (!params || Array.isArray(params) || typeof params !== 'object'
