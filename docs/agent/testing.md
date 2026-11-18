@@ -3465,8 +3465,11 @@ The real-host cases require permission to execute `ps` and read the boot UUID on
 a sandbox denying either operation produces unknown and cannot certify those cases.
 ## Optional early review and delayed fix push
 
-`review.startBeforeCi` admits an early review only with `hasGreenLedger` evidence for the exact
-head. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
+`review.startBeforeCi` requires both successful resolver evidence for the policy's CI prerequisites
+and `hasGreenLedger` evidence for the exact head. A marker never upgrades missing, malformed,
+pending, incomplete, foreign-head or untrusted-roster evidence, even with `startEarly: on`.
+Keep the named `verification only adds a requirement and never upgrades resolver evidence under %s`
+regression across push, fast-checks and ci-green, including a green-CI/false-marker denial. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
 red-main hold runs before CI-heal caps; test it with a PR behind main (`aheadByOnMain > 0`),
 since a PR already containing main has its own failure. `fix.pushAfterCi` waits before the
 agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
@@ -4608,8 +4611,9 @@ different runs, invalid lineage, foreign repositories, unavailable jobs, and the
 
 ## Required-check evidence opt-in and provenance (PR1)
 
-`resolveRequiredChecks` leaves absent required checks pending by default. Only the
-`review-ci-gate` adapter opts into `allowImplication`; CI-heal requires an own row.
+`resolveRequiredChecks` requires an own row for every required name. Rule 6 implication
+is removed, including historical `allowImplication: true` options. Review registration
+also requires an own row; a green `test` never proves an absent `integration`.
 CI-heal fixtures that prove green or held evidence must explicitly attest both
 `rowsComplete: true` and `rosterSource: live|cache`. Preserve the required-check
 reader's `source` through escalation recording and reconcile; an omitted source
@@ -4629,3 +4633,36 @@ successful observed names alone cannot establish admission.
 Consumers that decide whether to recheck evidence must inspect `unknown`, rather
 than infer completeness from the primary reason. The facts-first regression in
 `merge-gate-hold-class.test.mjs` requires a live recheck of an incomplete failure.
+
+
+## Review-owned checks and admission (#7037)
+
+Review admission filters `review-gate` and `merge-gate` out of the required roster,
+regardless of their conclusion, and excludes them from admission's red detection.
+They wait on the review being admitted. A validated nonempty roster containing only
+these names may become empty after filtering; the review adapter explicitly allows
+that empty result. Missing/empty input rosters, missing provenance, incomplete reads,
+and foreign read heads still refuse admission. Duplicate review-owned Actions rows
+do not need job-lineage reads because they cannot affect admission.
+Advisory review uses this same gate without a separate hold-binding override. Its
+reconcile cases admit excluded merge-gate rows with invalid bindings while refusing
+failed, pending, malformed or missing real CI and incomplete evidence. Hold binding
+belongs to the other resolver consumers below, not review admission.
+
+Other resolver consumers retain these names. Rule 7 treats only `failure` as eligible
+for a review hold (merge holds still require matching head/job evidence); `timed_out`,
+`startup_failure`, `cancelled`, `stale`, and `action_required` remain pending with
+`needs-rerun`. They cannot establish green CI for escalation retirement.
+The #7037 cases in `review-ci-gate.test.mjs` and `review-ci-gate-io.test.mjs` cover
+cancelled plus failing review-gate rows, a failing merge-gate, green real CI, and
+the negative case of a failing required `test` under each admission timing policy.
+
+
+Reconcile must forward the required-roster reader's source through every internal
+`reviewCiGate` and `reviewStartGate` call, including stale-base diagnosis, advisory
+conversion, and CI-dependent transitions. The planner binds its current `rosterSource`
+to each PR, replacing historical PR metadata; it never substitutes `live` for an
+unknown source. The named reconcile provenance regression covers complete green CI
+under `ci-green` timing with live/cache evidence, unavailable provenance, incomplete
+rows. Its source lint checks every reconcile gate call for explicit
+forwarding, so a new call cannot silently depend on a removed provenance default.

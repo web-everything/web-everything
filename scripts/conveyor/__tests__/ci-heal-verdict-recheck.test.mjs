@@ -882,3 +882,12 @@ describe('PR1 coordinator tightenings', () => {
     expect(ciGreenForEscalation({ ...evidence, rosterSource: 'cache' })).toBe(true);
   });
 });
+
+it('a timed-out review-gate cannot establish green CI for escalation retirement (Rule 7)', () => {
+  const headSha = 'a'.repeat(40);
+  expect(ciGreenForEscalation({ headSha, rowsHead: headSha, rowsComplete: true, rosterSource: 'live',
+    requiredChecks: ['test', 'review-gate'], rollup: [
+      { name: 'test', status: 'completed', conclusion: 'success' },
+      { name: 'review-gate', status: 'completed', conclusion: 'timed_out' },
+    ] })).toBe(false);
+});
