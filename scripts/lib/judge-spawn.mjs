@@ -924,7 +924,13 @@ export async function judgeSpawn({
     const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
       let child;
       try {
-        child = spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+        const options = { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'], detached: true };
+        // Production uses a group-leading supervisor. Injected spawns retain the CLI/argv test seam.
+        // Even a disabled caller timer gets a bounded supervisor lifetime, plus caller-death detection.
+        child = spawnFn === nodeSpawn
+          ? nodeSpawn(process.execPath, [fileURLToPath(new URL('./judge-spawn-supervisor.mjs', import.meta.url)),
+            String(process.pid), String(startedAt + (timeoutMs > 0 ? timeoutMs : JUDGE_TIMEOUT_MS) + JUDGE_TIMEOUT_GRACE_MS), cli, ...argv], options)
+          : spawnFn(cli, argv, options);
       } catch (e) {
         reject(new Error(`judge-spawn: could not start \`${cli}\`: ${e.message}`));
         return;
@@ -935,22 +941,40 @@ export async function judgeSpawn({
       let grace = null;
       let killed = false;
       let settled = false;
+      const killGroup = () => {
+        if (Number.isInteger(child.pid) && child.pid > 0) {
+          try { process.kill(-child.pid, 'SIGKILL'); return; } catch { /* fallback below */ }
+        }
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      };
+      const signals = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+      const handlers = signals.map((sig) => {
+        const handler = () => {
+          killGroup();
+          process.removeListener(sig, handler);
+          process.kill(process.pid, sig);
+        };
+        process.on(sig, handler);
+        return handler;
+      });
+      process.on('exit', killGroup);
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        if (grace) clearTimeout(grace);
+        signals.forEach((sig, i) => process.removeListener(sig, handlers[i]));
+        process.removeListener('exit', killGroup);
+      };
       // `close` and the grace timer can both fire; whichever is first wins and the other is inert.
       const settle = (r) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
-        if (grace) clearTimeout(grace);
+        cleanup();
         resolve(r);
       };
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           killed = true;
-          let groupKilled = false;
-          if (Number.isInteger(child.pid) && child.pid > 0) {
-            try { process.kill(-child.pid, 'SIGKILL'); groupKilled = true; } catch { /* fallback below */ }
-          }
-          if (!groupKilled) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+          killGroup();
           // Settling on `close` rather than here is what preserves the partial output: Node delivers the
           // buffered `data` events first. The grace timer only covers a `close` that never arrives.
           grace = setTimeout(() => settle({ stdout: out, stderr: err, code: null, signal: null, timedOut: true }), JUDGE_TIMEOUT_GRACE_MS);
@@ -961,8 +985,9 @@ export async function judgeSpawn({
       child.stdout?.on('data', (d) => { out += d; });
       child.stderr?.on('data', (d) => { err += d; });
       child.on('error', (e) => {
-        if (timer) clearTimeout(timer);
-        if (grace) clearTimeout(grace);
+        if (settled) return;
+        settled = true;
+        cleanup();
         reject(new Error(`judge-spawn: \`${cli}\` failed to run: ${e.message}`));
       });
       child.on('close', (c, signal) => settle({ stdout: out, stderr: err, code: c, signal, timedOut: killed }));
