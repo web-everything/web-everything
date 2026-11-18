@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { redTeamSentBackFindings } from '../conveyor/dispatch-eligibility-facts.mjs';
-import { RED_TEAM_FIX_COMMENT_MARKER } from '../conveyor/red-team-fix-round-count.mjs';
+import { publishRedTeamFixLaunch } from '../conveyor/red-team-fix-round-count.mjs';
+import { randomUUID } from 'node:crypto';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -120,7 +121,7 @@ export function parseFixRunArgv(argv = []) {
   const repairKind = flags['repair-kind'] === undefined ? 'fix' : String(flags['repair-kind']).trim();
   if (!['fix', 'ci-heal'].includes(repairKind)) throw new TypeError(`fix-run: invalid --repair-kind=${repairKind} (supported: fix|ci-heal)`);
   return {
-    repairKind, pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
+    repairKind, launchId: opt('launch-id') ?? randomUUID(), pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
     item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
     mergeOnto: opt('merge-onto'), provider: opt('provider') ?? 'codex', taskKind: opt('task-kind') ?? 'fix', effort: opt('effort'), model: opt('model'),
@@ -741,10 +742,16 @@ export async function runFixCli(argv = [], {
     let prContext;
     let openSendBacks = [];
     let repeatPlan = { action: 'patch' };
+    const chargeRedTeamLaunch = comments => publishRedTeamFixLaunch({
+      comments, pr: Number(pr), head: prHeadSha, attemptId: launch.launchId,
+      publish: body => withMessageFile(body, file => run('gh', ['pr', 'comment', pr,
+        ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })),
+    });
     if (launch.repairKind === 'ci-heal') {
       if (hasRedTeamSentBackLabels(prHead)) {
         const comments = await readComments(pr, { repo: launch.repo });
         redTeamRepair = redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
+        if (redTeamRepair) chargeRedTeamLaunch(comments);
       }
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
@@ -753,6 +760,7 @@ export async function runFixCli(argv = [], {
       const comments = await readComments(pr, { repo: launch.repo });
       redTeamRepair = hasRedTeamSentBackLabels(prHead)
         && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
+      if (redTeamRepair) chargeRedTeamLaunch(comments);
       openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
       for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
@@ -854,11 +862,6 @@ export async function runFixCli(argv = [], {
       }
     };
     const rearm = head => {
-      if (redTeamRepair) {
-        // Publication is required before clearing the pending hand-back: this path never posts a rearm marker.
-        withMessageFile(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team send-back repair pushed: ${head}. Independent re-review owed.\n`,
-          file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
-      }
       // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
       try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
       catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }

@@ -43,6 +43,7 @@
  */
 
 import { normNum } from '../../conveyor/queue-store.mjs';
+import { randomUUID } from 'node:crypto';
 import { notApplied } from '../effect-executor.mjs';
 import {
   DETACHED_HANDLE_PREFIX,
@@ -111,6 +112,9 @@ export function fixDetachedProvider(request, {
   if (!sessionSlug) throw notApplied(`dispatch-lane: refusing a mechanical fix dispatch for PR #${pr} with no session slug`);
 
   const argv = [String(runScript), `--pr=${pr}`, `--session=${sessionSlug}`];
+  // Session slugs repeat across dispatches. Preserve this ID on a retry of the same launch;
+  // a fresh dispatch gets its own counted repair, even if no executor makes a commit.
+  argv.push(`--launch-id=${request.launchId ?? randomUUID()}`);
   // The ITEM is optional for a repair (`planFixDispatchWrapper` takes `item: null`, and the brief documents
   // `$FIX_ITEM` as "when known"), so it is passed only when there is one rather than as an empty flag the
   // wrapper would have to re-normalise.

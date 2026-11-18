@@ -1,6 +1,4 @@
-import { RED_TEAM_FIX_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
-import { redTeamFact } from './dispatch-eligibility-facts.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { publishRedTeamFixLaunch } from './red-team-fix-round-count.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
@@ -1423,16 +1421,14 @@ export function publishRedTeamFixDispatch({ repo, planned }, {
 } = {}) {
   const comments = readComments(); // Complete reader throws on missing evidence; never launch uncounted.
   const head = planned.headRefOid;
-  const result = redTeamFact(comments, planned.pr, head)?.value;
-  if (result?.state !== 'send-back' || planned.redTeamSentBack?.head !== head
+  if (planned.redTeamSentBack?.head !== head
       || !Number.isSafeInteger(planned.attempts) || planned.attempts < 0) {
     throw new Error('red-team repair dispatch evidence unreadable; retry with a fresh reconciliation or ask an operator');
   }
-  const body = `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${head} result=${result.resultId} attempt=${planned.attempts + 1}`;
-  if (comments.some(c => isTrustedMarkerAuthor(c) && c.body === body)) return false;
-  exec('gh', ['pr', 'comment', String(planned.pr), '--repo', ghRepoSlug(repo), '--body', body],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 });
-  return true;
+  return publishRedTeamFixLaunch({ comments, pr: planned.pr, head, attemptId: planned.attempts + 1,
+    publish: body => exec('gh', ['pr', 'comment', String(planned.pr), '--repo', ghRepoSlug(repo), '--body', body],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 }),
+  });
 }
 
 /**
