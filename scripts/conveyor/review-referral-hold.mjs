@@ -651,7 +651,10 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     const prAt = Date.parse(pr.createdAt);
     const sameReview = hold.count === 1 && hold.attemptsSinceWake === 1 && Number.isFinite(prAt) && adv?.time >= prAt
       && Number.isFinite(hold.reviewStartedAt) && adv.time >= hold.reviewStartedAt;
-    const clean = adv && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
+    // An unreadable comment (non-string body) could hide a pending referral, and a second `Net basis` line could name another head.
+    const readable = pr.comments.every(c => c && typeof c.body === 'string');
+    const basisLines = body.split(/\r?\n/).filter(l => /net\s+basis/i.test(l)).length;
+    const clean = adv && readable && basisLines === 1 && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
       && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
     if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);
     if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);
