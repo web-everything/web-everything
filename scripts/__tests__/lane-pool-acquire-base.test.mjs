@@ -365,7 +365,9 @@ describe('lane-pool acquire --scope= persists advisory predicted scope (#2560)',
     const registry = () => JSON.parse(readFileSync(join(base, 'agent-scopes.json'), 'utf8')).entries;
     expect(registry()[0]).toMatchObject({ agent: 'lane-1', lane: 1, files: ['we:src/shared.ts'] });
     expect(registry()[0].owner).toBe(leaseOf(first.out.trim()).holder);
-    expect(registry()[0].lastSeenAt).toBeTruthy();
+    // No 45-minute heartbeat window: a live lane's claim must not expire while it is still leased.
+    expect(registry()[0].staleAfterMinutes).toBeUndefined();
+    expect(registry()[0].ttlHours).toBe(12);
     const args = ['acquire', ...common, '--lane=2', '--scope=we:src/shared.ts'];
     const refused = runPool(args, env);
     expect(refused.code).not.toBe(0);

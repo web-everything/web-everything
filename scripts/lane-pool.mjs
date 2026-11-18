@@ -133,7 +133,7 @@ import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeL
 import { isProseScopeFile } from './lib/prose-scope-globs.mjs';
 import { checkScope } from './operations/check-scope.mjs';
 import { registerScope, releaseScope } from './operations/free-scope.mjs';
-import { defaultRegistryPath, updateRegistry, resolveFreeScopeSettings, collectFreeScope } from './operations/free-scope-io.mjs';
+import { defaultRegistryPath, updateRegistry, collectFreeScope } from './operations/free-scope-io.mjs';
 import { normScope } from './readiness/scope-lease.mjs';
 import { laneGitSignature, readStatusCache, cachedGitFields, writeStatusCache, resolveStatusMaxAgeMs } from './lib/lane-status-cache.mjs';
 import { isCherryOutputAllPatchEquivalent } from './lib/git-patch-equivalence.mjs';
@@ -203,7 +203,8 @@ import { laneMaskingConfig, laneRedirectConfig, wellFormedConfigList, withHonest
 import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
-const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
+const LANE_SCOPE_TTL_HOURS = 12; // registry claim for a leased lane; cleared on release
+const parseScopeFlag =(v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
 
 // ── tiny arg parsing ──────────────────────────────────────────────────────────────────────────────
 const [, , cmd, ...rest] = process.argv;
@@ -2497,9 +2498,9 @@ async function cmdAcquire(repo) {
         appendFileSync(audit, `${JSON.stringify({ ts: new Date().toISOString(), scope: declaredScope,
           overlaps: scope.overlaps, reason: overlapReason.trim(), session })}\n`);
       }
-      const { staleAfterMinutes } = resolveFreeScopeSettings({ log });
+      // No heartbeat window: a live lane has no heartbeater, so the claim lives until release or the lane TTL.
       return registerScope(entries, { ...reservation, purpose: flags.purpose || session,
-        files: declaredScope, staleAfterMinutes }, new Date().toISOString());
+        files: declaredScope, ttlHours: LANE_SCOPE_TTL_HOURS }, new Date().toISOString());
     });
     await cmdAcquireReserved(repo, reservation);
     keepReservation = true; // A failed best-effort lane publication retains the conservative pending claim.
@@ -3032,11 +3033,10 @@ async function cmdAcquireReserved(repo, reservation) {
   }
   if (declaredScope.length) {
     try {
-      const { staleAfterMinutes } = resolveFreeScopeSettings({ log });
       updateRegistry(defaultRegistryPath(), entries => registerScope(reservation
         ? releaseScope(entries, reservation.agent, reservation.owner).entries : entries, {
         agent: `lane-${chosen}`, owner: holderSlug, purpose: flags.purpose || session,
-        files: declaredScope, staleAfterMinutes,
+        files: declaredScope, ttlHours: LANE_SCOPE_TTL_HOURS,
       }, new Date().toISOString()).map(entry => entry.agent === `lane-${chosen}` && entry.owner === holderSlug
         ? { ...entry, lane: chosen, ...(flags.item !== undefined ? { item: flags.item } : {}) } : entry));
     } catch (error) { log(`  warning: could not register lane scope: ${error.message}`); }
