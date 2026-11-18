@@ -56,6 +56,44 @@ export function scansRealProcess(source) {
   return found;
 }
 
+/** A real-tier file must actually start a real process: a literal command scan, any child_process import, or a
+ *  spawn/git helper import. A rename to `*.real.test.mjs` alone must not move a mock test out of PR validation. */
+export function startsRealProcess(source) {
+  if (scansRealProcess(source)) return true;
+  if (/(?:from\s+|require\(\s*)['"](?:node:)?child_process['"]/.test(source)) return true;
+  return /(?:from\s+|require\(\s*)['"][^'"]*(?:spawn|run-?git|git-?run|exec-?file)[^'"]*['"]/i.test(source);
+}
+
+/** PURE: problems with the real tier given tracked `*.real.test.mjs` files, the manifest list and a source reader. */
+export function realTierProblems(tracked, manifest, read) {
+  const problems = [];
+  const listed = new Set(manifest);
+  for (const file of tracked) {
+    if (!listed.has(file)) problems.push(`${file}: real-tier file not listed in scripts/settings/real-tier-manifest.json`);
+    else if (!startsRealProcess(read(file))) problems.push(`${file}: real-tier file never starts a real process (import child_process, git or a spawn helper)`);
+  }
+  for (const file of manifest) if (!tracked.includes(file)) problems.push(`${file}: listed in the real-tier manifest but not a tracked *.real.test.mjs`);
+  return problems;
+}
+
+describe('real-tier manifest guard', () => {
+  it('fails an unlisted rename, a listed file that starts no process, and a stale manifest entry', () => {
+    const sources = { 'a.real.test.mjs': `import { it } from 'vitest'; it('x', () => {});`, 'b.real.test.mjs': `import { spawnSync } from 'node:child_process';` };
+    const read = (file) => sources[file];
+    expect(realTierProblems(['a.real.test.mjs', 'b.real.test.mjs'], ['a.real.test.mjs'], read).join('\n')).toContain('b.real.test.mjs: real-tier file not listed');
+    expect(realTierProblems(['a.real.test.mjs'], ['a.real.test.mjs'], read).join('\n')).toContain('never starts a real process');
+    expect(realTierProblems([], ['gone.real.test.mjs'], read).join('\n')).toContain('not a tracked');
+    expect(realTierProblems(['b.real.test.mjs'], ['b.real.test.mjs'], read)).toEqual([]);
+  });
+  it('every tracked *.real.test.mjs is listed in the manifest and starts a real process', () => {
+    const root = process.cwd();
+    const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 })
+      .split('\0').filter((file) => file.endsWith('.real.test.mjs')).sort();
+    const manifest = JSON.parse(readFileSync(resolve(root, 'scripts/settings/real-tier-manifest.json'), 'utf8')).realTierFiles;
+    expect(realTierProblems(tracked, manifest, (file) => readFileSync(resolve(root, file), 'utf8'))).toEqual([]);
+  });
+});
+
 describe('real-process syntax scan', () => {
   for (const method of methods) {
     for (const command of ["'node'", 'process.execPath', "'git'", "'gh'"]) {

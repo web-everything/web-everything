@@ -40,8 +40,6 @@ jobs:
       - name: Real-process suite
         id: real
         continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: npm run test:real -- --reporter=default --reporter=json --outputFile=real-tests.json
 
       - name: Report a failure as a health smell (never fails the workflow)
@@ -74,3 +72,11 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label health-smell --body "$body"
           fi
+
+      # The issue above is the card; the run itself must not read green when the tier failed. Scheduled, so
+      # this reddens only this workflow and never a PR or main gate.
+      - name: Fail the run when the tier failed
+        if: steps.real.outcome == 'failure'
+        run: |
+          echo "::error::real-process tier failed; health-smell issue opened or updated."
+          exit 1
