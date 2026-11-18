@@ -1086,6 +1086,21 @@ const xxOptions = () => ({ repo: 'we', readPrs: () => [xxPr()], readAgents: () =
   enrichAlreadyLanded: prs => prs, enrichBaseRef: prs => prs, enrichSystemFix: prs => prs,
   enrichFixClaims: prs => prs, resolveMainSha: () => null, enrichTimeouts: prs => prs });
 
+it.each([false, true])('reconcile pass forwards incomplete agents to the planner (readOnly=%s)', async readOnly => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const agents = Object.defineProperty([], 'incomplete', { value: 'fixture read failed' });
+  const options = { ...xxOptions(), readOnly, readChecks: () => xxRuns() };
+  const before = runReconcilePass(options);
+  expect(before.dispatch.map(row => row.kind)).toEqual(['ci-heal']);
+  const held = runReconcilePass({ ...options, readAgents: () => agents });
+  expect(held.dispatch).toEqual([]);
+  expect(held.refusals.filter(row => row.kind === 'agents-incomplete')).toEqual([
+    expect.objectContaining({ prNumber: 3336, headSha: XX_HEAD, incomplete: true }),
+  ]);
+  expect(held.notes).toEqual(before.notes);
+  if (readOnly) expect(held.agentsIncomplete).toBe(true);
+});
+
 it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const readChecks = vi.fn(() => xxRuns());

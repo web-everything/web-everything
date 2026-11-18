@@ -302,6 +302,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
+  'agents-incomplete',
   'fix-join-wait',
   'review-ci', 'review-referrals-pending',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
@@ -2090,6 +2091,7 @@ const liveWhy = (pr, opts) => ` (live: ${liveCheckNames(pr, opts).slice(0, 5).jo
  * @param {Array<object>} [o.agents] - `claude agents --json` entries, each optionally carrying the two facts the
  *   listing cannot supply and the IO shell resolves: `laneHeadOid` (the `HEAD` of the lane at `cwd`) and
  *   `pidAlive` (`process.kill(pid, 0)` → `true`/`false`; absent = not probed = UNKNOWN).
+ * @param {boolean} [o.agentsIncomplete=false] - incomplete inventory holds every dispatch; non-array agents also hold.
  * @param {object} [o.durableCounts] - `{ [prNumber]: n }`, the PR-derived attempt count the shell reads back
  *   with `countRearmComments`. There is NO in-process tally parameter and none is consulted: a cap that a
  *   restart can reset is not a cap.
@@ -2174,7 +2176,7 @@ export function missingReviewLabel(pr) {
 
 
 export function planReconcile({
-  repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap: ciHealCapArg = null,
+  repo = 'we', prs = [], agents = [], agentsIncomplete = false, durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap: ciHealCapArg = null,
   // `ciHeal.*` budget cascade ({@link resolveCiHealBudget}); the IO shell may pass the resolved layers. An explicit
   // `ciHealCap` still wins (source `caller`).
   ciHealBudget = resolveCiHealBudget({ env: globalThis.process?.env ?? {} }),
@@ -4101,6 +4103,17 @@ export function planReconcile({
         attempts: entry.reviewFixAttempts ?? entry.attempts,
         joinedInputs: { head: pr.headRefOid, ciFailures: facts.ciFailures, reviewFindings: facts.findings.map(c => c.body) } });
     } else timedDispatch.push(entry);
+  }
+  // COMMON refusal path: every dispatch kind crosses this fence, including multiple actions on one PR.
+  if (agentsIncomplete === true || !Array.isArray(agents)) {
+    const held = new Set();
+    for (const entry of timedDispatch) {
+      if (held.has(entry.prNumber)) continue;
+      held.add(entry.prNumber);
+      refusals.push({ ...entry, kind: 'agents-incomplete', headSha: entry.headRefOid, incomplete: true,
+        why: 'agent inventory is incomplete or unreadable — retry with a complete agent listing before dispatch' });
+    }
+    timedDispatch.length = 0;
   }
   for (const d of timedDispatch) {
     if (d.kind !== 'review' || !d.churnCap || notes.some(n => n.kind === 'review-churn' && n.prNumber === d.prNumber)) continue;

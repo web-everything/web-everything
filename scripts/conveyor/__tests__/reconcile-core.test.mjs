@@ -234,6 +234,54 @@ describe('case 1 — the dispatch, keyed by PR NUMBER (#3296)', () => {
   });
 });
 
+describe('planReconcile incomplete agent inventory', () => {
+  const input = () => ({ prs: [
+    pr1563(),
+    pr1563({ number: 9002, labels: lbl('review:pending'), comments: [] }),
+    pr1563({ number: 9003, labels: [], statusCheckRollup: redRollup, comments: [] }),
+    pr1563({ number: 9004, isDraft: true, labels: lbl('review:pending'), comments: [] }),
+    pr1563({ number: 9005, labels: [], comments: [] }),
+  ], agents: [], now: NOW,
+  shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } });
+
+  it('agentsIncomplete=true refuses every would-be dispatch across all PRs, once per PR without extra notes', () => {
+    const facts = input();
+    const before = planReconcile(facts);
+    expect(before.dispatch.map(row => row.kind)).toEqual(['fix', 'review', 'ci-heal', 'promote-draft', 'restore-review-label']);
+    const held = planReconcile({ ...facts, agentsIncomplete: true });
+    expect(held.dispatch).toEqual([]);
+    expect(held.refusals.filter(row => row.kind === 'agents-incomplete')).toHaveLength(facts.prs.length);
+    expect(held.refusals.filter(row => row.kind !== 'agents-incomplete')).toEqual(before.refusals);
+    for (const pr of facts.prs) expect(held.refusals).toContainEqual(expect.objectContaining({
+      prNumber: pr.number, headSha: pr.headRefOid, kind: 'agents-incomplete', incomplete: true, why: expect.any(String),
+    }));
+    expect(held.notes).toEqual(before.notes);
+    expect(REFUSAL_KINDS).toContain('agents-incomplete');
+  });
+
+  it('false and absent flags preserve the existing mixed dispatch/refusal fixture with readable agents', () => {
+    const facts = { ...input(), prs: OPEN_AT_1734, agents: [{ sessionId: 'unbound-fixture', laneHeadOid: 'f'.repeat(40) }] };
+    const before = planReconcile(facts);
+    expect(before.dispatch.map(row => [row.prNumber, row.kind])).toEqual([[1576, 'fix']]);
+    expect(before.refusals.map(row => row.kind)).toEqual(['nothing-owed', 'nothing-owed', 'nothing-owed']);
+    expect(planReconcile({ ...facts, agentsIncomplete: false })).toEqual(before);
+    const held = planReconcile({ ...facts, agentsIncomplete: true });
+    expect(held.refusals.filter(row => row.kind !== 'agents-incomplete')).toEqual(before.refusals);
+    expect(held.refusals.filter(row => row.kind === 'agents-incomplete')).toHaveLength(1);
+  });
+
+  it.each([null, {}, 'unreadable', 1])('non-array agents fail closed even with an explicit false flag: %j', agents => {
+    const facts = input();
+    const before = planReconcile(facts);
+    const held = planReconcile({ ...facts, agents, agentsIncomplete: false });
+    expect(held.dispatch).toEqual([]);
+    const incomplete = held.refusals.filter(row => row.kind === 'agents-incomplete');
+    expect(incomplete).toHaveLength(facts.prs.length);
+    expect(incomplete.every(row => row.incomplete === true)).toBe(true);
+    expect(held.refusals.filter(row => row.kind !== 'agents-incomplete')).toEqual(before.refusals);
+  });
+});
+
 // ── CASE 2 — REFUSAL 1: `stood-down` IS TERMINAL ──────────────────────────────────────────────────────────────
 describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (#3296)', () => {
   const stoodDown = pr1563({ comments: [finding(), { body: `${STAND_DOWN_MARKER}\n\nthe finding needs a judgment.`, author: AUTOMATION }] });

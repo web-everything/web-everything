@@ -1829,6 +1829,7 @@ export function runReconcilePass({
   const rulingPrs = step('enrich-review-churn', () => enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug }));
   const listedAgents = readAgents(readOnly ? { readOnly: true } : {});
   const agents = preserveIncomplete(listedAgents, enrich(listedAgents));
+  const agentsIncomplete = !Array.isArray(listedAgents) || !Array.isArray(agents) || Object.hasOwn(agents, 'incomplete');
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
@@ -1844,7 +1845,7 @@ export function runReconcilePass({
     owedCiRerun: owedCiRerunSetting.value,
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
-    repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
+    repo: repoKey, prs, agents, agentsIncomplete, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
     ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
@@ -1857,8 +1858,8 @@ export function runReconcilePass({
     ...(readOnly ? { shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } } : {}),
   };
   const plan = step('plan', () => planReconcile(plannerInput));
-  const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
-  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  const { prs: _prs, agents: _agents, agentsIncomplete: _incomplete, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
+  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete, plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };

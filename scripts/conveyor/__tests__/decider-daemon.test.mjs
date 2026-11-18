@@ -509,9 +509,16 @@ it('uses hydrated agents and live planner policies without a second listing', as
   r.ingest([event()]); await r.tick();
   expect(planReconcile).toHaveBeenCalledWith(expect.objectContaining({ agents, ...plannerOptions }));
 });
-it('records incomplete hydration and retries without planning', async () => {
-  const r = rig({ overrides: { hydrate: () => ({ pr: pr(), agents: [], agentsIncomplete: true, plannerOptions: {} }) } });
+it.each([
+  { agents: [], agentsIncomplete: true },
+  { agents: null, agentsIncomplete: false },
+])('records incomplete hydration and retries without planning (%j)', async facts => {
+  const r = rig({ overrides: { hydrate: () => ({ pr: pr(), ...facts, plannerOptions: {} }) } });
   r.ingest([event()]); await r.tick();
-  expect(r.decisions()[0]).toMatchObject({ incomplete: true, action: null, reasons: ['agents-incomplete'], recheckAt: NOW + 60000 });
+  expect(r.decisions()).toHaveLength(1);
+  expect(r.decisions()[0]).toEqual({ version: DECIDE_VERSION, repo: REPO, number: 5454, head: HEAD, seq: 1,
+    action: null, considered: [], reasons: ['agents-incomplete'], recheckAt: NOW + 60000, incomplete: true,
+    shadow: true, kind: 'decision', process: { ...IDENTITY, role: 'decider' }, eventAt: NOW, decidedAt: NOW, lagMs: 0 });
   expect(planReconcile).not.toHaveBeenCalled();
+  expect(r.io.appendShadow).toHaveBeenCalledTimes(2); // one decision and the usual admission summary
 });
