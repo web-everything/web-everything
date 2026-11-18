@@ -62,14 +62,17 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       if (!FINDING_CLASSES.includes(a.class) || (finding?.class && finding.class !== a.class)) return block('invalid or conflicting class');
       const text = findingText(finding), location = parseFindingLocation(text);
       if (!location || (finding?.file && finding.file !== location.file) || (finding?.line && finding.line !== location.line)) return block('invalid head location');
-      if (!(changedLines instanceof Map)) return block('diff evidence missing');
+      if (!(changedLines instanceof Map) || changedLines.complete !== true) return block('diff evidence missing or truncated');
       const changed = changedLines.get(location.file) ?? new Set();
       if (!(changed instanceof Set) || changed.has(location.line)) return block('head line changed or diff evidence missing');
       const base = a.base;
       if (!base || !Number.isSafeInteger(base.line) || base.line < 1) return block('invalid base location');
       findingKey({ file: base.path, class: a.class });
       const source = readBaseFile(base.path);
-      if (typeof source !== 'string' || typeof a.quote !== 'string' || !a.quote.trim() || !source.includes(a.quote)) return block('base quote unavailable');
+      if (base.path !== location.file) return block('base path differs from the finding');
+      const quoteLines = typeof a.quote === 'string' ? a.quote.split('\n').length : 0;
+      if (typeof source !== 'string' || !quoteLines || !a.quote.trim()
+        || !source.split('\n').slice(base.line - 1, base.line - 1 + quoteLines).join('\n').includes(a.quote)) return block('base quote not at the claimed base line');
       const symbol = finding?.symbol || symbolAt(finding?.sourceText, location.line);
       const key = findingKey({ file: location.file, symbol, class: a.class });
       if (cardWritten(key) !== true) return block('card not written');
@@ -97,6 +100,8 @@ export function parseDiffChangedLines(diffU0Text) {
     const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (hunk && file) { headLine = Number(hunk[1]); remaining = Number(hunk[2] ?? 1); }
   }
+  // Complete only for a non-empty diff whose last hunk was read in full; an empty or cut-off diff clears nothing.
+  files.complete = remaining === 0 && /^diff --git /m.test(diffU0Text);
   return files;
 }
 

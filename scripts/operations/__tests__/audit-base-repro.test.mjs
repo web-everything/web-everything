@@ -64,7 +64,18 @@ describe('pre-existing classification', () => {
     } });
     expect(readBaseFile).toHaveBeenCalledWith('lib/x.mjs');
     expect(cardWritten).toHaveBeenCalledWith('lib/x.mjs|X|B2');
-    expect(classify({ changedLines: new Map() })[0].blocking).toBe(false);
+    expect(classify({ changedLines: Object.assign(new Map(), { complete: true }) })[0].blocking).toBe(false);
+  });
+  it('an empty, truncated or incomplete diff clears nothing', () => {
+    expect(classify({ changedLines: parseDiffChangedLines('') })[0].blocking).toBe(true);
+    expect(classify({ changedLines: parseDiffChangedLines(diff.replace('+  return fixed();\n', '')) })[0].blocking).toBe(true);
+    expect(classify({ changedLines: new Map() })[0].blocking).toBe(true);
+  });
+  it('the base quote must sit at the claimed base line and path', () => {
+    const wrongLine = parseReproAnswer(answer().replace('lib/x.mjs:2', 'lib/x.mjs:999999'), 1);
+    expect(classify({ answers: wrongLine })[0].blocking).toBe(true);
+    const wrongPath = parseReproAnswer(answer().replace('BASE=lib/x.mjs', 'BASE=lib/y.mjs'), 1);
+    expect(classify({ answers: wrongPath })[0].blocking).toBe(true);
   });
   it('a2 flagged changed head line blocks before carding', () => {
     const cardWritten = vi.fn();

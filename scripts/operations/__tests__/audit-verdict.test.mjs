@@ -1355,7 +1355,7 @@ describe('AU1 PR-A is inert', () => {
       && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text))).map(m => m?.file ?? 'unparsed grep line'))];
     // R1053 S1a: these pure modules may import the vocabulary, but must have no runtime callers.
     expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);
-    const callers = spawnSync('git', ['grep', '--untracked', '-nE', 'audit-finding-key\\.mjs|audit-base-repro\\.mjs', '--', 'scripts'],
+    const callers = spawnSync('git', ['grep', '--untracked', '-nE', 'audit-finding-key\\.mjs|audit-base-repro\\.mjs', '--', 'scripts', 'skills-src', '.claude', 'src'],
       { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
     expect(callers.error).toBeUndefined();
     expect(callers.status).toBe(0);
