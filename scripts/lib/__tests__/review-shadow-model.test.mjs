@@ -565,3 +565,15 @@ it('promotion resolves standard, platform, tool and env and rejects incomplete s
   }
   expect(resolveShadowPromoted({ ...base, readFile: () => { throw Error('unreadable'); } }).value).toBe(false);
 });
+
+describe('resolveShadowPromoted fails closed on an unreadable or malformed tool file (audit)', () => {
+  const platform = { shadowSeats: { antigravity: { promoted: true } } };
+  it.each([['malformed JSON', () => '{nope'], ['EACCES', () => { throw Object.assign(new Error('x'), { code: 'EACCES' }); }]])(
+    'a %s tool file refuses promotion even when the platform layer says true', (_n, readFile) => {
+      expect(resolveShadowPromoted({ env: {}, readFile, platform, log: () => {} })).toMatchObject({ value: false });
+    });
+  it('an absent tool file lets the platform layer speak', () => {
+    const readFile = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
+    expect(resolveShadowPromoted({ env: {}, readFile, platform, log: () => {} })).toMatchObject({ value: true });
+  });
+});

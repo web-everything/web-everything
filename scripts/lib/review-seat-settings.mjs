@@ -218,7 +218,13 @@ export function resolveCardOnlyReviewSettings({ env = process.env, platform,
 export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTINGS_FILE,
   readFile = (p) => readFileSync(p, 'utf8'), platform, log = (m) => console.error(m) } = {}) {
   let tool = {};
-  try { tool = JSON.parse(readFile(file)); } catch { /* default refuses */ }
+  try { tool = JSON.parse(readFile(file)); } catch (error) {
+    // Only an ABSENT tool file lets lower layers speak; unreadable or malformed tool settings refuse promotion (fail closed).
+    if (error?.code !== 'ENOENT') {
+      log('review.shadowSeats.antigravity: promoted=false (tool review.json unreadable or malformed; promotion refused)');
+      return { value: false, source: 'refused' };
+    }
+  }
   // A present malformed override refuses promotion at its own layer rather than exposing a lower true.
   const project = value => value === undefined ? {} : { promoted: value === true };
   const envPromoted = env.WE_REVIEW_SHADOW_AGY_PROMOTED;
