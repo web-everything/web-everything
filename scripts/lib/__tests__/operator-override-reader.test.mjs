@@ -24,6 +24,21 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('lock-free operator override reader', () => {
+  it.each([1, 8, 16])('accepts persisted live-review capacity %i', value => {
+    const key = 'reviewConcurrency.maxLiveReviewRounds';
+    writeFileSync(file, JSON.stringify({ [key]: value }));
+    expect(readOperatorOverrides({ file })).toEqual({ readable: true, values: { [key]: value } });
+  });
+
+  it.each([0, 17])('rejects persisted live-review capacity %i and names the invalid policy', value => {
+    writeFileSync(file, JSON.stringify({ 'reviewConcurrency.maxLiveReviewRounds': value }));
+    const log = vi.fn();
+    expect(readOperatorOverrides({ file, log })).toEqual({
+      readable: true, values: {}, invalidPolicies: ['reviewConcurrency'],
+    });
+    expect(log.mock.calls.flat().join(' ')).toContain('outside hard range');
+  });
+
   it('has only builtin dependencies and cannot reach the writer or drain lock', () => {
     const entry = resolve('scripts/lib/operator-override-reader.mjs');
     expect(importGraph(entry)).toEqual({
