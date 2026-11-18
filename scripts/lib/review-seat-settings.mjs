@@ -113,6 +113,33 @@ export function resolveShadowTrialReviews({ env = process.env, file = REVIEW_SET
   return { value: null, source: 'default' };
 }
 
+/** Reporting only: env > settings > 10 agreeing PRs. Promotion remains manual; no seat or gate changes. */
+export function resolveShadowPromotionPrs({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
+  const valid = (v) => {
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : NaN);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+  };
+  const fromEnv = valid(env?.WE_REVIEW_SHADOW_AGY_PROMOTION_PRS);
+  if (fromEnv) return { value: fromEnv, source: 'env' };
+  try {
+    const value = valid(JSON.parse(readFile(file))?.shadowSeats?.antigravity?.promotionAgreeingPrs);
+    if (value) return { value, source: 'settings' };
+  } catch { /* built-in */ }
+  return { value: 10, source: 'default' };
+}
+
+/** Report-only replacement target: one existing provider seat, never an extra seat. */
+export function resolveShadowPromotionReplaces({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
+  const valid = v => ['claude', 'codex', 'agy'].includes(v);
+  const fromEnv = env?.WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES;
+  if (valid(fromEnv)) return { value: fromEnv, source: 'env' };
+  try {
+    const value = JSON.parse(readFile(file))?.shadowSeats?.antigravity?.promotionReplaces;
+    if (valid(value)) return { value, source: 'settings' };
+  } catch { /* built-in */ }
+  return { value: 'claude', source: 'default' };
+}
+
 /** Operational panel safeguards. Standard → platform review → tool review.json → env.
  * enabled: false; scope: high-care; dailyCap: 100 (New York day); sampleRate: 0.1 in [0,1) (1 is refused).
  * minNonClaudeSeats: positive integer, default 1.

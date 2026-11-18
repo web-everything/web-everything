@@ -3,7 +3,7 @@
  * Every test here is red on the code before card 84 (none of these modules existed).
  */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +13,7 @@ import {
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../../lib/dispatch-routing-policy.mjs';
 import { runSeatWithProvider } from '../review-seat-runner.mjs';
 import {
-  compareShadowAnswers, summarizeShadowAgreement, renderShadowReport, appendShadowRow, readShadowRows,
+  compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport, appendShadowRow, readShadowRows,
 } from '../../lib/review-shadow-agreement.mjs';
 import { runAgyReviewJuror, stateChangingToolCalls, changedCheckouts, escapingSymlinks } from '../../lib/agy-review-juror.mjs';
 import { judgeOutcome, unwrapJudgeOutcome, createDefaultJudge } from '../cli-adapter.mjs';
@@ -226,6 +226,58 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
 });
 
 describe('the agreement report (#76a identity, #76b sameAs through the PR table)', () => {
+  const carbonRow = (extra = {}) => ({ repo: 'o/r', pr: 1, model: 'gemini-4-carbon-high',
+    status: 'ok', overlap: { jaccard: 1 }, verdictAgree: true, lens: 'correctness', ...extra });
+  it('counts each PR once across heads, runs and lenses, requiring every compared Carbon verdict to agree', () => {
+    const rows = [carbonRow(), carbonRow({ lens: 'security' }), carbonRow({ head: 'next', runId: 'next' }),
+      carbonRow({ pr: 2 }), carbonRow({ pr: 2, verdictAgree: false }),
+      carbonRow({ repo: 'other/repo' }), carbonRow({ pr: 3, verdictAgree: 'true' })];
+    const before = structuredClone(rows);
+    expect(summarizeCarbonPromotion(rows, { threshold: 2 })).toEqual({ agreeingPrs: 2, comparedPrs: 4, threshold: 2, reached: true });
+    expect(summarizeCarbonPromotion(rows, { threshold: 3 }).reached).toBe(false);
+    expect(rows).toEqual(before);
+  });
+  it('excludes other models, failed, voided, skipped, uncompared and fallback attempts and missing PR identity', () => {
+    const ignored = [null, carbonRow({ model: 'gemini-4-argon-high' }), carbonRow({ model: undefined }),
+      ...['failed', 'voided', 'skipped'].map(status => carbonRow({ status })),
+      carbonRow({ overlap: null }), carbonRow({ fellBackTo: 'routing-model' }),
+      carbonRow({ repo: null }), carbonRow({ pr: null })];
+    expect(summarizeCarbonPromotion(ignored)).toEqual({ agreeingPrs: 0, comparedPrs: 0, threshold: 10, reached: false });
+    expect(summarizeCarbonPromotion([carbonRow(), ...ignored.map(row => row && { ...row, verdictAgree: false })]).agreeingPrs).toBe(1);
+  });
+  it('refuses invalid and oversized explicit thresholds rather than claiming promotion', () => {
+    for (const threshold of [0, -1, 1.5, '1', NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => summarizeCarbonPromotion([], { threshold })).toThrow(/positive safe integer/);
+    }
+  });
+  it('renders reached and not reached with manual promotion and includes the empty report', () => {
+    const rows = [carbonRow()];
+    const message = 'Carbon vs Claude: 1 of 1 PRs agree; promotion threshold 1 agreeing PRs: reached (promotion is manual; the orchestrator flips it)';
+    expect(renderShadowReport(summarizeShadowAgreement(rows), summarizeCarbonPromotion(rows, { threshold: 1 }))).toContain(message);
+    expect(renderShadowReport([], summarizeCarbonPromotion([]))).toContain(
+      'Carbon vs Claude: 0 of 0 PRs agree; promotion threshold 10 agreeing PRs: not reached (promotion is manual; the orchestrator flips it)');
+  });
+  it('CLI text and JSON report Carbon promotion using the resolved threshold and log its source', () => {
+    const root = mkdtempSync(join(tmpdir(), 'carbon-report-'));
+    try {
+      mkdirSync(join(root, '.conveyor'));
+      writeFileSync(join(root, '.conveyor', 'agy-shadow-agreement.jsonl'), `${JSON.stringify(carbonRow())}\n`);
+      const env = { ...process.env, CONVEYOR_STATE_ROOT: root, WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: '1', WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES: 'codex' };
+      const script = 'scripts/lib/review-shadow-agreement.mjs';
+      const options = { env, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
+      const result = spawnSync(process.execPath, [script, '--report', '--json'], options);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('promotionAgreeingPrs=1 (env)');
+      expect(result.stderr).toContain('promotionReplaces=codex (env)');
+      const json = JSON.parse(result.stdout);
+      expect(json.carbonPromotion).toEqual({ agreeingPrs: 1, comparedPrs: 1, threshold: 1, reached: true, promotionReplaces: 'codex' });
+      expect(json.seats[0].compared).toBe(1);
+      const text = execFileSync(process.execPath, [script, '--report'], options);
+      expect(text).toContain('Carbon vs Claude: 1 of 1 PRs agree; promotion threshold 1 agreeing PRs: reached');
+      expect(text).toContain('(promotion is manual; the orchestrator flips it)');
+      expect(text).toContain('replace one existing codex seat; panel size stays fixed');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('verdict + finding overlap: an exact match, a moved line with the same claim, and a disjoint finding', () => {
     expect(compareShadowAnswers({ claude: { findings: [] }, agy: { findings: [] } })).toMatchObject({ verdictAgree: true, overlap: { jaccard: 1 } });
     const c = compareShadowAnswers({ claude: { findings: [FINDING] }, agy: { findings: [{ ...FINDING, line: 40 }] } });

@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { bindFindingIds, deriveVerdict, findingIdentityEntry, normalizeFindings } from './jury-core.mjs';
 import { findingDefectClass } from './review-round-rules.mjs';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
+import { resolveShadowPromotionPrs, resolveShadowPromotionReplaces } from './review-seat-settings.mjs';
 
 /** A quota hold/exhaustion is the agy backend being out of budget: no juror ran, so it is neither a failure of the seat nor evidence about agy. */
 export const isQuotaHeldShadow = (row) => row?.status !== 'ok' && row?.status !== 'voided'
@@ -181,22 +182,46 @@ export function summarizeShadowAgreement(rows = []) {
   }));
 }
 
+/** Count PRs with unanimous compared Carbon verdict agreement across every head/lens/run. PURE. */
+export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
+  if (!Number.isSafeInteger(threshold) || threshold <= 0) throw new RangeError('promotion threshold must be a positive safe integer');
+  const prs = new Map();
+  for (const row of rows) {
+    if (typeof row?.model !== 'string' || !row.model.includes('carbon') || row.status !== 'ok'
+      || !row.overlap || Object.hasOwn(row, 'fellBackTo') || row.repo == null || row.pr == null) continue;
+    const key = `${row.repo}#${row.pr}`;
+    prs.set(key, (prs.get(key) ?? true) && row.verdictAgree === true);
+  }
+  const agreeingPrs = [...prs.values()].filter(Boolean).length;
+  return { agreeingPrs, comparedPrs: prs.size, threshold, reached: agreeingPrs >= threshold };
+}
+
 /** The report as text lines. PURE. */
-export function renderShadowReport(summary) {
-  if (!summary.length) return ['agy shadow agreement: no shadow runs recorded yet'];
+export function renderShadowReport(summary, carbonPromotion = summarizeCarbonPromotion([]), promotionReplaces = 'claude') {
+  const c = carbonPromotion;
+  const replacement = `Carbon promotion would replace one existing ${promotionReplaces} seat; panel size stays fixed.`;
+  const promotion = `Carbon vs Claude: ${c.agreeingPrs} of ${c.comparedPrs} PRs agree; promotion threshold ${c.threshold} agreeing PRs: ${c.reached ? 'reached' : 'not reached'} (promotion is manual; the orchestrator flips it)`;
+  if (!summary.length) return ['agy shadow agreement: no shadow runs recorded yet', promotion, replacement];
   const pct = (v) => (v == null ? 'n/a' : `${Math.round(v * 100)}%`);
   return [
     'agy shadow agreement, per seat (only the Claude verdict counted on these runs):',
     ...summary.map((s) => `  ${s.lens}: ${s.runs} run(s) on ${s.prs} PR(s) — ${s.compared} compared, `
       + `${s.voided} voided (escaped its lane), ${s.failed} failed, ${s.held} held (agy quota), ${s.skipped} skipped; verdict agreement ${pct(s.verdictAgreement)}, `
       + `mean finding overlap ${pct(s.meanFindingOverlap)}`),
+    promotion, replacement,
   ];
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
   const args = process.argv.slice(2);
-  const summary = summarizeShadowAgreement(readShadowRows());
-  if (args.includes('--json')) process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
-  else process.stdout.write(`${renderShadowReport(summary).join('\n')}\n`);
+  const rows = readShadowRows();
+  const summary = summarizeShadowAgreement(rows);
+  const setting = resolveShadowPromotionPrs();
+  const replaces = resolveShadowPromotionReplaces();
+  const carbonPromotion = { ...summarizeCarbonPromotion(rows, { threshold: setting.value }), promotionReplaces: replaces.value };
+  process.stderr.write(`review.shadowSeats.antigravity.promotionReplaces=${replaces.value} (${replaces.source})\n`);
+  process.stderr.write(`review.shadowSeats.antigravity.promotionAgreeingPrs=${setting.value} (${setting.source})\n`);
+  if (args.includes('--json')) process.stdout.write(`${JSON.stringify({ seats: summary, carbonPromotion }, null, 2)}\n`);
+  else process.stdout.write(`${renderShadowReport(summary, carbonPromotion, replaces.value).join('\n')}\n`);
 }
