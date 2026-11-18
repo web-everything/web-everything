@@ -28,6 +28,27 @@ describe('audit ledger chain', () => {
     await appendChained(path, { verdict: 'NOT WEAKENED' });
     expect(records().at(-1).seq).toBe(1);
   });
+  it('refuses to append after a truncation below the high-water mark', async () => {
+    await genesis();
+    for (let i = 0; i < 4; i++) await appendChained(path, { verdict: 'WEAKENED', n: i });
+    const hwm = join(root, 'audits.hwm.json');
+    expect(JSON.parse(fs.readFileSync(hwm, 'utf8'))).toMatchObject({ seq: 4, lineHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    const kept = fs.readFileSync(path, 'utf8').split('\n').slice(0, 2).join('\n') + '\n';
+    fs.writeFileSync(path, kept);
+    const before = fs.readFileSync(path);
+    await expect(appendChained(path, { verdict: 'NOT WEAKENED' })).rejects.toThrow(/rollback/);
+    expect(fs.readFileSync(path)).toEqual(before);
+    expect(fs.existsSync(`${path}.lock`)).toBe(false);
+  });
+  it('refuses when the line at the high-water seq was rewritten', async () => {
+    await genesis();
+    await appendChained(path, { verdict: 'WEAKENED' });
+    await appendChained(path, { verdict: 'WEAKENED' });
+    const lines = fs.readFileSync(path, 'utf8').trim().split('\n');
+    lines[2] = JSON.stringify({ ...JSON.parse(lines[2]), verdict: 'NOT WEAKENED' });
+    fs.writeFileSync(path, `${lines.join('\n')}\n`);
+    await expect(appendChained(path, { verdict: 'NOT WEAKENED' })).rejects.toThrow(/rollback/);
+  });
   it('hashes all original legacy bytes and the last nonempty raw line', async () => {
     const raw = Buffer.from(' {"old":1}\r\n\nnot-json\n\n');
     fs.writeFileSync(path, raw);

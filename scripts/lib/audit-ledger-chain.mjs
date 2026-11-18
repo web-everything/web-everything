@@ -1,7 +1,7 @@
 /** @file Serialized, durable audit appends; legacy records stay unchained until genesis. */
 import { createHash, randomBytes } from 'node:crypto';
 import * as realFs from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 
 export const sha256Line = rawLine => createHash('sha256').update(rawLine).digest('hex');
@@ -45,6 +45,28 @@ function reclaimStale(lock, fs, now) {
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
 }
 
+const hwmPath = path => join(dirname(path), 'audits.hwm.json');
+/** Refuses a ledger that was truncated or rewritten below the recorded high-water mark. */
+function assertHighWater(path, lines, parsed, fs) {
+  let hwm;
+  try { hwm = JSON.parse(fs.readFileSync(hwmPath(path), 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw new Error('Audit ledger high-water mark unreadable; repair before appending.');
+  }
+  const at = parsed.findIndex(entry => entry?.seq === hwm?.seq && Number.isSafeInteger(hwm.seq));
+  const last = parsed.findLast(entry => Number.isSafeInteger(entry?.seq));
+  if (at === -1 || !last || last.seq < hwm.seq || sha256Line(lines[at]) !== hwm.lineHash) {
+    throw new Error(`Audit ledger rollback detected (high-water seq ${hwm?.seq}); refusing to append.`);
+  }
+}
+function writeHighWater(path, record, line, fs) {
+  const tmp = `${hwmPath(path)}.${process.pid}.tmp`, fd = fs.openSync(tmp, 'w', 0o600);
+  try { fs.writeSync(fd, JSON.stringify({ seq: record.seq, lineHash: sha256Line(line) })); fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+  fs.renameSync(tmp, hwmPath(path));
+}
+
 /** 40 bounded retries; on contention, inspect both lock files before operator repair. */
 export async function appendChained(path, record, { fs = realFs, sleep = setTimeout, now = Date.now } = {}) {
   fs.mkdirSync(dirname(path), { recursive: true });
@@ -74,6 +96,7 @@ export async function appendChained(path, record, { fs = realFs, sleep = setTime
     fs.writeFileSync(owner, String(process.pid));
     const raw = readLedger(path, fs), lines = linesOf(raw), parsed = lines.map(parse);
     const separator = raw.length && raw.at(-1) !== 10 ? '\n' : '';
+    assertHighWater(path, lines, parsed, fs);
     const genesis = parsed.findIndex(entry => entry?.kind === 'genesis');
     if (record.kind === 'genesis') {
       record = buildGenesis(separator ? Buffer.concat([raw, Buffer.from(separator)]) : raw);
@@ -91,6 +114,7 @@ export async function appendChained(path, record, { fs = realFs, sleep = setTime
       fs.appendFileSync(fd, `${separator}${JSON.stringify(record)}\n`, { encoding: 'utf8' });
       fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
+    if (Number.isSafeInteger(record.seq)) writeHighWater(path, record, Buffer.from(JSON.stringify(record)), fs);
     return record;
   } finally {
     try {

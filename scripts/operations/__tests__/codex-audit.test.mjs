@@ -361,7 +361,10 @@ describe('audit IO with injected filesystem and subprocesses', () => {
 
   it.each(['{}', '{"auditRecordPath":"~/custom/audits.jsonl"}'])('expands configured or default record path: %s', async settings => {
     const f = adapter();
-    f.fs.readFileSync.mockImplementation(path => String(path).endsWith('prototype-load.json') ? settings : Buffer.alloc(0));
+    f.fs.readFileSync.mockImplementation(path => {
+      if (String(path).endsWith('audits.hwm.json')) throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+      return String(path).endsWith('prototype-load.json') ? settings : Buffer.alloc(0);
+    });
     await f.deps.appendRecord({ head: HEAD });
     const path = settings === '{}' ? '/home/test/workspace/.operations/coordination/audits.jsonl' : '/home/test/custom/audits.jsonl';
     expect(f.fs.appendFileSync).toHaveBeenCalledWith(path, JSON.stringify({ head: HEAD }) + '\n', expect.any(Object));
