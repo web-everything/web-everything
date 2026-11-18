@@ -495,3 +495,23 @@ describe('full seed taints shas of vanished cached checks', () => {
     expect(m.evictedShas).toEqual([sha]);
   });
 });
+
+describe('refresh keeps mid-refresh evidence and fallback refuses malformed pages', () => {
+  it('a malformed (null) page throws instead of returning empty evidence', () => {
+    const sha = 'e'.repeat(40);
+    const exec = (_c, a) => (/pulls\/4$/.test(a[a.length - 1]) ? JSON.stringify({ number: 4, state: 'open', head: { sha }, labels: [] }) : 'null');
+    expect(() => readPrFactsFromGithub({ repo: 'o/r', number: 4, exec })).toThrow(/malformed page/);
+  });
+
+  it('full:backlog seeds from the delta-advanced mirror so an unattached check is tombstoned', async () => {
+    const repo = 'o/r';
+    const sha = 'f'.repeat(40);
+    const prev = seedMirror({ repo, body: { prs: [], stateCursor: 1, coverage: { bootstrap: [{ repo, status: 'complete' }] } }, nowMs: 1 });
+    const ev = { seq: 2, repo, type: 'check_run', action: 'completed', id: 'c1', sha, name: 'n', app: 'a', conclusion: 'failure', at: new Date(1).toISOString(), number: null };
+    const fetchImpl = async (u) => new Response(JSON.stringify(u.endsWith('/prs') ? { prs: [], stateCursor: 3, coverage: { bootstrap: [{ repo, status: 'complete' }] } }
+      : { cursor: 2, events: [ev], more: true }));
+    const r = await refreshMirror(prev, { repo, url: 'https://w.local', nowMs: 5, maxDeltaPages: 1, fetchImpl });
+    expect(r.mode).toBe('full:backlog');
+    expect(r.mirror.evictedShas).toContain(sha);
+  });
+});

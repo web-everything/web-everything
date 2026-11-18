@@ -324,7 +324,8 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
   retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs, timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
   const io = { fetchImpl, timeoutMs };
   const compact = (mirror) => compactMirror(mirror, { nowMs, retentionMs });
-  const full = async () => compact(seedMirror({ repo, body: await getJson(`${url}/prs`, token, io), nowMs, prev, retentionMs }));
+  // Seed from the newest state held (after delta pages), so evidence gathered mid-refresh is tombstoned, not silently lost.
+  const full = async (base = prev) => compact(seedMirror({ repo, body: await getJson(`${url}/prs`, token, io), nowMs, prev: base, retentionMs }));
   try {
     if (!prev || prev.v !== PR_FACTS_VERSION || !Number.isInteger(prev.cursor)) return { mirror: await full(), mode: 'full' };
     let m = prev;
@@ -333,13 +334,13 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
       const b = await getJson(`${url}/events?${q}`, token, io);
       if (!b || !Number.isInteger(b.cursor) || !Array.isArray(b.events)) throw new Error('malformed /events response');
       if (b.gap || b.reset) {
-        const mirror = await full();
+        const mirror = await full(m);
         return { mirror: { ...mirror, fullPulls: (prev.fullPulls || 0) + 1 }, mode: b.gap ? 'full:gap' : 'full:reset' };
       }
       m = { ...applyDelta(m, b.events), cursor: b.cursor, lastDeliveryAt: b.lastDeliveryAt ?? m.lastDeliveryAt, lastEventAt: b.lastEventAt ?? m.lastEventAt };
       if (!b.more) return { mirror: compact({ ...m, fetchedAtMs: nowMs, lastOkAt: nowMs, lastError: null }), mode: 'delta' };
     }
-    const mirror = await full();
+    const mirror = await full(m);
     return { mirror: { ...mirror, fullPulls: (prev.fullPulls || 0) + 1 }, mode: 'full:backlog' };
   } catch (e) {
     const base = prev && prev.v === PR_FACTS_VERSION ? prev : { v: PR_FACTS_VERSION, repo: repoKey(repo), buckets: { prs: {}, checks: {}, shas: {} }, cursor: null, fetchedAtMs: 0, lastOkAt: null, bootstrap: null };
@@ -450,7 +451,8 @@ export function readPrFactsFromGithub({ repo, number, exec = execFileSyncThrottl
   const paged = (path, pick) => {
     const all = [];
     for (let page = 1; page <= 50; page += 1) {
-      const rows = pick(api(`${path}?per_page=100${page > 1 ? `&page=${page}` : ''}`)) || [];
+      const rows = pick(api(`${path}?per_page=100${page > 1 ? `&page=${page}` : ''}`));
+      if (!Array.isArray(rows)) throw new Error(`${path}: malformed page ${page}; refusing a partial read`);
       all.push(...rows);
       if (rows.length < 100) return all;
     }
