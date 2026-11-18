@@ -1692,7 +1692,8 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
     valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
   });
-  const max = r.value.maxLiveReviewRounds;
+  // Unreadable tool settings never mean unlimited, even if a higher layer resolved the cap to null.
+  const max = r.value.maxLiveReviewRounds ?? (tool === undefined ? DEFAULT_MAX_LIVE_REVIEW_ROUNDS : null);
   if (max == null) return null;
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
