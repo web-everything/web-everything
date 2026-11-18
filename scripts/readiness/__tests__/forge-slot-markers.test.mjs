@@ -96,6 +96,31 @@ describe('R1017 run-less dead-owner recovery', () => {
     expect(existsSync(f.file)).toBe(!released);
     if (released) expect(existsSync(join(f.root, 'slot-1.unconfirmed'))).toBe(true);
   });
+  it('retains a run-less marker at 20 minutes when the active run absent from recent is bound only to the same owner', async () => {
+    const f = fixture({minutes: 20, change: t => {
+      t.activeRuns = 1; t.activeRunIds = [RUN_B]; t.recent = [];
+    }});
+    const other = join(f.root, 'slot-1.unconfirmed');
+    writeFileSync(other, markerContent({owner: 'remote-111-aabbcc', pid: 222, host: 'forge',
+      nowMs: NOW - 600_000, run: RUN_B}));
+    utimesSync(other, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+    expect(names(f.root)).toEqual(['0', '1']);
+  });
+  it('retains a run-less marker at 20 minutes when the active run absent from recent has mixed-owner bindings including the same owner', async () => {
+    const f = fixture({minutes: 20, change: t => {
+      t.activeRuns = 1; t.activeRunIds = [RUN_B]; t.recent = [];
+    }});
+    for (const [index, owner] of [[1, 'remote-111-aabbcc'], [2, 'other']]) {
+      const other = join(f.root, `slot-${index}.unconfirmed`);
+      writeFileSync(other, markerContent({owner, pid: 222, host: 'forge', nowMs: NOW - 600_000, run: RUN_B}));
+      utimesSync(other, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    }
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+    expect(names(f.root)).toEqual(['0', '1', '2']);
+  });
   it('retains a run-less marker at 20 minutes when the active run absent from recent is bound only to another host or no host', async () => {
     const f = fixture({minutes: 20, change: t => {
       t.activeRuns = 1; t.activeRunIds = [RUN_B]; t.recent = [];

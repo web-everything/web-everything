@@ -384,7 +384,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     async step(getTelemetry, now = clock()) {
       let names;
       try { names = fs.readdirSync(root); } catch { return []; }
-      const dead = [], reaped = [], held = [], boundRuns = new Set();
+      const dead = [], reaped = [], held = [], boundRuns = new Map();
       let finishedStillActive = false;
       for (const name of names) {
         const m = NAME.exec(name);
@@ -394,7 +394,10 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
-        if (marker.run && host !== undefined && marker.host === host) boundRuns.add(marker.run); // only this Forge host's own markers claim runs
+        if (marker.run && marker.owner !== undefined && host !== undefined && marker.host === host) { // only this Forge host's own markers claim runs
+          if (!boundRuns.has(marker.run)) boundRuns.set(marker.run, new Set());
+          boundRuns.get(marker.run).add(marker.owner);
+        }
         const gone = ownerGone(root, index, file, liveness, selfPid);
         // Only an old marker whose owner is provably gone is "stuck": a live owner is a long-running job, not a leak.
         const trace = {pid: marker.pid, caller: marker.caller ?? null, lane: marker.lane ?? null, pr: marker.pr ?? null, exit: marker.exit ?? 'no-exit-record'};
@@ -480,8 +483,10 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             } else {
               const at = entry.at ?? entry.mtimeMs;
               // This entry is run-less, so every bound run belongs to another marker.
-              if (!evidence.complete && ((!runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, decisionAt, boundRuns)
-                && !boundedOrphan(telemetry, evidence, sampledAt, at, diedBy, boundRuns)) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
+              // A run also bound by a marker of the SAME owner may be this client's own multi-slot run: it never counts as foreign.
+              const foreign = new Set([...boundRuns].filter(([, owners]) => entry.owner !== undefined && !owners.has(entry.owner)).map(([run]) => run));
+              if (!evidence.complete && ((!runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, decisionAt, foreign)
+                && !boundedOrphan(telemetry, evidence, sampledAt, at, diedBy, foreign)) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
               if (maybeOwnsInflight(telemetry, at, diedBy)) continue;
             }
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
