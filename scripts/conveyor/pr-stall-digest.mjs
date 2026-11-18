@@ -22,6 +22,8 @@ import { notifyDesktopChecked } from './branch-sync.mjs';
 import { repeatDue, labelNames } from './pr-sweep-core.mjs';
 import { sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { traceStuckPr } from './stuck-trace.mjs';
+import { handoffHome } from '../operations/handoff-home.mjs';
 
 export const STALLED_KIND = 'stalled';
 const sh = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -109,7 +111,8 @@ const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0,
  * @param {{items:object[], incomplete:boolean, settingsUnreadable?:boolean}} pass  the `runStallSweep` result
  * @param {{now?:number, env?:object, feedPath?:string, stateDir:string, notify?:Function, enabled?:boolean}} o
  */
-export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true, alertBackoffMinutes } = {}) {
+export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true, alertBackoffMinutes, trace = traceStuckPr,
+  traceStateDir = join(handoffHome(), 'pr-merge-watch') } = {}) {
   const errors = [];
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
   // Unknown policy is not an explicit disable: preserve open items, suppression and alert obligations until recovery.
@@ -122,11 +125,12 @@ export function publishStalledDigest(pass, { now = Date.now(), env = process.env
   catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
   // One delivery at a time: selection, sending and confirmation run under one lock, so two overlapping passes can never
   // both send the same owed alert. If the lock cannot be taken, every item is alerted (a repeat, never a drop).
-  try { mkdirSync(stateDir, { recursive: true }); return withFileLock(join(stateDir, 'digest.lock'), () => deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes })); }
+  // Use the watcher's receipt directory so the two daemons cannot trace the same head twice.
+  try { mkdirSync(stateDir, { recursive: true }); return withFileLock(join(stateDir, 'digest.lock'), () => deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, trace, traceStateDir })); }
   catch (e) { errors.push(`digest lock: ${String(e?.message ?? e).split('\n')[0]}`); return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
 }
 
-function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked = false }) {
+function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, trace, traceStateDir, unlocked = false }) {
   let lines = []; let fresh = items; let lock = null;
   const id = (f) => `${f.repo}#${f.pr}@${f.head}:${f.state}`;
   const mine = join(stateDir, 'digest-state.json');
@@ -178,6 +182,12 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       // its line is written. A failed save can repeat a line or an alert, never drop one.
       writeJsonAtomic(mine, { published: [...alerted], current: shown, unnotified, repeats });
       appendLines(path, r.lines);
+      if (!isUnderTest(env) && !isUnderTest()) for (const item of written) {
+        void Promise.resolve().then(() => trace({ repo: item.repo, pr: item.pr, head: item.head,
+          kind: STALLED_KIND, stateDir: traceStateDir, now, env })).catch(() => {
+          try { console.error('stuck-trace: digest hook unavailable'); } catch { /* best effort */ }
+        });
+      }
       writeJsonAtomic(sidecar, { ...prev, openKeys: r.openKeys });
       for (const f of newly) alerted.add(id(f));
       for (const f of written) shown[feedKey(f)] = f.state;

@@ -4580,3 +4580,11 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Stuck trace isolation
+
+The stuck-trace node:test fixtures inject both operations and the event sink. Keep
+`fileURLToPath(import.meta.url)` resolution inside the default child runner: the digest
+fixtures import modules through data URLs, where eager file-path resolution fails.
+The digest and merge watcher share the watcher receipt directory; when overriding
+its state directory, pass that directory as the digest’s `traceStateDir` too.
