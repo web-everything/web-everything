@@ -54,25 +54,50 @@ export function rollupRowKind(c) {
  *
  * Within a name: take the FIRST non-empty tier of `CheckRun` → untagged → `StatusContext` ({@link
  * rollupRowKind}), then the LATEST entry in that tier ({@link latestOf}). Pure. Order of the returned rows is
- * NOT the input order — one row per distinct name, in first-seen order.
+ * NOT the input order — one row per distinct source/name, in first-seen order.
+ * Workflow and check-suite identities partition same-named jobs: a run in one
+ * workflow/suite cannot supersede evidence from another. Without source metadata,
+ * the default retains the historical per-name grouping. Evidence guards must use
+ * `preserveUnknownJobs`: unknown sources or unordered attempts then pass through
+ * separately, so unreadable evidence cannot be hidden by another row.
  *
  * A row with NEITHER `name` NOR `context` (unreachable off a real `gh pr view --json statusCheckRollup` — every
  * live row carries one or the other) is passed through UNCOLLAPSED, one output row per such input row: there is
  * no name to group it by, so grouping it with any other nameless row would silently fold two unrelated checks
  * into one and grouping it under a shared empty-string key would do the same. Each gets its own group.
  * @param {Array<object>|null|undefined} rollup
- * @returns {Array<object>} one collapsed entry per distinct check name (nameless rows pass through 1:1).
+ * @param {{preserveUnknownJobs?: boolean}} [options]
+ * @returns {Array<object>} latest entries per source/name (unidentifiable evidence passes through).
  */
-export function collapseRollupToLatestPerName(rollup) {
+export function collapseRollupToLatestPerName(rollup, { preserveUnknownJobs = false } = {}) {
   const roll = Array.isArray(rollup) ? rollup : [];
   const byName = new Map();
   for (const c of roll) {
-    const name = c?.name || c?.context || Symbol('nameless-rollup-row'); // ungroupable — its own singleton group
-    if (!byName.has(name)) byName.set(name, []);
-    byName.get(name).push(c);
+    const name = c?.name || c?.context;
+    const scalar = value => (typeof value === 'string' && value.trim())
+      || (Number.isSafeInteger(value) && value > 0 ? String(value) : null);
+    const workflow = scalar(c?.workflowName ?? c?.workflow_name
+      ?? c?.workflowRun?.workflow?.id ?? c?.workflowRun?.workflow?.name
+      ?? c?.checkSuite?.workflowRun?.workflow?.id ?? c?.checkSuite?.workflowRun?.workflow?.name);
+    const suite = scalar(c?.checkSuite?.id ?? c?.check_suite?.id ?? c?.checkSuiteId ?? c?.check_suite_id);
+    const sourceKnown = !!(workflow || suite);
+    const key = !name || (preserveUnknownJobs && !sourceKnown)
+      ? Symbol('unidentified-rollup-job')
+      : JSON.stringify([name, workflow, suite, sourceKnown ? rollupRowKind(c) : null]);
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push(c);
   }
   const out = [];
   for (const matches of byName.values()) {
+    if (preserveUnknownJobs && !matches.every(c => Number.isSafeInteger(Number(c?.id)) && Number(c.id) > 0)) {
+      const timestamps = matches.map(c => Date.parse(c?.completedAt ?? c?.completed_at));
+      // Valid timestamps alone do not prove which tied attempt supersedes which.
+      if (!timestamps.every(time => time > Date.parse('2000-01-01T00:00:00Z'))
+        || new Set(timestamps).size !== timestamps.length) {
+        out.push(...matches);
+        continue;
+      }
+    }
     const tier = (k) => matches.filter((c) => rollupRowKind(c) === k);
     const pool = [tier('CheckRun'), tier('untagged'), matches].find((t) => t.length);
     out.push(latestOf(pool));
@@ -81,15 +106,20 @@ export function collapseRollupToLatestPerName(rollup) {
 }
 
 /**
- * The latest run of ONE named check ({@link collapseRollupToLatestPerName}, then a by-name lookup), or `null` when
- * that check has not reported. `we:scripts/merge-ai-prs.mjs#latestRequiredCheck` and the card group's combined-PR
+ * The latest evidence for ONE named check, or `null` when it has not reported.
+ * Independent workflow/suite rows cannot supersede one another: scalar readers
+ * see a failure first, then unfinished/unreadable evidence, then a passing row.
+ * `we:scripts/merge-ai-prs.mjs#latestRequiredCheck` and the card group's combined-PR
  * reconcile (`we:scripts/lib/card-group.mjs`) both read the required check through this one lookup. Pure.
  * @param {Array<object>|null|undefined} rollup
  * @param {string} name
  * @returns {object|null}
  */
 export function latestCheckNamed(rollup, name) {
-  return collapseRollupToLatestPerName(rollup).find((c) => (c?.name || c?.context) === name) || null;
+  const rows = collapseRollupToLatestPerName(rollup).filter(c => (c?.name || c?.context) === name);
+  return rows.find(isFailedCheckRow)
+    || rows.find(c => !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(c?.conclusion || c?.state || '').toUpperCase()))
+    || rows[0] || null;
 }
 
 /** Every conclusion (or legacy StatusContext `state`) that means a check DEFINITIVELY failed. The one list the
@@ -171,7 +201,7 @@ function latestOf(runs) {
  */
 function latestByTime(runs) {
   const stamp = (c) => {
-    const done = Date.parse(c?.completedAt);
+    const done = Date.parse(c?.completedAt ?? c?.completed_at);
     if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) return done;
     const status = String(c?.status ?? '').toUpperCase();
     if (status && status !== 'COMPLETED') return Infinity; // queued / in progress: the newest run

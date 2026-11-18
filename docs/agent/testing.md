@@ -4472,3 +4472,16 @@ evidence for the remaining checks. The verdict and gate-wait suites cover unknow
 rosters, missing/pending required checks, both hold verdicts, setup failures, and
 per-row evidence isolation. Keep historical raw rollup fixtures unchanged: their
 unreadable failure causes must remain red under this rule.
+
+Pass raw `statusCheckRollup` rows into review-wait/hold predicates. The shared
+collapse helper partitions workflow and check-suite identities; evidence readers
+use `preserveUnknownJobs` so unknown sources and unordered attempts stay separate.
+Only an ordered rerun of the same identifiable job supersedes an earlier failure.
+Equal completion timestamps without check IDs do not establish attempt order;
+retain both rows. The job-identity regression asserts this for both timestamp
+spellings and both input orders, including conflicting failure/success evidence.
+The gate-wait regression covers two same-name gates with one unreadable failure
+in both orders (including absent source metadata), requiring CI heal, recovery
+and escalation to remain available. The promotion fixture also refuses that
+shape; the job-identity fixture covers successful reruns. Unreadable causes retain
+the normal CI repair/escalation path as the operator-visible fallback.

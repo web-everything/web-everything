@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 import { formatPrResult } from '../../lib/merge-gate-verdict.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-gate-hold-class.mjs';
-import { waitingOnReview } from '../ci-heal-verdict-recheck.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { waitingOnReview, gateOnlyRedStates, requiredCheckStates } from '../ci-heal-verdict-recheck.mjs';
+import { planReconcile, reviewHoldGatesOnlyRed, reviewHoldOnlyRed } from '../reconcile-core.mjs';
 import { buildCandidates, sweepCiRedRecovery } from '../ci-red-recovery-watch.mjs';
 import { buildCiHealEscalationComment, checkNeedsHumanEscalable } from '../ci-heal-escalation-mark.mjs';
 import { planNeedsHumanVoid, runReconcileNotesAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
@@ -115,6 +115,53 @@ test('approval-wait plus a real red test -> heal and escalation remain available
   assert.ok(plan(pr).dispatch.some(row => row.kind === 'ci-heal'));
   assert.equal((await escalable(pr)).refusal, null);
   assert.equal(buildCandidates([pr], { requiredChecks, readAheadBy: () => 0 }).length, 1);
+});
+
+test('same-name review gates from different workflows/suites or unknown sources retain unreadable failures and heal', async () => {
+  for (const sources of [
+    [{ workflowName: 'main-ci' }, { workflowName: 'review' }],
+    [{ checkSuite: { id: 'suite-a' } }, { checkSuite: { id: 'suite-b' } }],
+    [{ workflowName: 'review', check_suite: { id: 1 } }, { workflowName: 'review', check_suite: { id: 2 } }],
+    [{}, {}],
+  ]) {
+    for (const reverse of [false, true]) {
+      const pr = classified();
+      const rows = [
+        check('review-gate', 'FAILURE', { id: 10, ...sources[0] }),
+        { ...pr.statusCheckRollup[2], id: 20, ...sources[1] },
+      ];
+      pr.statusCheckRollup.splice(2, 1, ...(reverse ? rows.toReversed() : rows));
+      const evidence = { rollup: pr.statusCheckRollup, requiredChecks, labels: pr.labels };
+      assert.equal(waitingOnReview(evidence), false);
+      assert.equal(gateOnlyRedStates(evidence).gateOnlyRed, false);
+      assert.equal(reviewHoldGatesOnlyRed(pr.statusCheckRollup, requiredChecks, pr.labels), false);
+      assert.equal(reviewHoldOnlyRed(pr.statusCheckRollup, requiredChecks, pr.labels), false);
+      const result = plan(pr);
+      assert.ok(result.dispatch.some(row => row.kind === 'ci-heal'));
+      assert.equal(result.refusals.some(row => row.ciClassification === 'waiting-on-review'), false);
+      assert.equal((await escalable(pr)).refusal, null);
+      assert.equal(buildCandidates([pr], { requiredChecks, readAheadBy: () => 0 }).length, 1);
+    }
+  }
+});
+
+test('a newer successful rerun of the same identifiable job supersedes its older failure and is not red', () => {
+  for (const source of [{ workflowName: 'review' }, { check_suite: { id: 42 } }]) {
+    for (const reverse of [false, true]) {
+      const pr = classified();
+      const rows = [
+        check('review-gate', 'FAILURE', { id: 10, ...source }),
+        check('review-gate', 'SUCCESS', { id: 20, ...source }),
+      ];
+      pr.statusCheckRollup = [check('test'), check('merge-gate'), ...(reverse ? rows.toReversed() : rows)];
+      const evidence = { rollup: pr.statusCheckRollup, requiredChecks: [...requiredChecks, 'review-gate'], labels: pr.labels };
+      assert.deepEqual(requiredCheckStates(evidence).red, []);
+      assert.deepEqual(gateOnlyRedStates(evidence).red, []);
+      assert.equal(waitingOnReview(evidence), false);
+      assert.equal(plan(pr).dispatch.some(row => row.kind === 'ci-heal'), false);
+      assert.deepEqual(buildCandidates([pr], { requiredChecks: evidence.requiredChecks, readAheadBy: () => 0 }), []);
+    }
+  }
 });
 
 test('the escalation CLI applies the same head-bound verdict annotation before recording', async () => {

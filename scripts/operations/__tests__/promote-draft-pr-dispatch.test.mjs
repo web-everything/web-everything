@@ -134,6 +134,23 @@ describe('review-hold-only red draft promotion', () => {
     expect(out).toMatchObject({ state, reviewHoldOnly });
   });
 
+  it.each([false, true])('fresh promotion refuses a same-name unreadable failure from another workflow (reverse=%s)', reverse => {
+    const gates = [
+      check('review-gate', 'failure', { workflowName: 'ci', id: 10, output: undefined }),
+      check('review-gate', 'failure', { workflowName: 'review', id: 20 }),
+    ];
+    const rows = [check('test'), check('merge-gate'), ...(reverse ? gates.toReversed() : gates)];
+    const out = defaultReadHeadCheckState({
+      repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
+      runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
+      getRequiredChecks: () => ({ checks: ['test', 'merge-gate', 'review-gate'], source: 'live' }),
+      readPrLabels: () => ['review:pending'],
+      readReviewGateLog: () => ({ error: 'unreadable job log' }),
+      mergeGateSetting: { value: 'off' },
+    });
+    expect(out).toMatchObject({ state: 'red', reviewHoldOnly: false });
+  });
+
   it('the fresh reader keeps an unannotated red merge-gate ineligible when its verdict is unreadable', () => {
     const out = defaultReadHeadCheckState({
       repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,

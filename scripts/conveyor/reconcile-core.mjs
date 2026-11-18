@@ -510,9 +510,8 @@ export function splitFailingChecks(rollup, requiredChecks) {
 /** PURE: every failing check is a review-owned hold, including gates outside the required roster. */
 export function reviewHoldGatesOnlyRed(rollup, requiredChecks, labels) {
   if (!Array.isArray(rollup)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
-  if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
-  return gateOnlyRedStates({ rollup: latest, requiredChecks, labels }).gateOnlyRed;
+  if (rollup.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
+  return gateOnlyRedStates({ rollup, requiredChecks, labels }).gateOnlyRed;
 }
 
 /** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
@@ -3131,7 +3130,7 @@ export function planReconcile({
 
     const reviewHoldRed = !pr.codeqlFailure
       && withPhase.labels.some(label => REVIEW_HOLD_LABELS.includes(label))
-      && waitingOnReview({ rollup: collapseRollupToLatestPerName(pr?.statusCheckRollup), requiredChecks, labels: pr?.labels });
+      && waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks, labels: pr?.labels });
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, ciClassification: 'waiting-on-review', owner: 'review/orchestrator',
         why: `review daemon owns held gates: ${failingCheckNames(collapseRollupToLatestPerName(pr?.statusCheckRollup)).join(', ')}` });

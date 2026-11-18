@@ -27,6 +27,7 @@ import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.
 import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -99,14 +100,14 @@ const normalizeRollupCheck = row => {
   return check;
 };
 
-/** Compatibility export: preserve every rollup row; metadata never selects evidence. */
+/** Supersede only ordered attempts of an identifiable job; retain unknown sources. */
 export function latestRollupAttempts(rollup) {
-  return Array.isArray(rollup) ? [...rollup] : [];
+  return collapseRollupToLatestPerName(rollup, { preserveUnknownJobs: true });
 }
 
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks, labels) {
-  const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
+  const checks = latestRollupAttempts(rollup).map(normalizeRollupCheck);
   const holdLabels = Array.isArray(labels)
     ? labels.map(label => typeof label === 'string' ? label : label?.name).filter(label => REVIEW_HOLD_LABELS.includes(label))
     : [];
