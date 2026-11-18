@@ -1685,7 +1685,19 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         await writeFile(statePath(request.run,'cancel'),'',{flag:'wx',mode:0o600}).catch(error=>{if(error.code!=='EEXIST')throw error;});
         const deadline=process.hrtime.bigint()+45000000000n;
         while(await lstat(join(worker.active,'executing')).catch(error=>{if(error.code!=='ENOENT')throw error;})) {
-          if(process.hrtime.bigint()>=deadline)throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');
+          if(process.hrtime.bigint()>=deadline) {
+            try {
+              const container=join(worker.root,request.run);
+              await directory(container,true,operator);
+              const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
+              if(reaped.code!==0)throw new Error('uid cleanup unconfirmed');
+              // The writer lease excludes a new controller; only proven UID emptiness permits removing this guard.
+              await rmdir(join(worker.active,'executing'));
+            } catch {
+              throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');
+            }
+            break;
+          }
           await new Promise(resolve=>setTimeout(resolve,50));
         }
       }
