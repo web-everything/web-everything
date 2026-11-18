@@ -619,7 +619,15 @@ describe('retried CI verdicts', () => {
     pr.labels = ['review:pending'];
     expect(realRequiredFailures(pr, ['review-gate'])).toEqual([]);
     pr.labels = [];
-    expect(realRequiredFailures(pr, ['review-gate'])).toEqual([]); // review-gate is held by contract, independent of labels
+    // Reader policy: a held review-gate is excused only while a human/pending review label is present.
+    expect(realRequiredFailures(pr, ['review-gate'])).toEqual(['review-gate']);
+  });
+  it('does not report recovery for a label-less PR whose review-gate failed', () => {
+    const pr = { ...green(), labels: [] };
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: ['test', 'review-gate'] }))
+      .toEqual({ state: 'failed', failures: ['review-gate'] });
+    expect(retryOutcome({ comments: [retry], pr: green(), requiredChecks: ['test', 'review-gate'] }))
+      .toEqual({ state: 'recovered' });
   });
   it('waits for pending, missing and pre-retry rows on the current head', () => {
     const pr = green();

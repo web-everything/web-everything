@@ -43,7 +43,11 @@ const retryChecks = (pr, requiredChecks) => resolveRequiredChecks({ rows: pr?.st
 /** Required failures on this head, excluding only holds proven by the shared contract. */
 export function realRequiredFailures(pr, requiredChecks) {
   const evidence = retryChecks(pr, requiredChecks);
-  return Object.entries(evidence.perName).filter(([, r]) => r.state === 'fail').map(([name]) => name);
+  // Reader policy: a held review-gate is excused only while a human/pending review label is present.
+  const human = (pr?.labels ?? []).some(l => REVIEW_HOLD_LABELS.includes(typeof l === 'string' ? l : l?.name));
+  return Object.entries(evidence.perName)
+    .filter(([name, r]) => r.state === 'fail' || (r.state === 'held' && name === 'review-gate' && !human))
+    .map(([name]) => name);
 }
 
 function requiredCompleted(pr, requiredChecks, after = null) {
