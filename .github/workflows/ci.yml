@@ -422,8 +422,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    # Measured 5.8-8.4 min (perf sweep 2026-10-07); ~2.5x the worst case.
-    timeout-minutes: 20
+    # Measured 5.8-8.4 min on 2026-10-07; 15-19 min on main by 2026-11-17, so 30 keeps headroom.
+    timeout-minutes: 30
     steps:
       - name: Gate on changes
         id: gate
