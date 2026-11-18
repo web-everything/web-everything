@@ -518,6 +518,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // died before `advise` too, or a failing review would be resumed every tick.
   const attemptsSinceWake = history.filter(r => Number.isFinite(r.startedAt) && r.startedAt >= wake).length;
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count, attemptsSinceWake,
+    reviewStartedAt: Number.isFinite(last.startedAt) ? last.startedAt : null,
     why, retryAt, persistenceFailed: false, exhausted: false,
     ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
       releases, source: retry?.source ?? 'standard' } } : {}) };
@@ -646,9 +647,10 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     const notes = trusted.map((c, i) => ({ i, at: Date.parse(c?.createdAt) || 0, note: String(c?.body ?? '').includes('ADVISORY REVIEW, NOT A RECORDED VERDICT') }))
       .filter(n => n.note).sort((a, b) => b.at - a.at || b.i - a.i);
     // Tie the advisory to the held review: exactly one finished attempt since the wake (the advisory is that review's
-    // write-back, not an older one), and the advisory cannot predate the PR itself.
+    // write-back, not an older one), and the advisory cannot predate the PR or the held review's start.
     const prAt = Date.parse(pr.createdAt);
-    const sameReview = hold.count === 1 && hold.attemptsSinceWake === 1 && Number.isFinite(prAt) && adv?.time >= prAt;
+    const sameReview = hold.count === 1 && hold.attemptsSinceWake === 1 && Number.isFinite(prAt) && adv?.time >= prAt
+      && Number.isFinite(hold.reviewStartedAt) && adv.time >= hold.reviewStartedAt;
     const clean = adv && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
       && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
     if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);

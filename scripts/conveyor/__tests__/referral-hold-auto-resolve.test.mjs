@@ -233,7 +233,7 @@ describe('same-head holds with no referral finding (#7012)', () => {
   const fx = FX[5775];
   const advisory = fx.comments.find(c => c.body.includes('ADVISORY REVIEW') && c.body.includes(fx.headRefOid));
   const comments = [advisory];
-  const held = () => enrich({ ...fx, comments, runs: fx.runs.filter(r => r.head === fx.headRefOid).slice(-1),
+  const held = () => enrich({ ...fx, comments, runs: fx.runs.filter(r => r.head === fx.headRefOid).slice(0, 1),
     labels: ['review:human', 'advisory:accepted', 'red-team:clear'] });
   const recordComment = change => ({ ...advisory,
     body: `<!-- mandatory-referrals-v1: ${encodeURIComponent(JSON.stringify({ ...liveRecord(fx), ...change }))} -->` });
@@ -269,6 +269,8 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold with a second malformed outcome line', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`123\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a duplicate accept outcome line', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`accept\`` }], {}, /no clean advisory accept/],
     ['same-head hold after two review attempts', comments, { count: 2, attemptsSinceWake: 2 }, /no clean advisory accept/],
+    ['same-head hold whose review started after the advisory', comments, { reviewStartedAt: Date.parse('2999-01-01T00:00:00Z') }, /no clean advisory accept/],
+    ['same-head hold that does not say when its review started', comments, { reviewStartedAt: null }, /no clean advisory accept/],
     ['same-head hold with an advisory older than the PR', comments, { }, /no clean advisory accept/, { createdAt: '2999-01-01T00:00:00Z' }],
     ['same-head hold with a short-prefix advisory head', [{ ...advisory, body: advisory.body.replace(/(Net basis: `[a-f0-9]+\.\.)[a-f0-9]+`/i, '$1' + fx.headRefOid.slice(0, 1) + '`') }], {}, /no clean advisory accept/],
     ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
