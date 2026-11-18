@@ -96,6 +96,15 @@ describe('scheduled upgrade check', () => {
     ]);
     expect(f.read('binary/health.json')).toMatchObject({ state: 'ok', version: '1.5.11' });
   });
+  it('holds the seat as dead/upgrading while brew upgrade runs', async () => {
+    const f = fixture([good, outdated]);
+    let during;
+    f.exec.mockImplementationOnce(async () => { during = f.read('binary/health.json'); return { ok: true }; });
+    f.exec.mockResolvedValueOnce(good);
+    await runUpgradeCheck(f.options);
+    expect(during).toMatchObject({ state: 'dead', reason: 'upgrading' });
+    expect(f.read('binary/health.json')).toMatchObject({ state: 'ok' });
+  });
   it('upgrade still hung writes dead before repair and raises one alert across repeats', async () => {
     const f = fixture([hung, outdated, { ok: true }, hung, hung, current]);
     f.alert.mockImplementation(() => {

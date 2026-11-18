@@ -137,6 +137,8 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
       return { status: 'staleness-unavailable', ...result };
     }
     if (casks.some(cask => cask?.name === 'antigravity-cli' || cask?.token === 'antigravity-cli')) {
+      // Hold the seat while the executable is replaced; the post-upgrade smoke is the only thing that clears it.
+      atomicWrite(io, healthPath, { state: 'dead', at: new Date(now()).toISOString(), version: result.version, reason: 'upgrading' });
       const upgrade = await exec('brew', ['upgrade', '--cask', 'antigravity-cli'], { timeoutMs: 120000 });
       if (upgrade.reason === 'cleanup incomplete') return await cleanupFailed(upgrade);
       result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
