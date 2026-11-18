@@ -1331,14 +1331,14 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
     }
     return true;
   }
-  async function installDependencies(request,work,command) {
+  async function installDependencies(request,work,temp,command) {
     let result;
       // npm accepts some manifest changes without lock changes. Key the entire
       // validated snapshot, including workspace manifests and local dependency
       // contents, so a warm archive represents the same install inputs. Earlier
       // profiles lack this binding (v3 also allowed an unkeyed shrinkwrap).
       const profile=join(cache,request.lock,'dev-v5-'+(request.manifest.siblings ? request.manifestDigest : request.inputDigest));
-      const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
+      const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development',TMPDIR:temp};
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
         await mkdir(join(cache,request.lock),{mode:0o700}).catch(e=>{if(e.code!=='EEXIST') throw e;});
         await directory(join(cache,request.lock),true,operator);
@@ -1412,18 +1412,21 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const run='warm-'+randomBytes(16).toString('hex'),nonce=randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce),record={run,nonce,...(worker.active?{slot:worker.user}:{})};
       try{return await exclusiveWorker(async command=>{
-        const work=join(worker.root,run);
-        await mkdir(work,{mode:0o755});
+        const container=join(worker.root,run),work=join(container,'work'),temp=join(container,'.forge-tmp');
+        await mkdir(container,{mode:0o755});
         try {
+          await mkdir(work,{mode:0o755});
           const entries=decodeManifest(manifest).entries;
           await copyLeaves(source,work,entries);
           await verifyManifest(work,manifest,digestManifest(manifest));
-          await handoff(worker,work,{recursive:true});
           const request={lock:await digestLock(work),inputDigest:await digestInput(work),manifest,manifestDigest:digestManifest(manifest)};
+          await mkdir(temp,{mode:0o700});
+          await handoff(worker,temp);
+          await handoff(worker,work,{recursive:true});
           const signature=await registryInstallSignature(work,request),parent=join(cache,request.lock),profile=join(parent,'dev-v5-'+request.inputDigest);
           const index=signature?join(parent,'.warm-inputs-'+signature):null;
           if(!await reuseWarmProfile(signature,request)) {
-            await installDependencies(request,work,command);
+            await installDependencies(request,work,temp,command);
             if(index) {
               const archiveDigestValue=await archiveDigest(join(profile,'dependencies.tar'));
               const pending=index+'-'+randomBytes(8).toString('hex');
@@ -1432,8 +1435,8 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
           }
           return {code:0};
         } finally {
-          if(testRoot)await rm(work,{recursive:true,force:true});
-          else if((await execute('/usr/bin/sudo',['-n','/usr/bin/rm','-rf','--',work])).code)throw new Error('Warm cleanup failed');
+          if(testRoot)await rm(container,{recursive:true,force:true});
+          else if((await execute('/usr/bin/sudo',['-n','/usr/bin/rm','-rf','--',container])).code)throw new Error('Warm cleanup failed');
         }
       },record);
       }finally{if(worker.active)await releaseWorker(record);}
@@ -1625,15 +1628,19 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       if(telemetryError)throw telemetryError;
       const telemetryTimer=setInterval(update,5000);
       telemetryTimer.unref();
+      const temp=join(container,'.forge-tmp');
       try {
-        result=await installDependencies(request,work,command);
+        // Keep runtime scratch outside the digested tree and inside run cleanup.
+        await mkdir(temp,{mode:0o700});
+        await handoff(worker,temp);
+        result=await installDependencies(request,work,temp,command);
         installMs=Math.max(0,Math.round(clock()-installAt));
         phase='test';
         runAt=clock();
         await update();
         if(telemetryError)throw telemetryError;
         await assertContained(work,request.argv);
-        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
+        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env,TMPDIR:temp};
         if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
           executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
         // Anchor the report in the work dir so a config root cannot redirect it; re-check links after the run.

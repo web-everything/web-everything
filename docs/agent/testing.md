@@ -2870,6 +2870,7 @@ head with them. Test an initially empty repository label catalog and a same-head
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
 UNKNOWN listings before collecting head-bound context and also revalidates before
 merging, waiting for the configured delay at most three times per read stage.
+Before listing re-polls, a bounded REST GET trigger requests mergeability computation for up to ten unknown or empty candidates without changing their facts or classification.
 Hermetic drain CLI fixtures with synthetic UNKNOWN reads pin
 `WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC=0` while retaining the retry count and
 merge/hold assertions. Several read stages can otherwise exhaust a child-process
@@ -4571,3 +4572,11 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Review job exit evidence
+
+Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
+a subdirectory beside the live `<slug>.json` records so no valid slug can collide. Exit markers
+are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
+marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
+review-job and review-daemon suites.
