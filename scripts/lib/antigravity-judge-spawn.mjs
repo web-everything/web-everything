@@ -158,8 +158,8 @@ export const ANTIGRAVITY_CLI = 'agy';
  * resolves implicitly (#3633 probe 9 — the CLI's own undocumented default self-reports as "Gemini 3.8 Flash"
  * with NO exposed effort tier, so a run record could not even stamp what it actually asked for).
  *
- * `gemini-4-argon-high` is an effort-suffixed id from the current `agy models` roster; no bare
- * `gemini-4-argon` id is available. High effort is baked into the model id. agy accepts effort as a
+ * `gemini-4-carbon-high` is an effort-suffixed id from the current `agy models` roster; no bare
+ * `gemini-4-carbon` id is available. High effort is baked into the model id. agy accepts effort as a
  * model-id suffix OR the `--effort` flag, never both, so the argv builder omits the flag for suffixed ids.
  *
  * NO LIVE COST/QUALITY COMPARISON HAS BEEN RUN across `agy`'s ten models for this role, unlike the Codex fourth
@@ -168,7 +168,7 @@ export const ANTIGRAVITY_CLI = 'agy';
  * `model-probation.json`'s own entry for this identity), not a benchmarked choice. Revisit once probation data
  * (#3649's run-quality recorder) accumulates.
  */
-export const ANTIGRAVITY_MODEL = 'gemini-4-argon-high';
+export const ANTIGRAVITY_MODEL = 'gemini-4-carbon-high';
 
 /**
  * The shared care→rigor dial's effort enum (`judge-spawn.mjs#EFFORT_LEVELS`) does not match `agy`'s own
@@ -188,7 +188,7 @@ export const ANTIGRAVITY_EFFORT_MAP = Object.freeze({
 /**
  * Legacy bare-model restrictions, layered under the CLI-level effort map. Historical callers of
  * `gemini-3.1-pro` still need medium clamped to high (agy only accepted low/high for that model).
- * The current Argon pin carries effort in its suffix and needs no override or separate effort flag.
+ * The current Carbon pin carries effort in its suffix and needs no override or separate effort flag.
  */
 export const ANTIGRAVITY_MODEL_EFFORT_OVERRIDES = Object.freeze({
   'gemini-3.1-pro': Object.freeze({ medium: 'high' }),
