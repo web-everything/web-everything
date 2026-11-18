@@ -7,6 +7,7 @@ import { overlayFilePath, addOverlay, removeOverlay, readOverlays } from '../../
 import { withAddGuardLock } from '../../../daemon-overlay.mjs';
 import { finalizeRebuild } from '../adopt.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
+import * as feed from '../../../operations/needs-you-feed.mjs';
 import * as planner from '../plan.mjs';
 import * as detector from '../overlay-prune.mjs';
 import { readRebuildState } from '../state.mjs';
@@ -213,7 +214,7 @@ describe('post-plan stale detector', () => {
   it('writes the conflict event and needs-you attention once without changing registrations', () => {
     addOverlay(root, { ref }, { env });
     const before = readFileSync(overlayFilePath(root, env), 'utf8');
-    tick({ emit: undefined }); tick({ emit: undefined }); tick({ emit: undefined }); tick({ emit: undefined });
+    tick({ emit: undefined, feed }); tick({ emit: undefined, feed }); tick({ emit: undefined, feed }); tick({ emit: undefined, feed });
     expect(readOverlayEventLog(root, env).filter(e => e.kind === 'overlay-stale-conflict')).toEqual([
       expect.objectContaining({ ref, tip, count: 3, ownerAction: `rebase ${ref} onto main` }),
     ]);

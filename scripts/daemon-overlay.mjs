@@ -107,6 +107,7 @@
  * Accept only if that preview is clean; conflicts with main or other overlays still refuse, and a failed
  * second preview preserves the original refusal.
  */
+import { readPendingDrops, pendingPath } from './lib/overlay-drop-pending.mjs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -369,17 +370,7 @@ function restoreRegistration(root, entry, env) {
 // registration is restored. Because every guarded add settles intents before its own check, no add is ever admitted
 // against a list that is missing an unsettled registration, so a restore returns the list to its pre-drop state.
 // No `.json` suffix: `pruneStaleOverlayRecords` deletes every clone-less `*.json` in the overlay dir.
-const pendingPath = (root, env) => `${overlayFilePath(root, env)}.drop-pending`;
-export function readPendingDrops(root, env = process.env) {
-  try {
-    const parsed = JSON.parse(readFileSync(pendingPath(root, env), 'utf8'));
-    if (!Array.isArray(parsed?.pending)) throw new Error('bad shape');
-    return parsed.pending;
-  } catch (e) {
-    if (e?.code === 'ENOENT') return [];
-    throw new Error(`drop-intent record ${pendingPath(root, env)} is unreadable — refusing to drop anything until it is fixed`);
-  }
-}
+export { readPendingDrops };
 function writePendingDrops(root, env, pending) {
   const file = pendingPath(root, env);
   if (!pending.length) { rmSync(file, { force: true }); return; }

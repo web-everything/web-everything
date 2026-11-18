@@ -13,7 +13,7 @@ import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
-import { readPendingDrops, withAddGuardLock } from '../../daemon-overlay.mjs';
+import { readPendingDrops } from '../overlay-drop-pending.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -361,6 +361,8 @@ export function staleAlertDetail(result, state) {
 /** I2: the pending-drop check and the HEAD reset must be atomic with retire/replace, which take the add-guard lock
  *  (and never the clone write lock, so holding both here cannot deadlock). A retirement during finalize waits. */
 export async function finalizeRebuild(options) {
+  // Lazy: daemon-overlay.mjs pulls a heavy import graph that the backlog CLI (which reaches this module) must not load.
+  const { withAddGuardLock } = await import('../../daemon-overlay.mjs');
   return withAddGuardLock(options.root, options.env ?? process.env, () => finalizeRebuildLocked(options));
 }
 

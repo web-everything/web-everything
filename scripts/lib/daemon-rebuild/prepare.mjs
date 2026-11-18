@@ -27,7 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
-import { readPendingDrops, withAddGuardLock } from '../../daemon-overlay.mjs';
+import { readPendingDrops } from '../overlay-drop-pending.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
@@ -391,7 +391,7 @@ export async function prepareRebuild({
   });
   if (plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   if (!readyOnly) {
-    try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git }); }
+    try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git, feed: await import('../../operations/needs-you-feed.mjs') }); }
     catch (error) { alert('overlay-stale-unknown', { error: String(error.message) }); }
   }
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
@@ -510,6 +510,7 @@ export async function prepareRebuild({
       // The pending-drop check and the removal are atomic under the add-guard lock retire/replace use (I2).
       let refused = null;
       try {
+        const { withAddGuardLock } = await import('../../daemon-overlay.mjs');
         refused = await withAddGuardLock(root, env, () => {
           if (dropPendingNow()) return 'drop-pending-unsettled';
           removeOverlay(root, d.ref, { env, why: d.reason, expectedOverlay: overlaysBefore.find((o) => o.ref === d.ref) });

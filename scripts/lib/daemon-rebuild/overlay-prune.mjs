@@ -7,7 +7,6 @@ import { createHash } from 'node:crypto';
 import { overlayFilePath, registrationIdentity, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
-import { feedPath, publishAttention } from '../../operations/needs-you-feed.mjs';
 import { pinnedStatus } from './plan.mjs';
 import { verifyRev, FULL_SHA_RE } from './shared.mjs';
 
@@ -53,16 +52,18 @@ export function readOpenPrHeads(root, env, query = runGhSync, repo = originSlug(
 }
 /** Fixed-length identity: the feed truncates `head`, so branch name length must not erase tip/registration. */
 export const attentionHead = row => createHash('sha256').update(`${row.ref}\0${row.tip ?? ''}\0${row.registration ?? ''}`).digest('hex').slice(0, 40);
-function notify(root, env, row) {
+// `feed` ({ feedPath, publishAttention }) is injected, not imported: needs-you-feed.mjs reaches worker-result.mjs, which
+// reads a schema at import time and would break every light CLI (backlog.mjs) that statically reaches this module.
+function notify(root, env, row, feed) {
   const kind = row.cause === 'conflict' ? 'overlay-stale-conflict' : `overlay-stale-${row.cause}`;
   appendOverlayEvent(root, { kind, ...row }, { env });
-  if (row.cause !== 'superseded') publishAttention({ repo: 'web-everything', pr: 0,
+  if (row.cause !== 'superseded' && feed) feed.publishAttention({ repo: 'web-everything', pr: 0,
     head: attentionHead(row), ref: row.ref, kind, title: `Overlay ${row.ref}`, ...row,
-  }, { path: feedPath({ env }) });
+  }, { path: feed.feedPath({ env }) });
 }
 /** Unknown inputs retain the registration and request operator inspection. No loss inference lives here. */
 export function detectOverlayStale({ root, env = process.env, overlays, plan, mainSha, git,
-  openPrHeads, remoteTips, settings = overlayStaleSettings(env), emit = row => notify(root, env, row),
+  openPrHeads, remoteTips, settings = overlayStaleSettings(env), feed, emit = row => notify(root, env, row, feed),
 }) {
   if (!settings.enabled) return [];
   const state = readState(root, env), rows = [], skipped = new Set();
