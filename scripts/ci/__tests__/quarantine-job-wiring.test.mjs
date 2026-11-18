@@ -58,30 +58,14 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
     expect(skip(job, `${file}::named failure`).skip).toEqual([]);
   });
 
-  it.each(['integration', 'test-shard (1)'])('%s never excludes a named entry even for a matching single test', (job) => {
+  it.each(['integration', 'test-shard (1)', 'soak-shard (1)'])('%s never excludes a named entry even for a matching single test', (job) => {
     expect(skip(job, `${soakFile}::${soakName}`).skip).toEqual([]);
   });
 
-  it('a named soak entry excludes only a file with exactly one matching it/test', () => {
-    expect(skip('soak-shard (1)', `${soakFile}::${soakName}`).skip).toEqual([soakFile]);
-    for (const declaration of ['it', 'test']) {
-      const source = `${declaration}('named case', () => {});`;
-      const named = `${soakFile}::named case`;
-      expect(skip('soak-shard (1)', named, { readSource: () => source }).skip).toEqual([soakFile]);
-      expect(skip('soak-shard (1)', named, { readSource: () => `${source}\ntest('unrelated assertion', () => {});` }).skip).toEqual([]);
-      expect(skip('soak-shard (1)', `${soakFile}::different case`, { readSource: () => source }).skip).toEqual([]);
-      expect(skip('soak-shard (1)', `${named}::different case`, { readSource: () => source }).skip).toEqual([]);
-    }
-  });
-
-  it.each(['', 'it(', "it.each([1, 2])('named case', () => {});", "for (const n of [1, 2]) it('named case', () => {});"])
-  ('unknown or generated soak test counts run everything: %j', (source) => {
-    expect(skip('soak-shard (1)', `${soakFile}::named case`, { readSource: () => source }).skip).toEqual([]);
-  });
-
-  it('unreadable single-test evidence runs the named soak case', () => {
-    expect(skip('soak-shard (1)', `${soakFile}::${soakName}`, { readSource: () => { throw new Error('unreadable'); } }).skip).toEqual([]);
-    expect(skip('soak-shard (1)', `${soakFile}::${soakName}`, { changed: [soakFile] }).skip).toEqual([]);
+  it('named quarantine never suppresses aliased unrelated assertions or scans their source', () => {
+    const readSource = vi.fn(() => "import { it, test as scenario } from 'vitest';\nit('named case', () => {});\nscenario('unrelated failure', () => { throw new Error('failure'); });");
+    expect(skip('soak-shard (1)', `${soakFile}::named case`, { readSource }).skip).toEqual([]);
+    expect(readSource).not.toHaveBeenCalled();
   });
 });
 
@@ -110,9 +94,15 @@ async function runSoak(args, files = [soakFile, otherFile], status = 0) {
 
 describe('soak CLI quarantine consumption', () => {
   it('removes the quarantined file after shard assignment and still runs the other file', async () => {
-    await runSoak(skip('soak-shard (1)', `${soakFile}::${soakName}`).line.split(' '));
+    await runSoak(skip('soak-shard (1)', soakFile).line.split(' '));
     expect(io.files).toHaveBeenCalledWith({ shard: 1, total: 8 });
     expect(io.spawn.mock.calls[0][1]).toEqual(['vitest', 'run', '--config', 'vitest.soak.config.ts', otherFile]);
+  });
+  it('a named soak quarantine keeps every assigned file running, including unrelated assertions', async () => {
+    const { line } = skip('soak-shard (1)', `${soakFile}::${soakName}`);
+    expect(line).toBe('');
+    await runSoak(line ? [line] : []);
+    expect(io.spawn.mock.calls[0][1]).toEqual(['vitest', 'run', '--config', 'vitest.soak.config.ts', soakFile, otherFile]);
   });
   it('a fully quarantined baseline shard succeeds without invoking Vitest on an empty file list', async () => {
     await runSoak([`--exclude=${soakFile}`], [soakFile]);

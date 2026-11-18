@@ -271,8 +271,39 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
 
 /** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
 export function readJobFailures(jobId, { exec, repoSlug }) {
+  return parseVitestFailures(readJobLog(jobId, { exec, repoSlug }));
+}
+
+function readJobLog(jobId, { exec, repoSlug }) {
   const text = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
-  return parseVitestFailures(String(text ?? ''));
+  return String(text ?? '');
+}
+
+/** Aggregates own no test failures: only the workflow's dependency message and final exit are covered. */
+function aggregateFailureCovered(job, text) {
+  const messages = {
+    test: /^(?:Unit shards|Coverage merge|Integration) did not succeed\.$/,
+    'coverage-merge': /^Unit shards did not succeed; refusing incomplete coverage\.$/,
+    'daemon-soak': /^One or more soak shards did not succeed \(soak-shard result: failure\)\.$/,
+  };
+  if (!Object.hasOwn(messages, job) || typeof text !== 'string') return false;
+  const lines = text.trimEnd().split('\n');
+  let command = false, message = false, exit = false;
+  for (const [index, raw] of lines.entries()) {
+    const line = raw.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /, '').replace(/\x1b\[[0-9;]*m/g, '').trim();
+    // Actions prints the shell script in a Run group; those quoted branches are not executed errors.
+    if (/^##\[group\]Run\b/.test(line)) { command = true; continue; }
+    if (command) {
+      if (/^(?:##\[error\]|::error::|\w*Error:)/i.test(line)) return false;
+      if (line === '##[endgroup]') command = false;
+      continue;
+    }
+    const plain = line.replace(/^(?:##\[error\]|::error::)/, '');
+    if (messages[job].test(plain)) { message = true; continue; }
+    if (index === lines.length - 1 && /^##\[error\]Process completed with exit code 1\.$/.test(line)) { exit = true; continue; }
+    if (/error|fail|did not succeed|timed?\s*out|timeout|ELIFECYCLE/i.test(line)) return false;
+  }
+  return !command && message && exit;
 }
 
 /**
@@ -626,9 +657,10 @@ export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = fal
   return testsToSkip({ list: r.list, now, prNumber, fixPrs, onMain });
 }
 
-/** Fresh, complete evidence only. At most five shard logs; larger/unknown reds stay held for operator repair. */
+/** Fresh, complete evidence only. At most five shard + three aggregate logs; larger/unknown reds need operator repair. */
 export function mainQuarantineCovered({ list, signal, now, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug,
-  readJobs = (id) => readRunJobs(id, { exec, repoSlug }), readLog = (id) => readJobFailures(id, { exec, repoSlug }) }) {
+  readJobs = (id) => readRunJobs(id, { exec, repoSlug }), readLog = (id) => readJobFailures(id, { exec, repoSlug }),
+  readAggregateLog = (id) => readJobLog(id, { exec, repoSlug }) }) {
   try {
     if (!validateQuarantineList(list).ok || list.mode !== 'quarantine') return false;
     const settings = mainCiRedSettings();
@@ -646,7 +678,10 @@ export function mainQuarantineCovered({ list, signal, now, exec = execFileSyncTh
     if (jobs.jobs.some((j) => !['success', 'skipped', 'neutral', 'failure', 'timed_out'].includes(j.conclusion)
       || (j.conclusion === 'timed_out' && !shards.some((s) => s.id === j.id)))) return false;
     const derived = { test: 'test-shard', 'coverage-merge': 'test-shard', 'daemon-soak': 'soak-shard' };
-    if (jobs.failed.some((j) => !shards.includes(j) && !shards.some((s) => local(s.name).startsWith(`${derived[local(j.name)]} (`)))) return false;
+    const aggregates = jobs.failed.filter((j) => !shards.includes(j));
+    if (aggregates.length > 3 || aggregates.some((j) => !Object.hasOwn(derived, local(j.name))
+      || !shards.some((s) => local(s.name).startsWith(`${derived[local(j.name)]} (`)))) return false;
+    if (!aggregates.every((j) => aggregateFailureCovered(local(j.name), readAggregateLog(j.id)))) return false;
     const shas = [signal.firstRedSha, signal.latestRedSha].filter(Boolean);
     const entries = list.entries.filter((e) => shas.some((s) => s.startsWith(e.brokenSha) || e.brokenSha.startsWith(s)));
     return shards.every((j) => {

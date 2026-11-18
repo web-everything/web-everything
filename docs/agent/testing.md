@@ -4616,3 +4616,10 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Quarantine aggregate log evidence
+
+Named quarantine entries never exclude files, including single-case soak files. Drain release also
+reads each failed aggregate log: only its known workflow dependency message and final exit are covered;
+unreadable, incomplete, independent or unknown failures retain the operator hold. Keep these regressions
+in `quarantine-job-wiring.test.mjs` and `red-main-quarantine-io.test.mjs` and run them through heavy admission.

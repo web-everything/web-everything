@@ -125,9 +125,70 @@ describe('latest main quarantine coverage releases the drain only with complete 
       exec: () => { if (scenario === 'unreadable-run') throw new Error('unreadable'); return JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: scenario === 'newer-run' ? 'other' : SHA }]); },
       readJobs: () => ({ complete: scenario !== 'incomplete-jobs', failed,
         ...(scenario === 'missing-full-jobs' ? {} : { jobs: failed.map((j) => ({ ...j, conclusion: 'failure' })) }) }),
-      readLog: scenario === 'unreadable-log' ? () => { throw new Error('unreadable'); } : readLog });
+      readLog: scenario === 'unreadable-log' ? () => { throw new Error('unreadable'); } : readLog,
+      readAggregateLog: () => `${scenario === 'unit-covered' ? '##[error]Unit shards did not succeed.' : 'One or more soak shards did not succeed (soak-shard result: failure).'}\n##[error]Process completed with exit code 1.` });
     expect(result).toBe(['all-covered', 'unit-covered'].includes(scenario));
     if (scenario === 'oversized') expect(readLog).not.toHaveBeenCalled();
+  });
+
+  describe.each([
+    ['test', 'test-shard (1)', '##[error]Unit shards did not succeed.'],
+    ['coverage-merge', 'test-shard (1)', '##[error]Unit shards did not succeed; refusing incomplete coverage.'],
+    ['daemon-soak', job, 'One or more soak shards did not succeed (soak-shard result: failure).'],
+  ])('%s aggregate evidence', (aggregate, shard, message) => {
+    const exit = '##[error]Process completed with exit code 1.';
+    function probe(log, extra = []) {
+      const now = Date.now(), reads = [];
+      const list = { ...addEntries(null, { tests: [file], job: shard, brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now }).list, mode: 'quarantine' };
+      const failed = [{ id: 1, name: `hetzner / ${shard}` }, { id: 2, name: `hetzner / ${aggregate}` }, ...extra];
+      const covered = mainQuarantineCovered({ list, signal: { latestRedSha: SHA }, now,
+        readJobs: () => ({ complete: true, failed, jobs: failed.map((j) => ({ ...j, conclusion: 'failure' })) }),
+        exec: (_bin, args, options) => {
+          if (args[0] === 'run') return JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: SHA }]);
+          reads.push(args[1]);
+          expect(options).toMatchObject({ timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+          if (args[1].endsWith('/2/logs')) { if (log instanceof Error) throw log; return log; }
+          if (args[1].endsWith('/1/logs')) return ` FAIL ${file} > covered case\nAssertionError: expected true\n Test Files 1 failed\n Tests 1 failed\n`;
+          throw new Error('unexpected log read');
+        },
+      });
+      return { covered, reads };
+    }
+
+    it('reads its own bounded log before accepting the known dependency failure and final exit', () => {
+      // Real Actions logs quote all shell branches inside the Run group before emitting the executed error.
+      const log = `##[group]Run if [ condition ]; then\necho "::error::Standards did not succeed."\n##[endgroup]\n${message}\n${exit}`;
+      const { covered, reads } = probe(log.split('\n').map((line) => `2026-11-18T12:00:00.000Z ${line}`).join('\n'));
+      expect(covered).toBe(true);
+      expect(reads).toHaveLength(2);
+      expect(reads.some((path) => path.endsWith('/2/logs'))).toBe(true);
+      expect(reads.some((path) => path.endsWith('/1/logs'))).toBe(true);
+    });
+
+    it.each(['Error: independent aggregate failure', '##[error]upload failed', '::error::permission denied',
+      'Integration did not succeed unexpectedly', 'Timeout: runner stopped', 'daemon-soak-scope did not succeed (result: failure).'])
+    ('retains the hold for independent error text: %s', (error) => {
+      expect(probe(`${error}\n${message}\n${exit}`).covered).toBe(false);
+      expect(probe(`${message}\n${error}\n${exit}`).covered).toBe(false);
+      expect(probe(`${message}\n${exit}\n${error}`).covered).toBe(false);
+    });
+
+    it.each([null, '', new Error('unreadable aggregate log')])('retains the hold for unreadable or empty aggregate evidence: %s', (log) => {
+      expect(probe(log).covered).toBe(false);
+    });
+    it('retains the hold for incomplete, unknown or quoted-only failure evidence', () => {
+      for (const log of [message, exit, `${message}\n${exit}\ntruncated`,
+        `##[error]Unknown dependency did not succeed.\n${exit}`,
+        `##[group]Run echo failure\n${message}\n##[endgroup]\n${exit}`,
+        `##[group]Run echo failure\n##[error]independent failure\n##[endgroup]\n${message}\n${exit}`,
+        `##[group]Run echo failure\n${message}\n${exit}`]) expect(probe(log).covered, log).toBe(false);
+    });
+    it('retains the operator hold for unknown aggregates and more than three aggregate logs without reading them', () => {
+      for (const extra of [[{ id: 3, name: 'unknown-aggregate' }],
+        [3, 4, 5].map((id) => ({ id, name: aggregate }))]) {
+        expect(probe(`${message}\n${exit}`, extra)).toEqual({ covered: false, reads: [] });
+      }
+    });
   });
 
   it.each(['success', 'cancelled', 'timed_out', 'startup_failure', 'action_required', null])('full job read retains the hold for an uncovered %s job', (conclusion) => {
@@ -135,6 +196,7 @@ describe('latest main quarantine coverage releases the drain only with complete 
     const list = { ...addEntries(null, { tests: [file], job, brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now }).list, mode: 'quarantine' };
     const exec = vi.fn((_bin, args) => {
       if (args[0] === 'run') return JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: SHA }]);
+      if (args[1].endsWith('/2/logs')) return 'One or more soak shards did not succeed (soak-shard result: failure).\n##[error]Process completed with exit code 1.';
       if (args[1].endsWith('/logs')) return ` FAIL ${file} > covered case\nAssertionError: expected true\n Test Files 1 failed\n Tests 1 failed\n`;
       return JSON.stringify({ total_count: 3, jobs: [{ id: 1, name: job, conclusion: 'failure' },
         { id: 2, name: 'daemon-soak', conclusion: 'failure' }, { id: 3, name: 'soak-shard (2)', conclusion }] });
