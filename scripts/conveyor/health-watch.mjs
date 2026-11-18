@@ -46,6 +46,7 @@
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
 import { runArchiveRetentionTick } from './archive-retention-tick.mjs';
+import { runUrgentSweepTick } from './urgent-sweep-tick.mjs';
 export { archiveRetentionTickAllowed } from './archive-retention-tick.mjs';
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
@@ -1159,6 +1160,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     if (error) probeErrors.archiveRetention = error;
     return results;
   });
+  const urgentSweepState = await attempt('urgentSweep', () => runUrgentSweepTick({
+    flags, now, state: prev.urgentSweep, sweep: deps.urgentSweep,
+  }));
+  if (urgentSweepState?.error) probeErrors.urgentSweep = urgentSweepState.error;
 
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
@@ -1439,6 +1444,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // Scrubbed ONCE, right here: everything below — the printed section, the returned summary, every file — sees
   // only the redacted state.
   const state = scrubDeep(result.state);
+  if (urgentSweepState) state.urgentSweep = urgentSweepState;
   if (claudeJobsArchive) state.claudeJobsArchive = { at: now, ...(claudeJobsArchive.complete ? { completedAt: now } : {}), ...claudeJobsArchive };
   else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
   if (prSweepJob) state.prSweep = prSweepJob.state;
