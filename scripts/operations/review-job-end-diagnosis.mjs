@@ -18,13 +18,15 @@ export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
   try {
     fd = openSync(jobLogPath(slug, dir), 'r');
     const size = fstatSync(fd).size;
-    // Redact a large window, not just the tail, so a multiline credential container keeps its opening context.
-    const start = Math.max(0, size - 4 * 1024 * 1024);
-    const bytes = Buffer.alloc(size - start);
-    const read = readSync(fd, bytes, 0, bytes.length, start);
-    let text = bytes.subarray(0, read).toString('utf8');
-    // Drop a partial first line (possibly a partial credential). An oversized final line names the fallback.
-    if (start > 0) text = text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '[log line exceeds diagnostic read bound; inspect job log]';
+    // Redact the WHOLE log (never a suffix: a multiline credential container needs its opening context). A log
+    // over the cap cannot be redacted safely, so it yields a fixed pointer instead of any content.
+    let text;
+    if (size > 4 * 1024 * 1024) text = '[log too large to redact safely; inspect job log]';
+    else {
+      const bytes = Buffer.alloc(size);
+      const read = readSync(fd, bytes, 0, size, 0);
+      text = bytes.subarray(0, read).toString('utf8');
+    }
     text = redactSpawnText(text).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
     tail = text.replace(/\n$/, '').split('\n').slice(-40).join('\n');
     if (Buffer.byteLength(tail) > MAX_TAIL) tail = Buffer.from(tail).subarray(-MAX_TAIL + 3).toString('utf8');
