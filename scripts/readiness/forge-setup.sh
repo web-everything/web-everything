@@ -192,7 +192,7 @@ try:
         # installed imports resolve to node builtins, including on Node 22.1.
         import re, json
         source_dir = os.path.dirname(sys.argv[1])
-        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"}
+        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-key-structure.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"}
         def bundle(filename, nested=False):
             if filename not in allowed:
                 raise RuntimeError("unexpected wrapper dependency")
