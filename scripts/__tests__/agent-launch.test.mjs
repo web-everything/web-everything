@@ -1,8 +1,72 @@
 import { describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
+import { findAgentLaunches } from '../lib/agent-launch-structure.mjs';
 
 const SID = '12345678-1234-4234-8234-123456789abc';
+
+// Audit probes use the real boundary with an injected primitive, never an actual agent process.
+it.each([
+  { name: 'R37.1 reassigned primitive', source: "let start=console.log; start=spawn; start('claude',[])", refused: true },
+  { name: 'R37.1 transitive alias', source: "let start=console.log; const go=start; start=spawn; go('claude',[])", refused: true },
+  { name: 'R37.1 ever assigned through var', source: "var start; start=spawn; start=console.log; start('claude',[])", refused: true },
+  { name: 'R37.1 computed primitive assignment', source: "let start; start=cp['spawn']; start('claude',[])", refused: true },
+  ...['bind(null)', 'call', 'apply'].map(method => ({ name: `R37.1 reassigned ${method}`,
+    source: `let start=console.log; start=spawn.${method}; start('claude',[])`, refused: true })),
+  { name: 'R37.1 safe reassignment control', source: "let start=console.log; start=console.info; start('claude',[])" },
+  { name: 'R37.1 lexical shadow control', source: "let start=console.log; { let start; start=spawn; } start('claude',[])" },
+  { name: 'R37.2 short global option hides exec', argv: ['-p', 'exec', 'exec', 'resume', 'other-id'], refused: true },
+  { name: 'R37.2 matching short global option control', argv: ['-p', 'exec', 'exec', 'resume', SID], resumeId: SID },
+  { name: 'R37.2 attached short option', argv: ['-pexec', 'exec', 'resume', 'other-id'], refused: true },
+  ...['-a', '-c', '-i', '-o', '-m', '-s', '-C'].map(option => ({
+    name: `R37.2 ${option} global option value`, argv: [option, 'exec', 'exec', 'resume', 'other-id'], refused: true })),
+  { name: 'R37.2 option values are not resume flags', argv: ['-p', '--resume', 'exec', '-c', '--session-id', '-'] },
+  { name: 'R37.2 short option consumes delimiter value', argv: ['-p', '--', 'exec', 'resume', 'other-id'], refused: true },
+  { name: 'R37.2 long global value hides exec', argv: ['--profile', 'exec', 'exec', 'resume', 'other-id'], refused: true },
+  { name: 'R37.3 unresolved shell executable', command: 'sh', argv: ['-c', 'tool=claude; "$tool" --resume other-id'], refused: true },
+  { name: 'R37.3 unresolved fresh executable', command: 'sh', argv: ['-c', '"$tool" -p hello'], refused: true },
+  { name: 'R37.3 unknown literal executable', command: 'sh', argv: ['-c', 'tool --resume other-id'], refused: true },
+  { name: 'R37.3 unresolved direct executable', command: '$tool', argv: ['--resume', 'other-id'], refused: true },
+  { name: 'R37.3 expanded resume id', command: 'sh', argv: ['-c', 'claude --resume "$SID"'], resumeId: '$SID', refused: true },
+  { name: 'R37.3 expanded subcommand', command: 'sh', argv: ['-c', 'codex "$subcommand" resume other-id'], refused: true },
+  { name: 'R37.3 glob-expanded option', command: 'sh', argv: ['-c', 'claude --resu?e other-id'], refused: true },
+  { name: 'R37.3 shell line continuation', command: 'sh', argv: ['-c', 'claude --resu\\\nme other-id'], refused: true },
+  { name: 'R37.3 implicit shell joins argv ambiguously', command: 'claude', argv: ['-p', 'hello'], shell: true, refused: true },
+  { name: 'R37.3 literal nested wrapper control', command: 'env',
+    argv: ['sh', '-c', `env bash -c 'claude --resume ${SID}'`], resumeId: SID },
+  { name: 'R37.3 oversized wrapper chain uses literal argv fallback', command: 'env',
+    argv: [...Array(34).fill('env'), 'claude', '-p', 'hello'], refused: true, reason: 'use literal argv' },
+  { name: 'R37.4 captured argv mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutate: true, refused: true },
+  { name: 'R37.4 frozen guard view mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutateView: true, refused: true },
+  { name: 'R37.4 shell option mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutateShell: true, refused: true },
+  { name: 'R37.4 observing guard control', command: 'claude', argv: ['--resume', SID], resumeId: SID, guard: true },
+])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, refused, mutate, mutateView, mutateShell, shell, guard, reason }) => {
+  const primitive = vi.fn(), original = [...argv], findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
+  const options = shell || mutateShell ? { shell: shell ?? false } : undefined;
+  const execute = () => {
+    if (findings.length) throw new Error('structural launch gate refused');
+    return launchAgent({ mode: 'worker-result-probe', resumeId, log() {},
+      ...((mutate || mutateView || mutateShell || guard) ? { launchGuard(view) {
+        expect(Object.isFrozen(view)).toBe(true);
+        expect(Object.isFrozen(view.argv)).toBe(true);
+        if (mutate) argv[1] = 'other-id';
+        if (mutateView) view.argv[1] = 'other-id';
+        if (mutateShell) options.shell = true;
+        return true;
+      } } : {}),
+    }, primitive, command, argv, ...(options ? [options] : []));
+  };
+  if (refused) {
+    if (source) expect(findings.some(finding => /^(?:start|go)$/.test(finding.kind))).toBe(true);
+    expect(execute).toThrow(reason ?? /refused/);
+    expect(primitive).not.toHaveBeenCalled();
+  } else {
+    expect(findings).toEqual([]);
+    execute();
+    expect(primitive).toHaveBeenCalledTimes(1);
+    expect(primitive).toHaveBeenCalledWith(command, original);
+  }
+});
 
 describe('launch refusal', () => {
   it.each([

@@ -4567,3 +4567,14 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Agent launch normalisation (R37)
+
+`agent-launch.test.mjs` contains one R37 audit table covering reassigned primitive bindings,
+Codex global short-option values, unresolved shell executable words, and guard mutation, with
+positive controls. Exercise the real `launchAgent` boundary with an injected primitive and assert
+zero primitive calls on refusal; use `findAgentLaunches` for the structural rows. Resolve literal
+wrappers before splitting options and their values. Resume validation consumes only that canonical
+form. Unsupported shell syntax/expansions and excessive wrapper nesting refuse with the direct
+literal-argv fallback. Guards receive a frozen view; guarded launches forward validated argv
+snapshots and refuse mutation of the caller's argv or shell execution option.

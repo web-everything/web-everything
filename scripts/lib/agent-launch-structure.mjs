@@ -33,6 +33,20 @@ export function findAgentLaunches(sources) {
     return found;
   };
   const declaration = node => checker.getSymbolAtLocation(node)?.valueDeclaration ?? checker.getSymbolAtLocation(node)?.declarations?.[0];
+  // This is a may-execute analysis: a mutable binding retains every primitive it can ever hold,
+  // regardless of source order, control flow, or a later safe assignment. Key by lexical declaration.
+  const assignments = new Map();
+  for (const file of files.values()) {
+    const visit = node => {
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+        && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment && ts.isIdentifier(node.left)) {
+        const binding = declaration(node.left);
+        if (binding) assignments.set(binding, [...(assignments.get(binding) ?? []), node.right]);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(file);
+  }
   function bindingExpression(binding, literal = false) {
     const keys = [];
     let owner = binding;
@@ -88,6 +102,7 @@ export function findAgentLaunches(sources) {
   function isPrimitive(node, seen = new Set(), allowDynamic = true) {
     if (!node || seen.has(node)) return false;
     seen.add(node);
+    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node)) return isPrimitive(node.expression, seen, allowDynamic);
     if (ts.isCallExpression(node)) return isPrimitive(node.expression, seen, allowDynamic);
     if (ts.isPropertyAccessExpression(node)) {
       // Method derivation needs a known primitive, not an arbitrary computed logger/callback.
@@ -102,6 +117,9 @@ export function findAgentLaunches(sources) {
     if (ts.isIdentifier(node)) {
       if (primitives.test(node.text)) return true;
       const d = declaration(node);
+      // Assignment taint needs primitive provenance, as method derivation does above: an arbitrary
+      // runtime-selected callback is not evidence that this binding holds an execution primitive.
+      if (assignments.get(d)?.some(n => isPrimitive(n, new Set(seen), false))) return true;
       if ((d && ts.isImportSpecifier(d))) return primitives.test(d.propertyName?.text ?? d.name.text);
       if (d && ts.isBindingElement(d)) return isPrimitive(d.initializer, seen, allowDynamic) || isPrimitive(bindingExpression(d), seen, allowDynamic);
       if (d && (ts.isVariableDeclaration(d) || ts.isParameter(d))) return isPrimitive(d.initializer, seen, allowDynamic);
