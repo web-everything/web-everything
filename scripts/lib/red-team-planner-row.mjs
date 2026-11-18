@@ -5,7 +5,7 @@ import { repoKeyForSlug } from './constellation-repos.mjs';
 import { splitFailingChecks, reviewHoldGatesOnlyRed, reviewHoldOnlyRed, refuseUnreviewable, planReconcile } from '../conveyor/reconcile-core.mjs';
 
 /** Reuse the normal gates, continuing past CI ownership without performing effects. Unknown scope holds. */
-function nominationSafety(pr, options) {
+function nominationSafety(pr, options, reviewOwnedCi, reviewOwned) {
   let hold;
   refuseUnreviewable({ pr, refuse: (kind, row) => { hold = `${kind}: ${row.why}`; } });
   if (hold) return hold;
@@ -13,7 +13,8 @@ function nominationSafety(pr, options) {
     || ![f.additions, f.deletions].every(n => Number.isSafeInteger(n) && n >= 0)))
     return 'scope inputs unreadable or incomplete; inspect the full changed files and size before retrying';
   const safety = planReconcile({ ...options, repo: repoKeyForSlug(options.repo), prs: [{ ...pr, labels: pr.labels?.map(l => typeof l === 'string' ? { name: l } : l) }], agents: [], reviewSafetyOnly: true });
-  return safety.refusals.find(r => !['review-ci', 'no-findings'].includes(r.kind))?.kind
+  return safety.refusals.find(r => r.kind !== 'no-findings' && !(r.kind === 'review-ci' && reviewOwnedCi
+    && r.ci?.affected?.length && r.ci.affected.every(check => reviewOwned.includes(check.name))))?.kind
     ?? safety.dispatch.find(r => r.kind !== 'review')?.kind ?? (safety.dispatch.length || safety.refusals.some(r => r.kind === 'review-ci') ? null : 'no review owed; inspect reconciliation');
 }
 
@@ -42,8 +43,11 @@ export function readPlannerRow({ repo, pr, plan, refusals = plan?.refusals ?? []
   // Ask the existing normal-path classifier separately for each failing required check. In particular,
   // a plain merge-gate (or red-team) failure is not silently promoted to a review-owned hold.
   const reviewOwned = [...new Set([...failing.required, ...pending])].filter(name => reviewHoldGatesOnlyRed(ownershipChecks, [name]));
+  const reviewOwnedCi = ci.allowed === false && ci.affected.length > 0 && ci.affected.every(check =>
+    reviewOwned.includes(check.name) && !['missing', 'wrong-head', 'malformed'].includes(check.reason)
+    && !(check.reason === 'pending' && (plan?.plannerOptions?.reviewTiming ?? rawPr?.reviewTiming)?.startEarly === 'off'));
   return { absent: false, refusal, nominationSafety: { head: rawPr?.headRefOid,
-    hold: nominationSafety(rawPr, { repo, ...plan?.plannerOptions, requiredChecks }) }, reviewOwnedChecks: {
+    hold: nominationSafety(rawPr, { repo, ...plan?.plannerOptions, requiredChecks }, reviewOwnedCi, reviewOwned) ?? (ci.allowed === false && !reviewOwnedCi ? 'review-ci' : null) }, reviewOwnedChecks: {
     ci,
     ...failing, reviewOwned, nonReviewOwned: failing.required.filter(name => !reviewOwned.includes(name)),
     gatesOnlyRed: reviewHoldGatesOnlyRed(checks, requiredChecks),
@@ -78,6 +82,7 @@ export function redTeamNominationRefusal(row, rawPr, rows = []) {
   if (!row.nominationSafety || row.nominationSafety.head !== rawPr?.headRefOid) return 'planner safety evidence unreadable; inspect reconciliation before retrying';
   if (row.nominationSafety.hold) return `planner safety hold: ${row.nominationSafety.hold}`;
   const checks = row.reviewOwnedChecks;
+  if (checks?.ci?.allowed === true && checks.ci.headSha === rawPr.headRefOid && checks.ci.affected?.length === 0) return null;
   if (checks?.ci?.allowed !== false || checks.ci?.headSha !== rawPr.headRefOid
     || !checks.ci.affected?.length || checks.ci.affected.some(check => !checks.reviewOwned?.includes(check.name)
       || ['missing', 'wrong-head', 'malformed'].includes(check.reason)))

@@ -1,4 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { loadPrOwnershipSettings } from '../conveyor/pr-ownership-settings.mjs';
 import { redTeamRequestForHead } from './red-team-request.mjs';
 import { readPlannerRow, readPlannerRows, redTeamNominationRefusal } from './red-team-planner-row.mjs';
 import { execFileSync } from 'node:child_process';
@@ -252,11 +253,10 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
 
 // review-labels.mjs exports names only. Fail closed for every review hold namespace,
 // including future merge holds, rather than maintaining a partial list here.
-function conflictsWithPolicyClear(label, { settlesPending = false, settlesReviewPending = false, settlesHuman = false } = {}) {
+function conflictsWithPolicyClear(label, { settlesPending = false, settlesReviewPending = false } = {}) {
   const name = typeof label === 'string' ? label : label?.name;
   // A finished not-owed result settles the stale pending status; blocked and review holds still refuse (D-R338).
   if (settlesPending && name === 'red-team:pending') return false;
-  if (settlesHuman && name === 'review:human') return false;
   // A parked run retains review:pending itself, so once its referrals are ruled it is the resume's own label, not a hold.
   if (settlesReviewPending && name === 'review:pending') return false;
   return typeof name === 'string' && (
@@ -310,7 +310,7 @@ function provenAcceptance({ comments, reviews, labels, head }) {
 /** Live holds supersede both carried and stored policy-clears. PURE.
  * Without an acceptance record nothing is "later", so any explicit hold comment stands (any author: fail closed).
  */
-function publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending = false, settlesReviewPending = false, settlesHuman = false }) {
+function publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending = false, settlesReviewPending = false }) {
   if (acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold) {
     return 'later verdict or hold supersedes acceptance';
   }
@@ -319,7 +319,7 @@ function publishableClearGuard({ labels, acceptance, comments, reviews, settlesP
   }
   if (acceptance?.reviewsUnreadable) return 'PR reviews unreadable; inspect formal reviews before policy-clear';
   if (!Array.isArray(labels)) return 'PR labels unreadable';
-  if (labels.some(label => conflictsWithPolicyClear(label, { settlesPending, settlesReviewPending, settlesHuman }))) {
+  if (labels.some(label => conflictsWithPolicyClear(label, { settlesPending, settlesReviewPending }))) {
     return 'conflicting label prevents policy-clear';
   }
   // A trusted marker alone is not acceptance provenance. Use numbering's whole-thread
@@ -482,6 +482,7 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
  */
 export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [], rawPrs, requiredChecks, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
+  explicitRequest, readOwnership = loadPrOwnershipSettings, log = () => {},
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
   const plannerRows = readPlannerRows({ repo, plan, refusals, rawPrs, requiredChecks });
@@ -493,7 +494,7 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
-    const request = redTeamRequestForHead(rawPr?.comments, { repo, pr, head });
+    const request = explicitRequest?.head === head ? explicitRequest : redTeamRequestForHead(rawPr?.comments, { repo, pr, head });
     const row = { prNumber: pr, head, action: 'skip', ...(request ? { requestReason: request.reason } : {}) };
     const skip = why => ({ ...row, why });
     // #6606: a verdict carry settles the head with a result but no round, so nothing else republishes its check. While
@@ -536,30 +537,12 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
     };
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
+    const fallback = 'automatic nomination requires a finished live-head review; use red-team-enqueue --actor=<login> --reason=<text>';
     const dispatchDecision = decision => {
+      if (nomination && !request && decision.action === 'review') return skip(fallback);
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
-    };
-    const fullReviewDecision = (why, { referralsRuled = false } = {}) => {
-      const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
-      const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
-      const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
-      // R640: pending is a merge hold, and does not prevent the full review.
-      // Once every refused referral is ruled, the daemon's own "referrals need a ruling" pause notice (trusted author
-      // only) is settled, and the parked run's retained review:pending is the resume's own label. Every other hold stands.
-      const guardComments = referralsRuled && Array.isArray(rawPr.comments)
-        ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment, { persistRecovered: true })) : rawPr.comments;
-      const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
-      const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
-        settlesPending: true, settlesReviewPending: referralsRuled, settlesHuman: nomination };
-      const refusal = publishableClearGuard(context);
-      if (refusal) return guardedSkip(refusal);
-      // Formal holds apply even without an acceptance comment. No timestamp
-      // floor: a missing acceptance cannot establish that a review was cleared.
-      if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-      if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-      return dispatchDecision({ action: 'review', why });
     };
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
@@ -607,9 +590,34 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
       if (!isRealHead(head) || ((refusal.headSha ?? refusal.headRefOid) != null && (refusal.headSha ?? refusal.headRefOid) !== head)) return skip('live head missing or changed');
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
+      const nominationEvidence = nomination ? readEvidence({ repo, pr, head }) : null;
       if (nomination) {
-        const guarded = fullReviewDecision('human head needs a full review before red team');
-        if (guarded.action === 'skip') return guarded;
+        if (nominationEvidence?.ok === false) return skip(nominationEvidence.reason);
+        const payload = nominationEvidence?.loopPayload, storedHead = payload?.findings?.read?.netBasis?.rev;
+        const stale = isRealHead(storedHead) && storedHead !== head;
+        const explicitAdvisory = request && stale;
+        if (explicitAdvisory) {
+          const resolved = readOwnership({ env })?.advisoryReviewOnHumanHandoff;
+          log(`pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=${resolved?.value} (source: ${resolved?.source})`);
+          if (resolved?.value !== 'on' || !resolved.source || resolved.source === 'unreadable' || resolved.ignored?.length)
+            return skip('advisoryReviewOnHumanHandoff off or unreadable; inspect settings before retrying');
+        }
+        const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
+        const labels = explicitAdvisory ? rawPr.labels.filter(l => (typeof l === 'string' ? l : l?.name) !== 'review:human') : rawPr.labels;
+        const hold = publishableClearGuard({ labels, comments: rawPr.comments, reviews,
+          acceptance: latestAcceptRecord(rawPr.comments, reviews), settlesPending: true });
+        if (hold) return skip(stale && !request && hold === 'conflicting label prevents policy-clear'
+          && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) !== 'review:human' && conflictsWithPolicyClear(l, { settlesPending: true })) ? `${hold}; ${fallback}` : hold);
+        if (storedHead !== head) {
+          if (!explicitAdvisory) return skip(fallback);
+          if (nominationEvidence.inFlight !== false || nominationEvidence.queued || nominationEvidence.recorded !== false
+            || nominationEvidence.seatRecorded !== false || nominationEvidence.completedRecorded || nominationEvidence.cleanRecorded
+            || nominationEvidence.status?.head === head || readStatus({ repo, pr, head }) != null) return skip('live head already has review/red-team state');
+          return dispatchDecision({ action: 'review', why: 'explicit request for a fresh human-handoff advisory' });
+        }
+        if (!redTeamOwedFor(payload)) return skip('stored finished review does not owe a red team');
       }
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
@@ -623,7 +631,7 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
       }
-      const evidence = readEvidence({ repo, pr, head });
+      const evidence = nominationEvidence ?? readEvidence({ repo, pr, head });
       if (evidence?.ok === false) return nomination ? skip(evidence.reason) : failedRead(evidence);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
@@ -702,13 +710,30 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
       };
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
-      const needsReview = !movedCardOnly && !pendingCardOnly && !unfinishedCarry && (accepted || nomination)
+      const needsReview = !movedCardOnly && !pendingCardOnly && !unfinishedCarry && accepted
         && (evidence?.loopPayload == null || (isRealHead(storedHead) && storedHead !== head))
         && evidence?.inFlight === false && !evidence.queued
         && evidence.recorded === false && evidence.seatRecorded === false
         && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
+      const fullReviewDecision = (why, { referralsRuled = false } = {}) => {
+        // R640: pending is a merge hold, and does not prevent the full review.
+        // Once every refused referral is ruled, the daemon's own "referrals need a ruling" pause notice (trusted author
+        // only) is settled, and the parked run's retained review:pending is the resume's own label. Every other hold stands.
+        const guardComments = referralsRuled && Array.isArray(rawPr.comments)
+          ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment, { persistRecovered: true })) : rawPr.comments;
+        const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
+        const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
+          settlesPending: true, settlesReviewPending: referralsRuled };
+        const refusal = publishableClearGuard(context);
+        if (refusal) return guardedSkip(refusal);
+        // Formal holds apply even without an acceptance comment. No timestamp
+        // floor: a missing acceptance cannot establish that a review was cleared.
+        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
+        return dispatchDecision({ action: 'review', why });
+      };
       if (needsReview) return fullReviewDecision('unprovable head move needs a full review');
       if (verdict === VERDICTS.NEEDS_HUMAN && storedHead === head) {
         let ruled = false;
@@ -908,7 +933,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   },
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels,
-  publishCheck = null,
+  readOwnership = loadPrOwnershipSettings, publishCheck = null,
   // #6606: the carried-check outbox and its republisher. Test runs need explicit IO for both, as for publishCheck.
   readCarriedCheck = isUnderTest() || isUnderTest(env) ? () => false : key => readCarriedCheckUnpublished({ ...key, env }),
   // The shared writer resolves the App id from the setting (the daemon never sets WE_APP_ID) and lets the writer env win.
@@ -979,7 +1004,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, plan, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
+      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env, readOwnership, log: note,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));

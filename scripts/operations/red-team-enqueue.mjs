@@ -8,10 +8,8 @@ import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { isRealHead } from '../lib/red-team-skip-outcome.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-
 export const RED_TEAM_ENQUEUE_OP = 'red-team-enqueue';
 export const RED_TEAM_ENQUEUE_EFFECT = 'red-team.request';
-
 function liveRedTeamRequest(input, live) {
   const request = validateRedTeamRequest(input);
   if (live?.state !== 'OPEN' || live.isDraft !== false) throw Error('red-team-enqueue: PR must be open and ready for review');
@@ -26,25 +24,23 @@ function liveRedTeamRequest(input, live) {
 export function planRedTeamEnqueue(input, live, planning) {
   const request = liveRedTeamRequest(input, live);
   const decision = planRedTeamNomination({ ...planning, repo: request.repo, pr: request.pr,
-    rawPrs: [{ ...live, number: request.pr }] });
+    explicitRequest: request, rawPrs: [{ ...live, number: request.pr }] });
   if (!['dispatch', 'review'].includes(decision.action)) throw Error(`red-team-enqueue: ${decision.why}`);
-  return { ...request, head: live.headRefOid };
+  return request;
 }
 
 export function redTeamEnqueueOperation() {
   return op(RED_TEAM_ENQUEUE_OP, {
-    input: { pr: 'number', repo: { type: 'string', required: false, default: 'web-everything/web-everything' }, reason: 'string' },
+    input: { pr: 'number', repo: { type: 'string', required: false, default: 'web-everything/web-everything' }, actor: 'string', reason: 'string' },
     verdictFrom: 'plan',
-    plan: compute({ reads: ['input.pr', 'input.repo', 'input.reason'], fn: ({ input }) => validateRedTeamRequest(input) }),
+    plan: compute({ reads: ['input.pr', 'input.repo', 'input.actor', 'input.reason'], fn: ({ input }) => validateRedTeamRequest(input) }),
     request: effect({ reads: ['verdict'], effects: ({ verdict }) => [{
       type: RED_TEAM_ENQUEUE_EFFECT, payload: verdict, idempotent: true,
     }] }),
   });
 }
 
-/** A durable PR comment avoids a second local queue writer racing the daemon's in-memory queue.
- * The complete thread and state are read at the effect, including on resumed registered operations.
- */
+/** Re-read live evidence at the effect; the durable comment shares the daemon queue. */
 export function createRedTeamEnqueueSinks({ env = process.env,
   gh = args => runGhSync(args, { env, throttle: { env: { ...env, WE_GH_READ_MEMO_DIR: '' } }, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 }),
   readComments = ({ repo, pr }) => readCompletePrComments(pr, { repo,
@@ -62,9 +58,9 @@ export function createRedTeamEnqueueSinks({ env = process.env,
     const comments = await readComments(input);
     liveRedTeamRequest(input, { ...live, comments });
     const request = planRedTeamEnqueue(input, { ...live, comments, reviews: await readReviews(input) },
-      { env, ...planning, plan: await readPlan(input) });
+      { env, log: line => console.error(line), ...planning, plan: await readPlan(input) });
     const existing = redTeamRequestForHead(comments, request);
-    if (existing?.reason === request.reason) return { status: 'already-requested', head: request.head };
+    if (existing?.reason === request.reason && existing.actor === request.actor) return { status: 'already-requested', head: request.head };
     // A move during the complete comment read must not bind a request to stale evidence.
     const fresh = await readLive(input);
     if (fresh?.headRefOid !== request.head || fresh.state !== 'OPEN' || fresh.isDraft !== false) {

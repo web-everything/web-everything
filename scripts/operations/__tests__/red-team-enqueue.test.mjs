@@ -5,26 +5,28 @@ import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { resolveOperation } from '../run.mjs';
 import { planRedTeamOnSkip, planRedTeamNomination, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
-import { readPlannerRows } from '../../lib/red-team-planner-row.mjs';
+import { readPlannerRows, redTeamNominationRefusal } from '../../lib/red-team-planner-row.mjs';
 import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../../lib/red-team-dispatch-queue.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { buildClearedHumanMarker, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
+import { resolvePrOwnershipSettings } from '../../conveyor/pr-ownership-settings.mjs';
 import { REVIEW_TIMING_DEFAULTS } from '../../lib/review-timing.mjs';
 
 const repo = 'web-everything/web-everything', pr = 6938, head = 'e'.repeat(40);
-const input = { repo, pr, reason: 'head moved after the last red team' };
+const input = { repo, pr, actor: 'chalbert', reason: 'head moved after the last red team' };
 const trusted = body => ({ body, author: { login: 'web-everything' } });
 const check = (name, conclusion = 'failure', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
 const live = () => ({ number: pr, state: 'OPEN', isDraft: false, headRefOid: head,
   files: [{ path: 'scripts/guard.mjs', additions: 5, deletions: 2 }],
   labels: ['review:human'], comments: [], reviews: [],
   statusCheckRollup: [check('test', 'success'), check('review-gate'), ...REVIEW_TIMING_DEFAULTS.fastChecks.we.map(name => check(name, 'success'))] });
-const planning = () => ({ env: {}, now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 },
+const planning = () => ({ readOwnership: resolvePrOwnershipSettings, log: vi.fn(), env: {}, now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 },
   lastDispatch: new Map(), readWitness: null, readCarry: () => null, readReviewRuns: () => [],
   readStatus: () => null, readEvidence: () => ({ inFlight: false, queued: false, recorded: false,
-    seatRecorded: false, completedRecorded: false, cleanRecorded: false }) });
+    seatRecorded: false, completedRecorded: false, cleanRecorded: false,
+    loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } } }) });
 const plan = (raw = live(), refusal = { kind: 'review-ci', prNumber: pr, headSha: head }, requiredChecks = ['test', 'review-gate']) => {
   const result = { refusals: refusal ? [refusal] : [], plannerOptions: { requiredChecks } };
   return { ...result, plannerRows: readPlannerRows({ repo, plan: result, rawPrs: [raw] }) };
@@ -42,15 +44,15 @@ describe('registered red-team-enqueue', () => {
     expect(operation.declaration.name).toBe('red-team-enqueue');
     const out = await runOperationCli({ ...operation,
       sinks: createRedTeamEnqueueSinks(f), store: createMemoryRunStore(),
-      newRunId: () => 'red-team-enqueue-test', argv: [`--pr=${pr}`, `--reason=${input.reason}`] });
+      newRunId: () => 'red-team-enqueue-test', argv: [`--pr=${pr}`, `--actor=${input.actor}`, `--reason=${input.reason}`] });
     expect(out.code).toBe(0);
     expect(f.post).toHaveBeenCalledOnce();
     const request = f.post.mock.calls[0][0];
     expect(request).toMatchObject({ ...input, head });
-    expect(redTeamRequestForHead([trusted(request.body)], { repo, pr, head })).toMatchObject({ ...input, head });
+    expect(redTeamRequestForHead([trusted(request.body)], { repo, pr, head })).toMatchObject({ ...input, head, time: expect.any(String) });
   });
-  it.each(['pr', 'reason'])('requires --%s through the generated CLI', field => {
-    const flags = [`--pr=${pr}`, '--reason=please review'].filter(arg => !arg.startsWith(`--${field}=`));
+  it.each(['pr', 'actor', 'reason'])('requires --%s through the generated CLI', field => {
+    const flags = [`--pr=${pr}`, '--actor=chalbert', '--reason=please review'].filter(arg => !arg.startsWith(`--${field}=`));
     expect(parseOperationArgv(redTeamEnqueueOperation(), flags).errors.length).toBeGreaterThan(0);
   });
   it.each([
@@ -85,6 +87,7 @@ describe('registered red-team-enqueue', () => {
     expect(f.post).not.toHaveBeenCalled();
   });
   it.each([
+    { actor: undefined }, { actor: '' }, { actor: ' ' }, { reason: undefined }, { reason: '' },
     { reason: 'x'.repeat(1001) }, { reason: 'bad\u001btext' }, { reason: ' ' },
     { pr: -1 }, { pr: 1.5 }, { repo: 'owner/$(touch bad)' }, { repo: '../..' },
   ])('rejects invalid or oversized input before IO: %j', async patch => {
@@ -110,9 +113,9 @@ describe('registered red-team-enqueue', () => {
 
 
 
-describe('automatic nomination / registered enqueue guard parity', () => {
+describe('finished-head automatic nomination / registered enqueue guard parity', () => {
   const cases = [
-    ...['review-ci', 'ci-heal-escalated', 'owed-ci-rerun'].map(kind => [kind, (_raw, row) => { row.kind = kind; }, true]),
+    ...['review-ci', 'ci-heal-escalated', 'owed-ci-rerun'].map(kind => [kind, (_raw, row) => { row.kind = kind; }, false]),
     ['scope-bloat', (_raw, row) => { row.kind = 'scope-bloat'; }, false],
     ['folded scope-bloat', (_raw, row) => { row.reviewRefusal = { kind: 'scope-bloat', scopeBloat: { stale: true } }; }, false],
     ['folded referral hold', (_raw, row) => { row.reviewRefusal = { kind: 'review-referrals-pending', referralHold: { why: 'ruling owed' } }; }, false],
@@ -139,12 +142,13 @@ describe('automatic nomination / registered enqueue guard parity', () => {
     ['thread hold', raw => { raw.comments = [trusted('🔁 review — changes requested\n\nFix the guard.')]; }, false],
     ['folded unknown hold', (_raw, row) => { row.reviewRefusal = { kind: 'future-hold' }; }, false],
     ['non-review required failure', raw => { raw.statusCheckRollup[0].conclusion = 'failure'; }, false],
+    ['pending standards behind review-ci with startEarly off', (raw, _row, required) => { required.push('standards'); raw.statusCheckRollup[2] = check('standards', null, { status: 'in_progress' }); }, false],
     ['non-review required pending', raw => { raw.statusCheckRollup[0] = check('test', null, { status: 'in_progress' }); }, false],
-    ['review-owned required pending', raw => { raw.statusCheckRollup[1] = check('review-gate', null, { status: 'in_progress' }); }, true],
+    ['review-owned required pending', raw => { raw.statusCheckRollup[1] = check('review-gate', null, { status: 'in_progress' }); }, false],
     ['plain red-team failure', (raw, _row, required) => { required.push('red-team'); raw.statusCheckRollup.push(check('red-team')); }, false],
     ['absent required merge-gate', (_raw, _row, required) => { required.push('merge-gate'); }, false],
     ['plain merge-gate failure', (raw, _row, required) => { required.push('merge-gate'); raw.statusCheckRollup.push(check('merge-gate')); }, false],
-    ['review-owned merge-gate failure', (raw, _row, required) => { required.push('merge-gate'); raw.statusCheckRollup.push(check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['red-team'], jobId: 5874001 } })); }, true],
+    ['review-owned merge-gate failure', (raw, _row, required) => { required.push('merge-gate'); raw.statusCheckRollup.push(check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['red-team'], jobId: 5874001 } })); }, false],
     ['absent row', (_raw, row) => { row.absent = true; }, false],
     ['non-human head', raw => { raw.labels = []; }, false],
     ['live-head mismatch', (_raw, row) => { row.headSha = 'b'.repeat(40); }, false],
@@ -156,8 +160,14 @@ describe('automatic nomination / registered enqueue guard parity', () => {
     const raw = live(), refusal = { kind: 'review-ci', prNumber: pr, headSha: head }, required = ['test', 'review-gate'];
     mutate(raw, refusal, required);
     const result = plan(raw, refusal.absent ? null : refusal, required), opts = planning();
+    result.plannerOptions.reviewTiming = { ...REVIEW_TIMING_DEFAULTS, startEarly: 'off' };
+    result.plannerRows = readPlannerRows({ repo, plan: { ...result, plannerRows: undefined }, rawPrs: [raw] });
+    const evidence = opts.readEvidence();
+    evidence.loopPayload.findings.read.netBasis.rev = head;
+    opts.readEvidence = () => evidence;
     const automatic = planRedTeamOnSkip({ repo, plan: result, rawPrs: [raw], ...opts });
     const decision = automatic[0] ?? planRedTeamNomination({ repo, pr, plan: result, rawPrs: [raw], ...opts });
+    expect(decision.action).toBe('skip');
     expect(['review', 'dispatch'].includes(decision.action)).toBe(accepted);
     const f = fixture({ readLive: () => raw, readComments: () => raw.comments, readReviews: () => raw.reviews,
       readPlan: () => result, planning: opts });
@@ -170,6 +180,20 @@ describe('automatic nomination / registered enqueue guard parity', () => {
     }
     expect(raw.labels).toEqual(live().labels.concat(_name === 'review:changes' ? ['review:changes'] : [])
       .concat(_name.startsWith('advisory repair') ? ['advisory:changes'] : []).filter(() => _name !== 'non-human head'));
+  });
+
+  it.each(cases.filter(([name]) => !['review-ci', 'ci-heal-escalated', 'owed-ci-rerun',
+    'review-owned required pending', 'review-owned merge-gate failure'].includes(name)))
+  ('stale advisory: %s still has identical refusal reasons', async (_name, mutate) => {
+    const raw = live(), refusal = { kind: 'review-ci', prNumber: pr, headSha: head }, required = ['test', 'review-gate'];
+    mutate(raw, refusal, required);
+    const result = plan(raw, refusal.absent ? null : refusal, required), opts = planning();
+    const automatic = planRedTeamNomination({ repo, pr, plan: result, rawPrs: [raw], ...opts });
+    expect(automatic.action).toBe('skip');
+    const f = fixture({ readLive: () => raw, readComments: () => raw.comments, readReviews: () => raw.reviews,
+      readPlan: () => result, planning: opts });
+    await expect(f.run()).rejects.toThrow(`red-team-enqueue: ${automatic.why}`);
+    expect(f.post).not.toHaveBeenCalled();
   });
 
   it('queue admits the row through the existing capacity-bound entry and daemon reads its request reason', () => {
@@ -225,6 +249,9 @@ describe('trusted request marker', () => {
     ['untrusted author', comment => { comment.author.login = 'outsider'; }],
     ['stale head', comment => { comment.body = redTeamRequestBody({ ...input, head: 'b'.repeat(40) }); }],
     ['oversized marker', comment => { comment.body += 'x'.repeat(8193); }],
+    ['legacy missing actor', comment => { comment.body = comment.body.replace(/"actor":"[^"]+",/, ''); }],
+    ['missing time', comment => { comment.body = comment.body.replace(/,"time":"[^"]+"/, ''); }],
+    ['invalid time', comment => { comment.body = comment.body.replace(/"time":"[^"]+"/, '"time":"invalid"'); }],
     ['malformed marker', comment => { comment.body = '<!-- red-team-request: invalid -->\n'; }],
   ])('ignores %s', (_name, change) => {
     const comment = trusted(redTeamRequestBody({ ...input, head })); change(comment);
@@ -259,11 +286,121 @@ it('unreadable reconciliation refuses without posting a request', async () => {
 });
 
 
-it('a stored review of an older head nominates a full review in both paths', async () => {
+it('stale advisory human-held head requires the explicit op with actor, reason and setting on', async () => {
   const opts = planning(), baseRead = opts.readEvidence;
   opts.readEvidence = () => ({ ...baseRead(), loopPayload: { verdict: { verdict: 'accept' },
     findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } } });
   const automatic = planRedTeamOnSkip({ repo, plan: plan(), rawPrs: [live()], ...opts })[0];
-  expect(automatic.action).toBe('review');
+  expect(automatic).toMatchObject({ action: 'skip', why: expect.stringContaining('red-team-enqueue --actor=<login> --reason=<text>') });
+  const raw = live(); raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+  expect(planRedTeamOnSkip({ repo, plan: plan(), rawPrs: [raw], ...opts })[0].action).toBe('review');
   expect(await fixture({ planning: opts }).run()).toMatchObject({ status: 'requested', head });
+});
+
+
+it.each([
+  ['off', () => ({ advisoryReviewOnHumanHandoff: { value: 'off', source: 'env' } })],
+  ['unreadable', () => { throw Error('unreadable'); }],
+  ['invalid', () => ({ advisoryReviewOnHumanHandoff: { value: 'on', source: 'standard', ignored: [{ source: 'repo' }] } })],
+  ['missing', () => ({})],
+])('explicit stale-advisory request refuses %s handoff settings before posting or dispatching', async (_name, readOwnership) => {
+  const opts = { ...planning(), readOwnership }, f = fixture({ planning: opts });
+  await expect(f.run()).rejects.toThrow(/unreadable|advisoryReviewOnHumanHandoff/);
+  expect(f.post).not.toHaveBeenCalled();
+  const raw = live(); raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+  expect(planRedTeamOnSkip({ repo, plan: plan(), rawPrs: [raw], ...opts })[0].action).toBe('skip');
+});
+
+it('resolves the normal handoff setting from the environment and logs its provenance', async () => {
+  const opts = planning(); opts.env.WE_PR_OWNERSHIP_ADVISORY_ON_HANDOFF = 'off';
+  const f = fixture({ planning: opts });
+  await expect(f.run()).rejects.toThrow('advisoryReviewOnHumanHandoff');
+  expect(opts.log).toHaveBeenCalledWith(expect.stringContaining('=off (source: env)'));
+  expect(f.post).not.toHaveBeenCalled();
+});
+
+it('finished-review live head automatically selects red team only and the op accepts the same decision', async () => {
+  const raw = live(); raw.labels = [];
+  const result = plan(raw, { kind: 'already-reviewed-head', prNumber: pr, headSha: head });
+  const opts = planning(), evidence = opts.readEvidence(); evidence.loopPayload.findings.read.netBasis.rev = head;
+  opts.readEvidence = () => evidence;
+  expect(planRedTeamOnSkip({ repo, plan: result, rawPrs: [raw], ...opts })[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+  const f = fixture({ readLive: () => raw, readPlan: () => result, planning: opts });
+  expect(await f.run()).toMatchObject({ status: 'requested', head });
+});
+
+it.each([undefined, null, { verdict: { verdict: 'accept' } }])('automatic nomination never starts a full review with incomplete finished evidence: %j', loopPayload => {
+  const opts = planning(); opts.readEvidence = () => ({ loopPayload, inFlight: false, recorded: false, seatRecorded: false });
+  expect(planRedTeamOnSkip({ repo, plan: plan(), rawPrs: [live()], ...opts })[0].action).toBe('skip');
+});
+
+
+it.each(['review-ci', 'ci-heal-escalated', 'owed-ci-rerun'])('pending standards behind %s blocks the stale-advisory exception with startEarly off', async kind => {
+  const raw = live(); raw.statusCheckRollup[2] = check('standards', null, { status: 'in_progress' });
+  const result = plan(raw, { kind, prNumber: pr, headSha: head }, ['test', 'standards', 'review-gate']);
+  result.plannerOptions.reviewTiming = { ...REVIEW_TIMING_DEFAULTS, startEarly: 'off' };
+  result.plannerRows = readPlannerRows({ repo, plan: { ...result, plannerRows: undefined }, rawPrs: [raw] });
+  const opts = planning();
+  const automatic = planRedTeamNomination({ repo, pr, plan: result, rawPrs: [raw], ...opts });
+  expect(automatic).toMatchObject({ action: 'skip', why: 'planner safety hold: review-ci' });
+  const f = fixture({ readLive: () => raw, readPlan: () => result, planning: opts });
+  await expect(f.run()).rejects.toThrow(automatic.why);
+  expect(f.post).not.toHaveBeenCalled();
+});
+
+it('a pending fast-check prerequisite cannot be excused even outside the required-check set', async () => {
+  const raw = live(); raw.statusCheckRollup[2] = check('standards', null, { status: 'in_progress' });
+  const result = plan(raw), opts = planning();
+  const automatic = planRedTeamNomination({ repo, pr, plan: result, rawPrs: [raw], ...opts });
+  expect(automatic).toMatchObject({ action: 'skip', why: 'planner safety hold: review-ci' });
+  const f = fixture({ readLive: () => raw, readPlan: () => result, planning: opts });
+  await expect(f.run()).rejects.toThrow(automatic.why);
+  expect(f.post).not.toHaveBeenCalled();
+});
+
+it('startEarly off retains a pending review-owned check refusal for both paths', async () => {
+  const raw = live(); raw.statusCheckRollup[1] = check('review-gate', null, { status: 'in_progress' });
+  const result = plan(raw); result.plannerOptions.reviewTiming = { ...REVIEW_TIMING_DEFAULTS, startEarly: 'off' };
+  result.plannerRows = readPlannerRows({ repo, plan: { ...result, plannerRows: undefined }, rawPrs: [raw] });
+  const automatic = planRedTeamNomination({ repo, pr, plan: result, rawPrs: [raw], ...planning() });
+  expect(automatic).toMatchObject({ action: 'skip', why: 'planner safety hold: review-ci' });
+  const f = fixture({ readLive: () => raw, readPlan: () => result });
+  await expect(f.run()).rejects.toThrow(automatic.why);
+  expect(f.post).not.toHaveBeenCalled();
+});
+
+
+it.each([
+  ['all-required-checks-green', 'success', 'success', null],
+  ['review-owned CI refusal', 'success', 'failure', null],
+  ['unrelated CI refusal', 'failure', 'success', 'review-ci'],
+  ['unrelated pending prerequisite', null, 'success', 'review-ci'],
+])('%s nomination preserves CI admission and the other guards', async (_name, testConclusion, reviewConclusion, hold) => {
+  const raw = live();
+  raw.statusCheckRollup[0] = check('test', testConclusion, testConclusion === null ? { status: 'in_progress' } : {});
+  raw.statusCheckRollup[1] = check('review-gate', reviewConclusion);
+  const result = plan(raw), row = result.plannerRows[0];
+  expect(row.nominationSafety.hold).toBe(hold);
+  expect(redTeamNominationRefusal(row, raw)).toBe(hold ? `planner safety hold: ${hold}` : null);
+  const opts = planning(), evidence = opts.readEvidence(); evidence.loopPayload.findings.read.netBasis.rev = head;
+  opts.readEvidence = () => evidence;
+  // Successful CI grants no exemption from the human hold on a finished review.
+  expect(planRedTeamOnSkip({ repo, plan: result, rawPrs: [raw], ...opts })[0].action).toBe('skip');
+  const f = fixture({ readLive: () => raw, readPlan: () => result });
+  if (hold) {
+    await expect(f.run()).rejects.toThrow(`planner safety hold: ${hold}`);
+    expect(f.post).not.toHaveBeenCalled();
+  } else {
+    // Only a valid explicit request for the stale advisory can enter full review.
+    expect(await f.run()).toMatchObject({ status: 'requested', head });
+  }
+});
+
+it('all-required-checks-green nomination dispatches the owed red team for a finished live-head review', () => {
+  const raw = live(); raw.labels = [];
+  raw.statusCheckRollup = raw.statusCheckRollup.map(row => ({ ...row, conclusion: 'success' }));
+  const result = plan(raw, { kind: 'already-reviewed-head', prNumber: pr, headSha: head });
+  const opts = planning(), evidence = opts.readEvidence(); evidence.loopPayload.findings.read.netBasis.rev = head;
+  opts.readEvidence = () => evidence;
+  expect(planRedTeamOnSkip({ repo, plan: result, rawPrs: [raw], ...opts })[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
 });
