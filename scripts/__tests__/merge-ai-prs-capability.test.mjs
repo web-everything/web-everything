@@ -14,23 +14,37 @@ function visit(node) {
 }
 visit(file);
 
-function directMerge(repo) {
+function landDispatch(repo, enqueues = false) {
   expect(callbacks).toHaveLength(1);
   const mergePr = vi.fn();
-  const enqueue = vi.fn();
+  const enqueue = vi.fn(() => ({ enqueued: true }));
+  const branchPush = vi.fn(() => ({ ok: true }));
   const wiring = {
     c: { repo, num: 42 }, localSlug: 'we', traceHeadSha: 'a'.repeat(40),
-    isPrAlreadyMerged: () => false, cardGrouping: { holdFor: () => null },
-    mergeStrategy: { enqueues: () => false }, enqueueWithSameHeadGuard: enqueue,
+    isPrAlreadyMerged: () => false, cardGrouping: { holdFor: () => null, mayHold: () => false },
+    mergeStrategy: { enqueues: () => enqueues }, enqueueWithSameHeadGuard: enqueue,
+    shouldPrepareBranchBeforeEnqueue: () => enqueues, branchPreparationRequired: () => true,
+    prepareBranchBeforeEnqueue: branchPush, finishBranchPreparation: () => true,
+    resolveCardNumbering: () => ({ value: { shadow: false } }), isLocalRepo: () => true,
+    openReservationPr: () => true, openPrContext: {}, revalidationAborted: [],
+    needsAcceptanceRestamp: new Set(), restampAcceptance: vi.fn(), approvedHeadHold: null,
+    preread: { read: true, comments: [] }, withLandWriteLock: run => ({ result: run() }),
     assertCapability, mergePr, __t: { time: (_name, run) => run() },
   };
-  const run = new Function(...Object.keys(wiring), `return (${callbacks[0].getText(file)})();`);
-  return { run: () => run(...Object.values(wiring)), mergePr, enqueue };
+  const lockStatement = callbacks[0].parent.parent.parent.parent;
+  const statements = [...lockStatement.parent.statements];
+  const preparation = statements.findIndex(node => ts.isIfStatement(node)
+    && node.expression.getText(file).startsWith('shouldPrepareBranchBeforeEnqueue('));
+  expect(preparation).toBeGreaterThan(1);
+  const dispatchSource = statements.slice(preparation - 2, statements.indexOf(lockStatement) + 1)
+    .map(node => node.getText(file)).join('\n');
+  const run = new Function(...Object.keys(wiring), `for (const candidate of [null]) { ${dispatchSource} return landLock.result; }`);
+  return { run: () => run(...Object.values(wiring)), mergePr, enqueue, branchPush };
 }
 
 describe('direct land dispatch capability admission', () => {
   it.each(['longshore', 'unknown/repo'])('refuses %s before mergePr or successful land bookkeeping', repo => {
-    const f = directMerge(repo);
+    const f = landDispatch(repo);
     expect(f.run).toThrow(expect.objectContaining({
       enqueueFailure: expect.objectContaining({ kind: 'unsupported-repo', repo }),
     }));
@@ -39,12 +53,32 @@ describe('direct land dispatch capability admission', () => {
   });
 
   it.each(['we', 'frontierui', 'plateau-app', undefined])('keeps supported direct merge unchanged: %s', repo => {
-    const f = directMerge(repo);
+    const f = landDispatch(repo);
     expect(f.run()).toEqual({ merged: true });
     expect(f.mergePr).toHaveBeenCalledTimes(1);
     expect(f.mergePr).toHaveBeenCalledWith({
       pr: 42, repo, method: 'merge', matchHeadCommit: 'a'.repeat(40), caller: 'drain',
     });
     expect(f.enqueue).not.toHaveBeenCalled();
+  });
+});
+
+describe('enqueue branch preparation capability admission', () => {
+  it.each(['longshore', 'unknown/repo'])('refuses %s before any branch preparation push or enqueue', repo => {
+    const f = landDispatch(repo, true);
+    expect(f.run).toThrow(expect.objectContaining({
+      enqueueFailure: expect.objectContaining({ kind: 'unsupported-repo', repo }),
+    }));
+    expect(f.branchPush).not.toHaveBeenCalled();
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.mergePr).not.toHaveBeenCalled();
+  });
+
+  it('prepares and enqueues a supported repo', () => {
+    const f = landDispatch('we', true);
+    expect(f.run()).toEqual({ enqueued: true });
+    expect(f.branchPush).toHaveBeenCalledTimes(1);
+    expect(f.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.mergePr).not.toHaveBeenCalled();
   });
 });
