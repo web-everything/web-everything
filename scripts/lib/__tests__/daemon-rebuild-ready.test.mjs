@@ -530,6 +530,8 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     ['overlay still registered', { registered: true }, false],
     ['retirement unrelated to merge', { reason: 'withdraw fix' }, false],
     ['negated merge statement', { reason: 'PR 7055 is not merged yet' }, false],
+    ['negated in-main statement', { reason: 'PR content is not in main' }, false],
+    ['has not yet merged', { reason: 'PR 7055 has not yet merged' }, false],
     ['explicit false content evidence', { evidence: { contentInMain: false, cleanMerges: true } }, false],
     ['later unknown lifecycle event', { later: 'unknown' }, false],
     ['unreadable event log', { log: 'unreadable' }, false],

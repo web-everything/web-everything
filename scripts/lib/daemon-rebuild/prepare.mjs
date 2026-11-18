@@ -605,7 +605,7 @@ export async function prepareRebuild({
           if (!last || !['auto-retired', 'auto-dropped'].includes(last.kind) || last.tip !== sha || typeof last.reason !== 'string') return false;
           // A positive statement only ("PR 123 ... merged ..." or in-main); negations never count.
           const reason = last.reason;
-          if (/\b(not|never|un|isn'?t|wasn'?t|hasn'?t)[\s-]*(been\s+)?merged\b/i.test(reason)) return false;
+          if (/\b(not|never|no|yet|unmerged|pending|without|unless|if|until)\b|n['’]t\b|\bun-?merged\b/i.test(reason)) return false;
           if (!(/^pr-merged$/i.test(reason.trim()) || /\bPR\s*#?\d+\b[^.]*\bmerged\b/i.test(reason) || /\bin[- ]main\b/i.test(reason))) return false;
           // Explicit negative proof vetoes; the retirement must predate the candidate's smoke (it saw the shrunken registry).
           if (last.evidence?.contentInMain === false || last.evidence?.cleanMerges === false) return false;
