@@ -412,6 +412,20 @@ describe('R972 Windows home paths', () => {
       expect(performance.now() - started).toBeLessThan(1500);
     }
   });
+  // PR 7008 self-review: host patterns restarted at every inner dot or dash (quadratic on a long run).
+  it('stays linear on long dotted and dashed runs', () => {
+    for (const text of ['1.'.repeat(40000), 'a-'.repeat(40000), 'a.'.repeat(40000) + 'workers', 'fd00:'.repeat(20000)]) {
+      const started = performance.now();
+      scanText(text);
+      expect(performance.now() - started).toBeLessThan(1500);
+    }
+  });
+  it('reports every private address on one long line once, with its line number', () => {
+    const text = `x\n${'::ffff:10.0.0.1 y '.repeat(2000)}`;
+    const hits = scanText(text).filter(hit => hit.pattern === 'private-network-ip');
+    expect(hits).toHaveLength(2000);
+    expect(hits.every(hit => hit.line === 2 && hit.match === '::ffff:10.0.0.1')).toBe(true);
+  });
   it('exempts complete template tokens behind Windows separators', () => {
     for (const token of ['<name>', 'username', '${user}']) {
       expect(homePaths(win('\\', 'C:', 'Users', token, 'project'))).toEqual([]);
@@ -448,12 +462,18 @@ describe('R972 tier-three patterns', () => {
     // A key ending in a hex letter (source, type, node) is a word, not a preceding IPv6 group.
     `source:${ula('fd12', '3456', '', '1')}`, `type:${ula('fc00', '', '1')}`, `node:${ula('fe80', '', '1')}`,
     `mode:${ula('', '', 'ffff', 'a00', '1')}`,
+    // A sentence colon after the hex mapped form, and the zero-prefixed mapped spelling.
+    `Address ${ula('', '', 'ffff', 'a00', '1')}: blocked`, ula('0', '', 'ffff', 'a00', '1'),
+    `ip::${ula('', 'ffff', 'a00', '1')}`, `${ula('fd00', v4(10, 0, 0, 1))}`,
   ])('detects private IPs beside ordinary punctuation: %s', text => {
     expect(scanText(text).some(hit => hit.pattern === 'private-network-ip')).toBe(true);
   });
   it.each([
     v4(10, 2, 3, 4, 5), v4(1, 10, 2, 3, 4), `${v4(10, 2, 3, 4)}a`, `${v4(8, 8, 8, 8)}.`,
     `8080:${v4(8, 8, 8, 8)}:80`, ula('2001', 'fd12', '', '1'), ula('2001', 'db8', '', 'fe80', '1'),
+    // A key directly before a public address: the longest valid address (public) wins over its private-looking tail.
+    `ip:${ula('2001', 'db8', 'fc00', '', '1')}`, `addr:${ula('2001', 'db8', 'fe80', '', '1')}`,
+    ula('fd0', '', '1'), `v ${ula('2001', 'db8', '', '1')}.`,
   ])('keeps dotted-number and public-address boundaries: %s', text => {
     expect(scanText(text).filter(hit => hit.pattern === 'private-network-ip')).toEqual([]);
   });

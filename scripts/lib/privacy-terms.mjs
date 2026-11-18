@@ -89,6 +89,9 @@ const WINDOWS_ROOT = String.raw`(?<=\b[A-Za-z]:|\b[A-Za-z]\$|/mnt/[A-Za-z])`;
 // Each alternative starts at most once per separator run (lookbehind or single separator), keeping scans linear.
 const HOME_PATH_SOURCE = `(?<![/\\\\])${SEP}(?:Users|home|Documents and Settings)${SEP}${HOME_TOKEN}`
   + `|${WINDOWS_ROOT}${SEP}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}|${BACKSLASH}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}`;
+const IPV4_SOURCE = String.raw`(?<!\w|\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)`;
+// One start per run of token characters (the lookbehind), at least two colons, optional zone.
+const IPV6_TOKEN_SOURCE = String.raw`(?<![\w:.%])(?:[0-9a-z]*:){2,}[0-9a-z:.]*(?:%[\w.-]+)?`;
 const SERVICE_PLACEHOLDERS = new Set(['example.workers.dev', 'your-worker.workers.dev']);
 const NETWORK_PLACEHOLDERS = new Set(['example.ts.net']);
 export const PATTERNS = Object.freeze([
@@ -98,34 +101,84 @@ export const PATTERNS = Object.freeze([
   { id: 'home-path', source: HOME_PATH_SOURCE, flags: 'g' },
   // Committed identity digests and optional local identity; never store the actual identity here.
   { id: 'operator-username', source: null, flags: 'gi' },
-  { id: 'private-service-url', source: String.raw`\b([a-z0-9][a-z0-9.-]*)\.workers\.dev\b`, flags: 'gi' },
-  { id: 'network-name', source: String.raw`\b[a-z0-9][a-z0-9.-]*\.(?:ts\.net|tailscale)\b|\btailscale(?:[- ]host(?:name)?)?\s*[:=]\s*["']?([a-z0-9][a-z0-9.-]*)`, flags: 'gi' },
-  // PR 7008: boundaries reject only a longer dotted number (digit.N) or a preceding IPv6 group,
-  // so sentence punctuation and colon-joined syntax (ssh -L port:host:port, key:value) still match.
-  // A preceding group is a hex/colon run that starts the token; a word ending in a hex letter
-  // (source:, type:, node:) is a key, not a group. The run is capped at 39 chars (the longest
-  // IPv6 text), so the lookbehind stays linear; a longer run is reported (fail closed).
-  { id: 'private-network-ip', source: String.raw`(?<!\w|(?:^|[^\w:])[0-9a-f:]{0,39}:)(?:::ffff:|(?:0{1,4}:){5}ffff:)(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f]{1,4}:[0-9a-f]{1,4})(?![\w:]|\.\d)|(?<!\w|\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)|(?<!\w|(?:^|[^\w:])[0-9a-f:]{0,39}:)(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9a-f:]+(?:%[\w.-]+)?`, flags: 'gi' },
+  // PR 7008: a host match starts only at the start of a host run, never after an inner dot or dash. The
+  // leftmost start already matched there, so results are unchanged, but a long dotted run is now linear.
+  { id: 'private-service-url', source: String.raw`(?<![\w.-])([a-z0-9][a-z0-9.-]*)\.workers\.dev\b`, flags: 'gi' },
+  { id: 'network-name', source: String.raw`(?<![\w.-])[a-z0-9][a-z0-9.-]*\.(?:ts\.net|tailscale)\b|\btailscale(?:[- ]host(?:name)?)?\s*[:=]\s*["']?([a-z0-9][a-z0-9.-]*)`, flags: 'gi' },
+  // PR 7008: two scans (see scanPrivacyView). IPv4 boundaries reject only a longer dotted number, so
+  // sentence punctuation and colon-joined syntax (ssh -L port:host:port, key:value) still match.
+  // IPv6 is matched as a whole colon-joined token and resolved by privateIpv6InToken.
+  { id: 'private-network-ip', source: `${IPV4_SOURCE}|${IPV6_TOKEN_SOURCE}`, flags: 'gi' },
   { id: 'account-id', source: String.raw`\b(?:[a-z][a-z0-9]*_)*(?:github[ _-]*)?(?:app|installation)[ _-]*id\b["'\x60]*\s*(?:[:=]|\bis\b)?\s*["'\x60]*(\d+)\b|/app/installations/(\d+)\b|\b(?:[a-z][a-z0-9]*_)*installations["']?\s*[:=]\s*(?:Object\.freeze\(\s*)?\{[^{}]*\}`, flags: 'gi' },
 ]);
 
 function isPrivateIp(value) {
-  let address = value.split('%')[0];
-  // A single trailing colon after an IPv6 address is sentence punctuation, never part of a valid address.
-  if (!isIP(address) && /[^:]:$/.test(address)) address = address.slice(0, -1);
+  const address = value.split('%')[0];
   if (isIP(address) === 6) {
-    const mapped = address.match(/^(?:::ffff:|(?:0{1,4}:){5}ffff:)(.+)$/i);
+    // PR 7008: canonical form (lower case, zeros compressed, mapped IPv4 in hex), so every spelling of a
+    // mapped address (::ffff:, 0::ffff:, five zero groups, dotted or hex tail) reads the same.
+    const host = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+    const mapped = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (mapped) {
-      if (mapped[1].includes('.')) return isPrivateIp(mapped[1]);
-      const words = mapped[1].split(':').map(word => parseInt(word, 16));
-      return isPrivateIp([words[0] >> 8, words[0] & 255, words[1] >> 8, words[1] & 255].join('.'));
+      const [high, low] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
+      return isPrivateIp([high >> 8, high & 255, low >> 8, low & 255].join('.'));
     }
-    return /^(?:f[cd]|fe[89ab])/i.test(address);
+    const first = parseInt(host.split(':')[0] || '0', 16);
+    return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80;
   }
   if (isIP(address) !== 4) return false;
   const [a, b] = address.split('.').map(Number);
   return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
     || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254);
+}
+
+/**
+ * PR 7008 — the private IPv6 address inside one colon-joined token, or null. Candidates start at the token
+ * start, after each `:` or `.`, and at each `::`; trailing sentence dots and one trailing colon are dropped.
+ * The LONGEST valid address wins: a valid public address is never reported for a private-looking tail
+ * (2001:db8:fc00::1), while a non-address prefix (source:, ip:) is skipped to reach the address after it.
+ * A hex-only key (db:fd00::5) forms a valid public address itself and is read as one.
+ */
+function privateIpv6InToken(token) {
+  const zoneAt = token.indexOf('%');
+  const body = zoneAt < 0 ? token : token.slice(0, zoneAt);
+  const zone = zoneAt < 0 ? '' : token.slice(zoneAt);
+  const dotless = body.replace(/\.+$/, '');
+  const ends = [...new Set([body, dotless, dotless.replace(/([^:]):$/, '$1')])];
+  for (const end of ends) {
+    // No valid IPv6 text exceeds 45 characters, so skip longer suffixes without slicing: one token stays linear.
+    for (let start = Math.max(0, end.length - 45); start < end.length; start += 1) {
+      if (start > 0 && !/[:.]/.test(end[start - 1]) && end.slice(start, start + 2) !== '::') continue;
+      const candidate = end.slice(start);
+      if (isIP(candidate) !== 6) continue;
+      if (!isPrivateIp(candidate)) return null;
+      return { offset: start, text: candidate + (end === body ? zone : '') };
+    }
+  }
+  return null;
+}
+
+/** PR 7008 — private-network-ip hits as `{ match, index }`, IPv6 tokens first so an IPv4 tail inside a reported
+ *  IPv6 address (::ffff:10.2.3.4) is not reported twice. */
+function privateNetworkHits(text) {
+  const hits = [];
+  const spans = [];
+  for (const match of text.matchAll(new RegExp(IPV6_TOKEN_SOURCE, 'gi'))) {
+    const hit = privateIpv6InToken(match[0]);
+    if (!hit) continue;
+    const index = match.index + hit.offset;
+    hits.push({ match: hit.text, index });
+    spans.push([index, index + hit.text.length]);
+  }
+  // Both lists ascend by index, so one moving cursor keeps the overlap check linear.
+  let cursor = 0;
+  for (const match of text.matchAll(new RegExp(IPV4_SOURCE, 'g'))) {
+    while (cursor < spans.length && spans[cursor][1] <= match.index) cursor += 1;
+    const inside = cursor < spans.length && spans[cursor][0] <= match.index;
+    if (!isPrivateIp(match[0]) || inside) continue;
+    hits.push({ match: match[0], index: match.index });
+  }
+  return hits.sort((a, b) => a.index - b.index);
 }
 
 // R972: exact match AND source-line digests, never a file-wide category exemption.
@@ -236,20 +289,39 @@ export function scanText(content, options = {}) {
 function scanPrivacyView(text, { path = '', allowlist = { entries: [], operatorUsernameSha256: [] }, operatorUsername = '', sourceLines }) {
   const hits = [];
   const seen = new Set();
+  // PR 7008: line starts computed once; a per-hit slice of the whole text made many-hit input quadratic.
+  const lineDigests = new Map();
+  const lineStarts = [0];
+  for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) lineStarts.push(at + 1);
+  const lineOf = (index) => {
+    let low = 0;
+    let high = lineStarts.length - 1;
+    while (low < high) {
+      const mid = (low + high + 1) >> 1;
+      if (lineStarts[mid] <= index) low = mid; else high = mid - 1;
+    }
+    return low;
+  };
   const add = (pattern, match, index) => {
     const key = `${pattern}:${index}:${match}`;
     if (seen.has(key)) return;
     seen.add(key);
-    const scanLine = text.slice(0, index).split('\n').length;
+    const lineIndex = lineOf(index);
+    const scanLine = lineIndex + 1;
     const source = sourceLines?.[scanLine - 1];
     const line = source?.line ?? scanLine;
-    const lineText = (source ? source.lineText
-      : text.slice(text.lastIndexOf('\n', index - 1) + 1).split('\n', 1)[0]).replace(/\r$/, '');
+    const lineEnd = lineIndex + 1 < lineStarts.length ? lineStarts[lineIndex + 1] - 1 : text.length;
+    const lineText = (source ? source.lineText : text.slice(lineStarts[lineIndex], lineEnd)).replace(/\r$/, '');
+    // One digest per line (the line text depends only on lineIndex), so many hits on one long line stay linear.
+    const lineSha = () => {
+      if (!lineDigests.has(lineIndex)) lineDigests.set(lineIndex, sha256(lineText));
+      return lineDigests.get(lineIndex);
+    };
     if (allowlist.entries.some(e => e.path === path && e.pattern === pattern
-      && e.matchText === match && e.matchSha256 === sha256(match) && e.lineSha256 === sha256(lineText))) return;
+      && e.matchText === match && e.matchSha256 === sha256(match) && e.lineSha256 === lineSha())) return;
     const hit = { pattern, line, match };
     // Preserve normalisation provenance for baseline keys without changing diagnostic output.
-    if (sourceLines !== undefined) Object.defineProperty(hit, 'rawLineSha256', { value: sha256(lineText) });
+    if (sourceLines !== undefined) Object.defineProperty(hit, 'rawLineSha256', { value: lineSha() });
     hits.push(hit);
   };
   for (const pattern of PATTERNS) {
@@ -258,12 +330,15 @@ function scanPrivacyView(text, { path = '', allowlist = { entries: [], operatorU
         ? String.raw`(?<![\w-])${operatorUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\w-])` : null)
       : pattern.source;
     if (!source) continue;
+    if (pattern.id === 'private-network-ip') {
+      for (const { match, index } of privateNetworkHits(text)) add(pattern.id, match, index);
+      continue;
+    }
     for (const match of text.matchAll(new RegExp(source, pattern.flags))) {
       if (pattern.id === 'home-path' && isPlaceholder(match[1] ?? match[2] ?? match[3])) continue;
       if (pattern.id === 'private-service-url' && SERVICE_PLACEHOLDERS.has(match[0])) continue;
       if (pattern.id === 'network-name' && (NETWORK_PLACEHOLDERS.has(match[0])
         || (match[1] && isPlaceholder(match[1])))) continue;
-      if (pattern.id === 'private-network-ip' && !isPrivateIp(match[0])) continue;
       if (pattern.id === 'account-id' && !match[1] && !match[2]
         && !/:\s*["']?\d+["']?\s*[,}]/.test(match[0])) continue;
       add(pattern.id, match[0], match.index);
