@@ -4584,6 +4584,12 @@ review-job and review-daemon suites.
 
 ## Pinned diff basis (PR-A)
 
+Pinned diffs disable Unicode path quoting; C-quoted or malformed headers remain unscored
+and retain holds. Keep real-Git Unicode and quote/backslash test-deletion cases. Drain
+clearance carries re-read both heads under isolation and require the complete live basis
+to match the scored pass, matching bases and identical content; replace objects, unreadable
+heads or any basis drift refuse carry. Retry or request human review of the full diff.
+
 DRAIN and PR-LAND share `resolvePinnedDiffBasis`: one base fetch, a checked FETCH_HEAD,
 fully qualified tracking refs, exact head commits and SHA-only ancestry/diffs under isolated Git.
 Keep the real-Git shadow-ref, moved-ref, replacement-object and missing-head regressions in

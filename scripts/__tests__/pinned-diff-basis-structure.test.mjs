@@ -185,6 +185,11 @@ const ALLOWLIST = [
 // TESTS
 const current = () => sources().flatMap(file => findRefStringSites(readFileSync(file, 'utf8'), file)).sort();
 describe('pinned diff basis structural ratchet', () => {
+  it('drain human-clearance carry uses both-head pinned evidence, never the legacy reader', () => {
+    const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    expect(src).toMatch(/readHeadDiff: \(sha\) => readPinnedCarryDiff\(\{ exec: diffExec, headSha: sha,\s*carriedHeadSha: humanClearedSha, expected: netDiffText \}\)/);
+    expect(src).not.toMatch(/readHeadDiff:[^\n]*readNetDiffAtHead/);
+  });
   it('has no new ref-string evidence sites and no stale allowlist entries', () => {
     expect(current()).toEqual([...ALLOWLIST].sort());
   });

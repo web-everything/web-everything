@@ -16,7 +16,7 @@ export function pinnedGit(exec, args) {
     '--src-prefix=a/', '--dst-prefix=b/', '--no-relative'] : [];
   // Repo-local diff rendering keys cannot be ignored, so pin every one that changes paths or prefixes.
   const pins = ['core.attributesFile=/dev/null', 'diff.noprefix=false', 'diff.mnemonicPrefix=false',
-    'diff.relative=false', 'core.quotepath=true', 'diff.suppressBlankEmpty=false', 'diff.orderFile=/dev/null',
+    'diff.relative=false', 'core.quotepath=false', 'diff.suppressBlankEmpty=false', 'diff.orderFile=/dev/null',
     'diff.ignoreSubmodules=none', 'diff.external=', 'color.ui=false', 'color.diff=false'].flatMap(c => ['-c', c]);
   return String(exec('git', [...pins, args[0], ...diff, ...args.slice(1)], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
@@ -55,9 +55,18 @@ export function resolvePinnedDiffBasis({ exec, remote = 'origin', baseRef = 'mai
   } catch { return fail('ref-unresolved'); }
 }
 
+/** The tamper parser only understands raw, matching two-tree paths. */
+export function isScorableDiffText(text) {
+  if (typeof text !== 'string') return false;
+  const headers = text.split('\n').filter(line => line.startsWith('diff --git'));
+  // Renames are disabled: both raw paths must agree. C-quoted/unknown headers cannot be parsed safely.
+  return (!text || headers.length > 0) && headers.every(line => /^diff --git a\/(.+) b\/\1$/.test(line));
+}
+
 /** Both callers refuse absent evidence; operators retry or review the full diff. */
 export function requireScoredNetDiff(sig, headSha) {
   if (!SHA.test(headSha ?? '') || !sig?.scored || !sig.netDiffText?.scored ||
+      !isScorableDiffText(sig.netDiffText.text) ||
       !isPinnedDiffBasis({ ...sig, ok: true }) || sig.headSha !== headSha.toLowerCase() ||
       ['baseSha', 'headSha', 'mergeBaseSha'].some(key => sig[key] !== sig.netDiffText[key])) {
     throw new Error('unscored or mismatched net diff; retry or request human review of the full diff');

@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolvePinnedDiffBasis, requireScoredNetDiff, pinnedGit } from '../lib/pinned-diff-basis.mjs';
-import { computeNetDiffSignals } from '../merge-ai-prs.mjs';
+import { computeNetDiffSignals, readPinnedCarryDiff, carryHumanClearanceOnIdenticalDiff } from '../merge-ai-prs.mjs';
+import { scanTestTampering } from '../lib/pr-merge-gate.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -170,6 +171,54 @@ describe('resolvePinnedDiffBasis real Git boundary', () => {
 });
 
 describe('pinned caller evidence', () => {
+  it.each(['café.test.mjs', 'quote"slash\\.test.mjs'])('deleted test %s raises tamper hold or stays unscored', name => {
+    const f = fixture();
+    writeFileSync(join(f.dir, name), 'test("guard", () => expect(true).toBe(true));\n');
+    f.git(['add', '.']);
+    const base = f.git(['commit-tree', f.git(['write-tree']), '-p', f.base, '-m', 'test base']);
+    f.setFetched(base);
+    f.git(['rm', '-f', '--', name]);
+    const head = f.git(['commit-tree', f.git(['write-tree']), '-p', base, '-m', 'delete test']);
+    const basis = resolvePinnedDiffBasis({ exec: f.exec, headSha: head });
+    const sig = computeNetDiffSignals({ exec: f.exec, basis });
+    if (name.startsWith('café')) {
+      expect(sig.scored).toBe(true);
+      expect(scanTestTampering({ diffText: sig.netDiffText.text }).tampered).toBe(true);
+    } else {
+      expect(sig.scored).toBe(false);
+      expect(sig.netDiffText.reason).toBe('unparseable-diff');
+      expect(() => requireScoredNetDiff(sig, head)).toThrow('retry or request human review');
+    }
+  });
+  it.each(['diff --git "a/quoted.test.mjs" "b/quoted.test.mjs"', 'diff --git unsupported'])('rejects unsupported headers at both scoring boundaries: %s', header => {
+    const f = fixture(); const basis = resolve(f);
+    const good = computeNetDiffSignals({ exec: f.exec, basis });
+    const text = `${good.netDiffText.text}${header}\ndeleted file mode 100644\n`;
+    const exec = (cmd, args, opts) => args.includes('diff') && !args.includes('--numstat') ? text : f.exec(cmd, args, opts);
+    expect(computeNetDiffSignals({ exec, basis }).scored).toBe(false);
+    expect(() => requireScoredNetDiff({ ...good, netDiffText: { ...good.netDiffText, text } }, f.head)).toThrow('unscored');
+  });
+  it('drain carry ignores real replacement objects that make changed content look cleared', () => {
+    const f = fixture(); const basis = resolve(f);
+    const expected = computeNetDiffSignals({ exec: f.exec, basis }).netDiffText;
+    // The recorded head had the base tree; replacing it with the live head forges identical legacy diffs.
+    const old = f.git(['commit-tree', f.git(['rev-parse', `${f.base}^{tree}`]), '-p', f.base, '-m', 'cleared']);
+    f.git(['replace', old, f.head]);
+    expect(f.git(['diff', f.base, old])).toBe(f.git(['diff', f.base, f.head]));
+    expect(readPinnedCarryDiff({ exec: f.exec, headSha: f.head, carriedHeadSha: old, expected })).toBeNull();
+    const carry = carryHumanClearanceOnIdenticalDiff({ setting: 'on', humanClearedSha: old,
+      headSha: f.head, pinnedHeadSha: f.head,
+      readHeadDiff: sha => readPinnedCarryDiff({ exec: f.exec, headSha: sha, carriedHeadSha: old, expected }) });
+    expect(carry).toMatchObject({ carried: false, humanClearedSha: old, retryable: true });
+    // Real identical content can carry; any field drifting from the scored basis refuses.
+    const identical = f.git(['commit-tree', f.git(['rev-parse', `${f.head}^{tree}`]), '-p', f.base, '-m', 'same']);
+    expect(readPinnedCarryDiff({ exec: f.exec, headSha: f.head, carriedHeadSha: identical, expected })).toEqual(expected);
+    for (const key of ['baseSha', 'headSha', 'mergeBaseSha']) {
+      expect(readPinnedCarryDiff({ exec: f.exec, headSha: f.head, carriedHeadSha: identical,
+        expected: { ...expected, [key]: 'f'.repeat(40) } })).toBeNull();
+    }
+    expect(readPinnedCarryDiff({ exec: f.exec, headSha: f.head, carriedHeadSha: 'f'.repeat(40), expected })).toBeNull();
+  });
   it('drain moved refs retain original evidence and a different decided head keeps the tamper hold', () => {
     const f = fixture();
     const basis = resolve(f);

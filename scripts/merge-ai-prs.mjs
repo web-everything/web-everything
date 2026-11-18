@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff } from './lib/pinned-diff-basis.mjs';
+import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff, isScorableDiffText } from './lib/pinned-diff-basis.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -713,7 +713,7 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
   // The merge is pinned to the pass-start head (`--match-head-commit`); a clearance carried onto any other head would
   // let the pinned commit merge on another commit's proof.
   if (pinnedHeadSha !== headSha) return unchanged('the live head is not the head this pass will merge; identity unproven', true);
-  // `readHeadDiff(headSha)` (the drain's call site: `readNetDiffAtHead` in the PR's clone) reads the live head's own diff,
+  // `readHeadDiff(headSha)` reads the live head's own diff under the caller's evidence boundary,
   // only once a carry is otherwise possible; `netDiffText` is the already-read form. A throw is an unscored read.
   if (typeof readHeadDiff === 'function') {
     try { netDiffText = readHeadDiff(headSha); } catch { netDiffText = null; }
@@ -741,6 +741,20 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
     }
   }
   return unchanged(carry.reason, carry.retryable === true);
+}
+
+/** Drain carries require fresh, isolated evidence for BOTH heads, matching the scored pass's basis. */
+export function readPinnedCarryDiff({ exec, headSha, carriedHeadSha, expected } = {}) {
+  try {
+    const basis = resolvePinnedDiffBasis({ exec, headSha });
+    const live = requireScoredNetDiff(computeNetDiffSignals({ exec, basis }), headSha);
+    if (['baseSha', 'headSha', 'mergeBaseSha'].some(key => live[key] !== expected?.[key])) return null;
+    const carriedBasis = resolvePinnedDiffBasis({ exec, headSha: carriedHeadSha });
+    const old = requireScoredNetDiff(computeNetDiffSignals({ exec, basis: carriedBasis }), carriedHeadSha);
+    if (old.baseSha !== live.baseSha || old.mergeBaseSha !== live.mergeBaseSha ||
+        old.netDiffText.text !== live.netDiffText.text || live.netDiffText.text !== expected.text) return null;
+    return live.netDiffText;
+  } catch { return null; } // Retain the hold; retry or request full human review.
 }
 
 /** The production tamper-park callback, shared with the carry wiring regression tests. */
@@ -4337,6 +4351,7 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
       const text = diff(mergeBaseSha);
       // Opaque content cannot grant tamper clearance; request full human review.
       if (/^Binary files .* differ$/m.test(text)) return miss('opaque-diff');
+      if (!isScorableDiffText(text)) return miss('unparseable-diff');
       const netDiffText = { ...stamp, text, base: mergeBaseSha, rev: headSha, scored: true };
       return { ...stamp, ...own, humanBasisFiles: cumulative.changedFiles,
         cumulativeDiffLines: cumulative.diffLines, basisKind: 'merge-base', basisNarrowed: true,
@@ -6506,7 +6521,8 @@ async function runCli() {
             const carried = carryHumanClearanceOnIdenticalDiff({
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
-              readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
+              readHeadDiff: (sha) => readPinnedCarryDiff({ exec: diffExec, headSha: sha,
+                carriedHeadSha: humanClearedSha, expected: netDiffText }),
               applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: candidateDryRun }),
             });
             humanClearedSha = carried.humanClearedSha;
