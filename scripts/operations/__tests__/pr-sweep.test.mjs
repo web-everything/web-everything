@@ -628,10 +628,10 @@ describe('humanReviewHold: the gate behind "your review" (#5768)', () => {
 
 
 describe('head-bound escalation notes', () => {
-  const green = [{ status: 'COMPLETED', conclusion: 'SUCCESS' }, { state: 'SUCCESS' }, { conclusion: 'NEUTRAL' }];
+  const green = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { context: 'lint', state: 'SUCCESS' }, { name: 'build', conclusion: 'NEUTRAL' }];
   const red = [{ status: 'COMPLETED', conclusion: 'FAILURE' }];
   const note = (extra = {}) => c('web-everything', '2026-10-21T06:00:00Z', buildNoteComment({
-    kind: 'owed-ci-rerun-spent', prNumber: 5485, head: HEAD, text: 'reruns spent', ...extra }));
+    kind: 'owed-ci-rerun-spent', prNumber: 5485, head: HEAD, failingRequiredChecks: ['test', 'lint', 'build'], text: 'reruns spent', ...extra }));
   it('producer embeds the head marker', () => {
     expect(note().body).toContain(`<!-- conveyor-note-head: ${HEAD} -->`);
   });
@@ -644,7 +644,7 @@ describe('head-bound escalation notes', () => {
   it('same head still red remains open', () => {
     expect(needsDecisionOpen([note()], { liveHead: HEAD, statusCheckRollup: red })).not.toBeNull();
   });
-  it('same head all success or neutral resolves, including at the sweep call site', () => {
+  it('same head named checks success or neutral resolves, including at the sweep call site', () => {
     expect(needsDecisionOpen([note()], { liveHead: HEAD, statusCheckRollup: green })).toBeNull();
     expect(row(sweep([mkPr({ comments: [note()], statusCheckRollup: green })]), 5485).waitingOn).not.toBe('needs-decision:note');
   });
@@ -657,6 +657,24 @@ describe('head-bound escalation notes', () => {
   });
   it('unknown live head stays open even with green checks', () => {
     expect(needsDecisionOpen([note()], { statusCheckRollup: green })).not.toBeNull();
+    expect(needsDecisionOpen([note()], { liveHead: 'unknown', statusCheckRollup: green })).not.toBeNull();
+  });
+  it('named check absent from a green rollup stays open', () => {
+    expect(needsDecisionOpen([note()], { liveHead: HEAD, statusCheckRollup: green.slice(0, 2) })).not.toBeNull();
+  });
+  it('matches URI-encoded check names against the live names', () => {
+    expect(needsDecisionOpen([note({ failingRequiredChecks: ['test / unit', 'lint,build'] })], {
+      liveHead: HEAD, statusCheckRollup: [{ name: 'test / unit', conclusion: 'SUCCESS' },
+        { name: 'lint,build', conclusion: 'NEUTRAL' }],
+    })).toBeNull();
+  });
+  it('legacy note without checks marker stays open on same-head green checks', () => {
+    expect(needsDecisionOpen([note({ failingRequiredChecks: undefined })], { liveHead: HEAD, statusCheckRollup: green })).not.toBeNull();
+  });
+  it('malformed checks marker stays open', () => {
+    const malformed = note();
+    malformed.body = malformed.body.replace('test,lint,build', '%ZZ');
+    expect(needsDecisionOpen([malformed], { liveHead: HEAD, statusCheckRollup: green })).not.toBeNull();
   });
   it('other note kinds remain open on same-head green checks', () => {
     expect(needsDecisionOpen([note({ kind: 'ci-heal-exhausted' })], { liveHead: HEAD, statusCheckRollup: green })).not.toBeNull();

@@ -94,7 +94,7 @@ export function createLiveRedTeamReader({ provider, readComments, env = process.
     if (!isRealHead(head)) return { clear: false };
     if (live.headRefOid.toLowerCase() !== head.toLowerCase()) return { clear: true };
     const result = redTeamForHead(readComments({ repo, pr }), pr, head);
-    if (result?.findings?.length === 0 && isPublishableRedTeamResult(result)) return { clear: true };
+    if (result) return { clear: result.findings?.length === 0 && isPublishableRedTeamResult(result) };
     return { clear: readCheckFact({ repo, pr, headSha: head })?.ok === true };
   };
 }

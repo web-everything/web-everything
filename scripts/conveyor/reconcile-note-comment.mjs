@@ -151,6 +151,9 @@ export function buildNoteComment(note, { informational = isInformationalNote(not
   }
   if (typeof note?.head === 'string' && /^[a-f0-9]{40}$/i.test(note.head))
     lines.push('', `<!-- conveyor-note-head: ${note.head} -->`);
+  if (Array.isArray(note?.failingRequiredChecks) && note.failingRequiredChecks.length > 0
+    && note.failingRequiredChecks.every(name => typeof name === 'string' && name.trim()))
+    lines.push('', `<!-- conveyor-note-checks: ${note.failingRequiredChecks.map(encodeURIComponent).join(',')} -->`);
   lines.push('', `<!-- conveyor-note-key: ${key} -->`);
   return lines.join('\n');
 }

@@ -145,10 +145,18 @@ export function needsDecisionOpen(comments, { headCommittedAt = null, liveHead =
   for (const e of list) if (e.at !== null && e.at > note.at && isOperatorAuthored(e.c)) return null;
   const body = bodyOf(note.c);
   const noteHead = /^<!-- conveyor-note-head: ([a-f0-9]{40}) -->$/im.exec(body)?.[1];
-  if (noteHead && liveHead) {
+  if (noteHead && typeof liveHead === 'string' && /^[a-f0-9]{40}$/i.test(liveHead)) {
     if (noteHead.toLowerCase() !== liveHead.toLowerCase()) return null;
+    let checks = [];
+    try {
+      const marker = /^<!-- conveyor-note-checks: (\S+) -->$/m.exec(body)?.[1];
+      if (marker) checks = marker.split(',').map(decodeURIComponent);
+    } catch { /* Malformed check names cannot prove recovery. */ }
     if (/^needs your decision:\s*owed-ci-rerun-spent\s*$/im.test(body)
       && Array.isArray(statusCheckRollup) && statusCheckRollup.length > 0
+      && checks.length > 0 && checks.every(name => name.trim()
+        && statusCheckRollup.some(check => (check?.name ?? check?.context) === name
+          && ['SUCCESS', 'NEUTRAL'].includes(String(check?.conclusion ?? check?.state ?? '').toUpperCase())))
       && statusCheckRollup.every(check => ['SUCCESS', 'NEUTRAL'].includes(
         String(check?.conclusion ?? check?.state ?? '').toUpperCase()))) return null;
   }

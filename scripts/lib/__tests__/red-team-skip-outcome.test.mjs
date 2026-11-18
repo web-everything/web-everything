@@ -406,6 +406,20 @@ describe('stored-review not-owed rule (R730)', () => {
 
 
 describe('live red-team alert suppression', () => {
+  it.each([
+    ['confirmed finding', '1. [**confirmed**] (correctness, high) `src/example.js:1` — breaks the result'],
+    ['malformed result', '1. [confirmed] malformed finding'],
+  ])('a %s comment overrides a success check', (_kind, finding) => {
+    const readCheckFact = vi.fn(() => ({ ok: true }));
+    const readLive = createLiveRedTeamReader({
+      provider: { readPrState: () => ({ headRefOid: head }) },
+      readComments: () => [{ body: `${redTeamMarker(pr, head)}\nAdvisory only: red team · recorded verdict \`changes\`.\n${finding}`,
+        author: { login: 'web-everything' } }],
+      readCheckFact,
+    });
+    expect(readLive({ repo, pr, head })).toEqual({ clear: false });
+    expect(readCheckFact).not.toHaveBeenCalled();
+  });
   const clearResult = rev => `${redTeamMarker(pr, rev)}\nAdvisory only: red team · recorded verdict \`accept\`.\nThe red team tried to break this change and reported nothing.`;
   it.each(['completed result', 'check', 'stale head'])('settles %s without publishing or retrying', kind => {
     const f = fixture();

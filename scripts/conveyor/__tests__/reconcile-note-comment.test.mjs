@@ -88,6 +88,11 @@ describe('noteHeadline — the operator\'s own rule', () => {
 });
 
 describe('buildNoteComment', () => {
+  it('URI-encodes failing required check names in the checks marker', () => {
+    const body = buildNoteComment({ kind: 'owed-ci-rerun-spent', prNumber: 7,
+      failingRequiredChecks: ['test / unit', 'lint,build'] });
+    expect(body).toContain('<!-- conveyor-note-checks: test%20%2F%20unit,lint%2Cbuild -->');
+  });
   it('referral-hold-auto-resolved posts an informational marker without a decision header', () => {
     const body = buildNoteComment({ kind: 'referral-hold-auto-resolved', prNumber: 7, text: 'all referrals already ruled' });
     expect(body.startsWith(INFO_NOTE_COMMENT_MARKER)).toBe(true);
