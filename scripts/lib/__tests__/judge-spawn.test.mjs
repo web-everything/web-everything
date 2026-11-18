@@ -1476,6 +1476,41 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   const sidOf = (argv) => flagValue(argv, '--session-id');
 
   it.each([
+    { type: 'object', format: 'uri' },
+    { type: 'object', properties: { url: { type: 'string', format: 'uri' } } },
+    { type: 'object', allOf: [{ properties: { url: { type: 'string', format: 'uri' } } }] },
+    { type: 'object', definitions: { unused: { type: 'string', format: 'uri' } } },
+  ])('refuses an unvalidatable format constraint anywhere in schema %j before spawning', async shape => {
+    const { fn, calls } = scriptedSpawn([{
+      stdout: JSON.stringify({ structured_output: { url: 'not a URI' } }), code: 0,
+    }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 0, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/schema is unvalidatable: format constraints/);
+    expect(err.message).toContain('no verdict');
+    expect(err).not.toHaveProperty('value');
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each(['before', 'after'])('rejects a truncated error object %s success with bounded redacted diagnostics', async position => {
+    const truncated = '  {"type":"error","message":"private-juror-content' + 'x'.repeat(10_000);
+    const stdout = position === 'before' ? `${truncated}\n${ANSWER_JSON}` : `${ANSWER_JSON}\n${truncated}`;
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 0, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err).not.toHaveProperty('value');
+    expect(err.message).toMatch(/malformed JSON object line.*content redacted/);
+    expect(err.message).toContain('no verdict');
+    expect(err.message).not.toContain('private-juror-content');
+    expect(err.message).not.toContain('stdout[0..600]');
+    expect(err.message.length).toBeLessThan(1200);
+    expect(err.failedAttempts[0].reason).toMatch(/malformed JSON object line/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
     ['is_error result', { type: 'result', is_error: true, result: 'review failed' }],
     ['is_error event', { type: 'system', is_error: true, result: 'review failed' }],
     ['error event', { type: 'error', error: 'x' }],

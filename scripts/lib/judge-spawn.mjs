@@ -93,6 +93,22 @@ import { quotaHoldRow } from './provider-quota-hold.mjs';
 
 const judgeSchemas = new Ajv({ strict: false });
 
+// No format validators are installed. Refuse even nested/unused format constraints
+// instead of allowing Ajv's strict:false mode to silently ignore them.
+function assertNoSchemaFormats(schema) {
+  const pending = [schema];
+  const seen = new Set();
+  while (pending.length) {
+    const node = pending.pop();
+    if (!node || typeof node !== 'object' || seen.has(node)) continue;
+    seen.add(node);
+    if (Object.hasOwn(node, 'format')) {
+      throw new Error('judge-spawn: juror schema is unvalidatable: format constraints require unavailable format validators; no verdict.');
+    }
+    for (const child of Object.values(node)) pending.push(child);
+  }
+}
+
 /**
  * Are these two paths the SAME DIRECTORY? By inode + device, never by comparing the strings.
  *
@@ -737,7 +753,15 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
           && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result' || candidate.type === 'error')) {
           parsed = candidate;
         }
-      } catch { /* stray stdout lines are not result objects */ }
+      } catch {
+        if (line.trimStart().startsWith('{')) {
+          const error = new Error('judge-spawn: the juror did not emit parseable JSON: malformed JSON object line on stdout (content redacted); no verdict.');
+          error.unparseableStdout = true;
+          error.verdictIntegrity = true;
+          throw error;
+        }
+        // Plain stdout log lines are not result objects.
+      }
     }
     if (parsed === undefined) {
       const tail = String(stderr).trim().slice(-600);
@@ -927,6 +951,7 @@ export async function judgeSpawn({
   }
   const setting = retries === undefined ? resolveUnparseableRetries({ env }) : { value: retries, source: 'caller' };
   retries = setting.value;
+  assertNoSchemaFormats(shape);
   const validate = judgeSchemas.compile(shape);
   const total = 1 + retries;
   const failedAttempts = [];
