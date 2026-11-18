@@ -4705,12 +4705,13 @@ does not establish confinement. These slice B tests were authored without runnin
 The build profile grants only clone, private per-run temp and the private HOME's `.gemini`
 writes (plus the named devices). The launcher creates that HOME outside workspace/lane/clone,
 writes `.gemini/antigravity-cli/settings.json` containing exactly
-`{ trustedWorkspaces: [clone] }` and copies only the host `.gemini/config/config.json` login into
-`.gemini/config/config.json`, both with mode 0600 and exclusive creation. The host login is opened
+`{ trustedWorkspaces: [clone] }` and copies only agy's own host OAuth token file
+`.gemini/antigravity-cli/antigravity-oauth-token` to the same relative path in the private HOME, both with mode 0600 and exclusive creation. The host login is opened
 with `O_NOFOLLOW`, must be a regular file at most 64KB, and the bounded read must match its stat size.
 Missing, redirected, oversized or otherwise unreadable login refuses with
 `agy login unavailable; use another provider or request operator review`. No host settings keys,
-MCP config, `.migrated`, `projects/` or other host config is copied. Failure to create
+`config/config.json`, MCP config, `.migrated`, `projects/` or other host config is copied;
+no private `.gemini/config` directory is created. Failure to create
 private settings also refuses with a provider/operator fallback. The launcher removes only its own mkdtemp
 root after the run, including every error path. `HOME` is replaced; `TMPDIR`, `TMP` and `TEMP` point to the private temp.
 Real home `.gemini` receives no read or write allowance. The REAL probe covers private state writes
@@ -4743,7 +4744,7 @@ refuse. Refusals record an unproductive outcome so the existing provider chain a
 
 
 Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER. It runs in a throwaway clone with a
-private HOME and a scrubbed environment. Agy's own login (`config.json`) is placed in that private HOME
+private HOME and a scrubbed environment. Agy's own OAuth token file (`.gemini/antigravity-cli/antigravity-oauth-token`) is placed in that private HOME
 with mode 0600 and deleted after the run, used the same way the review seat uses it. It runs under a sandbox-exec profile that confines
 writes to the clone, its private temp and its private HOME. Shells and tools inside that copy are out of scope:
 the copy can only damage itself. The DIFF BOUNDARY remains the control: we keep ONLY agy's git diff, and our code applies it

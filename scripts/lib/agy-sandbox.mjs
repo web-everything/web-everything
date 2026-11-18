@@ -14,7 +14,7 @@ const inside = (p, root) => p === root || p.startsWith(`${root}/`);
 export function preparePrivateAgyHome(homeDir, privateHomeDir, cloneDir) {
   let login;
   try {
-    const fd = openSync(join(homeDir, '.gemini/config/config.json'), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const fd = openSync(join(homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'), constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const stat = fstatSync(fd);
       if (!stat.isFile() || stat.size > 64 * 1024) throw new Error('invalid agy login file');
@@ -25,9 +25,9 @@ export function preparePrivateAgyHome(homeDir, privateHomeDir, cloneDir) {
       if (size !== stat.size) throw new Error('agy login size changed');
       login = buffer.subarray(0, size);
     } finally { closeSync(fd); }
-    const configDir = join(privateHomeDir, '.gemini/config');
-    mkdirSync(configDir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(configDir, 'config.json'), login, { mode: 0o600, flag: 'wx' });
+    const stateDir = join(privateHomeDir, '.gemini/antigravity-cli');
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(stateDir, 'antigravity-oauth-token'), login, { mode: 0o600, flag: 'wx' });
   } catch {
     throw new Error('agy login unavailable; use another provider or request operator review');
   }

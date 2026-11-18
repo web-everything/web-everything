@@ -24,8 +24,7 @@ function fixture() {
   const stateDir = join(homeDir, '.gemini/antigravity-cli');
   const workspaceOps = join(homeDir, 'workspace/.operations');
   for (const p of [cloneDir, privateTempDir, laneDir, join(privateHomeDir, '.gemini/antigravity-cli'), join(stateDir, 'log'), join(stateDir, 'bin'), join(stateDir, 'builtin'), ...sandboxSecretPaths(homeDir), workspaceOps]) mkdirSync(p, { recursive: true });
-  mkdirSync(join(homeDir, '.gemini/config'), { recursive: true });
-  writeFileSync(join(homeDir, '.gemini/config/config.json'), Buffer.from([0, 255, 10, 123, 125]));
+  writeFileSync(join(homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'), Buffer.from([0, 255, 10, 123, 125]));
   return { transcriptDir: join(root, 'transcript'), root, homeDir, cloneDir, privateTempDir, privateHomeDir, laneDir, workspaceOps, osTempBase: realpathSync(tmpdir()) };
 }
 
@@ -161,10 +160,12 @@ describe('pure sandbox profile', () => {
 });
 
 describe('private agy home settings', () => {
-  it('copies only byte-identical login and clone-only settings with mode 0600, never MCP config', () => {
+  it('copies only byte-identical OAuth token and clone-only settings with mode 0600, never config.json or MCP config', () => {
     const f = fixture();
     const settings = join(f.homeDir, '.gemini/antigravity-cli/settings.json');
     const config = join(f.homeDir, '.gemini/config');
+    mkdirSync(config, { recursive: true });
+    writeFileSync(join(config, 'config.json'), 'unused host config secret');
     writeFileSync(settings, JSON.stringify({ trustedWorkspaces: ['/previous'], apiKey: 'host secret' }));
     writeFileSync(join(f.homeDir, '.gemini/antigravity-cli/mcp_config.json'), 'host MCP secret');
     writeFileSync(join(config, 'mcp_config.json'), 'host MCP secret');
@@ -173,21 +174,20 @@ describe('private agy home settings', () => {
     writeFileSync(join(config, 'projects/secret'), 'host project');
     preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
     expect(readdirSync(f.privateHomeDir)).toEqual(['.gemini']);
-    expect(readdirSync(join(f.privateHomeDir, '.gemini')).sort()).toEqual(['antigravity-cli', 'config']);
+    expect(readdirSync(join(f.privateHomeDir, '.gemini')).sort()).toEqual(['antigravity-cli']);
     const state = join(f.privateHomeDir, '.gemini/antigravity-cli');
-    const privateConfig = join(f.privateHomeDir, '.gemini/config');
-    expect(readdirSync(state)).toEqual(['settings.json']);
-    expect(readdirSync(privateConfig)).toEqual(['config.json']);
+    expect(readdirSync(state).sort()).toEqual(['antigravity-oauth-token', 'settings.json']);
+    expect(existsSync(join(f.privateHomeDir, '.gemini/config'))).toBe(false);
     expect(JSON.parse(readFileSync(join(state, 'settings.json'), 'utf8')))
       .toEqual({ trustedWorkspaces: [f.cloneDir] });
-    expect(readFileSync(join(privateConfig, 'config.json'))).toEqual(readFileSync(join(config, 'config.json')));
-    for (const file of [join(state, 'settings.json'), join(privateConfig, 'config.json')])
+    expect(readFileSync(join(state, 'antigravity-oauth-token'))).toEqual(readFileSync(join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token')));
+    for (const file of [join(state, 'settings.json'), join(state, 'antigravity-oauth-token')])
       expect(statSync(file).mode & 0o777).toBe(0o600);
   });
   it.each(['missing', 'symlink', 'oversized', 'directory'])(
     'refuses %s login with operator fallback', kind => {
       const f = fixture();
-      const login = join(f.homeDir, '.gemini/config/config.json');
+      const login = join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token');
       rmSync(login);
       if (kind === 'symlink') {
         const target = join(f.root, 'login-target');
@@ -200,28 +200,40 @@ describe('private agy home settings', () => {
         .toThrow('agy login unavailable; use another provider or request operator review');
       expect(readdirSync(join(f.privateHomeDir, '.gemini'))).toEqual(['antigravity-cli']);
     });
+  it('accepts the OAuth token without any host config directory', () => {
+    const f = fixture();
+    expect(existsSync(join(f.homeDir, '.gemini/config'))).toBe(false);
+    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
+    expect(existsSync(join(f.privateHomeDir, '.gemini/config'))).toBe(false);
+  });
+  it('refuses an unreadable OAuth token with operator fallback', () => {
+    const f = fixture();
+    vi.mocked(readSync).mockImplementationOnce(() => { throw new Error('EACCES'); });
+    expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir))
+      .toThrow('agy login unavailable; use another provider or request operator review');
+    expect(readdirSync(join(f.privateHomeDir, '.gemini/antigravity-cli'))).toEqual([]);
+  });
   it('refuses a login read whose size differs from fstat with operator fallback', () => {
     const f = fixture();
     vi.mocked(readSync).mockReturnValueOnce(0);
     expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir))
       .toThrow('agy login unavailable; use another provider or request operator review');
-    expect(existsSync(join(f.privateHomeDir, '.gemini/config/config.json'))).toBe(false);
+    expect(existsSync(join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token'))).toBe(false);
   });
   it('refuses an existing private login without overwriting it', () => {
     const f = fixture();
-    const config = join(f.privateHomeDir, '.gemini/config');
-    mkdirSync(config);
-    writeFileSync(join(config, 'config.json'), 'existing login');
+    const login = join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token');
+    writeFileSync(login, 'existing login');
     expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir))
       .toThrow('agy login unavailable; use another provider or request operator review');
-    expect(readFileSync(join(config, 'config.json'), 'utf8')).toBe('existing login');
+    expect(readFileSync(login, 'utf8')).toBe('existing login');
   });
   it('accepts a login of exactly 64KB', () => {
     const f = fixture();
     const login = Buffer.alloc(65536, 42);
-    writeFileSync(join(f.homeDir, '.gemini/config/config.json'), login);
+    writeFileSync(join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'), login);
     preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    expect(readFileSync(join(f.privateHomeDir, '.gemini/config/config.json'))).toEqual(login);
+    expect(readFileSync(join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token'))).toEqual(login);
   });
   it.each(['absent', 'malformed', 'oversized', 'symlink'])(
     'seeds settings without reading host settings (%s)', state => {
@@ -292,6 +304,7 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     }
     const osTempTarget = join(realpathSync(tmpdir()), `${basename(f.root)}-blocked`);
     roots.push(osTempTarget);
+    mkdirSync(join(f.homeDir, '.gemini/config'));
     const sibling = join(f.homeDir, '.gemini-like');
     mkdirSync(sibling);
     for (const outside of [osTempTarget, join(f.root, 'blocked'), join(f.laneDir, 'blocked'),
@@ -308,9 +321,9 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     const privateRead = run('/bin/cat "$1"', join(f.privateHomeDir, '.gemini/projects.json'));
     expect(privateRead.status).toBe(0);
     expect(privateRead.stdout).toBe('allowed');
-    const privateLogin = run('/bin/cat "$1"', join(f.privateHomeDir, '.gemini/config/config.json'));
+    const privateLogin = run('/bin/cat "$1"', join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token'));
     expect(privateLogin.status).toBe(0);
-    const realLogin = run('/bin/cat "$1"', join(f.homeDir, '.gemini/config/config.json'));
+    const realLogin = run('/bin/cat "$1"', join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'));
     expect(realLogin.status).not.toBe(0);
     expect(realLogin.stderr).toMatch(/EPERM|Operation not permitted/i);
     expect(realLogin.stdout).toBe('');
