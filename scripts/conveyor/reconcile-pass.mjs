@@ -322,7 +322,7 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  */
 /** `PR_LIST_JSON_FIELDS` minus `author`: `author` is not a snapshot field, so asking for it made EVERY production read
  *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
-export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
+export const SNAPSHOT_LIST_FIELDS = [...PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author'), 'rowsHead', 'rowsComplete'].join(',');
 const pagedHeavyCache = new Map();
 /** A `fresh` read may reuse a cached heavy read (comments/body/files) only if it was taken AFTER its PR's `updatedAt`
  *  second had ended: updatedAt has 1 s granularity, so a comment posted in the same second as a cached read would leave
@@ -503,7 +503,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     if (!Array.isArray(listed)) return listed;
     return enrich(listed);
   }
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true, ...(readOnly ? { cacheOnly: true } : {}) }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true, ...(readOnly ? { cacheOnly: true } : {}) }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const rows = direct();
   return Array.isArray(rows) ? enrich(rows) : rows;
 }
@@ -1612,7 +1612,8 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
-    ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
+    // The rows are no longer the GraphQL rollup the evidence describes, so it must not read as complete.
+    ready.push({ ...pr, rowsComplete: false, rowsHead: null, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
       ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
@@ -1783,7 +1784,7 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+  const { checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
     ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
@@ -1793,6 +1794,9 @@ export function runReconcilePass({
   const hydrated = step('hydrate-checks', () => hydrateChecks(rawPrs, {
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   }));
+  if (typeof rosterSource === 'string') hydrated.prs = hydrated.prs.map(pr => ({ ...pr, rosterSource }));
+  const covered = hydrated.prs.filter(pr => pr.rowsComplete === true && pr.rowsHead === pr.headRefOid).length;
+  console.error(`check-evidence-coverage: ${covered}/${hydrated.prs.length} PRs rowsComplete===true && rowsHead===headRefOid`);
   // Evidence is applied before every downstream CI reader, including main-red attribution.
   const autoProceedPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,

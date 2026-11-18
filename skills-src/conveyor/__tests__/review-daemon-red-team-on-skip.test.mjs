@@ -37,6 +37,12 @@ beforeEach(() => {
 });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
+function livePrReader(rawPrs) {
+  const heads = new Map(rawPrs.map(({ number, headRefOid }) => [number, headRefOid]));
+  // Retire entries left in the shared queue by earlier fixtures.
+  return ({ pr }) => heads.has(pr) ? { state: 'OPEN', headRefOid: heads.get(pr) } : { state: 'CLOSED' };
+}
+
 it('CLI catches up gates after label repair, before capacity recovery, and survives catch-up exceptions', () => {
   const repo = 'web-everything/web-everything', rawPrs = [], repaired = [], refusals = [];
   const order = [];
@@ -51,7 +57,7 @@ it('CLI catches up gates after label repair, before capacity recovery, and survi
   });
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'off');
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const input = { repo, rawPrs, plan: { refusals } };
     expect(() => production.redTeamOnSkip(input)).not.toThrow();
     expect(order).toEqual(['labels', 'gate', 'capacity']);
@@ -86,7 +92,7 @@ it('CLI routes red-team recovery through the FIFO queue: capacity 1 dispatches o
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
   const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
     expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6001]);
@@ -110,7 +116,7 @@ it.each(['off', 'OFF', ' off ', '0', 'false', 'no'])('CLI bypasses the dispatch 
   const lines = [];
   const queueBefore = readQueueFile();
   try {
-    const production = cliReviewTickOpts({ log: { error: line => lines.push(line) } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: line => lines.push(line) } });
     production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 3, budget: { left: 3 }, remainingStarts: 3, take: vi.fn() }, paused: false });
     // Direct runner: the full unfiltered plan and PRs, no queue filtering, no queue file IO.
@@ -132,7 +138,7 @@ it('CLI keeps the queue on and logs when WE_RED_TEAM_DISPATCH_QUEUE is unrecogni
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'maybe');
   const lines = [];
   try {
-    const production = cliReviewTickOpts({ log: { error: line => lines.push(line) } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: line => lines.push(line) } });
     production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
     expect(dispatch.mock.calls.map(call => call[0].pr)).toEqual([6031]);
@@ -150,7 +156,7 @@ it('CLI exhausted capacity passes every owed PR to the real runner without spend
   const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
   const lastDispatch = new Map();
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch,
       capacity: { lanes: 0, budget: { left: 0 }, remainingStarts: 0, take: vi.fn() }, paused: false });
     expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6021, 6022]);
@@ -183,7 +189,7 @@ it('CLI label repair exception preserves original PRs and still dispatches red-t
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
 
@@ -213,7 +219,7 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader([{ number: pr, headRefOid: head }]), log: { error: vi.fn() } });
     const take = vi.fn();
     const out = runReviewTick({ ...production, repo,
       readPrs: () => [{ number: pr, headRefOid: head, labels: [], comments: [] }],
@@ -360,7 +366,7 @@ it.each([38, 5, 'throws'])('CLI queue uses the shared CPU sample (%s) and preser
   const capacity = { lanes: 4, startsCeiling: 3, remainingStarts: 1, budget: { left: 3 } };
   const budget = capacity.budget;
   try {
-    cliReviewTickOpts({ log: { error: vi.fn() } }).redTeamOnSkip({
+    cliReviewTickOpts({ readLivePr: livePrReader([]), log: { error: vi.fn() } }).redTeamOnSkip({
       repo: 'fixture/cpu-floor', plan: { refusals: [] }, rawPrs: [], capacity,
     });
     expect(hostSample.sampleHost).toHaveBeenCalledOnce();
@@ -384,7 +390,7 @@ it.each([
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   const take = vi.fn();
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const out = runReviewTick({ ...options, redTeamOnSkip: production.redTeamOnSkip,
       readPrs: () => rawPrs,
       reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6104 }] }),
@@ -409,7 +415,7 @@ it('production queue floor at idle 100 cannot replenish the shared host allowanc
   const check = vi.fn(() => ({ admitted: true, maxPerTick: 1 }));
   const hostAdmission = sharedHostBudget(check);
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const tickOptions = { ...options, redTeamOnSkip: production.redTeamOnSkip,
       readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [] }),
       liveReviewBudget: { left: 5 }, hostAdmission,
@@ -471,7 +477,7 @@ it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery r
   vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const out = runReviewTick({ ...options, redTeamOnSkip: production.redTeamOnSkip,
       readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6204 }] }),
       liveReviewBudget: { left: 5 }, hostAdmission: () => defaultReviewHostAdmission({

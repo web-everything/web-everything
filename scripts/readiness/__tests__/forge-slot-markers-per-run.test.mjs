@@ -48,7 +48,7 @@ describe('release log compatibility', () => {
 describe('R1017 finish settled active runs for dead owners', () => {
   const nonce = 'a'.repeat(32);
   const slot = 'forge-exec-2';
-  function fixture({code = 97, savedNonce = nonce, savedSlot = slot, alive = false, host = 'forge', finishRun = vi.fn(async () => {})} = {}) {
+  function fixture({code = 97, savedNonce = nonce, savedSlot = slot, alive = false, host = 'forge', finishRun = vi.fn(async () => {}), signal = vi.fn()} = {}) {
     const root = mkdtempSync(join(tmpdir(), 'slot-finish-')); roots.push(root);
     const file = join(root, 'slot-0.unconfirmed');
     writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host, run: RUN_DEAD}));
@@ -58,9 +58,9 @@ describe('R1017 finish settled active runs for dead owners', () => {
     writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: NOW - 120_000}));
     let now = NOW;
     const log = vi.fn();
-    const reaper = createMarkerReaper({root, host: 'forge', clock: () => now, liveness: () => alive ? 'alive' : 'dead', finishRun, log});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => now, liveness: () => alive ? 'alive' : 'dead', finishRun, log, signal});
     const sample = (patch = {}) => async () => ({sampledAtET: iso(now), activeRuns: 1, activeRunIds: [RUN_DEAD], recent: [{...dead, code}], ...patch});
-    return {root, file, log, reaper, sample, finishRun, setNow: value => { now = value; }};
+    return {root, file, log, reaper, sample, finishRun, signal, setNow: value => { now = value; }};
   }
   it.each([0, 1, 97, 254, 255])('finishes numbered-worker listed active code %s once and removes marker and sidecars', async code => {
     const f = fixture({code});
@@ -107,6 +107,62 @@ describe('R1017 finish settled active runs for dead owners', () => {
     expect(f.finishRun).toHaveBeenCalledTimes(2);
     expect(existsSync(f.file)).toBe(true);
     expect(f.log.mock.calls.filter(([line]) => line.includes('finish failed'))).toHaveLength(1);
+  });
+  it('retries execution-unconfirmed with cancel after the retry interval and releases as finished-on-behalf', async () => {
+    const finishRun = vi.fn().mockRejectedValueOnce(Object.assign(new Error('ssh failed'),
+      {stderr:'Worker execution unconfirmed; operator must stop the reserved UID'})).mockResolvedValue({finished:true});
+    const f = fixture({finishRun});
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    f.setNow(NOW + FINISH_RETRY_MS - 1);
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    expect(finishRun).toHaveBeenCalledTimes(1);
+    f.setNow(NOW + FINISH_RETRY_MS);
+    // A new reaper shares the escalation state for this root.
+    const second = createMarkerReaper({root:f.root, host:'forge', clock:() => NOW + FINISH_RETRY_MS,
+      liveness:() => 'dead', finishRun, log:f.log});
+    expect(await second.step(f.sample())).toEqual(['slot-0.unconfirmed']);
+    expect(finishRun).toHaveBeenLastCalledWith({run:RUN_DEAD, nonce, cancel:true});
+    expect(existsSync(f.file)).toBe(false);
+    expect(f.log.mock.calls.some(([line]) => line.includes('finished-on-behalf'))).toBe(true);
+    expect(f.signal).not.toHaveBeenCalled();
+  });
+  it.each(['Worker cancellation unconfirmed', 'transport failed'])('holds and signals slot once when cancel fails: %s', async failure => {
+    const finishRun = vi.fn().mockRejectedValueOnce(new Error('Worker execution unconfirmed'))
+      .mockRejectedValue(new Error(failure));
+    const f = fixture({finishRun});
+    await f.reaper.step(f.sample());
+    expect(f.signal).not.toHaveBeenCalled();
+    f.setNow(NOW + FINISH_RETRY_MS);
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    expect(f.signal).toHaveBeenCalledTimes(1);
+    expect(f.signal).toHaveBeenCalledWith({kind:'slot-uid-unprovable-0', detail:{slot:0, run:RUN_DEAD,
+      reason:failure, action:'operator: stop forge uid forge-exec-<n> and remove its worker-active executing lock'}});
+    f.setNow(NOW + 2 * FINISH_RETRY_MS);
+    await f.reaper.step(f.sample());
+    expect(finishRun).toHaveBeenCalledTimes(3);
+    expect(finishRun).toHaveBeenLastCalledWith({run:RUN_DEAD, nonce, cancel:true});
+    expect(f.signal).toHaveBeenCalledTimes(1);
+    expect(existsSync(f.file)).toBe(true);
+    expect(f.log.mock.calls.filter(([line]) => line.includes('slot-0 UID cleanup unprovable'))).toHaveLength(1);
+  });
+  it('gives cancel 100 seconds and raises a held-slot alert if that bound expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const finishRun = vi.fn().mockRejectedValueOnce(new Error('Worker execution unconfirmed'))
+        .mockImplementation(() => new Promise(() => {}));
+      const f = fixture({finishRun});
+      await f.reaper.step(f.sample());
+      f.setNow(NOW + FINISH_RETRY_MS);
+      let settled = false;
+      const pending = f.reaper.step(f.sample()).then(value => { settled = true; return value; });
+      await vi.advanceTimersByTimeAsync(99_999);
+      expect(settled).toBe(false);
+      expect(f.signal).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toEqual([]);
+      expect(f.signal).toHaveBeenCalledWith(expect.objectContaining({kind:'slot-uid-unprovable-0'}));
+      expect(existsSync(f.file)).toBe(true);
+    } finally { vi.useRealTimers(); }
   });
   it('shares the 30-second per-run finish retry limit across reaper instances (one per runWithRemoteDecision call)', async () => {
     const f = fixture({finishRun: vi.fn().mockRejectedValue(new Error('transport failed'))});
@@ -276,6 +332,19 @@ describe('R1017 bounded finish transport', () => {
       'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs finish'],
     expect.objectContaining({timeout: RUN_FINISH_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 64 * 1024}), expect.any(Function));
     expect(JSON.parse(f.stdin.end.mock.calls[0][0])).toEqual(request);
+  });
+  it('sends cancel only for true and allows 90 seconds for the supervisor wait and reap', async () => {
+    const f = transport(null);
+    await f.finish({...request, cancel:true});
+    expect(JSON.parse(f.stdin.end.mock.calls[0][0])).toEqual({...request, cancel:true});
+    expect(f.exec.mock.calls[0][2].timeout).toBe(90_000);
+    await f.finish({...request, cancel:false});
+    expect(JSON.parse(f.stdin.end.mock.calls[1][0])).toEqual(request);
+    expect(f.exec.mock.calls[1][2].timeout).toBe(RUN_FINISH_TIMEOUT_MS);
+  });
+  it('preserves Forge stderr on rejection for execution-unconfirmed classification', async () => {
+    const f = transport(new Error('ssh failed'), '', 'Worker execution unconfirmed');
+    await expect(f.finish(request)).rejects.toMatchObject({stderr:'Worker execution unconfirmed'});
   });
   it.each(['State mismatch', 'ENOENT: state missing', 'No such file or directory'])('does not treat consumed remote state as success: %s', async stderr => {
     const error = Object.assign(new Error('remote failure'), {code: 254});

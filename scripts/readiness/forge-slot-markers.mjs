@@ -296,8 +296,8 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   // process through a module map, across processes through a `.finish-<run>` stamp (newest wins). A missing, unreadable
   // or future-dated stamp is ignored: it can only allow one extra attempt, never suppress the retry for good.
   let shared = sharedFinishState.get(root);
-  if (!shared) { shared = {attempts: new Map(), logged: new Set(), finished: new Set()}; sharedFinishState.set(root, shared); }
-  const {attempts: finishAttempts, logged: finishFailuresLogged, finished: finishedRuns} = shared;
+  if (!shared) { shared = {attempts: new Map(), logged: new Set(), finished: new Set(), cancel: new Set()}; sharedFinishState.set(root, shared); }
+  const {attempts: finishAttempts, logged: finishFailuresLogged, finished: finishedRuns, cancel: cancelRuns} = shared;
   // Bounded: the oldest entries go first (insertion order); forgetting one can only allow one extra throttled attempt.
   const trim = store => { while (store.size > FINISH_STATE_MAX) store.delete(store.keys().next().value); };
   const finishStamp = run => join(root, `.finish-${run}`);
@@ -444,13 +444,25 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
                   if (last !== undefined && decisionAt - last < FINISH_RETRY_MS) continue;
                   finishAttempts.delete(entry.run); finishAttempts.set(entry.run, decisionAt); trim(finishAttempts);
                   try { writeFileSync(finishStamp(entry.run), JSON.stringify({at: decisionAt}), {mode: 0o600}); } catch { /* the in-memory time still throttles */ }
+                  const cancel = cancelRuns.has(finishKey);
                   let timer;
                   try {
-                    await Promise.race([Promise.resolve().then(() => finishRun({run: entry.run, nonce: entry.nonce})),
-                      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('finish timeout')), FINISH_TIMEOUT_MS); })]);
+                    await Promise.race([Promise.resolve().then(() => finishRun({run: entry.run, nonce: entry.nonce, ...(cancel ? {cancel: true} : {})})),
+                      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('finish timeout')), cancel ? 100_000 : FINISH_TIMEOUT_MS); })]);
                     finishedRuns.add(finishKey); trim(finishedRuns);
                     // The stamp stays until the marker is released: another process's lagging sample may still list the run.
-                  } catch {
+                  } catch (error) {
+                    const reason = `${error?.stderr ?? ''} ${error?.message ?? error}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').trim();
+                    if (cancel) {
+                      raise(`slot-uid-unprovable-${entry.index}`, {slot: entry.index, run: entry.run, reason: reason.slice(0, 240),
+                        action: 'operator: stop forge uid forge-exec-<n> and remove its worker-active executing lock'}, decisionAt);
+                      if (!finishFailuresLogged.has(finishKey)) {
+                        finishFailuresLogged.add(finishKey); trim(finishFailuresLogged);
+                        log(`heavy-admission: slot-${entry.index} UID cleanup unprovable; marker retained; operator cleanup required\n`);
+                      }
+                    } else if (/execution unconfirmed/i.test(reason)) {
+                      cancelRuns.add(finishKey); trim(cancelRuns);
+                    }
                     if (!finishFailuresLogged.has(entry.run)) {
                       finishFailuresLogged.add(entry.run); trim(finishFailuresLogged);
                       log(`heavy-admission: finish failed for ${entry.run}; marker retained; retry after ${FINISH_RETRY_MS}ms (operator cleanup if persistent)\n`);

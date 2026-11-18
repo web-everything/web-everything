@@ -1089,8 +1089,49 @@ describe('standards input parity', () => {
       expect(existsSync(active)).toBe(true);
       expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(true);
       expect(existsSync(cancel)).toBe(['cleanup failure','stale execution'].includes(fault));
-      expect(cleanup).toHaveBeenCalledTimes(fault === 'cleanup failure' ? 1 : 0);
+      expect(cleanup).toHaveBeenCalledTimes(['cleanup failure','stale execution'].includes(fault) ? 1 : 0);
+      if (fault === 'stale execution') expect(existsSync(join(active, 'executing'))).toBe(true);
     } finally {time?.mockRestore();}
+  });
+
+  it.each([[-1,'ok'], [0,'ok'], [1,'ok'], [1,'nonzero'], [1,'throws']])('stale executing cancellation requires hard max runtime (offset %s ms) and proven UID cleanup: %s', async (offset, outcome) => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-stale-')); auxiliary.push(root);
+    mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
+    const cleanup = vi.fn(async () => {
+      expect(existsSync(join(root, 'receipts/worker-active-1/executing'))).toBe(true);
+      if (outcome === 'throws') throw new Error('uid cleanup unconfirmed');
+      return {code:outcome === 'ok' ? 0 : 1};
+    });
+    const now = Date.now(), maxRuntimeMs = 3*1_740_000+15*60*1000;
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup, testReapProbe:{uidBusy:async()=>false}, clock:()=>now});
+    const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
+    const active = join(root, 'receipts/worker-active-1'), executing = join(active, 'executing');
+    mkdirSync(executing);
+    const started = new Date(now-maxRuntimeMs-offset);
+    utimesSync(executing, started, started);
+    await expect(runner.finish({...prepared, nonce})).rejects.toThrow('Worker execution unconfirmed');
+    expect(cleanup).not.toHaveBeenCalled();
+    let tick = 0n;
+    const time = vi.spyOn(process.hrtime, 'bigint').mockImplementation(() => (tick += 25000000000n));
+    try {
+      const finishing = runner.finish({...prepared, nonce, cancel:true});
+      if (outcome === 'ok' && offset >= 0) {
+        await expect(finishing).resolves.toMatchObject({run:prepared.run, cancelAck:true});
+        expect(existsSync(executing)).toBe(false);
+        expect(existsSync(active)).toBe(false);
+        expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(false);
+        expect(cleanup).toHaveBeenCalledTimes(2); // recovery proof, then ordinary finish proof
+      } else {
+        await expect(finishing).rejects.toThrow('Worker cancellation unconfirmed');
+        expect(existsSync(executing)).toBe(true);
+        expect(existsSync(join(active, 'reservation.json'))).toBe(true);
+        expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(true);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+      }
+      expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({argv:['/usr/bin/true'],
+        cwd:join(root, 'runs/slot-1', prepared.run), env:expect.objectContaining({PATH:'/usr/bin:/bin', HOME:'/nonexistent'}), cancel:undefined}));
+      expect(tick).toBeGreaterThanOrEqual(75000000000n); // preserve the supervisor's 45s grace
+    } finally {time.mockRestore();}
   });
 
   it('does not certify cancellation of a legacy shared-UID reservation', async () => {
@@ -1785,6 +1826,26 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-runner-too-old'});
     expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
     expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
+  });
+  it.each([
+    ['staged deletion','D',':120000 000000'],['staged retarget','M',':120000 120000'],['mode change','T',':120000 100644'],
+  ])('falls back locally, with no copy or run, when a HEAD symlink changed in the index (%s)',async(_name,status,modes)=>{
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>{
+      if(call.file==='git'&&gitArgs(call)[0]==='diff-index')
+        return {code:0,stdout:Buffer.from(`${modes} ${'a'.repeat(40)} ${'b'.repeat(40)} ${status}\0alias\0`)};
+      return original(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'head-symlink-changed',detail:'alias'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+  });
+  it('falls back locally when the HEAD-link comparison is unreadable (fail closed)',async()=>{
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>gitArgs(call)[0]==='diff-index'&&call.file==='git'?{code:1,stdout:Buffer.alloc(0)}:original(call));
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'head-symlink-changed'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
   });
   it('R807: a git-needing test routed remote on an unknown capability cache is refused safely at prepare by a runner without gitBundle',async()=>{
     const f=fixture(),original=f.exec,body=readFileSync(join(cwd,'a.test.mjs'));
