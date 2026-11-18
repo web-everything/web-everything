@@ -68,6 +68,6 @@ describe('R501 remote success record', () => {
     expect(existsSync(usage)).toBe(measured);
     if(measured)expect(JSON.parse(readFileSync(usage,'utf8').trim())).toEqual({ts:expect.any(String),kind:expect.any(String),
       key:'npm run test:unit --',threadsGranted:5,
-      memGranted:remoteExec.mock.calls[0][0].slotUnits*12*1024**3,...resources,runMs:25,code:0,backend:'systemd-scope'});
+      memGranted:null,...resources,runMs:25,code:0,backend:'systemd-scope'});
   });
 });

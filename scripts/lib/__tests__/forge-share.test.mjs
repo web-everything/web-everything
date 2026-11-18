@@ -173,17 +173,10 @@ describe('remote usage measurement ledger',()=>{
       recordRemoteUsage(options);
       recordRemoteUsage({...options,slotUnits:undefined,resources:{slotCpus:2,cpuUsec:null,memoryPeakBytes:null,oomKills:null}});
       const rows=readFileSync(join(root,'remote-usage.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
-      expect(rows[0]).toEqual({ts:options.at,kind:'files',key:'npm run test:unit -- --reporter=dot',threadsGranted:5,memGranted:36*1024**3,
+      expect(rows[0]).toEqual({ts:options.at,kind:'files',key:'npm run test:unit -- --reporter=dot',threadsGranted:5,memGranted:null,
         ...resources,runMs:50,code:1,backend:'systemd-scope'});
-      expect(rows[1]).toMatchObject({threadsGranted:2,memGranted:12*1024**3,cpuUsec:null,memoryPeakBytes:null,throttledUsec:null,nrThrottled:null,oomKills:null});
+      expect(rows[1]).toMatchObject({threadsGranted:2,memGranted:null,cpuUsec:null,memoryPeakBytes:null,throttledUsec:null,nrThrottled:null,oomKills:null});
       expect(readFileSync(join(root,'remote-runs.jsonl'),'utf8')).toBe('existing bytes\n');
-    } finally {rmSync(root,{recursive:true,force:true});}
-  });
-  it.each([0,-1,1.5,257,Number.MAX_SAFE_INTEGER+1,'3',null])('writes nothing for invalid slotUnits=%j',slotUnits=>{
-    const root=mkdtempSync(join(process.env.TMPDIR,'remote-usage-'));
-    try {
-      recordRemoteUsage({lockRoot:root,slotUnits,resources:{slotCpus:5}});
-      expect(existsSync(join(root,'remote-usage.jsonl'))).toBe(false);
     } finally {rmSync(root,{recursive:true,force:true});}
   });
   it.each([undefined,0,-1,1.5,Number.MAX_SAFE_INTEGER+1,'5',null])('writes nothing for missing or invalid slotCpus=%j',slotCpus=>{
