@@ -176,7 +176,7 @@ const evidenceIdentity = row => {
  * Every required name needs its own evidence; historical implication options are ignored.
  * rowsComplete is true only after exhausting pages or explicitly fetching every required name.
  */
-export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [] } = {}) {
+export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [], reviewGateOwnedByReview = false } = {}) {
   const perName = Object.create(null), reasons = [];
   const validNames = names => Array.isArray(names) && [...names].every(n => typeof n === 'string' && n.trim());
   if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || !requiredNames.length) reasons.push('roster-unavailable');
@@ -213,16 +213,26 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       // Foreign success is waiting for this head's evidence; foreign failure is unreadable.
       state = state === 'pass' ? 'pending' : 'unknown'; why.unshift('foreign-head');
     }
-    if (state === 'fail' && name === 'review-gate' && conclusion === 'failure') state = 'held';
-    if (state === 'fail' && name === 'merge-gate' && conclusion === 'failure') {
+    // A failed review-gate is review-owned only with the same head- and job-bound evidence as merge-gate (below).
+    const failedByName = state === 'fail' && conclusion === 'failure' && (name === 'merge-gate' || name === 'review-gate');
+    const job = evidenceInteger(evidenceJob(row));
+    const boundHold = hold => rowHead !== null && sha(hold?.headSha) === rowHead
+      && Array.isArray(hold?.holdIds) && hold.holdIds.length
+      && humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only;
+    // Review-start timing (not admission) owns the review-gate by contract: it is red until a review exists.
+    if (reviewGateOwnedByReview === true && name === 'review-gate' && failedByName) state = 'held';
+    else if (failedByName) {
       const candidates = [row.mergeGateReviewHold, row.mergeGateHoldExcused, ...(Array.isArray(holds) ? holds : [])];
-      const job = evidenceInteger(evidenceJob(row));
-      if (job !== null && candidates.some(hold => evidenceInteger(hold?.jobId) === job
-        && rowHead !== null && sha(hold?.headSha) === rowHead && Array.isArray(hold?.holdIds) && hold.holdIds.length
-        && humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only)) state = 'held';
+      if (job !== null && candidates.some(hold => evidenceInteger(hold?.jobId) === job && boundHold(hold))) state = 'held';
     }
     return { row, name, state, reasons: why, rowHead, identity: evidenceIdentity(row), run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
   });
+  // The review-gate has no verdict of its own: its failure is review-owned only when a merge-gate run on this very
+  // head carries a job-bound human-review hold (that run is already 'held' above). An unannotated failure stays 'fail'.
+  for (const r of classified) {
+    if (r.name === 'review-gate' && r.state === 'fail' && r.rowHead && normalize(r.row?.conclusion) === 'failure'
+      && classified.some(m => m.name === 'merge-gate' && m.state === 'held' && m.rowHead === r.rowHead)) r.state = 'held';
+  }
   // A nameless row cannot safely be assigned to an advisory check.
   if (classified.some(r => typeof r.name !== 'string' || !r.name.trim())) reasons.push('malformed');
   const resolveName = name => {

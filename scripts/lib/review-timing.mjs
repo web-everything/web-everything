@@ -52,7 +52,9 @@ export const isReviewHoldGate = row => {
 };
 const evidence = ({ headSha, checks, requiredChecks, rowsHead, rowsComplete, rosterSource }) =>
   resolveRequiredChecks({ head: headSha, rows: checks, requiredNames: requiredChecks,
-    rowsHead: rowsHead ?? null, rowsComplete, rosterSource });
+    rowsHead: rowsHead ?? null, rowsComplete, rosterSource,
+    // Review-start timing treats the review-gate as review-owned (#5463); merge admission never does.
+    reviewGateOwnedByReview: true });
 const redNames = resolved => Object.entries(resolved.perName).filter(([, value]) =>
   value.state === 'fail' || (value.state === 'pending' && value.reasons.includes('needs-rerun')));
 /** Actual required failures, including cancellations that require a rerun. */

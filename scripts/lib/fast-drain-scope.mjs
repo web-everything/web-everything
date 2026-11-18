@@ -1,5 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
 import { readFileSync, statSync } from 'node:fs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { withWriteLock } from './daemon-clone-lock.mjs';
@@ -124,12 +126,12 @@ export function readLegacyLocalManifestAt({ headRef, headSha, prNumber, git }) {
 }
 
 
-/** TTL is opt-in configurable; invalid bounds retain the standard 180s live-refresh fallback. */
+/** Invalid bounds retain the standard 60s live-refresh fallback. */
 function roundSnapshotTtl(env) {
   const raw = env.WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC;
   const number = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
   const valid = Number.isFinite(number) && number >= 0;
-  return { seconds: valid ? number : 180, source: valid ? 'env' : 'standard' };
+  return { seconds: valid ? number : 60, source: valid ? 'env' : 'standard' };
 }
 
 /** A round cache is advisory context only: reject incomplete, foreign or expired evidence. */
@@ -156,13 +158,16 @@ export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env =
  * writer here so simultaneous cold children do not all fall back live. Directory identity stays stable
  * across creation of the snapshot file (realpath of an absent file can differ on symlinked temp roots).
  */
-export async function withFastDrainRoundLock(path, fn, { owner, waitMs = 180_000, pollMs = 1000, sleep = delay } = {}) {
+export async function withFastDrainRoundLock(path, fn, { owner = `${hostname()}:${randomUUID()}`, waitMs = 180_000, pollMs = 1000, sleep = delay } = {}) {
   const deadline = Date.now() + waitMs;
   for (;;) {
-    const result = await withWriteLock(dirname(path), fn, { owner, lockRoot: `${path}.locks`,
-      waitMs: Math.max(0, deadline - Date.now()) });
-    if (result.ok || Date.now() >= deadline) return result;
-    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+    const result = await withWriteLock(dirname(path), fn, { owner, lockRoot: `${path}.locks`, waitMs: Math.max(0, deadline - Date.now()) });
+    // acquireWrite checks PID liveness and the heartbeat lease on EVERY attempt, reclaiming dead/stale
+    // writers. A healthy writer may take longer than a cold listing; elapsed waiter time is not death.
+    if (result.ok) return result;
+    if (Date.now() >= deadline) return { ok: false, reason: 'round-lock-deadline' };
+    if (result.reason !== 'concurrent-mover') return result;
+    await sleep(Math.min(pollMs, deadline - Date.now()));
   }
 }
 
@@ -172,36 +177,49 @@ export async function withFastDrainRoundLock(path, fn, { owner, waitMs = 180_000
  */
 export async function readFastDrainRoundListing({ path, repo, onlyPr, env = process.env, now,
   read, write = writeJsonAtomic, listLive, readTarget, defaultBranch = () => null,
+  reuseDefaultBranch = () => {}, requireDefaultBranch = false,
   log = line => process.stderr.write(`${line}\n`),
   lock = fn => withFastDrainRoundLock(path, fn),
 }) {
   const clock = () => now ?? Date.now();
   const ttl = roundSnapshotTtl(env);
-  const populate = async () => {
-    const snap = readFastDrainRoundSnapshot({ path, repo, env, now: clock(), read });
-    if (snap) return { rows: snap.rows, hit: true };
-    const rows = await listLive();
-    try { write(path, { repo, writtenAt: clock(), rows, defaultBranch: defaultBranch() }); }
+  const hasBranch = snap => !requireDefaultBranch || (typeof snap?.defaultBranch === 'string' && !!snap.defaultBranch.trim());
+  const populate = async ({ liveOnly = false, stillHeld } = {}) => {
+    const snap = liveOnly ? null : readFastDrainRoundSnapshot({ path, repo, env, now: clock(), read });
+    if (snap && hasBranch(snap)) return { ...snap, hit: true };
+    const rows = snap?.rows ?? await listLive();
+    const branch = await defaultBranch();
+    if (requireDefaultBranch && !hasBranch({ defaultBranch: branch })) throw new Error('round listing default branch unreadable — retry next pass');
+    if (!liveOnly && (typeof stillHeld !== 'function' || !stillHeld())) {
+      throw new Error('round listing lock unavailable (lock-lost) — retry next pass');
+    }
+    try { if (!liveOnly) write(path, { repo, writtenAt: snap?.writtenAt ?? clock(), rows, defaultBranch: branch }); }
     catch { /* Unwritable cache costs a live listing next time; it never authorizes a cached target. */ }
-    return { rows, hit: false };
+    return { rows, defaultBranch: branch, hit: !!snap };
   };
   // Hits do not need the population lock. Misses re-check inside it after a sibling's write.
   const snap = readFastDrainRoundSnapshot({ path, repo, env, now: clock(), read });
   let base;
-  let lockFallback = false;
-  if (snap) base = { rows: snap.rows, hit: true };
+  if (snap && hasBranch(snap)) base = { ...snap, hit: true };
   else {
     let entered = false;
     let locked;
-    try { locked = await lock(() => { entered = true; return populate(); }); }
+    try { locked = await lock(stillHeld => { entered = true; return populate({ stillHeld }); }); }
     catch (error) {
       if (entered) throw error; // The live reader failed: propagate it, never retry it as a cache error.
-      locked = { ok: false };
+      throw new Error('round listing lock unreadable — retry next pass', { cause: error });
     }
-    lockFallback = !locked.ok;
-    base = locked.ok ? locked.value : await populate();
+    if (!locked.ok && locked.reason === 'round-lock-deadline') {
+      log('fast-drain: round listing lock wait deadline expired — falling back to exact live listing');
+      base = await populate({ liveOnly: true });
+    } else {
+      if (!locked.ok) throw new Error(`round listing lock unavailable (${locked.reason || 'unknown'}) — retry next pass`);
+      base = locked.value;
+    }
   }
-  log(`fast-drain: ${base.hit ? 'served-from-snapshot' : 'listed-live'} (round listing; TTL=${ttl.seconds}s, source=${ttl.source}${lockFallback ? '; cache lock unavailable, live fallback' : ''})`);
+  log(`fast-drain: ${base.hit ? 'served-from-snapshot' : 'listed-live'} (round listing; TTL=${ttl.seconds}s, source=${ttl.source})`);
+  reuseDefaultBranch(base.defaultBranch);
+  if (typeof readTarget !== 'function') throw new Error('round listing live target reader missing — retry next pass');
   const target = await readTarget();
   if (!target || String(target.number) !== String(onlyPr) || !['OPEN', 'CLOSED', 'MERGED'].includes(target.state)) {
     throw new Error('round listing live target unreadable');
