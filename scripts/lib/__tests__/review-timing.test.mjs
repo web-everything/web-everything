@@ -16,7 +16,11 @@ describe('pending-CI start policy', () => {
         for (const checks of [[check('test')], [check('test', null, { status: 'in_progress' })]]) {
           const result = reviewStartGate({ headSha: head, requiredChecks: ['test'], checks,
             policy: { ...review, startAfter, startEarly, fastChecks: ['test'] }, ...completeness });
-          expect(result).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
+          const pending = checks[0].status === 'in_progress';
+          expect(result).toMatchObject({ allowed: false, unknown: true,
+            reason: pending ? 'required-checks-not-successful' : 'rows-incomplete',
+            ...(pending ? { secondaryReasons: ['rows-incomplete'], affected: [{ name: 'test', reason: 'pending' }] } : {}),
+          });
           expect(result.wouldStartEarly).toBeUndefined();
           expect(result.earlyStart).toBeUndefined();
           expect(result.earlyStartNote).toBeUndefined();

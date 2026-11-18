@@ -2988,7 +2988,10 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
       dispatch: options => dispatchReview({ ...options, root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
         ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
-          readChecks: () => [{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
+          // This synthetic reader supplies the entire feed on each of its four ticks.
+          readChecks: () => Object.defineProperty([
+            { name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion },
+          ], 'rowsComplete', { value: true }),
         }),
         readBrief: () => 'review {{PR}}', mintSessionId: () => 'ci-soak', ensureSessionCwd: path => path,
         resolveSettingsEnv: () => ({}), isolateSession: () => ({ worktreeSettings: {} }), spawnAgent,

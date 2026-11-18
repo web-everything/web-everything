@@ -86,7 +86,7 @@ describe('mechanical round enrichment port (#5948)', () => {
   const head = 'b'.repeat(40), priorHead = 'a'.repeat(40);
   const comment = (body, hour) => ({ author: { login: 'web-everything' }, body,
     createdAt: `2026-10-10T${String(hour).padStart(2, '0')}:00:00Z` });
-  const snapshot = (ordinary = false) => ({ number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
+  const snapshot = (ordinary = false) => ({ rowsHead: head, rowsComplete: true, number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
     baseRefName: 'main', labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
     comments: [...[1, 2, 3, 4, 5].map(h => comment(REARM_COMMENT_MARKER, h)),
@@ -186,7 +186,7 @@ it('maps repo slugs before binding and refuses unknown repos before IO', async (
   const options = {
     env: { WE_REVIEW_START_AFTER: 'ci-green' },
     readRequiredChecks: () => ({ checks: requiredChecks, source: 'live' }),
-    readPrs: () => [{ statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
+    readPrs: () => [{ rowsHead: 'a'.repeat(40), rowsComplete: true, statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
     readAgents: () => [{ name: 'review-fui-49', pidAlive: true, pid: 1 }], enrich: (agents) => agents,
   };
   expect(runReconcilePass({ ...options, repo: 'frontier-ui/frontierui' }).refusals.some((r) => r.kind === 'live-process')).toBe(true);
@@ -2098,4 +2098,11 @@ it('runs the file-based synchronous pool with real child processes and cleans it
     })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
     expect(evidenceExists(folder)).toBe(false);
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+it.each([undefined, 'live', 'cache', 'fallback'])('forwards required-check roster provenance %s into planner options', async source => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const result = runReconcilePass({ ...xxOptions(), readOnly: true, readPrs: () => [],
+    readRequiredChecks: () => ({ checks: ['test'], ...(source === undefined ? {} : { source }) }) });
+  expect(result.plannerOptions.rosterSource).toBe(source);
 });

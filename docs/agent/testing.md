@@ -4605,3 +4605,27 @@ cached within the read and capped at 20; missing/mismatched evidence or overflow
 review with an operator-visible request to inspect Actions jobs/reruns before retrying.
 The REST rerun integration cases in `review-ci-completeness.test.mjs` cover successful reruns,
 different runs, invalid lineage, foreign repositories, unavailable jobs, and the read cap.
+
+## Required-check evidence opt-in and provenance (PR1)
+
+`resolveRequiredChecks` leaves absent required checks pending by default. Only the
+`review-ci-gate` adapter opts into `allowImplication`; CI-heal requires an own row.
+CI-heal fixtures that prove green or held evidence must explicitly attest both
+`rowsComplete: true` and `rosterSource: live|cache`. Preserve the required-check
+reader's `source` through escalation recording and reconcile; an omitted source
+is unavailable evidence, never an implicit live roster. Named negative tests in
+`check-state-predicate`, `ci-heal-verdict-recheck`, and `ci-heal-escalation-mark`
+pin these defaults and the recording preflights.
+
+## Review CI refusal ordering
+
+An observed pending or failed required check takes precedence over `rows-incomplete`
+in the review adapter's primary reason. Incompleteness remains in `secondaryReasons`
+and preserves `unknown: true` with `allowed: false`. Missing checks alone do not
+establish an observed blocker. The ordering cases in `review-ci-gate.test.mjs` and
+the producer formatting cases in `review-ci-gate-io.test.mjs` pin these guarantees.
+Retry after exhausting pagination or explicitly reading every required name;
+successful observed names alone cannot establish admission.
+Consumers that decide whether to recheck evidence must inspect `unknown`, rather
+than infer completeness from the primary reason. The facts-first regression in
+`merge-gate-hold-class.test.mjs` requires a live recheck of an incomplete failure.
