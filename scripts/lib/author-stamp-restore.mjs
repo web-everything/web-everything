@@ -87,8 +87,10 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     const markers = [];
     const htmlLines = [];
     let ambiguousTicks = false;
-    // Brackets can make a backticked span part of a link target or text across lines: no exemption.
-    const bracketed = /[\[\]]/.test(edit.diff);
+    // A backticked span on a bracketed line, or inside a bracket still open from earlier lines, may be part of a
+    // link target or text: no exemption. Brackets on lines without backticks (checkboxes) do not matter.
+    let bracketed = false;
+    let depth = 0;
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
@@ -98,6 +100,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       if (unclosedComment) {
         return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
       }
+      if (line.includes('`') && (depth > 0 || /[\[\]]/.test(line))) bracketed = true;
+      for (const ch of line) depth = ch === '[' ? depth + 1 : ch === ']' ? Math.max(0, depth - 1) : depth;
       const stripped = fence || delimiter ? line : outsideInlineCode(line);
       // One ambiguous backtick line may open a multiline span: no inline-code exemption anywhere in the snapshot.
       if (stripped === undefined) ambiguousTicks = true;

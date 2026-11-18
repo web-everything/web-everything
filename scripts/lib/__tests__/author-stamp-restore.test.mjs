@@ -160,6 +160,12 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     expect(result).toEqual(JSON.parse(JSON.stringify(baseline).replaceAll('invariants.json', '<path>')));
   });
 
+  it('keeps the code-span exemption when brackets only appear on lines without backticks', () => {
+    const text = '- [x] done\n- [ ] [link](https://example.test)\n- gains `--invariants-file=<path>`.';
+    expect(plan({ edits: [edit(`${text}\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'restore', id: ID });
+  });
+
   it.each([
     ['single backticks', '`<path>`'],
     ['double backticks containing single backticks', '`` `<path>` ``'],
@@ -177,6 +183,7 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     ['unbalanced backtick after balanced tag span', '`<path>` then `'],
     ['mismatched backtick runs', '``<path>`'],
     ['multiline code span around balanced tag span', '`\n`<div>`\n`'],
+    ['backticks after an unclosed bracket line', '[text\nmore\n`<path>`'],
     ['backticks inside a link url', '[link](https://example.test/`<path>`)'],
     ['backticks in multiline link text', '[text\n`<path>`\n](https://example.test)'],
     ['non-placeholder tag with attribute in code', '`<a href="x">`'],
