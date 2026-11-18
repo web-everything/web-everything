@@ -2,6 +2,7 @@
 import { it, expect } from 'vitest';
 import ts from 'typescript';
 import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { scanRoot, scopedScanFiles } from '../repo-scan-tests.mjs';
 
 const root = scanRoot(process.cwd());
@@ -135,7 +136,7 @@ function scan(source, { delegatedExecHelpers = [] } = {}) {
 }
 it('inventories every conveyor launch and requires an exiting runtime refusal before the effect', () => {
   const files = ['skills-src/conveyor/build-dispatch-daemon.mjs', 'scripts/conveyor/tick-core.mjs',
-    'scripts/operations/dispatch-lane-io.mjs', ...readdirSync(`${root}/scripts/conveyor`)
+    'scripts/operations/dispatch-lane-io.mjs', ...readdirSync(join(root, 'scripts/conveyor'))
       .filter(f => /^build-dispatch-.*\.mjs$/.test(f)).map(f => `scripts/conveyor/${f}`)];
   let count = 0;
   for (const file of scopedScanFiles(files)) {
