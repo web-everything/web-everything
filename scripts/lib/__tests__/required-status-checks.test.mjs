@@ -476,7 +476,7 @@ describe('defaultReadRequiredStatusChecks', () => {
   });
 
   it('a rules access denial keeps an expired live cache (ruleset-only check kept, file untouched) and the review gate still refuses its red', async () => {
-    const { readReviewCiGate } = await import('../review-ci-gate-io.mjs');
+    const { readReviewCiGate } = await import('./helpers/review-checks.mjs');
     const cachePath = join(dir, 'cache.json');
     const repo = 'web-everything/web-everything';
     getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });

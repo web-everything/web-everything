@@ -34,7 +34,7 @@ describe('review facts: facts first', () => {
   });
 
   it('count: a 10-PR tick makes 40 gate gh calls on the old path (2 heads + check-runs + status) and 10 on facts-first', async () => {
-    const { readReviewCiGate } = await import('../review-ci-gate-io.mjs');
+    const { readReviewCiGate } = await import('./helpers/review-checks.mjs');
     let calls = 0;
     const readHead = () => { calls += 1; return 'abc'; };
     const readChecks = () => { calls += 2; return [{ name: 'test', status: 'completed', conclusion: 'success', head_sha: 'abc' }]; }; // check-runs + status

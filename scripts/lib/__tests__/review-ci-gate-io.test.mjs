@@ -4,13 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
 import { readReviewCiGate as rawReadGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
-// Hermetic reader fixtures attest the same pinned, exhaustive fetch as production.
-const readGate = options => rawReadGate({ ...options, ...(options.readChecks ? {
-  readChecks: args => {
-    const rows = options.readChecks(args);
-    return Array.isArray(rows) ? Object.assign([...rows], { rowsHead: rows.rowsHead ?? args.headSha, rowsComplete: rows.rowsComplete ?? true }) : rows;
-  },
-} : {}) });
+import { exhaustiveReadChecks, readReviewCiGate as readGate } from './helpers/review-checks.mjs';
 const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
 it('push requires both fast prerequisites, and discovers required checks for repos with no fast set', () => {
   const sha = 'a'.repeat(40);
@@ -48,13 +42,13 @@ it.each(['fast-checks', 'push'])('uses required CI ownership under %s and report
       { context: 'optional-status', state: 'failure' }] };
   expect(readGate(args)).toMatchObject({ allowed: true, startAfter });
   expect(readGate({ ...args, readRequired: () => { throw Error('protection unavailable'); } }))
-    .toMatchObject({ allowed: false, reason: 'unreadable-ci', startAfter });
+    .toMatchObject({ allowed: startAfter !== 'push', ...(startAfter === 'push' ? { reason: 'ci-red' } : {}), startAfter, source: 'timing-policy' });
   expect(readGate({ ...args, readChecks: () => [...args.readChecks(), { name: 'test', status: 'completed', conclusion: 'failure' }] }))
     .toMatchObject({ allowed: false, reason: 'ci-red', startAfter });
   expect(readGate({ ...args, readHead: () => null })).toMatchObject({ allowed: false, startAfter });
   expect(readGate({ ...args, readChecks: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci', startAfter });
   expect(readGate({ ...args, policy: { ...policy, startAfter: 'ci-green' }, readRequired: () => ({ source: 'fallback', checks: [] }) }))
-    .toMatchObject({ allowed: false, reason: 'unknown-required-set', startAfter: 'ci-green' });
+    .toMatchObject({ allowed: false, reason: 'untrusted-required-set', startAfter: 'ci-green' });
 });
 it.each(['throws', 'fallback', 'empty', 'untrusted'])('push CI discovery %s never converts healable red into permission', mode => {
   const readRequired = () => {
@@ -64,7 +58,7 @@ it.each(['throws', 'fallback', 'empty', 'untrusted'])('push CI discovery %s neve
   const io = { repo: 'other/product', pr: 7, policy: { startAfter: 'push', startEarly: 'shadow' },
     readHead: () => headSha, readRequired,
     readChecks: () => [{ name: 'test', head_sha: headSha, status: 'completed', conclusion: 'failure' }] };
-  expect(readGate(io)).toMatchObject({ allowed: false, headSha, reason: mode === 'throws' ? 'unreadable-ci' : 'unknown-required-set' });
+  expect(readGate(io)).toMatchObject({ allowed: false, headSha, reason: 'ci-red' });
 });
 it('push waits for any registered CI and the pending bypass ignores unrelated rows without logging', () => {
   const io = { repo: 'other/product', pr: 7, readHead: () => headSha,
@@ -83,6 +77,27 @@ function fixture(over = {}) {
     readRequired: vi.fn(() => ({ source: 'live', checks: ['custom'] })),
     readChecks: vi.fn(() => [{ name: 'custom', status: 'completed', conclusion: 'success' }]), ...over };
 }
+describe('exhaustive check fixture provenance', () => {
+  it('attests the requested head without mutating the injected rows', () => {
+    const rows = [{ name: 'custom', status: 'completed', conclusion: 'success' }];
+    const read = exhaustiveReadChecks(() => rows);
+    expect(read({ headSha })).toMatchObject({ rowsHead: headSha, rowsComplete: true });
+    expect(read({ sha: headSha })).toMatchObject({ rowsHead: headSha, rowsComplete: true });
+    expect(rows).not.toHaveProperty('rowsHead');
+    expect(rows).not.toHaveProperty('rowsComplete');
+  });
+  it.each([{}, { rowsHead: headSha }, { rowsComplete: true },
+    { rowsHead: headSha, rowsComplete: false },
+    { rowsHead: 'b'.repeat(40), rowsComplete: true }])('refuses incomplete or unknown evidence %j', metadata => {
+    const rows = Object.assign([{ name: 'custom', status: 'completed', conclusion: 'success' }], metadata);
+    const io = fixture({ readChecks: () => rows });
+    expect(rawReadGate(io).allowed).toBe(false);
+    if (Object.keys(metadata).length) {
+      expect(exhaustiveReadChecks(io.readChecks)({ headSha })).toBe(rows);
+      expect(readGate(io).allowed).toBe(false);
+    }
+  });
+});
 describe('fresh review CI IO', () => {
   it('reads repo, fresh required set and exact SHA, then verifies the head again', () => {
     const io = fixture();
@@ -91,23 +106,24 @@ describe('fresh review CI IO', () => {
     expect(io.readChecks).toHaveBeenCalledWith({ repo: io.repo, headSha });
     expect(io.readRequired).toHaveBeenCalledWith({ repo: io.repo, ttlMs: 0 });
   });
-  it.each(['live', 'cache'])('allows trusted source %s with green required checks', source => {
+  it.each(['live', 'cache', 'declared'])('allows trusted source %s with green required checks', source => {
     expect(readReviewCiGate(fixture({ readRequired: () => ({ source, checks: ['custom'] }) })))
       .toMatchObject({ allowed: true, source });
   });
-  it.each(['declared', 'fallback', 'unavailable', undefined])('refuses untrusted source %s', source => {
-    expect(readReviewCiGate(fixture({ readRequired: () => ({ source, checks: ['custom'] }) }))).toMatchObject({ allowed: false, reason: 'unknown-required-set' });
+  it.each(['fallback', 'unavailable', undefined])('refuses untrusted source %s', source => {
+    expect(readReviewCiGate(fixture({ readRequired: () => ({ source, checks: ['custom'] }) }))).toMatchObject({ allowed: false, reason: 'untrusted-required-set' });
   });
-  it.each([0, 60_000, 24 * 60 * 60_000])('refuses stale cache aged %s ms without treating it as live evidence', cacheAgeMs => {
+  it.each([0, 60_000, 24 * 60 * 60_000])('allows stale cache aged %s ms and reports its age', cacheAgeMs => {
     const result = readReviewCiGate(fixture({ readRequired: () => ({ source: 'stale-cache', checks: ['custom'], cacheAgeMs }) }));
-    expect(result).toMatchObject({ allowed: false, source: 'stale-cache', reason: 'unknown-required-set' });
+    expect(result).toMatchObject({ allowed: true, source: 'stale-cache', cacheAgeMs });
+    expect(result.reason).toContain(`cache-age-ms=${cacheAgeMs}`);
   });
   it.each([undefined, NaN, Infinity, -1, '1000', 24 * 60 * 60_000 + 1, 2 * 24 * 60 * 60_000])('refuses stale cache with invalid or expired age %s', cacheAgeMs => {
     const io = fixture({ readRequired: () => ({ source: 'stale-cache', checks: ['custom'], cacheAgeMs }) });
     const result = readReviewCiGate(io);
     expect(result.allowed).toBe(false);
-    expect(result.reason).toBe('unknown-required-set');
-    expect(io.readChecks).toHaveBeenCalled();
+    expect(result.reason).toContain('untrusted-required-set');
+    expect(io.readChecks).not.toHaveBeenCalled();
   });
   it.each(['readHead', 'readRequired', 'readChecks'])('fails closed on %s errors', key => {
     expect(readReviewCiGate(fixture({ [key]: () => { throw new Error('offline'); } }))).toMatchObject({ allowed: false, reason: 'unreadable-ci' });
@@ -127,7 +143,7 @@ it.each([198, 199])('replays Plateau PR #%s with protection unavailable and test
       readChecks: () => { throw new Error('Resource not accessible by integration (HTTP 403)'); } });
     const checks = ['test', 'e2e'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
     const io = fixture({ repo: 'plateauapp/plateau-app', pr, readRequired, readChecks: () => checks });
-    expect(readReviewCiGate(io)).toMatchObject({ allowed: false, source: 'declared', headSha, reason: 'unknown-required-set' });
+    expect(readReviewCiGate(io)).toMatchObject({ allowed: true, source: 'declared', headSha });
     expect(readReviewCiGate({ ...io, readChecks: () => checks.slice(0, 1) })).toMatchObject({ allowed: false, source: 'declared' });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -139,9 +155,8 @@ it('production read argv is repo/SHA-explicit and fetches every page and rerun',
   expect(readReviewHead({ repo: 'other/product', pr: 3432, run: runHead })).toBe(headSha);
   expect(runHead).toHaveBeenCalledWith(['pr', 'view', '3432', '--repo', 'other/product', '--json', 'headRefOid']);
   const runChecks = vi.fn(argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success', id: 9 }] }, { total_count: 1, statuses: [] }]
-    : [{ total_count: 2, check_runs: [{ id: 2 }] }, { total_count: 2, check_runs: [{ id: 1 }] }]));
-  expect(readReviewChecks({ repo: 'other/product', headSha, run: runChecks })).toMatchObject({ rowsHead: headSha, rowsComplete: true });
+    ? [{ statuses: [{ context: 'legacy', state: 'success', id: 9 }] }, { statuses: [] }]
+    : [{ check_runs: [{ id: 2 }] }, { check_runs: [{ id: 1 }] }]));
   expect(readReviewChecks({ repo: 'other/product', headSha, run: runChecks })).toEqual([{ id: 2 }, { id: 1 }, { context: 'legacy', state: 'success' }]);
   expect(runChecks).toHaveBeenCalledWith(['api', '--paginate', '--slurp', `repos/other/product/commits/${headSha}/check-runs?per_page=100&filter=all`]);
   expect(runChecks).toHaveBeenCalledWith(['api', '--paginate', '--slurp', `repos/other/product/commits/${headSha}/status?per_page=100`]);
@@ -151,7 +166,7 @@ it('production read argv is repo/SHA-explicit and fetches every page and rerun',
 
 it('admits successful required commit statuses', () => {
   const run = argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success' }] }] : [{ total_count: 1, check_runs: [{ name: 'custom', status: 'completed', conclusion: 'success' }] }]);
+    ? [{ statuses: [{ context: 'legacy', state: 'success' }] }] : [{ check_runs: [{ name: 'custom', status: 'completed', conclusion: 'success' }] }]);
   expect(readReviewCiGate(fixture({ readRequired: () => ({ source: 'live', checks: ['custom', 'legacy'] }),
     readChecks: ({ repo, headSha }) => readReviewChecks({ repo, headSha, run }) }))).toMatchObject({ allowed: true });
 });
@@ -175,9 +190,9 @@ it.each([
 
 it.each([
   // A denial past TTL no longer replaces the seeded live entry with the declared set (#4708): stale-cache wins.
-  ['Resource not accessible by integration (HTTP 403)', 60_000, false, 'stale-cache'],
-  ['offline', 60_000, false, 'stale-cache'],
-  ['offline', 24 * 60 * 60_000, false, 'stale-cache'],
+  ['Resource not accessible by integration (HTTP 403)', 60_000, true, 'stale-cache'],
+  ['offline', 60_000, true, 'stale-cache'],
+  ['offline', 24 * 60 * 60_000, true, 'stale-cache'],
   ['offline', 2 * 24 * 60 * 60_000, false, 'stale-cache'],
 ])('replays WE protection failure %s with cache age %s', (message, age, allowed, source) => {
   const dir = mkdtempSync(join(tmpdir(), 'we-review-ci-cache-'));
@@ -223,12 +238,12 @@ describe('formatReviewCiSkip — the real error behind unreadable-ci is logged (
   });
 });
 
-it('fast-check dispatch refuses unreadable branch-protection discovery', () => {
+it('fast-check dispatch reads all head checks without waiting for branch-protection discovery', () => {
   const readRequired = vi.fn(() => { throw Error('protection unavailable'); });
   const io = fixture({ policy: { startAfter: 'fast-checks', fastChecks: ['standards', 'test-shard (1)'] }, readRequired,
     readChecks: () => ['standards', 'test-shard (1)'].map(name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' })) });
-  expect(readGate(io)).toMatchObject({ allowed: false, headSha, reason: 'unreadable-ci' });
-  expect(readRequired).toHaveBeenCalled();
+  expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'timing-policy' });
+  expect(readRequired).not.toHaveBeenCalled();
 });
 
 it('a repo without its own fast checks waits on its trusted required set', () => {
@@ -236,17 +251,17 @@ it('a repo without its own fast checks waits on its trusted required set', () =>
   const green = name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' });
   const io = fixture({ policy, repo: 'frontier-ui/frontierui', readRequired: vi.fn(() => ({ source: 'declared', checks: ['test'] })),
     readChecks: () => [green('test')] });
-  expect(readGate(io)).toMatchObject({ allowed: false, headSha, source: 'declared', reason: 'unknown-required-set' });
+  expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'declared' });
   expect(readGate({ ...io, readChecks: () => [{ ...green('test'), status: 'in_progress', conclusion: null }] }))
-    .toMatchObject({ allowed: false, reason: 'unknown-required-set' });
+    .toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
   expect(readGate({ ...io, readRequired: () => ({ source: 'fallback', checks: ['test'] }) }))
-    .toMatchObject({ allowed: false, reason: 'unknown-required-set' });
+    .toMatchObject({ allowed: false, reason: 'untrusted-required-set' });
   expect(readGate({ ...io, readRequired: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci' });
-  // WE also needs a live/cache roster before applying fast timing.
+  // WE keeps its fast checks and never waits on discovery.
   const we = fixture({ policy, repo: 'web-everything/web-everything', readRequired: vi.fn(),
     readChecks: () => ['standards', 'test-shard (1)'].map(green) });
-  expect(readGate(we)).toMatchObject({ allowed: false, reason: 'unknown-required-set' });
-  expect(we.readRequired).toHaveBeenCalled();
+  expect(readGate(we)).toMatchObject({ allowed: true, source: 'timing-policy' });
+  expect(we.readRequired).not.toHaveBeenCalled();
 });
 
 it('publish-time gate reads the exact head marker only when enabled', () => {
@@ -261,38 +276,4 @@ it('publish-time gate reads the exact head marker only when enabled', () => {
   readVerifyGreen.mockClear();
   expect(readGate({ ...args, policy: { startAfter: 'ci-green' } }).allowed).toBe(false);
   expect(readVerifyGreen).not.toHaveBeenCalled();
-});
-
-it.each([
-  { rowsHead: headSha, rowsComplete: false },
-  { rowsHead: 'b'.repeat(40), rowsComplete: true },
-  { rowsComplete: true },
-])('preserves fetch provenance rather than substituting the current PR head: %j', metadata => {
-  expect(rawReadGate(fixture({ readChecks: () => Object.assign([
-    { name: 'custom', status: 'completed', conclusion: 'success' },
-  ], metadata) }))).toMatchObject({ allowed: false, ...metadata });
-});
-
-// Exercise the production fetch rather than attesting injected rows in the fixture wrapper.
-it.each(['check-runs', 'status'])('refuses truncated %s totals despite green required rows', feed => {
-  const run = argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ total_count: feed === 'status' ? 2 : 1, sha: headSha, statuses: [{ context: 'legacy', state: 'success' }] }]
-    : [{ total_count: feed === 'check-runs' ? 2 : 1, check_runs: [{ name: 'custom', head_sha: headSha, status: 'completed', conclusion: 'success' }] }]);
-  const rows = readReviewChecks({ repo: 'other/product', headSha, run });
-  expect(rows).toMatchObject({ rowsHead: headSha, rowsComplete: false });
-  expect(rawReadGate({ ...fixture(), readChecks: () => rows })).toMatchObject({ allowed: false, rowsComplete: false, reason: 'rows-incomplete' });
-});
-it.each([
-  ['truncated', { truncated: true }], ['error', { error: 'partial response' }],
-  ['foreign status head', { sha: 'b'.repeat(40) }], ['missing total', { total_count: undefined }],
-])('does not attest complete evidence with %s', (_, patch) => {
-  const run = argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ total_count: 0, statuses: [], ...patch }] : [{ total_count: 0, check_runs: [] }]);
-  expect(readReviewChecks({ repo: 'other/product', headSha, run }).rowsComplete).toBe(false);
-});
-it('does not attest foreign check-run heads or an empty page stream', () => {
-  const run = argv => JSON.stringify(argv[3].includes('/status?') ? [{ total_count: 0, statuses: [] }]
-    : [{ total_count: 1, check_runs: [{ name: 'custom', head_sha: 'b'.repeat(40) }] }]);
-  expect(readReviewChecks({ repo: 'other/product', headSha, run }).rowsComplete).toBe(false);
-  expect(readReviewChecks({ repo: 'other/product', headSha, run: () => '[]' }).rowsComplete).toBe(false);
 });

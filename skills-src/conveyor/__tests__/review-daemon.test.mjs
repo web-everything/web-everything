@@ -1,5 +1,5 @@
 import { dispatchReview } from '../../../scripts/operations/review-dispatch.mjs';
-import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
+import { readReviewCiGate } from '../../../scripts/lib/__tests__/helpers/review-checks.mjs';
 import { sweepAuthorStamps } from '../../../scripts/lib/author-stamp-restore.mjs';
 /**
  * @file skills-src/conveyor/__tests__/review-daemon.test.mjs
@@ -2207,7 +2207,7 @@ describe('runReviewTick — #4133 shared reads (opt-in via readPrs/readAgents)',
   });
 
   it('never carries a token-shaped string from stderr into reconcileError', () => {
-    const readPrs = () => { const err = new Error('Command failed: gh pr list'); err.status = 1; err.stderr = 'HTTP 401: Bad credentials (token gh' + 's_abcdefghijklmnopqrstuvwxyz0123456789)\n'; throw err; };
+    const readPrs = () => { const err = new Error('Command failed: gh pr list'); err.status = 1; err.stderr = 'HTTP 401: Bad credentials (token gh\x73_abcdefghijklmnopqrstuvwxyz0123456789)\n'; throw err; };
     const out = runReviewTick({ reconcile: () => ({ dispatch: [], refusals: [] }), readPrs, readAgents: () => [], dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
     expect(out.reconcileError).toContain('HTTP 401');
     expect(out.reconcileError).not.toMatch(/ghs_[A-Za-z0-9]{10}/);
