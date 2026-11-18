@@ -208,6 +208,21 @@ describe('same-head referral resume preserves a newer send-back', () => {
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
 
+  it('a metadata-only changes verdict after the last fixer attempt cannot release the same-head hold', () => {
+    const request = { ...sendBack, body: `🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\n---\nNet basis: \`${'a'.repeat(40)}..${head}\` (reviewed against current main).\n\n${buildReviewedShaMarker(head)}\n<!-- review metadata -->\n\n_Posted automatically by the review operation._` };
+    const result = run(['status:sent-back-review', 'review:changes'], [attempt, advisory, request]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it('a real must-fix list with metadata after the last fixer attempt releases the same-head hold', () => {
+    const request = { ...sendBack, body: sendBack.body.replace('Fix the missing export.',
+      '### Findings (1)\n\n**correctness/correctness** (1)\n- `src/export.mjs:1` — Restore the missing export. — Consumers cannot import it. _[CONFIRMED]_') };
+    const result = run(['status:sent-back-review', 'review:changes'], [attempt, advisory, request]);
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+    expect(result.refusals).toEqual([]);
+  });
+
   it.each(['missing result', 'empty fix list'])('a sent-back gate with %s cannot release the hold', evidence => {
     const gate = comment(redTeamGateMarker(6989, head, 'sent-back'), '2026-11-18T05:43:00Z');
     const comments = [attempt, advisory,

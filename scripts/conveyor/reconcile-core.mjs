@@ -1506,6 +1506,13 @@ function sendBackAfterFixAttempt(pr) {
   const lastAt = Math.max(-Infinity, ...times);
   const lastIndex = Math.max(-1, ...attempts.map(c => comments.indexOf(c)));
   const verdict = latestChangesVerdict(trusted);
+  // Count the must-fix body, never the verdict envelope or its review metadata. A
+  // metadata-only bounce must leave the same-head hold in place (no work for a fixer).
+  const verdictBody = operatorSendBackBody(verdict?.body)
+    .split(/\r?\n/)
+    .filter(line => !/^\s*(?:Net basis:|reviewed-sha\b|_?Posted automatically\b|---\s*$)/i.test(line))
+    .join('\n').trim();
+  const verdictHasFindings = countFindings(verdictBody ? [verdictBody] : []) > 0;
   const operatorRequest = operatorSendBackAfterReview(pr);
   const gate = latestGateForHead(comments, pr.number, pr.headRefOid);
   const gateHasFixes = redTeamForHead(comments, pr.number, pr.headRefOid)
@@ -1514,7 +1521,7 @@ function sendBackAfterFixAttempt(pr) {
     || (gate?.outcome === 'operator-block' && labels.includes('red-team:blocked')))
     ? gate.comment : null;
   const requests = trusted.filter(c => {
-    return (c === verdict && operatorSendBackBody(c.body)
+    return (c === verdict && verdictHasFindings
       && (!isOperatorAuthored(c) || Boolean(operatorRequest))) || c === gateRequest;
   });
   // Requests are not completed reviews. Keep their slots so thread order remains comparable,
@@ -4032,6 +4039,12 @@ export function planReconcile({
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
       continue;
     }
+
+    // A changes label cannot bypass the same-head hold retained above when its
+    // newer send-back has no actionable body. Real repair requests clear it in the pre-pass.
+    if (pr.referralHold?.kind === 'same-head' && pr.referralHold.head === pr.headRefOid
+      && pr.referralHoldAutoResolve?.outcome === 'resume'
+      && refuseReferralHold({ pr, refuse, withPhase })) continue;
 
     // ── THE CAP, from the PR and ONLY from the PR. See the fuller note at REFUSAL 3 below.
     const attempts = roundAttempts();
