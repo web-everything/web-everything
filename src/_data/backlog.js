@@ -166,8 +166,9 @@ const SCOPE_PREFIX_LOCUS = {
   we: 'webeverything', webeverything: 'webeverything',
   fui: 'frontierui', frontierui: 'frontierui',
   plateau: 'plateau-app', 'plateau-app': 'plateau-app', pa: 'plateau-app',
+  longshore: 'longshore',
 };
-const SCOPE_LOCUS_PREFIX = { webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau' };
+const SCOPE_LOCUS_PREFIX = { webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau', longshore: 'longshore' };
 function inferLocusFromScope(scope) {
   // This inference helper reports only an explicit scope signal. Its callers may supply authored input;
   // do not invent a locus for a bare path. Scheduling's normalizeScope still qualifies every bare path.

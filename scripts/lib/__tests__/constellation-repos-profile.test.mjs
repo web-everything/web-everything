@@ -103,6 +103,11 @@ describe('repoProfile', () => {
 });
 
 describe('gateFor', () => {
+  it.each(['longshore', 'longshore:', 'ls', 'longshoreai/longshore'])('fails closed for %s without a wired verification gate, even with a checkout', (repo) => {
+    expect(gateFor(repo, { checkoutExists: () => true })).toBeNull();
+    expect(briefTokensForRepo(repo, { checkoutExists: () => true })).toBeNull();
+  });
+
   it('returns null for an unknown repo', () => {
     expect(gateFor('not-a-repo')).toBeNull();
   });
