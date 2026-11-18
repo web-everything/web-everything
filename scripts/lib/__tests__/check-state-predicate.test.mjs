@@ -856,6 +856,96 @@ describe('audit: roster and human-hold refusal paths', () => {
   const evidence = { head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
     rows: [failed], requiredNames: ['merge-gate'] };
 
+  const invalidIntegers = [undefined, null, 0, NaN, -1, 1.5, Infinity, '', '0', '00', '07',
+    '-1', '1.5', '7\n', ' 7', '7 ', '1e1', true, {}, 9007199254740992, '9007199254740992'];
+  const bound = { jobId: 7, headSha: head, holdIds: ['review-acceptance'] };
+  const withHold = (row, hold, source) => source === 'holds'
+    ? { ...evidence, rows: [row], holds: [hold] }
+    : { ...evidence, rows: [{ ...row, [source]: hold }] };
+
+  it.each(invalidIntegers.map(value => [value]))('Rule 7 never binds invalid hold jobId %j to an invalid or valid row job', jobId => {
+    for (const job of ['0', '00', '07', '9007199254740992', '7']) {
+      for (const field of ['detailsUrl', 'details_url']) {
+        const { detailsUrl, ...row } = failed;
+        row[field] = `https://github.com/o/r/actions/runs/1/job/${job}`;
+        for (const source of ['holds', 'mergeGateReviewHold', 'mergeGateHoldExcused']) {
+          expect(resolveRequiredChecks(withHold(row, { ...bound, jobId }, source)))
+            .toMatchObject({ state: 'fail', perName: { 'merge-gate': { state: 'fail' } } });
+        }
+      }
+    }
+  });
+
+  it.each(['0', '00', '07', '-1', '1.5', '9007199254740992', '7suffix', '7/extra'])(
+    'Rule 7 rejects invalid anchored row job %s even with a matching hold', job => {
+      for (const jobId of [job, Number(job), 7]) {
+        for (const source of ['holds', 'mergeGateReviewHold', 'mergeGateHoldExcused']) {
+          const row = { ...failed, detailsUrl: `https://github.com/o/r/actions/runs/1/job/${job}` };
+          expect(resolveRequiredChecks(withHold(row, { ...bound, jobId }, source)).state).toBe('fail');
+        }
+      }
+    });
+
+  it.each([1, '1', 7, '7', Number.MAX_SAFE_INTEGER, String(Number.MAX_SAFE_INTEGER)])(
+    'Rule 7 binds canonical positive safe jobId %j', jobId => {
+      const row = { ...failed, detailsUrl: `https://github.com/o/r/actions/runs/1/job/${jobId}` };
+      for (const source of ['holds', 'mergeGateReviewHold', 'mergeGateHoldExcused']) {
+        expect(resolveRequiredChecks(withHold(row, { ...bound, jobId }, source)).state).toBe('held');
+      }
+    });
+
+  it.each([undefined, null, '', 'bad', 0, 'a'.repeat(39), `${head}\n`].map(value => [value]))(
+    'invalid headSha %j never binds a hold or equates two missing heads', headSha => {
+      for (const source of ['holds', 'mergeGateReviewHold', 'mergeGateHoldExcused']) {
+        const options = withHold(failed, { ...bound, headSha }, source);
+        expect(resolveRequiredChecks(options).state).toBe('fail');
+        expect(resolveRequiredChecks({ ...options, head: headSha, rowsHead: headSha }).state).toBe('unknown');
+      }
+      const rows = ['failure', 'success'].map((conclusion, index) => ({ name: 'test', status: 'completed',
+        conclusion, head_sha: headSha, run_id: 1, run_attempt: index + 1, id: 7 }));
+      const result = resolveRequiredChecks({ ...evidence, rowsHead: undefined, rows, requiredNames: ['test'] });
+      expect(result).toMatchObject({ state: 'unknown', perName: { test: { rows: expect.arrayContaining(rows) } } });
+    });
+
+  it.each(['run_id', 'run_attempt', 'id', 'check_run_id', 'databaseId'])(
+    'invalid %s values cannot prove rerun supersession', field => {
+      for (const invalid of invalidIntegers) {
+        const failed = { name: 'test', status: 'completed', conclusion: 'failure', run_id: 1, run_attempt: 1, [field]: invalid };
+        const passed = { ...failed, conclusion: 'success', run_attempt: 2, [field]: invalid };
+        if (field === 'run_id' || field === 'run_attempt') {
+          failed.id = passed.id = 7;
+        }
+        const pairs = [[failed, passed]];
+        if (field === 'run_attempt') {
+          pairs.push([{ ...failed, run_attempt: 1 }, passed], [failed, { ...passed, run_attempt: 2 }]);
+        }
+        for (const pair of pairs) {
+          for (const rows of [pair, pair.toReversed()]) {
+            expect(resolveRequiredChecks({ ...evidence, rows, requiredNames: ['test'] }))
+              .toMatchObject({ state: 'fail', perName: { test: { rows: expect.arrayContaining(pair) } } });
+          }
+        }
+      }
+    });
+
+  it('invalid job identities cannot discard failures during ordered reruns', () => {
+    for (const job of ['0', '00', '07', '9007199254740992']) {
+      const rows = ['failure', 'success'].map((conclusion, index) => ({ name: 'test', status: 'completed',
+        conclusion, run_id: 1, run_attempt: index + 1, detailsUrl: `https://github.com/o/r/actions/runs/1/job/${job}` }));
+      for (const ordered of [rows, rows.toReversed()]) {
+        expect(resolveRequiredChecks({ ...evidence, rows: ordered, requiredNames: ['test'] }))
+          .toMatchObject({ state: 'fail', perName: { test: { rows: expect.arrayContaining(rows) } } });
+      }
+    }
+  });
+
+  it.each([undefined, null, 0, '', 'bad'].map(value => [value]))('invalid human hold ID %j cannot excuse a failure', id => {
+    for (const source of ['holds', 'mergeGateReviewHold', 'mergeGateHoldExcused']) {
+      expect(resolveRequiredChecks(withHold(failed, { ...bound, holdIds: [id] }, source)).state).toBe('fail');
+      expect(resolveRequiredChecks(withHold(failed, { ...bound, holdIds: ['review-acceptance', id] }, source)).state).toBe('fail');
+    }
+  });
+
   it.each([
     ['https://untrusted.invalid/o/r/actions/runs/999/job/7', 'fail'],
     ['https://untrusted.invalid/actions/runs/999/job/7suffix', 'fail'],
