@@ -1,7 +1,8 @@
 /** R1062/S7: sandbox-exec enforced filesystem confinement plus patch/transcript checks.
  * The launcher alone applies admitted hunks; agy's git operations remain forbidden. */
 import { execFileSync, spawn } from 'node:child_process';
-import { accessSync, constants, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { accessSync, constants, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
@@ -11,10 +12,12 @@ import { buildSandboxEnv, buildSandboxProfile, preparePrivateAgyHome, sandboxedS
 import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isAgyFixPathAllowed } from './agy-fix-admission.mjs';
+import { criticalWorkVerdict } from './critical-work.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
 // The juror's SAFE_GIT is private; keep its pins at every git boundary, including injected exec.
-const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false'];
+const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false',
+  '-c', 'core.attributesFile=/dev/null', '-c', 'core.pager=cat', '-c', 'diff.external='];
 const DEFAULTS = { allowedKinds: ['doc-fix', 'test-fix'], maxSize: 1, kindMaxSize: 3 };
 const WRITE_TOOLS = new Set(['write_to_file', 'replace_file_content', 'multi_replace_file_content']);
 const validPath = p => typeof p === 'string' && !!p && !isAbsolute(p)
@@ -22,6 +25,33 @@ const validPath = p => typeof p === 'string' && !!p && !isAbsolute(p)
   && !p.split('/').some(s => !s || s === '.' || s === '..' || s.toLowerCase() === '.git');
 const inScope = (p, scope) => scope.some(s => p === s || p.startsWith(`${s}/`));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// Plain filesystem evidence only: never resolve attacker-controlled git routing with git.
+// Missing optional controls are recorded; unreadable, redirected or special controls throw.
+function cloneGitControls(clone) {
+  const out = {};
+  const record = (rel, type, recursive = false) => {
+    const path = join(clone, rel);
+    let st;
+    try { st = lstatSync(path); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; out[rel] = null; return; }
+    if (st.isSymbolicLink() || (type === 'dir' ? !st.isDirectory()
+      : type === 'file' ? !st.isFile() : !st.isDirectory() && !st.isFile()))
+      throw new Error('unsafe clone git control');
+    out[rel] = st.isDirectory() ? `dir:${st.dev}:${st.ino}:${st.mode}`
+      : `${st.mode}:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+    if (recursive && st.isDirectory())
+      for (const name of readdirSync(path).sort()) record(`${rel}/${name}`, 'any', true);
+  };
+  record('.git', 'dir');
+  if (out['.git'] === null) throw new Error('missing clone git directory');
+  for (const p of ['info', 'objects', 'objects/info', 'refs']) record(`.git/${p}`, 'dir');
+  for (const p of ['commondir', 'HEAD', 'config', 'info/attributes', 'info/exclude', 'objects/info/alternates', 'shallow'])
+    record(`.git/${p}`, 'file');
+  for (const p of ['worktrees', 'modules', 'refs/replace', 'hooks']) record(`.git/${p}`, 'dir', true);
+  record('.gitattributes', 'file');
+  return out;
+}
 const defaultExec = (bin, args, opts) => {
   try { return execFileSync(bin, args, opts); }
   catch (e) { if (opts.diffExit && e.status === 1) return String(e.stdout); throw e; }
@@ -173,8 +203,11 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     const startHead = git(['-C', clone, 'rev-parse', 'HEAD']).trim();
     if (startHead !== before[laneDir].head) return result('refused', ['lane HEAD changed during clone']);
     if (escapingSymlinks(clone).length) return result('refused', ['clone contains escaping symlinks']);
-    const control = gitControlFiles(clone);
-    const gitDir = realpathSync(join(clone, '.git'));
+    const control = cloneGitControls(clone);
+    const cloneGit = (args, opts = {}) => git(args, { ...opts, env: { ...gitEnv,
+      GIT_DIR: join(clone, '.git'), GIT_COMMON_DIR: join(clone, '.git'), GIT_WORK_TREE: clone,
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: '',
+    } });
     // Stored inside the disposable clone, outside the tracked diff. Never accept a caller-selected log path.
     const transcriptFile = join(clone, '.git', 'agy-build.jsonl');
     let outcome, spawnError;
@@ -183,8 +216,8 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
         task: `Implement the repair described by the task data. Use only native file tools inside this checkout. Never run shell commands or git. ${FENCED_DATA_RULE}\n${fenceUntrusted('task', task)}\nAllowed paths: ${JSON.stringify(scope)}` });
     } catch (e) { spawnError = e; }
     const reasons = [];
-    if (!lstatSync(join(clone, '.git')).isDirectory() || realpathSync(join(clone, '.git')) !== gitDir
-      || !same(control, gitControlFiles(clone))) reasons.push('clone git config, hooks or attributes changed');
+    if (!same(control, cloneGitControls(clone)))
+      return result('voided', ['clone git controls changed; use another fix provider or request human review']);
     const controls = { [laneDir]: gitControlFiles(laneDir) };
     if (changedControl(before, controls).length) reasons.push('real lane git controls changed');
     else if (changedCheckouts(before, { [laneDir]: snapshotCheckout(laneDir, snapExec) }).length)
@@ -201,12 +234,13 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     if (escapingSymlinks(clone).length) reasons.push('clone contains escaping symlinks after run');
     // Do not invoke git after detecting changed controls or incomplete escape evidence.
     if (reasons.length) return result('voided', reasons);
-    if (git(['-C', clone, 'rev-parse', 'HEAD']).trim() !== startHead) return result('voided', ['clone HEAD moved']);
+    if (cloneGit(['-C', clone, 'rev-parse', 'HEAD']).trim() !== startHead) return result('voided', ['clone HEAD moved']);
     if (spawnError || outcome?.code !== 0 || outcome?.timedOut) return result('failed', ['agy build failed; use the next fix provider']);
     const diffFlags = ['--no-ext-diff', '--no-textconv', '--no-renames'];
-    const raw = git(['-C', clone, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
+    const raw = cloneGit(['-C', clone, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
     const paths = [];
-    const rejectPath = p => !isAgyFixPathAllowed(p, kind) || !inScope(p, scope) || p.split('/').includes('.gitattributes');
+    const rejectPath = p => !isAgyFixPathAllowed(p, kind) || !inScope(p, scope) || p.split('/').includes('.gitattributes')
+      || criticalWorkVerdict({ taskType: kind, filesTouched: [p] }).critical !== false;
     for (let i = 0; i < raw.length && raw[i]; i += 2) {
       const match = /^:(\d{6}) (\d{6}) [a-f0-9]+ [a-f0-9]+ ([AMD])$/.exec(raw[i]);
       const p = raw[i + 1];
@@ -217,13 +251,13 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
         return result('voided', ['symlink, submodule or mode change rejected']);
       paths.push(p);
     }
-    let patch = git(['-C', clone, 'diff', '--binary', ...diffFlags, startHead]);
-    const untracked = git(['-C', clone, 'ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean);
+    let patch = cloneGit(['-C', clone, 'diff', '--binary', ...diffFlags, startHead]);
+    const untracked = cloneGit(['-C', clone, 'ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean);
     for (const p of untracked) {
       if (rejectPath(p)) return result('voided', ['unsafe or out-of-scope untracked path']);
       const st = lstatSync(join(clone, p));
       if (!st.isFile() || st.isSymbolicLink()) return result('voided', ['untracked symlink or special file rejected']);
-      patch += git(['diff', '--no-index', '--binary', ...diffFlags, '--', '/dev/null', p], { cwd: clone, diffExit: true });
+      patch += cloneGit(['diff', '--no-index', '--binary', ...diffFlags, '--', '/dev/null', p], { cwd: clone, diffExit: true });
       paths.push(p);
     }
     if (/^(GIT binary patch|Binary files )/m.test(patch)) return result('voided', ['binary diff rejected']);

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { runConfinedAgyBuild } from '../agy-confined-build.mjs';
@@ -27,6 +27,7 @@ function fixture() {
   commit(lane);
   let clone;
   const commands = [];
+  const execCalls = [];
   const spawnAgy = vi.fn();
   const log = vi.fn();
   const run = async (act = () => {}, options = {}) => {
@@ -58,13 +59,14 @@ function fixture() {
         },
         exec: (bin, args, opts) => {
           commands.push(args);
+          execCalls.push({ bin, args, opts });
           if (options.raw !== undefined && args.includes('--raw')) return options.raw;
           try { return execFileSync(bin, args, opts); }
           catch (e) { if (opts.diffExit && e.status === 1) return String(e.stdout); throw e; }
         },
       } });
   };
-  return { root, lane, run, spawnAgy, commands, log, clone: () => clone };
+  return { root, lane, run, spawnAgy, commands, execCalls, log, clone: () => clone };
 }
 
 describe('agy build fail-closed admission', () => {
@@ -150,6 +152,51 @@ describe('agy build fail-closed admission', () => {
 });
 
 describe('launcher-owned atomic application', () => {
+  it.each([false, true])('voids critical docs/agent/testing.md under docs scope atomically (tracked=%s)', async tracked => {
+    const f = fixture();
+    const path = 'docs/agent/testing.md';
+    if (tracked) {
+      mkdirSync(dirname(join(f.lane, path)), { recursive: true });
+      writeFileSync(join(f.lane, path), 'before\n');
+      commit(f.lane);
+    }
+    expect(await f.run(dir => {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), 'changed\n');
+      writeFileSync(join(dir, 'docs/a.md'), 'after\n');
+    })).toMatchObject({ status: 'voided', applied: [] });
+    expect(f.commands.some(a => a.includes('apply'))).toBe(false);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+  it.each([false, true])('applies non-critical docs/guide.md under docs scope (tracked=%s)', async tracked => {
+    const f = fixture();
+    if (tracked) {
+      writeFileSync(join(f.lane, 'docs/guide.md'), 'before\n');
+      commit(f.lane);
+    }
+    expect(await f.run(dir => writeFileSync(join(dir, 'docs/guide.md'), 'after\n')))
+      .toMatchObject({ status: 'ok', applied: ['docs/guide.md'] });
+    expect(readFileSync(join(f.lane, 'docs/guide.md'), 'utf8')).toBe('after\n');
+  });
+  it('pins every post-run clone git call, including untracked diff generation', async () => {
+    const f = fixture();
+    let post;
+    expect((await f.run(dir => {
+      writeFileSync(join(dir, 'docs/a.md'), 'after\n');
+      writeFileSync(join(dir, 'docs/guide.md'), 'new\n');
+      post = f.execCalls.length;
+    })).status).toBe('ok');
+    const calls = f.execCalls.slice(post).filter(c => c.opts.env.GIT_WORK_TREE === f.clone());
+    expect(calls).toHaveLength(5);
+    for (const { args, opts } of calls) {
+      expect(opts.env).toMatchObject({ GIT_DIR: join(f.clone(), '.git'), GIT_COMMON_DIR: join(f.clone(), '.git'),
+        GIT_WORK_TREE: f.clone(), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_NO_REPLACE_OBJECTS: '1', GIT_ALTERNATE_OBJECT_DIRECTORIES: '' });
+      expect(args).toEqual(expect.arrayContaining(['core.attributesFile=/dev/null', 'core.fsmonitor=false',
+        'core.hooksPath=/dev/null', 'core.pager=cat', 'diff.external=']));
+      if (args.includes('diff')) expect(args).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv']));
+    }
+  });
   it('applies an in-scope hunk and an untracked text file, without staging or committing', async () => {
     const f = fixture();
     const head = git(f.lane, 'rev-parse', 'HEAD');
@@ -211,16 +258,42 @@ describe('launcher-owned atomic application', () => {
     })).status).toBe('voided');
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
   });
-  it.each(['.git/config', '.git/hooks/pre-commit', '.git/info/attributes'])('voids planted %s without post-run git in the clone', async p => {
+  it.each(['.git/config', '.git/commondir', '.git/HEAD', '.git/info/attributes', '.git/info/exclude',
+    '.git/objects/info/alternates', '.git/shallow', '.git/worktrees/evil/gitdir', '.git/modules/evil/config',
+    '.git/refs/replace/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '.git/hooks/pre-commit', '.git/hooks/nested/hook',
+  ])('voids planted %s without ANY post-run git', async p => {
     const f = fixture();
     let post;
     expect((await f.run(dir => {
       mkdirSync(dirname(join(dir, p)), { recursive: true });
-      writeFileSync(join(dir, p), 'planted\n');
+      writeFileSync(join(dir, p), p.endsWith('attributes') ? '* filter=attacker\n' : 'planted\n');
       post = f.commands.length;
     })).status).toBe('voided');
-    expect(f.commands.slice(post).some(a => a.includes(f.clone()))).toBe(false);
+    expect(f.commands.slice(post)).toEqual([]);
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+  it.each(['symlink', 'gitfile', 'missing'])('voids .git replaced with %s without ANY post-run git', async type => {
+    const f = fixture();
+    let post;
+    expect(await f.run(dir => {
+      renameSync(join(dir, '.git'), join(dir, '.git-saved'));
+      if (type === 'symlink') symlinkSync('.git-saved', join(dir, '.git'));
+      if (type === 'gitfile') writeFileSync(join(dir, '.git'), 'gitdir: .git-saved\n');
+      post = f.commands.length;
+    })).toMatchObject({ status: 'voided', applied: [] });
+    expect(f.commands.slice(post)).toEqual([]);
+  });
+  it('voids a redirected control parent without ANY post-run git', async () => {
+    const f = fixture();
+    let post;
+    expect(await f.run(dir => {
+      mkdirSync(join(dir, '.git/info'), { recursive: true }); // --template= leaves no info dir
+      renameSync(join(dir, '.git/info'), join(dir, '.git/info-saved'));
+      symlinkSync('info-saved', join(dir, '.git/info'));
+      post = f.commands.length;
+    })).toMatchObject({ status: 'voided', applied: [] });
+    // Only git aimed at the attacker-writable clone is forbidden; the trusted lane's own snapshot git is fine.
+    expect(f.commands.slice(post).filter(a => a.some(x => String(x).startsWith(f.clone())))).toEqual([]);
   });
   it('refuses a committed symlink out of the clone before launching', async () => {
     const f = fixture();

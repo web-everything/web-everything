@@ -4734,3 +4734,11 @@ the copy can only damage itself. The boundary is the diff: we keep ONLY the git 
 through the shared protected-path predicate, intersected with the launch scope (an item scope may only narrow
 it, with criticality re-checked), before the normal review and audit path. Network stays allowed (agy needs its
 API) and size-1 jobs of any kind are admitted by operator ruling R1062; neither is a confinement claim.
+
+The launcher hashes clone Git redirect/configuration controls with filesystem reads before any
+post-run Git invocation; unreadable or changed controls and a missing Git directory void the run. Clone Git reads
+pin both Git directories and the work tree, disable external diff/textconv and external configuration,
+and never accept clone controls as routing authority. Recheck every tracked and untracked diff path
+against the shared critical-work verdict as well as the protected-path predicate before applying anything.
+Keep regression cases asserting zero post-run exec calls after control tampering and atomic refusal
+of critical descendants within an otherwise permitted directory scope.
