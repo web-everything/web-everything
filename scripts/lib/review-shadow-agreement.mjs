@@ -98,7 +98,7 @@ function validShadowAnswer(answer) {
   const text = value => typeof value === 'string' && value.trim().length > 0;
   return object(answer) && text(answer.summary) && Array.isArray(answer.findings)
     && Array.from(answer.findings).every(finding => object(finding) && text(finding.summary)
-      && ['file', 'path', 'category', 'failure_scenario', 'disposition', 'impactIfUnfixed'].every(
+      && ['file', 'path', 'category', 'failure_scenario', 'disposition', 'impactIfUnfixed', 'quote'].every(
         key => finding[key] == null || typeof finding[key] === 'string')
       && (finding.line == null || (Number.isSafeInteger(finding.line) && finding.line > 0)));
 }

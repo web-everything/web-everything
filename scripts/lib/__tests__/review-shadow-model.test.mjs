@@ -274,6 +274,7 @@ describe('shadow rows', () => {
     { summary: 'reviewed', findings: [{ summary: 42 }] },
     { summary: 'reviewed', findings: [{ summary: 'defect', file: 42 }] },
     { summary: 'reviewed', findings: [{ summary: 'defect', line: -1 }] },
+    { summary: 'reviewed', findings: [{ summary: 'defect', quote: {} }] },
   ])('malformed raw answer %j is invalid promotion evidence on either side', malformed => {
     const valid = { summary: 'reviewed', findings: [finding] };
     const makeRow = (claude, agy, lens) => buildShadowRow({
