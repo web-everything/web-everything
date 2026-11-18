@@ -112,7 +112,7 @@ import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { latestChangesVerdict } from '../review-set-label.mjs';
-import { gateOutcomesForHead } from '../lib/red-team-gate.mjs';
+import { latestGateForHead } from '../lib/red-team-gate.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
@@ -1508,10 +1508,12 @@ function sendBackAfterFixAttempt(pr) {
   const lastIndex = Math.max(-1, ...attempts.map(c => comments.indexOf(c)));
   const verdict = latestChangesVerdict(trusted);
   const operatorRequest = operatorSendBackAfterReview(pr);
+  const gate = latestGateForHead(comments, pr.number, pr.headRefOid);
+  const gateRequest = gate?.outcome === 'sent-back'
+    || (gate?.outcome === 'operator-block' && labelNames(pr.labels).includes('red-team:blocked'))
+    ? gate.comment : null;
   const requests = trusted.filter(c => {
-    const outcomes = gateOutcomesForHead([c], pr.number, pr.headRefOid);
-    return (c === verdict && (!isOperatorAuthored(c) || Boolean(operatorRequest))) || outcomes.has('sent-back')
-      || (labelNames(pr.labels).includes('red-team:blocked') && outcomes.has('operator-block'));
+    return (c === verdict && (!isOperatorAuthored(c) || Boolean(operatorRequest))) || c === gateRequest;
   });
   // Requests are not completed reviews. Keep their slots so thread order remains comparable,
   // and require readable review evidence before reopening an already-reviewed head.
@@ -1519,9 +1521,8 @@ function sendBackAfterFixAttempt(pr) {
   if (!review) return false;
   if (requests.some(c => {
     const heads = reviewedHeadsOf(c);
-    const outcomes = gateOutcomesForHead([c], pr.number, pr.headRefOid);
     const pinned = heads.some(head => sameHeadSha(head, pr.headRefOid))
-      || outcomes.has('sent-back') || outcomes.has('operator-block');
+      || c === gateRequest;
     const sanctionedOperator = c === verdict && operatorRequest
       && String(c.id ?? c.node_id) === operatorRequest.verdictId;
     return (pinned || sanctionedOperator)

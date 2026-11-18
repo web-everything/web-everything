@@ -130,6 +130,34 @@ describe('same-head referral resume preserves a newer send-back', () => {
     expect(result.refusals).toEqual([]);
   });
 
+  it.each(['round-cap', 'clear', 'card-queued', 'unknown'])('a later red-team %s supersedes a sent-back on the same head after the fixer attempt', outcome => {
+    const sentBack = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=sent-back -->`, '2026-11-18T05:43:00Z');
+    const later = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, '2026-11-18T05:44:00Z');
+    const result = run(['status:sent-back-red-team', 'red-team:blocked'], [attempt, advisory, sentBack, later], { number: 6989 });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it.each([
+    { name: 'creation time before thread position', sentAt: '2026-11-18T05:43:00Z', reversed: true },
+    { name: 'thread position for equal creation times', sentAt: '2026-11-18T05:44:00Z', reversed: false },
+  ])('latest red-team decision uses $name', ({ sentAt, reversed }) => {
+    const sentBack = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=sent-back -->`, sentAt);
+    const capped = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=round-cap -->`, '2026-11-18T05:44:00Z');
+    const result = run(['status:sent-back-red-team', 'red-team:blocked'],
+      [attempt, advisory, ...(reversed ? [capped, sentBack] : [sentBack, capped])], { number: 6989 });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it('a latest operator-block without red-team:blocked cannot release the hold', () => {
+    const sentBack = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=sent-back -->`, '2026-11-18T05:43:00Z');
+    const blocked = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=operator-block -->`, '2026-11-18T05:44:00Z');
+    const result = run(['status:sent-back-red-team'], [attempt, advisory, sentBack, blocked], { number: 6989 });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
   it('without a send-back after the last fixer attempt still refuses already-reviewed-head', () => {
     const result = run([], [sendBack, { ...attempt, createdAt: '2026-11-18T05:30:00Z' }, advisory]);
     expect(result.dispatch).toEqual([]);
