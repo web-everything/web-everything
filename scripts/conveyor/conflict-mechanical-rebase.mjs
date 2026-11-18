@@ -10,6 +10,9 @@ import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
+import { countUnresolvedStandDowns, concurrentAuthorPauseState } from './reconcile-core.mjs';
+import { standDownHeadChangeAt } from './stand-down.mjs';
+import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 import { defaultReadOpenPrs, defaultReadMainTip, refreshOntoMain, defaultReadIsCrossRepository,
   sameRepoRefusal, reconcileAcceptanceAfterRebase, defaultPostRebaseComment } from './ci-red-recovery-watch.mjs';
 
@@ -90,7 +93,7 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
   const result = { dispatch, applied, refusals };
   if (!Number.isInteger(maxPerPass) || maxPerPass < 1 || maxPerPass > 100) return result;
   const candidates = buildConflictRebaseCandidates(readOpenPrs({ repo, extraFields:
-    ['state', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'labels'] }), { defaultBranch });
+    ['state', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'labels', 'comments'] }), { defaultBranch });
   if (!candidates.length) return result;
   const mainSha = readMainTip({ repo, defaultBranch })?.sha;
   if (!/^[a-f0-9]{40}$/i.test(mainSha ?? '')) {
@@ -102,6 +105,14 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
   for (const pr of candidates) {
     if (attempts >= maxPerPass) break;
     const row = { prNumber: pr.number, headRefName: pr.headRefName, headSha: pr.headRefOid };
+    const commentsReadable = Array.isArray(pr.comments) && pr.comments.length < LIST_COMMENTS_PAGE_SIZE
+      && pr.comments.every(c => typeof c?.body === 'string' && typeof c?.author?.login === 'string');
+    const pause = commentsReadable ? concurrentAuthorPauseState({ ...pr, now: now() }) : null;
+    const why = !commentsReadable ? 'comments unreadable or possibly truncated; operator must inspect the full thread before rebasing'
+      : countUnresolvedStandDowns(pr.comments, { headRefOid: pr.headRefOid, headChangedAt: standDownHeadChangeAt(pr) }) > 0
+        ? 'unanswered stand-down; record an explicit operator answer with stand-down-answer.mjs'
+        : pause?.held ? pause.why : null;
+    if (why) { refusals.push({ ...row, kind: 'conflict-rebase-held', why }); continue; }
     if (!apply) { dispatch.push(row); continue; }
     const held = checkClaim({ repo, branch: pr.headRefName });
     const guard = held || sameRepoRefusal(pr.number, { repo, readIsCrossRepository });

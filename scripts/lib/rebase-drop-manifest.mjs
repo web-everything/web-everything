@@ -33,6 +33,9 @@
  * unit-testable without a real repo (see `scripts/lib/__tests__/rebase-drop-manifest.test.mjs`).
  */
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { gitRun as gitRunner, ensureFullHistory } from './git-run.mjs';
 import { applyCollisionHealToIndex } from './nnn-collision-heal.mjs';
 import { isFixEvidencePath, isDrainTransientPath } from './transient-paths.mjs';
@@ -129,7 +132,7 @@ export { gitRunner };
  * @param {boolean} [o.fetch=true]      fetch `<laneRef>` from `<remote>` first so `<remote>/<laneRef>` is current (#2231).
  * @param {string} [o.manifest='.lane-manifest.json']
  * @param {string} [o.message]          commit-tree message (defaults to a "drain: rebase … drop manifest" line).
- * @param {string} [o.tmpIndex]         temp index path for GIT_INDEX_FILE (default `.git/rebase-drop-index`).
+ * @param {string} [o.tmpIndex]         temp index path for GIT_INDEX_FILE (default `.git/rebase-drop-index`; strict calls own a unique index).
  * @param {boolean}[o.healCollision=false] #2276 — ALSO renumber a colliding new backlog item in the SAME rebuilt
  *                                       tip (reusing #2222's `applyCollisionHealToIndex`), so the rebuild that
  *                                       already runs to shed the manifest also clears an `ids must be unique` dup
@@ -140,7 +143,20 @@ export { gitRunner };
  *                                       non-local lane tip too, given that repo's own clone is provisioned.
  * @param {(cmd:string,args:string[],opts?:object)=>{status:number,stdout:string,stderr:string}} [o.run] injected runner.
  */
-export function rebaseDropManifest({
+export function rebaseDropManifest(options = {}) {
+  if (!options.strict) return rebaseDropManifestCore(options);
+  let dir;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'rebase-drop-'));
+    return rebaseDropManifestCore({ ...options, tmpIndex: join(dir, 'index') });
+  } catch (e) {
+    return { action: 'error', reason: `strict rebase failed: ${e.message}` };
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function rebaseDropManifestCore({
   laneRef,
   base = 'origin/main',
   remote = 'origin',
@@ -211,12 +227,14 @@ export function rebaseDropManifest({
   const read = run('git', ['read-tree', parsed.tree], { env, cwd });
   if (read.status !== 0) return { action: 'error', reason: `read-tree failed (${(read.stderr || '').split('\n')[0]})` };
   // Drop the manifest if present (--ignore-unmatch: a clean merge with no manifest in the tree is fine).
-  run('git', ['rm', '--cached', '--ignore-unmatch', manifest], { env, cwd });
+  const removed = run('git', ['rm', '--cached', '--ignore-unmatch', manifest], { env, cwd });
+  if (strict && removed.status !== 0) return { action: 'error', reason: 'git rm --cached manifest failed; use existing fix dispatch or human review' };
   const rootEntries = run('git', ['ls-tree', '--name-only', parsed.tree], { env, cwd });
   const droppedEvidence = rootEntries.status === 0
     ? String(rootEntries.stdout || '').split('\n').filter(isFixEvidencePath) : [];
   if (droppedEvidence.length) {
-    run('git', ['rm', '--cached', '--ignore-unmatch', '--', ...droppedEvidence], { env, cwd });
+    const removedEvidence = run('git', ['rm', '--cached', '--ignore-unmatch', '--', ...droppedEvidence], { env, cwd });
+    if (strict && removedEvidence.status !== 0) return { action: 'error', reason: 'git rm --cached fix evidence failed; use existing fix dispatch or human review' };
   }
   // #2276 — in the SAME rebuilt tip, renumber a colliding new backlog item against `<base>` (reusing #2222's
   // apply-to-index), so a rebuild that already runs to shed the manifest also clears an `ids must be unique`

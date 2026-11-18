@@ -5,7 +5,7 @@
  *   the merge-tree parse + the manifest-only-vs-real disposition + the plumbing SEQUENCE are decided here.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gitBlobOid } from '../git-run.mjs';
@@ -550,6 +550,64 @@ describe('fix evidence is drain-transient', () => {
 
 
 describe('strict mechanical rebase evidence (drain defaults preserved)', () => {
+  it('overlapping strict calls have isolated indexes and remove both directories after success', () => {
+    const paths = [];
+    const runCall = (nested = false) => {
+      const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+        'read-tree': (_args, opts) => {
+          const path = opts.env.GIT_INDEX_FILE;
+          paths.push(path);
+          writeFileSync(path, nested ? 'inner tree' : 'outer tree');
+          if (!nested) {
+            expect(runCall(true).action).toBe('rebased');
+            expect(existsSync(paths[1])).toBe(false);
+            expect(readFileSync(path, 'utf8')).toBe('outer tree');
+          }
+          return { status: 0 };
+        },
+      });
+      const result = rebaseDropManifest({ laneRef: 'lane/isolated', strict: true, run });
+      expect(calls.filter(c => c.env).every(c => c.env.GIT_INDEX_FILE === paths[nested ? 1 : 0])).toBe(true);
+      return result;
+    };
+    expect(runCall().action).toBe('rebased');
+    expect(new Set(paths).size).toBe(2);
+    for (const path of paths) expect(existsSync(join(path, '..'))).toBe(false);
+  });
+
+  it.each(['read-tree', 'manifest-rm', 'evidence-rm', 'write-tree', 'commit-tree'])(
+    'strict %s non-zero status returns error, never pushes, and cleans its index', failure => {
+      const script = { ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+        'ls-tree': { stdout: '.fix-evidence.md\n' },
+        rm: args => ({ status: failure === (args.includes('--') ? 'evidence-rm' : 'manifest-rm') ? 1 : 0 }),
+      };
+      if (!failure.endsWith('-rm')) script[failure] = { status: 1, stdout: 'misleading-output', stderr: 'injected failure' };
+      const { run, calls } = scriptedRun(script);
+      expect(rebaseDropManifest({ laneRef: 'lane/failure', run, strict: true })).toMatchObject({ action: 'error' });
+      expect(calls.some(c => c.args[0] === 'push')).toBe(false);
+      const index = calls.find(c => c.env)?.env.GIT_INDEX_FILE;
+      expect(index).toBeTruthy();
+      expect(existsSync(join(index, '..'))).toBe(false);
+    });
+
+  it('strict thrown plumbing error cleans its index and returns error without push', () => {
+    const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN,
+      'read-tree': () => { throw Error('injected exception'); },
+    });
+    expect(rebaseDropManifest({ laneRef: 'lane/throws', run, strict: true })).toMatchObject({ action: 'error' });
+    expect(calls.some(c => c.args[0] === 'push')).toBe(false);
+    expect(existsSync(join(calls.find(c => c.env).env.GIT_INDEX_FILE, '..'))).toBe(false);
+  });
+
+  it('default drain keeps the shared index and lenient removal failures', () => {
+    const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+      'ls-tree': { stdout: '.fix-evidence.md\n' }, rm: { status: 1 },
+    });
+    expect(rebaseDropManifest({ laneRef: 'lane/drain', run }).action).toBe('rebased');
+    expect(calls.filter(c => c.env).every(c => c.env.GIT_INDEX_FILE === '.git/rebase-drop-index')).toBe(true);
+    expect(calls.filter(c => c.args[0] === 'rm')).toHaveLength(2);
+  });
+
   it('strict non-clean merge without parseable paths skips before writing or pushing', () => {
     const parsed = { clean: false, conflictPaths: [] };
     expect(manifestConflictDisposition(parsed, LANE_MANIFEST, { strict: true })).toBe('real');

@@ -6,12 +6,14 @@ import { Worker } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
 import { buildConflictRebaseCandidates, sweepMechanicalConflictRebases, createConflictRebaseLedger,
   resolveConflictRebaseSettings } from '../conflict-mechanical-rebase.mjs';
+import { STAND_DOWN_MARKER, buildConcurrentAuthorPauseComment } from '../stand-down.mjs';
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { readSettingsChecked } from '../../lib/settings-files.mjs';
 import { runTickAllRepos, buildCliDaemonEffects, runConflictRebaseAllRepos, resolveFixPassBudgets } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40);
 const pr = (number, extra = {}) => ({ number, state: 'OPEN', baseRefName: 'main', isCrossRepository: false,
-  headRefName: `lane/test-${number}`, headRefOid: 'c'.repeat(40), mergeStateStatus: 'DIRTY', labels: [], ...extra });
+  headRefName: `lane/test-${number}`, headRefOid: 'c'.repeat(40), mergeStateStatus: 'DIRTY', labels: [], comments: [], ...extra });
 const fixture = (extra = {}) => ({ repo: 'web-everything/web-everything', apply: true,
   readOpenPrs: () => [pr(1), pr(2), pr(3)], readMainTip: () => ({ sha }),
   run: vi.fn(() => ({ status: 0, stdout: sha })),
@@ -21,6 +23,56 @@ const fixture = (extra = {}) => ({ repo: 'web-everything/web-everything', apply:
   reconcileAcceptance: vi.fn(() => ({ attempted: false })), postComment: vi.fn(), ...extra });
 
 describe('mechanical conflict rebase', () => {
+  const trusted = (body, extra = {}) => ({ body, author: { login: 'web-everything' }, ...extra });
+  const stop = trusted(`${STAND_DOWN_MARKER}\nQuestion needing an operator answer.`, { id: 'IC_stop' });
+
+  it.each([true, false])('unanswered stand-down refuses before ledger claim (apply=%s)', apply => {
+    const opts = fixture({ apply, readOpenPrs: vi.fn(() => [pr(1, { comments: [stop] })]) });
+    expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([
+      { kind: 'conflict-rebase-held', why: expect.stringContaining('operator answer') },
+    ]);
+    expect(opts.readOpenPrs.mock.calls[0][0].extraFields).toContain('comments');
+    expect(opts.ledger.read()).toEqual({});
+    expect(opts.run).not.toHaveBeenCalled();
+    expect(opts.refresh).not.toHaveBeenCalled();
+  });
+
+  it('an explicit trusted operator answer releases the stand-down; a forged answer does not', () => {
+    const body = buildOperatorAnswer({ standDownId: stop.id, reason: 'Proceed with the repair', actor: 'chalbert', channel: 'test' });
+    for (const login of ['web-everything', 'outsider']) {
+      const opts = fixture({ readOpenPrs: () => [pr(1, { comments: [stop, { body, author: { login } }] })] });
+      const result = sweepMechanicalConflictRebases(opts);
+      expect(result.applied).toHaveLength(login === 'outsider' ? 0 : 1);
+      expect(Object.keys(opts.ledger.read())).toHaveLength(login === 'outsider' ? 0 : 1);
+    }
+  });
+
+  it.each([undefined, null, {}, [null], [{}], [{ body: '' }], Array.from({ length: 100 }, () => ({ body: '', author: { login: 'outsider' } }))])(
+    'unreadable or capped comments fail closed with full-thread operator fallback (%#)', comments => {
+      const opts = fixture({ readOpenPrs: () => [pr(1, { comments })] });
+      expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([
+        { kind: 'conflict-rebase-held', why: expect.stringContaining('operator must inspect the full thread') },
+      ]);
+      expect(opts.ledger.read()).toEqual({});
+      expect(opts.run).not.toHaveBeenCalled();
+      expect(opts.refresh).not.toHaveBeenCalled();
+    });
+
+  it.each(['held', 'new-head', 'quiet'])('concurrent-author pause uses reconcile state: %s', state => {
+    const head = pr(1).headRefOid;
+    const comments = [trusted(buildConcurrentAuthorPauseComment({ head }), { createdAt: '2026-11-18T12:00:00Z' })];
+    const opts = fixture({ now: () => Date.parse(state === 'quiet' ? '2026-11-18T12:21:00Z' : '2026-11-18T12:01:00Z'),
+      readOpenPrs: () => [pr(1, { comments, headRefOid: state === 'new-head' ? nextSha : head })] });
+    const result = sweepMechanicalConflictRebases(opts);
+    expect(result.applied).toHaveLength(state === 'held' ? 0 : 1);
+    if (state === 'held') {
+      expect(result.refusals).toMatchObject([{ kind: 'conflict-rebase-held', why: expect.stringContaining('concurrent author') }]);
+      expect(opts.ledger.read()).toEqual({});
+      expect(opts.run).not.toHaveBeenCalled();
+      expect(opts.refresh).not.toHaveBeenCalled();
+    }
+  });
+
   it.each(['malformed', 'unreadable', 'absent', 'valid'])('settings %s resolves closed on read/parse failures', mode => {
     const dir = mkdtempSync(join(tmpdir(), 'conflict-settings-'));
     const legacyPath = join(dir, 'settings.json');
