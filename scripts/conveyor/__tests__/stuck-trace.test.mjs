@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { traceStuckPr, TRACE_TRIGGERS } from '../stuck-trace.mjs';
+import { createHash } from 'node:crypto';
+import { enqueueStuckTrace, drainStuckTraces, TRACE_TRIGGERS } from '../stuck-trace.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
 import { runMergeWatch } from '../pass-daemons/pr-merge-watch-pass.mjs';
 
@@ -25,19 +26,106 @@ function fixture(t) {
   return { root, options, events, calls, why, trace };
 }
 
-test('dedupe persists before IO across callers and triggers; a new head re-arms', async t => {
+const queue = f => JSON.parse(readFileSync(join(f.root, 'stuck-trace-queue.json')));
+const key = `${repo}#17@${head}`;
+async function traceStuckPr(options) {
+  const enqueued = enqueueStuckTrace(options);
+  if (enqueued.skipped === 'trigger') return enqueued;
+  const result = await drainStuckTraces(options);
+  return { posted: result.processed > 0 };
+}
+
+test('enqueue never throws, including an unwritable queue, and does no subprocess IO', t => {
   const f = fixture(t);
-  const run = f.options.run;
-  f.options.run = async args => {
-    assert.ok(JSON.parse(readFileSync(join(f.root, 'stuck-trace.json')))[`${repo}#17@${head}`]);
-    return run(args);
+  assert.deepEqual(enqueueStuckTrace(f.options), { queued: true });
+  assert.equal(f.calls.length, 0);
+  assert.equal(queue(f)[key].attempts, 0);
+  assert.equal(enqueueStuckTrace({ ...f.options, kind: 'stalled' }).skipped, 'duplicate');
+  const bad = join(f.root, 'not-a-directory'); writeFileSync(bad, 'file');
+  assert.doesNotThrow(() => enqueueStuckTrace({ ...f.options, stateDir: bad }));
+});
+
+test('drain processes only two oldest entries, persists claims before IO, and done never repeats', async t => {
+  const f = fixture(t);
+  for (const pr of [19, 18, 17]) enqueueStuckTrace({ ...f.options, pr, now: Date.parse(now) + pr });
+  const run = async args => {
+    const subject = `${repo}#${args[1].slice('--pr='.length)}@${head}`;
+    assert.equal(queue(f)[subject].attempts, 1);
+    assert.equal(queue(f)[subject].state, 'queued');
+    return f.options.run(args);
   };
-  const results = await Promise.all([traceStuckPr(f.options), traceStuckPr({ ...f.options, kind: 'stalled' })]);
-  assert.equal(results.filter(r => r.posted).length, 1);
-  assert.equal((await traceStuckPr(f.options)).skipped, 'duplicate');
-  await traceStuckPr({ ...f.options, run, head: 'b'.repeat(40) });
-  assert.equal(f.events.length, 2); assert.equal(f.calls.length, 4);
+  assert.equal((await drainStuckTraces({ ...f.options, now: Date.parse(now) + 100, run })).processed, 2);
+  assert.deepEqual(f.events.map(e => e.pr), [17, 18]);
+  assert.equal(f.calls.length, 4);
+  assert.equal(queue(f)[key].state, 'done');
+  await drainStuckTraces(f.options); await drainStuckTraces(f.options);
+  assert.deepEqual(f.events.map(e => e.pr), [17, 18, 19]);
+  assert.equal(f.calls.length, 6);
   assert.deepEqual(f.calls[0], ['why', '--pr=17', `--repo=${repo}`, '--json']);
+  assert.equal((await drainStuckTraces({ ...f.options, max: 3 })).processed, 0);
+});
+
+test('transient read or sink failure retries an unchanged head after ten minutes, up to three attempts', async t => {
+  for (const failure of ['read', 'sink', 'throw']) {
+    const f = fixture(t); enqueueStuckTrace(f.options);
+    const failed = { ...f.options, ...(failure === 'read'
+      ? { run: async () => { throw Error('offline'); } }
+      : { emit: () => { if (failure === 'throw') throw Error('sink'); return false; } }) };
+    await drainStuckTraces(failed);
+    assert.equal(queue(f)[key].state, 'queued');
+    assert.equal(f.events.length, 0);
+    assert.equal(enqueueStuckTrace(f.options).skipped, 'duplicate');
+    assert.equal((await drainStuckTraces({ ...f.options, now: Date.parse(now) + 599_999 })).processed, 0);
+    await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_000 });
+    assert.equal(queue(f)[key].state, 'done');
+    assert.equal(queue(f)[key].attempts, 2);
+    assert.equal(f.events.length, 1);
+    await drainStuckTraces({ ...f.options, now: Date.parse(now) + 1800_000 });
+    assert.equal(f.events.length, 1);
+  }
+  const f = fixture(t); enqueueStuckTrace(f.options);
+  for (const minutes of [0, 10, 20, 30]) await drainStuckTraces({ ...f.options,
+    now: Date.parse(now) + minutes * 60_000, emit: () => false });
+  assert.equal(queue(f)[key].attempts, 3); assert.equal(f.calls.length, 6);
+});
+
+test('crashed claims retry; legacy done receipts and completion markers remain delivered', async t => {
+  const f = fixture(t);
+  writeFileSync(join(f.root, 'stuck-trace.json'), JSON.stringify({
+    [key]: { state: 'claimed', at: now, attempts: 1 },
+    [`${repo}#18@${head}`]: { state: 'done', at: now, attempts: 1 },
+    [`${repo}#19@${head}`]: { at: now, trigger: 'stalled' },
+    [`${repo}#20@${head}`]: { state: 'claimed', at: now, attempts: 1 },
+  }));
+  const hash = createHash('sha256').update(`${repo}#20@${head}`).digest('hex');
+  writeFileSync(join(f.root, `stuck-trace-done-${hash}.json`), JSON.stringify({ state: 'done' }));
+  assert.equal((await drainStuckTraces(f.options)).processed, 0);
+  await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_000 });
+  assert.deepEqual(f.events.map(e => e.pr), [17]);
+  assert.equal(queue(f)[key].state, 'done');
+});
+
+test('successful emit survives a busy receipt-finalization lock and never repeats', async t => {
+  const f = fixture(t), lock = join(f.root, 'stuck-trace-queue.json.lock');
+  enqueueStuckTrace(f.options);
+  await drainStuckTraces({ ...f.options, emit: event => {
+    f.events.push(event);
+    writeFileSync(lock, String(process.pid), { flag: 'wx' });
+    return true;
+  } });
+  assert.equal(queue(f)[key].state, 'queued');
+  const hash = createHash('sha256').update(key).digest('hex');
+  assert.equal(JSON.parse(readFileSync(join(f.root, `stuck-trace-done-${hash}.json`))).state, 'done');
+  rmSync(lock);
+  for (const minutes of [10, 30]) {
+    assert.equal((await drainStuckTraces({ ...f.options, now: Date.parse(now) + minutes * 60_000 })).processed, 0);
+  }
+  assert.equal(queue(f)[key].state, 'done');
+  assert.equal(f.events.length, 1); assert.equal(f.calls.length, 2);
+  enqueueStuckTrace({ ...f.options, pr: 18 });
+  await drainStuckTraces(f.options);
+  assert.deepEqual(f.events.map(e => e.pr), [17, 18]);
+  assert.equal(f.calls.length, 4);
 });
 
 test('one event contains owner, suggested operation, gates, holds, stage, labels and daemon times', async t => {
@@ -62,74 +150,28 @@ test('reads both direct and wrapped verdict shapes for each operation', async t 
   }
 });
 
-test('unknown direct shapes emit incomplete evidence with a manual inspection fallback', async t => {
+test('unknown direct shapes remain queued without delivering a note', async t => {
   const f = fixture(t);
   await traceStuckPr({ ...f.options, run: async () => ({ owner: 17, likelyBlocker: null }) });
-  assert.match(f.events[0].detail.note, /INCOMPLETE/);
-  assert.match(f.events[0].detail.note, /inspect manually/);
+  assert.equal(f.events.length, 0);
+  assert.equal(queue(f)[key].state, 'queued');
 });
 
-test('operation failure emits one incomplete note with unavailable fields and never retries', async t => {
-  const f = fixture(t); let calls = 0;
-  const options = { ...f.options, run: async () => { calls++; throw Error('offline'); } };
-  await traceStuckPr(options); await traceStuckPr(options);
-  assert.equal(calls, 2); assert.equal(f.events.length, 1);
-  assert.match(f.events[0].detail.note, /INCOMPLETE/);
-  assert.match(f.events[0].detail.note, /owner: unavailable/);
-});
-
-test('failed sink retries only on a later call after ten minutes, then success never repeats', async t => {
-  for (const emit of [() => false, () => { throw Error('sink'); }]) {
-    const f = fixture(t);
-    assert.equal((await traceStuckPr({ ...f.options, emit })).posted, false);
-    const receipt = () => JSON.parse(readFileSync(join(f.root, 'stuck-trace.json')))[`${repo}#17@${head}`];
-    assert.deepEqual(receipt(), { state: 'claimed', at: new Date(now).toISOString(), attempts: 1 });
-    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 600_000 })).skipped, 'duplicate');
-    assert.equal(f.calls.length, 2);
-    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 600_001, kind: 'stalled' })).posted, true);
-    assert.equal(receipt().state, 'done'); assert.equal(receipt().attempts, 2);
-    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 1800_000 })).skipped, 'duplicate');
-    assert.equal(f.calls.length, 4); assert.equal(f.events.length, 1);
-  }
-});
-
-test('successful emit survives a busy receipt-finalization lock and never repeats', async t => {
-  const f = fixture(t), file = join(f.root, 'stuck-trace.json'), lock = `${file}.lock`;
-  const emit = event => {
-    f.events.push(event);
-    writeFileSync(lock, String(process.pid), { flag: 'wx' });
-    return true;
-  };
-  assert.deepEqual(await traceStuckPr({ ...f.options, emit }), { posted: true });
-  assert.equal(JSON.parse(readFileSync(file))[`${repo}#17@${head}`].state, 'claimed');
-  rmSync(lock);
-  const later = { ...f.options, now: Date.parse(now) + 600_001, kind: 'stalled' };
-  assert.equal((await traceStuckPr(later)).skipped, 'duplicate');
-  assert.equal((await traceStuckPr({ ...later, now: Date.parse(now) + 1800_000 })).skipped, 'duplicate');
-  assert.equal(f.events.length, 1); assert.equal(f.calls.length, 2);
-  // Completion is specific to the subject, not a global suppression flag.
-  assert.equal((await traceStuckPr({ ...later, pr: 18 })).posted, true);
-});
-
-test('crashed claims are reclaimed once across concurrent daemons, with three attempts maximum', async t => {
-  const f = fixture(t), file = join(f.root, 'stuck-trace.json');
-  writeFileSync(file, JSON.stringify({ [`${repo}#17@${head}`]: { state: 'claimed', at: now, attempts: 1 } }));
-  const options = { ...f.options, now: Date.parse(now) + 600_001, emit: () => false };
-  await Promise.all([traceStuckPr(options), traceStuckPr({ ...options, kind: 'stalled' })]);
-  assert.equal(f.calls.length, 2);
-  await traceStuckPr({ ...options, now: Date.parse(now) + 1200_002 });
-  assert.equal(f.calls.length, 4);
-  assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 1800_003 })).skipped, 'duplicate');
-  assert.equal(JSON.parse(readFileSync(file))[`${repo}#17@${head}`].attempts, 3);
-});
-
-test('legacy receipts remain suppressed and malformed claims fail closed', async t => {
-  for (const receipt of [{ at: now, trigger: 'stalled' }, { state: 'claimed', at: 'invalid', attempts: 1 },
-    { state: 'claimed', at: now }, { state: 'unknown', at: now, attempts: 1 }]) {
-    const f = fixture(t);
-    writeFileSync(join(f.root, 'stuck-trace.json'), JSON.stringify({ [`${repo}#17@${head}`]: receipt }));
-    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 1800_000 })).skipped, 'duplicate');
-    assert.equal(f.calls.length, 0);
+test('persistent failure of either evidence read never delivers duplicate incomplete notes', async t => {
+  for (const failedOp of ['why', 'pr-trace']) {
+    const f = fixture(t); enqueueStuckTrace(f.options);
+    let calls = 0;
+    const run = async args => {
+      calls++;
+      if (args[0] === failedOp) throw Error('offline');
+      return f.options.run(args);
+    };
+    for (const minutes of [0, 10, 20, 30]) await drainStuckTraces({ ...f.options, run,
+      now: Date.parse(now) + minutes * 60_000 });
+    assert.equal(calls, 6);
+    assert.equal(queue(f)[key].attempts, 3);
+    assert.equal(queue(f)[key].state, 'queued');
+    assert.equal(f.events.length, 0);
   }
 });
 
@@ -143,6 +185,8 @@ test('why screen gaps and each pr-trace gap list independently mark notes INCOMP
     if (source === 'none') assert.doesNotMatch(note, /INCOMPLETE/);
     else { assert.match(note, /INCOMPLETE/); assert.match(note, /checks: offline/); }
     if (source === 'screen') assert.match(note, /queue: denied/);
+    await drainStuckTraces({ ...f.options, now: Date.parse(now) + 1800_000 });
+    assert.equal(f.events.length, 1);
   }
 });
 
@@ -177,50 +221,64 @@ test('oversized hostile fields are bounded, sanitized and name the full-evidence
   assert.match(note, /inspect full operation JSON/);
 });
 
-test('unreadable receipts fail closed without running operations', async t => {
-  const f = fixture(t); writeFileSync(join(f.root, 'stuck-trace.json'), '{bad');
-  assert.equal((await traceStuckPr(f.options)).posted, false); assert.equal(f.calls.length, 0);
+test('unreadable queue fails closed without subprocess IO', async t => {
+  const f = fixture(t); writeFileSync(join(f.root, 'stuck-trace-queue.json'), '{bad');
+  assert.equal(enqueueStuckTrace(f.options).queued, false);
+  assert.equal((await drainStuckTraces(f.options)).processed, 0);
+  assert.equal(f.calls.length, 0);
 });
 
 test('unknown head re-arms once per PR per day', async t => {
-  const f = fixture(t); const opts = { ...f.options, head: 'unknown-head' };
-  await traceStuckPr(opts); assert.equal((await traceStuckPr(opts)).skipped, 'duplicate');
-  await traceStuckPr({ ...opts, now: '2026-11-11T12:00:00Z' }); assert.equal(f.events.length, 2);
+  const f = fixture(t), options = { ...f.options, head: 'unknown-head' };
+  await traceStuckPr(options); await traceStuckPr(options);
+  await traceStuckPr({ ...options, now: '2026-11-11T12:00:00Z' });
+  assert.equal(f.events.length, 2);
 });
 
-test('hung operations time out into one incomplete event without a retry', async t => {
-  const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
-  const options = { ...f.options, run: () => new Promise(() => {}) };
-  const pending = traceStuckPr(options);
-  t.mock.timers.tick(59_000);
-  assert.deepEqual(await pending, { posted: true });
-  assert.match(f.events[0].detail.note, /INCOMPLETE/);
-  assert.equal((await traceStuckPr(options)).skipped, 'duplicate');
+test('hung reads and hung delivery are bounded and remain queued for retry', async t => {
+  for (const stage of ['read', 'emit']) {
+    const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
+    enqueueStuckTrace(f.options);
+    const pending = drainStuckTraces({ ...f.options, ...(stage === 'read'
+      ? { run: () => new Promise(() => {}) } : { emit: () => new Promise(() => {}) }) });
+    await new Promise(resolve => setImmediate(resolve));
+    t.mock.timers.tick(stage === 'read' ? 59_000 : 1000);
+    await pending;
+    assert.equal(queue(f)[key].state, 'queued');
+    assert.equal(queue(f)[key].attempts, 1);
+    t.mock.timers.reset();
+  }
 });
 
-test('hung event delivery is bounded and leaves the receipt claimed', async t => {
-  const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
-  const pending = traceStuckPr({ ...f.options, emit: () => new Promise(() => {}) });
-  // Allow both injected operation results to settle before advancing the sink timer.
-  await new Promise(resolve => setImmediate(resolve));
-  t.mock.timers.tick(1000);
-  assert.equal((await pending).posted, false);
-  assert.equal((await traceStuckPr(f.options)).skipped, 'duplicate');
-});
-
-test('digest traces only newly written operator stalls, detached and never under test', async t => {
-  const f = fixture(t), seen = [];
+test('digest enqueues every unchanged operator head and drains detached after alerts, never under test', async t => {
+  const f = fixture(t), seen = [], order = [];
   const item = { repo, pr: 17, head, lane: 'operator', state: 'queue-wait', evidence: [] };
   const options = { stateDir: join(f.root, 'digest'), traceStateDir: f.root, feedPath: join(f.root, 'feed.jsonl'),
-    now: Date.parse(now), env: {}, notify: () => ({ ok: false }), trace: args => { seen.push(args); return Promise.reject(Error('best effort')); } };
+    now: Date.parse(now), env: {}, notify: () => { order.push('alert'); return { ok: true }; },
+    enqueue: args => { seen.push(args); enqueueStuckTrace(args); },
+    drain: () => { order.push('drain'); throw Error('best effort'); } };
   const pass = { items: [item, { ...item, pr: 18, lane: 'daemon' }], incomplete: false };
-  publishStalledDigest(pass, options); assert.equal(seen.length, 0);
-  await new Promise(resolve => setImmediate(resolve)); assert.equal(seen.length, 1);
-  assert.equal(seen[0].kind, 'stalled'); assert.equal(seen[0].stateDir, f.root);
-  publishStalledDigest(pass, options); // failed desktop delivery is retried, trace is not
-  publishStalledDigest({ ...pass, items: [{ ...item, pr: 19 }] }, { ...options, env: { WE_UNDER_TEST: '1' } });
-  publishStalledDigest({ ...pass, items: [{ ...item, pr: 20 }] }, { ...options, feedPath: join(options.stateDir, 'digest-state.json') });
-  await new Promise(resolve => setImmediate(resolve)); assert.equal(seen.length, 1);
+  publishStalledDigest(pass, options);
+  assert.deepEqual(order, ['alert']);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(order, ['alert', 'drain']);
+  publishStalledDigest(pass, options);
+  assert.equal(seen.length, 2); assert.equal(seen[1].kind, 'stalled');
+  assert.equal(Object.keys(queue(f)).length, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  publishStalledDigest(pass, { ...options, env: { WE_UNDER_TEST: '1' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(order.filter(x => x === 'drain').length, 2);
+});
+
+test('digest still alerts when queue writing and post-pass drain throw', async t => {
+  const f = fixture(t); let alerts = 0;
+  publishStalledDigest({ items: [{ repo, pr: 17, head, lane: 'operator', state: 'queue-wait' }] }, {
+    stateDir: join(f.root, 'digest'), feedPath: join(f.root, 'feed.jsonl'), env: {},
+    enqueue: () => { throw Error('queue write'); }, drain: () => { throw Error('drain'); },
+    notify: () => { alerts++; return { ok: true }; },
+  });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(alerts, 1);
 });
 
 test('watch hook runs only after successful delivery for ready-stuck and pr-no-progress', async t => {
@@ -240,7 +298,7 @@ test('watch hook runs only after successful delivery for ready-stuck and pr-no-p
       settings: { noProgressMinutes: kind === 'ready-stuck' ? 100000 : 180 }, signalLogs: () => [], log: () => {},
       readyStuck: { readLabelTime: () => '2026-11-09T00:00:00Z', readSkipReason: () => 'held' },
       emitEvent: event => { order.push(event.kind); if (delivery === 'throw') throw Error('delivery'); return delivery === 'ok'; },
-      trace: args => { seen.push(args); assert.ok(order.includes(args.kind)); } });
+      drain: () => {}, enqueue: args => { seen.push(args); assert.ok(order.includes(args.kind)); } });
     assert.equal(seen.length, delivery === 'ok' ? 1 : 0, `${kind} ${delivery}`);
     if (seen.length) { assert.equal(seen[0].kind, kind); assert.equal(seen[0].head, head); }
   }

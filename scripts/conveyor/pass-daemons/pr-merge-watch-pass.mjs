@@ -7,7 +7,7 @@
  */
 import { runReadyStuck } from './pr-ready-stuck.mjs';
 import { runMergeWatchSignals } from './pr-merge-watch-signals.mjs';
-import { traceStuckPr, TRACE_TRIGGERS } from '../stuck-trace.mjs';
+import { enqueueStuckTrace, drainStuckTraces, TRACE_TRIGGERS } from '../stuck-trace.mjs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -41,7 +41,7 @@ export function resolveMergeWatchSettings({ env = process.env, log = console.err
 
 export async function runMergeWatch({ repos = [], gh, now = new Date().toISOString(),
   stateDir = join(handoffHome(), 'pr-merge-watch'), settings, emitEvent = appendDaemonEvent,
-  log = console.error, signalLogs, readyStuck = {}, trace = traceStuckPr } = {}) {
+  log = console.error, signalLogs, readyStuck = {}, enqueue = enqueueStuckTrace, drain = drainStuckTraces } = {}) {
   // Load the analysis graph after the shared gate graph has finished evaluating.
   const { atomicJson, readOptionalJson, ghJson, repoFilenameKey } = await import('../../operations/coroner-pr-postmortem.mjs');
   const { defaultListPrComments } = await import('../pr-comments-list.mjs');
@@ -50,7 +50,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
   const config = settings ? { ...defaults, ...settings } : resolveMergeWatchSettings({ log });
   const stamp = Date.parse(now);
   if (!Number.isFinite(stamp) || Object.entries(config).some(([k, v]) => !minutesValid(v) || (k === 'ciJobOverdueFactor' && v <= 0) || (k === 'readyStuckMinutes' && v > 1440))) throw Error('invalid merge-watch time/settings');
-  let calls = 0, traces = 0, delivered = 0, incomplete = false, budgetExhausted = false;
+  let calls = 0, delivered = 0, incomplete = false, budgetExhausted = false;
   const read = args => {
     if (calls >= 128) { budgetExhausted = true; throw Error('GitHub evidence tick budget exceeded'); }
     calls++;
@@ -63,6 +63,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
   };
   // A single durable cursor covers repositories and both kinds of PR work. A partial
   // subject restarts with a fresh budget; bounded readers fit within that budget.
+  try {
   const cursorFile = join(stateDir, 'cursor.json');
   let cursor;
   try {
@@ -100,21 +101,12 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
       }
       if (compacted) save();
       const send = async event => {
-        // Trace children own their GitHub readers: this separate cap is additive
-        // and bounded (2 traces x 2 read-only operations: why + pr-trace per tick).
-        // Skip the hook and defer delivery when capped, leaving both receipts
-        // unarmed so a later tick can trace it. Each child retains its 58s timeout.
-        if (TRACE_TRIGGERS.includes(event.kind) && traces >= 2) {
-          log('stuck-trace: tick cap reached; deferred to next tick; operator can inspect why/pr-trace manually');
-          throw Error('trace tick cap reached');
-        }
         if (await emitEvent(event) === false) throw Error('event delivery unavailable');
         delivered++;
         if (TRACE_TRIGGERS.includes(event.kind)) {
-          traces++;
-          try { await trace({ repo, pr: event.pr, head: event.detail?.head
+          try { enqueue({ repo, pr: event.pr, head: event.detail?.head
             ?? open.find(p => p.number === event.pr)?.head?.sha,
-          kind: event.kind, stateDir, now }); } catch { log('stuck-trace: hook unavailable'); }
+          kind: event.kind, stateDir, now }); } catch { /* enqueue must never affect alerts/self-heal */ }
         }
       };
       const open = listOpenPrs(repo, { gh: read });
@@ -211,6 +203,9 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
   }
   if (cursor !== null && repoOrder.length) atomicJson(cursorFile, { repo: repoOrder[0], number: null });
   return { delivered, incomplete };
+  } finally {
+    try { await drain({ stateDir, now, max: 2 }); } catch { /* post-pass best effort */ }
+  }
 }
 
 export async function runMergeWatchCli(values, { runPass = runMergeWatch, sleep: wait = sleep,

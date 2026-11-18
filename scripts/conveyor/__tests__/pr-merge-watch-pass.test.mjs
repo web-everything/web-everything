@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { join } from 'node:path';
 import { humanReviewHold } from '../../operations/pr-sweep-core.mjs';
-import { traceStuckPr } from '../stuck-trace.mjs';
+import { drainStuckTraces } from '../stuck-trace.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 
 // Only the not-yet-shipped tool settings file is virtual. State and platform
@@ -284,32 +284,47 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     expect(emitEvent.mock.calls.every(([event]) => event.kind === 'pr-merged')).toBe(true);
   });
 
-  it('starts at most two traces per tick and leaves capped subjects unarmed for the next tick', async () => {
+  it('alerts every PR before the once-per-pass drain, caps drain at two, and drains queued heads next tick', async () => {
     prs.set(REPO, Array.from({ length: 5 }, (_, i) => readyPr({ number: i + 1,
       labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED' })));
-    const run = vi.fn(async ([op]) => op === 'why'
-      ? { verdict: { owner: 'operator' } } : { likelyBlocker: 'held' });
-    const trace = vi.fn(args => traceStuckPr({ ...args, run, emit: () => true }));
-    const options = { trace, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } };
+    const run = vi.fn(async ([op]) => {
+      expect(emitEvent.mock.calls.filter(([e]) => e.kind === 'ready-stuck')).toHaveLength(5);
+      return op === 'why' ? { owner: 'operator' } : { likelyBlocker: 'held' };
+    });
+    const drain = vi.fn(args => drainStuckTraces({ ...args, run, emit: () => true }));
+    const options = { drain, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } };
     await tick(181, options);
-    expect(trace).toHaveBeenCalledTimes(2);
+    expect(drain).toHaveBeenCalledTimes(1);
     expect(run).toHaveBeenCalledTimes(4);
-    let receipts = JSON.parse(fs.readFileSync(join(stateDir, 'stuck-trace.json'), 'utf8'));
-    expect(Object.keys(receipts)).toHaveLength(2);
-    expect(receipts[`${REPO}#3@${HEAD}`]).toBeUndefined();
+    const queue = () => JSON.parse(fs.readFileSync(join(stateDir, 'stuck-trace-queue.json'), 'utf8'));
+    expect(Object.keys(queue())).toHaveLength(5);
+    expect(queue()[`${REPO}#3@${HEAD}`].state).toBe('queued');
     const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(REPO)}.json`), 'utf8'));
-    expect(state.prs[3].heads[HEAD].readyStuckAlerted).not.toBe(true);
-    expect(log.mock.calls.flat().join(' ')).toMatch(/deferred to next tick; operator can inspect/);
-    await tick(182, options);
-    expect(trace).toHaveBeenCalledTimes(4);
-    expect(run).toHaveBeenCalledTimes(8);
-    receipts = JSON.parse(fs.readFileSync(join(stateDir, 'stuck-trace.json'), 'utf8'));
-    expect(receipts[`${REPO}#3@${HEAD}`].state).toBe('done');
-    await tick(183, options);
-    expect(trace).toHaveBeenCalledTimes(5);
+    expect(state.prs[3].heads[HEAD].readyStuckAlerted).toBe(true);
+    await tick(182, options); expect(run).toHaveBeenCalledTimes(8);
+    await tick(183, options); expect(run).toHaveBeenCalledTimes(10);
+    await tick(184, options); expect(run).toHaveBeenCalledTimes(10);
   });
 
-  it('keeps trace operations separate from all 128 guarded GitHub reads', async () => {
+  it('delivers alerts and completes self-heal even when enqueue and drain throw', async () => {
+    prs.set(REPO, [readyPr({ labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED',
+      statusCheckRollup: [{ name: 'unit', conclusion: 'FAILURE', completedAt: at(-2000) }] })]);
+    const enqueue = vi.fn(() => { throw Error('queue write'); });
+    const drain = vi.fn(() => { throw Error('drain'); });
+    const refresh = vi.fn();
+    await tick(181, { enqueue, drain, readyStuck: {
+      readLabelTime: () => at(0), readSkipReason: () => 'held', refresh,
+      onlyChecksBlock: () => true, readRequiredChecks: () => ['unit'],
+      readMainChecks: () => ({ sha: HEAD, checks: [{ name: 'unit', conclusion: 'SUCCESS' }] }),
+    } });
+    expect(emitEvent.mock.calls.some(([e]) => e.kind === 'ready-stuck')).toBe(true);
+    expect(enqueue).toHaveBeenCalled(); expect(drain).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(REPO)}.json`), 'utf8'));
+    expect(state.prs[17].heads[HEAD].readyStuckAlerted).toBe(true);
+  });
+
+  it('drains once after budget deferral, outside all 128 guarded GitHub reads', async () => {
     prs.set(REPO, Array.from({ length: 140 }, (_, i) => readyPr({ number: i + 1,
       labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED' })));
     const read = gh.getMockImplementation();
@@ -317,9 +332,9 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
       if (args[0] === 'pr' && Number(args[2]) !== 1) throw Error('view unavailable');
       return read(args);
     });
-    const trace = vi.fn();
-    await tick(181, { trace, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } });
-    expect(trace).toHaveBeenCalledTimes(1);
+    const drain = vi.fn(() => { expect(gh).toHaveBeenCalledTimes(128); });
+    await tick(181, { drain, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } });
+    expect(drain).toHaveBeenCalledTimes(1);
     expect(gh).toHaveBeenCalledTimes(128);
   });
 

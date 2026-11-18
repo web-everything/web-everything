@@ -1,9 +1,12 @@
 /** Layered, read-only stuck-PR evidence, once per repo/PR/head. EVENT ONLY:
  * PR comments notify watchers and retrigger comment/label daemons; the existing
  * daemon event feed is queryable and already carries ready-stuck/needs-you signals.
- * Receipts precede IO: failed delivery/crashes retry after 10 minutes, at most 3 attempts.
- * No retries within a call; successfully delivered notes never repeat.
- * Share stateDir between callers that must share receipts. Unknown heads re-arm daily.
+ * Hooks only enqueue; failures never escape into alert delivery. Share stateDir.
+ * The drain is a separate, explicitly capped (2 x 2 read-only ops per call)
+ * post-pass stage outside the watch tick's 128-read guard BY DESIGN. This declared
+ * exception never runs inside the alert loop: it is bounded, and per-head dedupe
+ * plus a three-attempt cap bounds total reads. Failed/crashed attempts stay queued
+ * and retry after 10 minutes; delivered heads never repeat. Unknown heads re-arm daily.
  */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -29,38 +32,94 @@ function runner(args, env) {
     (error, stdout) => { if (error) reject(error); else { try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); } } }));
 }
 
-export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.now(), run,
-  emit = appendDaemonEvent, env = process.env } = {}) {
+const queueFile = stateDir => join(stateDir, 'stuck-trace-queue.json');
+const doneFile = (stateDir, key) => join(stateDir, `stuck-trace-done-${createHash('sha256').update(key).digest('hex')}.json`);
+function readObject(file) {
+  let value;
+  try { value = JSON.parse(readFileSync(file, 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') return {}; throw e; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('invalid queue');
+  return value;
+}
+function readQueue(stateDir) {
+  const saved = readObject(queueFile(stateDir));
+  // Merge historical delivered receipts and interrupted claims without re-arming them.
+  for (const [key, receipt] of Object.entries(readObject(join(stateDir, 'stuck-trace.json')))) {
+    if (Object.hasOwn(saved, key)) continue;
+    const retryable = receipt?.state === 'claimed' && Number.isInteger(receipt.attempts)
+      && receipt.attempts >= 1 && Number.isFinite(Date.parse(receipt.at));
+    saved[key] = { kind: receipt?.trigger ?? 'stalled', enqueuedAt: receipt?.at,
+      attempts: retryable ? receipt.attempts : 3, state: retryable ? 'queued' : 'done',
+      ...(retryable ? { attemptedAt: receipt.at } : {}) };
+  }
+  for (const [key, entry] of Object.entries(saved)) {
+    if (entry?.state === 'done') continue;
+    try {
+      if (readObject(doneFile(stateDir, key)).state === 'done') entry.state = 'done';
+    } catch { throw Error('invalid completion'); }
+  }
+  return saved;
+}
+export function enqueueStuckTrace({ repo, pr, head, kind, stateDir, now = Date.now() } = {}) {
   try {
-    if (!TRACE_TRIGGERS.includes(kind)) return { posted: false, skipped: 'trigger' };
-    if (!run && (isUnderTest(env) || isUnderTest())) return { posted: false, skipped: 'under-test' };
+    if (!TRACE_TRIGGERS.includes(kind)) return { queued: false, skipped: 'trigger' };
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(pr) || pr < 1) throw Error('invalid subject');
-    const day = localDateString(new Date(now));
-    head = !head || head === 'unknown-head' ? `unknown-head:${day}` : head;
+    const at = new Date(now).toISOString();
+    head = !head || head === 'unknown-head' ? `unknown-head:${localDateString(new Date(now))}` : head;
     const key = `${repo}#${pr}@${head}`;
     mkdirSync(stateDir, { recursive: true });
-    const file = join(stateDir, 'stuck-trace.json');
-    const doneFile = join(stateDir, `stuck-trace-done-${createHash('sha256').update(key).digest('hex')}.json`);
-    const claimed = withFileLock(`${file}.lock`, () => {
-      // A successful sink may have finalized outside the contended shared lock.
-      try {
-        if (JSON.parse(readFileSync(doneFile, 'utf8'))?.state !== 'done') throw Error('invalid completion');
-        return false;
-      } catch (e) { if (e.code !== 'ENOENT') throw e; }
-      let saved = {};
-      try { saved = JSON.parse(readFileSync(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-      if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw Error('invalid receipts');
-      const previous = saved[key];
-      // Legacy receipts already suppressed delivery; retain that deduplication.
-      if (Object.hasOwn(saved, key) && (previous?.state !== 'claimed'
-        || !Number.isInteger(previous.attempts) || previous.attempts < 1 || previous.attempts >= 3
-        || !Number.isFinite(Date.parse(previous.at))
-        || new Date(now).getTime() - Date.parse(previous.at) <= 10 * 60_000)) return false;
-      const claim = { state: 'claimed', at: new Date(now).toISOString(), attempts: (previous?.attempts ?? 0) + 1 };
-      writeJsonAtomic(file, { ...saved, [key]: claim });
-      return claim;
+    return withFileLock(`${queueFile(stateDir)}.lock`, () => {
+      const saved = readQueue(stateDir);
+      if (Object.hasOwn(saved, key)) return { queued: false, skipped: 'duplicate' };
+      writeJsonAtomic(queueFile(stateDir), { ...saved, [key]: { kind, enqueuedAt: at, attempts: 0, state: 'queued' } });
+      return { queued: true };
     }, { timeoutMs: 0 });
-    if (!claimed) return { posted: false, skipped: 'duplicate' };
+  } catch { report(); return { queued: false, skipped: 'incomplete' }; }
+}
+
+export async function drainStuckTraces({ stateDir, max = 2, now = Date.now(), run,
+  emit = appendDaemonEvent, env = process.env } = {}) {
+  if (!run && (isUnderTest(env) || isUnderTest())) return { processed: 0 };
+  let processed = 0;
+  try {
+    if (!Number.isInteger(max) || max < 0 || max > 2) throw Error('invalid drain cap');
+    const at = new Date(now).toISOString(), stamp = Date.parse(at), file = queueFile(stateDir);
+    const claims = withFileLock(`${file}.lock`, () => {
+      const saved = readQueue(stateDir);
+      const selected = Object.entries(saved).filter(([, e]) => e?.state === 'queued'
+        && TRACE_TRIGGERS.includes(e.kind) && Number.isFinite(Date.parse(e.enqueuedAt))
+        && Number.isInteger(e.attempts) && e.attempts >= 0 && e.attempts < 3
+        && (e.attempts === 0 || (Number.isFinite(Date.parse(e.attemptedAt)) && stamp - Date.parse(e.attemptedAt) >= 600_000)))
+        .sort((a, b) => Date.parse(a[1].enqueuedAt) - Date.parse(b[1].enqueuedAt)).slice(0, max);
+      for (const [, e] of selected) { e.attempts++; e.attemptedAt = at; }
+      writeJsonAtomic(file, saved); // Merge legacy completions; persist attempts BEFORE IO, including crashes.
+      return selected;
+    }, { timeoutMs: 0 });
+    for (const [key, claim] of claims) {
+      processed++;
+      const subject = /^([\w.-]+\/[\w.-]+)#([1-9]\d*)@(.+)$/.exec(key);
+      if (!subject) { report(); continue; }
+      const [, repo, pr, head] = subject;
+      const result = await traceStuckPr({ repo, pr: Number(pr), head, kind: claim.kind, run, emit, env });
+      if (!result.posted) continue;
+      try {
+        withFileLock(`${file}.lock`, () => {
+          const saved = readQueue(stateDir);
+          if (saved[key]?.attemptedAt === claim.attemptedAt && saved[key]?.attempts === claim.attempts)
+            writeJsonAtomic(file, { ...saved, [key]: { ...claim, state: 'done' } });
+        }, { timeoutMs: 0 });
+      } catch {
+        // Delivery succeeded: preserve completion without the contended queue lock.
+        // readQueue merges this subject-specific marker before selecting retries.
+        writeJsonAtomic(doneFile(stateDir, key), { state: 'done' });
+      }
+    }
+  } catch { report(); }
+  return { processed };
+}
+
+async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
+  try {
     // Both layers share one wall-clock budget, including a misbehaving injected runner.
     let timer;
     const evidence = Promise.all(['why', 'pr-trace'].map(async op => {
@@ -78,6 +137,9 @@ export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.
         timer = setTimeout(() => resolve([null, null]), 59_000);
       })]);
     } finally { clearTimeout(timer); }
+    // Retry failed reads without delivering a note that would then be repeated.
+    // Valid verdicts may still describe incomplete evidence; a delivered note is final.
+    if (!why || !trace) { report(); return { posted: false, skipped: 'incomplete' }; }
     const section = name => why?.sections?.find(s => s.name === name)?.lines;
     const headline = clean(trace?.likelyBlocker ?? 'unavailable root cause; inspect why/pr-trace manually');
     const owner = clean(why?.owner), waitingFor = clean(why?.waitingFor);
@@ -106,19 +168,6 @@ export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.
       ]);
       if (delivered === false) throw Error('delivery failed');
     } finally { clearTimeout(timer); }
-    try {
-      withFileLock(`${file}.lock`, () => {
-        const saved = JSON.parse(readFileSync(file, 'utf8'));
-        // Only finalize our own claim; preserve receipts written by other subjects.
-        if (saved[key]?.state === 'claimed' && saved[key].at === claimed.at && saved[key].attempts === claimed.attempts) {
-          writeJsonAtomic(file, { ...saved, [key]: { ...claimed, state: 'done' } });
-        }
-      }, { timeoutMs: 0 });
-    } catch {
-      // Delivery succeeded. Persist a subject-specific completion without the
-      // shared lock, so contention cannot make a later daemon repeat the note.
-      writeJsonAtomic(doneFile, { state: 'done' });
-    }
     return { posted: true };
   } catch { report(); return { posted: false, skipped: 'incomplete' }; }
 }
