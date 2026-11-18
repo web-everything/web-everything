@@ -4591,3 +4591,11 @@ queue fields and requires readable, valid settings at every cascade layer. Persi
 execution outcomes (including unknown terminal outcomes) remain recorded debt; only an
 explicit absent status or a recognized finished no-execution result can prove otherwise.
 A skipped pass needs no execution seal; any retained seal must be explicitly clean.
+
+
+Completed red-team passes and carried proofs share the readability and idle-work predicates
+with the exemption table (`RED_TEAM_CLEARANCE_INPUTS`). Exercise missing and non-boolean
+proof as well as queued/running work after an earlier completed result. Mutation tests delete
+each shared clearance prerequisite and its evaluation. The retired
+`WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE` override must never disable admission; cover
+both preparation and enqueue without a completed result when it is set to zero.

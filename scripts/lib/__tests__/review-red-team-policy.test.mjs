@@ -7,13 +7,36 @@ import { reviewedRead, completedSeat, completedComment, exemptInput } from './fi
 const head = 'a'.repeat(40), fromRev = 'b'.repeat(40);
 const pass = (rev = head) => ({ head: rev, read: reviewedRead(rev),
   seats: [{ ...completedSeat(rev), valid: true }], result: parseRedTeamComment(completedComment(42, rev).body),
-  scheduling: { scheduled: true, inFlight: false, queued: false, skipCardOnly: true } });
+  scheduling: { scheduled: true, inFlight: false, queued: false, skipCardOnly: true, commentsReadable: true, settingsReadable: true } });
 describe('redTeamOwedDecision', () => {
   it('clears only a completed result, scored head-bound diff, and completed valid seat together', () => {
     expect(redTeamOwedDecision(pass())).toEqual({ owed: true, cleared: true, reasons: [] });
     for (const over of [{ result: null }, { seats: [] }, { seats: [{ ...completedSeat(head), status: 'error', valid: true }] },
       { result: { ...pass().result, rev: fromRev } }, { result: { ...pass().result, completedReview: false } }]) {
       expect(redTeamOwedDecision({ ...pass(), ...over }).cleared).toBe(false);
+    }
+  });
+  it('canonical audit B: a completed result and seat cannot clear unreadable comments and settings', () => {
+    const input = pass(); input.scheduling.commentsReadable = false; input.scheduling.settingsReadable = false;
+    expect(redTeamOwedDecision(input)).toMatchObject({ owed: true, cleared: false });
+    expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS['evidence-unknown']);
+  });
+  it.each(['commentsReadable', 'settingsReadable'])('completed-pass clearance needs explicit %s=true', key => {
+    for (const value of [undefined, null, false, 'true', 1, {}]) {
+      const input = pass();
+      if (value === undefined) delete input.scheduling[key]; else input.scheduling[key] = value;
+      expect(redTeamOwedDecision(input), `${key}=${JSON.stringify(value)}`).toMatchObject({ owed: true, cleared: false });
+    }
+  });
+  it.each(['queued', 'inFlight'])('canonical audit C: %s work holds despite an earlier completed result and seat', key => {
+    for (const value of [true, undefined, null, 'false', 0]) {
+      const input = pass();
+      if (value === undefined) delete input.scheduling[key]; else input.scheduling[key] = value;
+      expect(redTeamOwedDecision(input)).toMatchObject({ owed: true, cleared: false });
+      expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS['pass-owed']);
+      const carried = { ...pass(), seats: [], carry: { fromRev, proof: { ...input, head: fromRev,
+        read: reviewedRead(fromRev), result: pass(fromRev).result, seats: pass(fromRev).seats } } };
+      expect(redTeamOwedDecision(carried).cleared).toBe(false);
     }
   });
   it('a publishable policy-clear never pays execution debt, and one bad row poisons a completed pass', () => {

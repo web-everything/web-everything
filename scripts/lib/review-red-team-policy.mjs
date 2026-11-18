@@ -99,6 +99,14 @@ export const RED_TEAM_EXEMPTION_INPUTS = Object.freeze({
   'scheduling.scheduled': x => typeof x.scheduling?.scheduled === 'boolean',
 });
 
+/** These exemption predicates also govern every completed pass, including carried proof. */
+export const RED_TEAM_CLEARANCE_INPUTS = Object.freeze({
+  'scheduling.settingsReadable': 'evidence-unknown',
+  'scheduling.commentsReadable': 'evidence-unknown',
+  'scheduling.inFlight': 'pass-owed',
+  'scheduling.queued': 'pass-owed',
+});
+
 /** One decision for admission, recovery and carry. Inputs are normalized by the evidence reader. */
 export function redTeamOwedDecision(input = {}) {
   const { head, read, seats, result, carry, scheduling = {},
@@ -128,6 +136,9 @@ export function redTeamOwedDecision(input = {}) {
   if (owed && !carried) {
     if (!result) hold(scheduling.recorded ? 'result-incomplete' : 'pass-owed');
     else if (!(completedResult && read?.netBasis?.rev === result.rev && validSeats && seats.some(completedRedTeamSeat))) hold('result-incomplete');
+  }
+  for (const [key, kind] of Object.entries(RED_TEAM_CLEARANCE_INPUTS)) {
+    if (!RED_TEAM_EXEMPTION_INPUTS[key](input) && !reasons.some(hold => hold.kind === kind)) hold(kind);
   }
   return { owed, cleared: reasons.length === 0, reasons };
 }

@@ -1299,7 +1299,7 @@ const hold = (over = {}) => {
   const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, proof: { head: hit.carriedFrom,
     read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
     result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
-    scheduling: { skipCardOnly: false } } } : null;
+    scheduling: { skipCardOnly: false, inFlight: false, queued: false, commentsReadable: true, settingsReadable: true } } } : null;
   return redTeamEnqueueHold({ ...idleEvidence(), carry, scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(over.head ?? head) } }, seats: over.recorded || over.comments?.length ? [completedSeat(over.head ?? head)] : [], labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
 };
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
@@ -1654,6 +1654,10 @@ describe('drain policy cascade', () => {
     readDrainQueueSafety({ env: { WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'true' }, tool: { enqueueWhenRedTeamNeverScheduled: true }, platform: {}, log: l => lines.push(l) });
     expect(lines.join('')).toContain('env WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED and drain.enqueueWhenRedTeamNeverScheduled setting is retired and ignored');
   });
+  it.each(['0', 'false', 'off', 'typo', '1'])('retired wait env %s cannot change red-team admission policy', value => {
+    expect(readDrainQueueSafety({ env: { WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: value }, tool: {}, platform: {} }))
+      .toMatchObject({ value: { waitForRedTeamBeforeEnqueue: true }, sources: { waitForRedTeamBeforeEnqueue: 'standard' } });
+  });
   it('resolves pending timing and provenance independently, rejecting invalid timings', () => {
     const r = readDrainQueueSafety({ env: { WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '600', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: 'NaN' },
       platform: { redTeamPendingBackoffSec: 120, redTeamPendingMaxMin: 90 },
@@ -1670,7 +1674,7 @@ describe('drain policy cascade', () => {
     const r = readDrainQueueSafety({ env: { WE_DRAIN_DEQUEUE_ON_SEND_BACK: 'off', WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'typo' }, platform: { waitForRedTeamBeforeEnqueue: false }, tool: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: 'invalid' } });
     expect(r.value).toMatchObject({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: false });
     expect(r.sources).toMatchObject({ waitForRedTeamBeforeEnqueue: 'tool', dequeueOnSendBack: 'env' });
-    expect(r.invalid).toHaveLength(2);
+    expect(r.invalid).toHaveLength(1);
     expect(readDrainQueueSafety({ env: {}, tool: {}, platform: { dequeueOnSendBack: false } }).sources.dequeueOnSendBack).toBe('platform');
   });
 });

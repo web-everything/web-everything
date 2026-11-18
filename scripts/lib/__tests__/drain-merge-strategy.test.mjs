@@ -49,7 +49,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
     const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, proof: { head: hit.carriedFrom,
       read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
       result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
-      scheduling: { skipCardOnly: false } } } : null;
+      scheduling: { skipCardOnly: false, inFlight: false, queued: false, commentsReadable: true, settingsReadable: true } } } : null;
     return Object.assign(Object.defineProperties(idleEvidence(), Object.getOwnPropertyDescriptors(raw ?? {})),
       { ...(raw?.loopPayload === undefined ? { loopPayload: defaultEvidence(key.head).loopPayload } : {}),
         seats: raw?.seats ?? (hit ? [completedSeat(key.head, { repo: key.repo, pr: key.pr })] : []), carry: raw?.carry ?? carry });
@@ -1510,9 +1510,17 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
 
   it.each(['WE_RED_TEAM_STATUS_LABELS', 'WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'])('%s off retains a live pending hold even with a result', key => {
     const h = harness({ strategy: 'github-merge-queue', labels: [...ACCEPTED, 'red-team:pending'],
-      liveComments: [clean], env: { WE_UNDER_TEST: '1', [key]: 'false' } });
+      liveComments: [clean], evidence: { queued: key === 'WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE' },
+      env: { WE_UNDER_TEST: '1', [key]: 'false' } });
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [clean] })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(enqueuedAny(h)).toBe(false);
+  });
+
+  it('retired wait env still reconciles a stale pending label after a completed pass with no live work', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: [...ACCEPTED, 'red-team:pending'],
+      liveComments: [clean], env: { WE_UNDER_TEST: '1', WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: '0' } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [clean] })).toMatchObject({ enqueued: true });
+    expect(enqueuedAny(h)).toBe(true);
   });
 
   it('a result for a DIFFERENT head never releases the hold', () => {
@@ -1852,9 +1860,11 @@ describe('queue safeguard overrides and untracked queue entries', () => {
       expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(status === 'red-team:clear');
     }
   });
-  it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('%s off cannot substitute for execution evidence when admission waits', key => {
+  it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('canonical audit A: %s=0 cannot bypass admission without a result', key => {
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], env: { ...process.env, [key]: '0' } });
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: key === 'WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE' });
+    expect(h.s.prestage({ num: 5283 }, HEAD).allowed).toBe(false);
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
   });
   it('dequeueOnSendBack off leaves queued send-backs untouched', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true, labels: [], initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] }, env: { ...process.env, WE_DRAIN_DEQUEUE_ON_SEND_BACK: 'false' } });

@@ -6,7 +6,7 @@ import ts from 'typescript';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRecoveryWitness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
-import { redTeamOwedDecision, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS } from '../review-red-team-policy.mjs';
+import { redTeamOwedDecision, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS, RED_TEAM_CLEARANCE_INPUTS } from '../review-red-team-policy.mjs';
 import { redTeamAdmissionHold } from '../drain-queue-safety.mjs';
 import { failedRedTeamRetry } from '../red-team-run-result.mjs';
 import { reviewedRead, completedSeat, completedComment, exemptInput } from './fixtures/red-team-owed.mjs';
@@ -194,6 +194,17 @@ function assertStructure(source) {
   for (const property of properties) expect(property.initializer.getText()).toBe(RED_TEAM_EXEMPTION_INPUTS[property.name.text].toString());
   expect(policy.text).toContain('Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input))');
   expect(source['review-red-team-policy.mjs']).toMatch(/&& Array\.isArray\(read\.netRenameSources\)/);
+  const clearance = all(policy, n => ts.isVariableDeclaration(n) && n.name?.getText() === 'RED_TEAM_CLEARANCE_INPUTS');
+  expect(clearance).toHaveLength(1);
+  const clearanceProperties = clearance[0].initializer.arguments[0].properties;
+  expect(clearanceProperties.map(p => [p.name.text, p.initializer.text])).toEqual([
+    ['scheduling.settingsReadable', 'evidence-unknown'], ['scheduling.commentsReadable', 'evidence-unknown'],
+    ['scheduling.inFlight', 'pass-owed'], ['scheduling.queued', 'pass-owed'],
+  ]);
+  expect(Object.keys(RED_TEAM_CLEARANCE_INPUTS).every(key => exemptionKeys.includes(key))).toBe(true);
+  expect(policy.text).toContain('Object.entries(RED_TEAM_CLEARANCE_INPUTS)');
+  expect(policy.text).toContain('!RED_TEAM_EXEMPTION_INPUTS[key](input)');
+  expect(source['drain-queue-safety.mjs']).not.toContain('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE');
   const queue = parse('drain-queue-safety.mjs', source['drain-queue-safety.mjs']);
   const merge = parse('drain-merge-strategy.mjs', source['drain-merge-strategy.mjs']);
   for (const file of [queue, merge]) {
@@ -217,6 +228,11 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
+  ...Object.keys(RED_TEAM_CLEARANCE_INPUTS).map(key => [`completed-pass prerequisite ${key} deleted`, 'review-red-team-policy.mjs', text =>
+    text.replace(new RegExp(`^  '${key.replaceAll('.', '\\.')}': '[^']+',\n`, 'm'), '')]),
+  ['completed-pass table call deleted', 'review-red-team-policy.mjs', text => text.replace('Object.entries(RED_TEAM_CLEARANCE_INPUTS)', 'Object.entries({})')],
+  ['completed-pass predicate call deleted', 'review-red-team-policy.mjs', text => text.replace('!RED_TEAM_EXEMPTION_INPUTS[key](input)', 'false')],
+  ['environment bypass restored', 'drain-queue-safety.mjs', text => `${text}\nconst bypass = env => env.WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE;\n`],
   ['recorded normalization deleted', 'drain-red-team-input.mjs', text => text.replace('recorded: raw.recorded,', '')],
   ...exemptionKeys.map(key => [`exemption prerequisite ${key} deleted`, 'review-red-team-policy.mjs', text => {
     const line = text.split('\n').find(line => line.trimStart().startsWith(`${key.includes('.') ? `'${key}'` : key}: x =>`));
