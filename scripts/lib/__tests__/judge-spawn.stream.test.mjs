@@ -53,6 +53,31 @@ describe('Claude stream diagnostics', () => {
     }
   });
 
+  it('rejects typeless verdicts mixed with stream events or stray stdout', async () => {
+    const legacy = { structured_output: { verdict: 'accept' } };
+    for (const stdout of [jsonl([{ type: 'system' }, legacy]), `warning\n${JSON.stringify(legacy)}\n`]) {
+      await expect(judgeSpawn({ ...request, ...fake([], { chunks: [stdout] }), log: () => {} }))
+        .rejects.toBeInstanceOf(JudgeUnparseableError);
+    }
+    expect(parseJudgeOutcome(JSON.stringify(legacy, null, 2)).value).toEqual(legacy.structured_output);
+  });
+
+  it.each([false, true])('never exposes truncated tool-use stdout in diagnostics (timeout=%s)', async (hang) => {
+    const stdout = JSON.stringify(tool('git diff SECRET_TOKEN=private-value')).slice(0, -4);
+    const log = vi.fn();
+    const error = await judgeSpawn({ ...request, ...fake([], { hang, chunks: [stdout] }), timeoutMs: 10, log })
+      .catch(e => e);
+    expect(error).toBeInstanceOf(hang ? JudgeTimeoutError : JudgeUnparseableError);
+    expect(error.lastEvents).toEqual([{ type: 'unrecognized' }]);
+    expect(error.message).toContain(`stdout ${Buffer.byteLength(stdout)} bytes`);
+    expect(error.message).toContain('last events: [{"type":"unrecognized"}]');
+    expect([error.message, JSON.stringify(error.lastEvents), JSON.stringify(error.telemetry),
+      JSON.stringify(error.failedAttempts), log.mock.calls.flat().join(' ')].join(' '))
+      .not.toMatch(/SECRET_TOKEN|private-value/);
+    expect(() => parseJudgeOutcome(stdout)).toThrow(/last events: \[{"type":"unrecognized"}\]/);
+    try { parseJudgeOutcome(stdout); } catch (e) { expect(e.message).not.toMatch(/SECRET_TOKEN|private-value/); }
+  });
+
   it.each([false, true])('records bounded, redacted last events and last tool on failure (timeout=%s)', async (hang) => {
     const events = [tool('git diff SECRET_TOKEN=private-value https://user:password@example.test')];
     events.push(...Array.from({ length: 60 }, () => ({ type: 'user', text: 'private-output'.repeat(500) })));
@@ -127,6 +152,14 @@ describe('Claude stream diagnostics', () => {
 });
 
 describe('Claude non-interactive environment', () => {
+  it('preserves stricter caller Bash timeout bounds in the spawned environment', async () => {
+    const env = { BASH_DEFAULT_TIMEOUT_MS: '1000', BASH_MAX_TIMEOUT_MS: '2000' };
+    const f = fake([result]);
+    await judgeSpawn({ ...request, ...f, env });
+    expect(f.options().env).toMatchObject(env);
+    expect(env).toEqual({ BASH_DEFAULT_TIMEOUT_MS: '1000', BASH_MAX_TIMEOUT_MS: '2000' });
+  });
+
   it('sanitizes credentials and overrides interactive settings and unbounded Bash timeouts', () => {
     const env = { GH_TOKEN: 'secret', GIT_SSH_COMMAND: 'ssh', GIT_TERMINAL_PROMPT: '1', CI: '0',
       BASH_DEFAULT_TIMEOUT_MS: '9999999', BASH_MAX_TIMEOUT_MS: '9999999', PATH: '/bin' };

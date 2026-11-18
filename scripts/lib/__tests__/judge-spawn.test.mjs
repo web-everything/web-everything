@@ -396,9 +396,9 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
     expect(() => parseJudgeOutcome(JSON.stringify(noShape))).toThrow(/end_turn/);
   });
 
-  it('throws with both streams quoted when stdout is not JSON at all', () => {
+  it('throws with a stdout byte count and redacted event summary when stdout is not JSON at all', () => {
     expect(() => parseJudgeOutcome('command not found', 'sh: claude: not found'))
-      .toThrow(/parseable JSON[\s\S]*command not found[\s\S]*claude: not found/);
+      .toThrow(/parseable JSON[\s\S]*stdout 17 bytes; last events: \[{"type":"unrecognized"}\][\s\S]*claude: not found/);
   });
 });
 
@@ -681,7 +681,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
       sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
     const original = new JudgeUnparseableError({ attempt: 1, attempts: 1, exitCode: 1,
-      signal: null, stdout, stderr, wallMs: 0, sessionId: SID, failedAttempts: [] });
+      signal: null, stdout, stderr, wallMs: 0, sessionId: SID, failedAttempts: [],
+      lastEvents: [{ type: 'unrecognized' }] });
     expect(error).toBeInstanceOf(JudgeUnparseableError);
     expect(error.message).toBe(original.message);
     expect(error.telemetry).toMatchObject({
@@ -697,7 +698,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   it.each(['stdout', 'stderr'])('ignores matching raw %s when parsed is_error result is ordinary', async source => {
     const text = "You've hit your weekly limit · resets tomorrow";
     const result = 'schema invalid';
-    const parsed = JSON.stringify({ is_error: true, result });
+    const parsed = JSON.stringify({ type: 'result', is_error: true, result });
     const { fn } = fakeSpawn(source === 'stdout' ? `${text}\n${parsed}` : parsed,
       { code: 1, stderr: source === 'stderr' ? text : '' });
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
@@ -1613,7 +1614,7 @@ describe('resolveUnparseableRetries — the retry count is a cascade setting wit
 
 describe('parseJudgeOutcome — a stray line around the result object does not lose the answer', () => {
   it('reads the last line that is a JSON result object when the whole stdout is not one document', () => {
-    const answer = JSON.stringify({ is_error: false, stop_reason: 'tool_use', session_id: 's', structured_output: { verdict: 'accept', findings: [] } });
+    const answer = JSON.stringify({ type: 'result', is_error: false, stop_reason: 'tool_use', session_id: 's', structured_output: { verdict: 'accept', findings: [] } });
     expect(parseJudgeOutcome(`some warning printed to stdout\n${answer}\n`).value).toEqual({ verdict: 'accept', findings: [] });
   });
   it('still throws the unparseable error, marked as such, when no line is a result object', () => {

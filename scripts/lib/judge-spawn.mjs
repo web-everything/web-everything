@@ -232,10 +232,15 @@ function stderrSnippet(stderr) {
 
 /** Fixed bounds also apply when the caller supplies a more permissive environment. */
 export function buildJudgeEnv(env = process.env) {
+  const capTimeout = (key, cap) => {
+    const existing = Number(env[key]);
+    return String(Number.isFinite(existing) && existing > 0 ? Math.min(existing, cap) : cap);
+  };
   return markWorkerEnv({ ...sanitizeSpawnEnv(env),
     GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
     GIT_TERMINAL_PROMPT: '0', CI: '1',
-    BASH_DEFAULT_TIMEOUT_MS: '300000', BASH_MAX_TIMEOUT_MS: '600000',
+    BASH_DEFAULT_TIMEOUT_MS: capTimeout('BASH_DEFAULT_TIMEOUT_MS', 300000),
+    BASH_MAX_TIMEOUT_MS: capTimeout('BASH_MAX_TIMEOUT_MS', 600000),
   });
 }
 
@@ -292,14 +297,14 @@ function killJudgeGroup(child, fallback = true) {
 /** Final unparseable output, with evidence from every failed attempt. */
 export class JudgeUnparseableError extends Error {
   constructor({ attempt, attempts, exitCode, signal, stdout, stderr, wallMs, sessionId, failedAttempts, lastEvents = [], lastToolCall = null }) {
-    const bytes = stdout.length;
+    const bytes = Buffer.byteLength(String(stdout));
     const snippet = stderrSnippet(stderr);
     const tail = String(stderr).trim().slice(-600);
     exitCode = exitCode ?? null;
     signal = signal ?? null;
     super(
       `judge-spawn: the juror did not emit parseable JSON on stdout (attempt ${attempt}/${attempts}, exit ${exitCode ?? 'none'}, signal ${signal ?? 'none'}, stdout ${bytes} bytes${snippet ? `, stderr: ${snippet}` : ''}${lastToolCall ? `, last tool: ${lastToolCall}` : ''}).\n`
-      + `stdout[0..600]: ${lastEvents.some(e => e.type !== 'unrecognized' || e.truncated) ? JSON.stringify(lastEvents).slice(0, 600) : String(stdout).slice(0, 600)}\n`
+      + `last events: ${JSON.stringify(lastEvents).slice(0, 600)}\n`
       + (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>')
       + (lastEvents.some(e => e.truncated) ? '\nStream diagnostics were truncated; rerun with a narrower mandate to inspect the step.' : ''),
     );
@@ -333,7 +338,7 @@ export class JudgeTimeoutError extends Error {
       `judge-spawn: the juror exceeded ${timeoutMs}ms and was killed (ran ${wallMs}ms)${lastToolCall ? `; last tool: ${lastToolCall}` : ''}. `
       + 'Its output did not parse, so no partial verdict is available — but this is a BOUND being hit, not a '
       + `crash: see JUDGE_TIMEOUT_MS for what the bound was derived from.\n`
-      + `stdout[0..600]: ${lastEvents.some(e => e.type !== 'unrecognized' || e.truncated) ? JSON.stringify(lastEvents).slice(0, 600) : String(stdout).slice(0, 600)}\n`
+      + `stdout ${Buffer.byteLength(String(stdout))} bytes; last events: ${JSON.stringify(lastEvents).slice(0, 600)}\n`
       + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`
       + (lastEvents.some(e => e.truncated) ? '\nStream diagnostics were truncated; rerun with a narrower mandate to inspect the step.' : ''),
     );
@@ -799,17 +804,20 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       try {
         const candidate = JSON.parse(line);
         if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
-          && (candidate.type === 'result' || (!candidate.type && ('structured_output' in candidate || 'is_error' in candidate)))) {
+          && candidate.type === 'result') {
           parsed = candidate;
           break;
         }
       } catch { /* stray stdout lines are not result objects */ }
     }
     if (parsed === undefined) {
+      const evidence = streamEvidence();
+      evidence.add(stdout);
+      evidence.finish();
       const tail = String(stderr).trim().slice(-600);
       const err = new Error(
         `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
-        `stdout[0..600]: ${String(stdout).slice(0, 600)}\n` +
+        `stdout ${Buffer.byteLength(String(stdout))} bytes; last events: ${JSON.stringify(evidence.lastEvents).slice(0, 600)}\n` +
         (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
       );
       err.unparseableStdout = true;
