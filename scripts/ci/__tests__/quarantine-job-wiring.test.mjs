@@ -98,10 +98,10 @@ describe('soak CLI quarantine consumption', () => {
     await runSoak(line ? [line] : []);
     expect(io.spawn.mock.calls[0][1]).toEqual(['vitest', 'run', '--config', 'vitest.soak.config.ts', soakFile, otherFile]);
   });
-  it('a fully quarantined baseline shard succeeds without invoking Vitest on an empty file list', async () => {
+  it('a fully quarantined shard FAILS (no green shard without assertions) and never invokes Vitest', async () => {
     await runSoak([`--exclude=${soakFile}`], [soakFile]);
     expect(io.spawn).not.toHaveBeenCalled();
-    expect(process.exitCode).toBe(0);
+    expect(process.exitCode).toBe(1);
     expect(process.stdout.write).toHaveBeenCalledWith(expect.stringContaining('quarantined'));
   });
   it('with no skips it runs the original assignment and preserves failures', async () => {
