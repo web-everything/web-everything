@@ -11,6 +11,7 @@ const now = Date.parse('2026-10-27T23:00:00Z');
 const integrationFile = 'scripts/__tests__/lane-pool-acquire-base.test.mjs';
 const soakFile = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs';
 const otherFile = 'scripts/conveyor/soak/breaks/other.soak.test.mjs';
+const soakName = '50 real daemon ticks: every invariant holds after every tick';
 
 function skip(job, file, overrides = {}) {
   const list = addEntries(null, { tests: [file], job, brokenSha: 'a'.repeat(40), owner: 'red-main-safety-net',
@@ -54,7 +55,33 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
       { job, event: 'workflow_dispatch', ref: 'refs/heads/main' },
       { job, event: 'pull_request', ref: 'refs/pull/6010/merge' },
     ]) expect(skip(job, file, { flags }).skip).toEqual([]);
-    expect(skip(job, `${file}::named failure`).skip).toEqual(job.startsWith('soak-shard') ? [file] : []);
+    expect(skip(job, `${file}::named failure`).skip).toEqual([]);
+  });
+
+  it.each(['integration', 'test-shard (1)'])('%s never excludes a named entry even for a matching single test', (job) => {
+    expect(skip(job, `${soakFile}::${soakName}`).skip).toEqual([]);
+  });
+
+  it('a named soak entry excludes only a file with exactly one matching it/test', () => {
+    expect(skip('soak-shard (1)', `${soakFile}::${soakName}`).skip).toEqual([soakFile]);
+    for (const declaration of ['it', 'test']) {
+      const source = `${declaration}('named case', () => {});`;
+      const named = `${soakFile}::named case`;
+      expect(skip('soak-shard (1)', named, { readSource: () => source }).skip).toEqual([soakFile]);
+      expect(skip('soak-shard (1)', named, { readSource: () => `${source}\ntest('unrelated assertion', () => {});` }).skip).toEqual([]);
+      expect(skip('soak-shard (1)', `${soakFile}::different case`, { readSource: () => source }).skip).toEqual([]);
+      expect(skip('soak-shard (1)', `${named}::different case`, { readSource: () => source }).skip).toEqual([]);
+    }
+  });
+
+  it.each(['', 'it(', "it.each([1, 2])('named case', () => {});", "for (const n of [1, 2]) it('named case', () => {});"])
+  ('unknown or generated soak test counts run everything: %j', (source) => {
+    expect(skip('soak-shard (1)', `${soakFile}::named case`, { readSource: () => source }).skip).toEqual([]);
+  });
+
+  it('unreadable single-test evidence runs the named soak case', () => {
+    expect(skip('soak-shard (1)', `${soakFile}::${soakName}`, { readSource: () => { throw new Error('unreadable'); } }).skip).toEqual([]);
+    expect(skip('soak-shard (1)', `${soakFile}::${soakName}`, { changed: [soakFile] }).skip).toEqual([]);
   });
 });
 
@@ -83,7 +110,7 @@ async function runSoak(args, files = [soakFile, otherFile], status = 0) {
 
 describe('soak CLI quarantine consumption', () => {
   it('removes the quarantined file after shard assignment and still runs the other file', async () => {
-    await runSoak(skip('soak-shard (1)', `${soakFile}::50 real daemon ticks`).line.split(' '));
+    await runSoak(skip('soak-shard (1)', `${soakFile}::${soakName}`).line.split(' '));
     expect(io.files).toHaveBeenCalledWith({ shard: 1, total: 8 });
     expect(io.spawn.mock.calls[0][1]).toEqual(['vitest', 'run', '--config', 'vitest.soak.config.ts', otherFile]);
   });

@@ -181,13 +181,27 @@ const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
  */
 export function parseVitestFailures(logText) {
   const tests = [];
-  let failedFiles = null, failedTests = null, incomplete = false;
-  for (const raw of String(logText ?? '').split('\n')) {
+  let failedFiles = null, failedTests = null, incomplete = false, assertionBlock = false, assertionErrorSeen = false;
+  const lines = String(logText ?? '').trimEnd().split('\n');
+  for (const [index, raw] of lines.entries()) {
     const line = raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd();
-    // Assertion blocks precede the summary. Later errors/failures are additional evidence, never covered by it.
-    if (failedFiles !== null && /Error|Unhandled|##\[error\]|^\s*(?:FAIL\b|[×❯])/i.test(line)) incomplete = true;
+    // A listed FAIL owns only its assertion block, never independent runner/worker errors.
+    if (/^\s*(?:[⎯─═-]{3,}|Test Files\b|Tests\b)/.test(line)) assertionBlock = false;
+    const finalExit = index === lines.length - 1 && failedFiles !== null
+      && /^\s*##\[error\]Process completed with exit code [1-9]\d*\.$/.test(line);
+    if (!finalExit && (/Unhandled|worker.*(?:crash|exit|error)|##\[error\]|ELIFECYCLE/i.test(line)
+      || (!assertionBlock && /Error|timed?\s*out|timeout/i.test(line))
+      || (failedFiles !== null && /^\s*(?:FAIL\b|[×❯])/.test(line)))) incomplete = true;
+    if (/^\s*(?:\w*Error|Timeout):/i.test(line)) {
+      if (assertionErrorSeen) incomplete = true;
+      assertionErrorSeen = true;
+    }
     const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line); // `FAIL file > a > b`, or `FAIL file [ file ]` (a suite that failed to load)
-    if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
+    if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) {
+      tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
+      assertionBlock = failedFiles === null;
+      assertionErrorSeen = false;
+    }
     else if (/^\s*FAIL\b/.test(line)) incomplete = true;
     const s = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
     if (s) failedFiles = Number(s[1]);

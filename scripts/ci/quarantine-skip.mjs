@@ -28,6 +28,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parse } from 'acorn';
 import { readQuarantine } from '../lib/red-main-quarantine-io.mjs';
 import { decideCiSkip, ciJobContext, RED_MAIN_MODES } from '../lib/red-main-quarantine.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -76,13 +77,39 @@ export function renderExclude(files) {
   return { line: safe.length === 0 ? '' : `--exclude=${safe.length === 1 ? safe[0] : `{${safe.join(',')}}`}`, refused };
 }
 
+/** Only a single, literal, top-level it/test call proves that a named soak case covers its file. */
+function singleSoakTest(file, board, readSource) {
+  try {
+    if (!/^scripts\/conveyor\/soak\/(?!.*\.\.)[\w./-]+\.soak\.test\.mjs$/.test(file)) return null;
+    const ast = parse(readSource(resolve(board, file), 'utf8'), { ecmaVersion: 2020, sourceType: 'module' });
+    const calls = [];
+    const visit = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (node.type === 'CallExpression') {
+        let callee = node.callee;
+        while (callee?.type === 'MemberExpression' || callee?.type === 'CallExpression') callee = callee.object ?? callee.callee;
+        if (callee?.type === 'Identifier' && /^(it|test)$/.test(callee.name)) calls.push(node);
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach(visit);
+        else if (value?.type) visit(value);
+      }
+    };
+    visit(ast);
+    const [call] = calls;
+    return calls.length === 1 && call.callee.type === 'Identifier'
+      && ast.body.some((node) => node.type === 'ExpressionStatement' && node.expression === call)
+      && typeof call.arguments[0]?.value === 'string' ? call.arguments[0].value : null;
+  } catch { return null; } // Unknown/unreadable source runs everything.
+}
+
 /**
  * The whole step, with every seam injectable. Returns `{line, why}` — `line` is what goes to stdout.
  */
 export function quarantineSkip({
   env = process.env, board = process.cwd(), now = Date.now(), flags = {},
   mode = undefined, read = null, readList = (b) => readQuarantine({ board: b }), changed = undefined, readEvent = (p) => JSON.parse(readFileSync(p, 'utf8')),
-  changedOf = changedFilesOf,
+  changedOf = changedFilesOf, readSource = readFileSync,
 }) {
   // The mode is the one the safety net PUBLISHED on the list (it resolves it through env / preference / settings, which
   // a CI job cannot see). No stamp ⇒ stop: this job's tree and env are PR-controlled, never a source for the mode.
@@ -99,7 +126,15 @@ export function quarantineSkip({
   const changedFiles = changed !== undefined ? changed
     : flags.changed !== undefined ? String(flags.changed).split(',').filter(Boolean)
       : (ctx.known && !ctx.onMain ? changedOf({ board, base }) : null);
-  const d = decideCiSkip({ mode: mode.value, read: r, ctx, changedFiles, now, job: firstSet(flags.job) });
+  const job = firstSet(flags.job);
+  const readForSkip = /^soak-shard \(\d+\)$/.test(job) && r.ok ? { ...r, list: { ...r.list,
+    entries: r.list.entries.map((entry) => {
+      const [file, ...parts] = entry.test.split('::');
+      const name = parts.join('::');
+      return name && singleSoakTest(file, board, readSource) === name ? { ...entry, test: file } : entry;
+    }),
+  } } : r;
+  const d = decideCiSkip({ mode: mode.value, read: readForSkip, ctx, changedFiles, now, job });
   const why = `${d.why}${d.unsupported?.length ? `; ${d.unsupported.length} name-qualified entr${d.unsupported.length === 1 ? 'y' : 'ies'} not skipped (vitest --exclude is per file)` : ''}`;
   if (flags.nonblocking) return { line: d.skip.join(' '), why, skip: d.skip };
   const { line, refused } = renderExclude(d.skip);

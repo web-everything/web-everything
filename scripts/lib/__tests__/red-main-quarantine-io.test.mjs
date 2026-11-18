@@ -153,6 +153,28 @@ describe('latest main quarantine coverage releases the drain only with complete 
       readJobs: () => ({ complete: true, failed: [{ id: 1, name: job }], jobs: [{ id: 1, name: job, conclusion: 'failure' }] }),
     })).toBe(tail === '');
   });
+
+  it.each([
+    'Unhandled Rejection: worker died', 'Unhandled Error: worker died', 'Error: worker crashed',
+    '##[error]uncovered runner failure', 'ELIFECYCLE Command failed', 'Timeout: runner exceeded its deadline',
+    'Error: independent failure',
+  ])('coverage fails closed for independent errors anywhere in the log: %s', (error) => {
+    const now = Date.now();
+    const list = { ...addEntries(null, { tests: [file], job, brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now }).list, mode: 'quarantine' };
+    const block = ` FAIL ${file} > covered case\nAssertionError: expected true\n⎯⎯⎯⎯⎯ [1/1] ⎯⎯⎯\n`;
+    const summary = ' Test Files 1 failed\n Tests 1 failed\n';
+    const covered = (log) => mainQuarantineCovered({ list, signal: { latestRedSha: SHA }, now,
+      exec: (_bin, args) => args[0] === 'run'
+        ? JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: SHA }]) : log,
+      readJobs: () => ({ complete: true, failed: [{ id: 1, name: job }], jobs: [{ id: 1, name: job, conclusion: 'failure' }] }),
+    });
+    expect(covered(`${block}${summary}`)).toBe(true);
+    expect(covered(`${block}${summary}##[error]Process completed with exit code 1.`)).toBe(true);
+    for (const log of [`${error}\n${block}${summary}`, `${block}${error}\n${summary}`, `${block}${summary}${error}`,
+      ` FAIL ${file} > covered case\nAssertionError: expected true\n${error}\n${summary}`]) {
+      expect(covered(log), log).toBe(false);
+    }
+  });
 });
 
 describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of the broken main run, once per sha', () => {
