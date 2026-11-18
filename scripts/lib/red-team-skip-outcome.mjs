@@ -1,4 +1,4 @@
-import { EMPTY_NET_DIFF_SKIP, verifyEmptyNetDiff } from './red-team-empty-net-diff.mjs';
+import { EMPTY_NET_DIFF_SKIP, emptyDiffExemptionEvidence } from './red-team-empty-net-diff.mjs';
 /** Settle skipped red teams: explicit policy produces a result; everything else needs an operator. */
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync } from 'node:fs';
@@ -171,7 +171,8 @@ export function settleRedTeamSkip(input = {}) {
       let proven = false;
       try {
         const stored = (io.readStatus ?? readRedTeamStatus)({ repo, pr, head, env: io.env ?? process.env });
-        proven = stored?.head === head && verifyEmptyNetDiff(stored.loopPayload?.findings?.read, head, { exec: io.gitExec, cwd: io.cwd });
+        proven = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: stored, env: io.env, storePath: io.storePath,
+          exec: io.gitExec, cwd: io.cwd }).exempt;
       } catch { /* unreadable proof retains the operator hold */ }
       if (!proven) classified = { kind: 'non-policy', reason: 'empty net diff not proven for this head; inspect stored evidence' };
     }

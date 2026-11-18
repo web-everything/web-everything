@@ -4992,13 +4992,15 @@ async function runCli() {
           if (!Array.isArray(comments)) throw Error('complete comments unreadable');
           const safety = readDrainQueueSafety({ log });
           if (safety.value.waitForRedTeamBeforeEnqueue) {
-            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
+            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha,
+              cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo), gitExec: exec });
             const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
               readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
               cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
               unedited: target => readUneditedCommentIds(target, { gh }),
             });
-            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
+            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling, exec,
+              cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo) })) return false;
           }
           // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
           const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,

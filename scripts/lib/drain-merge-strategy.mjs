@@ -1,6 +1,6 @@
 import { redTeamForHead } from './red-team-gate.mjs';
 import { redTeamCardOnly } from './review-red-team-policy.mjs';
-import { emptyNetDiffSkip } from './red-team-empty-net-diff.mjs';
+import { emptyDiffExemptionEvidence } from './red-team-empty-net-diff.mjs';
 import { skippedRedTeamRetry, failedRedTeamRetry } from './red-team-run-result.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { candidateQueueClass } from './merge-queue.mjs';
@@ -230,7 +230,7 @@ export function createDrainMergeStrategy({
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readRedTeamCheck = null,
-  cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
+  cwd: subjectCwd, // Exemption evidence requires an explicit subject checkout.
   // The located primary checkout, if any. A corrupt `cwd` self-heals only when it is a different clone (never the
   // primary itself); unknown (null) never heals.
   primary = null,
@@ -248,6 +248,7 @@ export function createDrainMergeStrategy({
   redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
   publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
 } = {}) {
+  const cwd = subjectCwd ?? process.cwd();
   const { policy, note } = resolved;
   // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.
   const grantScopeFor = (c, headSha, comments) => {
@@ -349,14 +350,14 @@ export function createDrainMergeStrategy({
   const checkRunDispositionHold = (c, head, live) => {
     let reason;
     try {
-      let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head, env });
+      let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head, env, cwd: subjectCwd, gitExec: exec });
       if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) throw new Error('unreadable evidence');
       const pages = readThreadPages(c.repo, c.num);
       if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error('unreadable complete comments');
       const comments = pages.flat();
       const standingRuling = grantScopeFor(c, head, comments);
       evidence = settleUnknownEvidenceByComment(evidence, comments, c.num, head, live.reviews);
-      reason = redTeamEnqueueHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
+      reason = redTeamEnqueueHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, cwd: subjectCwd, exec, standingRuling });
       // The check owns pending/wait states; confirmed breaks and unknown evidence still fail closed.
       if (!reason || (!reason.includes('requiring send-back') && evidence.ok !== false)) return null;
     } catch {
@@ -437,8 +438,8 @@ export function createDrainMergeStrategy({
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();
         if (checkRunOnly || !safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
-        const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha, live.reviews);
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
+        const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env, cwd: subjectCwd, gitExec: exec }), pages.flat(), c.num, headSha, live.reviews);
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, cwd: subjectCwd, exec,
           standingRuling: grantScopeFor(c, headSha, pages.flat()) });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
@@ -475,7 +476,7 @@ export function createDrainMergeStrategy({
       let deadlineOverride = false;
       // Head-bound file preparation is reusable; authorization evidence is always live.
       if (!checkRunOnly && safety.value.waitForRedTeamBeforeEnqueue) {
-        let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env, cwd: subjectCwd, gitExec: exec });
         const pending = before.redTeamPending?.[key];
         // Migrate legacy current-head spend before replacing transient wait state.
         if (pending?.requestAttemptedAt != null || pending?.requestedAt != null) {
@@ -506,7 +507,7 @@ export function createDrainMergeStrategy({
           && admissionLabels.includes('review:accepted') && admissionLabels.includes('red-team:pending')
           && !redTeamForHead(pages.flat(), c.num, headSha)
           && !evidence.inFlight && !evidence.queued && !evidence.recorded
-          && !emptyNetDiffSkip(writer, headSha)
+          && !emptyDiffExemptionEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, seatRecord: writer, env, cwd: subjectCwd, exec, requireSkip: true }).exempt
           && !(writer.skipCardOnly === true && redTeamCardOnly(writer.loopPayload?.findings?.read))
           && (writer.retryCount >= 1
             || (!skippedRedTeamRetry(writer, evidence) && !failedRedTeamRetry(writer, evidence)));
@@ -525,7 +526,7 @@ export function createDrainMergeStrategy({
         }
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
         evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha, live.reviews);
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, cwd: subjectCwd, exec, standingRuling });
         try {
           const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
             live, comments: pages.flat(), provider: statusProvider, log: say };

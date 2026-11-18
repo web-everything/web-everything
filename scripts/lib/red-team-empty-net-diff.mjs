@@ -1,52 +1,68 @@
 import { execFileSync } from 'node:child_process';
-
-/** Positive, head-bound proof only: missing diff evidence never grants an exemption. */
-export function provenEmptyNetDiff(read, head = read?.netBasis?.rev) {
-  return typeof head === 'string' && /^[a-f0-9]{40}$/i.test(head)
-    && read?.netBasis?.rev === head && read.netBasis.scored === true && read.diffScored === true
-    && Array.isArray(read.netChangedFiles) && read.netChangedFiles.length === 0
-    && typeof read.diffText === 'string' && read.diffText === '';
-}
-
-/**
- * A payload's read proves an empty diff for `head` only when it was taken on that head. A head-move carry rebinds
- * its source read's rev onto the new head but keeps the source's diff fields, so it never proves the new head empty.
- */
-export function provenEmptyNetDiffPayload(loopPayload, head) {
-  const from = loopPayload?.carriedFrom;
-  return (from == null || from === head) && provenEmptyNetDiff(loopPayload?.findings?.read, head);
-}
+import { readFileSync } from 'node:fs';
+import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 
 export const EMPTY_NET_DIFF_SKIP = Object.freeze({ status: 'skipped', policy: 'empty-net-diff',
   reason: 'red team skipped: empty net diff' });
 
-/** Legacy skips can be recovered only from the stored read for this exact writer head. */
-export function emptyNetDiffSkip(status, head = status?.head) {
-  const result = status?.result;
-  return status?.status === 'finished' && status.head === head
-    && (typeof result === 'string' ? result : result?.status) === 'skipped'
-    && (!result?.policy || result.policy === 'empty-net-diff')
-    && !result?.deferredByGuard && !result?.deferredByCap
-    && provenEmptyNetDiffPayload(status.loopPayload, head);
-}
+const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
+const refused = reason => ({ exempt: false, reason });
 
-/** Revalidate the stored base and range, never a live head ref. Unknown or oversized output retains the hold. */
-export function verifyEmptyNetDiff(read, head, { exec = execFileSync, cwd } = {}) {
-  if (!provenEmptyNetDiff(read, head) || typeof read.netBasis.base !== 'string' || !read.netBasis.base) return false;
+/**
+ * The ONLY empty-net-diff exemption decision. Callers must supply the subject checkout and
+ * the prior read/skip record, never a boolean claiming the records were readable. Read the actual
+ * store without readStore's missing-file fallback. Unknown evidence keeps the red team owed;
+ * operators must inspect stored evidence (including oversized Git output) before retrying.
+ */
+export function emptyDiffExemptionEvidence({ repo, pr, head, seatRecord, loopPayload = seatRecord?.loopPayload,
+  read = loopPayload?.findings?.read, requireSkip = false, env = process.env,
+  storePath = resolveScorecardStorePath(env), readFile = readFileSync, cwd, exec = execFileSync } = {}) {
+  let store;
   try {
-    // Every Git read must ignore replacement objects, including resolution of the stored base.
-    const git = args => exec('git', ['--no-replace-objects', ...args],
-      { cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
-    const base = git(['rev-parse', '--verify', '--end-of-options', `${read.netBasis.base}^{commit}`]).trim();
-    // A replacement-aware merge-base may have recorded head itself. Even a replacement-free
-    // head..head diff then says nothing about the contribution; retain the hold for inspection.
-    if (!/^[a-f0-9]{40}$/i.test(base) || base.toLowerCase() === head.toLowerCase()) return false;
-    // Match the review reader's PR base ref (resolveNetDiffBasis defaults to origin/main).
-    // A poisoned merge-base can also be DISTINCT from head while carrying head's tree.
-    // Never trust that stored base without re-deriving its replacement-free provenance.
-    const mergeBase = git(['merge-base', '--end-of-options', 'origin/main', head]).trim();
-    if (!/^[a-f0-9]{40}$/i.test(mergeBase) || mergeBase.toLowerCase() !== base.toLowerCase()) return false;
-    return git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
-      '--end-of-options', `${base}..${head}`, '--']) === '';
-  } catch { return false; }
+    store = readFile(storePath, 'utf8');
+  } catch (error) {
+    return refused(error?.code === 'ENOENT' ? 'store-missing' : 'store-unreadable');
+  }
+  try {
+    store = JSON.parse(store);
+    if (!store || !Array.isArray(store.records)) return refused('store-unparseable');
+  } catch { return refused('store-unparseable'); }
+  if (typeof repo !== 'string' || !repo || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
+    || !sha(head) || !store.records.some(row => row?.dispatchKind === 'review-seat'
+      && typeof row.seat === 'string' && row.seat.length > 0 && row.repo === repo
+      && ['number', 'string'].includes(typeof row.pr) && Number(row.pr) === Number(pr) && row.rev === head)) return refused('seat-record-missing');
+  if (seatRecord && seatRecord.head !== head) return refused('seat-record-mismatch');
+  if (requireSkip) {
+    const result = seatRecord?.result;
+    if (seatRecord?.status !== 'finished'
+      || (typeof result === 'string' ? result : result?.status) !== 'skipped'
+      || (result?.policy && result.policy !== EMPTY_NET_DIFF_SKIP.policy)
+      || result?.deferredByGuard || result?.deferredByCap) return refused('skip-record-invalid');
+  }
+  if ((loopPayload?.carriedFrom != null && loopPayload.carriedFrom !== head)
+    || read?.netBasis?.rev !== head || read.netBasis.scored !== true || read.diffScored !== true
+    || !Array.isArray(read.netChangedFiles) || read.netChangedFiles.length !== 0
+    || read.diffText !== '') return refused('read-unproven');
+  if (typeof cwd !== 'string' || !cwd.trim()) return refused('cwd-missing');
+  if (typeof read.netBasis.base !== 'string' || !read.netBasis.base) return refused('base-unresolvable');
+  const git = args => {
+    const output = exec('git', ['--no-replace-objects', ...args],
+      { cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' } });
+    if (typeof output !== 'string' || Buffer.byteLength(output) > 1024 * 1024) throw Error('unreadable Git output');
+    return output;
+  };
+  let base, recomputed;
+  try {
+    base = git(['rev-parse', '--verify', '--end-of-options', `${read.netBasis.base}^{commit}`]).trim();
+    recomputed = git(['merge-base', '--end-of-options', 'origin/main', head]).trim();
+  } catch { return refused('base-unresolvable'); }
+  if (!sha(base) || !sha(recomputed)) return refused('base-unresolvable');
+  if (base.toLowerCase() === head.toLowerCase() || recomputed.toLowerCase() !== base.toLowerCase())
+    return refused('base-mismatch');
+  try {
+    if (git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
+      '--end-of-options', `${base}..${head}`, '--']) !== '') return refused('diff-nonempty');
+  } catch { return refused('diff-unreadable'); }
+  return { exempt: true, reason: 'empty-net-diff' };
 }

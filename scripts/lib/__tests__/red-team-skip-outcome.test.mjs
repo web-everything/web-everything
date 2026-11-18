@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
@@ -57,7 +57,9 @@ function fixture() {
   const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
   vi.stubEnv('WE_SHARED_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
   const comments = [];
-  const io = { env, log: vi.fn(),
+  const storePath = join(root, 'scorecards.json');
+  writeFileSync(storePath, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'advisory', repo, pr, rev: head }] }));
+  const io = { env, storePath, cwd: 'subject-checkout', log: vi.fn(),
     postComment: vi.fn(({ body }) => { comments.push({ body, author: { login: 'web-everything' } }); }),
     publishNeedsYou: vi.fn(),
   };

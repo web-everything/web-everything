@@ -1,4 +1,4 @@
-import { emptyNetDiffSkip, provenEmptyNetDiffPayload, verifyEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
+import { emptyDiffExemptionEvidence, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
@@ -337,8 +337,8 @@ export function normalizeRedTeamResult(result) {
 }
 
 /** Historical card-only skips need a result comment, not a resumed model pass. PURE. */
-export function redTeamSkipNeedsSettlement(status) {
-  if (emptyNetDiffSkip(status)) return true;
+export function redTeamSkipNeedsSettlement(status, proof = {}) {
+  if (emptyDiffExemptionEvidence({ repo: status?.repo, pr: status?.pr, ...proof, head: status?.head, seatRecord: status, requireSkip: true }).exempt) return true;
   const read = status?.loopPayload?.findings?.read;
   const result = status?.result;
   if (result && typeof result === 'object' && result.policy !== 'card-only') return false;
@@ -363,10 +363,10 @@ export function cardOnlyHeadMoveCandidate(evidence, head) {
 }
 
 /** A failed policy comment remains retryable after the carried read has been pinned to this head. */
-export function cardOnlySkipSettlementCandidate(evidence, head) {
+export function cardOnlySkipSettlementCandidate(evidence, head, proof = {}) {
   const read = evidence?.loopPayload?.findings?.read;
   return !evidence?.carryConflict && isRealHead(head) && read?.netBasis?.rev === head
-    && (redTeamCardOnly(read) || provenEmptyNetDiffPayload(evidence.loopPayload, head)) && redTeamSkipNeedsSettlement(evidence?.status)
+    && (redTeamCardOnly(read) || emptyDiffExemptionEvidence({ repo: evidence.status?.repo, pr: evidence.status?.pr, ...proof, head, seatRecord: evidence.status, loopPayload: evidence.loopPayload, requireSkip: true }).exempt) && redTeamSkipNeedsSettlement(evidence?.status, proof)
     && evidence.status.head === head
     && evidence.recorded === false && evidence.seatRecorded === false
     && !evidence.inFlight && !evidence.queued;
@@ -588,7 +588,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
       }
-      const evidence = readEvidence({ repo, pr, head });
+      const evidence = readEvidence({ repo, pr, head, env, cwd, gitExec });
       if (evidence?.ok === false) return failedRead(evidence);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
@@ -629,7 +629,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const movedCardOnly = cardOnlyHeadMoveCandidate(evidence, head)
         && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
       const status = unfinishedCarry ? evidence.status : readStatus({ repo, pr, head });
-      const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
+      const pendingCardOnly = status?.loopPayload?.findings?.read?.diffText !== ''
+        && cardOnlySkipSettlementCandidate({ ...evidence, status }, head, { repo, pr, env, cwd, exec: gitExec });
       const owed = redTeamOwedFor(evidence?.loopPayload);
       const verdict = evidence?.loopPayload?.verdict?.verdict;
       const finishedNotOwed = [evidence?.status, status].every(candidate => candidate?.status === 'finished'
@@ -705,16 +706,19 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (ruled) return fullReviewDecision('stored review needs-human only on referrals now ruled; resume the parked run',
           { referralsRuled: true });
       }
-      if (emptyNetDiffSkip(status, head) && emptyNetDiffSkip(evidence.status, head)
-        && provenEmptyNetDiffPayload(evidence.loopPayload, head)
+      // A claim selects the recovery path; only the shared evidence function may grant clearance.
+      if ((status?.result?.policy === EMPTY_NET_DIFF_SKIP.policy
+        || (normalizeRedTeamResult(status?.result).priorResult === 'skipped'
+          && status?.loopPayload?.findings?.read?.diffText === ''))
         && evidence.recorded === false && evidence.seatRecorded === false
         && evidence.inFlight === false && !evidence.queued && !evidence.carryConflict
         && acceptedReview && acceptance?.sha === head) {
         const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
           comments: rawPr.comments, reviews, settlesPending: true });
         if (refusal) return guardedSkip(refusal);
-        // The subject checkout must be explicit: the daemon may be reviewing another repository.
-        if (!cwd || !verifyEmptyNetDiff(evidence.loopPayload?.findings?.read, head, { exec: gitExec, cwd }))
+        const proof = { repo, pr, head, env, cwd, exec: gitExec, requireSkip: true };
+        if (!emptyDiffExemptionEvidence({ ...proof, seatRecord: status }).exempt
+          || !emptyDiffExemptionEvidence({ ...proof, seatRecord: evidence.status, loopPayload: evidence.loopPayload }).exempt)
           return skip('empty net diff not proven for this head; inspect stored evidence');
         return { ...row, action: 'clear', policy: EMPTY_NET_DIFF_SKIP.policy, why: EMPTY_NET_DIFF_SKIP.reason };
       }

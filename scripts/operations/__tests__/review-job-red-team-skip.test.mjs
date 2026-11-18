@@ -1,6 +1,6 @@
 // @vitest-environment node
-import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
@@ -17,7 +17,8 @@ import { createRedTeamIo, speculateRedTeam, runRedTeam } from '../review-extra-s
 import { execFileSync } from 'node:child_process';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
-import { emptyNetDiffSkip, provenEmptyNetDiffPayload, verifyEmptyNetDiff } from '../../lib/red-team-empty-net-diff.mjs';
+import { emptyDiffExemptionEvidence } from '../../lib/red-team-empty-net-diff.mjs';
+import { emptyDiffFixture } from '../../lib/__tests__/red-team-empty-net-diff-fixture.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
 const emptySkip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
@@ -887,26 +888,38 @@ describe('readRedTeamOnlyPayload fails closed on a held carry fallback', () => {
   });
 });
 
+const emptyEvidenceRoots = [];
+afterEach(() => { for (const root of emptyEvidenceRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function newEmptyEvidence() {
+  const f = emptyDiffFixture({ repo, pr }); emptyEvidenceRoots.push(f.root); return f;
+}
+
 describe('empty net diff producer proof', () => {
-  const read = () => ({ netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
+  const read = () => ({ netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
   it('owes a scheduled red-team result even with a proven empty net diff', () => {
     expect(redTeamOwedOnHead({ read: read(), evidence: { scheduled: true, skipCardOnly: false } })).toBe(true);
   });
   it('does not owe an unscheduled red-team result with a proven empty net diff', () => {
-    expect(redTeamOwedOnHead({ read: read(), evidence: { scheduled: false, skipCardOnly: false } })).toBe(false);
+    const f = newEmptyEvidence();
+    expect(redTeamOwedOnHead({ ...f.proof, read: f.read, evidence: { status: f.status, scheduled: false, skipCardOnly: false } })).toBe(false);
+    expect(redTeamOwedOnHead({ read: f.read, evidence: { scheduled: false, skipCardOnly: false } })).toBe(true);
   });
   it('skips a proven empty net diff before provider work with policy and reason', async () => {
-    expect(await speculateRedTeam({ repo, pr, read: read(), env: {} }, { now: () => 1000, readRecords: () => [], log: vi.fn() })).toEqual(emptySkip);
+    const f = newEmptyEvidence();
+    const readRecords = vi.fn(() => [f.row]);
+    expect(await speculateRedTeam({ repo, pr, lanePath: f.root, read: f.read, env: {} }, { storePath: f.storePath, now: () => 1000, readRecords, log: vi.fn() })).toEqual(emptySkip);
+    expect(readRecords).toHaveBeenCalledWith({ strict: true });
   });
   it('refuses empty net diff clearance when the production scorecard reader encounters a directory', async () => {
     const storePath = mkdtempSync(join(tmpdir(), 'red-team-scorecard-directory-'));
     try {
       const production = createRedTeamIo({ env: {}, storePath });
       expect(production.readRecords()).toEqual([]);
-      const io = { now: () => 1000, readRecords: production.readRecords, log: vi.fn(),
+      const io = { storePath, now: () => 1000, readRecords: vi.fn(production.readRecords), log: vi.fn(),
         cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), append: vi.fn(), postComment: vi.fn() };
       const result = await speculateRedTeam({ repo, pr, read: read(), env: {} }, io);
       expect(result).toEqual({ status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' });
+      expect(io.readRecords).toHaveBeenCalledWith({ strict: true });
       expect(result).not.toHaveProperty('policy');
       for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) {
         expect(io[effect]).not.toHaveBeenCalled();
@@ -925,7 +938,15 @@ describe('empty net diff producer proof', () => {
     ['unreadable diff', r => { delete r.diffText; }],
   ])('never grants a policy for %s', async (_, mutate) => {
     const r = read(); mutate(r);
-    expect(await speculateRedTeam({ repo, pr, read: r, env: {} }, {})).toEqual({ status: 'skipped', reason: 'the review printed no diff' });
+    const f = newEmptyEvidence();
+    f.writeStore([{ ...f.row, rev: head }]);
+    const io = { storePath: f.storePath, now: () => 1000, readRecords: vi.fn(() => []), log: vi.fn() };
+    const result = await speculateRedTeam({ repo, pr, lanePath: f.root, read: r, env: {} }, io);
+    expect(result).not.toHaveProperty('policy');
+    expect(result).toEqual({ status: 'skipped', reason: r.diffText == null ? 'the review printed no diff'
+      : !r.netBasis.rev ? 'the review printed no pinned head commit (netBasis.rev)'
+      : 'empty net diff not proven (read-unproven) — inspect stored evidence before retrying; no call launched' });
+    if (r.diffText != null && r.netBasis.rev) expect(io.readRecords).toHaveBeenCalledOnce();
   });
 
   it('empty net diff preserves resume-only refusal when the scorecard store is unreadable', async () => {
@@ -951,7 +972,8 @@ describe('empty net diff producer proof', () => {
     ['resumable', { resumeOnly: false, resume: true }],
     ['speculative', { resumeOnly: false, resume: false }],
   ])('refuses empty net diff policy clearance with an unreadable scorecard store (%s)', async (_, mode) => {
-    const io = {
+    const f = newEmptyEvidence();
+    const io = { storePath: f.root,
       now: () => 1000, readRecords: () => { throw Error('unreadable'); }, log: vi.fn(),
       cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(),
       append: vi.fn(), postComment: vi.fn(),
@@ -1000,8 +1022,11 @@ describe('empty net diff terminal publication through the production carry path'
   function productionCarry({ skipCardOnly, realDiff = false, replaceRef = false }) {
     const root = mkdtempSync(join(tmpdir(), 'empty-net-diff-carry-'));
     const { lanePath, base, sha } = laneFixture(root, { realDiff, replaceRef });
-    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: skipCardOnly ? '1' : '0',
+    const env = { CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: skipCardOnly ? '1' : '0',
       WE_RED_TEAM_STATUS_LABELS: '0' };
+    mkdirSync(join(root, '.conveyor'));
+    writeFileSync(join(root, '.conveyor', 'run-scorecards.json'), JSON.stringify({ version: 1, records: [
+      { dispatchKind: 'review-seat', seat: 'advisory', repo, pr, rev: sha } ] }));
     const comments = [], labels = ['red-team:pending'], gitCwds = [], gitOutputs = [];
     const exec = vi.fn((file, args, options = {}) => {
       if (file === 'git') {
@@ -1035,6 +1060,7 @@ describe('empty net diff terminal publication through the production carry path'
     const production = createReviewJobIo({ root, env, exec, readEvidence, readSeatRecords: () => [] });
     const f = fixture();
     Object.assign(f.io, {
+      env, gitExec: production.gitExec,
       acquireLane: () => ({ lanePath }), readRedTeamOnlyPayload: k => ({ ...readEvidence(k), head: sha }),
       prepareLane: () => ({ head: sha }), fetchRedTeamHead: () => ({ head: sha }), redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
       settleRedTeamSkip: vi.fn(production.settleRedTeamSkip),
@@ -1076,7 +1102,10 @@ describe('empty net diff terminal publication through the production carry path'
       expect(readRedTeamCarry(c.key)).toBeNull();
       // The refusal came from the lane's own diff naming the changed file, not from a failed Git call.
       expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
-      expect(c.gitOutputs).toEqual([`${c.base}\n`, `${c.base}\n`, 'file.txt\0']);
+      expect(c.gitOutputs.length).toBeGreaterThanOrEqual(3);
+      expect(c.gitOutputs.length % 3).toBe(0);
+      for (let i = 0; i < c.gitOutputs.length; i += 3)
+        expect(c.gitOutputs.slice(i, i + 3)).toEqual([`${c.base}\n`, `${c.base}\n`, 'file.txt\0']);
     } finally { rmSync(c.root, { recursive: true, force: true }); }
   });
 
@@ -1087,9 +1116,13 @@ describe('empty net diff terminal publication through the production carry path'
       expect(git(c.lanePath, ['diff', '--name-only', `${c.base}..${c.sha}`])).toBe('');
       // Mutation: the exact production probe minus --no-replace-objects would accept the faked empty diff.
       const read = c.loopPayload.findings.read;
-      const dropFlag = (file, args, options) => execFileSync(file, args.filter(arg => arg !== '--no-replace-objects'), options);
-      expect(verifyEmptyNetDiff(read, c.sha, { exec: dropFlag, cwd: c.lanePath })).toBe(true);
-      expect(verifyEmptyNetDiff(read, c.sha, { cwd: c.lanePath })).toBe(false);
+      const dropFlag = (file, args, options) => {
+        const { GIT_NO_REPLACE_OBJECTS: _disabled, ...env } = options.env;
+        return execFileSync(file, args.filter(arg => arg !== '--no-replace-objects'), { ...options, env });
+      };
+      const proof = { repo, pr, read, head: c.sha, cwd: c.lanePath, env: c.key.env };
+      expect(emptyDiffExemptionEvidence({ ...proof, exec: dropFlag }).exempt).toBe(true);
+      expect(emptyDiffExemptionEvidence(proof)).toEqual({ exempt: false, reason: 'diff-nonempty' });
       // Production: the claim is refused — non-policy, no comment, label unchanged, no carry.
       const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io);
       expect(out.redTeam).toMatchObject({ outcome: 'non-policy', reason: expect.stringContaining('empty net diff not proven') });
@@ -1098,39 +1131,98 @@ describe('empty net diff terminal publication through the production carry path'
       expect(readRedTeamCarry(c.key)).toBeNull();
       expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
       expect(c.exec.mock.calls.filter(([file]) => file === 'git').every(([, args]) => args[0] === '--no-replace-objects')).toBe(true);
-      expect(c.gitOutputs).toEqual([`${c.base}\n`, `${c.base}\n`, 'file.txt\0']);
+      expect(c.gitOutputs.length).toBeGreaterThanOrEqual(3);
+      expect(c.gitOutputs.length % 3).toBe(0);
+      for (let i = 0; i < c.gitOutputs.length; i += 3)
+        expect(c.gitOutputs.slice(i, i + 3)).toEqual([`${c.base}\n`, `${c.base}\n`, 'file.txt\0']);
     } finally { rmSync(c.root, { recursive: true, force: true }); }
   });
 
   it('carry eligibility exempts only a proven empty read when card-only skipping is disabled', () => {
-    const proven = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    const f = newEmptyEvidence();
+    const proven = f.read;
     const readLive = vi.fn(() => null);
-    const carry = createRedTeamCarryIo({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: '0' }, readLive, readComments: () => [] });
-    expect(carry.eligible({ repo, pr, head, loopPayload: { findings: { read: { ...proven, netChangedFiles: ['backlog/5872.md'], diffText: '+card' } } } })).toBe(false);
-    expect(carry.eligible({ repo, pr, head, loopPayload: { findings: { read: { ...proven, diffScored: false } } } })).toBe(false);
+    const carry = createRedTeamCarryIo({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: '0' }, storePath: f.storePath, lanePath: f.root, readStatus: () => f.status, readLive, readComments: () => [] });
+    expect(carry.eligible({ repo, pr, head: f.head, loopPayload: { findings: { read: { ...proven, netChangedFiles: ['backlog/5872.md'], diffText: '+card' } } } })).toBe(false);
+    expect(carry.eligible({ repo, pr, head: f.head, loopPayload: { findings: { read: { ...proven, diffScored: false } } } })).toBe(false);
     expect(readLive).not.toHaveBeenCalled();
     // A proven empty read passes the policy gate and reaches the live guards (which then refuse a missing head).
-    expect(carry.eligible({ repo, pr, head, loopPayload: { findings: { read: proven } } })).toBe(false);
+    expect(carry.eligible({ repo, pr, head: f.head, loopPayload: { findings: { read: proven } } })).toBe(false);
     expect(readLive).toHaveBeenCalledOnce();
   });
 
   it('a head-move carry rebinding an empty source read never proves the new head empty', () => {
     const from = 'b'.repeat(40);
     const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
-    expect(provenEmptyNetDiffPayload({ findings: { read } }, head)).toBe(true);
-    expect(provenEmptyNetDiffPayload({ carriedFrom: head, findings: { read } }, head)).toBe(true);
-    expect(provenEmptyNetDiffPayload({ carriedFrom: from, findings: { read } }, head)).toBe(false);
+    const f = newEmptyEvidence();
+    expect(emptyDiffExemptionEvidence(f.proof).exempt).toBe(true);
+    expect(emptyDiffExemptionEvidence({ ...f.proof, loopPayload: { carriedFrom: f.head, findings: { read: f.read } } }).exempt).toBe(true);
+    expect(emptyDiffExemptionEvidence({ ...f.proof, loopPayload: { carriedFrom: from, findings: { read: f.read } } })).toEqual({ exempt: false, reason: 'read-unproven' });
     const rebound = { repo, pr, head, loopPayload: { carriedFrom: from, verdict: null, findings: { read } } };
-    expect(emptyNetDiffSkip({ repo, pr, head, status: 'finished', result: { ...emptySkip }, loopPayload: rebound.loopPayload }, head)).toBe(false);
+    expect(emptyDiffExemptionEvidence({ ...f.proof, loopPayload: { ...rebound.loopPayload, findings: { read: f.read } } }).exempt).toBe(false);
     // Policy off: the rebound read cannot buy the empty-diff exemption past the policy gate.
     const readLive = vi.fn(() => null), writeStatus = vi.fn(), postResult = vi.fn();
     const carry = createRedTeamCarryIo({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: '0' }, readLive, readComments: () => [], writeStatus, postResult });
     expect(carry.eligible(rebound)).toBe(false);
     expect(readLive).not.toHaveBeenCalled();
-    // Any effect for a moved carry keeps card-only provenance and text.
-    carry.recordIntent(rebound);
-    expect(writeStatus.mock.calls[0][0].result).toEqual({ status: 'skipped', policy: 'card-only' });
-    carry.postResult(rebound);
-    expect(postResult.mock.calls[0][0].body).toContain('card-only diff (policy redTeam.skipCardOnly)');
+    // A refused empty claim cannot fall back to publishing a card-only clearance.
+    expect(() => carry.recordIntent(rebound)).toThrow('empty net diff not proven');
+    expect(() => carry.postResult(rebound)).toThrow('empty net diff not proven');
+    expect(writeStatus).not.toHaveBeenCalled();
+    expect(postResult).not.toHaveBeenCalled();
   });
+});
+
+
+it('review-extra-seats refuses an empty-net-diff exemption on a missing production scorecard store (ENOENT)', async () => {
+  const f = newEmptyEvidence();
+  rmSync(f.storePath);
+  const production = createRedTeamIo({ env: {}, storePath: f.storePath });
+  expect(production.readRecords({ strict: true })).toEqual([]); // The legacy fallback is deliberately still present.
+  const io = { storePath: f.storePath, readRecords: vi.fn(production.readRecords), now: () => 1000, log: vi.fn(),
+    cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), append: vi.fn(), postComment: vi.fn() };
+  const result = await speculateRedTeam({ repo, pr, lanePath: f.root, read: f.read, env: {} }, io);
+  expect(result).toEqual({ status: 'skipped', reason: 'empty net diff not proven (store-missing) — inspect stored evidence before retrying; no call launched' });
+  expect(result).not.toHaveProperty('policy');
+  expect(io.readRecords).toHaveBeenCalledWith({ strict: true });
+  for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) expect(io[effect]).not.toHaveBeenCalled();
+});
+
+
+it('carry effects refuse evidence removed after a complete empty-diff proof', () => {
+  const f = newEmptyEvidence(), writeStatus = vi.fn(), postResult = vi.fn();
+  const carry = createRedTeamCarryIo({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' }, storePath: f.storePath,
+    lanePath: f.root, readStatus: () => f.status, writeStatus, postResult });
+  const state = { repo, pr, head: f.head, loopPayload: { ...f.loopPayload, carriedFrom: f.head } };
+  expect(emptyDiffExemptionEvidence({ ...f.proof, loopPayload: state.loopPayload }).exempt).toBe(true);
+  rmSync(f.storePath);
+  expect(() => carry.recordIntent(state)).toThrow('empty net diff not proven');
+  expect(() => carry.postResult(state)).toThrow('empty net diff not proven');
+  expect(writeStatus).not.toHaveBeenCalled();
+  expect(postResult).not.toHaveBeenCalled();
+});
+
+
+it('producer keeps recovery owed when its seat read fails despite otherwise complete positive evidence', async () => {
+  const f = newEmptyEvidence();
+  expect(emptyDiffExemptionEvidence(f.proof).exempt).toBe(true);
+  const io = { storePath: f.storePath, readRecords: vi.fn(() => { throw Error('seat read failed'); }),
+    now: () => 1000, log: vi.fn(), cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn() };
+  expect(await speculateRedTeam({ repo, pr, lanePath: f.root, read: f.read, env: {} }, io)).toEqual({
+    status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched',
+  });
+  expect(io.readRecords).toHaveBeenCalledWith({ strict: true });
+  for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat']) expect(io[effect]).not.toHaveBeenCalled();
+});
+
+
+it('a persisted empty-diff policy with missing read text keeps an unscheduled red team owed', () => {
+  const f = newEmptyEvidence();
+  const evidence = { status: f.status, scheduled: false, skipCardOnly: false };
+  expect(redTeamOwedOnHead({ ...f.proof, read: f.read, evidence })).toBe(false);
+  delete f.read.diffText;
+  const exec = vi.fn();
+  expect(redTeamOwedOnHead({ ...f.proof, read: f.read, evidence, exec })).toBe(true);
+  expect(emptyDiffExemptionEvidence({ ...f.proof, exec })).toEqual({ exempt: false, reason: 'read-unproven' });
+  expect(exec).not.toHaveBeenCalled();
 });

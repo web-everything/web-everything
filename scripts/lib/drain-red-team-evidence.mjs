@@ -1,4 +1,4 @@
-import { emptyNetDiffSkip, provenEmptyNetDiffPayload, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
+import { emptyDiffExemptionEvidence, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
@@ -919,15 +919,15 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
 }
 
 /** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
-export function historicalCardOnlySkipCandidate(old) {
+export function historicalCardOnlySkipCandidate(old, proof = {}) {
   const prior = old?.status;
-  return prior?.status === 'finished' && (prior.skipCardOnly === true || emptyNetDiffSkip(prior))
+  return prior?.status === 'finished' && ((prior.skipCardOnly === true && redTeamCardOnly(prior.loopPayload?.findings?.read)) || emptyDiffExemptionEvidence({ repo: prior.repo, pr: prior.pr, ...proof, head: prior.head, seatRecord: prior, requireSkip: true }).exempt)
     && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
     && !old.recorded && !old.inFlight && !old.queued;
 }
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
-export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
+export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env, cwd, gitExec,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
@@ -957,7 +957,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
     // An empty-net-diff carry is its own policy: its stored skip is proven by the head-bound read, not by the
     // writer's card-only setting, so it stays the carry's own status with that setting disabled.
-    const emptyOwn = emptyNetDiffSkip(status, head);
+    const emptyOwn = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: status, env, cwd, exec: gitExec, requireSkip: true }).exempt;
     const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
       && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && (status.skipCardOnly === true || emptyOwn)))
       && status.status === 'finished'
@@ -969,7 +969,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     if (carry) {
       // The journal survives a crash before the compatibility status exists. Never invent an accept.
       // Project the carry's own policy: an empty-net-diff carry never claims the card-only setting.
-      const empty = provenEmptyNetDiffPayload(carry.loopPayload, head);
+      const empty = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: status, loopPayload: carry.loopPayload, env, cwd, exec: gitExec }).exempt;
+      if (!empty && carry.loopPayload?.findings?.read?.diffText === '')
+        return { ok: false, reason: 'empty-net-diff-unproven' };
       const skipCardOnly = empty ? status?.skipCardOnly === true : true;
       const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
         result: empty ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'skipped', policy: 'card-only' }, skipCardOnly };
@@ -1024,9 +1026,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const older = olderHit.run;
     const oldHead = older?.findings?.read?.netBasis?.rev;
     if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
-      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn, now,
+      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, cwd, gitExec, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn, now,
         isAlive, host, namespace, readPidStart, readScorecards });
-      if (historicalCardOnlySkipCandidate(old)) return old;
+      if (historicalCardOnlySkipCandidate(old, { env, cwd, exec: gitExec })) return old;
     }
   }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head

@@ -14,7 +14,7 @@ function settingsReadable(path) {
   try { JSON.parse(readFileSync(path, 'utf8')); return true; } catch { return false; }
 }
 
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
+export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, cwd, exec, storePath, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
   // The shared hold decision (PR #6622): the sealed stored evidence holds the head unless the posted comment shows the same
   // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
   // pass never plans clear for a conflict it just recorded.
@@ -46,7 +46,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     : pendingOnly ? 'red-team:pending'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
-      : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
+      : redTeamOwedOnHead({ repo, pr, env, cwd, exec, storePath, read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   // A head PROVEN card-only (readable net files, skip policy on) with no pass in flight, scheduled or recorded bypasses the
   // red-team pass and never gets an outcome, so its stale pending label would stay forever (#6733). Only pending is dropped:

@@ -1,10 +1,19 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verifyEmptyNetDiff } from '../red-team-empty-net-diff.mjs';
+import { emptyDiffExemptionEvidence } from '../red-team-empty-net-diff.mjs';
+import { emptyDiffFixture } from './red-team-empty-net-diff-fixture.mjs';
 import { resolveNetDiffBasis, computeNetDiffText } from '../../merge-ai-prs.mjs';
+
+const roots = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function verify(read, head, options) {
+  const f = emptyDiffFixture(); roots.push(f.root);
+  f.writeStore([{ ...f.row, rev: head }]);
+  return emptyDiffExemptionEvidence({ ...f.proof, read, head, seatRecord: { head }, ...options }).exempt;
+}
 
 describe('empty net diff provenance probes', () => {
   const base = 'a'.repeat(40), head = 'b'.repeat(40);
@@ -18,14 +27,14 @@ describe('empty net diff provenance probes', () => {
       if (Buffer.byteLength(output) > options.maxBuffer) throw Object.assign(Error('maxBuffer'), { code: 'ENOBUFS' });
       return output;
     });
-    expect(verifyEmptyNetDiff(read, head, { exec, cwd: 'subject' })).toBe(false);
+    expect(verify(read, head, { exec, cwd: 'subject' })).toBe(false);
     expect(exec).toHaveBeenCalledTimes(2);
     expect(exec.mock.calls[1][1]).toEqual(['--no-replace-objects', 'merge-base', '--end-of-options', 'origin/main', head]);
     expect(exec.mock.calls[1][2]).toMatchObject({ cwd: 'subject', maxBuffer: 1024 * 1024, timeout: 30_000 });
   });
   it('accepts only after matching provenance and executing the hardened diff', () => {
     const exec = vi.fn().mockReturnValueOnce(base).mockReturnValueOnce(`${base}\n`).mockReturnValueOnce('');
-    expect(verifyEmptyNetDiff(read, head, { exec })).toBe(true);
+    expect(verify(read, head, { exec, cwd: 'subject' })).toBe(true);
     expect(exec).toHaveBeenCalledTimes(3);
     expect(exec.mock.calls[1][1]).toEqual(['--no-replace-objects', 'merge-base', '--end-of-options', 'origin/main', head]);
     expect(exec.mock.calls[2][1]).toEqual(['--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
@@ -36,8 +45,10 @@ describe('empty net diff provenance probes', () => {
 describe('empty net diff base provenance (real git)', () => {
   function fixture(run) {
     const cwd = mkdtempSync(join(tmpdir(), 'empty-diff-provenance-'));
+    let gitClock = 1700000000;
     const git = (...args) => execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
-      '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' }).trim();
+      '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8', env: { ...process.env,
+        GIT_AUTHOR_DATE: `@${++gitClock} +0000`, GIT_COMMITTER_DATE: `@${gitClock} +0000` } }).trim();
     try {
       git('init', '--quiet');
       writeFileSync(join(cwd, 'file.txt'), 'base\n');
@@ -50,8 +61,11 @@ describe('empty net diff base provenance (real git)', () => {
       const sameTree = git('rev-parse', 'HEAD');
       git('commit', '--quiet', '--allow-empty', '-m', 'head');
       const head = git('rev-parse', 'HEAD');
+      // A separate main tip keeps the replacement graph acyclic; its legitimate merge-base is base.
+      const mainTip = git('commit-tree', `${base}^{tree}`, '-p', base, '-m', 'main tip');
+      git('update-ref', 'refs/remotes/origin/main', mainTip);
       const replacement = git('commit-tree', `${base}^{tree}`, '-p', sameTree, '-m', 'planted');
-      git('replace', base, replacement);
+      git('replace', mainTip, replacement);
       const poisonedBase = git('merge-base', 'origin/main', head);
       expect(poisonedBase).toBe(sameTree);
       expect(poisonedBase).not.toBe(head);
@@ -65,7 +79,7 @@ describe('empty net diff base provenance (real git)', () => {
   it('refuses a replaced merge-base distinct from head but sharing its tree', () => fixture(({ cwd, head, poisonedBase }) => {
     const exec = vi.fn(execFileSync);
     const read = { netBasis: { base: poisonedBase, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
-    expect(verifyEmptyNetDiff(read, head, { cwd, exec })).toBe(false);
+    expect(verify(read, head, { cwd, exec })).toBe(false);
     expect(exec).toHaveBeenCalledWith('git', ['--no-replace-objects', 'merge-base', '--end-of-options', 'origin/main', head], expect.anything());
   }));
 
@@ -88,4 +102,56 @@ describe('empty net diff base provenance (real git)', () => {
     expect(exec.mock.calls.map(([, args]) => args[0])).toEqual(['rev-parse', 'merge-base', 'diff']);
     expect(exec.mock.calls[1][2].env.GIT_NO_REPLACE_OBJECTS).toBe('1');
   }));
+});
+
+
+describe('complete positive exemption evidence (real Git)', () => {
+  it.each([
+    ['all present', () => {}, true, 'empty-net-diff', 'diff'],
+    ['missing store', f => rmSync(f.storePath), false, 'store-missing'],
+    ['unreadable store', f => { rmSync(f.storePath); mkdirSync(f.storePath); }, false, 'store-unreadable'],
+    ['malformed store', f => writeFileSync(f.storePath, '{broken'), false, 'store-unparseable'],
+    ['empty file', f => writeFileSync(f.storePath, ''), false, 'store-unparseable'],
+    ['invalid store shape', f => writeFileSync(f.storePath, '{}'), false, 'store-unparseable'],
+    ['missing seat', f => f.writeStore([]), false, 'seat-record-missing'],
+    ['wrong seat head', f => f.writeStore([{ ...f.row, rev: 'a'.repeat(40) }]), false, 'seat-record-missing'],
+    ['wrong seat repo', f => f.writeStore([{ ...f.row, repo: 'other/repo' }]), false, 'seat-record-missing'],
+    ['wrong seat PR', f => f.writeStore([{ ...f.row, pr: 123 }]), false, 'seat-record-missing'],
+    ['missing checkout', f => { delete f.proof.cwd; }, false, 'cwd-missing'],
+    ['unresolvable base', f => { f.read.netBasis.base = 'missing-ref'; }, false, 'base-unresolvable', 'rev-parse'],
+    ['missing main ref', f => f.git('update-ref', '-d', 'refs/remotes/origin/main'), false, 'base-unresolvable', 'merge-base'],
+    ['mismatched base', f => { f.read.netBasis.base = f.head; }, false, 'base-mismatch', 'merge-base'],
+    ['unreadable diff', f => { f.failDiff = true; }, false, 'diff-unreadable', 'diff'],
+    ['oversized diff', f => { f.oversizeDiff = true; }, false, 'diff-unreadable', 'diff'],
+    ['unscored read', f => { f.read.diffScored = false; }, false, 'read-unproven'],
+    ['moved source', f => { f.loopPayload.carriedFrom = f.base; }, false, 'read-unproven'],
+  ])('%s => %s / %s', (_name, mutate, exempt, reason, reached) => {
+    const f = emptyDiffFixture(); roots.push(f.root); mutate(f);
+    const exec = vi.fn((file, args, options) => {
+      if (args.includes('diff') && f.failDiff) throw Error('diff unavailable');
+      if (args.includes('diff') && f.oversizeDiff) return 'x'.repeat(1024 * 1024 + 1);
+      return execFileSync(file, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    });
+    expect(emptyDiffExemptionEvidence({ ...f.proof, exec })).toEqual({ exempt, reason });
+    if (reached) expect(exec.mock.calls.some(([, args]) => args.includes(reached))).toBe(true);
+    else expect(exec).not.toHaveBeenCalled();
+    for (const [, args, options] of exec.mock.calls) {
+      expect(args[0]).toBe('--no-replace-objects');
+      expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      expect(options.cwd).toBe(f.root);
+    }
+  });
+
+  it.each([false, true])('refuses a real nonempty diff (planted head replace ref: %s)', replace => {
+    const f = emptyDiffFixture({ realDiff: true }); roots.push(f.root);
+    if (replace) {
+      const planted = f.git('commit-tree', `${f.base}^{tree}`, '-p', f.base, '-m', 'planted');
+      f.git('replace', f.head, planted);
+      expect(f.git('diff', '--name-only', `${f.base}..${f.head}`)).toBe('');
+    }
+    const exec = vi.fn(execFileSync);
+    expect(emptyDiffExemptionEvidence({ ...f.proof, exec })).toEqual({ exempt: false, reason: 'diff-nonempty' });
+    expect(exec.mock.calls.at(-1)[1]).toContain('diff');
+    expect(exec.mock.results.at(-1).value).toBe('file.txt\0');
+  });
 });
