@@ -1354,13 +1354,13 @@ describe('AU1 PR-A is inert', () => {
     const hits = [...new Set(matches.filter(m => !m || (/\.(mjs|js|cjs|ts)$/.test(m.file) && !/__tests__\/|\.test\./.test(m.file)
       && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text))).map(m => m?.file ?? 'unparsed grep line'))];
     // R1053 S1b: only the audit adapters wire the pure modules and trusted settings.
-    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/codex-audit-io.mjs']);
+    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/canonical-audit-gate.mjs', 'scripts/operations/codex-audit-io.mjs']);
     const callers = spawnSync('git', ['grep', '--untracked', '-nE', 'audit-finding-key\\.mjs|audit-base-repro\\.mjs', '--', 'scripts', 'skills-src', '.claude', 'src'],
       { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
     expect(callers.error).toBeUndefined();
     expect(callers.status).toBe(0);
     expect([...new Set(callers.stdout.split('\n').filter(l => l && !/__tests__\//.test(l)
-      && !/^scripts\/(lib\/audit-(settings|finding-key)|operations\/audit-base-repro)\.mjs:/.test(l)).map(l => l.split(':')[0]))].sort()).toEqual(['scripts/operations/codex-audit-io.mjs', 'scripts/operations/codex-audit.mjs']);
+      && !/^scripts\/(lib\/audit-(settings|finding-key)|operations\/audit-base-repro)\.mjs:/.test(l)).map(l => l.split(':')[0]))].sort()).toEqual(['scripts/operations/canonical-audit-gate.mjs', 'scripts/operations/codex-audit-io.mjs', 'scripts/operations/codex-audit.mjs']);
   });
   it('the inertness check ignores a comment-only mention but catches code that names the module (PR #6381 merge)', () => {
     expect(commentOnly(' * scripts/lib/audit-settings.mjs once that lands. */')).toBe(true);

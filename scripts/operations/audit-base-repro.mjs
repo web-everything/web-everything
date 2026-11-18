@@ -1,7 +1,12 @@
 /** @file Pure base-reproduction protocol and fail-closed classification; no worktrees, cards or callers wired. */
 import { createHash } from 'node:crypto';
-import { FINDING_CLASSES } from './audit-verdict.mjs';
-import { findingKey, parseFindingLocation, symbolAt } from '../lib/audit-finding-key.mjs';
+import { FINDING_CLASSES, matchesSome } from './audit-verdict.mjs';
+import { GUARD_FLOOR, AUDITOR_FLOOR, REVIEW_AUTH_FLOOR, LOCK_PRIMITIVES, LOCK_HOLDERS, LOCK_USERS } from '../lib/audit-settings.mjs';
+import { findingKey, parseFindingLocation, symbolAt, symbolRangeAt } from '../lib/audit-finding-key.mjs';
+
+export const PREEXISTING_ELIGIBLE = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
+const protectedPath = path => matchesSome(path, [...GUARD_FLOOR, ...AUDITOR_FLOOR, ...REVIEW_AUTH_FLOOR,
+  ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS]);
 
 const unknown = () => ({ status: 'UNDETERMINED' });
 const findingText = f => typeof f === 'string' ? f : f?.text;
@@ -52,16 +57,18 @@ export function parseReproAnswer(text, count) {
  * IO seams are synchronous: readBaseFile(path) returns git-show base:path text, cardWritten(key) returns true.
  * changedLines must be a Map; absent files in a complete diff have no changed lines.
  */
-export function classifyPreExisting({ findings, answers, baseSha, headSha, readBaseFile, changedLines, recheckMax, cardWritten }) {
+export function classifyPreExisting({ findings, answers, baseSha, headSha, readBaseFile, changedLines, recheckMax, cardWritten,
+  isProtectedPath = protectedPath }) {
   return findings.map((finding, i) => {
     const block = reason => ({ blocking: true, reason: `${reason}; human review required` });
     try {
       if (!Number.isSafeInteger(recheckMax) || i >= recheckMax) return block('recheck limit');
       const a = answers?.[i];
       if (!baseSha || !headSha || a?.status !== 'REPRODUCES' || a.relation !== 'SAME') return block('base reproduction is not SAME');
-      if (!FINDING_CLASSES.includes(a.class) || (finding?.class && finding.class !== a.class)) return block('invalid or conflicting class');
+      if (!PREEXISTING_ELIGIBLE.includes(a.class) || (finding?.class && finding.class !== a.class)) return block('ineligible or conflicting class');
       const text = findingText(finding), location = parseFindingLocation(text);
       if (!location || (finding?.file && finding.file !== location.file) || (finding?.line && finding.line !== location.line)) return block('invalid head location');
+      if (isProtectedPath(location.file) !== false) return block('protected path');
       if (!(changedLines instanceof Map) || changedLines.complete !== true) return block('diff evidence missing or truncated');
       const changed = changedLines.get(location.file) ?? new Set();
       if (!(changed instanceof Set) || changed.has(location.line) || changedLines.binary?.has(location.file)) return block('head line changed or diff evidence missing');
@@ -74,6 +81,9 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       if (typeof source !== 'string' || !quoteLines || !a.quote.trim()
         || !source.split('\n').slice(base.line - 1, base.line - 1 + quoteLines).join('\n').includes(a.quote)) return block('base quote not at the claimed base line');
       const symbol = finding?.symbol || symbolAt(finding?.sourceText, location.line);
+      const range = symbolRangeAt(source, base.line), quoteEnd = base.line + quoteLines - 1;
+      if (symbol === '<top>' ? range !== null || base.line < location.line - 3 || quoteEnd > location.line + 3
+        : !range || range.symbol !== symbol || base.line < range.start || quoteEnd > range.end) return block('base quote outside the finding symbol');
       const key = findingKey({ file: location.file, symbol, class: a.class });
       if (cardWritten(key) !== true) return block('card not written');
       return { blocking: false, preExisting: { line: text, key, base: { sha: baseSha, ...base, quote: a.quote },

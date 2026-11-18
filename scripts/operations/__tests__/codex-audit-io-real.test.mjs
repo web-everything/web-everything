@@ -1,7 +1,8 @@
 /** @file Real Git resolution and filesystem persistence for audit IO. */
 import { describe, it, expect } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import * as realFs from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
@@ -60,6 +61,43 @@ describe('codex-audit real IO', () => {
 
 
 describe('R1053 base reproduction IO', () => {
+  it.each(['card', 'needs-you'])('repairs missing %s text despite a matching index and deduplicates the repair', async missing => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, cardsPath, indexPath };
+      const card = { key: 'x.mjs|X|B1', cardLine: '- [R1053] test security', expedite: true, needsYou: true };
+      createAuditDeps(options).fileCard(card);
+      const first = readFileSync(cardsPath, 'utf8');
+      writeFileSync(cardsPath, first.split('\n').filter(l => missing === 'card' ? l !== card.cardLine : !l.includes('[needs-you]')).join('\n'));
+      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      const repaired = readFileSync(cardsPath, 'utf8');
+      expect(repaired.split('\n').filter(l => l === card.cardLine)).toHaveLength(1);
+      expect(repaired.split('\n').filter(l => l.includes('[needs-you]'))).toHaveLength(1);
+      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      expect(readFileSync(cardsPath, 'utf8')).toBe(repaired);
+    });
+  });
+  it.each(['lost write', 'write throws', 'verification throws'])('fails closed on card persistence failure: %s', async failure => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const card = { key: 'x.mjs|X|B2', cardLine: '- [R1053] test' };
+      createAuditDeps({ cwd: root, cardsPath, indexPath }).fileCard(card);
+      writeFileSync(cardsPath, '');
+      let wrote = false;
+      const fs = { ...realFs,
+        appendFileSync(path, ...args) {
+          if (path !== cardsPath) return realFs.appendFileSync(path, ...args);
+          wrote = true;
+          if (failure === 'write throws') throw Error('disk');
+          if (failure !== 'lost write') realFs.appendFileSync(path, ...args);
+        },
+        readFileSync(path, ...args) {
+          if (path === cardsPath && wrote && failure === 'verification throws') throw Error('read');
+          return realFs.readFileSync(path, ...args);
+        } };
+      expect(() => createAuditDeps({ cwd: root, cardsPath, indexPath, fs }).fileCard(card)).toThrow();
+    });
+  });
   it('a1 reruns dedupe cards and B1 adds one security needs-you line', async () => {
     await withRealRepo(async ({ root, tmp }) => {
       const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');

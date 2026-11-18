@@ -1,6 +1,7 @@
 /** @file R1053 S1a base reproduction: every incomplete proof remains blocking. */
 import { describe, expect, it, vi } from 'vitest';
-import { cardHash, cardLine, classifyPreExisting, parseDiffChangedLines, parseReproAnswer, REPRO_QUESTION } from '../audit-base-repro.mjs';
+import { cardHash, cardLine, classifyPreExisting, parseDiffChangedLines, parseReproAnswer, PREEXISTING_ELIGIBLE, REPRO_QUESTION } from '../audit-base-repro.mjs';
+import { symbolRangeAt } from '../../lib/audit-finding-key.mjs';
 import { AUDITOR_FLOOR } from '../../lib/audit-settings.mjs';
 
 const source = 'function X() {\n  return unsafe();\n}\nfunction Y() {\n  return fixed();\n}\n';
@@ -56,6 +57,47 @@ describe('strict reproduction protocol', () => {
 });
 
 describe('pre-existing classification', () => {
+  it('exports exactly the eligible classes and permits each on unprotected unchanged source', () => {
+    expect(PREEXISTING_ELIGIBLE).toEqual(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
+    for (const cls of PREEXISTING_ELIGIBLE) expect(classify({ answers: parseReproAnswer(answer(cls), 1) })[0].blocking).toBe(false);
+  });
+  it('uses one-based inclusive base symbol ranges and permits shifted base lines', () => {
+    expect(symbolRangeAt(source, 2)).toEqual({ symbol: 'X', start: 1, end: 3 });
+    expect(symbolRangeAt(source, 7)).toBe(null);
+    const answers = parseReproAnswer(answer().replace(':2', ':3'), 1);
+    expect(classify({ answers, readBaseFile: () => `\n${source}` })[0].blocking).toBe(false);
+  });
+  it('blocks a valid quote borrowed from a different base symbol', () => {
+    const answers = parseReproAnswer(answer().replace(':2', ':5').replace('unsafe', 'fixed'), 1);
+    expect(classify({ answers })[0].blocking).toBe(true);
+  });
+  it('blocks a quote extending outside the enclosing base symbol', () => {
+    const a = parseReproAnswer(answer(), 1)[0];
+    expect(classify({ answers: [{ ...a, quote: 'return unsafe();\n}\nfunction Y() {' }] })[0].blocking).toBe(true);
+  });
+  it('bounds top-level quotes to three lines around the reported base line', () => {
+    const sourceText = 'const value = unsafe();\n\n\n\nconst other = unsafe();';
+    const a = { ...parseReproAnswer(answer(), 1)[0], base: { path: 'lib/x.mjs', line: 1 }, quote: sourceText };
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText, answers: [a] })[0].blocking).toBe(true);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
+      answers: [{ ...a, quote: 'const value = unsafe();' }] })[0].blocking).toBe(false);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
+      answers: [{ ...a, base: { path: 'lib/x.mjs', line: 5 }, quote: 'const other = unsafe();' }] })[0].blocking).toBe(true);
+  });
+  it.each(['D1', 'D3', 'X1', 'X2', 'Z9'])('never exempts ineligible class %s', cls => {
+    const a = parseReproAnswer(answer(), 1)[0];
+    expect(classify({ answers: [{ ...a, class: cls }] })[0].blocking).toBe(true);
+  });
+  it.each(['scripts/readiness/file-locks.mjs', 'scripts/operations/audit-verdict.mjs', '.githooks/pre-commit'])('never exempts protected path %s', path => {
+    const a = parseReproAnswer(answer(), 1)[0], cardWritten = vi.fn();
+    expect(classify({ findings: [{ ...finding, text: `${path}:2 unsafe` }],
+      answers: [{ ...a, base: { path, line: 2 } }], cardWritten })[0].blocking).toBe(true);
+    expect(cardWritten).not.toHaveBeenCalled();
+  });
+  it('uses the injected path protection check and fails closed on unreadable protection', () => {
+    expect(classify({ isProtectedPath: () => true })[0].blocking).toBe(true);
+    expect(classify({ isProtectedPath: () => { throw Error('unreadable'); } })[0].blocking).toBe(true);
+  });
   it('a1 finding in X while PR edits Y is non-blocking with a stable card identity', () => {
     const readBaseFile = vi.fn(() => source), cardWritten = vi.fn(() => true);
     const [result] = classify({ readBaseFile, cardWritten });

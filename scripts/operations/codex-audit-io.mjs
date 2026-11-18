@@ -88,14 +88,31 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       }
     },
     fileCard({ key, cardLine, expedite, needsYou }) {
-      let rows = '';
-      try { rows = fs.readFileSync(indexPath, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-      if (rows.split('\n').filter(Boolean).map(l => JSON.parse(l)).some(r => r.key === key)) return true;
-      fs.mkdirSync(dirname(cardsPath), { recursive: true });
+      const read = path => {
+        try { return fs.readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; return ''; }
+      };
+      const rows = read(indexPath).split('\n').filter(Boolean).map(l => JSON.parse(l));
+      const prior = rows.findLast(r => r.key === key);
+      const contents = read(cardsPath), lines = contents.split('\n');
       const date = new Date().toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
-      fs.appendFileSync(cardsPath, `${cardLine}\n${expedite && needsYou ? `- [R1053][needs-you] ${date} ET: security pre-existing (B1) ${key}\n` : ''}`, { encoding: 'utf8', mode: 0o600 });
+      const securityLine = line => typeof line === 'string' && line.startsWith('- [R1053][needs-you] ')
+        && line.endsWith(` ET: security pre-existing (B1) ${key}`);
+      const needsYouLine = expedite && needsYou ? (securityLine(prior?.needsYouLine) && prior.needsYouHash === cardHash(prior.needsYouLine)
+        ? prior.needsYouLine : lines.find(securityLine) || `- [R1053][needs-you] ${date} ET: security pre-existing (B1) ${key}`) : null;
+      const expected = [cardLine, ...(needsYouLine ? [needsYouLine] : [])];
+      const missing = expected.filter(line => !lines.some(actual => cardHash(actual) === cardHash(line)));
+      if (missing.length) {
+        fs.mkdirSync(dirname(cardsPath), { recursive: true });
+        fs.appendFileSync(cardsPath, `${contents && !contents.endsWith('\n') ? '\n' : ''}${missing.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+      }
+      const verified = read(cardsPath).split('\n');
+      if (!expected.every(line => verified.some(actual => cardHash(actual) === cardHash(line)))) throw new Error('card persistence verification failed');
+      const row = { key, cardHash: cardHash(key), cardLineHash: cardHash(cardLine),
+        ...(needsYouLine ? { needsYouLine, needsYouHash: cardHash(needsYouLine) } : {}) };
+      if (!missing.length && prior && Object.entries(row).every(([k, v]) => prior[k] === v)) return true;
       fs.mkdirSync(dirname(indexPath), { recursive: true });
-      fs.appendFileSync(indexPath, `${JSON.stringify({ key, cardHash: cardHash(key) })}\n`, { encoding: 'utf8', mode: 0o600 });
+      fs.appendFileSync(indexPath, `${JSON.stringify(row)}\n`, { encoding: 'utf8', mode: 0o600 });
+      if (!read(indexPath).split('\n').includes(JSON.stringify(row))) throw new Error('card index verification failed');
       return true;
     },
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
