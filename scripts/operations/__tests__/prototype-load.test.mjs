@@ -54,6 +54,11 @@ function fixture(options = {}) {
   const fs = {
     readFileSync(p) {
       reads.push(p);
+      if (p.endsWith('/urgent-full-green.jsonl')) {
+        if (options.urgentLedger === undefined) throw new Error('unreadable urgent ledger');
+        return options.urgentLedger;
+      }
+      if (p.endsWith('/.github/workflows/ci.yml')) return options.urgentWorkflow ?? 'jobs:\n  test-shard:\n    strategy:\n      matrix:\n        shard: [1]\n    steps:\n      - run: vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}';
       if (p === '/home/test/platform-preferences.json') return JSON.stringify({ prototypeLoad: options.platformSettings });
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('/test-clone-key.json')) return options.registryRaw ?? (options.list ? JSON.stringify({ overlays: [...registrations.values()] }) : '');
@@ -260,6 +265,33 @@ function fixture(options = {}) {
   return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
+describe('urgent prototype admission', () => {
+  const reason = 'Restore critical daemon operation';
+  const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: '/repo' };
+  it('logs the urgent event and writes explicit urgent readiness evidence', async () => {
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1)).toMatchObject({ tests: 'green', testCheck: { source: 'urgent-local-full', marker, reason } });
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', ref: BASE.branch, sha: SHA, reason, marker }));
+  });
+  it.each(['ledger', 'workflow'])('refuses unreadable %s with an operator fallback', async (missing) => {
+    const f = fixture({ testCheck: async () => null, ...(missing === 'workflow' ? { urgentLedger: JSON.stringify(marker), urgentWorkflow: 'broken' } : {}) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-urgent-marker', fallback: expect.stringContaining('urgent-verify') });
+    expect(f.readyWrites).toEqual([]);
+  });
+  it('keeps non-urgent CI refusal unchanged even with a green marker', async () => {
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run()).toMatchObject({ detail: 'no-passing-test-check' });
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+  });
+  it('uses normal passing CI when urgent was requested and still logs the event', async () => {
+    const f = fixture();
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1).testCheck).toMatchObject({ name: 'test', conclusion: 'success' });
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', marker: null }));
+  });
+});
 const auditRecord = (overrides = {}) => ({
   at: '2026-10-20T12:00:00Z', base: TREE, head: SHA, baseRef: 'origin/main',
   questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], ...overrides,

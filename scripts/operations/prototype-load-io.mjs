@@ -27,6 +27,7 @@ import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, t
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
+import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason } from './urgent-verify-marker.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -547,9 +548,26 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (runs.code !== 0) return null;
         return testWorkflowBound(evidence, JSON.parse(runs.stdout), sha, config.testWorkflowPath) ? evidence : null;
       });
-      const checkRun = await readTestCheck({ sha: input.sha, branch: input.branch });
-      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success')
-        return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
+      if (input.urgent && !urgentReason(input.reason)) return stop('no-ready', { detail: 'no-urgent-marker', fallback: 'Supply --reason with at least 10 characters after trimming, or wait for passing CI.' });
+      let checkRun;
+      try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
+      catch (e) { if (!input.urgent) throw e; }
+      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
+        if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
+        let ledger, shards;
+        try {
+          ledger = fs.readFileSync(urgentLedger(env.HOME), 'utf8');
+          shards = ciUnitPlan(fs.readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8')).length;
+        } catch { /* Missing or unreadable evidence fails closed below. */ }
+        const urgent = urgentMarker({ ...input, ledger, shards, now: now() });
+        if (!urgent.ok) return stop('no-ready', urgent);
+        checkRun = urgent.evidence;
+      }
+      if (input.urgent) {
+        const file = urgentLedger(env.HOME, 'urgent-loads');
+        fs.mkdirSync(dirname(file), { recursive: true });
+        fs.appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, reason: input.reason, marker: checkRun.marker ?? null })}\n`, { encoding: 'utf8', mode: 0o600 });
+      }
       const canonical = out.canonicalAudit.record;
       // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
       // becomes this sha's latest readiness. Keep the fingerprint that evidence already stores for this exact sha, or

@@ -4614,3 +4614,19 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Urgent prototype verification
+
+`node scripts/operations/run.mjs urgent-verify --sha=<full sha>` requires a clean checkout at
+that SHA. It reads CI's unit shard matrix, uses the current time-balanced covered/nocov assignments
+and npm-script Vitest arguments, and runs each group sequentially through heavy admission before
+`check:standards`. Unknown workflow/command layouts refuse; repair the runner or wait for CI.
+Admission exhaustion stops the run without an outer retry loop. Only this runner appends full-suite
+green/red receipts to `~/workspace/.operations/coordination/urgent-full-green.jsonl`.
+
+`prototype-load --urgent --reason=<at least 10 characters>` prefers passing CI, otherwise requires
+the latest exact-SHA receipt to be full, green, current-shard-count and at most two hours old.
+Other admission gates remain in force; merging still requires real CI. Urgent admissions append
+`prototype-load.urgent` events to `~/workspace/.operations/coordination/urgent-loads.jsonl`.
+`urgent-verify.test.mjs` and `prototype-load.test.mjs` cover runner authorship, closed paths,
+later-red supersession, event logging and the unchanged non-urgent CI gate. Run via heavy admission.

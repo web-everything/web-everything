@@ -45,6 +45,7 @@ import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry, op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
+import { urgentVerify } from './urgent-verify.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -616,6 +617,19 @@ export const OPERATIONS = Object.freeze({
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
+  }),
+  'urgent-verify': () => ({
+    declaration: op('urgent-verify', {
+      input: { sha: { type: 'string' } }, verdictFrom: 'assess',
+      verify: effect({ reads: ['input.sha'], effects: ({ input }) => [{ type: 'urgent-verify.run', payload: input, idempotent: false }] }),
+      assess: compute({ reads: ['findings.verify'], fn: ({ findings }) => {
+        const entry = findings.verify?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('urgent-verify did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'urgent-verify.run': input => urgentVerify(input) },
+    finish: ({ run, code, lines }) => run?.verdict ? { code: run.verdict.ok ? 0 : 1, lines: [JSON.stringify(run.verdict)] } : { code, lines },
   }),
   'codex-audit': () => ({
     declaration: op('codex-audit', {
