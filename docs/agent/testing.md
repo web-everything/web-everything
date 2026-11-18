@@ -4684,6 +4684,15 @@ are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/s
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
 
+## Pre-existing audit exemption evidence (R1053)
+
+Keep proof-mode fixtures explicit about `auditPolicy` (`releaseStage`, `requirePayBy`,
+`requireOnMain`); a missing or partial policy must retain findings for human review.
+Pay-by fixtures inject trusted persisted card text through `readCard`, never a date in
+model finding text. A confirmed held card satisfies existence (D5). Security fixtures
+for every B class must supply separate `written`, `expedite`, and `needsYou` confirmations,
+and exercise a persisted-card write that drops the needs-you line. Keep the block-mode
+stdout/record golden unchanged when changing proof-mode policy.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;

@@ -25,11 +25,16 @@ export function parseFindingLocation(findingText) {
 
 /** Simple regex/brace scan, not a JS parser. Strings/comments are masked, preserving offsets. */
 export function symbolAt(sourceText, line) {
-  if (typeof sourceText !== 'string' || !Number.isSafeInteger(line) || line < 1) return '<top>';
+  return symbolRangeAt(sourceText, line)?.symbol || '<top>';
+}
+
+/** One-based inclusive line range of the innermost scanned symbol, or null at top level. */
+export function symbolRangeAt(sourceText, line) {
+  if (typeof sourceText !== 'string' || !Number.isSafeInteger(line) || line < 1) return null;
   const source = sourceText.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|'(?:\\[\s\S]|[^'\\])*'|"(?:\\[\s\S]|[^"\\])*"|`(?:\\[\s\S]|[^`\\])*`/g,
     s => s.replace(/[^\n]/g, ' '));
   const lines = source.split('\n');
-  if (line > lines.length) return '<top>';
+  if (line > lines.length) return null;
   const start = lines.slice(0, line - 1).reduce((n, s) => n + s.length + 1, 0), end = start + lines[line - 1].length;
   const names = new Map(), expressions = [];
   const declarations = /\bfunction\s*\*?\s+([\w$]+)\s*\([^)]*\)\s*\{|\bconst\s+([\w$]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[\w$]+)\s*=>\s*|\b([\w$]+)\s*\([^)]*\)\s*\{/g;
@@ -45,5 +50,7 @@ export function symbolAt(sourceText, line) {
     if (source[i] === '{') stack.push(names.get(i) || null);
     if (source[i] === '}') { const scope = stack.pop(); if (scope) scopes.push({ ...scope, end: i }); }
   }
-  return scopes.filter(s => s.start <= end && s.end >= start).sort((a, b) => b.start - a.start)[0]?.name || '<top>';
+  const scope = scopes.filter(s => s.start <= end && s.end >= start).sort((a, b) => b.start - a.start)[0];
+  return scope ? { symbol: scope.name, start: source.slice(0, scope.start).split('\n').length,
+    end: source.slice(0, scope.end).split('\n').length } : null;
 }
