@@ -239,7 +239,7 @@ import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from '.
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-freeze-shared.mjs';
-import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
+import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON, freezeUnreadableOnly } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
@@ -1204,6 +1204,25 @@ export function isTransientUnknownMergeability(verdict) {
 
 /** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 3 × 20 s by default). */
 export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
+export const UNKNOWN_MERGEABILITY_MAX_RECOMPUTE = 10;
+
+/** Trigger GitHub's computation without refreshing or changing this pass's PR facts. */
+export async function triggerMergeabilityRecompute({ prsByRepo, recompute, log, max = UNKNOWN_MERGEABILITY_MAX_RECOMPUTE }) {
+  const seen = new Set();
+  for (const [repo, prs] of prsByRepo) {
+    for (const pr of prs) {
+      if (['CLOSED', 'MERGED'].includes(String(pr.state ?? '').toUpperCase())
+        || !['UNKNOWN', ''].includes(String(pr.mergeable ?? '').toUpperCase())) continue;
+      const key = `${repo}#${pr.number}`;
+      if (seen.has(key)) continue;
+      if (seen.size >= max) return;
+      seen.add(key);
+      try { await recompute({ repo, num: pr.number }); } catch { /* best effort; next pass reads fresh */ }
+      log(`mergeable-unknown-recompute ${String(repo ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, '')}#${pr.number}`);
+    }
+  }
+}
+
 /** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
 export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
@@ -5281,7 +5300,7 @@ async function runCli() {
   // `--only` sweep filtered out of the candidate set is still visible for the couple gate's health read.
   // #4108 (converge round 1 v3, simplicity lens) — no default: the sole call site (below) always passes
   // `liveListingsByRepo` explicitly.
-  const collectContext = (liveByRepo) => collectOpenPrContext({
+  const collectContext = (liveByRepo, readLiveRowsByRepo) => collectOpenPrContext({
     contextRepos: CONTEXT_REPOS,
     reconcileRan: true,
     // #999/xq985wu F3 — `--limit OPEN_PR_LIST_LIMIT` (raised off the old silent 100). This listing is the SOLE
@@ -5293,6 +5312,9 @@ async function runCli() {
       // that is in `CONTEXT_REPOS` but not `REPOS` (a narrowed `--repos`/`--this-repo` sweep's extra
       // constellation-context repos — rare, a no-op on the common full sweep) needs its own live open set.
       if (liveByRepo.has(repo)) return liveByRepo.get(repo);
+      // Round rows are candidate evidence only. Re-list pages live, reusing the hydrated
+      // heavy-field cache/shared host seed only after matching the live head and updatedAt.
+      if (readLiveRowsByRepo.has(repo)) return readLiveRowsByRepo.get(repo)();
       // xsbyo56 — `body` added so the #2832 held-reconcile branch (below) can read back the PR's own
       // `## Escalation reason` block (`buildHeldReviewHoldReason`/`parseEscalationReason`) and name the
       // specific file(s) that forced a review:human/pending/changes hold, not just the label.
@@ -5711,9 +5733,13 @@ async function runCli() {
         return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       };
       const rows = roundPath && slug
-        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget,
-          defaultBranch: () => defaultBranchByRepo.get(repo) ?? null,
-          listLive: async () => { const rows = await listLive(); await resolveDefaultBranch(repo); return rows; } })
+        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: true,
+          defaultBranch: async () => {
+            await __t.timeAsync('listing.defaultBranch', () => resolveDefaultBranch(repo));
+            return defaultBranchByRepo.get(repo) ?? null;
+          },
+          reuseDefaultBranch: name => { if (typeof name === 'string' && name.trim()) defaultBranchByRepo.set(repo, name); },
+          listLive })
         : await listLive();
       const listedRows = Array.isArray(rows) ? rows : [];
       const truncated = Array.isArray(rows) && isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT);
@@ -5767,6 +5793,7 @@ async function runCli() {
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
   const liveListingsByRepo = buildLiveListingsByRepo(listings);
+  const readLiveRowsByRepo = new Map(listings.filter(l => l.listing === 'snapshot').map(l => [l.repo, l.readLiveRows]));
   // #2421 — the shared open-PR listing + manifest reads + cross-repo item-openness set the reconcile below
   // needs, computed ONCE for this pass (RECONCILE-gated — same cost profile as the reconcile it feeds: free on
   // a bare, unlabelled sweep). #4108 — reuses `liveListingsByRepo` above instead of re-listing every repo in
@@ -5776,8 +5803,17 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: async () => { await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
-    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
+    repoll: async () => {
+      await triggerMergeabilityRecompute({ prsByRepo,
+        recompute: ({ repo, num }) => {
+          const slug = repo || localSlug;
+          return execFileP('gh', ['api', `repos/${slug}/pulls/${num}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        },
+        log: line => process.stderr.write(`${line}\n`),
+      });
+      await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts();
+    },
+    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo, readLiveRowsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
   // Round snapshots are candidate evidence only. Reuse the live context listing when available; a bare
@@ -6785,9 +6821,11 @@ async function runCli() {
           const d = quarantine && isLocalRepo(v.repo)
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
             : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
-          if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
+          if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen && !freezeUnreadableOnly(sig) ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
         }
-        if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
+        if (!AS_JSON) process.stderr.write(freezeUnreadableOnly(sig)
+          ? `  🛑 freeze-unreadable-hold: freeze unreadable — ${held} PR(s) held until the shared freeze is readable\n`
+          : `  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
       }
     }
   }

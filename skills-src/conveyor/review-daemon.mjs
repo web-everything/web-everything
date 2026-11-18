@@ -92,9 +92,12 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
 import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { reviewSessionSlug } from '../../scripts/conveyor/review-session-slug.mjs';
+import { diagnoseEndedJob, summarizeDiagnosis, writeEndedJobDiagnosis } from '../../scripts/operations/review-job-end-diagnosis.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
+import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
 import { sampleHost } from '../../scripts/lib/host-sample.mjs';
-import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
+import { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
@@ -238,16 +241,20 @@ export function formatOperatorHoldsRecord({ repo, observedAt, intervalMs, holds 
  *  unlogged for hours because its refusal was dropped here and the notice that excuses the silence is posted once). */
 const ALWAYS_EXPLAINED_LABEL = 'review:human';
 
+// Restart-local scheduling history; keys include the repo so equal PR numbers stay independent.
+const reviewDispatchState = { firstOwedAt: new Map(), lastDispatched: new Map(), noVerdictCounts: new Map() };
+
 /**
  * The dispatch order for this tick's owed reviews. Pure, stable. Rank 0: a main-fix PR (the plan marks it
  * `mainFix`); rank 1: a PR someone is blocked on (`review:human` or `ready-to-merge`); rank 2: the rest.
- * Within a rank the oldest PR (lowest number) goes first. Only the plan's own review rows move: a red-team
+ * Within a rank the longest continuously owed PR goes first, then the lowest number.
+ * Only the plan's own review rows move: a red-team
  * request row (`redTeamRequest` / `carriedAcceptHead`) keeps its slot, since the code that adds those rows already
  * places them deliberately (the main-fix PR's red-team first).
  * @param {Array<object>} reviews
- * @param {{labelsByPr?:Map<number, Array<string|{name:string}>>, plan?:{dispatch?:Array<object>}}} [o]
+ * @param {{labelsByPr?:Map<number, Array<string|{name:string}>>, plan?:{dispatch?:Array<object>}, owedSince?:Map<number,number>}} [o]
  */
-export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan = {} } = {}) {
+export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan = {}, owedSince = new Map() } = {}) {
   const mainFixPrs = new Set((plan?.dispatch ?? []).filter((d) => d?.mainFix).map((d) => Number(d.prNumber)));
   const rank = (d) => {
     const n = Number(d?.prNumber);
@@ -258,7 +265,9 @@ export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan 
   const movable = (d) => !d?.redTeamRequest && !d?.carriedAcceptHead;
   const slots = reviews.map((d, i) => (movable(d) ? i : -1)).filter((i) => i >= 0);
   const sorted = slots.map((i) => ({ d: reviews[i], i, r: rank(reviews[i]), n: Number(reviews[i]?.prNumber) }))
-    .sort((a, b) => a.r - b.r || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i);
+    .sort((a, b) => a.r - b.r
+      || (owedSince.get(a.n) ?? Infinity) - (owedSince.get(b.n) ?? Infinity)
+      || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i);
   const out = [...reviews];
   slots.forEach((slot, k) => { out[slot] = sorted[k].d; });
   return out;
@@ -389,6 +398,7 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  recoveryAcquirableLanes = acquirableLanes,
   // verify-admission (2026-10-20) — host-level admission for new review sessions: `() => {admitted, reason,
   // maxPerTick?}`. Not admitted ⇒ nothing is dispatched this tick (every review stays owed: queued, never dropped);
   // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
@@ -439,6 +449,10 @@ export function runReviewTick({
   log = () => {},
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
+  dispatchState = reviewDispatchState,
+  isPidAlive = pidAlive,
+  diagnoseJob = diagnoseEndedJob,
+  writeJobDiagnosis = writeEndedJobDiagnosis,
 } = {}) {
   // #x01u7az — runs FIRST and INDEPENDENTLY of `reconcile`'s own plan: it is a plain `gh pr list` + label read
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
@@ -588,6 +602,56 @@ export function runReviewTick({
   const mergeConflictedByPr = new Map((Array.isArray(rawPrs) ? rawPrs : [])
     .map((p) => [Number(p?.number), String(p?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY']));
   const reviews = (plan.dispatch ?? []).filter((d) => d && d.kind === 'review');
+  const keyFor = pr => `${repo}#${Number(pr)}`;
+  const owedKeys = new Set(reviews.map(d => keyFor(d.prNumber)));
+  const refusedKeys = new Set((plan.refusals ?? []).map(d => keyFor(d.prNumber)));
+  const openPrs = Array.isArray(rawPrs) ? new Map(rawPrs.map(p => [keyFor(p?.number), p])) : null;
+  const noVerdictCounts = dispatchState.noVerdictCounts ??= new Map();
+  for (const key of new Set([...dispatchState.firstOwedAt.keys(), ...noVerdictCounts.keys()])) {
+    if (!key.startsWith(`${repo}#`)) continue;
+    if ((!owedKeys.has(key) && !refusedKeys.has(key)) || (openPrs && !openPrs.has(key))) {
+      dispatchState.firstOwedAt.delete(key);
+      noVerdictCounts.delete(key);
+    } else if (openPrs?.get(key)?.headRefOid && noVerdictCounts.get(key)?.head !== openPrs.get(key).headRefOid) {
+      noVerdictCounts.delete(key);
+    }
+  }
+  const owedSince = new Map();
+  const endedNoVerdict = [];
+  const observedAt = now();
+  for (const d of reviews) {
+    const key = keyFor(d.prNumber);
+    if (!dispatchState.firstOwedAt.has(key)) dispatchState.firstOwedAt.set(key, observedAt);
+    const prior = dispatchState.lastDispatched.get(key);
+    const head = d.headRefOid ?? d.headSha ?? d.head
+      ?? rawPrs?.find(p => Number(p?.number) === Number(d.prNumber))?.headRefOid;
+    if (head && noVerdictCounts.get(key)?.head !== head) noVerdictCounts.delete(key);
+    if (prior && head && prior.head === head && isPidAlive(prior.pid) === false) {
+      const count = (noVerdictCounts.get(key)?.count ?? 0) + 1;
+      noVerdictCounts.set(key, { head, count });
+      // One immediate retry keeps its place; repeated failures yield to waiting peers.
+      if (count >= 2) dispatchState.firstOwedAt.set(key, observedAt);
+      let diagnosis = 'exit=? signal=? last="diagnosis unavailable"';
+      try {
+        const slug = prior.slug ?? reviewSessionSlug(d.prNumber, repoKeyForSlug(repo));
+        const job = { slug, pid: prior.pid };
+        const detail = diagnoseJob(job);
+        diagnosis = summarizeDiagnosis(detail);
+        writeJobDiagnosis(job, detail);
+      } catch { /* Diagnostics must never interrupt a retry. */ }
+      endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
+      dispatchState.lastDispatched.delete(key);
+      try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`); } catch {}
+    }
+    owedSince.set(Number(d.prNumber), dispatchState.firstOwedAt.get(key));
+  }
+  // Keep a live job's identity across planner live-process refusals; drop closed PRs when known.
+  if (Array.isArray(rawPrs)) {
+    const open = new Set(rawPrs.map(p => keyFor(p?.number)));
+    for (const key of dispatchState.lastDispatched.keys()) {
+      if (key.startsWith(`${repo}#`) && !open.has(key)) dispatchState.lastDispatched.delete(key);
+    }
+  }
   // Live-caught 2026-09-22, #xli631k: a PR that moved to being owed a FIX (not a review) used to never
   // reach `statusCandidates` at all, so its `review-status:reviewing` label sat stale once its review
   // session finished (PR #2472, ~2 hours stale). `selectStatusCandidates` now takes fix-owed entries as a
@@ -612,7 +676,7 @@ export function runReviewTick({
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
   // 2026-10-20 — when this tick can dispatch fewer reviews than are owed, the scarce seats go in priority
   // order (see orderReviewsForDispatch): main-fix first, then PRs a human or the merge queue waits on, oldest first.
-  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
+  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan, owedSince }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   let host = { admitted: true, maxPerTick: Infinity };
@@ -671,7 +735,13 @@ export function runReviewTick({
   const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
   const recoverRedTeam = (recoveryStarts) => {
     if (paused || typeof redTeamOnSkip !== 'function') return;
-    const recoveryLanes = Math.max(0, acquirable - occupiedLanes);
+    // Recovery starts need only one lane; ordinary rounds reserve a companion lane too.
+    // A failed recovery-only read must not abort the tick (it runs before ordinary dispatch): read it as 0 lanes.
+    let rawLanes = 0;
+    try { rawLanes = recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo }); }
+    catch (e) { log(`review-daemon: ${repo} recovery lane read failed (${String(e?.message ?? e).split('\n')[0]}); recovery gets 0 lanes this tick`); }
+    const rawAcquirable = Math.max(0, (Array.isArray(rawLanes) ? rawLanes.length : Number(rawLanes)) || 0);
+    const recoveryLanes = Math.max(0, rawAcquirable - occupiedLanes);
     let taken = 0;
     const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
       startsCeiling: Math.max(0, hostLimit - occupiedLanes - (reviews.length ? 1 : 0)),
@@ -732,6 +802,10 @@ export function runReviewTick({
         prNumber: d.prNumber, agentId: result?.agentId ?? null,
         ...(result?.mode ? { mode: result.mode } : {}), ...(Number.isInteger(result?.jobPid) ? { jobPid: result.jobPid } : {}),
       });
+      const head = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
+      if (Number.isInteger(result?.jobPid) && result.jobPid > 0 && head) {
+        dispatchState.lastDispatched.set(keyFor(d.prNumber), { pid: result.jobPid, head, ...(result.sessionSlug ? { slug: result.sessionSlug } : {}) });
+      }
       occupiedLanes++;
       if (typeof host.take === 'function') host.take(1);
     } catch (e) {
@@ -747,10 +821,16 @@ export function runReviewTick({
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
-  const live = liveReviewBudget?.live + (initialReviewCapacity - liveCap);
-  const capReason = Number.isFinite(live)
+  const earlierDispatches = Number.isFinite(liveReviewBudget?.max) && Number.isFinite(liveReviewBudget?.live)
+    ? Math.max(0, liveReviewBudget.max - liveReviewBudget.live - initialReviewCapacity) : 0;
+  // Never clamp: an overrun (10 live of max 8) must still read "10 of 8".
+  const live = Number.isFinite(liveReviewBudget?.live)
+    ? liveReviewBudget.live + earlierDispatches + (initialReviewCapacity - liveCap)
+    : Number.isFinite(liveReviewBudget?.max) ? liveReviewBudget.max - liveCap : NaN;
+  let capReason = Number.isFinite(live)
     ? liveReviewBudget?.reason?.replace(/live review rounds \d+ of /, `live review rounds ${live} of `)
     : liveReviewBudget?.reason;
+  if (capReason && earlierDispatches > 0) capReason += `; ${earlierDispatches} seat(s) taken by dispatches earlier in this tick`;
   const hostBound = !paused && (!host.admitted || hostLimit - occupiedLanes <= 0);
   const capBound = !paused && !hostBound && liveCap === 0;
   const deferredTotal = reviews.length - dispatchable.length;
@@ -759,7 +839,9 @@ export function runReviewTick({
   const deferredForLanes = paused || hostBound || capBound ? 0 : deferredTotal;
   const deferredForAuth = paused ? deferredTotal : 0;
   const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
-    : hostBound ? `review owed, but held by host admission (${host.reason ?? 'host start budget exhausted'})`
+    : hostBound ? (host.admitted
+      ? `review owed, held by the per-tick review start budget (${host.startBudget ?? hostLimit} of ${host.startBudget ?? hostLimit} used this tick; host admitted: ${host.reason ?? 'not checked'})`
+      : `review owed, but held by host admission (${host.reason ?? 'host start budget exhausted'})`)
     : capBound ? `review owed, but held by the live-review cap (${capReason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
       : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
   if (deferredForCap && capReason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${capReason}\n`);
@@ -806,6 +888,7 @@ export function runReviewTick({
     }
   }
   return {
+    ...(endedNoVerdict.length ? { endedNoVerdict } : {}),
     ...(redTeamOnSkipResult !== undefined ? { redTeamOnSkip: redTeamOnSkipResult } : {}),
     reviewsOwed: reviews.length, dispatched, failed, notStarted, refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({
@@ -855,10 +938,11 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  * per-PR, one level up. Every downstream step this daemon already calls (`reconcile-pass.mjs`,
  * `review-dispatch.mjs`, both tag scripts) was already fully repo-generic before this — the daemon's own tick
  * was the only WE-hardcoded link (see `runReviewTick`'s own `repo` fix above, filed the same day this was).
- * @param {{repos?:string[], tick?:Function, authGateOverride?:Function}} [o] - `tick` is injectable (defaults to
+ * @param {{repos?:string[], tick?:Function, authGateOverride?:Function, startIndex?:number}} [o] - `tick` is injectable (defaults to
  *   `runReviewTick`); every other option is forwarded to it for EVERY repo except `repo` itself, which this
  *   loop supplies per-iteration. `authGateOverride` (card x5kagse) is a test-only injection point for
  *   {@link planClaudeAuthDispatchGate}'s own real IO decision — see the block below for when the real one runs.
+ *   `startIndex` pins the first repo; omitted, successive ticks rotate first access to shared capacity.
  * @returns {{repos:Array<{repo:string, result?:object, error?:string}>, reviewsOwed:number,
  *   dispatched:Array<object>, failed:Array<object>, refusals:number, reconcileFailed:Array<{repo:string, error:string}>,
  *   deferredForLanes:number, deferredForAuth:number, authPaused:boolean, authPauseReason:(string|null),
@@ -868,20 +952,48 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  */
 /** Wrap a host admission so it is evaluated once and its `maxPerTick` is a budget shared by every caller: each
  *  call returns the SAME verdict with what is left, and `take(n)` spends it. A throwing check fails closed. */
-export function sharedHostBudget(hostAdmission) {
+const malformedReviewStartBudgets = new Set();
+export function sharedHostBudget(hostAdmission, log = console.error) {
   let verdict = null;
   let left = 0;
-  return () => {
+  let spentTotal = 0;
+  const shared = () => {
     if (!verdict) {
       try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
       catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
-      left = verdict.admitted ? (Number.isFinite(verdict.maxPerTick) && verdict.maxPerTick >= 1 ? verdict.maxPerTick : Infinity) : 0;
+      let budget = verdict.maxPerTick;
+      if (verdict.admitted && !(Number.isInteger(budget) && budget >= 0)) {
+        let got;
+        try { got = String(budget); } catch { got = typeof budget; }
+        const reason = `${typeof budget}:${got}`;
+        budget = Number.isInteger(DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK) && DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK >= 0
+          ? DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK : 1;
+        if (!malformedReviewStartBudgets.has(reason)) {
+          malformedReviewStartBudgets.add(reason);
+          try { log(`review-daemon: review-start-budget-malformed (got ${got}) - using safe default ${budget}`); }
+          catch { /* Diagnostics must not interrupt admission. */ }
+        }
+      }
+      verdict = { ...verdict, maxPerTick: budget };
+      left = verdict.admitted ? budget : 0;
     }
-    return { ...verdict, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
+    return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { const before = left; left = Math.max(0, left - n); spentTotal += before - left; } };
   };
+  // Seats spent so far through ANY path (dispatch, failed dispatch, red-team recovery): the rotation reads this
+  // per repo instead of trusting `dispatched`, which misses seats a failed or recovery start still consumed.
+  shared.spent = () => spentTotal;
+  return shared;
 }
 
-export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
+// Round-robin cursor for first access to the shared review seats. It moves only when a tick actually handed out
+// a seat (see the end of the repo loop below): a tick with no free seat must not spend any repo's turn, or a
+// seat pattern that repeats with the rotation (1,0,0 over three repos) would serve the same repo forever.
+let reviewRepoRotation = 0;
+
+export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride,
+  startIndex, ...tickOpts } = {}) {
+  const pinnedStart = startIndex !== undefined;
+  if (!pinnedStart) startIndex = reviewRepoRotation;
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -890,15 +1002,47 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   // `authGateOverride` to test the gate itself.
   const authGate = authGateOverride ? authGateOverride()
     : (tick === runReviewTick ? planClaudeAuthDispatchGate() : { paused: false, reason: null });
-  const perRepoMs = {};
+  const perRepoMs = Object.fromEntries(repos.map(repo => [repo, 0]));
   // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
   // the per-tick cap is host-wide (never cap × repos).
-  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission);
-  const perRepo = forEachRepo(repos, (repo) => {
+  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission, tickOpts.log);
+  // Give each repo first access to the shared seats on successive ticks. An injected index pins
+  // execution order for callers/tests without advancing the default round-robin counter.
+  const start = repos.length && Number.isSafeInteger(startIndex)
+    ? ((startIndex % repos.length) + repos.length) % repos.length : 0;
+  const orderedRepos = [...repos.slice(start), ...repos.slice(0, start)];
+  const seatTakers = new Set();
+  const rotatedResults = forEachRepo(orderedRepos, (repo) => {
     const started = Date.now();
+    const spentBefore = tickOpts.hostAdmission?.spent?.() ?? 0;
+    // The live-review pool is a second shared seat pool: a live-job skip can keep its seat without a host take or a
+    // dispatch entry, so a net drop in `left` over this repo's tick also counts as a seat spent.
+    const leftBefore = tickOpts.liveReviewBudget?.left;
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
-    finally { perRepoMs[repo] = Date.now() - started; }
+    finally {
+      perRepoMs[repo] = Date.now() - started;
+      const leftAfter = tickOpts.liveReviewBudget?.left;
+      if ((tickOpts.hostAdmission?.spent?.() ?? 0) > spentBefore
+        || (Number.isFinite(leftBefore) && Number.isFinite(leftAfter) && leftAfter < leftBefore)) seatTakers.add(repo);
+    }
   });
+  // Preserve the public result (and aggregate) order even when execution starts at another repo.
+  const split = repos.length - start;
+  const perRepo = [...rotatedResults.slice(split), ...rotatedResults.slice(0, split)];
+  // Advance the default rotation past the last repo (in execution order) that actually took a seat — a seat
+  // spent from the shared host budget (dispatch, failed dispatch, red-team recovery, or a tick that threw after
+  // spending) or a reported dispatch; leave it untouched when nobody did, and never move it for an injected
+  // `startIndex`. Over-counting is safe (the repo just goes last); missing a spender would pin it first.
+  if (!pinnedStart && repos.length) {
+    let lastServed = -1;
+    rotatedResults.forEach((entry, i) => {
+      const r = entry?.result;
+      // `failed` is deliberately NOT a signal: it also lists non-seat failures (pause notice, scope-bloat) that
+      // happen on ticks with no free seat and must not spend a repo's turn.
+      if (seatTakers.has(orderedRepos[i]) || (r?.dispatched?.length ?? 0) > 0) lastServed = i;
+    });
+    if (lastServed >= 0) reviewRepoRotation = (start + lastServed + 1) % repos.length;
+  }
   const dispatched = [];
   const failed = [];
   const notStarted = [];
@@ -1129,8 +1273,8 @@ export function hasStaleMainRefusal(tickResult) {
 }
 
 /**
- * #3383 bug 3 — the REAL `acquirableLanes` effect: how many lanes are acquirable RIGHT NOW in `repo`'s own
- * pool. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
+ * #3383 bug 3 — the REAL `acquirableLanes` effect: how many review starts fit RIGHT NOW in `repo`'s own
+ * pool, allowing roughly two lanes per round. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
  * --acquirable --json` read `tick-core.mjs`'s IO shell already uses — rather than re-deriving a second copy;
  * `repoProfile(repo).lanePoolRepo` is the exact same derivation `review-dispatch.mjs#planReviewDispatch`
  * already uses to pick which pool a given repo's own review session acquires from. Fail-soft, like
@@ -1144,9 +1288,17 @@ export function defaultAcquirableLaneCount({ repo }) {
   return defaultAcquirableLaneNumbers({ repo }).length;
 }
 
-/** Preserve the tick's fresh scan so sibling jobs acquire distinct lanes without scanning again. */
-export function defaultAcquirableLaneNumbers({ repo }) {
-  return freeLaneNumbers({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+/** Preserve distinct preferred lanes while leaving one companion lane per review round available.
+ * A round needs roughly two lanes; an unmatched lane cannot fit another round this tick.
+ * Returning no candidates uses the existing typed lane deferral / poolExhaustion path. */
+export function defaultAcquirableLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  const lanes = readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+  return lanes.slice(0, Math.floor(lanes.length / 2));
+}
+
+/** Red-team-only recovery needs one lane per start, so every free lane is available. */
+export function defaultRecoveryLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  return readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
 }
 
 /** The lane-pool repo path for `repo` (the same derivation {@link defaultAcquirableLaneCount} uses). */
@@ -1276,13 +1428,15 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 let redTeamDispatchQueue;
 const redTeamGateRetryHistory = new Map();
 let lastRedTeamQueueFloorLine;
-export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
     log: line => log.error(line),
-    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
+    acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
+    readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
-    liveReviewBudget: liveReviewRoundBudget(),
+    // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
+    liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;
       try {
@@ -1657,22 +1811,30 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
   return count;
 }
 
+const REVIEW_CONCURRENCY_PATH = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json');
+
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync } = {}) {
+  const validMax = v => Number.isSafeInteger(v) && v >= 1 && v <= 16;
+  // Invalid overrides fall back to the committed cap; unreadable/invalid defaults hold all new rounds.
+  let defaultMax = 0;
+  try {
+    const configured = JSON.parse(readFile(REVIEW_CONCURRENCY_PATH, 'utf8')).maxLiveReviewRounds;
+    if (validMax(configured)) defaultMax = configured;
+  } catch { /* fail closed with zero slots */ }
   let tool;
-  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  try { tool = JSON.parse(readFile(toolPath, 'utf8')); } catch { tool = undefined; }
   const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
   const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
-    env, standard: { maxLiveReviewRounds: null },
+    env, standard: { maxLiveReviewRounds: defaultMax },
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
-    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
+    valid: { maxLiveReviewRounds: validMax },
   });
   const max = r.value.maxLiveReviewRounds;
-  if (max == null) return null;
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }

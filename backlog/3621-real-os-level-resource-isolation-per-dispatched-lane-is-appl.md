@@ -10,7 +10,7 @@ tags: [conveyor, capacity, isolation, container, apple-silicon, platform]
 
 # Real OS-level resource isolation per dispatched lane — is Apple's container/Containerization framework (Apple Silicon-only, 1.0 June 2026) the right foundation?
 
-Live incident 2026-09-07: a busy-spin bug in a dispatched agent's Monitor command (a while/until wait-loop with no sleep in its body, caught and manually killed after 3.5+ minutes at 95-98% CPU, we:backlog/3594) burned host CPU with nothing to contain it, and the same night 42 concurrent claude -p sessions launching in one tick drove 1-min load average to 34.95 on a 12-core host (we:backlog/3612-cap-concurrent-dispatched-lanes-with-a-max-concurrent-lanes.md, we:backlog/3609-a-manual-emergency-pause-new-dispatch-lever-distinct-from-th.md). Everything filed tonight in response — we:backlog/3456's heavy-command admission cap, we:backlog/3611-hardware-usage-aware-heavy-command-capacity-control-a-staged.md's staged self-learning admission project (epic, parent #3456, filed but not yet merged, PR #1998) with its own we:backlog/3608-stage-1-sample-real-cpu-memory-usage-per-heavy-command-run-a.md (Stage 1 sampling) and we:backlog/3610-how-far-to-take-heavy-command-admission-control-beyond-stage.md (the EWMA-vs-learned-policy fork), we:backlog/3612's MAX_CONCURRENT_LANES dispatch ceiling, we:backlog/3609's manual pause lever, and we:backlog/3593-catch-and-correct-agent-instruction-slips-mechanically-a-syn.md / we:backlog/3594's instruction-slip scanner — is either ADMISSION (deciding whether to let a lane or heavy command start at all) or DETECTION (statically flagging a badly-written Monitor loop after the fact, report-only). Confirmed by reading each in full: none of them CONTAIN what an already-admitted, already-running process actually does to host resources once it is running. A perfect admission policy plus a perfect static scanner still would not have capped the busy-spin loop's CPU draw once it started — only a hard ceiling enforced by the OS itself would. This item is that different, deeper axis, filed as a sibling of 3611 (parented directly under #3383, not under 3611 or #3456) because 3611 is scoped narrowly to we:scripts/readiness/heavy-admission.mjs's command-counting semaphore and never touches per-process resource caps, and 3612 is scoped to how many lanes get dispatched, not what a dispatched lane's process can consume once running.
+Live incident 2026-09-07: a busy-spin bug in a dispatched agent's Monitor command (a while/until wait-loop with no sleep in its body, caught and manually killed after 3.5+ minutes at 95-98% CPU, we:backlog/3594) burned host CPU with nothing to contain it, and the same night 42 concurrent claude -p sessions launching in one tick drove 1-min load average to 34.95 on the host (we:backlog/3612-cap-concurrent-dispatched-lanes-with-a-max-concurrent-lanes.md, we:backlog/3609-a-manual-emergency-pause-new-dispatch-lever-distinct-from-th.md). Everything filed tonight in response — we:backlog/3456's heavy-command admission cap, we:backlog/3611-hardware-usage-aware-heavy-command-capacity-control-a-staged.md's staged self-learning admission project (epic, parent #3456, filed but not yet merged, PR #1998) with its own we:backlog/3608-stage-1-sample-real-cpu-memory-usage-per-heavy-command-run-a.md (Stage 1 sampling) and we:backlog/3610-how-far-to-take-heavy-command-admission-control-beyond-stage.md (the EWMA-vs-learned-policy fork), we:backlog/3612's MAX_CONCURRENT_LANES dispatch ceiling, we:backlog/3609's manual pause lever, and we:backlog/3593-catch-and-correct-agent-instruction-slips-mechanically-a-syn.md / we:backlog/3594's instruction-slip scanner — is either ADMISSION (deciding whether to let a lane or heavy command start at all) or DETECTION (statically flagging a badly-written Monitor loop after the fact, report-only). Confirmed by reading each in full: none of them CONTAIN what an already-admitted, already-running process actually does to host resources once it is running. A perfect admission policy plus a perfect static scanner still would not have capped the busy-spin loop's CPU draw once it started — only a hard ceiling enforced by the OS itself would. This item is that different, deeper axis, filed as a sibling of 3611 (parented directly under #3383, not under 3611 or #3456) because 3611 is scoped narrowly to we:scripts/readiness/heavy-admission.mjs's command-counting semaphore and never touches per-process resource caps, and 3612 is scoped to how many lanes get dispatched, not what a dispatched lane's process can consume once running.
 
 Checked before filing: grepped this repo for any existing resource-capping primitive (ulimit/cgroup/nice/renice/cpulimit/rlimit) across we:scripts/ and we:skills-src/ — zero hits; genuinely new ground. Searched we:backlog/ for 'container'/'virtualization'/'resource isolation'/'sandbox' in a capacity/conveyor context — nothing exists; the one superficially similar hit, we:backlog/3141-safe-edit-sandbox-discard-or-emit-pr-orchestration.md, is an editor undo/discard buffer, unrelated to OS-level process isolation. Checked we:backlog/2445-plateau-loop-extract-the-delivery-machinery-into-a-coordinat.md, we:backlog/2505-plateau-loop-operable-backlog-console-built-fresh-in-plateau.md, we:docs/agent/platform-decisions.md, and we:skills-src/mechanical-delivery-doctrine/SKILL.md for any existing target-hardware/audience statement: none exists anywhere on record. So the operator's framing tonight (Apple Silicon is an acceptable hard requirement because Plateau Loop targets an early-adopter audience, not legacy-hardware breadth) is not contradicted by anything already written, but it is also not yet a codified platform decision — if this item is ratified toward building on Apple's tool, its own resolution should be the first place that gets stated explicitly in we:docs/agent/platform-decisions.md, not left as an assumed conversational premise.
 
@@ -117,7 +117,7 @@ how many cores that dedicated pool would need, if this is ever built.
 
 **Secondary implication, worth recording in the same amendment:** if this holds up, it could reshape how the
 operator's in-progress second-machine hardware purchase decision (a separate, not-yet-filed conversation about
-a Mac mini/Studio) gets sized — potentially one pool of machine(s)/cores for many cheap concurrent
+a build host) gets sized — potentially one pool of machine(s)/cores for many cheap concurrent
 lane-orchestration sessions, and a smaller dedicated core allocation specifically for heavy-command throughput,
 rather than sizing hardware as if lane count and core count scale together 1:1. Not filing a new item for the
 hardware decision itself — it lives in conversation, not yet in the backlog — just noting the connection here
@@ -221,7 +221,7 @@ the Codex-isolation problem.** The two concerns barely overlap. See "the headlin
 `command -v container` exited 1 (not preinstalled), matching the parallel probe's earlier check. It is a
 plain Homebrew-core formula: `brew install container` installed **1.3.1** (400.8 MB), then
 `container system start --enable-kernel-install` pulled the kata-containers 3.32.0 arm64 static kernel
-(`vmlinux-6.18.35`). Host: macOS 26.6.2 (build 25G83), `uname -m` = **arm64**, 12 cores. Note for this
+(`vmlinux-6.18.35`). Host: macOS 26.6.2 (build 25G83), `uname -m` = **arm64**. Note for this
 item's own record: the body above cites "1.0.0 shipped 2026-06-09" — the tool is now three minor versions
 past that, so the desk research was current when written but the project is moving.
 
@@ -239,7 +239,7 @@ one `--cpus 2 --memory 2g` container.
 | --- | --- |
 | host `com.apple.Virtualization.VirtualMachine` process | **188.3% CPU** |
 | `container stats` (guest's own view) | 214.66% CPU, 5.38 MiB / 2.00 GiB |
-| unconstrained equivalent on this 12-core host | ~800% CPU |
+| unconstrained equivalent on the host | ~800% CPU |
 
 The cap held: ~16% of the machine instead of ~two-thirds of it. **This is the first direct evidence for
 this item's central claim** — that a hypervisor-enforced ceiling contains an *already-running* runaway,
@@ -434,7 +434,7 @@ because they bear directly on open questions THIS item's own body left unresolve
 
 - **The CPU cap reproduces this item's own 2026-09-11 busy-spin containment result on a second, independent
   build**: 8 unbounded spinners inside a `--cpus 2 --memory 2g` container held host CPU at ~190-205%
-  throughout the run, versus ~800% unconstrained on this same 12-core host. Corroborates, does not merely
+  throughout the run, versus ~800% unconstrained on this same the host. Corroborates, does not merely
   repeat, the earlier finding.
 - **A real fidelity proof for a HEAVY COMMAND specifically** (the earlier amendment proved the isolation
   provider's own unit suite in-container; this proves an actual heavy command in the closed named set
@@ -792,7 +792,7 @@ built and fresh on this host):
   `we:vitest.integration.config.ts`'s `poolOptions.forks.maxForks`. It calls neither `os.cpus()` nor
   `os.availableParallelism()` at all — confirmed by reading the constant's own definition and every call site.
   It was deliberately sized (per that constant's own `#3650` comment, already in the repo, unrelated to this
-  amendment) for the HOST's 12-core budget under a documented worst-case assumption of **3 concurrent `vitest`
+  amendment) for the HOST's core budget under a documented worst-case assumption of **3 concurrent `vitest`
   invocations** racing past `we:scripts/readiness/heavy-admission.mjs`'s admission cap during its fail-open timeout window (3×4=12,
   "fully subscribed but never oversubscribed" — on the HOST). **That sizing has nothing to do with, and does
   not adapt to, any container it might later run inside.** Ran the real 35-file/441-test `we:blocks/__tests__`

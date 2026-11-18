@@ -12,7 +12,7 @@ tags: []
 
 # heavy-admission should route an overloaded run to Forge instead of deferring it when remote mode is always
 
-Live 2026-10-31 10:40 ET (lane-2): heavy-admission DEFERRED 'npm run check:standards' for host load (84 on 12 cores > 6/core) while heavyAdmission.remote.mode=always and Forge was idle (~1). Overload should route remote, not defer. Check the order of the load-cap test vs the remote decision, and whether check:standards is on the remote allowlist. Prove on a lane run under load.
+Live 2026-10-31 10:40 ET (lane-2): heavy-admission DEFERRED 'npm run check:standards' for host load (84 against the host core count > 6/core) while heavyAdmission.remote.mode=always and Forge was idle (~1). Overload should route remote, not defer. Check the order of the load-cap test vs the remote decision, and whether check:standards is on the remote allowlist. Prove on a lane run under load.
 
 ## Acceptance
 

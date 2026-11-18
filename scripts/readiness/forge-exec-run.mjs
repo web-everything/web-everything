@@ -238,6 +238,16 @@ async function readDeployState(path) {
   } catch { return null; }
   finally { try { await file?.close(); } catch { /* evidence unavailable */ } }
 }
+// 50 retained entries must stay inside parseTelemetry's 64 KiB budget.
+const FAILURE_TAIL_BYTES = 512;
+function failureTail(stderr) {
+  const lines=String(stderr).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g,'').replace(/\n$/,'').split('\n').slice(-20).join('\n');
+  const bytes=Buffer.from(lines);
+  let start=Math.max(0,bytes.length-FAILURE_TAIL_BYTES);
+  // Keep the newest bytes without cutting through a UTF-8 character.
+  while(start<bytes.length && (bytes[start]&0xc0)===0x80) start++;
+  return bytes.subarray(start).toString('utf8');
+}
 export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
@@ -255,7 +265,11 @@ export function parseTelemetry(text) {
     || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
       ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
-      || (exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET') && typeof r.prewarmed==='boolean'))
+      || exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET')
+      || exactKeys(r,'code,failureTail,runId,stageMs,startedAtET')
+      || exactKeys(r,'code,failureTail,prewarmed,runId,stageMs,startedAtET'))
+      || ('prewarmed' in r && typeof r.prewarmed!=='boolean')
+      || ('failureTail' in r && (typeof r.failureTail!=='string' || Buffer.byteLength(r.failureTail)>FAILURE_TAIL_BYTES || !r.code))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
       || !duration(r.stageMs.install) || !duration(r.stageMs.run) || !(r.code===null || (duration(r.code)&&r.code<=255))))
     throw new Error('Invalid telemetry schema');
@@ -1317,14 +1331,14 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
     }
     return true;
   }
-  async function installDependencies(request,work,command) {
+  async function installDependencies(request,work,temp,command) {
     let result;
       // npm accepts some manifest changes without lock changes. Key the entire
       // validated snapshot, including workspace manifests and local dependency
       // contents, so a warm archive represents the same install inputs. Earlier
       // profiles lack this binding (v3 also allowed an unkeyed shrinkwrap).
       const profile=join(cache,request.lock,'dev-v5-'+(request.manifest.siblings ? request.manifestDigest : request.inputDigest));
-      const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
+      const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development',TMPDIR:temp};
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
         await mkdir(join(cache,request.lock),{mode:0o700}).catch(e=>{if(e.code!=='EEXIST') throw e;});
         await directory(join(cache,request.lock),true,operator);
@@ -1398,18 +1412,21 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const run='warm-'+randomBytes(16).toString('hex'),nonce=randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce),record={run,nonce,...(worker.active?{slot:worker.user}:{})};
       try{return await exclusiveWorker(async command=>{
-        const work=join(worker.root,run);
-        await mkdir(work,{mode:0o755});
+        const container=join(worker.root,run),work=join(container,'work'),temp=join(container,'.forge-tmp');
+        await mkdir(container,{mode:0o755});
         try {
+          await mkdir(work,{mode:0o755});
           const entries=decodeManifest(manifest).entries;
           await copyLeaves(source,work,entries);
           await verifyManifest(work,manifest,digestManifest(manifest));
-          await handoff(worker,work,{recursive:true});
           const request={lock:await digestLock(work),inputDigest:await digestInput(work),manifest,manifestDigest:digestManifest(manifest)};
+          await mkdir(temp,{mode:0o700});
+          await handoff(worker,temp);
+          await handoff(worker,work,{recursive:true});
           const signature=await registryInstallSignature(work,request),parent=join(cache,request.lock),profile=join(parent,'dev-v5-'+request.inputDigest);
           const index=signature?join(parent,'.warm-inputs-'+signature):null;
           if(!await reuseWarmProfile(signature,request)) {
-            await installDependencies(request,work,command);
+            await installDependencies(request,work,temp,command);
             if(index) {
               const archiveDigestValue=await archiveDigest(join(profile,'dependencies.tar'));
               const pending=index+'-'+randomBytes(8).toString('hex');
@@ -1418,8 +1435,8 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
           }
           return {code:0};
         } finally {
-          if(testRoot)await rm(work,{recursive:true,force:true});
-          else if((await execute('/usr/bin/sudo',['-n','/usr/bin/rm','-rf','--',work])).code)throw new Error('Warm cleanup failed');
+          if(testRoot)await rm(container,{recursive:true,force:true});
+          else if((await execute('/usr/bin/sudo',['-n','/usr/bin/rm','-rf','--',container])).code)throw new Error('Warm cleanup failed');
         }
       },record);
       }finally{if(worker.active)await releaseWorker(record);}
@@ -1611,15 +1628,19 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       if(telemetryError)throw telemetryError;
       const telemetryTimer=setInterval(update,5000);
       telemetryTimer.unref();
+      const temp=join(container,'.forge-tmp');
       try {
-        result=await installDependencies(request,work,command);
+        // Keep runtime scratch outside the digested tree and inside run cleanup.
+        await mkdir(temp,{mode:0o700});
+        await handoff(worker,temp);
+        result=await installDependencies(request,work,temp,command);
         installMs=Math.max(0,Math.round(clock()-installAt));
         phase='test';
         runAt=clock();
         await update();
         if(telemetryError)throw telemetryError;
         await assertContained(work,request.argv);
-        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
+        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env,TMPDIR:temp};
         if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
           executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
         // Anchor the report in the work dir so a config root cannot redirect it; re-check links after the run.
@@ -1632,7 +1653,9 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const receipt=createRunReceipt(prepared,{resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code},tasks);
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       if (tasks.tasksNear) process.stderr.write('forge-exec-run: '+tasks.tasksNote+'\n');
-      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed});
+      // Receipts have a closed client schema; diagnostics live only in telemetry.
+      const failure=result.code!==0 && (phase==='install'||phase==='supervisor') ? {failureTail:failureTail(result.stderr)} : {};
+      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed,...failure});
       if(telemetryError)throw telemetryError;
       return result;
       },prepared);

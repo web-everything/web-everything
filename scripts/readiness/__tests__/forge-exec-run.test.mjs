@@ -42,6 +42,8 @@ beforeEach(async () => {
   await writeFile(join(bin,'npm'), `#!/bin/bash
 if [ "$1" = ci ]; then
   printf '%s\n' "$*|$NODE_ENV|$HOME" >> '${root}/install.log'
+  printf '%s' "$TMPDIR" > '${root}/install-tmpdir'
+  touch "$TMPDIR/install-temp"
   if [ -f fail-install ]; then echo INJECTED_INSTALL_FAILURE >&2; exit 1; fi
   mkdir -p node_modules packages/deep/node_modules
   echo dev > node_modules/vitest
@@ -55,6 +57,8 @@ node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "$@" > arg
 printf '%s\n' "$*|$NODE_ENV" > task-seen
 echo forged > .exit-code
 printf '%s' "$VERIFY_SCAN_FILES" > scan-files-seen
+printf '%s' "$TMPDIR" > '${root}/execution-tmpdir'
+touch "$TMPDIR/execution-temp"
 echo '{"phase":"test","code":0}' > receipt.json
 exit 3
 `, {mode:0o755});
@@ -348,6 +352,7 @@ if (process.argv[2] !== 'ci') {
 }
 `,{mode:0o755});
     expect(await runner.run(request)).toMatchObject({code:0,stdout:'é😀',stderr:'é😀'});
+    expect((await runner.telemetry()).recent[0]).not.toHaveProperty('failureTail');
   });
   it('refuses an overlapping run and rechecks its input after the first worker substitutes its assertions', async () => {
     const other = createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin'});
@@ -438,6 +443,91 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     await expect(runner.finish(request)).rejects.toThrow();
     expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
+  it('confines install and execution temp files to private run container storage and removes them on finish', async () => {
+    const temp=join(root,'runs',request.run,'.forge-tmp');
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(root,'install-tmpdir'),'utf8')).toBe(temp);
+    expect(await readFile(join(root,'execution-tmpdir'),'utf8')).toBe(temp);
+    expect((await stat(temp)).mode & 0o777).toBe(0o700);
+    expect((await stat(temp)).uid).toBe((await stat(work)).uid);
+    expect(await readdir(temp)).toEqual(['execution-temp','install-temp']);
+    await expect(stat(join(work,'.forge-tmp'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toMatchObject({phase:'test',code:3});
+    await expect(stat(temp)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('hands scratch over without permitting worker-owned container ancestors and refuses a failed handoff', async () => {
+    const calls=[];
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testOwnershipExec:async call=>{
+      const cfg=JSON.parse(call.args.at(-1));calls.push(cfg);
+      return {code:1};
+    }});
+    expect(await runner.run(request)).toMatchObject({code:97,stderr:expect.stringContaining('ownership handoff refused')});
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({parts:[request.run,'.forge-tmp'],recursive:false,workerParent:false});
+    expect((await stat(join(work,'..'))).mode & 0o022).toBe(0);
+    await expect(readFile(join(root,'install-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    await runner.finish(request);
+  });
+  it.skipIf(process.platform!=='linux'||opsSudoMissing)('scratch is writable by a distinct slot UID which cannot replace container entries', () => {
+    const script=`import os, sys, json, tempfile, shutil
+cfg=json.loads(sys.argv[1])
+container=tempfile.mkdtemp(prefix='scratch-permissions-',dir=cfg['root'])
+os.chmod(container,0o755)
+try:
+    scratch=os.path.join(container,'.forge-tmp')
+    os.mkdir(scratch,0o700)
+    os.mkdir(os.path.join(container,'work'),0o755)
+    cfg['parts']=[os.path.basename(container),'.forge-tmp']
+    sys.argv=[sys.argv[0],json.dumps(cfg)]
+    exec(${JSON.stringify(manifestAPI.ownershipSource)})
+    scratch_fd=os.open(scratch,os.O_RDONLY|os.O_DIRECTORY)
+    container_fd=os.open(container,os.O_RDONLY|os.O_DIRECTORY)
+    pid=os.fork()
+    if pid==0:
+        try:
+            os.setgroups([])
+            os.setgid(cfg['worker']['gid'])
+            os.setuid(cfg['worker']['uid'])
+            fd=os.open('probe',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=scratch_fd)
+            os.write(fd,b'worker scratch');os.close(fd)
+            for entry in ['work','.forge-tmp']:
+                try: os.rename(entry,entry+'.replaced',src_dir_fd=container_fd,dst_dir_fd=container_fd)
+                except PermissionError: pass
+                else: raise AssertionError('worker replaced container entry')
+            try: os.open('escape',os.O_WRONLY|os.O_CREAT,0o600,dir_fd=container_fd)
+            except PermissionError: pass
+            else: raise AssertionError('worker wrote outside scratch')
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    _,status=os.waitpid(pid,0)
+    assert status==0,status
+    assert open(os.path.join(scratch,'probe'),'rb').read()==b'worker scratch'
+    os.close(scratch_fd);os.close(container_fd)
+finally:
+    shutil.rmtree(container)
+`;
+    const cfg={root:join(root,'runs'),operator:{uid:process.getuid(),gid:process.getgid()},worker:{uid:65533,gid:65533},recursive:false,workerParent:false};
+    const result=spawnSync('/usr/bin/sudo',opsSudoPythonArgs(script,JSON.stringify(cfg)),{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+  });
+  it('hashes .forge-tmp contents and rejects its nested symlinks and excessive depth', async () => {
+    const temp=join(work,'.forge-tmp');await mkdir(temp);
+    const file=join(temp,'input');await writeFile(file,'one');
+    const before=await digestInput(work);await writeFile(file,'two');
+    expect(await digestInput(work)).not.toBe(before);
+    await symlink(file,join(temp,'link'));
+    await expect(digestInput(work)).rejects.toThrow('Input symlink');
+    await rm(join(temp,'link'));
+    await mkdir(join(temp,...Array(129).fill('d')),{recursive:true});
+    await expect(digestInput(work)).rejects.toThrow('Input depth limit');
+  });
+  it('refuses request.env TMPDIR=/tmp before install or execution without weakening the environment allowlist', async () => {
+    await expect(runner.run({...request,env:{...request.env,TMPDIR:'/tmp'}})).rejects.toThrow();
+    await expect(readFile(join(root,'install-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(root,'execution-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toBeNull();
+  });
   it('rejects input and lock changes before install and accepts odd filenames literally', async () => {
     for (const name of ['#file',';file',"quote'`$()",'--option','é\u2028fixture','tab\tfile','trailing ']) await writeFile(join(work,name),name);
     await expect(runner.run(request)).rejects.toThrow(/digest/);
@@ -453,6 +543,31 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect((await runner.run(request)).code).toBe(97);
     expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
     await expect(stat(join(work,'task-seen'))).rejects.toThrow();
+  });
+  it.each([
+    ['last 20 stderr lines', Array.from({length:30},(_,i)=>`install line ${i+1}`).join('\n')+'\n',
+      Array.from({length:20},(_,i)=>`install line ${i+11}`).join('\n')],
+    ['UTF-8 byte cap keeps newest output', '😀'.repeat(600)+'END\n', '😀'.repeat(127)+'END'],
+    ['control characters removed without redaction', 'old\n\x00\x07\t\x1bsecret=value\x7f\x85\r\n', 'npm ci failed: old\nsecret=value'],
+  ])('publishes install exit 97 failureTail: %s', async (_name,stderr,expected) => {
+    await writeFile(join(root,'bin','npm'),`#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(stderr)}); process.exitCode=1;\n`,{mode:0o755});
+    expect((await runner.run(request)).code).toBe(97);
+    const recent=(await runner.telemetry()).recent[0];
+    expect(recent).toMatchObject({code:97,failureTail:expected});
+    expect(Buffer.byteLength(recent.failureTail)).toBeLessThanOrEqual(512);
+    const receipt=await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'install',code:97});
+    expect(receipt).not.toHaveProperty('failureTail');
+  });
+  it('publishes supervisor exit 254 failureTail', async () => {
+    let calls=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      if(++calls===2) throw new Error('supervisor diagnostic\x00');
+      return {code:0,stdout:'',stderr:''};
+    }});
+    expect((await runner.run(request)).code).toBe(254);
+    expect((await runner.telemetry()).recent[0]).toMatchObject({code:254,failureTail:'supervisor diagnostic'});
+    expect(await runner.finish(request)).toMatchObject({phase:'supervisor',code:254});
   });
   it('does not reuse labels, rejects invalid run names, and consumes prepared state once', async () => {
     const other = await runner.prepare({nonce:request.nonce,label:'abcdef-1'});
@@ -1118,6 +1233,19 @@ assert fired
     const {manifest}=await snapshotBinding(source);
     expect(await runner.warmInstall(source,manifest)).toEqual({code:0});
     expect(await readFile(join(root,'install.log'),'utf8')).toContain('ci --include=dev --ignore-scripts');
+    const temp=await readFile(join(root,'install-tmpdir'),'utf8');
+    expect(temp).toMatch(/[/]warm-[a-f0-9]{32}[/]\.forge-tmp$/);
+    await expect(stat(temp)).rejects.toMatchObject({code:'ENOENT'});
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+  });
+  it('warm-install removes container scratch after install failure', async () => {
+    const source=join(root,'failed-warm-source');await mkdir(source);
+    await writeFile(join(source,'package-lock.json'),'lock');
+    await writeFile(join(source,'fail-install'),'fail');
+    const {manifest}=await snapshotBinding(source);
+    await expect(runner.warmInstall(source,manifest)).rejects.toThrow('npm ci failed');
+    const temp=await readFile(join(root,'install-tmpdir'),'utf8');
+    await expect(stat(temp)).rejects.toMatchObject({code:'ENOENT'});
     expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
   });
   it.skipIf(process.platform!=='linux'||process.getuid()!==0)

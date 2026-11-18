@@ -4013,7 +4013,7 @@ export function ungatedHeavyRunReason(segment, depth = 0) {
   if (run.kind === 'test' && !hasLeadingEnvEscape(s, FULL_SUITE_ESCAPE_ENV) && fullSuiteRunReason(replacement)) {
     return FULL_SUITE_DENY_MESSAGE;
   }
-  return `heavy-enforce: each direct run spawns ~6–11 workers outside the host cap of 2 queued heavy runs; load hit 25–48 on a 12-core host. There is no admission override. Use: \`${env}${replacement}\`.`;
+  return `heavy-enforce: each direct run spawns ~6–11 workers outside the host cap of 2 queued heavy runs; load hit 25–48 on the host. There is no admission override. Use: \`${env}${replacement}\`.`;
 }
 
 // ── xpnhz4o — a BARE FULL-SUITE run from an agent session ─────────────────────────────────────────────────

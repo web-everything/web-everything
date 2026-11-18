@@ -16,14 +16,14 @@ tags: []
 # Load-cap admits on instantaneous load average, which our own fork storm inflates; admit on CPU idle and memory pressure instead
 
 Tick-core's `load-cap` (#4076) holds every build and every prepare/fix/ci-heal lane when ONE host-sampler
-reading of `load1 / cores` is above 1.5 (load1 > 18 on this 12-core host). On macOS the load average counts
+reading of `load1 / cores` is above 1.5 (load1 > 18 on the host). On macOS the load average counts
 runnable threads. Our own daemons start about 400 short-lived processes per second (cards 4344, 4345,
 4346). That pushes load1 into the 20s–60s while about 45% of CPU sits idle and memory is never under pressure.
 So the gate holds dispatch because of our own polling, not because the host lacks capacity.
 
 ## Evidence (read-only, 2026-09-28)
 
-- 08:30 ET (operator): tick-core held 6 builds `load-cap` "host load 21.24/12 cores (1.77 > 1.5)". `top` at
+- 08:30 ET (operator): tick-core held 6 builds `load-cap` "host load 21.24/host core count (1.77 > 1.5)". `top` at
   08:40: load 27.7, **CPU 14.4% user, 56.2% sys, 29.6% idle**, memory 92% free.
 - Host-sampler, today's file (`~/workspace/.operations/telemetry/2026-09-28.jsonl`, 3239 `host.cpu.busy_pct`
   samples, 30 s interval): idle% p5/p50/p95 = 25.8 / 43.5 / 66.4. **sys% median 39**, user% median 15.3 (p95
