@@ -270,6 +270,17 @@ describe('planReconcile incomplete agent inventory', () => {
     expect(held.refusals.filter(row => row.kind === 'agents-incomplete')).toHaveLength(1);
   });
 
+  it('an agents array carrying the `incomplete` marker holds like the explicit flag (draft-promotion-loop passes it without the flag)', () => {
+    const facts = input();
+    const before = planReconcile(facts);
+    const marked = Object.assign([], { incomplete: true });
+    const held = planReconcile({ ...facts, agents: marked });
+    expect(held.dispatch).toEqual([]);
+    expect(held.refusals.filter(row => row.kind === 'agents-incomplete')).toHaveLength(facts.prs.length);
+    expect(held.refusals.filter(row => row.kind !== 'agents-incomplete')).toEqual(before.refusals);
+    expect(planReconcile({ ...facts, agents: [] }).dispatch.map(row => row.kind)).toEqual(before.dispatch.map(row => row.kind));
+  });
+
   it.each([null, {}, 'unreadable', 1])('non-array agents fail closed even with an explicit false flag: %j', agents => {
     const facts = input();
     const before = planReconcile(facts);
