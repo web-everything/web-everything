@@ -18,7 +18,6 @@
 import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { LOCAL_BY_DESIGN_REASONS } from './remote-fallback-log.mjs';
 
 export const DEFAULT_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'forge-share.json');
 const MIN = 60_000;
@@ -72,7 +71,6 @@ export function computeForgeShare({ now, windowMs, target, expectedLocalReasons 
     const t = Date.parse(row?.ts);
     if (!Number.isFinite(t) || t > now) continue;
     const reason = normalizeFallbackReason(row.reason);
-    if (LOCAL_BY_DESIGN_REASONS.has(reason)) continue; // R830/R823: a local-by-design reason row is not a failed remote attempt
     const isExpected = expected.has(reason);
     if (!isExpected) { if (t > from) byReason[reason] = (byReason[reason] ?? 0) + 1; continue; }
     const key = laneKey(row.lane);
