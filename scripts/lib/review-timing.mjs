@@ -143,8 +143,8 @@ function registeredStartGate(input) {
 export function reviewStartGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete, rosterSource, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   const provenance = { rowsHead, rowsComplete, rosterSource };
   const input = { headSha, checks, requiredChecks, ...provenance };
-  const strict = () => reviewCiGate(input);
-  if (evidence(input).state === 'unknown') return strict();
+  const strictGate = reviewCiGate(input), strict = () => strictGate;
+  if (evidence(input).state === 'unknown' || strictGate.reason === 'required-review-gate-conflict') return strict();
   // Rollback preserves the original strict CI-green result, including its reason and affected rows.
   if (policy.startEarly === 'off' && !policy.startBeforeCi && policy.startAfter === 'ci-green') return strict();
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;
@@ -210,7 +210,11 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
   return { action: 'dispatch', joined: false };
 }
 
-/** Required failures remain actionable even when another required job is pending. */
+/**
+ * PURE: select timestamped head-local readiness facts. findings are validated producer records supplied by caller.
+ * With a known required set, only REQUIRED failures count: those are the only ones a CI heal repairs, so an optional
+ * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold.
+ */
 export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks,
   rowsHead, rowsComplete, rosterSource } = {}) {
   const resolved = evidence({ headSha, checks, requiredChecks, rowsHead, rowsComplete, rosterSource });

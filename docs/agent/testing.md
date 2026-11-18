@@ -4614,3 +4614,5 @@ return `unknown` with `roster-unavailable`, including persisted options containi
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
 
 Review timing fixtures must carry the fetch's `rowsHead`, `rowsComplete` and unchanged live/cache roster source. `readReviewChecks` attests its paginated SHA-pinned REST read on the returned array; injected readers must attest their own snapshots. Unknown provenance refuses review admission; fix push waits until its existing bounded fallback. Keep failed same-name rows in both input orders, and cancellations in the review-void and verification-marker tests.
+
+The reconcile pass carries the required-roster source unchanged through hydration. Legacy flattened listings begin with `rowsHead: null` and `rowsComplete: false`; successful SHA-pinned pagination replaces those facts, while a refused refresh keeps completeness false. Required `review-gate` holds still refuse review emission and superseded-verdict conversion; they are not healable CI failures.

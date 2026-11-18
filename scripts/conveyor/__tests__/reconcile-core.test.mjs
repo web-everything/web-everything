@@ -3751,6 +3751,7 @@ it('xxh4zw8 complete hydrated cancellation heals while caps, claims and stand-do
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
   const pr = { number: 3336, isDraft: true, headRefName: 'lane/3336-replay', headRefOid: '4ecb5deb362c81aa28de162db4616bb4c2009347',
     labels: [], comments: [], statusCheckRollup: requiredChecks.map((name, i) => ({ id: 100 + i, name,
+      run_id: 7, run_attempt: 1, detailsUrl: `https://github.com/o/r/actions/runs/7/job/${100 + i}`,
       status: 'COMPLETED', conclusion: name === 'smoke' ? 'CANCELLED' : 'SUCCESS' })) };
   const plan = override => planReconcile({ prs: [{ ...pr, ...override }], requiredChecks, agents: [], now: NOW });
   expect(plan({}).dispatch.map(d => d.kind)).toEqual(['ci-heal']);
@@ -3762,7 +3763,7 @@ it('xxh4zw8 complete hydrated cancellation heals while caps, claims and stand-do
     expect(plan(override).dispatch).toEqual([]);
     expect(plan(override).refusals.map(r => r.kind)).toContain(kind);
   }
-  const latest = { id: 200, name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' };
+  const latest = { ...pr.statusCheckRollup[1], id: 200, run_attempt: 2, name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' };
   for (const statusCheckRollup of [[latest, ...pr.statusCheckRollup], [...pr.statusCheckRollup, latest]]) {
     expect(plan({ statusCheckRollup }).dispatch.map(d => d.kind)).toEqual(['promote-draft']);
   }

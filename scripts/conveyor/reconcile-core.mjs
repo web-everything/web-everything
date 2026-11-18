@@ -1723,7 +1723,7 @@ function dispatchReviewRow({
       // A targeted-check agent is a review emission too, so a required `review-gate` conflict still refuses it
       // (the early planner refusal no longer reaches a `needs-human` PR). Other required-check states are
       // deliberately NOT applied here: converting a superseded verdict never waited on CI (#xconv1).
-      const convertCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
+      const convertCi = reviewCiGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr?.statusCheckRollup });
       if (convertCi.reason === 'required-review-gate-conflict') {
         refuse('review-ci', {
           ...withPhase, ...extra, ci: convertCi,
@@ -2987,7 +2987,7 @@ export function planReconcile({
     // affected check. Any other failing required check, and every non-`ci-red` phase (a bounced PR owed a
     // fixer, an advisory-fix PR), falls through so its repair ownership is intact; review emission is
     // already gated separately by {@link reviewChecksAllow}.
-    const reviewCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
+    const reviewCi = reviewCiGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr?.statusCheckRollup });
     // LIVE INCIDENT 2026-10-04, PR #3833: `classifyPr` ranks `review:human` ('needs-human') ABOVE `ci-red`, so a
     // `review:human` PR with a genuinely red required check never entered the `ci-red` branch below — the
     // main-red watch logged "owed a ci-heal" and the review row logged `review-ci`, and NOBODY planned the heal

@@ -551,3 +551,17 @@ describe('strict timing evidence regressions', () => {
         policy: { ...fix, pushAfterCi: true } })).toMatchObject({ action: 'wait', evidenceReason: expect.any(String) });
     });
 });
+
+
+it.each(['failure', 'in_progress'])('a required review-gate %s refuses every early review path', state => {
+  const checks = [check('test'), state === 'failure' ? check('review-gate', 'failure')
+    : check('review-gate', null, { status: 'in_progress' })];
+  for (const startAfter of ['ci-green', 'fast-checks', 'push']) {
+    for (const startEarly of ['off', 'shadow', 'on']) {
+      const result = reviewStartGate({ headSha: head, checks, requiredChecks: ['test', 'review-gate'], verifyGreen: true,
+        policy: { ...review, startAfter, startEarly, startBeforeCi: true, fastChecks: ['test'] } });
+      expect(result).toMatchObject({ allowed: false, reason: 'required-review-gate-conflict' });
+      expect(result.wouldStartEarly).not.toBe(true);
+    }
+  }
+});
