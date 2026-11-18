@@ -26,7 +26,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, pinnedStatus } from './plan.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
@@ -391,7 +391,9 @@ export async function prepareRebuild({
   for (const o of overlaysBefore) {
     const tip = plan.establishedLost?.find(l => l.ref === o.ref)?.sha
       ?? plan.decisions?.find(d => d.ref === o.ref)?.sha;
-    if (tip && pinnedBefore[o.ref] === `established-overlay-parked:${tip}`) pinnedNow[o.ref] = pinnedBefore[o.ref];
+    if (tip && [`established-overlay-parked:${tip}`, `established-overlay-needs-you:${tip}`].includes(pinnedBefore[o.ref])) {
+      pinnedNow[o.ref] = pinnedBefore[o.ref];
+    }
   }
   // A refusal can stop before visiting other pins. Keep their notices and persist any new ones
   // already emitted, even though this plan will not be adopted.
@@ -455,7 +457,8 @@ export async function prepareRebuild({
   // (and every stacked overlay above them) now conflict with main. Building without them would smoke-pass and be
   // adopted, silently dropping live hotfixes. Instead HOLD on the last-good build (dispatch continues from it via
   // x5wbsbc; `daemon-held-on-last-good` raises needs-you after 15 min) and leave the overlay list untouched, until the
-  // lost overlays are rebased onto main (or retired), or the bounded hold expires and parks them.
+  // lost overlays are rebased onto main (or retired), or the bounded feature-overlay hold expires and parks them.
+  // A pin or mechanism overlay keeps the entire set on last-good indefinitely.
   // A lost overlay whose current tip this build still contains is live through its carrier — e.g. a mechanism-pinned
   // original (never set aside as stack-contained) beside its registered auto-rebase repair. Holding on it would keep
   // the repair from ever being adopted. Only a tip the running build already carries qualifies: a changed tip says
@@ -475,6 +478,26 @@ export async function prepareRebuild({
       catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
     }
     const park = resolveEstablishedOverlayParkMinutes(env);
+    const protectedLost = lost.filter(l => {
+      if (l.reason === 'pinned-conflict-skipped' || l.pinned || l.pinnedBy) return true;
+      try {
+        // Missing evidence must never authorize dropping the running rebuild mechanism.
+        if (!plan.mainSha || !l.sha) return true;
+        const pin = pinnedStatus(git, overlaysBefore.find(o => o.ref === l.ref), plan.mainSha, l.sha);
+        return pin?.pinned !== false;
+      } catch { return true; }
+    });
+    for (const l of protectedLost) {
+      const noticeKey = `established-overlay-needs-you:${l.sha}`;
+      pinnedNow[l.ref] = noticeKey;
+      if (pinnedBefore[l.ref] === noticeKey) continue;
+      alert('established-overlay-needs-you', { ...l, need: 'needs-you',
+        message: `Pinned or mechanism overlay ${l.ref} would be lost — holding on the last-good build; rebase or retire it explicitly.` });
+    }
+    if (protectedLost.length > 0) {
+      state.pinnedNotified = pinnedNow;
+      writeState();
+    }
     const unparked = lost.filter(l => pinnedNow[l.ref] !== `established-overlay-parked:${l.sha}`);
     // Old persisted holds have no lost snapshot: the adopted tips supply the migration evidence.
     // Missing tip/time evidence starts a fresh clock rather than authorizing an immediate omission.
@@ -484,7 +507,7 @@ export async function prepareRebuild({
     const sinceMs = sameHold ? Date.parse(state.held.since) : NaN;
     const since = Number.isFinite(sinceMs) && sinceMs <= nowMs() ? state.held.since : nowIso();
     const expired = sameHold && Number.isFinite(sinceMs) && nowMs() - sinceMs > park.value * 60_000;
-    if (park.value > 0 && (unparked.length === 0 || expired)) {
+    if (protectedLost.length === 0 && park.value > 0 && (unparked.length === 0 || expired)) {
       for (const l of unparked) {
         const parked = { ...l, reason: 'established-overlay-parked', need: 'needs-you',
           since, parkMinutes: park.value, source: park.source,

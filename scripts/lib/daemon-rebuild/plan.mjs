@@ -25,6 +25,8 @@ export const REBUILD_MECHANISM_PATHS = Object.freeze([
   'scripts/lib/daemon-overlays.mjs',
   'scripts/lib/daemon-clone-lock.mjs',
   'scripts/lib/daemon-self-sync.mjs',
+  'scripts/lib/daemon-self-sync*',
+  'scripts/conveyor/pass-daemons/daemon-*',
   'scripts/lib/daemon-live-smoke.mjs',
   'scripts/daemon-overlay.mjs',
   'scripts/lib/daemon-last-good.mjs',
@@ -45,11 +47,11 @@ export function pinnedStatus(git, raw, mainSha, ovSha) {
   if (raw?.pinned === true) return { pinned: true, why: 'flag' };
   if (!ovSha) return { pinned: false, why: null };
   const mb = git(['merge-base', mainSha, ovSha]);
-  const base = String(mb.stdout ?? '').trim();
-  if (mb.status !== 0 || !base) return { pinned: true, why: 'unknown' };
+  const base = typeof mb?.stdout === 'string' ? mb.stdout.trim() : '';
+  if (mb?.status !== 0 || !base) return { pinned: true, why: 'unknown' };
   const diff = git(['diff', '--name-only', base, ovSha, '--', ...REBUILD_MECHANISM_PATHS]);
-  if (diff.status !== 0) return { pinned: true, why: 'unknown' };
-  return String(diff.stdout ?? '').trim() ? { pinned: true, why: 'mechanism' } : { pinned: false, why: null };
+  if (diff?.status !== 0 || typeof diff.stdout !== 'string') return { pinned: true, why: 'unknown' };
+  return diff.stdout.trim() ? { pinned: true, why: 'mechanism' } : { pinned: false, why: null };
 }
 
 /** The mechanism files main itself must carry for a build WITHOUT a skipped pinned overlay to still rebuild

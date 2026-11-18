@@ -14,7 +14,7 @@ import { addOverlay, readOverlays } from '../../daemon-overlays.mjs';
 const ref = 'lane/live', sha = 'a'.repeat(40), head = 'b'.repeat(40), main = 'c'.repeat(40);
 const start = Date.parse('2026-11-18T10:00:00Z');
 describe('bounded established overlay hold', () => {
-  let root, env, plan, time;
+  let root, env, plan, time, mechanismFiles, classification;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'established-park-'));
     const prefs = join(root, 'prefs.json');
@@ -29,6 +29,8 @@ describe('bounded established overlay hold', () => {
     writeRebuildState(root, { adopted: { head, applied: [{ ref, sha }] },
       held: { reason: 'established-overlay-conflict', since: new Date(start).toISOString(), lastGood: head } }, env);
     time = start + 31 * 60_000;
+    mechanismFiles = '';
+    classification = 'available';
     vi.spyOn(localState, 'ensureSafeToMove').mockReturnValue({ safe: true, untracked: [] });
     vi.spyOn(repair, 'repairCloneRefs').mockReturnValue({ ok: true, pruned: [], reportedNew: [] });
     vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
@@ -41,12 +43,87 @@ describe('bounded established overlay hold', () => {
     if (args[0] === 'symbolic-ref') return ok('main');
     if (args[0] === 'rev-parse') return ok(args.at(-1) === 'HEAD' ? head : main);
     if (args[0] === 'ls-files' || args[0] === 'log') return ok();
+    if (args[0] === 'merge-base' && args[1] !== '--is-ancestor') {
+      if (classification === 'throws') throw new Error('classification unavailable');
+      return classification === 'unavailable' ? { status: 1, stdout: '', stderr: '' } : ok(main);
+    }
+    if (args[0] === 'diff') {
+      expect(args).toEqual(['diff', '--name-only', main, expect.any(String), '--', ...planner.REBUILD_MECHANISM_PATHS]);
+      if (classification === 'incomplete') return { status: 0 };
+      if (args[3] !== sha || !mechanismFiles) return ok();
+      const matched = args.slice(5).some(path => path.endsWith('*')
+        ? mechanismFiles.startsWith(path.slice(0, -1))
+        : path.endsWith('/') ? mechanismFiles.startsWith(path) : mechanismFiles === path);
+      return ok(matched ? mechanismFiles : '');
+    }
     if (args[0] === 'merge-base') return { status: 1, stdout: '', stderr: '' };
     throw new Error(`unexpected Git: ${args.join(' ')}`);
   };
   const tick = () => prepareRebuild({ root, env, run, now: () => time, prBaseChain: () => [] });
   const held = () => readRebuildState(root, env).held;
   const parked = (r) => r.alerts.filter(a => a.kind === 'established-overlay-parked');
+  const needsYou = (r) => r.alerts.filter(a => a.kind === 'established-overlay-needs-you');
+  const expectProtectedHold = async () => {
+    const r = await tick();
+    expect(r.result.reason).toBe('established-overlay-conflict');
+    expect(r.alerts.map(a => a.kind)).toContain('established-overlay-hold');
+    expect(held()).toMatchObject({ reason: 'established-overlay-conflict', lastGood: head });
+    expect(parked(r)).toEqual([]);
+    expect(needsYou(r)).toEqual([expect.objectContaining({ detail: expect.objectContaining({ ref, sha, need: 'needs-you' }) })]);
+    time += 365 * 24 * 3_600_000;
+    const again = await tick();
+    expect(again.result.reason).toBe('established-overlay-conflict');
+    expect(parked(again)).toEqual([]);
+    expect(needsYou(again)).toEqual([]);
+    expect(readOverlayEventLog(root, env).filter(e => e.kind === 'established-overlay-parked')).toEqual([]);
+  };
+  it.each(['scripts/lib/daemon-rebuild/prepare.mjs', 'scripts/lib/daemon-self-sync-state.mjs',
+    'scripts/conveyor/pass-daemons/daemon-review.mjs'])('mechanism overlay %s holds forever and alerts needs-you once', async (file) => {
+    mechanismFiles = file;
+    await expectProtectedHold();
+  });
+  it('pinned conflict-skipped overlay holds past the threshold', async () => {
+    plan.establishedLost[0].reason = 'pinned-conflict-skipped';
+    await expectProtectedHold();
+  });
+  it('explicitly pinned overlay holds past the threshold', async () => {
+    addOverlay(root, { ref, pinned: true }, { env });
+    await expectProtectedHold();
+  });
+  it.each(['unavailable', 'throws', 'incomplete'])('classification %s fails closed to mechanism and alerts needs-you', async (mode) => {
+    classification = mode;
+    await expectProtectedHold();
+  });
+  it('mixed feature and mechanism set holds every overlay', async () => {
+    const feature = { ref: 'lane/gh-per-app-pools', sha: 'e'.repeat(40), reason: 'conflict' };
+    addOverlay(root, { ref: feature.ref }, { env });
+    plan.establishedLost.unshift(feature);
+    mechanismFiles = 'scripts/lib/daemon-rebuild/prepare.mjs';
+    await expectProtectedHold();
+    expect(held().lost).toEqual(plan.establishedLost.map(({ ref, sha }) => ({ ref, sha })));
+  });
+  it('a historical park notice cannot authorize losing a mechanism overlay', async () => {
+    const state = readRebuildState(root, env);
+    state.pinnedNotified = { [ref]: `established-overlay-parked:${sha}` };
+    writeRebuildState(root, state, env);
+    mechanismFiles = 'scripts/lib/daemon-rebuild/prepare.mjs';
+    await expectProtectedHold();
+  });
+  it('missing main evidence fails closed to mechanism', async () => {
+    delete plan.mainSha;
+    await expectProtectedHold();
+  });
+  it('pure feature set parks after its hold expires', async () => {
+    const feature = { ref: 'lane/gh-per-app-pools', sha: 'e'.repeat(40), reason: 'conflict' };
+    addOverlay(root, { ref: feature.ref }, { env });
+    plan.establishedLost.push(feature);
+    await tick();
+    time += 31 * 60_000;
+    const r = await tick();
+    expect(r.terminal).toBe(false);
+    expect(parked(r).map(a => a.detail.ref)).toEqual([ref, feature.ref]);
+    expect(held()).toBeNull();
+  });
   it('holds under the threshold, including the exact boundary', async () => {
     time = start + 30 * 60_000;
     const r = await tick();
