@@ -21,6 +21,16 @@
       "since": "2026-09-13",
       "owner": "3383",
       "note": "The fifth review-panel seat (`judgeAntigravityReview`, `review-pr.mjs`), wired the same day the standalone `antigravity-judge-spawn.mjs` primitive first proved live against the real `agy` CLI (commit 63102bde8). Unlike codex's entry above, this identity has ZERO real trials in ANY role before this date — no prior delivery exercise to lean on — so it starts on `probation` with a more cautious posture, not a graduated one: no `delivery` role is declared at all (there is no Antigravity delivery agent; `antigravity-judge-spawn.mjs`'s own header explains why a write-capable seat is not safe yet — `--sandbox` only confines its shell, not its 57 in-process tools). Promotion to `trusted` (or demotion to `unvalidated`) is a future ruling, not automatic — see #3651."
+    },
+    {
+      "provider": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "roles": {
+        "advisory-review": "probation"
+      },
+      "since": "2026-11-18",
+      "owner": "3383",
+      "note": "Gemini 4 Carbon (agy 1.5.11 roster) replaces Argon as the pinned advisory-review model. Same probation rules as the Argon entry: advisory only, collects run-quality data, never gates a merge until promoted."
     }
   ]
 }

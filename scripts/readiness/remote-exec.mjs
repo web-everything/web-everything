@@ -639,6 +639,22 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
   }
+  // The runner restores HEAD symlinks into its index and cannot prove from the
+  // manifest that the client still has them: a link deleted, retargeted or turned
+  // into a file here (staged or not) can leave an identical-looking projection.
+  // So refuse remote use when the client index differs from HEAD at any HEAD link.
+  if(head!==undefined) {
+    const changed=await exec({file:'git',args:['diff-index','--cached','--raw','-z','--no-renames',head,'--'],cwd});
+    if(changed.code!==0||!Buffer.isBuffer(changed.stdout)||changed.stdout.length>LIMIT
+      ||(changed.stdout.length&&changed.stdout.at(-1)!==0))throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+    const fields=splitPaths(changed.stdout);
+    if(fields.length%2)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+    for(let i=0;i<fields.length;i+=2) {
+      const meta=fields[i].toString('latin1').match(/^:([0-7]{6}) ([0-7]{6}) [a-f0-9]{40,64} [a-f0-9]{40,64} [ACDMTUXB]$/);
+      if(!meta)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+      if(meta[1]==='120000')throw manifestRefusal('head-symlink-changed',fields[i+1]);
+    }
+  }
   const trackedLinks=new Map();
   for(const key of indexLinks.keys()) {
     const link={linkPath:Buffer.from(key,'base64'),linkOid:indexBlobs.get(key)};
@@ -1618,7 +1634,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');

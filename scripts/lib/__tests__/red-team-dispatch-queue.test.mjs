@@ -72,7 +72,7 @@ const prefix = 'review-daemon: red-team queue ';
 // Sync IO doubles match node:fs semantics without touching the operator's queue.
 // No persisted envelope is assumed: restart assertions exercise the public reader.
 // maxAttempts is deliberately NOT defaulted here: omitting it exercises the production default (3).
-function fixture({ maxAttempts, logger } = {}) {
+function fixture({ maxAttempts, logger, readLivePr = ({ pr }) => ({ state: 'OPEN', headRefOid: head(pr) }) } = {}) {
   const file = join('queue-fixture', 'queue.json');
   const files = new Map();
   const operations = [];
@@ -96,7 +96,7 @@ function fixture({ maxAttempts, logger } = {}) {
   const unlink = vi.fn(path => { files.delete(path); });
   const log = logger ?? ((...parts) => logs.push(parts.join(' ')));
   const open = () => createRedTeamDispatchQueue({
-    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts,
+    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts, readLivePr,
   });
   return {
     file, files, operations, logs, log, readFile, writeFile, rename, unlink, open,
@@ -880,7 +880,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(f.open().entries()).toEqual(before);
   });
 
-  it.each(['sync', 'async'])('runner %s failure rolls back sync mutations, admissions and persisted state', async mode => {
+  it.each(['sync', 'async'])('runner %s failure rolls back reconciliation, sync mutations, admissions and persisted state', async mode => {
     const f = fixture();
     await f.queue.sync(repo, candidates([1, 2, 3]));
     await f.queue.admit(repo, 1);
@@ -888,12 +888,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const persisted = new Map(f.files);
     f.operations.length = 0;
     const error = new Error('runner failed after sync mutations');
-    const options = inputs([2, 3, 4], { capacity: capacity(1) });
-    options.plan.refusals[0].headSha = 'f'.repeat(40);
+    const options = inputs([2, 3, 4], { capacity: capacity(1),
+      readLivePr: ({ pr }) => ({ state: pr === 1 ? 'MERGED' : 'OPEN', headRefOid: pr === 2 ? head(22) : head(pr) }),
+    });
     const run = vi.fn(() => {
-      // Sync removed PR 1, replaced PR 2's head and appended PR 4 before admission.
-      expect(numbers(f.queue.entries())).toEqual([3, 2, 4]);
-      expect(f.queue.entries()[1]).toMatchObject({ head: 'f'.repeat(40), attempts: 0 });
+      // Reconcile evicted PR 1 and re-keyed PR 2; sync appended PR 4 before admission.
+      expect(numbers(f.queue.entries())).toEqual([2, 3, 4]);
+      expect(f.queue.entries()[0]).toMatchObject({ head: head(22), attempts: 0 });
       if (mode === 'async') return Promise.reject(error);
       throw error;
     });
@@ -1476,4 +1477,83 @@ it.each([
     expect(redTeamQueueAdmitCount(bound)).toBe(0);
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+describe('live red-team queue reconciliation', () => {
+  const seed = f => {
+    f.queue.sync(repo, candidates([1, 2]));
+    f.queue.admit(repo, 1);
+    f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'superseded acceptance' }] });
+  };
+  it.each(['MERGED', 'CLOSED'])('evicts a live %s PR before sync can re-enqueue its stale planner row', state => {
+    const readLivePr = vi.fn(({ pr }) => ({ state: pr === 1 ? state : 'OPEN', headRefOid: head(pr) }));
+    const f = fixture({ readLivePr }); seed(f);
+    const run = vi.fn(options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([2]);
+      return refused(2, 'no review capacity left');
+    });
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run });
+    expect(numbers(f.open().entries())).toEqual([2]);
+    expect(f.logs.join(' ')).toContain(`live PR ${state.toLowerCase()}`);
+    expect(readLivePr).toHaveBeenCalledTimes(2);
+  });
+  it.each(['MERGED', 'CLOSED'])('maintenance followed by dispatch never re-enqueues or dispatches a stale %s planner candidate', state => {
+    const readLivePr = vi.fn(({ pr }) => ({ state: pr === 1 ? state : 'OPEN', headRefOid: head(pr) }));
+    const f = fixture({ readLivePr }); seed(f);
+    f.queue.reconcile();
+    expect(numbers(f.open().entries())).toEqual([2]);
+    const afterMaintenance = f.logs.length;
+    const run = vi.fn(options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([2]);
+      expect(options.rawPrs.map(pr => pr.number)).toEqual([2]);
+      return started(options);
+    });
+    const result = runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run });
+    expect(run).toHaveBeenCalledOnce();
+    expect(result.dispatched.map(row => row.prNumber)).toEqual([2]);
+    expect(f.logs.slice(afterMaintenance).some(line => line.includes(`enqueue ${repo}#1`))).toBe(false);
+    expect(f.open().entries()).toEqual([]);
+  });
+  it('re-keys a changed live head in place, resets attempts/block, and defers stale planner evidence', () => {
+    const readLivePr = ({ pr }) => ({ state: 'OPEN', headRefOid: pr === 1 ? head(100) : head(pr) });
+    const f = fixture({ readLivePr }); seed(f);
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run: options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([2]);
+      return refused(2, 'no review capacity left');
+    } });
+    const entries = f.open().entries();
+    expect(numbers(entries)).toEqual([1, 2]);
+    expect(entries[0]).toMatchObject({ head: head(100), attempts: 0 });
+    expect(entries[0].blocked).toBeUndefined();
+    expect(f.logs.join(' ')).toContain('re-key');
+  });
+  it.each(['null', 'throw', 'incomplete'])('keeps and logs %s live evidence even when absent from candidates', mode => {
+    const f = fixture(); seed(f);
+    const before = f.queue.entries();
+    const readLivePr = () => { if (mode === 'throw') throw new Error('offline'); return mode === 'null' ? null : { state: 'OPEN' }; };
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([]), readLivePr, run: () => ({}) });
+    expect(f.open().entries()).toEqual(before);
+    expect(f.logs.filter(line => line.includes('live PR unreadable'))).toHaveLength(2);
+  });
+  it.each(['null', 'throw', 'incomplete'])('blocks runnable persisted candidates from dispatch on %s live evidence and keeps them persisted', mode => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([1, 2]));
+    const before = f.open().entries();
+    expect(before.every(entry => entry.blocked === undefined)).toBe(true);
+    const readLivePr = vi.fn(() => {
+      if (mode === 'throw') throw new Error('offline');
+      return mode === 'null' ? null : { state: 'OPEN' };
+    });
+    const run = vi.fn(options => {
+      expect(options.plan.refusals).toEqual([]);
+      expect(options.rawPrs).toEqual([]);
+      return started(options);
+    });
+    const result = runWithRedTeamQueue({ queue: f.open(), ...inputs([1, 2]), readLivePr, run });
+    expect(run).toHaveBeenCalledOnce();
+    expect(readLivePr).toHaveBeenCalledTimes(2);
+    expect(result.dispatched).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+    expect(f.logs.filter(line => line.includes('live PR unreadable'))).toHaveLength(2);
+  });
 });
