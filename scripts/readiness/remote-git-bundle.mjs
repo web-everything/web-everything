@@ -196,6 +196,9 @@ function allowedFindings(allowed, label, content, findings) {
     // Byte-preserving mask first: every raw view (latin1, utf8, utf16 either order) of what is left must be clean, so
     // a NUL-separated (UTF-16) token cannot hide behind a listed encoding finding.
     if (credentialBufferFinding(Buffer.from(text, 'latin1')) !== null) return false;
+    // The scanners do not detect a bare key BODY (base64 lines under a PEM label): code has no 64+ base64 run and no
+    // line that is only a long base64 token, so either one means key material and keeps the bundle refused.
+    if (/[A-Za-z0-9+/]{64,}/.test(text) || /^[ \t]*[A-Za-z0-9+/]{40,}={0,2}[ \t]*$/m.test(text)) return false;
     if (set.has('unsupported-text-encoding')) text = text.replace(/\0/g, ' ');
     return credentialContentFinding(Buffer.from(label), Buffer.from(text, 'utf8')) === null;
   } catch { return false; }

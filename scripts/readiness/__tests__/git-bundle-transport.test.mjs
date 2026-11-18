@@ -715,6 +715,12 @@ describe('R830/R823 reviewed allow-list for tracked key-handling code', () => {
     const head = await put(repo, { 'lib/shim.mjs': hidden }, 'shim');
     expect(await scanBundleRange({ cwd: repo, head, prerequisite: base, exec })).toMatchObject({ path: 'lib/shim.mjs' });
   });
+  it('refuses a listed-hash file that carries a PEM key body (long base64 lines)', async () => {
+    const body = 'const k = `-----BEGIN ' + 'PRIVATE KEY-----\n' + 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\nMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu\n-----END ' + 'PRIVATE KEY-----`;\n';
+    const { repo, base } = await mk(doc('lib/shim.mjs', body, ['pem-header', 'private-key']));
+    const head = await put(repo, { 'lib/shim.mjs': body }, 'shim');
+    expect(await scanBundleRange({ cwd: repo, head, prerequisite: base, exec })).toMatchObject({ path: 'lib/shim.mjs' });
+  });
   it('refuses a UTF-16 token hidden next to a listed encoding finding', async () => {
     const bytesOf = Buffer.concat([Buffer.from(keyish + '\0'), Buffer.from('ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8', 'utf16le')]);
     const text = bytesOf.toString('latin1');
