@@ -323,3 +323,17 @@ describe('liveness gather paths and human output', () => {
     expect(lines[4]).toBe('  outcome: dry-run'); expect(lines.at(-2)).toBe('1 finding(s)'); expect(lines.at(-1)).toContain('offline');
   });
 });
+
+import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
+it('excludes review-disabled repos from liveness PR recovery evidence', async () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  const listed = [];
+  const { snapshot } = await gatherSnapshot({ now, noMovementStore: true }, {
+    resolveProfile, env: {}, homedir: () => process.env.TMPDIR,
+    readSharedOpenPrs: ({repo}) => { listed.push(repo); return []; },
+    cachedClaudeAgents: () => '[]', daemonCloneRoots: () => [],
+    readTail: () => '', readFile: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); },
+  });
+  expect(snapshot.prs).toEqual([]);
+  expect(listed).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});

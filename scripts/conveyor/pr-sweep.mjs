@@ -3,6 +3,7 @@
  * @file scripts/conveyor/pr-sweep.mjs
  * @description Card 335 — bounded IO shell for the health-watch PR movement job. CLI: run [--dry-run] [--json].
  */
+import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
 import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync, appendFileSync, readdirSync, openSync, closeSync, fstatSync, readSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -150,13 +151,14 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
   }));
 }
 export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,
-  settings, sourceRoot = ROOT, readPrs, readQueue, readSignals = collectOwnerSignals, readPrevious,
+  settings, resolveProfile = repoProfile, sourceRoot = ROOT, readPrs, readQueue, readSignals = collectOwnerSignals, readPrevious,
   notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest, stallSweep = runStallSweep, stallDigest = publishStalledDigest, detector = runDetector } = {}) {
   const errors = [];
   const safe = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
   if (!config && !settings) config = await safe('health config', () => JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')), {});
   const resolved = settings ?? resolvePrSweepSettings({ config, env }); errors.push(...(resolved.errors ?? []));
-  const value = resolved.value;
+  const eligible = new Set(constellationRepoKeysWith('review', { resolveProfile }));
+  const value = { ...resolved.value, repos: resolved.value.repos.filter((repo) => eligible.has(repoKeyForSlug(repo))) };
   if (settings) console.error(formatCascadeSourcesLine('prSweep', resolved));
   const previous = await safe('previous sweep', () => readPrevious ? readPrevious() : (existsSync(join(dir, 'pr-sweep.json')) ? JSON.parse(readFileSync(join(dir, 'pr-sweep.json'), 'utf8')).nextState : {}), {});
   const prs = []; let prsReadOk = true;

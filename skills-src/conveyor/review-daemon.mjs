@@ -72,6 +72,7 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
+import { constellationRepoKeysWith, repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { createPlannerFactCache } from '../../scripts/conveyor/planner-fact-cache.mjs';
@@ -126,7 +127,6 @@ import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-h
 import { runSessionReaperPass, makeReapedLedger, makePidDeadResolver, REPO_ROOT as SESSION_REAPER_REPO_ROOT, DEFAULT_IDLE_REAP_THRESHOLD_MS } from '../../scripts/conveyor/session-reaper.mjs';
 import { mintSessionSlug } from '../../scripts/conveyor/session-slug.mjs';
 import { freeLaneNumbers } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
-import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
@@ -895,7 +895,7 @@ export function refreshScopeBloatedPr({ headRefName, defaultBranch = 'main', ref
  *  watching it, live-caught 2026-09-22, #xvyuwtg). Kept as a plain exported list, not inlined into the loop
  *  below, so a future per-user configurable repo list (plateau as a product letting an operator choose which
  *  repos to integrate) is a source swap here, not a redesign of {@link runReviewTickAllRepos}. */
-export const REVIEW_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+export const REVIEW_DAEMON_REPOS = constellationRepoKeysWith('review').map((key) => CONSTELLATION_REPOS[key].slug);
 
 /**
  * App auth for this daemon is PER-OWNER: it sweeps every constellation repo in one process, and each org has its
@@ -954,7 +954,9 @@ export function sharedHostBudget(hostAdmission, log = console.error) {
   };
 }
 
-export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
+export function runReviewTickAllRepos({ resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
+  const eligible = new Set(constellationRepoKeysWith('review', { resolveProfile }));
+  repos = repos.filter(repo => repoKeyForSlug(repo) === null || eligible.has(repoKeyForSlug(repo)));
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -1131,9 +1133,11 @@ export async function runConvertAdvisoryTick({
  *   posted:Array<object>, skipped:Array<object>, failed:Array<object>, reconcileFailed:Array<{repo:string, error:string}>}>}
  */
 export async function runConvertAdvisoryTickAllRepos({
-  repos = REVIEW_DAEMON_REPOS, tick = runConvertAdvisoryTick,
+  resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runConvertAdvisoryTick,
   concurrency = resolveReviewTickSharing().repoConcurrency, ...tickOpts
 } = {}) {
+  const eligible = new Set(constellationRepoKeysWith('review', { resolveProfile }));
+  repos = repos.filter(repo => repoKeyForSlug(repo) === null || eligible.has(repoKeyForSlug(repo)));
   const perRepo = new Array(repos.length);
   const limit = Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8
     ? concurrency : resolveReviewTickSharing().repoConcurrency;

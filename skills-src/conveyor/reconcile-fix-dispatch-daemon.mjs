@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { constellationRepoKeysWith, repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs
@@ -74,7 +75,6 @@ import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
-import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
@@ -187,7 +187,16 @@ export async function runDaemonLoop({
  *  today ({@link ../../scripts/lib/repo-profile.mjs}'s `capabilities.fix`/`ciHeal` — turning them on for the
  *  couple repos is a later slice), but every repo is now actually TICKED, so the existing `unsupported-repo`
  *  refusal + ledger write run and are recorded for them instead of being skipped silently. */
-export const FIX_DISPATCH_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+export const FIX_DISPATCH_DAEMON_REPOS = constellationRepoKeysWith('fix').map((key) => CONSTELLATION_REPOS[key].slug);
+const reposWith = (capability, resolveProfile) => constellationRepoKeysWith(capability, { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug);
+// Keep lazy budget iterables lazy. Explicit non-constellation targets retain their existing validation path.
+function* eligibleRepos(repos, capability, resolveProfile) {
+  const eligible = new Set(constellationRepoKeysWith(capability, { resolveProfile }));
+  for (const repo of repos) {
+    const key = repoKeyForSlug(repo);
+    if (key === null || eligible.has(key)) yield repo;
+  }
+}
 
 /**
  * Run {@link runReconcileFixDispatch} once per watched repo via the shared {@link forEachRepo} helper,
@@ -204,9 +213,9 @@ export const FIX_DISPATCH_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map(
  *   outright refusals — a PR reconcile never even offered as a `fix`/`ci-heal` dispatch entry (#x0mn6x0, epic
  *   #4075/#3383; see `runReconcileFixDispatch`'s own `reconcileRefusalDetails` docblock for the full why).
  */
-export function runReconcileFixDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcileFixDispatch,
+export function runReconcileFixDispatchAllRepos({ resolveProfile = repoProfile, repos = reposWith('fix', resolveProfile), tick = runReconcileFixDispatch,
   allowStandDownAutoProceed = resolveFixSettings().standDownAutoProceed, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, allowStandDownAutoProceed }));
+  const perRepo = forEachRepo(eligibleRepos(repos, 'fix', resolveProfile), (repo) => tick({ ...tickOpts, repo, allowStandDownAutoProceed }));
   const dispatched = [];
   const refusals = [];
   const reconcileRefusals = [];
@@ -248,9 +257,9 @@ export function runReconcileFixDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_RE
  *   {@link runReconcileFixDispatchAllRepos}'s own identical field for the shape and the why (#x0mn6x0, epic
  *   #4075/#3383).
  */
-export async function runReconcileCiHealDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcileCiHealDispatch, ...tickOpts } = {}) {
+export async function runReconcileCiHealDispatchAllRepos({ resolveProfile = repoProfile, repos = reposWith('ciHeal', resolveProfile), tick = runReconcileCiHealDispatch, ...tickOpts } = {}) {
   const perRepo = [];
-  for (const repo of repos) {
+  for (const repo of eligibleRepos(repos, 'ciHeal', resolveProfile)) {
     try {
       // eslint-disable-next-line no-await-in-loop -- sequential by design (see this fn's own docblock): one
       // repo's ci-heal tick must finish (or fail) before the next repo's is attempted, so a rejection is
@@ -306,8 +315,8 @@ export async function runReconcileCiHealDispatchAllRepos({ repos = FIX_DISPATCH_
  *   refusals:Array<object>, reconcileRefusals:Array<object>}} same shape as
  *   {@link runReconcileCiHealDispatchAllRepos}'s own return, repo-tagged the same way.
  */
-export function runPromoteDraftDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcilePromoteDraftDispatch, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
+export function runPromoteDraftDispatchAllRepos({ resolveProfile = repoProfile, repos = reposWith('review', resolveProfile), tick = runReconcilePromoteDraftDispatch, ...tickOpts } = {}) {
+  const perRepo = forEachRepo(eligibleRepos(repos, 'review', resolveProfile), (repo) => tick({ ...tickOpts, repo }));
   const dispatched = [];
   const refusals = [];
   const reconcileRefusals = [];
@@ -638,8 +647,8 @@ export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequir
  * card xiqtf7w — the supersede half: per repo, hold (stand down + label) every open PR a merged PR declares it
  * supersedes. Runs BEFORE the fix/ci-heal halves so the hold is on the thread before they plan. Never throws.
  */
-export function runSupersedeAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runSupersedeWatch, ...tickOpts } = {}) {
-  return { repos: repos.map((repo) => {
+export function runSupersedeAllRepos({ resolveProfile = repoProfile, repos = reposWith('review', resolveProfile), tick = runSupersedeWatch, ...tickOpts } = {}) {
+  return { repos: [...eligibleRepos(repos, 'review', resolveProfile)].map((repo) => {
     try { return tick({ ...tickOpts, repo }); } catch (e) { return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] }; }
   }) };
 }
@@ -690,8 +699,8 @@ export function realSleep(ms) { return new Promise((resolve) => { setTimeout(res
  *   refusals:Array<object>}} `dispatched`/`refusals` here are the pass's own `applied`/`dispatch`+`refusals`
  *   rows, repo-tagged the same way {@link runReconcileFixDispatchAllRepos} tags its own.
  */
-export function runHungCiRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepHungCiRecovery, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true }));
+export function runHungCiRecoveryAllRepos({ resolveProfile = repoProfile, repos = reposWith('ciHeal', resolveProfile), tick = sweepHungCiRecovery, ...tickOpts } = {}) {
+  const perRepo = forEachRepo(eligibleRepos(repos, 'ciHeal', resolveProfile), (repo) => tick({ ...tickOpts, repo, apply: true }));
   const dispatched = [];
   const refusals = [];
   for (const entry of perRepo) {
@@ -734,11 +743,11 @@ export function runHungCiRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, t
  *   refusals:Array<object>}} `dispatched`/`refusals` here are the pass's own `applied`/`dispatch`+`refusals`
  *   rows, repo-tagged the same way {@link runHungCiRecoveryAllRepos} tags its own.
  */
-export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepCiRedRecovery, createLedger = createFileApplyLedger, ...tickOpts } = {}) {
+export function runMainRedRebaseAllRepos({ resolveProfile = repoProfile, repos = reposWith('ciHeal', resolveProfile), tick = sweepCiRedRecovery, createLedger = createFileApplyLedger, ...tickOpts } = {}) {
   // This daemon is the only live caller: without a per-repo file-backed fairness ledger the budget-capped apply
   // loop restarts at the head of the queue every tick and slow/deferred PRs starve later recoverable ones.
   // Built inside the per-repo callback so a ledger construction failure is isolated to that repo (tick-failed).
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true, applyLedger: tickOpts.applyLedger ?? createLedger({ repo }) }));
+  const perRepo = forEachRepo(eligibleRepos(repos, 'ciHeal', resolveProfile), (repo) => tick({ ...tickOpts, repo, apply: true, applyLedger: tickOpts.applyLedger ?? createLedger({ repo }) }));
   const dispatched = [];
   const refusals = [];
   for (const entry of perRepo) {
@@ -777,8 +786,8 @@ export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, ti
  *   refusals:Array<object>}} `dispatched`/`refusals` here are the pass's own `applied`/`dispatch`+`refusals`
  *   rows, repo-tagged the same way {@link runMainRedRebaseAllRepos} tags its own.
  */
-export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepMissingRunRecovery, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true }));
+export function runMissingRunRecoveryAllRepos({ resolveProfile = repoProfile, repos = reposWith('ciHeal', resolveProfile), tick = sweepMissingRunRecovery, ...tickOpts } = {}) {
+  const perRepo = forEachRepo(eligibleRepos(repos, 'ciHeal', resolveProfile), (repo) => tick({ ...tickOpts, repo, apply: true }));
   const dispatched = [];
   const refusals = [];
   for (const entry of perRepo) {

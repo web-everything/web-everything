@@ -2148,7 +2148,7 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
 
 describe('REVIEW_DAEMON_REPOS', () => {
   it('is every constellation repo\'s real slug, not just WE (live-caught 2026-09-22, #xvyuwtg: plateau-app PR #167 sat unwatched)', () => {
-    expect(REVIEW_DAEMON_REPOS.sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
+    expect([...REVIEW_DAEMON_REPOS].sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
     expect(REVIEW_DAEMON_REPOS).toContain('plateauapp/plateau-app');
     expect(REVIEW_DAEMON_REPOS).toContain('frontier-ui/frontierui');
     expect(REVIEW_DAEMON_REPOS).toContain('web-everything/web-everything');
@@ -3041,3 +3041,14 @@ it.each(['idle', 'low', 'denied', 'floor throws', 'sample throws', 'infinite'])(
       expect(readCpuIdlePct).not.toHaveBeenCalled();
     }
   });
+
+import { repoProfile as capabilityProfile } from '../../../scripts/lib/repo-profile.mjs';
+it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('filters review-disabled repos from the default review/advisory sweep', async (run) => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  const tick = vi.fn(() => ({ dispatched: [], failed: [] }));
+  await run({ resolveProfile, tick, authGateOverride: () => ({ ok: true }) });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+  tick.mockClear();
+  await run({ resolveProfile, repos: Object.values(CONSTELLATION_REPOS).map(r => r.slug), tick, authGateOverride: () => ({ ok: true }) });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});

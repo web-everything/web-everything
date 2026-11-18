@@ -11,6 +11,7 @@
  * read skips the repo for this tick (reported, never thrown). Usage as a one-off: `node supersede-watch.mjs
  * [--repo=<owner/name>] [--apply]` (dry run without `--apply`).
  */
+import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -138,10 +139,14 @@ export function formatSupersedeLines(result) {
   return lines;
 }
 
+export function supersedeSweepRepos(resolveProfile = repoProfile) {
+  return constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug);
+}
+
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const flags = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')).map(([k, v]) => [k, v ?? true]));
-  const repos = typeof flags.repo === 'string' ? [flags.repo] : Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+  const repos = typeof flags.repo === 'string' ? [flags.repo] : supersedeSweepRepos();
   const result = { repos: repos.map((repo) => runSupersedeWatch({ repo, apply: flags.apply === true })) };
   for (const line of formatSupersedeLines(result)) process.stderr.write(`${line}\n`);
   process.stdout.write(`${JSON.stringify(result)}\n`);

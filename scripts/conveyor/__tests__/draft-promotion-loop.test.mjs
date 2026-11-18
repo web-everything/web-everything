@@ -109,3 +109,11 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
     expect(ready).not.toHaveBeenCalled();
   });
 });
+
+import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
+it('does not list drafts for a review-disabled repo in the default promotion sweep', () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  const listDrafts = vi.fn(() => []);
+  runDraftPromotionStep({ resolveProfile, listDrafts });
+  expect(listDrafts.mock.calls.map(([o]) => o.repoSlug)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});

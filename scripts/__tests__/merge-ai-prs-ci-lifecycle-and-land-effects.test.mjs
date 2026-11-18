@@ -1478,3 +1478,11 @@ describe('the TOTAL ci-lifecycle reconcile clears a stale label even when UNCERT
     expect(isRequiredCheckGreen(pr, 'test')).toBe(false);
   });
 });
+
+import { repoProfile as capabilityProfile } from '../lib/repo-profile.mjs';
+it('excludes review-disabled repos from the default lander, even when self is disabled', () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  const expected = ['web-everything/web-everything', 'plateauapp/plateau-app'];
+  expect(resolveRepos({ self: expected[0], resolveProfile })).toEqual(expected);
+  expect(resolveRepos({ self: 'frontier-ui/frontierui', resolveProfile })).toEqual(expected);
+});

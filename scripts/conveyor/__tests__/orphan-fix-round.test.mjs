@@ -496,3 +496,11 @@ describe('wiring — the fix daemon runs the guard inside its stuck-fixer reclai
     expect(r.rows).toEqual([{ kind: 'orphan-fix-round', decision: 'error', reason: 'boom' }]);
   });
 });
+
+import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
+it('does not list orphan fixes for a fix-disabled repo', async () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, fix: key !== 'frontierui' } });
+  const listBounced = vi.fn(() => []);
+  await runOrphanFixRoundPass({ resolveProfile, listBounced, env: {} });
+  expect(listBounced.mock.calls.map(([slug]) => slug)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});

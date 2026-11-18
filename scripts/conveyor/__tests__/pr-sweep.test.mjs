@@ -650,3 +650,17 @@ it('R502: collectOwnerSignals attaches the live fixer claim as evidence and tole
   expect(broken[`${pr.repo}#12`].fixClaim).toBeUndefined();
   expect(errors.join(' ')).toContain('EACCES'); // incomplete evidence is reported, so ownerReadsOk goes false
 });
+
+import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
+it('excludes review-disabled repos from configured movement and diagnosis sweeps', async () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  const listed = [];
+  const result = await runPrSweep({ now, dryRun: true, config: {}, resolveProfile,
+    settings: { value: { ...settings, repos: ['frontier-ui/frontierui', pr.repo] }, sources: {} },
+    readPrevious: () => ({}), readPrs: (repo) => { listed.push(repo); return []; },
+    readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+    detector: async () => ({ items: [], errors: [], nextSeen: {} }),
+  });
+  expect(listed).toEqual([pr.repo]);
+  expect(result.diagnose).not.toContain('frontier-ui/frontierui');
+});

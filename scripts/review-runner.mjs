@@ -51,6 +51,7 @@
  * Exit codes: 0 = a pass ran (or a live runner already held the lease — a benign no-op); 2 = usage error
  * (`--enforce`, or a discovery/gh failure that left nothing to do). A per-PR error never aborts the batch.
  */
+import { constellationRepoKeysWith, repoProfile } from './lib/repo-profile.mjs';
 import { readGh } from './lib/proc-read.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
@@ -220,6 +221,10 @@ export function appendShadowRecords(records, repo, append = appendVerdict) {
   }
 }
 
+export function reviewRunnerRepoAllowed(repo, resolveProfile = repoProfile) {
+  return constellationRepoKeysWith('review', { resolveProfile }).includes(repoKeyForSlug(repo));
+}
+
 // ── the CLI (gated on direct invocation) ──────────────────────────────────────────────────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 if (IS_CLI) main(process.argv.slice(2));
@@ -239,7 +244,7 @@ function main(argv) {
   // key (`${key}#${pr}`), never the slug. Fail-CLOSED on an unknown slug rather than silently keying it `we` (the
   // #2830 M3 defect: `--repo=…frontierui` reading a FrontierUI PR but folding the WE ledger).
   const repoKey = repoKeyForSlug(repoSlug);
-  if (!repoKey) {
+  if (!reviewRunnerRepoAllowed(repoSlug)) {
     writeAllSync(1, `${JSON.stringify({ error: `review-runner: --repo=${repoSlug} is not a known constellation repo (slug or key) — refusing to guess its ledger key` })}\n`);
     return process.exit(2);
   }

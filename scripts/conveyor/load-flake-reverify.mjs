@@ -1,6 +1,7 @@
 /** Local verify / host-load counterpart to #4999 (CI per-test flake scoring and quarantine).
  * Pure planning plus injectable IO. A quiet host retries one saved fix, never force-pushing.
  */
+import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
 import os from 'node:os';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -94,14 +95,15 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
 
 /** Programmatic default stays WE; the CLI sweeps the constellation when no repo is specified. */
 export const REVERIFY_DEFAULT_REPO = 'we';
-export const REVERIFY_SWEEP_REPOS = Object.keys(CONSTELLATION_REPOS);
+export const REVERIFY_SWEEP_REPOS = constellationRepoKeysWith('fix');
 
-export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo(config)) {
+export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig(), resolveProfile = repoProfile } = {}, io = defaultReverifyIo(config)) {
   const now = io.now();
   const load = io.loadavg();
   const cores = io.cpuCount();
   const key = repoKeyForSlug(repo);
   if (!key) throw new Error(`unknown repo: ${repo}`);
+  if (!constellationRepoKeysWith('fix', { resolveProfile }).includes(key)) return { repo, deferred: 'unsupported-repo' };
   const slug = CONSTELLATION_REPOS[key].slug;
   const prs = await io.listPrs(slug);
   // One shared decision per run (x9xkupj). An admission probe that throws or answers nothing leaves the legacy rule.

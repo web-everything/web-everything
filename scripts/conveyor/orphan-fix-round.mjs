@@ -31,6 +31,7 @@
  * Kill switch `WE_ORPHAN_FIX_GUARD=0` (report only). PURE core: {@link planOrphanFixRound}. IO shell:
  * {@link runOrphanFixRoundPass}, run by the fix daemon inside its stuck-fixer reclaim step.
  */
+import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
 import { stripVTControlCharacters } from 'node:util';
 import { resolve } from 'node:path';
@@ -265,7 +266,8 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
 export async function runOrphanFixRoundPass({
   env = process.env,
   nowMs = Date.now(),
-  repos = Object.entries(CONSTELLATION_REPOS).map(([key, r]) => ({ key, slug: r.slug })),
+  resolveProfile = repoProfile,
+  repos = constellationRepoKeysWith('fix', { resolveProfile }).map((key) => ({ key, slug: CONSTELLATION_REPOS[key].slug })),
   listBounced = (slug) => defaultListBounced(slug),
   readComments = defaultReadComments,
   isOwned = defaultOwned,

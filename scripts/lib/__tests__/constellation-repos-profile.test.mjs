@@ -271,3 +271,14 @@ describe('repoProfileForLanePath', () => {
     expect(repoProfileForLanePath('')).toBeNull();
   });
 });
+
+import { constellationRepoKeysWith } from '../repo-profile.mjs';
+it.each(['review', 'fix', 'ciHeal', 'build'])('filters %s, excludes missing evidence and never enrolls pending repos', (cap) => {
+  const repos = { on: {}, off: {}, missing: {} };
+  const resolveProfile = key => key === 'missing' ? null : { capabilities: { [cap]: cap === 'build' ? (key === 'on' ? 'direct' : 'none') : key === 'on' } };
+  expect(constellationRepoKeysWith(cap, { repos, resolveProfile })).toEqual(['on']);
+  expect(constellationRepoKeysWith(cap)).not.toContain('longshore');
+  expect(constellationRepoKeysWith(cap, { repos: { longshore: {} } })).toEqual([]);
+  expect(constellationRepoKeysWith(cap, { repos, resolveProfile: () => ({ capabilities: {} }) })).toEqual([]);
+});
+it('rejects an unknown capability', () => expect(constellationRepoKeysWith('unknown')).toEqual([]));

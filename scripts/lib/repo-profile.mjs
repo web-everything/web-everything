@@ -140,6 +140,20 @@ export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
 }
 
 /**
+ * Enrolled repo keys eligible for automated work; pending profiles never enroll themselves.
+ * Unknown capabilities and missing profiles/flags fail closed. PURE; lookup/roster injectable for tests.
+ * Unfiltered observers: bootstrap, live-state, gate-health, operator-queue, queue, health-watch, ownership, metrics, close-items, item-activity, credentials, app-auth, ledgers, open-pr counts/context, daemon-live-smoke.
+ * @param {'review'|'fix'|'ciHeal'|'build'} capability
+ */
+export function constellationRepoKeysWith(capability, { repos = CONSTELLATION_REPOS, resolveProfile = repoProfile } = {}) {
+  if (!['review', 'fix', 'ciHeal', 'build'].includes(capability)) return [];
+  return Object.keys(repos).filter((key) => {
+    const value = resolveProfile(key)?.capabilities?.[capability];
+    return capability === 'build' ? value != null && value !== 'none' : Boolean(value);
+  });
+}
+
+/**
  * The gate command a dispatched fix / ci-heal agent runs in its lane (`{{GATE_COMMAND}}`) for a constellation
  * repo. xpnhz4o — it is `node <WE root>/scripts/verify-lane.mjs run --repo=.`: WE's own diff-selected gate
  * (`verify-lane-gate.mjs#resolveDefaultGate`, which already builds only the halves the target checkout's npm

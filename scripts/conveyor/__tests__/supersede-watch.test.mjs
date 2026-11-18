@@ -150,3 +150,17 @@ describe('supersede daemon wiring', () => {
     ]);
   });
 });
+
+import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
+import { supersedeSweepRepos } from '../supersede-watch.mjs';
+it('excludes review-disabled repos from the CLI supersede roster', () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  expect(supersedeSweepRepos(resolveProfile)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});
+
+it('excludes review-disabled repos from the daemon supersede sweep', () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  const tick = vi.fn(() => ({ holds: [], applied: [] }));
+  runSupersedeAllRepos({ resolveProfile, tick });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});

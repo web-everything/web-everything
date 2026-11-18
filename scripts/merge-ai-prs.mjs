@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { constellationRepoKeysWith, repoProfile } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -3788,7 +3789,7 @@ const CONSTELLATION_REPO_NAMES = ['web-everything', 'frontierui', 'plateau-app']
  * @param {{repos?:string|null, singleRepo?:boolean, self?:string|null}} o
  * @returns {Array<string|null>}
  */
-export function resolveRepos({ repos, singleRepo, self: rawSelf } = {}) {
+export function resolveRepos({ repos, singleRepo, self: rawSelf, resolveProfile = repoProfile } = {}) {
   const self = typeof rawSelf === 'string' ? canonicalizeSlug(rawSelf) : rawSelf;
   if (typeof repos === 'string' && repos.trim()) {
     // #xc7p3q9 (R10) — NORMALIZE every `--repos` entry to `owner/name`. A short-name `--repos=frontierui` otherwise
@@ -3806,7 +3807,8 @@ export function resolveRepos({ repos, singleRepo, self: rawSelf } = {}) {
   // The constellation spans ONE ORG PER REPO since the 2026-10-03 move, so when self IS a constellation repo the
   // default set is the declared slugs themselves — never "self's owner x names", which would invent
   // `web-everything/frontierui`. A non-constellation self (a fork) keeps the owner-times-names derivation.
-  const declared = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+  const declared = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug);
+  if (self && repoKeyForSlug(self) && !declared.includes(self)) return declared;
   if (self && declared.includes(self)) return [self, ...declared.filter((s) => s !== self)];
   const owner = self && self.includes('/') ? self.split('/')[0] : null;
   if (!owner) return [null]; // can't derive the constellation without an owner → stay single-repo (safe)
@@ -3831,7 +3833,9 @@ export function resolveRepos({ repos, singleRepo, self: rawSelf } = {}) {
 export function resolveContextRepos(repos, self) {
   const base = Array.isArray(repos) ? repos : [];
   const localToken = base.includes(null) ? null : self;   // the form REPOS uses for the local repo
-  return [...new Set([...base, ...resolveRepos({ self })].map((r) => (r == null || r === self) ? localToken : r))];
+  // Context reads must still see disabled repos for couple/dependency guards.
+  const context = repoKeyForSlug(self) ? Object.values(CONSTELLATION_REPOS).map((r) => r.slug) : resolveRepos({ self });
+  return [...new Set([...base, ...context].map((r) => (r == null || r === self) ? localToken : r))];
 }
 
 /**

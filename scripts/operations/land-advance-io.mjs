@@ -9,6 +9,7 @@
  * Follow-ups use the existing run-store's in-flight DISPATCH_EFFECT + plain dispatch
  * metadata, one run per launch, with no changes to dispatch-lane semantics.
  */
+import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -91,6 +92,7 @@ export function createLandAdvanceReader(ports = {}) {
     machineLoad = () => loadavg()[0] / cpus().length, store = createFileRunStore(),
     drainDir = join(home, 'workspace/plateau-app/.drain-daemon'), jobsDir = join(home, 'workspace/.operations/jobs'),
     trialLog = join(home, 'workspace/.operations/delegation-trials.jsonl'), escalationsDir = join(home, 'workspace/.operations/escalations'),
+    resolveProfile = repoProfile,
     sweptReposPath = join(ROOT, 'scripts/lib/swept-repos.json'),
     readSessions = () => readLiveSessions({ run }), findItemFn = findItem, loadItems = () => defaultLoadItems(ROOT),
     resolveFallbackScope = (pr) => run('gh', ['pr', 'diff', String(pr), '--repo', 'web-everything/web-everything', '--name-only']).trim().split('\n').filter(Boolean).map((p) => `we:${p}`),
@@ -112,7 +114,8 @@ export function createLandAdvanceReader(ports = {}) {
       { cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 64 * 1024 * 1024, stdio: 'pipe' }))) : null } = ports;
   return function readInputs() {
     const errors = [], get = (source, fn, fallback) => { try { return fn(); } catch (e) { errors.push({ source, message: String(e.message ?? e) }); return fallback; } };
-    const slugs = JSON.parse(io.readFileSync(sweptReposPath, 'utf8'));
+    const eligible = new Set(constellationRepoKeysWith('review', { resolveProfile }));
+    const slugs = JSON.parse(io.readFileSync(sweptReposPath, 'utf8')).filter((slug) => eligible.has(repoKeyFromSlug(slug)));
     const prs = slugs.flatMap((slug) => {
       const repo = repoKeyFromSlug(slug);
       return get(`prs:${repo}`, () => JSON.parse(run('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200', '--json', 'number,title,labels,baseRefName,headRefName,headRefOid,createdAt,updatedAt,mergeable,mergeStateStatus,isDraft,body'])).map((p) => ({ ...p, repo, slug })), []);

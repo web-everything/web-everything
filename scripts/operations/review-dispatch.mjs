@@ -534,14 +534,14 @@ export function isReviewCodePath(path, { closure = reviewSandboxClosure() } = {}
  * @param {{pr: number|string, repo: string}} o
  * @returns {{pr: number, repo: string, sessionSlug: string}}
  */
-export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home = homedir() } = {}) {
+export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home = homedir(), resolveProfile = repoProfile } = {}) {
   const prNum = Number(pr);
   if (!Number.isInteger(prNum) || prNum <= 0) {
     throw new Error(`review-dispatch: --pr must be a positive integer, got ${JSON.stringify(pr)}`);
   }
   const repoStr = String(repo ?? '').trim();
   const repoKey = repoKeyForSlug(repoStr);
-  const profile = repoKey === null ? null : repoProfile(repoKey, { home });
+  const profile = repoKey === null ? null : resolveProfile(repoKey, { home });
   if (!profile?.capabilities?.review) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
   const laneRepo = profile.lanePoolRepo;
   if (repoKey !== 'we' && !checkoutExists(laneRepo)) {

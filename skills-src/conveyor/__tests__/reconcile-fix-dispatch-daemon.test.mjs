@@ -139,7 +139,7 @@ describe('runDaemonLoop — the pure control flow', () => {
 
 describe('FIX_DISPATCH_DAEMON_REPOS', () => {
   it('is every constellation repo\'s real slug, not just WE (#x1rr9rh, multi-repo slice 2)', () => {
-    expect(FIX_DISPATCH_DAEMON_REPOS.sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
+    expect([...FIX_DISPATCH_DAEMON_REPOS].sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
     expect(FIX_DISPATCH_DAEMON_REPOS).toContain('plateauapp/plateau-app');
     expect(FIX_DISPATCH_DAEMON_REPOS).toContain('frontier-ui/frontierui');
     expect(FIX_DISPATCH_DAEMON_REPOS).toContain('web-everything/web-everything');
@@ -2930,4 +2930,19 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
     expect(tick.mock.calls.map(([options]) => options.repo)).toEqual(['repo-a', 'repo-b']);
     expect(posted).toEqual([42, 43]);
   });
+});
+
+import { repoProfile as capabilityProfile } from '../../../scripts/lib/repo-profile.mjs';
+it.each([
+  [runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal'],
+  [runPromoteDraftDispatchAllRepos, 'review'], [runHungCiRecoveryAllRepos, 'ciHeal'],
+  [runMainRedRebaseAllRepos, 'ciHeal'], [runMissingRunRecoveryAllRepos, 'ciHeal'],
+])('filters disabled repos from each stage default roster (%s, %s)', async (run, capability) => {
+  const resolveProfile = key => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, [capability]: key !== 'frontierui' } });
+  const tick = vi.fn(() => ({}));
+  await run({ resolveProfile, tick, createLedger: () => ({}) });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+  tick.mockClear();
+  await run({ resolveProfile, repos: Object.values(CONSTELLATION_REPOS).map(r => r.slug), tick, createLedger: () => ({}) });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
 });

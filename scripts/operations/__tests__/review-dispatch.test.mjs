@@ -879,3 +879,9 @@ describe('card 273 advisory CI waiver at session dispatch', () => {
     expect(Boolean(out.skipped)).toBe(state !== 'matching');
   });
 });
+
+it('refuses an enrolled repo with review:false before checkout access', () => {
+  const checkoutExists = vi.fn();
+  expect(() => planReviewDispatch({ pr: 1, repo: 'frontierui', checkoutExists, resolveProfile: () => ({ capabilities: { review: false } }) })).toThrow(/not a constellation repo/);
+  expect(checkoutExists).not.toHaveBeenCalled();
+});

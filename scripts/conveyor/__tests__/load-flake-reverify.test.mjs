@@ -538,3 +538,11 @@ describe('defaultReverifyIo admission decision source (x9xkupj)', () => {
       gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: 'hold' }));
   });
 });
+
+it('does not read PRs or verify for a fix-disabled repo', async () => {
+  const { io } = fixture();
+  const out = await runLoadFlakeReverify({ repo: 'frontierui', resolveProfile: () => ({ capabilities: { fix: false } }) }, io);
+  expect(out.deferred).toBe('unsupported-repo');
+  expect(io.listPrs).not.toHaveBeenCalled();
+  expect(io.verify).not.toHaveBeenCalled();
+});

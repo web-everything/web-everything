@@ -21,6 +21,7 @@
  * tick's `already-landed` refusal needs git reads (blob identity against `main`'s history) that a fast step must not
  * pay; a conflicting green draft is rare and the tick still promotes it when it is not already landed.
  */
+import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -83,7 +84,8 @@ export function defaultReadPrView({ repoSlug, prNumber, runGh = runGhSync, readC
  * @returns {{rows:Array<{repo:string, pr:number|null, action:'promoted'|'skip'|'error', why:string, reason?:string}>}}
  */
 export function runDraftPromotionStep({
-  repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
+  resolveProfile = repoProfile,
+  repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug),
   listDrafts = defaultListDrafts,
   readHeadCheckState = defaultReadHeadCheckState,
   readPrView = defaultReadPrView,

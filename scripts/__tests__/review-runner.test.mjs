@@ -203,3 +203,12 @@ it('recognizes owner-qualified sibling slugs', () => {
   expect(repoKeyForSlug('frontier-ui/frontierui')).toBe('frontierui');
   expect(repoKeyForSlug('plateauapp/plateau-app')).toBe('plateau-app');
 });
+
+import { repoProfile as capabilityProfile } from '../lib/repo-profile.mjs';
+import { reviewRunnerRepoAllowed } from '../review-runner.mjs';
+it('refuses a review-disabled repo before running a review sweep', () => {
+  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+  expect(reviewRunnerRepoAllowed('frontier-ui/frontierui', resolveProfile)).toBe(false);
+  expect(reviewRunnerRepoAllowed('we', resolveProfile)).toBe(true);
+  expect(reviewRunnerRepoAllowed('unknown', resolveProfile)).toBe(false);
+});
