@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { defaultSpawnAgy } from '../agy-confined-build.mjs';
@@ -65,7 +65,9 @@ it.each(['direct', 'homebrew-symlink'])('production sandbox callback resolves %s
   }
   vi.stubEnv('GH_TOKEN', 'must-not-reach-child');
   vi.stubEnv('SSH_AUTH_SOCK', '/host-agent');
+  let privateHome;
   spawn.mockImplementation((bin, args, opts) => {
+    privateHome = opts.env.HOME;
     expect(bin).toBe('/usr/bin/sandbox-exec');
     expect(args).toContain(realpathSync(options.cli));
     const profile = readFileSync(args[1], 'utf8');
@@ -95,6 +97,7 @@ it.each(['direct', 'homebrew-symlink'])('production sandbox callback resolves %s
   });
   expect(readAgyHold(options.model)).toBeNull();
   expect(await defaultSpawnAgy(options)).toMatchObject({ code: 1, quotaState: 'exhausted' });
+  expect(existsSync(privateHome)).toBe(false);
   expect(readAgyHold(options.model)).toMatchObject({ fallbackDecision: 'skip-quota-hold', heldBackend: 'google' });
   expect(spawn).toHaveBeenCalledOnce();
   expect(await defaultSpawnAgy({ ...options, logFile: join(dirname(options.logFile), 'held.jsonl') })).toMatchObject({ fallbackDecision: 'skip-quota-hold' });
@@ -148,3 +151,41 @@ it('writes confined transcript through the original fd even if the pathname is r
   expect(readFileSync(original, 'utf8')).toBe('recorded\n');
   expect(readFileSync(target, 'utf8')).toBe('unchanged');
 });
+
+it.each(['missing', 'symlink', 'oversized'])('refuses %s login and removes private HOME before returning', async kind => {
+  const { root, options } = fixture();
+  vi.stubEnv('TMPDIR', root);
+  const login = join(host.home, '.gemini/config/config.json');
+  rmSync(login);
+  if (kind === 'symlink') symlinkSync(join(host.home, '.gemini/antigravity-cli/settings.json'), login);
+  if (kind === 'oversized') writeFileSync(login, Buffer.alloc(65537));
+  await expect(defaultSpawnAgy(options)).rejects.toThrow('agy login unavailable; use another provider or request operator review');
+  expect(spawn).not.toHaveBeenCalled();
+  expect(readdirSync(root).filter(name => name.startsWith('we-agy-sandbox-'))).toEqual([]);
+});
+
+it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
+  'REAL launcher allows private login, denies fake real-home login, and removes private HOME after run', async () => {
+    const { options } = fixture();
+    const login = join(host.home, '.gemini/config/config.json');
+    writeFileSync(login, 'fixture-login');
+    writeFileSync(options.cli, `#!/bin/sh
+/bin/cat "$HOME/.gemini/config/config.json" || exit 2
+if /bin/cat "$FAKE_REAL_LOGIN"; then exit 3; fi
+printf '\nreal-home-denied\n'
+`);
+    const actual = await vi.importActual('node:child_process');
+    let privateHome;
+    spawn.mockImplementation((bin, args, opts) => {
+      privateHome = opts.env.HOME;
+      return actual.spawn(bin, args, { ...opts, env: { ...opts.env, FAKE_REAL_LOGIN: login } });
+    });
+    const result = await defaultSpawnAgy(options);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('fixture-login');
+    expect(result.stdout).toContain('real-home-denied');
+    expect(result.stderr).toMatch(/EPERM|Operation not permitted/i);
+    expect(privateHome).toBeTruthy();
+    expect(existsSync(privateHome)).toBe(false);
+  },
+);

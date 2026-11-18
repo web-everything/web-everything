@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, normalize } from 'node:path';
 
 export const sandboxSecretPaths = home => ['.ssh', '.aws', '.gnupg', '.config/gh',
@@ -10,8 +10,27 @@ const safePath = p => {
 };
 const inside = (p, root) => p === root || p.startsWith(`${root}/`);
 
-/** Seed private state without reading host settings, MCP config or credentials. */
-export function preparePrivateAgyHome(_homeDir, privateHomeDir, cloneDir) {
+/** Seed clone-only trust and only agy's own login; never inherit host settings or MCP config. */
+export function preparePrivateAgyHome(homeDir, privateHomeDir, cloneDir) {
+  let login;
+  try {
+    const fd = openSync(join(homeDir, '.gemini/config/config.json'), constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size > 64 * 1024) throw new Error('invalid agy login file');
+      // One extra byte detects growth without allowing an unbounded read.
+      const buffer = Buffer.alloc(stat.size + 1);
+      let size = 0, count;
+      while (size < buffer.length && (count = readSync(fd, buffer, size, buffer.length - size, null)) > 0) size += count;
+      if (size !== stat.size) throw new Error('agy login size changed');
+      login = buffer.subarray(0, size);
+    } finally { closeSync(fd); }
+    const configDir = join(privateHomeDir, '.gemini/config');
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(configDir, 'config.json'), login, { mode: 0o600, flag: 'wx' });
+  } catch {
+    throw new Error('agy login unavailable; use another provider or request operator review');
+  }
   try {
     const stateDir = join(privateHomeDir, '.gemini/antigravity-cli');
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });

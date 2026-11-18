@@ -4704,14 +4704,20 @@ does not establish confinement. These slice B tests were authored without runnin
 
 The build profile grants only clone, private per-run temp and the private HOME's `.gemini`
 writes (plus the named devices). The launcher creates that HOME outside workspace/lane/clone,
-writes only `.gemini/antigravity-cli/settings.json` containing exactly
-`{ trustedWorkspaces: [clone] }`. It never reads or copies host settings keys, config directories,
-MCP config or credentials; absent host settings give the same empty starting state. Failure to create
-private settings refuses with a provider/operator fallback. The launcher removes only its own mkdtemp
-root after the run. `HOME` is replaced; `TMPDIR`, `TMP` and `TEMP` point to the private temp.
+writes `.gemini/antigravity-cli/settings.json` containing exactly
+`{ trustedWorkspaces: [clone] }` and copies only the host `.gemini/config/config.json` login into
+`.gemini/config/config.json`, both with mode 0600 and exclusive creation. The host login is opened
+with `O_NOFOLLOW`, must be a regular file at most 64KB, and the bounded read must match its stat size.
+Missing, redirected, oversized or otherwise unreadable login refuses with
+`agy login unavailable; use another provider or request operator review`. No host settings keys,
+MCP config, `.migrated`, `projects/` or other host config is copied. Failure to create
+private settings also refuses with a provider/operator fallback. The launcher removes only its own mkdtemp
+root after the run, including every error path. `HOME` is replaced; `TMPDIR`, `TMP` and `TEMP` point to the private temp.
 Real home `.gemini` receives no read or write allowance. The REAL probe covers private state writes
-and real state write/conversation-read denial. Private-HOME fixtures assert exactly one settings file,
-no inherited host keys, and no config copy, including absent, redirected and oversized host inputs.
+and real state write/conversation-read denial. Private-HOME fixtures assert exactly the settings and login files,
+mode 0600, byte-identical login content, no inherited host keys or MCP config, and refusal for missing,
+symlinked, nonregular and oversized login inputs. The REAL launcher probe uses a fake real home,
+checks private login reads and real login denial, and asserts private HOME removal after the run.
 The shared kind-agnostic `isAdmissibleTargetPath` allowlist gates scope admission and every
 tracked/untracked changed path. Only normalized repo-relative documentation (`docs/**` or `.md`/`.mdx`)
 and tests (`**/__tests__/**` or `.test.*`/`.spec.*`) qualify. Refuse `.github/**`, `scripts/settings/**`,
@@ -4737,12 +4743,14 @@ refuse. Refusals record an unproductive outcome so the existing provider chain a
 
 
 Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER. It runs in a throwaway clone with a
-private HOME and a scrubbed environment (no secrets or credentials), under a sandbox-exec profile that confines
+private HOME and a scrubbed environment. Agy's own login (`config.json`) is placed in that private HOME
+with mode 0600 and deleted after the run, used the same way the review seat uses it. It runs under a sandbox-exec profile that confines
 writes to the clone, its private temp and its private HOME. Shells and tools inside that copy are out of scope:
-the copy can only damage itself. The boundary is the diff: we keep ONLY the git diff, and our code applies it
+the copy can only damage itself. The DIFF BOUNDARY remains the control: we keep ONLY agy's git diff, and our code applies it
 through the shared documentation/test allowlist predicate, intersected with the launch scope (an item scope may only narrow
 it, with criticality re-checked), before the normal review and audit path. Network stays allowed (agy needs its
-API) and size-1 jobs of any kind are admitted by operator ruling R1062; neither is a confinement claim.
+API), so the credential is not protected from the worker; this is an accepted operator ruling (R1062).
+Size-1 jobs of any kind are also admitted by R1062; neither is a confinement claim.
 
 The launcher hashes clone Git redirect/configuration controls with filesystem reads before any
 post-run Git invocation; unreadable or changed controls and a missing Git directory void the run. Clone Git reads
