@@ -4093,9 +4093,9 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "sha256": "1c9087d186e8106c74d1e5f9b90f32d2d1ff4d51cc268d0e4ee010bd9dfa2f7b",
   },
   {
-    "count": 246,
+    "count": 252,
     "file": "scripts/lib/agent-launch-structure.mjs",
-    "sha256": "c5302f5975cef17ff2b5814f4d858075da332a67ed6f10000157ba5cc7580a2c",
+    "sha256": "4a959e4f2e917f6a283f99193000c86844a1a8b750874ca541ab18a2d4b8845b",
   },
   {
     "count": 197,

@@ -62,9 +62,53 @@ it.each([
   { name: 'R37.9 empty nested shell script', command: 'sh', argv: ['-c', ''], refused: true },
   { name: 'R37.9 inspectable fresh command control', command: 'claude', argv: ['-p', 'hello'] },
   { name: 'R37.9 inspectable argv-less command control', command: 'claude', argv: [] },
+  ...["clau'de'", 'clau"de"', "'clau'de", 'clau\\de', 'cla*de', 'cla?de', 'cla[up]de',
+    'clau{d,d}e', '$tool', '${tool}', '$(printf claude)', '`printf claude`'].map(executable => ({
+    name: `R37.12 ambiguous shell executable refuses even with matching id: ${executable}`,
+    command: 'sh', argv: ['-c', `${executable} --resume ${SID}`], resumeId: SID, refused: true,
+    reason: 'use literal argv',
+  })),
+  { name: 'R37.12 quoted command string concatenation', command: `clau'de' --resume ${SID}`,
+    argv: [], resumeId: SID, refused: true, reason: 'use literal argv' },
+  { name: 'R37.12 quoted argv-string concatenation', command: 'codex', argvText: `res'ume' ${SID}`,
+    resumeId: SID, mode: 'codex-exec-resume', refused: true, reason: 'use literal argv' },
+  { name: 'R37.12 wholly quoted executable and id control', command: 'sh',
+    argv: ['-c', `"claude" --resume '${SID}'`], resumeId: SID },
+  { name: 'R37.12 shell syntax in literal argv is data control', command: 'claude',
+    argv: ['-p', 'literal $tool `text` * ? {a,b} \\'] },
+  { name: 'R37.13 top-level resume with fresh descriptor', mode: 'codex-exec',
+    argv: ['resume', 'unchecked-id'], refused: true },
+  ...['resume', 'fork'].flatMap(subcommand => [
+    ...[null, undefined].map(resumeId => ({ name: `R37.13 ${subcommand} missing descriptor id ${resumeId}`,
+      mode: 'codex-exec-resume', argv: [subcommand, SID], resumeId, refused: true })),
+    { name: `R37.13 ${subcommand} mismatched id`, mode: 'codex-exec-resume',
+      argv: ['--profile', 'fixture', subcommand, '--model', 'fixture', 'unchecked-id'], resumeId: SID, refused: true },
+    { name: `R37.13 ${subcommand} matching id but wrong mode`, mode: 'codex-exec',
+      argv: [subcommand, SID], resumeId: SID, refused: true },
+    ...[[], ['--last'], ['--all'], ['--last', '--all'], ['--last', SID]].map(tail => ({
+      name: `R37.13 ${subcommand} unverifiable session selection ${tail.join(' ')}`,
+      mode: 'codex-exec-resume', argv: [subcommand, ...tail], resumeId: SID, refused: true,
+    })),
+    ...[[subcommand, SID], ['-p', 'resume', subcommand, '--model', 'fork', SID],
+      [subcommand, '--all', SID], [subcommand, '--', SID]].map(argv => ({
+      name: `R37.13 matching ${subcommand} control ${argv.join(' ')}`, mode: 'codex-exec-resume', argv, resumeId: SID,
+    })),
+    { name: `R37.13 ${subcommand} shell control`, command: 'sh', argv: ['-c', `codex ${subcommand} ${SID}`],
+      mode: 'codex-exec-resume', resumeId: SID },
+    { name: `R37.13 ${subcommand} exec-string control`, command: `codex ${subcommand} ${SID}`, argv: [],
+      mode: 'codex-exec-resume', resumeId: SID },
+    { name: `R37.13 ${subcommand} argv-string control`, argvText: `--profile fixture ${subcommand} ${SID}`,
+      mode: 'codex-exec-resume', resumeId: SID },
+  ]),
+  { name: 'R37.13 resume word as option value control', argv: ['--profile', 'resume', 'exec', '-'] },
+  { name: 'R37.13 resume word as delimited prompt control', argv: ['--', 'resume', SID] },
+  { name: 'R37.13 Claude prompt word control', command: 'claude', argv: ['resume', 'unchecked-id'] },
+  { name: 'R37.13 exec --last cannot be validated by an accompanying id', mode: 'codex-exec-resume',
+    argv: ['exec', 'resume', '--last', SID], resumeId: SID, refused: true },
 ])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, mode = 'worker-result-probe',
-  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg }) => {
-  const primitive = vi.fn(), original = [...argv], findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
+  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg, argvText }) => {
+  if (argvText !== undefined) argv = argvText;
+  const primitive = vi.fn(), original = Array.isArray(argv) ? [...argv] : argv, findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
   let invoke = primitive;
   if (opaque === 'preset' || opaque === 'renamed') invoke = primitive.bind(null, 'claude', ['--resume', 'other-id']);
   if (opaque === 'renamed') Object.defineProperty(invoke, 'name', { value: 'start' });
@@ -401,6 +445,17 @@ describe('completion wrapper', () => {
 
 // Codex `exec resume [OPTIONS] [SESSION_ID] [PROMPT]`: the id is the first POSITIONAL after `resume`.
 describe('codex resume id is the positional session id, never an option', () => {
+  it.each(['resume', 'fork'])('extracts top-level %s ids through the same normaliser', subcommand => {
+    const argv = ['-p', 'fixture', subcommand, '--model', 'fixture', SID];
+    expect(agentResumeId(argv)).toBe(SID);
+    expect(agentResumeId(argv.join(' '))).toBe(SID);
+    expect(agentResumeId(`codex ${argv.join(' ')}`)).toBe(SID);
+    expect(agentResumeId([subcommand, '--all', SID])).toBe(SID);
+    expect(agentResumeId([subcommand, '--', SID])).toBe(SID);
+    for (const tail of [[], ['--all'], ['--last'], ['--last', SID]]) {
+      expect(agentResumeId([subcommand, ...tail])).toBe('');
+    }
+  });
   const ignoreRulesShapes = [
     ['exec', '--ignore-rules', 'resume', SID],
     ['exec', 'resume', '--ignore-rules', SID],

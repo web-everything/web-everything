@@ -3,6 +3,7 @@ import ts from 'typescript';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve, relative } from 'node:path';
+import { agentShellEvidence } from './agent-launch.mjs';
 
 const primitives = /^(?:spawn(?:Sync|Fn|Process|ToCompletion(?:Fn)?)?|exec(?:File(?:Sync)?(?:Throttled)?|Sync|Fn)?|fork|run(?:Fn|Default)?|listing)$/;
 const agent = /(?:^|[^\w-])(?:claude|codex)(?=$|[^\w-])/;
@@ -232,15 +233,18 @@ export function findAgentLaunches(sources) {
       const d = declaration(node);
       if (!d) return false;
       if (bindingWrites.has(d)) return false;
-      if (ts.isImportSpecifier(d)) return childProcess.test(importSource(d))
-        && primitives.test(d.propertyName?.text ?? d.name.text);
+      if (ts.isImportSpecifier(d)) {
+        const name = d.propertyName?.text ?? d.name.text;
+        return childProcess.test(importSource(d)) && primitives.test(name) && name;
+      }
       if (ts.isVariableDeclaration(d)) return literalPrimitive(d.initializer, seen);
       if (ts.isBindingElement(d)) return literalPrimitive(bindingExpression(d), seen);
       return false;
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const members = ts.isPropertyAccessExpression(node) ? [node.name.text] : values(node.argumentExpression);
-      return processNamespace(node.expression, new Set(), true) && members.length === 1 && members[0] != null && primitives.test(members[0]);
+      return processNamespace(node.expression, new Set(), true) && members.length === 1 && members[0] != null
+        && primitives.test(members[0]) && members[0];
     }
     return false;
   }
@@ -387,12 +391,25 @@ export function findAgentLaunches(sources) {
     };
     const visit = n => {
       if (ts.isCallExpression(n) && !approvedWrapper(n.expression)) {
-        if (literalPrimitive(n.expression)) {
+        const primitiveName = literalPrimitive(n.expression);
+        if (primitiveName) {
           const command = values(n.arguments[0]);
           const unresolved = !command.length || command.includes(null);
           const argumentsEvidence = n.arguments.flatMap(a => values(a));
           const wrapped = command.some(c => wrapper.test(c)) && values(n.arguments[1]).includes(null);
-          if (unresolved || argumentsEvidence.some(c => c != null && agent.test(c)) || wrapped) {
+          // Inspect shell text even if quote concatenation hides the agent name. Keep literal argv
+          // opaque to shell syntax: e.g. a glob in a direct git argument is only data.
+          const shellOption = n.arguments.some(arg => ts.isObjectLiteralExpression(unwrap(arg))
+            && unwrap(arg).properties.some(p => p.name?.text === 'shell' && p.initializer?.kind !== ts.SyntaxKind.FalseKeyword));
+          const shellText = /^(?:exec|execSync|execFn)$/.test(primitiveName) || shellOption
+            || argumentsEvidence.some(c => c != null && /(?:^|[/\\])(?:ba|z|da|k)?sh$/.test(c))
+            || command.some(c => c != null && /\s|[;|&'"`$]/.test(c));
+          const hiddenShell = shellText && argumentsEvidence.some(c => {
+            if (c == null) return false;
+            const { unquoted, ambiguous } = agentShellEvidence(c);
+            return agent.test(unquoted) || ambiguous;
+          });
+          if (unresolved || argumentsEvidence.some(c => c != null && agent.test(c)) || wrapped || hiddenShell) {
             report(n, n.arguments, unresolved ? 'unresolved command; cannot establish launch boundary' : 'agent execution outside agent-launch.mjs');
           }
         } else if (!unrelated(n.expression)) {

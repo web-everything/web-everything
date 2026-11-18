@@ -36,9 +36,9 @@ function refuse(reason, descriptor, log, cause) {
 
 /** The native id already present in argv, never a reporting slug or a newly minted id. */
 export function agentResumeId(argv = []) {
-  // This helper also accepts argv without a binary: `exec` identifies the Codex grammar there.
+  // This helper also accepts argv without a binary: Codex's subcommands identify its grammar.
   const commands = typeof argv === 'string' ? normaliseScript(argv, 0, true)
-    : [normaliseOptions(argv, argv.includes('exec') ? 'codex' : 'claude')];
+    : [normaliseOptions(argv, argv.some(word => ['exec', 'resume', 'fork'].includes(word)) ? 'codex' : 'claude')];
   return commands.flatMap(command => command.resumeIds)[0] ?? null;
 }
 
@@ -91,15 +91,44 @@ function normaliseOptions(argv, executable) {
     } else entries.push({ kind: 'positional', word });
   }
   const positionals = entries.filter(entry => entry.kind === 'positional');
-  // Only the first two positional words can be exec/resume. Global option VALUES cannot hide them.
-  if (positionals[0]?.word === 'exec' && positionals[1]?.word === 'resume') {
-    resumeIds.push(positionals[2]?.word ?? '');
+  // Global option VALUES cannot hide a subcommand. Interactive resume/fork have no `exec` prefix.
+  const interactiveResume = executable === 'codex' && ['resume', 'fork'].includes(positionals[0]?.word);
+  const execResume = positionals[0]?.word === 'exec' && positionals[1]?.word === 'resume';
+  if (interactiveResume || execResume) {
+    const subcommand = positionals[interactiveResume ? 0 : 1];
+    const tail = entries.slice(entries.indexOf(subcommand) + 1);
+    // --last selects a session independently of any supplied id. A picker/--all without an id
+    // is equally unverifiable. After the subcommand, `--` can introduce a literal session id.
+    const selectedByLast = entries.some(entry => entry.kind === 'option' && /^--last(?:=|$)/.test(entry.word));
+    resumeIds.push(selectedByLast ? '' : tail.find(entry => ['positional', 'prompt'].includes(entry.kind))?.word ?? '');
   }
-  return { executable, entries, resumeIds };
+  return { executable, entries, resumeIds, interactiveResume };
+}
+
+/** Shared conservative shell evidence for the runtime normaliser and structural gate. Never evaluate it. */
+export function agentShellEvidence(text) {
+  const unquoted = text.replace(/['"`\\]/g, '');
+  let quote = '', started = false, closedQuote = false;
+  let ambiguous = /[$`\\~*?\[\]{}]/.test(text);
+  for (const c of text) {
+    if (quote) {
+      if (c === quote) { quote = ''; closedQuote = true; }
+    } else if (/\s|[;|&]/.test(c)) {
+      started = false; closedQuote = false;
+    } else if (c === "'" || c === '"') {
+      if (started) ambiguous = true;
+      quote = c; started = true;
+    } else {
+      if (closedQuote) ambiguous = true;
+      started = true;
+    }
+  }
+  return { unquoted, ambiguous: ambiguous || Boolean(quote) };
 }
 
 // Parse quoting only. Unsupported shell grammar refuses with the literal-argv fallback; never evaluate it.
 function shellWords(text) {
+  if (agentShellEvidence(text).ambiguous) throw new SyntaxError('unresolved shell quoting, escape or expansion; use literal argv');
   const words = []; let word = '', quote = '', started = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
@@ -133,8 +162,8 @@ function normaliseScript(text, depth, optionsOnly = false) {
     if (i !== words.length && words[i] !== separator) continue;
     const segment = words.slice(start, i); start = i + 1;
     if (!segment.length) continue;
-    if (optionsOnly && (isOption(segment[0]) || segment[0] === 'exec')) {
-      commands.push(normaliseOptions(segment, segment.includes('exec') ? 'codex' : 'claude'));
+    if (optionsOnly && (isOption(segment[0]) || ['exec', 'resume', 'fork'].includes(segment[0]))) {
+      commands.push(normaliseOptions(segment, segment.some(word => ['exec', 'resume', 'fork'].includes(word)) ? 'codex' : 'claude'));
     }
     else commands.push(...normaliseCommand(segment, depth, true));
   }
@@ -229,6 +258,9 @@ export function launchAgent(descriptor, primitive, ...args) {
   }
   if (!normalised.length) refuse('missing invocation evidence; use explicit literal argv', descriptor, log);
   const nativeIds = normalised.flatMap(command => command.resumeIds);
+  if (normalised.some(command => command.interactiveResume) && descriptor.mode !== 'codex-exec-resume') {
+    refuse('interactive resume/fork requires codex-exec-resume mode and a matching native resume id', descriptor, log);
+  }
   // Snapshot the validated words before the guard can mutate a captured argv reference.
   const validatedArgv = Array.isArray(args[1]) ? [...args[1]] : args[1];
   const validatedShell = args[2]?.shell;

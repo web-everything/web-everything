@@ -47,6 +47,22 @@ describe('single agent launch boundary', () => {
       "spawn('custom', ['echo x; codex'], {shell:true})"].map(source => ({ name: `R37.6 literal agent word: ${source}`, source, refused: true })),
     { name: 'R37.6 unrelated literal wrapper control', source: "spawn('npx', ['unrelated-tool'])" },
     { name: 'R37.6 agent name substring control', source: "spawn('custom', ['claude-tools', 'mycodex'], {shell:true})" },
+    ...["clau'de'", 'co"dex"', 'clau\\de', 'cla*de', 'co?ex', 'cla[up]de', 'co{d,d}ex',
+      '$tool', '${tool}', '$(printf tool)', '`printf tool`'].flatMap(command => {
+      const script = JSON.stringify(`${command} --resume unchecked-id`);
+      return [
+        `spawn('sh', ['-c', ${script}])`,
+        `exec(${script})`,
+        `execSync(${script})`,
+        `import {exec as execute} from 'node:child_process'; execute(${script})`,
+        `cp.exec(${script})`,
+        `spawn(${script}, [], {shell:true})`,
+      ].map(source => ({ name: `R37.12 shell text: ${source}`, source, refused: true }));
+    }),
+    { name: 'R37.12 wholly quoted agent command', source: 'spawn("sh", ["-c", "\\"claude\\" --resume unchecked-id"])', refused: true },
+    { name: 'R37.12 literal unrelated shell command control', source: "spawn('sh', ['-c', 'git status --short'])" },
+    { name: 'R37.12 wholly quoted unrelated shell command control', source: 'exec("\\"git\\" status")' },
+    { name: 'R37.12 shell syntax in direct argv control', source: 'spawn("git", ["$tool", "*", "{a,b}", "clau\\\'de\\\'"])' },
     ...[
       "import {spawn as start} from 'node:child_process'; start('claude',[])",
       "import {spawn} from 'child_process'; const start=spawn; start('claude',[])",

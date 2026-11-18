@@ -4599,3 +4599,13 @@ Production migration snapshots pin sorted per-file inventories with exact counts
 digests over every call kind, classification and fingerprint; line movement remains irrelevant.
 Audit snippets declare their shorthand primitive imports through the shared fixture helper.
 Unbound names and mutable default/require namespaces provide no literal-binding exemption.
+
+R37.12 shares conservative shell-text evidence between the structural gate and the single runtime
+normaliser: inspect raw and de-quoted agent words; refuse mid-word quote concatenation, escapes,
+expansions and globbing even when the raw text hides the executable. Whole-word literal quotes
+remain supported; direct argv treats shell characters as data. The fallback is direct literal argv.
+R37.13 includes Codex's top-level `resume` and `fork`, after global options and before session
+options. These require `codex-exec-resume` mode and the matching literal `resumeId`. Pickers,
+`--last` (even alongside an id), and `--all` without an id refuse because session selection cannot
+be verified; supply an explicit session id instead. Keep matching-id controls for both subcommands,
+all invocation forms, and option-value/delimited-prompt controls in the R37 table.
