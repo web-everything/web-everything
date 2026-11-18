@@ -13,7 +13,7 @@ function fixture(test, enforce = true) {
   const logPath = join(dir, 'events.log');
   const spawn = vi.fn(() => ({ status: 0, stdout: '{"pr":123,"url":"example"}' }));
   const review = vi.fn(() => ({ action: 'pass' }));
-  const runner = (options = {}) => createPrLandRunner({ spawn, prePrReview: review, cwd: dir, prepLogPath: logPath, ...(enforce ? { prepMode: 'enforce' } : {}), ...options });
+  const runner = (options = {}) => createPrLandRunner({ canonicalAudit: () => ({ ok: true }), spawn, prePrReview: review, cwd: dir, prepLogPath: logPath, ...(enforce ? { prepMode: 'enforce' } : {}), ...options });
   const argv = ['--ref=lane/prep', '--title=feature', `--body-file=${bodyFile}`];
   try { test({ dir, bodyFile, logPath, spawn, review, runner, argv }); }
   finally { rmSync(dir, { recursive: true, force: true }); }
@@ -129,7 +129,7 @@ describe('open-pr prep admission', () => {
       import { createPrLandRunner } from ${JSON.stringify(moduleUrl)};
       import { prepVerdict } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../lib/prep-block.mjs')).href)};
       let copiedBody, gatedBody, prepPath, spawns = 0;
-      const run = createPrLandRunner({
+      const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }),
         readPrepBody: (path, encoding) => {
           prepPath = path;
           return readFileSync(path, encoding);
