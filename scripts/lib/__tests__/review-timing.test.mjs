@@ -587,9 +587,21 @@ it.each(['timed_out', 'startup_failure', 'action_required', 'cancelled', 'stale'
 
 describe('fail-closed provenance and strict admission (PR2a audit)', () => {
   it('unknown provenance makes fixReadiness wait instead of reporting nothing pending', () => {
-    const r = fixReadiness({ headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks: ['test'] });
-    expect(r.otherPending).toBe(true);
-    expect(r.ciFailed).toBe(false);
+    // The raw reader: the file-level wrapper would supply complete live provenance.
+    const queued = rawfixReadiness({ headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks: ['test'] });
+    const failed = rawfixReadiness({ headSha: head, checks: [check('test', 'failure')], requiredChecks: ['test'] });
+    for (const r of [queued, failed]) {
+      expect(r.otherPending).toBe(true);
+      expect(r.ciFailed).toBe(false);
+      expect(r.reason).toMatch(/foreign-head|rows-incomplete|roster-unavailable/);
+    }
+    // Complete provenance on the same rows is NOT unknown: the failure is promptly ciFailed.
+    expect(fixReadiness({ headSha: head, checks: [check('test', 'failure')], requiredChecks: ['test'] }).ciFailed).toBe(true);
+  });
+  it('a roster of only held review gates is not CI evidence: the fix push waits to the bound', () => {
+    const input = { headSha: head, previousHeadChecks: [check('review-gate', 'failure')], requiredChecks: ['review-gate'],
+      firstHeldAt: 0, now: 0, policy: { pushAfterCi: true, pushAfterCiMaxMin: 1 } };
+    expect(fixPushGate(input).action).toBe('wait');
   });
   it('strict ci-green admission refuses a failed required review-gate (conflict), as on main', () => {
     const gate = reviewStartGate({ headSha: head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
