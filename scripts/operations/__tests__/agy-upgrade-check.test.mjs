@@ -155,6 +155,16 @@ describe('scheduled upgrade check', () => {
       expect(fs.existsSync(join(f.dir, 'upgrade-check.lock'))).toBe(true);
       expect(await runUpgradeCheck(f.options)).toEqual({ status: 'locked' });
     });
+  it('keeps the lock even when alert publication throws after a refused kill', async () => {
+    vi.useFakeTimers();
+    const f = fixture([]), kill = vi.fn(() => { throw Object.assign(Error('refused'), { code: 'EPERM' }); });
+    f.exec.mockImplementationOnce((command, args, options) => boundedExec(command, args, { ...options, spawn: fakeChild, kill }));
+    f.alert.mockRejectedValue(new Error('feed down'));
+    const pending = expect(runUpgradeCheck(f.options)).rejects.toThrow('feed down');
+    await vi.advanceTimersByTimeAsync(120000);
+    await pending;
+    expect(fs.existsSync(join(f.dir, 'upgrade-check.lock'))).toBe(true);
+  });
   it('creates the binary folder and leaves only atomic destination files', async () => {
     const f = fixture([good, current]); fs.rmdirSync(join(f.dir, 'binary'));
     await runUpgradeCheck(f.options);

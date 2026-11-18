@@ -114,11 +114,12 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
       }
     };
     let result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
+    if (result.reason === 'cleanup incomplete') leaveLock = true; // before record(): persistence may throw
     await record(result);
-    if (result.reason === 'cleanup incomplete') { leaveLock = true; return { status: 'dead', ...result }; }
+    if (result.reason === 'cleanup incomplete') return { status: 'dead', ...result };
     const outdated = await exec('brew', ['outdated', '--cask', '--json=v2'], { timeoutMs: 60000 });
     const cleanupFailed = async command => {
-      leaveLock = true;
+      leaveLock = true; // before record(): persistence may throw
       result = { ...result, ok: false, reason: 'cleanup incomplete', hung: !!command.hung };
       await record(result);
       return { status: 'dead', ...result };
@@ -134,8 +135,8 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
       const upgrade = await exec('brew', ['upgrade', '--cask', 'antigravity-cli'], { timeoutMs: 120000 });
       if (upgrade.reason === 'cleanup incomplete') return await cleanupFailed(upgrade);
       result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
+      if (result.reason === 'cleanup incomplete') leaveLock = true; // before record(): persistence may throw
       await record(result);
-      if (result.reason === 'cleanup incomplete') leaveLock = true;
       if (!upgrade.ok) log('agy-upgrade: upgrade failed; operator should inspect brew upgrade --cask antigravity-cli');
     }
     return { status: result.ok ? 'ok' : 'dead', ...result };
