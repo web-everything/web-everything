@@ -12,7 +12,7 @@ export function pinnedGit(exec, args) {
   }
   Object.assign(env, { GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0', GIT_ATTR_NOSYSTEM: '1' });
-  const diff = args[0] === 'diff' ? ['--no-textconv', '--no-ext-diff', '--no-renames'] : [];
+  const diff = args[0] === 'diff' ? ['--no-textconv', '--no-ext-diff', '--no-renames', '--no-color'] : [];
   return String(exec('git', ['-c', 'core.attributesFile=/dev/null', args[0], ...diff, ...args.slice(1)], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
     maxBuffer: 64 * 1024 * 1024, env,

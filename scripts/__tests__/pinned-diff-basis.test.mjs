@@ -207,4 +207,21 @@ describe('pinned caller evidence', () => {
     const good = computeNetDiffSignals({ exec: f.exec, basis });
     expect(() => requireScoredNetDiff({ ...good, netDiffText: { ...good.netDiffText, baseSha: f.head } }, f.head)).toThrow('mismatched');
   });
+  it('repo-local color.diff=always cannot colour pinned diffs past the tamper parser', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'pinned-color-'));
+    dirs.push(dir);
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@e.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@e.test' };
+    const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    git(['init', '-q']);
+    git(['config', 'color.diff', 'always']);
+    git(['config', 'color.ui', 'always']);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    git(['add', '.']); git(['commit', '-q', '-m', 'one']);
+    const first = git(['rev-parse', 'HEAD']);
+    writeFileSync(join(dir, 'a.txt'), 'two\n');
+    git(['commit', '-qam', 'two']);
+    const text = pinnedGit((cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir }), ['diff', '--end-of-options', first, 'HEAD']);
+    expect(text).toContain('+two');
+    expect(text).not.toContain('\u001b[');
+  });
 });
