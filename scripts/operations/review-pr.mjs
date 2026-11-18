@@ -760,8 +760,9 @@ export function buildReviewReferralVerifierJudgeRequest({ read, candidates }) {
 export const ANTIGRAVITY_REVIEW_ENV_VAR = 'REVIEW_PR_ANTIGRAVITY_REVIEW';
 
 /** New runs use the review setting; saved runs retain their recorded roster. */
-export function antigravityReviewFromEnv(env = process.env, options = {}) {
-  return resolveExternalJurorSettings({ ...options, env }).value.antigravityReview === 'on';
+export function antigravityReviewFromEnv(env = process.env, { isOnProbation = defaultAntigravityReviewProbationCheck, ...options } = {}) {
+  const mode = resolveExternalJurorSettings({ ...options, env }).value.antigravityReview;
+  return mode === 'probation' ? isOnProbation() : mode === 'on';
 }
 
 /**
@@ -841,7 +842,7 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
 }
 
 /**
- * Legacy exported probation check (new-run seating uses advisorySeats.antigravityReview): is the seated Antigravity
+ * Default check for advisorySeats.antigravityReview=probation: is the seated Antigravity
  * identity declared `'probation'` or `'trusted'` for the `'advisory-review'` role? Named and exported
  * separately, mirroring `defaultCodexAdvisoryProbationCheck`, so a test can assert ON it directly without
  * stubbing the whole default parameter chain.

@@ -3547,13 +3547,13 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
     });
 
     // #3383 — the probation default, mirroring both Codex seats' own.
-    it('when the env var is UNSET, defaults off even on probation', () => {
-      expect(antigravityReviewFromEnv({}, { isOnProbation: () => true })).toBe(false);
+    it('when the env var is UNSET, follows probation by default', () => {
+      expect(antigravityReviewFromEnv({}, { isOnProbation: () => true })).toBe(true);
       expect(antigravityReviewFromEnv({}, { isOnProbation: () => false })).toBe(false);
     });
 
-    it('when the env var is UNSET, uses the shipped off setting', () => {
-      expect(antigravityReviewFromEnv({})).toBe(false);
+    it('when the env var is UNSET, uses the shipped probation setting', () => {
+      expect(antigravityReviewFromEnv({})).toBe(defaultAntigravityReviewProbationCheck());
     });
 
     it('the real default probation check reads the ANTIGRAVITY identity, and today\'s registry declares it on probation', () => {

@@ -195,7 +195,7 @@ export function resolveExternalJurorSettings({ env = process.env, platform, file
   const valid = {
     firstOutputMs: v => Number.isSafeInteger(v) && v >= 0,
     cooldownMs: v => Number.isSafeInteger(v) && v > 0,
-    antigravityReview: v => v === 'on' || v === 'off',
+    antigravityReview: v => ['on', 'off', 'probation'].includes(v),
   };
   const invalid = [];
   const project = v => Object.fromEntries(Object.entries({ firstOutputMs: v?.externalJurors?.firstOutputMs,
@@ -207,7 +207,7 @@ export function resolveExternalJurorSettings({ env = process.env, platform, file
     }));
   const numeric = v => typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : v;
   const result = cascadePolicy('review.externalJurors', project(tool), {
-    standard: { firstOutputMs: 120000, cooldownMs: 1800000, antigravityReview: 'off' },
+    standard: { firstOutputMs: 120000, cooldownMs: 1800000, antigravityReview: 'probation' },
     platform: project(platform ?? platformPreference('review', { env })), env,
     envValues: { firstOutputMs: numeric(env.WE_REVIEW_JUROR_FIRST_OUTPUT_MS),
       cooldownMs: numeric(env.WE_REVIEW_JUROR_COOLDOWN_MS),

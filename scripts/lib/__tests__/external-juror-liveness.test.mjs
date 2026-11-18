@@ -11,6 +11,7 @@ import { normalizeJudgeTelemetry } from '../../operations/run-record.mjs';
 import { createDefaultJudge, unwrapJudgeOutcome, judgeOutcome } from '../../operations/cli-adapter.mjs';
 import { antigravityReviewFromEnv, buildReviewAntigravityJudgeRequest, buildReviewAgyCorrectnessJudgeRequest,
   reviewSeatOptionsForRun } from '../../operations/review-pr.mjs';
+import { referralSeatDisabled } from '../../operations/review-seat-policy.mjs';
 import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
 
 function childProcess() {
@@ -86,7 +87,7 @@ describe('external juror first-output liveness', () => {
 describe('review external juror setting cascade', () => {
   it('uses standard defaults and logs their provenance', () => {
     const log = vi.fn(); const result = settings({ log });
-    expect(result.value).toEqual({ firstOutputMs: 120000, cooldownMs: 1800000, antigravityReview: 'off' });
+    expect(result.value).toEqual({ firstOutputMs: 120000, cooldownMs: 1800000, antigravityReview: 'probation' });
     expect(log.mock.calls[0][0]).toContain('firstOutputMs=120000 (standard)');
   });
   it('resolves each leaf standard -> platform -> tool -> env', () => {
@@ -102,11 +103,25 @@ describe('review external juror setting cascade', () => {
     const r = settings({ readFile, env: { WE_REVIEW_JUROR_FIRST_OUTPUT_MS: String(value), WE_REVIEW_JUROR_COOLDOWN_MS: String(value) } });
     expect(r.value.firstOutputMs).toBe(120000); expect(r.value.cooldownMs).toBe(1800000); expect(r.invalid.length).toBeGreaterThan(0);
   });
-  it('defaults the seat off without consulting probation, and preserves literal env overrides', () => {
-    const opts = { platform: {}, readFile: () => '{}', log: () => {}, isOnProbation: () => { throw Error('must not consult probation'); } };
-    expect(antigravityReviewFromEnv({}, opts)).toBe(false);
-    expect(antigravityReviewFromEnv({}, { ...opts, readFile: () => '{"advisorySeats":{"antigravityReview":"on"}}' })).toBe(true);
+  it.each([true, false])('default probation mode preserves old seating when probation=%s', active => {
+    const opts = { platform: {}, readFile: () => '{}', log: () => {}, isOnProbation: () => active };
+    expect(antigravityReviewFromEnv({}, opts)).toBe(active);
+    expect(antigravityReviewFromEnv({}, { ...opts, readFile: () => '{"advisorySeats":{"antigravityReview":"probation"}}' })).toBe(active);
+  });
+  it.each(['on', 'off'])('forced %s bypasses probation and literal env overrides win', mode => {
+    const opts = { platform: {}, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: mode } }),
+      log: () => {}, isOnProbation: () => { throw Error('must not consult probation'); } };
+    expect(antigravityReviewFromEnv({}, opts)).toBe(mode === 'on');
     for (const value of ['1', '0', '', 'true']) expect(antigravityReviewFromEnv({ REVIEW_PR_ANTIGRAVITY_REVIEW: value }, opts)).toBe(value === '1');
+  });
+  it('invalid seat mode falls back to probation and logs tool provenance for valid probation', () => {
+    expect(settings({ readFile: () => '{"advisorySeats":{"antigravityReview":"unknown"}}' }))
+      .toMatchObject({ value: { antigravityReview: 'probation' }, sources: { antigravityReview: 'standard' }, invalid: [expect.stringContaining('antigravityReview')] });
+    expect(settings({ readFile: () => '{"advisorySeats":{"antigravityReview":"probation"}}' }))
+      .toMatchObject({ value: { antigravityReview: 'probation' }, sources: { antigravityReview: 'tool' } });
+  });
+  it('shipped probation keeps existing unruled Antigravity referrals enabled and saved rosters intact', () => {
+    expect(referralSeatDisabled('judgeAntigravityReview', {})).toBe(false);
     expect(reviewSeatOptionsForRun({ findings: { read: { seatSteps: ['judge', 'judgeSecurity', 'judgeAntigravityReview'] }, judgeAntigravityReview: {} } }, null, { antigravityReview: false }).antigravityReview).toBe(true);
   });
 });
@@ -122,6 +137,29 @@ describe('unresponsive advisory skip evidence', () => {
     expect(answer.value.skipped.reason).toBe('provider-unresponsive');
     expect(answer.value.summary).toContain('first-output window 15 ms; cooldown 1000 ms');
     expect(answer.telemetry).toMatchObject({ fallbackDecision: 'skip-provider-unresponsive', firstOutputMs: 15 });
+  });
+  it.each(['skip-provider-unresponsive', 'skip-quota-exhausted', 'skip-quota-hold', 'skip-backend-mismatch', 'skip-model-mismatch'])('skips explicit provider evidence %s', fallbackDecision => {
+    const error = agyEvidenceError({ ...evidence, fallbackDecision });
+    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw error; }, checkProviderHold: () => null, logGracefulOutcome: () => {} });
+    const request = buildReviewAntigravityJudgeRequest({ read: { title: 'fixture', netChangedFiles: [], diffText: 'diff' } });
+    return judge(request).then(result => {
+      const answer = unwrapJudgeOutcome(result);
+      expect(answer.value.skipped).toBeDefined();
+      expect(answer.value.findings).toEqual([]);
+      expect(answer.telemetry.fallbackDecision).toBe(fallbackDecision);
+    });
+  });
+  it.each(['missing structured output', 'malformed structured output', 'schema validation failed', 'tool-denial', 'unexpected failure'])('fails closed on %s without skip evidence', async message => {
+    const error = new Error(message);
+    const log = vi.fn();
+    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw error; }, checkProviderHold: () => null, logGracefulOutcome: log });
+    const request = buildReviewAntigravityJudgeRequest({ read: { title: 'fixture', netChangedFiles: [], diffText: 'diff' } });
+    await expect(judge(request)).rejects.toBe(error);
+    error.telemetry = { ...evidence, fallbackDecision: 'none' };
+    await expect(judge(request)).rejects.toBe(error);
+    error.telemetry.fallbackDecision = 'skip-unknown';
+    await expect(judge(request)).rejects.toBe(error);
+    expect(log).not.toHaveBeenCalled();
   });
   it('agy-correctness preserves unresponsive evidence through its advisory runner', async () => {
     const request = buildReviewAgyCorrectnessJudgeRequest({ read: { title: 'fixture', netChangedFiles: [], diffText: 'diff' }, model: 'fixture' });
