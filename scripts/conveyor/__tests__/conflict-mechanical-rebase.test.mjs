@@ -6,6 +6,7 @@ import { Worker } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
 import { buildConflictRebaseCandidates, sweepMechanicalConflictRebases, createConflictRebaseLedger,
   resolveConflictRebaseSettings } from '../conflict-mechanical-rebase.mjs';
+import { readSettingsChecked } from '../../lib/settings-files.mjs';
 import { runTickAllRepos, buildCliDaemonEffects, runConflictRebaseAllRepos, resolveFixPassBudgets } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40);
@@ -13,12 +14,80 @@ const pr = (number, extra = {}) => ({ number, state: 'OPEN', baseRefName: 'main'
   headRefName: `lane/test-${number}`, headRefOid: 'c'.repeat(40), mergeStateStatus: 'DIRTY', labels: [], ...extra });
 const fixture = (extra = {}) => ({ repo: 'web-everything/web-everything', apply: true,
   readOpenPrs: () => [pr(1), pr(2), pr(3)], readMainTip: () => ({ sha }),
+  run: vi.fn(() => ({ status: 0, stdout: sha })),
   refresh: vi.fn(() => ({ ok: true, action: 'rebased', newCommit: nextSha })),
   ledger: createConflictRebaseLedger({ env: { WE_UNDER_TEST: '1' } }), maxPerPass: 3,
   now: () => 1000, checkClaim: () => null, readIsCrossRepository: () => false,
   reconcileAcceptance: vi.fn(() => ({ attempted: false })), postComment: vi.fn(), ...extra });
 
 describe('mechanical conflict rebase', () => {
+  it.each(['malformed', 'unreadable', 'absent', 'valid'])('settings %s resolves closed on read/parse failures', mode => {
+    const dir = mkdtempSync(join(tmpdir(), 'conflict-settings-'));
+    const legacyPath = join(dir, 'settings.json');
+    try {
+      if (mode === 'malformed') writeFileSync(legacyPath, '{');
+      if (mode === 'valid') writeFileSync(legacyPath, '{}');
+      const result = resolveConflictRebaseSettings({ env: {}, platform: {},
+        readSettings: () => readSettingsChecked({ dir, legacyPath: mode === 'unreadable' ? dir : legacyPath }),
+      });
+      expect(result.value.conflictRebasePerPass).toBe(['absent', 'valid'].includes(mode) ? 3 : 0);
+      if (['malformed', 'unreadable'].includes(mode)) {
+        const closed = resolveConflictRebaseSettings({ env: { WE_CONFLICT_REBASE_PER_PASS: '3' }, platform: {},
+          readSettings: () => readSettingsChecked({ dir, legacyPath: mode === 'unreadable' ? dir : legacyPath }),
+        });
+        expect(closed.value.conflictRebasePerPass).toBe(0);
+        expect(closed.sources.conflictRebasePerPass).toBe('tool');
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([null, undefined, -1, 101, 1.5, 'bad', {}, false])('invalid present tool cap %s disables even with an enabling environment', value => {
+    const resolved = resolveConflictRebaseSettings({ env: { WE_CONFLICT_REBASE_PER_PASS: '3' }, platform: {},
+      file: { fix: { conflictRebasePerPass: value } },
+    });
+    expect(resolved.value.conflictRebasePerPass).toBe(0);
+    expect(resolved.sources.conflictRebasePerPass).toBe('tool');
+  });
+
+  it.each(['stale', 'unreadable', 'fetch-failed', 'throws'])('%s local main refuses before consuming a ledger attempt', mode => {
+    const run = vi.fn((_cmd, args) => {
+      if (mode === 'throws') throw Error('git unavailable');
+      return { status: mode === 'fetch-failed' || mode === 'unreadable' && args[0] === 'rev-parse' ? 1 : 0, stdout: nextSha };
+    });
+    const opts = fixture({ run });
+    expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([{ kind: 'conflict-rebase-stale-main' }]);
+    expect(opts.ledger.read()).toEqual({});
+    expect(opts.refresh).not.toHaveBeenCalled();
+    expect(opts.postComment).not.toHaveBeenCalled();
+    expect(run.mock.calls[0]).toEqual(['git', ['fetch', 'origin', 'main'], { cwd: expect.any(String) }]);
+  });
+
+  it('fetches and verifies the configured default branch in the repo root before claiming', () => {
+    const opts = fixture({ defaultBranch: 'trunk', readOpenPrs: () => [pr(1, { baseRefName: 'trunk' })] });
+    opts.ledger.claim = vi.fn(() => {
+      expect(opts.run.mock.calls.map(call => call[1])).toEqual([['fetch', 'origin', 'trunk'], ['rev-parse', 'origin/trunk']]);
+      expect(opts.run.mock.calls[0][2]).toEqual(opts.run.mock.calls[1][2]);
+      return true;
+    });
+    expect(sweepMechanicalConflictRebases(opts).applied).toHaveLength(1);
+    expect(opts.ledger.claim).toHaveBeenCalledWith(`1@${sha}`, 1000);
+    expect(opts.refresh).toHaveBeenCalledWith('lane/test-1', expect.objectContaining({ base: 'origin/trunk' }));
+  });
+
+  it.each(['unknown-conflict', 'unreadable-count'])('default sweep refresh uses strict rebase for %s', mode => {
+    const run = vi.fn((_cmd, args) => {
+      if (args[0] === 'rev-parse') return { status: 0, stdout: sha };
+      if (args[0] === 'merge-tree') return { status: mode === 'unknown-conflict' ? 1 : 0, stdout: 'd'.repeat(40) + '\n' };
+      if (args[0] === 'write-tree') return { status: 0, stdout: 'e'.repeat(40) };
+      if (args[0] === 'diff') return { status: 1, stdout: '' };
+      return { status: 0, stdout: '' };
+    });
+    const opts = fixture({ refresh: undefined, run, readOpenPrs: () => [pr(1)] });
+    expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([{ kind: 'conflict-rebase-not-mechanical' }]);
+    expect(run.mock.calls.some(call => ['commit-tree', 'push'].includes(call[1][0]))).toBe(false);
+    expect(opts.ledger.read()).toEqual({ [`1@${sha}`]: 1000 });
+  });
+
   it('includes drafts and review:human/accepted across all conflict signals; excludes non-main, closed, forks and unknown evidence', () => {
     const rows = [pr(1, { isDraft: true, labels: ['review:human'] }),
       pr(2, { labels: [{ name: 'review:accepted' }], mergeStateStatus: 'BLOCKED', mergeable: 'CONFLICTING' }),
@@ -41,7 +110,7 @@ describe('mechanical conflict rebase', () => {
         }) });
       sweepMechanicalConflictRebases(opts);
       expect(sweepMechanicalConflictRebases({ ...opts, ledger: createConflictRebaseLedger({ path }) }).applied).toEqual([]);
-      expect(sweepMechanicalConflictRebases({ ...opts, readMainTip: () => ({ sha: nextSha }) }).applied).toHaveLength(1);
+      expect(sweepMechanicalConflictRebases({ ...opts, readMainTip: () => ({ sha: nextSha }), run: () => ({ status: 0, stdout: nextSha }) }).applied).toHaveLength(1);
       const later = 31 * 86400000;
       expect(sweepMechanicalConflictRebases({ ...opts, now: () => later, refresh: () => ({ ok: true, action: 'current' }) }).applied).toHaveLength(1);
       expect(opts.ledger.read()).toEqual({ [`1@${sha}`]: later });
@@ -90,6 +159,7 @@ describe('mechanical conflict rebase', () => {
           repo: 'web-everything/web-everything', apply: true, maxPerPass: 1, now: () => 1000,
           readOpenPrs: () => [workerData.pr], readMainTip: () => ({ sha: workerData.sha }),
           checkClaim: () => null, readIsCrossRepository: () => false,
+          run: () => ({ status: 0, stdout: workerData.sha }),
           ledger: { claim: (...args) => { const won = ledger.claim(...args); claims.push(won); return won; } },
           refresh: () => { refreshes++; return { ok: true, action: 'current' }; },
           reconcileAcceptance: () => { throw Error('current must not reconcile acceptance'); }, postComment: () => {},

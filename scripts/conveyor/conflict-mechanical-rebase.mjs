@@ -3,7 +3,8 @@
 import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
-import { readSettings } from '../lib/settings-files.mjs';
+import { readSettingsChecked } from '../lib/settings-files.mjs';
+import { rebaseDropManifest, gitRunner } from '../lib/rebase-drop-manifest.mjs';
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
@@ -16,14 +17,21 @@ const TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** standard → platform → tool → environment; malformed/oversized caps disable this pass.
  * The cascade logs the effective value and source. Existing fix dispatch remains the fallback. */
-export function resolveConflictRebaseSettings({ env = process.env, file = readSettings(), platform } = {}) {
-  const cap = v => v === undefined ? undefined
-    : ((typeof v === 'number' || typeof v === 'string') && /^\d+$/.test(String(v))
-      && Number(v) <= 100 ? Number(v) : 0);
-  return cascadePolicy('fix', { conflictRebasePerPass: cap(file?.fix?.conflictRebasePerPass) }, {
+export function resolveConflictRebaseSettings({ env = process.env, file, platform,
+  readSettings = readSettingsChecked,
+} = {}) {
+  const checked = file === undefined ? readSettings() : { value: file, taint: [] };
+  file = checked.value;
+  const raw = file?.fix?.conflictRebasePerPass;
+  const validCap = v => (typeof v === 'number' || typeof v === 'string')
+    && /^\d+$/.test(String(v)) && Number(v) <= 100;
+  const cap = v => v === undefined ? undefined : validCap(v) ? Number(v) : 0;
+  const disabled = checked.taint.length > 0
+    || (Object.hasOwn(file?.fix ?? {}, 'conflictRebasePerPass') && !validCap(raw));
+  return cascadePolicy('fix', { conflictRebasePerPass: disabled ? 0 : cap(raw) }, {
     standard: { conflictRebasePerPass: 3 },
     platform: { conflictRebasePerPass: cap((platform ?? platformPreference('fix', { env }))?.conflictRebasePerPass) },
-    env, envValues: { conflictRebasePerPass: cap(env.WE_CONFLICT_REBASE_PER_PASS) },
+    env, envValues: { conflictRebasePerPass: disabled ? undefined : cap(env.WE_CONFLICT_REBASE_PER_PASS) },
   });
 }
 
@@ -70,7 +78,10 @@ function claimAttempt(ledger, key, at) {
 }
 
 export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBranch = 'main',
-  readOpenPrs = defaultReadOpenPrs, readMainTip = defaultReadMainTip, refresh = refreshOntoMain,
+  readOpenPrs = defaultReadOpenPrs, readMainTip = defaultReadMainTip,
+  run = gitRunner, refresh = (laneRef, options) => refreshOntoMain(laneRef, {
+    ...options, rebase: args => rebaseDropManifest({ ...args, strict: true, run }),
+  }),
   ledger = createConflictRebaseLedger({ repo }), maxPerPass = resolveConflictRebaseSettings().value.conflictRebasePerPass,
   now = Date.now, checkClaim = pushRefusal, readIsCrossRepository = defaultReadIsCrossRepository,
   reconcileAcceptance = reconcileAcceptanceAfterRebase, postComment = defaultPostRebaseComment,
@@ -95,6 +106,18 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
     const held = checkClaim({ repo, branch: pr.headRefName });
     const guard = held || sameRepoRefusal(pr.number, { repo, readIsCrossRepository });
     if (guard) { refusals.push({ ...row, kind: 'conflict-rebase-guard', why: guard.message ?? guard.error }); continue; }
+    try {
+      const fetched = run('git', ['fetch', 'origin', defaultBranch], { cwd: root });
+      const local = fetched.status === 0
+        ? run('git', ['rev-parse', `origin/${defaultBranch}`], { cwd: root }) : null;
+      if (local?.status !== 0 || String(local.stdout ?? '').trim() !== mainSha) {
+        throw new Error('local main does not match live main');
+      }
+    } catch {
+      refusals.push({ ...row, kind: 'conflict-rebase-stale-main',
+        why: 'main fetch/verification failed; existing fix path retains ownership' });
+      break;
+    }
     try {
       if (!(ledger.claim ? ledger.claim(`${pr.number}@${mainSha}`, now())
         : claimAttempt(ledger, `${pr.number}@${mainSha}`, now()))) continue;

@@ -547,3 +547,41 @@ describe('fix evidence is drain-transient', () => {
     expect(calls.some((c) => ['commit-tree', 'push'].includes(c.args[0]))).toBe(false);
   });
 });
+
+
+describe('strict mechanical rebase evidence (drain defaults preserved)', () => {
+  it('strict non-clean merge without parseable paths skips before writing or pushing', () => {
+    const parsed = { clean: false, conflictPaths: [] };
+    expect(manifestConflictDisposition(parsed, LANE_MANIFEST, { strict: true })).toBe('real');
+    expect(manifestConflictDisposition(parsed)).toBe('clean');
+    const { run, calls } = scriptedRun({ 'merge-tree': { status: 1, stdout: 'a'.repeat(40) + '\nunknown format' } });
+    expect(rebaseDropManifest({ laneRef: 'lane/unknown', run, strict: true }).action).toBe('skip');
+    expect(calls.map(c => c.args[0])).toEqual(['fetch', 'merge-tree']);
+  });
+
+  it.each([[null, 0], [0, null], [NaN, 0], [0, Infinity], [undefined, 3]])('strict unreadable counts %s/%s refuse', (prev, post) => {
+    expect(scopeJumpVerdict(prev, post, { strict: true })).toMatchObject({ ok: false, reason: expect.stringContaining('unreadable') });
+    expect(scopeJumpVerdict(prev, post).ok).toBe(true);
+  });
+
+  it('strict zero baseline permits unchanged empty scope and refuses oversized growth', () => {
+    expect(scopeJumpVerdict(0, 0, { strict: true }).ok).toBe(true);
+    expect(scopeJumpVerdict(0, 309, { strict: true }).ok).toBe(false);
+    expect(scopeJumpVerdict(0, 309).ok).toBe(true);
+  });
+
+  it.each(['before', 'after'])('strict unreadable %s diff count prevents commit/push; default remains lenient', failed => {
+    const script = { ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+      diff: args => ({ status: args[2].includes('...') === (failed === 'before') ? 1 : 0, stdout: '' }),
+    };
+    const { run, calls } = scriptedRun(script);
+    expect(rebaseDropManifest({ laneRef: 'lane/counts', run, strict: true })).toMatchObject({ action: 'error', guard: 'scope-jump' });
+    expect(calls.some(c => ['commit-tree', 'push'].includes(c.args[0]))).toBe(false);
+    expect(rebaseDropManifest({ laneRef: 'lane/counts', run: scriptedRun(script).run }).action).toBe('rebased');
+  });
+
+  it('strict readable zero counts still allow rebuilding', () => {
+    const { run } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING });
+    expect(rebaseDropManifest({ laneRef: 'lane/empty', run, strict: true }).action).toBe('rebased');
+  });
+});

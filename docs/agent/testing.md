@@ -4623,3 +4623,8 @@ fixtures; a refresh must invalidate shared PR discovery before fix planning. Kee
 restart/same-main-SHA ledger checks paired with failure-before-refresh checks:
 unreadable or unwritable attempt state leaves ownership with existing fix dispatch.
 Run these scoped suites through the host heavy-admission queue.
+
+The mechanical sweep uses checked settings and opts into strict manifest/count evidence;
+keep the drain defaults lenient. Fetch and verify the local default-branch ref against
+the live main SHA before claiming a ledger attempt. Cover stale/unreadable evidence
+without ledger consumption and strict refusals without commit/push in the scoped suites.

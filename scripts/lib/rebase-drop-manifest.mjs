@@ -70,10 +70,10 @@ export function parseMergeTree(stdout, exitCode) {
  *   'real'          — a non-manifest path conflicts → a human must resolve; skip.
  * @param {{clean:boolean, conflictPaths:string[]}} parsed
  */
-export function manifestConflictDisposition(parsed, manifest = LANE_MANIFEST) {
+export function manifestConflictDisposition(parsed, manifest = LANE_MANIFEST, { strict = false } = {}) {
   if (parsed.clean) return 'clean';
   const paths = parsed.conflictPaths || [];
-  if (paths.length === 0) return 'clean'; // exit≠0 but no parseable conflict paths → treat as no-op
+  if (paths.length === 0) return strict ? 'real' : 'clean'; // exit≠0 but no parseable conflict paths → treat as no-op
   if (paths.every((p) => isDrainTransientPath(p, manifest))) return 'manifest-only';
   return 'real';
 }
@@ -86,11 +86,15 @@ export const SCOPE_JUMP_FACTOR = 3;
 /**
  * PR #3794 — decide whether a rebuilt tip's changed-file count jumped implausibly far past the PR's previous
  * count (the signature of main's own commits being carried into the PR instead of just its own). Pure.
- * `prev`/`post` are file COUNTS; either being null/0 (unreadable / no baseline) means "cannot judge" -> ok.
+ * `prev`/`post` are file COUNTS; by default null/0 (unreadable / no baseline) means "cannot judge" -> ok.
+ * Strict mode refuses unreadable counts and applies the bounds even with a zero baseline.
  * @returns {{ok:boolean, prev:number|null, post:number|null, reason?:string}}
  */
-export function scopeJumpVerdict(prev, post) {
-  if (!Number.isFinite(prev) || !Number.isFinite(post) || prev <= 0) return { ok: true, prev, post };
+export function scopeJumpVerdict(prev, post, { strict = false } = {}) {
+  if (strict && (!Number.isFinite(prev) || !Number.isFinite(post))) {
+    return { ok: false, prev, post, reason: 'file counts unreadable; use existing fix dispatch or human review' };
+  }
+  if (!Number.isFinite(prev) || !Number.isFinite(post) || (!strict && prev <= 0)) return { ok: true, prev, post };
   if (post > prev + SCOPE_JUMP_SLACK && post > prev * SCOPE_JUMP_FACTOR) {
     return { ok: false, prev, post, reason: `the rebuilt tip would change ${post} files against base, but the PR changed ${prev} before the rebase (more than +${SCOPE_JUMP_SLACK} and x${SCOPE_JUMP_FACTOR}) — main's own commits are probably being carried into the PR` };
   }
@@ -121,6 +125,7 @@ export { gitRunner };
  * @param {string} [o.remote='origin']
  * @param {string} [o.readRef]          the ref to FEED the merge inputs (defaults to `<remote>/<laneRef>`);
  *                                       in a fresh clone (#2197) the bare `<laneRef>` does not resolve.
+ * @param {boolean} [o.strict=false]    refuse unknown conflicts/counts (opt-in for the conflict sweep).
  * @param {boolean} [o.fetch=true]      fetch `<laneRef>` from `<remote>` first so `<remote>/<laneRef>` is current (#2231).
  * @param {string} [o.manifest='.lane-manifest.json']
  * @param {string} [o.message]          commit-tree message (defaults to a "drain: rebase … drop manifest" line).
@@ -141,6 +146,7 @@ export function rebaseDropManifest({
   remote = 'origin',
   readRef,
   fetch = true,
+  strict = false,
   manifest = LANE_MANIFEST,
   message,
   tmpIndex = '.git/rebase-drop-index',
@@ -197,7 +203,7 @@ export function rebaseDropManifest({
     }
   }
 
-  const disp = manifestConflictDisposition(parsed, manifest);
+  const disp = manifestConflictDisposition(parsed, manifest, { strict });
   if (disp === 'real') return { action: 'skip', reason: `real conflict beyond ${manifest}`, conflictPaths: parsed.conflictPaths };
 
   // Build a resolved, manifest-free tree in a TEMP index — never touches HEAD or the working tree.
@@ -249,12 +255,12 @@ export function rebaseDropManifest({
   // PR #3794 — SCOPE-JUMP GUARD: refuse to push a rebuilt tip whose changed-file count (vs `base`) exploded past the
   // PR's count before the rebase, and report it. Counts are read with `git diff --name-only`: BEFORE = the PR's own
   // contribution (`base...mergeRef`, merge-base form); AFTER = `base` vs the resolved tree (what the PR will show once
-  // GitHub measures it against `base`). A read that fails or returns nothing means "cannot judge" and never blocks.
+  // GitHub measures it against `base`). By default, unreadable counts never block; strict callers refuse them.
   const countFiles = (args) => {
     const r = run('git', ['diff', '--name-only', ...args], { cwd });
     return r.status === 0 ? String(r.stdout || '').split('\n').filter(Boolean).length : null;
   };
-  const jump = scopeJumpVerdict(countFiles([`${base}...${mergeRef}`]), countFiles([base, resolvedTree]));
+  const jump = scopeJumpVerdict(countFiles([`${base}...${mergeRef}`]), countFiles([base, resolvedTree]), { strict });
   if (!jump.ok) {
     return { action: 'error', guard: 'scope-jump', prevFiles: jump.prev, postFiles: jump.post, reason: `refusing to push ${laneRef}: ${jump.reason}` };
   }
