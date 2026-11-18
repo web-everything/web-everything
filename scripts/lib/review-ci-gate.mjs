@@ -16,13 +16,8 @@ function statusAsCheckRow(row) {
   return row;
 }
 
-export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead, rowsComplete } = {}) {
-  const refuse = (reason, affected = []) => ({ allowed: false, headSha: headSha ?? null, reason, affected });
-  if (rowsComplete !== true || rowsHead !== headSha)
-    return { ...refuse('rows-incomplete'), unknown: true };
-  if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
-  if (!Array.isArray(requiredChecks) || !requiredChecks.length
-      || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return refuse('unknown-required-set');
+/** Shared head-bound prerequisite selection; foreign rows cannot imply required checks away. */
+export function reviewCiPrerequisites({ headSha, requiredChecks, checks }) {
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, statusAsCheckRow(row)]));
   // Validate explicit row heads before allowing an aggregate to imply a required check.
   const wrongHeads = new Set([...latest].filter(([, row]) => row?.head_sha != null && row.head_sha !== headSha).map(([name]) => name));
@@ -31,7 +26,18 @@ export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead, rowsCo
   // A wrong-head row is reported when required, or when it alone would have implied a required check away.
   const impliedAway = needed.length !== withoutImpliedRequiredChecks(requiredChecks, [...latest.values()]).length;
   const wrongHeadNames = [...wrongHeads].filter(name => impliedAway || requiredChecks.includes(name));
-  const affected = [...new Set([...wrongHeadNames, ...needed])].flatMap(name => {
+  return { latest, wrongHeads, needed: [...new Set([...wrongHeadNames, ...needed])] };
+}
+
+export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead, rowsComplete } = {}) {
+  const refuse = (reason, affected = []) => ({ allowed: false, headSha: headSha ?? null, reason, affected });
+  if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
+  if (rowsComplete !== true || rowsHead !== headSha)
+    return { ...refuse('rows-incomplete'), unknown: true };
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length
+      || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return refuse('unknown-required-set');
+  const { latest, wrongHeads, needed } = reviewCiPrerequisites({ headSha, requiredChecks, checks });
+  const affected = needed.flatMap(name => {
     const row = latest.get(name);
     let reason;
     if (!row) reason = 'missing';

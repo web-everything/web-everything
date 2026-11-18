@@ -18,8 +18,15 @@ describe('strict review CI prerequisite', () => {
     expect(gate([success('test'), ...(row ? [{ name: 'daemon-soak', ...row }] : [])])).toMatchObject({ allowed: false, affected: [{ name: 'daemon-soak', reason }] });
   });
   it('fails closed for absent evidence', () => {
-    for (const over of [{ headSha: null }, { requiredChecks: null }, { requiredChecks: [] }, { requiredChecks: [null] }, { checks: [] }, { checks: null }]) {
+    for (const over of [{ requiredChecks: null }, { requiredChecks: [] }, { requiredChecks: [null] }, { checks: [] }, { checks: null }]) {
       expect(reviewCiGate({ rowsComplete: true, rowsHead: headSha, headSha, requiredChecks: ['test'], checks: [success('test')], ...over }).allowed).toBe(false);
+    }
+  });
+  it.each([undefined, null, '', '   '])('reports missing-head before row hydration for headSha=%j', missingHead => {
+    for (const rowsHead of [missingHead, headSha]) {
+      expect(reviewCiGate({ rowsComplete: true, rowsHead, headSha: missingHead,
+        requiredChecks: ['test'], checks: [success('test')] }))
+        .toMatchObject({ allowed: false, reason: 'missing-head', affected: [] });
     }
   });
   it('uses the newest rerun regardless of REST ordering', () => {

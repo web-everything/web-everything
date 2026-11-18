@@ -768,6 +768,18 @@ describe('R272 fail-closed evidence across every row', () => {
 });
 
 describe('hydrated CI evidence for escalation retirement', () => {
+  it.each(['test', 'integration'])('foreign-head success cannot satisfy or imply required %s', required => {
+    for (const aggregate of [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { context: 'test', state: 'SUCCESS' },
+    ]) {
+      const evidence = { headSha: input.headSha, rowsHead: input.headSha, rowsComplete: true, requiredChecks: [required] };
+      for (const head_sha of [undefined, input.headSha]) {
+        expect(ciGreenForEscalation({ ...evidence, rollup: [{ ...aggregate, head_sha }] })).toBe(true);
+      }
+      expect(ciGreenForEscalation({ ...evidence, rollup: [{ ...aggregate, head_sha: 'other' }] })).toBe(false);
+    }
+  });
   it.each([
     { rowsComplete: undefined }, { rowsComplete: false }, { rowsHead: undefined }, { rowsHead: 'other' }, { rowsHead: null },
   ])('does not call green rows complete for this head: %j', evidence => {

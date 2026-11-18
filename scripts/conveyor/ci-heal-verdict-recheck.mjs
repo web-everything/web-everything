@@ -75,7 +75,10 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 export function ciGreenForEscalation({ rollup, requiredChecks, headSha, rowsHead, rowsComplete, rosterSource }) {
   if (rowsComplete !== true || rowsHead !== headSha) return false;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
-  const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
+  // Aggregate hydration metadata cannot override a row explicitly bound to another head.
+  const currentRows = (Array.isArray(rollup) ? rollup : [])
+    .filter(row => row?.head_sha == null || row.head_sha === headSha);
+  const { red, pending, missing } = requiredCheckStates({ rollup: currentRows, requiredChecks });
   return !red.length && !pending.length && !missing.length;
 }
 

@@ -10,6 +10,18 @@ const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
+  it.each(['off', 'shadow', 'on'])('push refuses foreign-head aggregate implication under startEarly=%s', startEarly => {
+    for (const aggregate of [check('test'), { context: 'test', state: 'success' }]) {
+      const input = { rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['integration'],
+        policy: { ...review, startAfter: 'push', startEarly, fastChecks: ['integration'] } };
+      for (const head_sha of [undefined, head]) {
+        expect(reviewStartGate({ ...input, checks: [{ ...aggregate, head_sha }] }).allowed).toBe(true);
+      }
+      const result = reviewStartGate({ ...input, checks: [{ ...aggregate, head_sha: 'other' }] });
+      expect(result.allowed).toBe(false);
+      expect(result.affected).toContainEqual({ name: 'integration', reason: 'missing' });
+    }
+  });
   it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
     const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
     const result = reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
