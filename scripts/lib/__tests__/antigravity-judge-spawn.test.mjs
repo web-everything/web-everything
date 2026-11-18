@@ -110,7 +110,7 @@ describe('buildAntigravityJudgeArgv — the argv translation, per #3633\'s probe
   });
 
   it('pins Argon high and omits --effort for every supported shared effort', () => {
-    expect(ANTIGRAVITY_MODEL).toBe('gemini-4-argon-high');
+    expect(ANTIGRAVITY_MODEL).toBe('gemini-4-carbon-high');
     for (const effort of Object.keys(ANTIGRAVITY_EFFORT_MAP)) {
       expect(buildAntigravityJudgeArgv({ ...base, model: ANTIGRAVITY_MODEL, effort })).not.toContain('--effort');
     }

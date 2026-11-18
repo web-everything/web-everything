@@ -392,7 +392,9 @@ export function scrubPaths(text, roots = [], home = homedir()) {
  */
 export function relativizeFindings(findings, roots = []) {
   const prefixes = roots.filter(Boolean).map((r) => `${String(r).replace(/\/+$/, '')}/`);
-  return (Array.isArray(findings) ? findings : []).map((f) => {
+  // Preserve malformed raw evidence for the shadow answer validator; never turn it into a clean accept.
+  if (!Array.isArray(findings)) return findings;
+  return findings.map((f) => {
     if (!f || typeof f.file !== 'string') return f;
     const hit = prefixes.find((p) => f.file.startsWith(p));
     return hit ? { ...f, file: f.file.slice(hit.length) } : f;
@@ -483,6 +485,10 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     let transcriptText = '';
     if (transcriptFile) {
       try { transcriptText = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
+      // Fail closed: a transcript with any non-empty line that is not valid JSON is incomplete escape evidence.
+      if (transcriptText.split('\n').some((line) => { if (!line.trim()) return false; try { JSON.parse(line); return false; } catch { return true; } })) {
+        reasons.push('transcript malformed — escape check incomplete');
+      }
       const calls = stateChangingToolCalls(transcriptText, {
         allowedRoots: [jurorLane, realpathOr(jurorLane)], home, sessionId: outcome?.sessionId,
       });
