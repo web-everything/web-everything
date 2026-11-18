@@ -10,7 +10,7 @@ export const PUBLIC_REPOSITORY='https://github.com/chalbert/web-everything.git';
 export const anonymousGitEnv=()=>({PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',
   GIT_TERMINAL_PROMPT:'0',GIT_ASKPASS:'/bin/false',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_COUNT:'0'});
 const stderrTail=value=>String(value??'').replace(/[\x00-\x1f\x7f-\x9f]/g,'').slice(-300);
-function gitExec({file='git',args,cwd,env,input}) {
+function gitExec({file='git',args,cwd,env,input,raw=false}) {
   return new Promise((resolve,reject)=>{
     const child=spawn(file,args,{cwd,env,stdio:[input===undefined?'ignore':'pipe','pipe','pipe']});
     const chunks=[];let size=0,overflow=false,stderr='';
@@ -21,7 +21,7 @@ function gitExec({file='git',args,cwd,env,input}) {
       if(stream===child.stderr)stderr=(stderr+chunk.toString('utf8')).slice(-600);
     });
     child.on('error',error=>{clearTimeout(timer);reject(error);});
-    child.on('close',code=>{clearTimeout(timer);overflow?reject(Object.assign(new Error('Git bound exceeded; use local fallback'),{stderr})):resolve({code,stdout:Buffer.concat(chunks).toString('utf8'),stderr});});
+    child.on('close',code=>{clearTimeout(timer);overflow?reject(Object.assign(new Error('Git bound exceeded; use local fallback'),{stderr})):resolve({code,stdout:raw?Buffer.concat(chunks):Buffer.concat(chunks).toString('utf8'),stderr});});
     if(input!==undefined){child.stdin.on('error',()=>{});child.stdin.end(input);}
   });
 }
@@ -92,13 +92,13 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
   const pending=await fs.mkdtemp(join(root,'.git-run-'));
   const cloned=join(pending,'clone');
   const env=anonymousGitEnv();
-  const git=async(args,cwd=cloned,input,allowMissing=false)=>{
+  const git=async(args,cwd=cloned,input,allowMissing=false,raw=false)=>{
     try {
       const result=await exec({file:'git',args:['-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
         '-c','protocol.ext.allow=never','-c','http.followRedirects=false',
-        '-c','safe.directory='+join(root,'repo.git'),'-c','safe.directory='+cloned,...args],cwd,env,input});
+        '-c','safe.directory='+join(root,'repo.git'),'-c','safe.directory='+cloned,...args],cwd,env,input,raw});
       if(result.code!==0){if(allowMissing)return null;throw Object.assign(new Error('Anonymous Git unavailable; use local fallback'),{stderr:result.stderr});}
-      return result.stdout.toString().trim();
+      return raw?Buffer.from(result.stdout):result.stdout.toString().trim();
     } catch(error) {
       throw new Error(`${args[0]}: ${stderrTail(error.stderr??error.message)}`,{cause:error});
     }
@@ -165,7 +165,8 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     // a root-owned .git directory, and Git config can execute commands.
     await git(['read-tree','--empty']);
     const index=[];
-    for(const entry of decodeManifest(primary).entries) {
+    const entries=decodeManifest(primary).entries;
+    for(const entry of entries) {
       const content=await baseFile(bytePath(work,entry.path));
       if(createHash('sha256').update(content).digest('hex')!==entry.sha256)throw new Error('Git snapshot changed');
       if(!entry.tracked)continue;
@@ -174,6 +175,49 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       // stages deletions of HEAD paths absent from the tracked Mac snapshot.
       const oid=await git(['hash-object','-w','--stdin'],cloned,content);
       index.push(Buffer.from(`${entry.executable?'100755':'100644'} ${oid}\t`),entry.path,Buffer.from([0]));
+    }
+    // Restore only HEAD links represented by projected aliases. Keep the real
+    // projected files in work: these entries are index metadata, never checkout.
+    const tree=await git(['ls-tree','-r','-z','HEAD'],cloned,undefined,false,true);
+    const linkPrefixes=tree.toString('latin1').split('\0')
+      .filter(record=>/^120000 blob [a-f0-9]+\t/.test(record))
+      .map(record=>record.slice(record.indexOf('\t')+1)+'/');
+    const byPath=new Map(entries.map(entry=>[entry.path.toString('latin1'),entry]));
+    let start=0;
+    for(let end=0;end<tree.length;end++)if(tree[end]===0) {
+      const record=tree.subarray(start,end),tab=record.indexOf(9);start=end+1;
+      const match=/^120000 blob ([a-f0-9]{40}(?:[a-f0-9]{24})?)$/.exec(record.subarray(0,tab).toString('ascii'));
+      if(tab<0||!match)continue;
+      const linkPath=record.subarray(tab+1);
+      let parts;
+      try {parts=pathParts(linkPath);}catch {continue;}
+      const prefix=Buffer.concat([linkPath,Buffer.from('/')]);
+      const under=entries.filter(entry=>entry.path.subarray(0,prefix.length).equals(prefix));
+      // A tracked descendant means the client replaced this link with a real
+      // directory; restoring the link would conflict with it as parent and child.
+      if(under.some(entry=>entry.tracked)||!under.length)continue;
+      const target=await git(['cat-file','blob',match[1]],cloned,undefined,true,true);
+      if(!target?.length||target[0]===47||target.some(b=>b===0||b===10||b===13))continue;
+      const targetParts=parts.slice(0,-1).map(part=>part.toString('latin1'));
+      let escaped=false;
+      for(const part of target.toString('latin1').split('/')) {
+        if(part==='..'){if(!targetParts.length){escaped=true;continue;}targetParts.pop();}
+        else if(part&&part!=='.')targetParts.push(part);
+      }
+      if(escaped)continue;
+      const targetPrefix=targetParts.length?targetParts.join('/')+'/':'';
+      const aliasPrefix=prefix.toString('latin1');
+      // The manifest has no link OID: prove the HEAD target still matches the
+      // client's projection in both directions before restoring its index blob.
+      if(entries.some(entry=>!entry.tracked&&entry.path.subarray(0,prefix.length).equals(prefix)
+        &&byPath.get(targetPrefix+entry.path.toString('latin1').slice(aliasPrefix.length))?.sha256!==entry.sha256))continue;
+      if(entries.some(entry=>{
+        const path=entry.path.toString('latin1');
+        if(!path.startsWith(targetPrefix)||linkPrefixes.some(prefix=>path.startsWith(prefix)))return false;
+        const alias=byPath.get(aliasPrefix+path.slice(targetPrefix.length));
+        return !alias||alias.tracked||alias.sha256!==entry.sha256;
+      }))continue;
+      index.push(Buffer.from(`120000 ${match[1]}\t`),linkPath,Buffer.from([0]));
     }
     await git(['update-index','-z','--index-info'],cloned,Buffer.concat(index));
     // HEAD-based gates see exactly the working delta from the Mac's HEAD.
