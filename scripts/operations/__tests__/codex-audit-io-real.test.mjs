@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
+import { cardLine, cardHash } from '../audit-base-repro.mjs';
 
 describe('codex-audit real IO', () => {
   it('resolves a branch and commit SHA to the full 40-hex commit in a real repo', async () => {
@@ -61,6 +62,46 @@ describe('codex-audit real IO', () => {
 
 
 describe('R1053 base reproduction IO', () => {
+  it.each(['A1', 'B2'].flatMap(cls => ['2026-11-18 12:00:01', '2026-11-18 12:01:00'].map(date => [cls, date])))
+  ('reuses the persisted card and index hash for %s on a retry at %s', async (cls, date) => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, cardsPath, indexPath };
+      const fields = { cls, path: 'x.mjs', symbol: 'X', sha10: '1234567890', text: 'finding with 2026-11-18 12:00:00 ET: inside' };
+      const firstLine = cardLine({ ...fields, date: '2026-11-18 12:00:00' });
+      const request = { key: `x.mjs|X|${cls}`, expedite: cls === 'B2', needsYou: cls === 'B2' };
+      const receipt = cls === 'B2' ? { written: true, expedite: true, needsYou: true } : true;
+      expect(createAuditDeps(options).fileCard({ ...request, cardLine: firstLine })).toEqual(receipt);
+      const firstCards = readFileSync(cardsPath, 'utf8');
+      const firstIndex = readFileSync(indexPath, 'utf8');
+      expect(createAuditDeps(options).fileCard({ ...request, cardLine: cardLine({ ...fields, date }) })).toEqual(receipt);
+      expect(readFileSync(cardsPath, 'utf8')).toBe(firstCards);
+      expect(firstCards.split('\n').filter(line => line.startsWith('- [R1053] '))).toEqual([firstLine]);
+      expect(firstCards.split('\n').filter(line => line.includes('[needs-you]'))).toHaveLength(cls === 'B2' ? 1 : 0);
+      expect(readFileSync(indexPath, 'utf8')).toBe(firstIndex);
+      const rows = firstIndex.trim().split('\n').map(line => JSON.parse(line));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].cardLineHash).toBe(cardHash(firstLine));
+    });
+  });
+  it.each(['A1', 'B2'].flatMap(cls => ['text', 'sha10'].map(field => [cls, field])))
+  ('keeps a changed %s finding distinct when %s changes', async (cls, field) => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, cardsPath, indexPath };
+      const fields = { cls, path: 'x.mjs', symbol: 'X', sha10: '1234567890', text: 'finding 2026-11-18 12:00:00 ET:' };
+      const request = { key: `x.mjs|X|${cls}`, expedite: cls === 'B2', needsYou: cls === 'B2' };
+      const firstLine = cardLine({ ...fields, date: '2026-11-18 12:00:00' });
+      const nextLine = cardLine({ ...fields, [field]: field === 'text' ? 'finding 2026-11-18 12:01:00 ET:' : 'abcdef1234', date: '2026-11-18 12:01:00' });
+      createAuditDeps(options).fileCard({ ...request, cardLine: firstLine });
+      createAuditDeps(options).fileCard({ ...request, cardLine: nextLine });
+      const lines = readFileSync(cardsPath, 'utf8').split('\n');
+      expect(lines.filter(line => line.startsWith('- [R1053] '))).toEqual([firstLine, nextLine]);
+      expect(lines.filter(line => line.includes('[needs-you]'))).toHaveLength(cls === 'B2' ? 1 : 0);
+      const rows = readFileSync(indexPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(rows.map(row => row.cardLineHash)).toEqual([cardHash(firstLine), cardHash(nextLine)]);
+    });
+  });
   it.each(['card', 'needs-you'])('repairs missing %s text despite a matching index and deduplicates the repair', async missing => {
     await withRealRepo(async ({ root, tmp }) => {
       const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');

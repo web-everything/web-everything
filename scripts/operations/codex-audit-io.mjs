@@ -110,7 +110,10 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         && line.endsWith(` ET: security pre-existing (${cls}) ${key}`);
       const needsYouLine = expedite && needsYou ? (securityLine(prior?.needsYouLine) && prior.needsYouHash === cardHash(prior.needsYouLine)
         ? prior.needsYouLine : lines.find(securityLine) || `- [R1053][needs-you] ${date} ET: security pre-existing (${cls}) ${key}`) : null;
-      const expected = [cardLine, ...(needsYouLine ? [needsYouLine] : [])];
+      // Only the generated leading date is incidental; retain the complete finding and base SHA.
+      const identity = line => line.replace(/^(- \[R1053\] )\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})? (?=ET:)/, '$1');
+      const persistedCardLine = lines.find(actual => identity(actual) === identity(cardLine)) ?? cardLine;
+      const expected = [persistedCardLine, ...(needsYouLine ? [needsYouLine] : [])];
       const missing = expected.filter(line => !lines.some(actual => cardHash(actual) === cardHash(line)));
       if (missing.length) {
         fs.mkdirSync(dirname(cardsPath), { recursive: true });
@@ -118,7 +121,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       }
       const verified = read(cardsPath).split('\n');
       if (!expected.every(line => verified.some(actual => cardHash(actual) === cardHash(line)))) throw new Error('card persistence verification failed');
-      const row = { key, cardHash: cardHash(key), cardLineHash: cardHash(cardLine),
+      const row = { key, cardHash: cardHash(key), cardLineHash: cardHash(persistedCardLine),
         ...(needsYouLine ? { needsYouLine, needsYouHash: cardHash(needsYouLine) } : {}) };
       if (!missing.length && prior && Object.entries(row).every(([k, v]) => prior[k] === v)) return receipt;
       fs.mkdirSync(dirname(indexPath), { recursive: true });
