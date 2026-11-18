@@ -584,3 +584,18 @@ it.each(['timed_out', 'startup_failure', 'action_required', 'cancelled', 'stale'
     }
   }
 });
+
+describe('fail-closed provenance and strict admission (PR2a audit)', () => {
+  it('unknown provenance makes fixReadiness wait instead of reporting nothing pending', () => {
+    const r = fixReadiness({ headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks: ['test'] });
+    expect(r.otherPending).toBe(true);
+    expect(r.ciFailed).toBe(false);
+  });
+  it('strict ci-green admission refuses a failed required review-gate (conflict), as on main', () => {
+    const gate = reviewStartGate({ headSha: head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
+      requiredChecks: ['test', 'review-gate'], checks: [check('test'), check('review-gate', 'failure')],
+      policy: { ...review, startAfter: 'ci-green', startEarly: 'off', startBeforeCi: false } });
+    expect(gate.allowed).toBe(false);
+    expect(gate.reason).toBe('required-review-gate-conflict');
+  });
+});

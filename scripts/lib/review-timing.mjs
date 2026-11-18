@@ -143,8 +143,11 @@ function registeredStartGate(input) {
 export function reviewStartGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete, rosterSource, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   const provenance = { rowsHead, rowsComplete, rosterSource, reviewStart: true };
   const input = { headSha, checks, requiredChecks, ...provenance };
-  const strictGate = reviewCiGate(input), strict = () => strictGate;
-  if (evidence(input).state === 'unknown' || strictGate.reason === 'required-review-gate-conflict') return strict();
+  const strictGate = reviewCiGate({ ...input, reviewStart: false }), strict = () => strictGate;
+  const admitGate = reviewCiGate(input);
+  // A held (failed) review-gate is excused for early/push starts, but strict ci-green admission still refuses it.
+  if (evidence(input).state === 'unknown' || admitGate.reason === 'required-review-gate-conflict'
+    || (policy.startAfter === 'ci-green' && strictGate.reason === 'required-review-gate-conflict')) return strict();
   // Rollback preserves the original strict CI-green result, including its reason and affected rows.
   if (policy.startEarly === 'off' && !policy.startBeforeCi && policy.startAfter === 'ci-green') return strict();
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;
@@ -225,8 +228,9 @@ export function fixReadiness({ headSha, checks = [], findings = [], reviewPendin
   return { ciFailed: failed.length > 0, reviewFindings: findings.length > 0,
     reason: resolved.state === 'unknown' ? resolved.reasons.join(',') : resolved.state,
     firstReadyAt: times.length ? Math.min(...times) : NaN,
-    otherPending: failed.length > 0 ? reviewPending && findings.length === 0
-      : Object.values(resolved.perName).some(value => value.state === 'pending'),
+    // Unknown evidence waits for CI (never an immediate dispatch): fail closed.
+    otherPending: resolved.state === 'unknown' || (failed.length > 0 ? reviewPending && findings.length === 0
+      : Object.values(resolved.perName).some(value => value.state === 'pending')),
     ciFailures: failed.map(row => ({ name: row.name ?? row.context, conclusion: row.conclusion ?? row.state,
       detailsUrl: row.details_url ?? row.detailsUrl ?? row.targetUrl ?? null })), findings };
 }
