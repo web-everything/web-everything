@@ -43,30 +43,23 @@ export function registeredDaemons(root, { env = process.env, exec = execFileSync
   });
 }
 
-/** Conservative immutable snapshot; narrowing by dependency analysis is a later optimization. */
+/** Every tracked change owes proof; inspect Git evidence when a snapshot is incomplete. */
 export function readClosure(root, daemon, sha) {
   try {
-    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha)) return { complete: false };
+    const oid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
+    if (typeof sha !== 'string' || !oid.test(sha)) return { complete: false };
     const entry = daemon.entry;
     if (typeof entry !== 'string' || !entry || isAbsolute(entry) ||
         entry.split('/').some(p => !p || p === '.' || p === '..')) return { complete: false };
-    const scope = entry.includes('/') ? entry.split('/')[0] + '/' : '.';
-    const paths = [...new Set(['scripts/', 'skills-src/', scope, 'package.json', 'package-lock.json'])];
-    const output = execFileSync('git', ['ls-tree', '-rz', '--full-tree', sha, '--',
-      ...paths.map(p => `:(literal)${p}`)], {
-      cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 8 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'pipe'],
+    const git = args => execFileSync('git', args, {
+      cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'pipe'],
     });
-    if (!output.endsWith('\0')) return { complete: false };
-    const files = new Map();
-    for (const row of output.slice(0, -1).split('\0')) {
-      const tab = row.indexOf('\t'), meta = row.slice(0, tab), file = row.slice(tab + 1);
-      const match = /^(?:100644|100755) blob ([a-f0-9]{40}|[a-f0-9]{64})$/.exec(meta);
-      if (tab < 0 || !match || !file || files.has(file)) return { complete: false };
-      files.set(file, match[1]);
-    }
-    return files.has(entry) ? { complete: true, files: Object.fromEntries(files) } : { complete: false };
-  } catch { return { complete: false }; } // Git failure/output bounds owe proof; operator must inspect the scoped tree.
+    const tree = git(['rev-parse', `${sha}^{tree}`]).trim();
+    const blob = /^(?:100644|100755) blob ([a-f0-9]{40}|[a-f0-9]{64})\0$/i.exec(
+      git(['ls-tree', '-z', '--full-tree', '--format=%(objectmode) %(objecttype) %(objectname)', sha, '--', `:(literal)${entry}`]));
+    return oid.test(tree) && blob
+      ? { complete: true, files: { '.tree': tree, [entry]: blob[1] } } : { complete: false };
+  } catch { return { complete: false }; }
 }
 
 function readRecord(root, env, now) {

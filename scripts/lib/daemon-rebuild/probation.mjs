@@ -68,7 +68,7 @@ export function validateProbation(p, now) {
 }
 
 /** `registered` must be the complete roster for ONE clone, frozen at adoption.
- * `readClosure(daemon, sha)` supplies complete repo-relative path -> Git blob maps at both revisions.
+ * `readClosure(daemon, sha)` supplies immutable tree and entry object ID snapshots at both revisions.
  * Unreadable closures owe proof; unreadable/ambiguous rosters refuse adoption, never imply an empty set.
  */
 export function freezeProbation({ adoptionId, sha, provenGood, adoptedAt, registered, readClosure } = {}) {

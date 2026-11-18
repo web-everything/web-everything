@@ -54,105 +54,65 @@ describe('R986 report-only probation persistence', () => {
       exec: () => JSON.stringify({ Label: mode === 'ambiguous label' ? 'com.we.Y' : 'com.we.X',
         WorkingDirectory: root, ProgramArguments: ['node', 'workers/x.mjs'] }) })).toThrow(/roster|identity/);
   });
-  it('any tracked scoped file changes the snapshot and owes proof, while docs do not', async () => {
-    const m = await load();
-    const roster = [...registered, { id: 'Z', entry: 'workers/y.mjs' }];
-    const paths = ['scripts/unrelated-sibling.mjs', 'scripts/unrelated.cjs', 'scripts/config.json',
-      'scripts/alias-target.cjs', 'scripts/tab\tand\nnewline.bin', 'skills-src/brief.md', 'workers/nested/sibling.txt',
-      'package.json', 'package-lock.json', 'docs/guide.md'];
-    writeFileSync(join(root, 'workers/y.mjs'),
-      "import { createRequire } from 'node:module'; const alias = createRequire(import.meta.url); alias('../scripts/alias-target.cjs');");
-    for (const file of paths) {
+  it.each(['docs/agent/reviewer-expectations.md', 'scripts/lib/policy.mjs', 'config.json', 'unrelated.cjs'])(
+    'any tracked change to %s changes every daemon snapshot and owes proof', async file => {
+      const m = await load();
       mkdirSync(join(root, file, '..'), { recursive: true });
       writeFileSync(join(root, file), 'before');
-    }
-    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'scope baseline']);
-    for (const file of paths) {
+      git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'baseline']);
       writeFileSync(join(root, file), 'after');
-      git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', file]);
-      const owed = [];
-      for (const daemon of roster) {
-        const ownDir = daemon.entry.split('/')[0];
-        const scoped = !file.startsWith('docs/') && (!file.startsWith('workers/') || ownDir === 'workers');
-        if (scoped) owed.push(daemon.id);
+      git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'changed']);
+      for (const daemon of registered) {
         const before = m.readClosure(root, daemon, good), after = m.readClosure(root, daemon, head);
-        expect(before.complete).toBe(true); expect(after.complete).toBe(true);
-        expect(after.files).toEqual(Object.fromEntries(
-          [...(ownDir === 'workers' ? ['workers/x.mjs', 'workers/dep.mjs', 'workers/y.mjs'] : ['services/y.mjs']),
-            ...paths.filter(p => !p.startsWith('docs/') && (!p.startsWith('workers/') || ownDir === 'workers'))]
-            .map(p => [p, git(['rev-parse', `${head}:${p}`])])));
-        expect(after.files[file]).toBe(scoped ? git(['rev-parse', `${head}:${file}`]) : undefined);
-        expect(after.files).toEqual(scoped ? { ...before.files, [file]: after.files[file] } : before.files);
-        if (scoped) expect(after.files[file]).not.toBe(before.files[file]);
+        expect(before.complete).toBe(true);
+        expect(after).toEqual({ complete: true, files: {
+          '.tree': git(['rev-parse', `${head}^{tree}`]),
+          [daemon.entry]: git(['rev-parse', `${head}:${daemon.entry}`]),
+        } });
+        expect(after.files['.tree']).not.toBe(before.files['.tree']);
+        expect(after.files[daemon.entry]).toBe(before.files[daemon.entry]);
       }
-      rmSync(env.WE_DAEMON_STATE_DIR, { recursive: true, force: true });
-      expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
-        .toMatchObject(owed.length ? { action: 'pending', owed } : { action: 'pass' });
-      expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).owed).toEqual(owed);
-      writeFileSync(join(root, file), 'before');
-    }
-  });
-  it.each([
-    ['workers/x.mjs', 'excluded'], ['workers/x.mjs', 'external'],
-    ['workers/linked.mjs', 'excluded'], ['workers/linked.mjs', 'external'],
-    ['scripts/linked.mjs', 'excluded'], ['scripts/linked.mjs', 'external'],
-  ])('symlink target changes cannot bypass probation debt (%s, %s)', async (link, location) => {
+      expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
+        .toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
+      expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).owed).toEqual(['X', 'Y']);
+    });
+  it('distinct commits with identical trees give equal snapshots and owe no proof', async () => {
     const m = await load();
-    mkdirSync(join(root, 'docs')); mkdirSync(join(root, 'scripts'));
-    const target = location === 'excluded' ? join(root, 'docs/target.mjs') : join(dir, 'target.mjs');
+    head = git(['commit-tree', git(['rev-parse', `${good}^{tree}`]), '-p', good, '-m', 'same tree']);
+    expect(head).not.toBe(good);
+    for (const daemon of registered)
+      expect(m.readClosure(root, daemon, head)).toEqual(m.readClosure(root, daemon, good));
+    expect(await m.createProbationObserver(opts).adopt(previous(), adopted())).toMatchObject({ action: 'pass' });
+  });
+  it('symlink target changes cannot bypass probation debt for an external entry target', async () => {
+    const m = await load(), target = join(dir, 'target.mjs');
     writeFileSync(target, 'export default 1;');
-    rmSync(join(root, link), { force: true });
-    symlinkSync(location === 'excluded' ? '../docs/target.mjs' : '../../target.mjs', join(root, link));
+    rmSync(join(root, registered[0].entry));
+    symlinkSync('../../target.mjs', join(root, registered[0].entry));
     git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'symlink baseline']);
     writeFileSync(target, 'export default 2;');
-    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'target changed']);
-    expect(readFileSync(join(root, link), 'utf8')).toBe('export default 2;');
-    expect(git(['rev-parse', `${head}:${link}`])).toBe(git(['rev-parse', `${good}:${link}`]));
-    expect(git(['diff-tree', '--no-commit-id', '--name-only', '-r', good, head]))
-      .toBe(location === 'excluded' ? 'docs/target.mjs' : '');
-    const owed = link.startsWith('scripts/') ? ['X', 'Y'] : ['X'];
-    for (const daemon of registered) {
-      for (const sha of [good, head]) {
-        const snapshot = m.readClosure(root, daemon, sha);
-        if (owed.includes(daemon.id)) expect(snapshot).toEqual({ complete: false });
-        else expect(snapshot.complete).toBe(true);
-      }
+    head = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'external target changed']);
+    expect(readFileSync(join(root, registered[0].entry), 'utf8')).toBe('export default 2;');
+    expect(git(['rev-parse', `${head}^{tree}`])).toBe(git(['rev-parse', `${good}^{tree}`]));
+    expect(git(['rev-parse', `${head}:${registered[0].entry}`]))
+      .toBe(git(['rev-parse', `${good}:${registered[0].entry}`]));
+    for (const sha of [good, head]) {
+      expect(m.readClosure(root, registered[0], sha)).toEqual({ complete: false });
+      expect(m.readClosure(root, registered[1], sha).complete).toBe(true);
     }
     expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
-      .toMatchObject({ action: 'pending', owed });
-    expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).owed).toEqual(owed);
+      .toMatchObject({ action: 'pending', owed: ['X'] });
+    expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).owed).toEqual(['X']);
   });
-  it('a root-level daemon entry conservatively snapshots the whole repository', async () => {
-    const m = await load();
-    writeFileSync(join(root, 'entry.mjs'), 'export default 1;');
-    git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'root entry']);
-    expect(m.readClosure(root, { entry: 'entry.mjs' }, sha)).toEqual({ complete: true,
-      files: Object.fromEntries(['entry.mjs', 'workers/x.mjs', 'workers/dep.mjs', 'services/y.mjs']
-        .map(p => [p, git(['rev-parse', `${sha}:${p}`])])) });
-  });
-  it('oversized Git tree output is incomplete and owes proof pending operator inspection', async () => {
-    const m = await load();
-    const blob = git(['rev-parse', `${good}:workers/x.mjs`]);
-    const input = Array.from({ length: 35000 }, (_, i) =>
-      `100644 blob ${blob}\t${String(i).padStart(6, '0')}${'x'.repeat(220)}\n`).join('');
-    expect(Buffer.byteLength(input)).toBeGreaterThan(8 * 1024 * 1024);
-    const tree = execFileSync('git', ['mktree'], { cwd: root, input, encoding: 'utf8' }).trim();
-    const sha = execFileSync('git', ['mktree'], { cwd: root,
-      input: `040000 tree ${tree}\tscripts\n`, encoding: 'utf8' }).trim();
-    expect(m.readClosure(root, { entry: 'scripts/000000' + 'x'.repeat(220) }, sha)).toEqual({ complete: false });
-    const roster = ['X', 'Y'].map((id, i) => ({ id, entry: `scripts/${String(i).padStart(6, '0')}${'x'.repeat(220)}` }));
-    expect(await m.createProbationObserver({ ...opts, registered: roster, readClosure: d => m.readClosure(root, d, sha) })
-      .adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
-  });
-  it.each(['preserved', 'reverted'])('successive freezes retain unproven X debt when its files are %s', async mode => {
+  it.each(['preserved', 'reverted'])('successive freezes retain every daemon debt when worker changes are %s', async mode => {
     const m = await load(), observer = m.createProbationObserver(opts);
-    expect(await observer.adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X'] });
+    expect(await observer.adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
     const first = adopted();
     if (mode === 'reverted') writeFileSync(join(root, 'workers/dep.mjs'), 'export default 1;');
     writeFileSync(join(root, 'unrelated.txt'), 'second adoption');
     git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', head, '-m', 'second']);
     expect(await observer.adopt(first, { head, at: iso(at + 1) }))
-      .toMatchObject({ action: 'pending', owed: ['X'] });
+      .toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
     const record = JSON.parse(readFileSync(m.probationPath(root, env), 'utf8'));
     expect(record.provenGood).toBe(good);
     expect(record.records).toEqual({});
@@ -205,19 +165,19 @@ describe('R986 report-only probation persistence', () => {
       const id = m.ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: identityEnv,
         argv: ['node', join(root, 'workers/x.mjs')] });
       expect(id).toBeNull();
-      expect(await observer.proof(processRecord(id, 101))).toMatchObject({ action: 'pending', owed: ['X'] });
+      expect(await observer.proof(processRecord(id, 101))).toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
       expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).toEqual({});
     }
-    expect(await observer.status()).toMatchObject({ action: 'pending', owed: ['X'] });
+    expect(await observer.status()).toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
   });
-  it('freezes two registered daemons at adoption; Y cannot satisfy X, X own proof can', async () => {
+  it('freezes all registered daemons at adoption; each must supply its own proof', async () => {
     const m = await load();
     const observer = m.createProbationObserver(opts);
-    expect(await observer.adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X'] });
+    expect(await observer.adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
     expect(await observer.proof(processRecord('Y', 202))).toMatchObject({ action: 'pending', owed: ['X'] });
     expect(await observer.proof(processRecord('X', 101))).toMatchObject({ action: 'pass' });
     const persisted = JSON.parse(readFileSync(m.probationPath(root, env), 'utf8'));
-    expect(persisted.owed).toEqual(['X']);
+    expect(persisted.owed).toEqual(['X', 'Y']);
     expect(persisted.records.X.boot.pid).toBe(101);
     expect(git(['rev-parse', 'HEAD'])).toBe(head);
     expect(persisted.provenGood).toBe(good);
@@ -263,8 +223,10 @@ describe('R986 report-only probation persistence', () => {
   });
   it('failed Git reads and missing or outside entries are incomplete and owe proof', async () => {
     const m = await load();
-    expect(m.readClosure(root, registered[0], 'f'.repeat(40)).complete).toBe(false);
-    for (const entry of ['missing.mjs', '../outside.mjs', '/outside.mjs'])
+    for (const sha of ['f'.repeat(40), 'bad-sha', '--all', null])
+      expect(m.readClosure(root, registered[0], sha)).toEqual({ complete: false });
+    expect(m.readClosure(join(dir, 'missing-repo'), registered[0], head)).toEqual({ complete: false });
+    for (const entry of ['missing.mjs', 'workers', '../outside.mjs', '/outside.mjs'])
       expect(m.readClosure(root, { entry }, head)).toEqual({ complete: false });
     const observer = m.createProbationObserver({ ...opts, readClosure: () => ({ complete: false }) });
     expect(await observer.adopt(previous(), adopted())).toMatchObject({ owed: ['X', 'Y'] });
@@ -300,10 +262,11 @@ describe('R986 report-only probation persistence', () => {
     expect(await a.status()).toMatchObject({ action: 'pass' });
     expect(onDisk()).toEqual(['X', 'Y']);
   });
-  it('closure snapshots use Git blob IDs at each SHA, independent of working-tree bytes', async () => {
+  it('closure snapshots use immutable tree and entry IDs, independent of working-tree bytes', async () => {
     const m = await load();
     writeFileSync(join(root, 'workers/dep.mjs'), 'uncommitted');
     expect(m.readClosure(root, registered[0], good)).toEqual({ complete: true, files: {
-      'workers/x.mjs': git(['rev-parse', good + ':workers/x.mjs']), 'workers/dep.mjs': git(['rev-parse', good + ':workers/dep.mjs']) } });
+      '.tree': git(['rev-parse', `${good}^{tree}`]),
+      'workers/x.mjs': git(['rev-parse', good + ':workers/x.mjs']) } });
   });
 });
