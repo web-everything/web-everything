@@ -389,6 +389,7 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  recoveryAcquirableLanes = acquirableLanes,
   // verify-admission (2026-10-20) — host-level admission for new review sessions: `() => {admitted, reason,
   // maxPerTick?}`. Not admitted ⇒ nothing is dispatched this tick (every review stays owed: queued, never dropped);
   // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
@@ -671,7 +672,10 @@ export function runReviewTick({
   const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
   const recoverRedTeam = (recoveryStarts) => {
     if (paused || typeof redTeamOnSkip !== 'function') return;
-    const recoveryLanes = Math.max(0, acquirable - occupiedLanes);
+    // Recovery starts need only one lane; ordinary rounds reserve a companion lane too.
+    const rawLanes = recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo });
+    const rawAcquirable = Math.max(0, (Array.isArray(rawLanes) ? rawLanes.length : Number(rawLanes)) || 0);
+    const recoveryLanes = Math.max(0, rawAcquirable - occupiedLanes);
     let taken = 0;
     const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
       startsCeiling: Math.max(0, hostLimit - occupiedLanes - (reviews.length ? 1 : 0)),
@@ -1152,6 +1156,11 @@ export function defaultAcquirableLaneNumbers({ repo }, { readLanes = freeLaneNum
   return lanes.slice(0, Math.floor(lanes.length / 2));
 }
 
+/** Red-team-only recovery needs one lane per start, so every free lane is available. */
+export function defaultRecoveryLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  return readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+}
+
 /** The lane-pool repo path for `repo` (the same derivation {@link defaultAcquirableLaneCount} uses). */
 function poolExhaustionLanePoolRepo(repo) {
   try { return repoProfile(repo).lanePoolRepo ?? null; } catch { return null; }
@@ -1283,7 +1292,8 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
     log: line => log.error(line),
-    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
+    acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
+    readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     liveReviewBudget: liveReviewRoundBudget(),
     redTeamOnSkip: o => {

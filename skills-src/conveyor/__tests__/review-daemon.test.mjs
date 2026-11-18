@@ -1050,10 +1050,11 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
   });
 
   it('host admission (verify-admission): the CLI daemon\'s review pass is wired to defaultReviewHostAdmission', async () => {
-    const { cliReviewTickOpts, defaultReviewHostAdmission } = await import('../review-daemon.mjs');
+    const { cliReviewTickOpts, defaultReviewHostAdmission, defaultRecoveryLaneNumbers } = await import('../review-daemon.mjs');
     const opts = cliReviewTickOpts({ log: { error: () => {} } });
     expect(typeof defaultReviewHostAdmission).toBe('function');
     expect(opts.hostAdmission).toBe(defaultReviewHostAdmission);
+    expect(opts.recoveryAcquirableLanes).toBe(defaultRecoveryLaneNumbers);
     // The default runReview of buildCliDaemonEffects runs with those opts, and the host check it hands every repo's
     // tick is the real one (real host-load + memory readers; the Vitest host seams stand in for the machine).
     vi.stubEnv('WE_REVIEW_FACTS', '0');
@@ -1197,6 +1198,52 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     }
     if (lanes === 0) expect(poolExhaustion.exhausted).toHaveBeenCalledWith(expect.objectContaining({ deferred: 16 }));
     else expect(poolExhaustion.recovered).toHaveBeenCalled();
+  });
+
+  it.each([0, 1])('with %i free lanes, red-team-only recovery uses unhalved capacity while ordinary reviews defer for lanes', async laneCount => {
+    const { defaultAcquirableLaneNumbers, defaultRecoveryLaneNumbers } = await import('../review-daemon.mjs');
+    const pool = Array.from({ length: laneCount }, (_, i) => i + 1);
+    const readLanes = vi.fn(() => pool);
+    const dispatch = vi.fn();
+    const recoveryDispatch = vi.fn(() => ({ prNumber: 900, agentId: 'red-team' }));
+    let recoveryLanes;
+    const out = runReviewTick({ reconcile: () => reviewsPlan(1), dispatch,
+      readPrs: () => [{ number: 100, labels: ['review:pending'] }], readAgents: () => [],
+      acquirableLanes: opts => defaultAcquirableLaneNumbers(opts, { readLanes }),
+      recoveryAcquirableLanes: opts => defaultRecoveryLaneNumbers(opts, { readLanes }),
+      redTeamOnSkip: ({ capacity }) => {
+        recoveryLanes = capacity.lanes;
+        if (capacity.lanes < 1 || capacity.remainingStarts < 1) return { dispatched: [] };
+        capacity.take();
+        capacity.lanes--;
+        capacity.remainingStarts--;
+        return { dispatched: [recoveryDispatch()] };
+      },
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(recoveryLanes).toBe(laneCount);
+    expect(recoveryDispatch).toHaveBeenCalledTimes(laneCount);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(laneCount);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.deferredForLanes).toBe(1);
+    expect(out.pendingNotDispatched[0].reasons.join(' ')).toContain('no acquirable lane this tick');
+    expect(out.failed).toEqual([]);
+  });
+
+  it.each([0, 1, 2])('recovery subtracts occupied starts from raw capacity %i and floors at zero', rawLanes => {
+    let recoveryLanes;
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      recoveryLanes = capacity.lanes;
+      return { dispatched: [] };
+    });
+    runReviewTick({ reconcile: () => reviewsPlan(1), dispatch: () => ({ agentId: 'ordinary' }),
+      acquirableLanes: () => 1, recoveryAcquirableLanes: () => rawLanes, redTeamOnSkip,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+    expect(recoveryLanes).toBe(Math.max(0, rawLanes - 1));
   });
 
   it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
