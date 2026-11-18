@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-15"
-preparedAgainstSha: "7a92d9600ec0da5ef600045686b9a22ca975a082"
+preparedDate: "2026-11-18"
+preparedAgainstSha: "42b5c9a6707ba430b1f2b0459dbd4bf1592017b0"
 tags: []
 ---
 
@@ -33,6 +33,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Re-prepare 2026-11-10 against origin/main 42b15b8a: premise still open (no `backlog-retired-field` or `backlog-unreadable-card` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 7cf64add..HEAD` over we:scripts/check-standards.mjs, we:scripts/readiness/claimScope.mjs, we:src/_data/backlog.js and the 1683 card is empty; we:scripts/check-standards-rules.mjs gained only two `LEASH_PIN_SNAPSHOT` entries (~:4456), below every cited line. Raw loop (:1058-1061) and parse scan (:999-1000) unchanged. No scope, size or goal change; only the stamp is refreshed.
 
 - Re-prepare 2026-11-14 against origin/main 432c9452: premise still open (no `backlog-retired-field` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 42b15b8a..HEAD` over we:scripts/check-standards.mjs, we:scripts/check-standards-rules.mjs, we:scripts/readiness/claimScope.mjs, we:src/_data/backlog.js and the 1683 card is empty, so every citation holds. No scope, size or goal change; only the stamp is refreshed.
+
+- Re-prepare 2026-11-18 against origin/main 42b5c9a6: premise still open (no `backlog-retired-field` or `backlog-unreadable-card` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). we:scripts/check-standards.mjs gained about 80 lines since 432c9452, so the Design citations above shifted: the raw loop's swallowing catch is now :1065 (was :1061), the parse scan's unguarded read is now :1003 (was :1000), and the later cached/caught scans moved down by roughly 3–16 lines (locate by reader name, not number). we:src/_data/backlog.js skip warning is still at :434. No scope, size or goal change; only the stamp is refreshed.
 
 ## Design
 
