@@ -345,6 +345,30 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
           }
           return output;
         }
+        if (poison === 'remote-alias' || poison === 'fetch-mapping') {
+          // A lane remote NAMED like the explicit fetch URL: Git resolves the URL argument as that remote,
+          // taking its url (transport redirect) and its fetch mapping (an unrelated local ref update).
+          const url = `git@github.com:${repo}.git`, alias = [`remote.${url}.url`, `remote.${url}.fetch`];
+          const aliasUrl = poison === 'remote-alias' ? 'review-marker::alias' : url;
+          const mapping = `+refs/pull/${pr}/head:refs/heads/main`;
+          git(lane, ['update-ref', 'refs/heads/main', laneHead]);
+          git(lane, ['config', '--local', alias[0], aliasUrl]);
+          git(lane, ['config', '--local', alias[1], mapping]);
+          expect(git(lane, ['ls-remote', '--get-url', url]).trim()).toBe(aliasUrl);
+          // Positive control in a lane-shaped repo: the alias really redirects or rewrites refs/heads/main.
+          const control = join(root, 'alias-control.git');
+          git(root, ['init', '--bare', '--quiet', control]);
+          git(control, ['config', alias[0], aliasUrl]);
+          git(control, ['config', alias[1], mapping]);
+          if (poison === 'remote-alias') {
+            expect(() => git(control, ['-c', 'protocol.review-marker.allow=always', 'fetch', url, `refs/pull/${pr}/head`])).toThrow();
+            expect(readFileSync(marker, 'utf8')).toContain('alias'); rmSync(marker);
+          } else {
+            git(control, ['fetch', '--no-tags', url, `refs/pull/${pr}/head`]);
+            expect(git(control, ['rev-parse', 'refs/heads/main']).trim()).toBe(head);
+          }
+          return output;
+        }
         const included = join(root, 'included');
         let target = ['--local'];
         if (poison === 'worktree') {
@@ -415,7 +439,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     };
     const run = () => createReviewJobIo({ env, exec, spawnPack, log: () => {} })[method]({ repo, pr, lanePath: lane,
       head: failure === 'moved-head' ? laneHead : head });
-    return { run, git, lane, head, marker, genuineCommit, counts: () => ({ networkCalls, packCalls, indexCalls }), iso: () => iso };
+    return { run, git, lane, head, laneHead, marker, genuineCommit, counts: () => ({ networkCalls, packCalls, indexCalls }), iso: () => iso };
   }
 
   it.each(['forged-tree', 'forged-commit'])('rejects or replaces a %s loose object accepted by the old design', poison => {
@@ -428,9 +452,13 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     expect(existsSync(f.iso())).toBe(false);
   });
 
-  it.each(['local', 'worktree', 'includeIf', 'unborn', 'template-env', 'template-global'])('ignores replanted %s config and imports the genuine commit', poison => {
+  it.each(['local', 'worktree', 'includeIf', 'unborn', 'template-env', 'template-global', 'remote-alias', 'fetch-mapping'])('ignores replanted %s config and imports the genuine commit', poison => {
     const f = fixture({ poison });
     expect(f.run()).toEqual({ head: f.head });
+    // A lane remote aliasing the fetch URL never redirects transport or moves an unrelated local ref.
+    if (poison === 'remote-alias' || poison === 'fetch-mapping') {
+      expect(f.git(f.lane, ['rev-parse', 'refs/heads/main']).trim()).toBe(f.laneHead);
+    }
     expect(f.git(f.lane, ['rev-parse', '--verify', `${f.head}^{commit}`]).trim()).toBe(f.head);
     expect(f.git(f.lane, ['show', `${f.head}:payload`])).toBe('genuine fixture object\n');
     expect(existsSync(f.marker)).toBe(false);
