@@ -22,9 +22,9 @@ describe('strict review CI prerequisite', () => {
       expect(reviewCiGate({ rowsComplete: true, headSha, requiredChecks: ['test'], checks: [success('test')], ...over }).allowed).toBe(false);
     }
   });
-  it('supersedes only ordered attempts of the same run', () => {
+  it('supersedes only ordered attempts of the same job in a run', () => {
     const old = { ...success('test'), id: 1, run_id: 1, run_attempt: 1, conclusion: 'failure' };
-    const fresh = { ...success('test'), id: 2, run_id: 1, run_attempt: 2 };
+    const fresh = { ...success('test'), id: 1, run_id: 1, run_attempt: 2 };
     for (const rows of [[old, fresh], [fresh, old]]) expect(gate([...rows, success('daemon-soak')]).allowed).toBe(true);
     for (const status of ['in_progress', 'completed']) {
       expect(gate([{ ...fresh, id: 3, status, conclusion: 'failure' }, fresh, success('daemon-soak')]).allowed).toBe(false);
@@ -57,4 +57,13 @@ describe('review CI completeness evidence', () => {
     // Retry with exhausted pagination or explicit reads of every required name.
     expect(reviewCiGate({ ...evidence, rowsComplete: true }).allowed).toBe(true);
   });
+});
+
+it('the review adapter explicitly opts into historical integration implication', () => {
+  const options = { headSha, rowsComplete: true, requiredChecks: ['test', 'integration'],
+    checks: [success('test')] };
+  expect(reviewCiGate(options).allowed).toBe(true);
+  for (const integration of [{ name: 'integration' }, { ...success('integration'), head_sha: 'b'.repeat(40) }]) {
+    expect(reviewCiGate({ ...options, checks: [...options.checks, integration] }).allowed).toBe(false);
+  }
 });

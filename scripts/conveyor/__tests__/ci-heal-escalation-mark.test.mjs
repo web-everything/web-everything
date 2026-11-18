@@ -301,7 +301,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   const escalation = latest(fixture.comments);
   const asOf = fixture.statusCheckRollup.filter((r) => r.startedAt <= fixture.escalationAt)
     .map((r) => r.completedAt > fixture.escalationAt ? { ...r, status: 'IN_PROGRESS', conclusion: null } : r);
-  const refusal = (overrides = {}) => notCiBreakRecordRefusal({ headSha: head, pr: fixture, requiredChecks: fixture.requiredChecks, ...overrides });
+  const refusal = (overrides = {}) => notCiBreakRecordRefusal({ rosterSource: 'live', headSha: head, pr: fixture, requiredChecks: fixture.requiredChecks, ...overrides });
 
   it('finds the real escalation and voids it only with rechecking enabled', () => {
     expect(escalation).toMatchObject({ outcome: 'not-a-ci-break', headSha: head, createdAt: fixture.escalationAt });
@@ -336,7 +336,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const pr = { ...fixture, rowsComplete: false,
       statusCheckRollup: fixture.requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })) };
     expect(refusal({ pr })).toContain('check-evidence');
-    expect(needsHumanGateOnlyRefusal({ headSha: head, pr, requiredChecks: fixture.requiredChecks })).toBeNull();
+    expect(needsHumanGateOnlyRefusal({ rosterSource: 'live', headSha: head, pr, requiredChecks: fixture.requiredChecks })).toBeNull();
   });
   it('accepts all required checks green', () => {
     const statusCheckRollup = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
@@ -347,7 +347,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   });
 
   const recordOptions = () => ({ pr: 4535, repo: fixture.repo, headSha: head, outcome: 'not-a-ci-break', settings,
-    readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ checks: fixture.requiredChecks })) });
+    readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ source: 'live', checks: fixture.requiredChecks })) });
 
   it.each([[[]], [undefined], [null]])('refuses an unavailable roster (%j) without using observed names', async requiredChecks => {
     for (const conclusion of ['FAILURE', 'SUCCESS']) {
@@ -368,7 +368,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
         const rows = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }, malformed];
         await expect(preflight({ ...recordOptions(), outcome,
           readPr: () => ({ ...fixture, statusCheckRollup: reverse ? rows.toReversed() : rows }),
-          readRequired: async () => ({ checks: ['test'] }),
+          readRequired: async () => ({ source: 'live', checks: ['test'] }),
         })).rejects.toThrow(TypeError);
       }
     }
@@ -379,7 +379,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const gatePr = (statusCheckRollup = [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]) => ({
       ...fixture, statusCheckRollup,
     });
-    const humanRefusal = (overrides = {}) => needsHumanGateOnlyRefusal({
+    const humanRefusal = (overrides = {}) => needsHumanGateOnlyRefusal({ rosterSource: 'live',
       headSha: head, pr: gatePr(), requiredChecks: ['test'], ...overrides,
     });
     it.each([1, 2, 3])('does not match a --head prefix of %i characters', length => {
@@ -387,7 +387,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     });
 
     const humanOptions = () => ({ ...recordOptions(), outcome: 'needs-human',
-      readPr: vi.fn(() => gatePr()), readRequired: vi.fn(async () => ({ checks: ['test'] })) });
+      readPr: vi.fn(() => gatePr()), readRequired: vi.fn(async () => ({ source: 'live', checks: ['test'] })) });
 
     const requiredStates = ['SUCCESS', 'FAILURE', 'CANCELLED', 'STALE', 'IN_PROGRESS', 'MISSING'];
     const gateStates = ['SUCCESS', 'FAILURE', 'IN_PROGRESS', 'MISSING'];
@@ -401,7 +401,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
                 ? { detailsUrl: 'https://github.com/example/repo/actions/runs/100/job/123',
                   mergeGateReviewHold: { holds: ['review-acceptance'], holdIds: ['review-acceptance'], headSha: head, jobId: 123 } } : {}) })];
         const readers = { readPr: () => gatePr([...row('test', required), ...row(gate, state)]),
-          readRequired: async () => ({ checks: ['test', gate] }) };
+          readRequired: async () => ({ source: 'live', checks: ['test', gate] }) };
         const human = await checkNeedsHumanEscalable({ ...humanOptions(), ...readers });
         const notCi = await checkNotCiBreakRecordable({ ...recordOptions(), ...readers });
         expect(human.refusal !== null).toBe(required === 'SUCCESS' && state === 'FAILURE');
@@ -472,7 +472,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
         check('test', 'FAILURE', { __typename: 'CheckRun', completedAt: '2026-10-28T02:00:00Z' }),
       ];
       const pr = gatePr([...(reverse ? rows.toReversed() : rows), check('review-gate', 'FAILURE')]);
-      const readers = { readPr: vi.fn(() => pr), readRequired: vi.fn(async () => ({ checks: ['test'] })) };
+      const readers = { readPr: vi.fn(() => pr), readRequired: vi.fn(async () => ({ source: 'live', checks: ['test'] })) };
       await expect(checkNeedsHumanEscalable({ ...humanOptions(), ...readers })).resolves.toEqual({ refusal: null });
       await expect(checkNotCiBreakRecordable({ ...recordOptions(), ...readers })).resolves.toEqual({ refusal: expect.stringContaining('red: test') });
       expect(readers.readPr).toHaveBeenCalledTimes(2);
@@ -953,7 +953,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
         { name: 'merge-gate', id: jobId, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T13:00:00-04:00' },
       ] };
     return { pr: 6042, repo: 'example/repo', headSha: HEAD, outcome: 'needs-human',
-      settings: { recheckNotCiBreak: true }, readRequired: () => ({ checks: ['test', 'merge-gate'] }),
+      settings: { recheckNotCiBreak: true }, readRequired: () => ({ source: 'live', checks: ['test', 'merge-gate'] }),
       prChecksOptions: {
         runGh: vi.fn(prReader(facts)),
         readMergeGateVerdict: vi.fn(() => ({ num: 6042, head_sha: HEAD, ok: false,
@@ -1111,7 +1111,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     facts.statusCheckRollup.push({ name: 'MERGE-GATE', id: 999,
       status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T14:00:00-04:00' });
     opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
-    opts.readRequired = () => ({ checks: ['test', 'merge-gate', 'MERGE-GATE'] });
+    opts.readRequired = () => ({ source: 'live', checks: ['test', 'merge-gate', 'MERGE-GATE'] });
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
     expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
       .toEqual({ refusal: expect.stringContaining('red: MERGE-GATE') });
@@ -1130,5 +1130,25 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
       .toEqual({ refusal: conclusion ? null : expect.stringContaining('merge-gate') });
     expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
+  });
+});
+
+describe('PR1 recording roster provenance', async () => {
+  const { checkNotCiBreakRecordable, checkNeedsHumanEscalable } = await import('../ci-heal-escalation-mark.mjs');
+  const head = 'a'.repeat(40);
+  const options = { pr: 123, repo: 'o/r', headSha: head, settings: { recheckNotCiBreak: true },
+    readPr: () => ({ headRefOid: head, rowsHead: head, rowsComplete: true, statusCheckRollup: [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] }) };
+  it.each([undefined, 'fallback', 'declared', 'unavailable'])('preserves unavailable roster source %s through both preflights', async source => {
+    const readRequired = () => ({ checks: ['test'], ...(source === undefined ? {} : { source }) });
+    expect((await checkNotCiBreakRecordable({ ...options, outcome: 'not-a-ci-break', readRequired })).refusal).toContain('check-evidence');
+    expect((await checkNeedsHumanEscalable({ ...options, outcome: 'needs-human', readRequired })).refusal).toBeNull();
+  });
+  it.each(['live', 'cache'])('preserves trusted roster source %s through both preflights', async source => {
+    const readRequired = () => ({ checks: ['test'], source });
+    expect((await checkNotCiBreakRecordable({ ...options, outcome: 'not-a-ci-break', readRequired })).refusal).toBeNull();
+    expect((await checkNeedsHumanEscalable({ ...options, outcome: 'needs-human', readRequired })).refusal).toContain('only review-gate');
   });
 });

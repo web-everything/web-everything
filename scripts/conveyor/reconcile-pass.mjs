@@ -1785,7 +1785,7 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+  const { checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
     ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
@@ -1867,7 +1867,7 @@ export function runReconcilePass({
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
-    mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
+    mainLatestCheckRuns, requiredChecks, rosterSource, mainSha, fixerLadder,
     ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
     ...roundExtensionAnchorSetting(loadRoundExtensionAnchorSetting, env),

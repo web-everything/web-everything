@@ -1715,8 +1715,9 @@ function dispatchReviewRow({
       // A targeted-check agent is a review emission too, so a required `review-gate` conflict still refuses it
       // (the early planner refusal no longer reaches a `needs-human` PR). Other required-check states are
       // deliberately NOT applied here: converting a superseded verdict never waited on CI (#xconv1).
+      // Unknown or incomplete evidence still refuses: it cannot prove conversion safe.
       const convertCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, rowsHead: pr?.rowsHead, rowsComplete: pr?.rowsComplete === true });
-      if (convertCi.reason === 'required-review-gate-conflict') {
+      if (convertCi.unknown || convertCi.reason === 'required-review-gate-conflict') {
         refuse('review-ci', {
           ...withPhase, ...extra, ci: convertCi,
           why: `${convertCi.reason}: ${convertCi.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2212,7 +2213,7 @@ export function planReconcile({
   // Optional and pure DATA IN: this file stays IO-free, so the caller (`we:scripts/conveyor/reconcile-pass.mjs`)
   // is the one that fetches (and caches) the live set; omitted, `classifyPr` falls back to its own exclusion-
   // list default unchanged — byte-identical behaviour to before this param existed.
-  requiredChecks = null, reviewTiming = REVIEW_TIMING_DEFAULTS, fixTiming = FIX_TIMING_DEFAULTS,
+  requiredChecks = null, rosterSource, reviewTiming = REVIEW_TIMING_DEFAULTS, fixTiming = FIX_TIMING_DEFAULTS,
   advisoryReviewOnHumanHandoff = 'off', unlabeledRedAgentPr = 'off',
   // xilx617 (epic #4075/#3383) — the bound a `live-process` refusal must overrun before it also gets a
   // surfaced `session-overrun` note (see {@link LIVE_SESSION_OVERRUN_MS}'s own docblock). A `planReconcile`
@@ -2299,7 +2300,7 @@ export function planReconcile({
         && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN'
         && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
         && !pr.codeqlFailure
-        && ciGreenForEscalation({ headSha: pr.headRefOid, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete === true, rollup: pr.statusCheckRollup, requiredChecks })
+        && ciGreenForEscalation({ headSha: pr.headRefOid, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete === true, rollup: pr.statusCheckRollup, requiredChecks, rosterSource })
         && latestCiHealEscalationForHead(pr.comments, pr.headRefOid, {
           baseHead: pr.escalationBaseHead ?? null, recheck: verdictSettings.recheckNotCiBreak,
           voidNeedsHuman: verdictSettings.voidNeedsHumanWhenCiGreen,

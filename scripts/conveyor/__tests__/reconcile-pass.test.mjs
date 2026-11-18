@@ -2063,3 +2063,10 @@ it('runs the file-based synchronous pool with real child processes and cleans it
     expect(evidenceExists(folder)).toBe(false);
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
+
+it.each([undefined, 'live', 'cache', 'fallback'])('forwards required-check roster provenance %s into planner options', async source => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const result = runReconcilePass({ ...xxOptions(), readOnly: true, readPrs: () => [],
+    readRequiredChecks: () => ({ checks: ['test'], ...(source === undefined ? {} : { source }) }) });
+  expect(result.plannerOptions.rosterSource).toBe(source);
+});
