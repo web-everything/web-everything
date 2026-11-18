@@ -518,6 +518,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
       let urgentCiFailed = false;
+      let prConflict, conflict;
       const readTestCheck = testCheck || (({ sha }) => {
         let apiUnavailable = false;
         const gh = (args) => {
@@ -533,6 +534,23 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (!origin.repo) {
           if (apiUnavailable) return null;
           throw new Error('unreadable CI repository');
+        }
+        if (input.urgent) {
+          try {
+            const head = encodeURIComponent(`${origin.repo.split('/')[0]}:${input.branch}`);
+            const listed = origin.gh(['api', `repos/${origin.repo}/pulls?head=${head}&state=open&per_page=2`]);
+            const prs = listed.code === 0 ? JSON.parse(listed.stdout) : null;
+            if (Array.isArray(prs) && prs.length === 1 && Number.isSafeInteger(prs[0]?.number)
+              && prs[0].head?.sha === sha && prs[0].head?.ref === input.branch
+              && prs[0].head?.repo?.full_name === origin.repo) {
+              const result = origin.gh(['api', `repos/${origin.repo}/pulls/${prs[0].number}`]);
+              const pr = result.code === 0 ? JSON.parse(result.stdout) : null;
+              if (pr?.number === prs[0].number && pr.state === 'open' && pr.head?.sha === sha
+                && pr.head?.ref === input.branch && pr.head?.repo?.full_name === origin.repo
+                && (pr.mergeable_state === 'dirty' || pr.mergeable === false))
+                prConflict = { pr: pr.number, mergeableState: pr.mergeable_state ?? null };
+            }
+          } catch { /* Unknown mergeability retains the existing urgent rules. */ }
         }
         const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
         if (result.code !== 0) return null;
@@ -588,6 +606,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);
         checkRun = urgent.evidence;
+        if (prConflict) {
+          conflict = prConflict;
+          checkRun = { ...checkRun, conflict: true };
+        }
       }
       const canonical = out.canonicalAudit.record;
       // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
@@ -800,6 +822,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       };
       if (input.urgent) {
         urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
+        if (conflict) urgentIntent.conflict = conflict;
         // Persist intent before any registration mutation; failure refuses admission.
         appendUrgent(urgentIntent);
       }

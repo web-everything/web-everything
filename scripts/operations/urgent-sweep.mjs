@@ -243,6 +243,11 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           data = await deps.checks(r);
           anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
           validateChecks(data, r.sha);
+          // GitHub cannot run CI without a merge ref. Resume normal monitoring as soon as checks appear.
+          if (r.conflict && data.total_count === 0) {
+            results.push({ id, status: 'pending' });
+            continue;
+          }
           // Like testCheckEvidence, reruns supersede only their own suite. Check IDs
           // increase across workflow run attempts; keep distinct job/shard names apart.
           const latestByCheck = new Map();

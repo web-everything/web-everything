@@ -3275,7 +3275,8 @@ describe('default test check-run reader (production wiring)', () => {
   const REPO_SLUG = 'web-everything/web-everything';
   const run = (o = {}) => ({ id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 }, ...o });
   const wf = (o = {}) => ({ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml', ...o });
-  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, ...options } = {}) {
+  const conflictPr = { number: 42, state: 'open', head: { sha: SHA, ref: BASE.branch, repo: { full_name: REPO_SLUG } }, mergeable_state: 'dirty', mergeable: false };
+  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, pr = null, listedPr = pr, ...options } = {}) {
     const gh = [];
     const combinedIO = { fs: {},
       handles: (cmd, args) => cmd === 'gh' || (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url'),
@@ -3284,6 +3285,8 @@ describe('default test check-run reader (production wiring)', () => {
         gh.push(args.join(' '));
         const bad = () => { throw Object.assign(new Error('gh: HTTP 500'), { status: 1, stdout: '', stderr: 'HTTP 500' }); };
         if (args[0] === 'repo' && args[1] === 'view') return fail === 'repo' ? bad() : JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
+        if (args[1]?.includes('/pulls?')) return JSON.stringify(listedPr ? [listedPr] : []);
+        if (args[1]?.endsWith('/pulls/42')) return fail === 'mergeability' ? bad() : JSON.stringify(pr);
         if (args[0] === 'api' && args[1].includes('/check-runs') && fail === 'overflow') throw Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' });
         if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : checksRaw ?? JSON.stringify(checks);
         if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : runsRaw ?? JSON.stringify(runs);
@@ -3299,6 +3302,35 @@ describe('default test check-run reader (production wiring)', () => {
     const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
     return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
   };
+  it.each([
+    ['dirty', conflictPr],
+    ['mergeable false', { ...conflictPr, mergeable_state: 'blocked' }],
+  ])('loads a conflicting exact head with a signed receipt (%s) and records conflict evidence', async (_, pr) => {
+    const f = ghFixture({ pr, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] } });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1).testCheck).toMatchObject({ source: 'urgent-local-full', conflict: true });
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', conflict: { pr: 42, mergeableState: pr.mergeable_state } }));
+    expect(f.gh).toContain(`api repos/${REPO_SLUG}/pulls?head=web-everything%3Alane%2Fnew&state=open&per_page=2 --hostname github.com`);
+  });
+  it.each([
+    ['unknown', { pr: { ...conflictPr, mergeable_state: 'unknown', mergeable: null } }],
+    ['missing', { pr: { ...conflictPr, mergeable_state: undefined, mergeable: undefined } }],
+    ['unreadable', { pr: conflictPr, fail: 'mergeability' }],
+    ['list head mismatch', { pr: conflictPr, listedPr: { ...conflictPr, head: { ...conflictPr.head, sha: TREE } } }],
+    ['detail head mismatch', { listedPr: conflictPr, pr: { ...conflictPr, head: { ...conflictPr.head, sha: TREE } } }],
+  ])('keeps existing urgent rules without the conflict exception for %s mergeability', async (_, options) => {
+    const f = ghFixture({ ...options, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] } });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1).testCheck).not.toHaveProperty('conflict');
+    expect(f.records.find(r => r.type === 'prototype-load.urgent')).not.toHaveProperty('conflict');
+  });
+  it('refuses a conflicting head without a valid receipt and still vetoes completed CI failure', async () => {
+    const missing = ghFixture({ pr: conflictPr, checks: { total_count: 0, check_runs: [] } });
+    expect(await missing.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    const failed = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } });
+    expect(await failed.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+    expect(mutations(failed, 'add')).toHaveLength(0);
+  });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
     'urgent refuses a pending suite plus another suite completed with %s', async conclusion => {
       const f = ghFixture({ urgentLedger: urgentReceipt(), checks: { total_count: 2, check_runs: [

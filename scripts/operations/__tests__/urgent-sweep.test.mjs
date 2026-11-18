@@ -21,6 +21,23 @@ function fixture(rows = required.map(n => check(n))) {
   return { d, state, settlements: () => [...new Map(state.filter(r => r.status !== 'sweep-cursor').map(r => [r.id, r])).values()], events, loads, run: () => urgentSweep({}, d) };
 }
 describe('urgent CI sweep', () => {
+  it('never times out absent CI for a conflict load, then resumes monitoring when CI runs', async () => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' }, at: '2026-11-01T12:00:00Z' };
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).not.toHaveBeenCalled();
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', null, { status: 'queued' })], workflows });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('still unloads and escalates completed CI failure for a conflict load', async () => {
+    const f = fixture([check('test', 'failure')]);
+    f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' } };
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalled();
+  });
   it('unloads a 17-day-old zero-check load, escalates once and tracks adoption', async () => {
     const f = fixture([]);
     f.loads[0] = { ...load, at: '2026-11-01T12:00:00Z' };
