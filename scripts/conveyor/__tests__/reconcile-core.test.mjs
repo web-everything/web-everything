@@ -4846,6 +4846,21 @@ describe('unannotated admission gates cannot deadlock review', () => {
     expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
   });
+  it.each(['merge-gate', 'review-gate'])('refuses review for a failed %s on a different head', name => {
+    const result = plan(checks.map(r => r.name === name ? { ...r, head_sha: 'b'.repeat(40) } : r));
+    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
+  });
+  it.each(['merge-gate', 'review-gate'])('admits review for a failed %s on the current head', name => {
+    const result = plan(checks.map(r => r.name === name ? { ...r, head_sha: pr1563().headRefOid } : r));
+    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
+  });
+  it.each(['merge-gate', 'review-gate'].flatMap(name => ['status', 'conclusion'].flatMap(field =>
+    [null, 1, true, [field === 'status' ? 'completed' : 'failure'],
+      { toString: () => field === 'status' ? 'completed' : 'failure' }].map(value => [name, field, value]))))(
+    'refuses review for %s with non-string %s (%j)', (name, field, value) => {
+      const result = plan(checks.map(r => r.name === name ? { ...r, [field]: value } : r));
+      expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
+    });
   it.each(['test', 'smoke', 'daemon-soak'])('owes ci-heal when required %s fails alongside gates', name => {
     const result = plan(checks.map(r => r.name === name ? row(name, 'failure') : r));
     expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));

@@ -1567,8 +1567,9 @@ function reviewAdmissionCi(pr, requiredChecks) {
   if (pr?.isDraft || !labelNames(pr?.labels).includes('review:pending') || !Array.isArray(checks))
     return { checks, requiredChecks };
   const ignored = collapseRollupToLatestPerName(checks)
-    .filter(row => String(row?.status).toUpperCase() === 'COMPLETED'
-      && FAILED_CHECK_CONCLUSIONS.includes(String(row?.conclusion).toUpperCase()))
+    .filter(row => (row?.head_sha == null || row.head_sha === pr.headRefOid)
+      && typeof row?.status === 'string' && row.status.toUpperCase() === 'COMPLETED'
+      && typeof row.conclusion === 'string' && FAILED_CHECK_CONCLUSIONS.includes(row.conclusion.toUpperCase()))
     .map(row => row.name ?? row.context).filter(name => name === 'merge-gate' || name === 'review-gate');
   if (!ignored.length) return { checks, requiredChecks };
   return {
