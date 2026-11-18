@@ -269,9 +269,21 @@ function streamEvidence() {
   let pending = '';
   let oversized = false;
   let lastToolCall = null;
+  let resultCount = 0;
+  let unaccounted = false;
+  let invalidTrailer = false;
   const line = (text) => {
     let event;
     try { event = JSON.parse(text); } catch { event = null; }
+    // Sticky integrity evidence must outlive both the stdout tail and lastEvents.
+    if (oversized || (!event && text.trim())) unaccounted = true;
+    if (text.trim() && resultCount) {
+      const benign = event && ['system', 'rate_limit_event'].includes(event.type)
+        && !event.is_error && !event.error
+        && !(typeof event.subtype === 'string' && /error/i.test(event.subtype));
+      if (!benign || oversized) invalidTrailer = true;
+    }
+    if (!oversized && event?.type === 'result') resultCount = Math.min(2, resultCount + 1);
     const tools = Array.isArray(event?.message?.content)
       ? event.message.content.filter(b => b?.type === 'tool_use').slice(-8).map(toolSummary) : [];
     if (tools.length) lastToolCall = tools.at(-1);
@@ -283,6 +295,7 @@ function streamEvidence() {
   return {
     lastEvents,
     get lastToolCall() { return lastToolCall; },
+    get completeTerminalResult() { return resultCount === 1 && !unaccounted && !invalidTrailer; },
     add(chunk) {
       for (const [i, part] of String(chunk).split('\n').entries()) {
         if (i) { line(pending); pending = ''; oversized = false; }
@@ -1047,6 +1060,7 @@ export async function judgeSpawn({
     // then settling with the accumulated streams turns total loss into a parse attempt: often the answer IS
     // there and only the process failed to exit.
     const evidence = streamEvidence();
+    let stdoutTruncated = false;
     const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
       let child;
       try {
@@ -1083,7 +1097,11 @@ export async function judgeSpawn({
       }
       child.stdout?.setEncoding?.('utf8');
       child.stderr?.setEncoding?.('utf8');
-      child.stdout?.on('data', (d) => { evidence.add(d); out = (out + d).slice(-STREAM_LIMIT); });
+      child.stdout?.on('data', (d) => {
+        evidence.add(d);
+        if (out.length + d.length > STREAM_LIMIT) stdoutTruncated = true;
+        out = (out + d).slice(-STREAM_LIMIT);
+      });
       child.stderr?.on('data', (d) => {
         if (stderrCapped) return;
         const text = err + d;
@@ -1124,6 +1142,12 @@ export async function judgeSpawn({
     wallMs += thisAttemptMs;
     let outcome;
     try {
+      if (stdoutTruncated && !evidence.completeTerminalResult) {
+        const error = new Error('stdout exceeded the cap; terminal result evidence is incomplete or conflicting. Rerun with a narrower mandate.');
+        error.unparseableStdout = true;
+        error.verdictIntegrity = true;
+        throw error;
+      }
       // Keep the CLI's explicit is_error handling (including budget/quota failures) first.
       outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
       if (!validate(outcome.value)) {

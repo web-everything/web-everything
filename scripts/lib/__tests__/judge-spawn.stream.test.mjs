@@ -272,7 +272,7 @@ describe('Claude stream diagnostics', () => {
     expect(failedAttempts[0].stderrTail).toBe(secret);
   });
 
-  it('bounds oversized events, reports truncation, and keeps the next result usable', async () => {
+  it('bounds oversized events and refuses an unaccounted prefix even with a later result', async () => {
     const oversized = JSON.stringify({ type: 'assistant', text: 'x'.repeat(9 * 1024 * 1024) }) + '\n';
     const failed = await judgeSpawn({ ...request, ...fake([], { chunks: [oversized] }), log: () => {} }).catch(e => e);
     expect(failed).toBeInstanceOf(JudgeUnparseableError);
@@ -280,9 +280,45 @@ describe('Claude stream diagnostics', () => {
     expect(failed.stdoutBytes).toBeLessThanOrEqual(8 * 1024 * 1024);
     expect(failed.message).toContain('did not emit parseable JSON');
     expect(failed.message).toContain('rerun with a narrower mandate');
-    const outcome = await judgeSpawn({ ...request, ...fake([], { chunks: [oversized, jsonl([result])] }) });
-    expect(outcome.value).toEqual(result.structured_output);
+    const later = await judgeSpawn({ ...request, ...fake([], { chunks: [oversized, jsonl([result])] }), log: () => {} }).catch(e => e);
+    expect(later).toBeInstanceOf(JudgeUnparseableError);
+    expect(later.message).toContain('stdout exceeded the cap');
   });
+
+  it.each([false, true])('rejects discarded error or success results before an oversized system event (error=%s)', async is_error => {
+    const secret = 'private-discarded-result';
+    const first = jsonl([{ ...result, is_error, result: secret }]);
+    const oversized = jsonl([{ type: 'system', text: 'x'.repeat(9 * 1024 * 1024) }]);
+    const last = jsonl([result]).trimEnd();
+    const log = vi.fn();
+    const error = await judgeSpawn({ ...request, ...fake([], { chunks: [
+      first.slice(0, 12), first.slice(12), oversized.slice(0, 30), oversized.slice(30), last,
+    ] }), log }).catch(e => e);
+    expect(error).toBeInstanceOf(JudgeUnparseableError);
+    expect(error.message).toContain('stdout exceeded the cap');
+    expect(error.message).toContain('Rerun with a narrower mandate');
+    expect(inspect(error, { depth: null }) + JSON.stringify(log.mock.calls)).not.toContain(secret);
+    expect(error.message).not.toContain('x'.repeat(100));
+  });
+
+  it.each(['single result', 'earlier result', 'unreadable prefix', 'invalid trailer'])
+    ('checks incremental evidence outside the retained stdout window: %s', async scenario => {
+      const housekeeping = jsonl([{ type: 'system', text: 'x'.repeat(1024) }]).repeat(8300);
+      const prefix = scenario === 'earlier result' ? jsonl([result])
+        : scenario === 'unreadable prefix' ? 'unreadable prefix\n' : '';
+      const trailer = scenario === 'invalid trailer' ? jsonl([{ type: 'assistant' }]) : '';
+      // Many individually parseable lines distinguish scanner evidence from the bounded tail.
+      const pending = judgeSpawn({ ...request, ...fake([], { chunks: [
+        prefix, housekeeping, jsonl([result]), trailer,
+      ] }), log: () => {} });
+      if (scenario === 'single result') {
+        expect((await pending).value).toEqual(result.structured_output);
+      } else {
+        const error = await pending.catch(e => e);
+        expect(error).toBeInstanceOf(JudgeUnparseableError);
+        expect(error.message).toContain('stdout exceeded the cap');
+      }
+    });
 
   it('keeps bounded evidence through the graceful caller and the run-record whitelist', async () => {
     const lastEvents = [{ type: 'assistant', tools: ['Bash: git diff'] }];

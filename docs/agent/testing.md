@@ -4446,6 +4446,9 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 
 Claude jurors use verbose `stream-json`; only the terminal `result` supplies the verdict.
 An error or incomplete last result, or malformed output after it, invalidates any earlier verdict.
+When stdout exceeds its retained cap, incremental line evidence must account for the full stream
+and exactly one terminal result; oversized/unreadable lines or earlier results mean no verdict.
+The operator fallback is a fresh attempt with a narrower mandate, never trusting the retained tail alone.
 CLI failure excerpts must be redacted before truncation, including quota telemetry and metadata.
 Default `GIT_SSH_COMMAND` only when no caller SSH command, SSH executable, or environment Git config is set.
 Keep the last 50 bounded event projections and a redacted last-tool summary through both
