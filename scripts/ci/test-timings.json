@@ -1711,6 +1711,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-daemon-budget-lists-real-processes.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/live-changes-stale-accepted-phase.soak.test.mjs": 2,
