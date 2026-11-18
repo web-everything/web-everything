@@ -466,6 +466,9 @@ export function readPrFactsFromGithub({ repo, number, exec = execFileSyncThrottl
     throttle: { op: 'pr facts (github)', ...(caller ? { caller } : {}) },
   }) || 'null'));
   const pull = api(`repos/${repo}/pulls/${Number(number)}`);
+  if (!pull || typeof pull !== 'object' || Array.isArray(pull) || typeof pull.head?.sha !== 'string' || !pull.head.sha) {
+    throw new Error('malformed pull; refusing a partial read');
+  }
   const sha = pull?.head?.sha;
   // Every page: the latest review / check must never fall off the end (a short page ends the walk; the cap fails loud).
   const paged = (path, pick) => {
@@ -478,8 +481,8 @@ export function readPrFactsFromGithub({ repo, number, exec = execFileSyncThrottl
     }
     throw new Error(`${path}: more than 5000 rows; refusing a truncated read`);
   };
-  const checkRuns = sha ? paged(`repos/${repo}/commits/${sha}/check-runs`, (b) => b?.check_runs) : [];
-  const checkSuites = sha ? paged(`repos/${repo}/commits/${sha}/check-suites`, (b) => b?.check_suites) : [];
+  const checkRuns = paged(`repos/${repo}/commits/${sha}/check-runs`, (b) => b?.check_runs);
+  const checkSuites = paged(`repos/${repo}/commits/${sha}/check-suites`, (b) => b?.check_suites);
   const reviews = paged(`repos/${repo}/pulls/${Number(number)}/reviews`, (b) => b);
   return { ...normalizeGithubPr({ repo, pull, checkRuns, checkSuites, reviews }), source: 'github', asOfMs: Date.now(), cursor: null };
 }

@@ -360,10 +360,12 @@ describe('mirror compaction', () => {
     m.closedSeen = { 7: T0 - 1000 };
     const next = compact(m);
     expect(next.evicted).toEqual([7]);
-    const reopened = applyDelta(next, [{ seq: 11, repo: REPO.toLowerCase(), type: 'pull_request', action: 'reopened', number: 7, sha: HEAD, draft: false, labels: [] }]);
-    expect(lookup(reopened).facts).toBeNull();
-    expect(lookup({ ...reopened, evicted: [] }).reason).not.toBe('evicted');
-    expect(lookup(compact(reopened, 10 ** 9)).facts).toBeNull();
+    const reopened = applyDelta(next, [{ seq: 11, repo: REPO.toLowerCase(), type: 'pull_request', action: 'reopened', prs: [7], state: 'open', sha: HEAD, draft: false, labels: [] }]);
+    expect(reopened.buckets.prs[key(7)]).toMatchObject({ number: 7, state: 'open', sha: HEAD });
+    expect(lookup(reopened)).toEqual({ facts: null, reason: 'evicted' });
+    expect(lookup({ ...reopened, evicted: [] })).toEqual({ facts: null, reason: 'evicted' });
+    expect(lookup({ ...reopened, evicted: [], evictedShas: [] }).facts).toBeTruthy();
+    expect(lookup(compact(reopened, 10 ** 9))).toEqual({ facts: null, reason: 'evicted' });
   });
 
   it('keeps a current-head check joined to an open PR only through the sha bucket', () => {
@@ -680,6 +682,18 @@ describe('full seed taints shas of vanished cached checks', () => {
 });
 
 describe('refresh keeps mid-refresh evidence and fallback refuses malformed pages', () => {
+  it.each([null, false, 7, 'pull', [], {}, { head: null }, { head: { sha: 7 } }, { head: { sha: '' } }])(
+    'a malformed pull (%j) throws instead of returning empty checks and suites', (pull) => {
+      const fx = githubFixture();
+      const path = `repos/${REPO}/pulls/7`;
+      fx[path] = pull;
+      const calls = [];
+      expect(() => readPrFactsFromGithub({ repo: REPO, number: 7, exec: fakeGh(fx, calls) }))
+        .toThrow('malformed pull; refusing a partial read');
+      expect(calls).toEqual([path]);
+    },
+  );
+
   it('a malformed (null) page throws instead of returning empty evidence', () => {
     const sha = 'e'.repeat(40);
     const exec = (_c, a) => (/pulls\/4$/.test(a[a.length - 1]) ? JSON.stringify({ number: 4, state: 'open', head: { sha }, labels: [] }) : 'null');
