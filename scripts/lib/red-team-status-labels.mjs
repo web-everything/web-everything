@@ -1,7 +1,7 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { readFileSync } from 'node:fs';
-import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamCardOnly, redTeamOwedOnHead, redTeamReadReviewable } from './review-red-team-policy.mjs';
 import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -25,7 +25,8 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // A card-only CURRENT head with the skip on and no pass started owes no red team (the bypass writes no status, so a
   // `pending` set earlier would never clear): pending is a false hold. `headFiles` are the CURRENT head's live PR files (never
   // the stored status's read, which may be an older head's); unreadable or empty = unclassifiable = pending stays.
-  const cardOnlyNotOwed = headVerified && !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled && !evidence.carryConflict
+  const reviewable = redTeamReadReviewable(evidence.loopPayload?.findings?.read);
+  const cardOnlyNotOwed = reviewable && headVerified && !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled && !evidence.carryConflict
     && evidence.ok !== false && typeof evidence.skipCardOnly === 'boolean' && !(evidence.status?.status === 'finished' && evidence.status.result?.foldedVerdict) && readRedTeamProbes({ env, path: settingsPath }).value.skipCardOnly !== false
     && settingsReadable(settingsPath)
     && evidence.skipCardOnly
@@ -42,8 +43,10 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   }
   const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
   const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
+  const skippedUnreadable = !reviewable && (disposition.result?.policyClear || evidence.loopPayload?.carriedFrom != null
+    || evidence.status?.result === 'skipped' || evidence.status?.result?.status === 'skipped');
   const desired = broken ? 'red-team:blocked'
-    : pendingOnly ? 'red-team:pending'
+    : pendingOnly || skippedUnreadable ? 'red-team:pending'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
@@ -59,7 +62,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   try { JSON.parse(readFileSync(settingsPath, 'utf8')); fileReadable = true; } catch { /* unreadable policy */ }
   const skipCardOnly = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly
     : probes.value.skipCardOnly === true && (probes.sources?.skipCardOnly !== 'standard' || fileReadable);
-  const cardOnlyBypass = desired === null && headVerified
+  const cardOnlyBypass = reviewable && desired === null && headVerified
     // Live head files, when read, must also prove card-only (the stored read alone never overrides them).
     && (headFiles == null || (headFiles.length > 0 && isCardOnlyDiff(headFiles))) && evidence.ok !== false && skipCardOnly === true
     && !evidence.inFlight && !evidence.scheduled && !evidence.recorded && !evidence.carryConflict

@@ -8,7 +8,7 @@ import { readRecoveryWitness, redTeamStatusDir } from './drain-red-team-evidence
 import { VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
-import { redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamOwedFor, redTeamReadReviewable } from './review-red-team-policy.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
@@ -74,7 +74,7 @@ function storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam }) {
     const payload = stored?.ok === false ? null : stored?.newest;
     const verdict = payload?.verdict;
     return Boolean(verdict) && typeof verdict === 'object' && Object.values(VERDICTS).includes(verdict.verdict) && payload?.findings?.read?.netBasis?.rev === head
-      && !redTeamOwedFor(payload)
+      && redTeamReadReviewable(payload?.findings?.read) && !redTeamOwedFor(payload)
       // A human-required needs-human verdict is only positively not-owed when its advisory lens says changes.
       && (verdict.verdict !== VERDICTS.NEEDS_HUMAN || verdict.humanRequired !== true
         || advisoryLabelOutcome({ read: payload.findings.read, verdict }) === ADVISORY_OUTCOMES.CHANGES);
@@ -178,6 +178,8 @@ export function settleRedTeamSkip(input = {}) {
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
     if ((ruleApplies || classified.kind === 'policy') && !boundRead) {
       reason = 'policy skip head not bound to the reviewed read';
+    } else if ((ruleApplies || classified.kind === 'policy') && !redTeamReadReviewable(input.read ?? input.carry?.loopPayload?.findings?.read)) {
+      reason = 'review has no scored nonempty diff; inspect the read before retrying';
     } else if ((ruleApplies || classified.kind === 'policy')) {
       try {
         if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || typeof repo !== 'string' || !repo

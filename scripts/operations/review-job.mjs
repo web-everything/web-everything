@@ -95,6 +95,7 @@ import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, r
 
 import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
+import { redTeamReadReviewable } from '../lib/review-red-team-policy.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -976,7 +977,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
-          head, readHead, runId: out.runId });
+          head, readHead, read: seatsBox.input.loopPayload?.findings?.read, runId: out.runId });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
@@ -1146,6 +1147,9 @@ function runReviewArc({
               // decided before any restamp, owed marker or comment. Anything else re-reviews instead of stranding.
               const carriedAdvisory = prior.advisoryBody
                 ? prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha)) : null;
+              if (parseRedTeamComment(carriedAdvisory)?.policyClear
+                && !redTeamReadReviewable(io.readRedTeamOnlyPayload?.({ repo: planned.repo, pr: planned.pr, head: prior.sha })?.loopPayload?.findings?.read))
+                throw Error('carried policy-clear has no scored nonempty read; inspect before retrying');
               if (!isPublishableRedTeamResult(parseRedTeamComment(carriedAdvisory)))
                 throw Error('carried red-team result is not publishable on the new head');
               const stamped = io.restampVerdict({ pr: planned.pr, repo: planned.repo, newHead: evidence.headSha,
@@ -1259,6 +1263,10 @@ function runReviewArc({
         loopPayload = { ...loopPayload, carriedFrom: loopPayload.carriedFrom ?? head, verdict: null };
       }
       const pinned = stored?.head === head && loopPayload?.findings?.read?.netBasis?.rev === head;
+      if (!redTeamReadReviewable(loopPayload?.findings?.read)) {
+        classified = { outcome: 'red-team-not-owed', reason: 'stored review has no scored nonempty diff; inspect the read before retrying' };
+        return result({ ...classified, lanePath });
+      }
       if (!pinned || (!cardOnlyRecovery && (loopPayload?.carriedFrom != null || !redTeamOwedFor(loopPayload)))) {
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
         return result({ ...classified, lanePath });
@@ -1288,7 +1296,7 @@ function runReviewArc({
         // this job still holds the lane/claim. It never enters queued model admission.
         const redTeam = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
         const settled = io.settleRedTeamSkip({ repo: planned.repo, pr: planned.pr, head, readHead: head,
-          redTeam, carry: { loopPayload, lanePath } });
+          read: loopPayload.findings.read, redTeam, carry: { loopPayload, lanePath } });
         classified = { outcome: 'red-team-only' };
         return result({ ...classified, lanePath, redTeam: { ...redTeam, ...settled } });
       }

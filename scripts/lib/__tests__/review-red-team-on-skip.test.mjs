@@ -40,7 +40,7 @@ vi.mock('../github-app-identity.mjs', async importOriginal => {
 });
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
-const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev: head } } } });
 function fixture(over = {}) {
   return { repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
     rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [] }],
@@ -507,7 +507,7 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
         comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${storedHead} -->`, author: { login: 'web-everything' } }] }],
       readEvidence: () => ({ loopPayload: {
         verdict: { verdict: 'needs-human', humanRequired: false },
-        findings: { read: { netBasis: { rev: storedHead },
+        findings: { read: { diffScored: true, netBasis: { rev: storedHead },
           diffText: 'diff --git a/backlog/5910-card.md b/backlog/5910-card.md\n+update',
           netChangedFiles: ['backlog/5910-card.md'], netRenameSources: [] } },
       } }),
@@ -538,7 +538,7 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     const f = storedFixture(); const rev = storedHead;
     f.rawPrs[0].labels = labels;
     f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
-      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false,
+      findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false,
     ...evidenceOver });
     return f;
   };
@@ -614,7 +614,7 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
 
   it.each(['recorded', 'seatRecorded'])('does not treat an omitted %s as proof the head never ran (explicit-false contrast)', key => {
     const omitted = judgeAcceptedFixture(pendingLabels);
-    const evidence = { loopPayload: { verdict: { verdict: 'prevention-outstanding' }, findings: { read: { netBasis: { rev: storedHead } } } },
+    const evidence = { loopPayload: { verdict: { verdict: 'prevention-outstanding' }, findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev: storedHead } } } },
       recorded: false, seatRecorded: false, inFlight: false, queued: false };
     delete evidence[key];
     omitted.readEvidence = () => evidence;
@@ -627,7 +627,7 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     f.rawPrs[0].labels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
     const status = { status: 'finished', result: 'not-owed' };
     f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
-      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false, status });
+      findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false, status });
     f.readStatus = () => status;
     expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'clear' });
   });
@@ -1294,7 +1294,7 @@ describe('daemon rows without formal reviews', () => {
       ], statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     return runFixture({ rawPrs: [rawPr],
       plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: number, headSha: live }] },
-      readEvidence: () => ({ inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+      readEvidence: () => ({ loopPayload: payload(), inFlight: false, queued: false, recorded: false, seatRecorded: false }),
       readReviews: vi.fn(() => []),
       proveMove: vi.fn(() => { throw Error('acceptance re-stamp does not require a linear head move'); }),
     });
@@ -1661,7 +1661,7 @@ describe('PR 5890 review-pr status payloads', () => {
 describe('card-only head move recovery', () => {
   const fromSha = 'b'.repeat(40);
   const oldPayload = () => ({ verdict: { verdict: 'changes' }, findings: { read: {
-    netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    diffScored: true, netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
   } } });
   const oldEvidence = () => {
     const loopPayload = oldPayload();
@@ -1676,6 +1676,8 @@ describe('card-only head move recovery', () => {
     ['moved read head', e => { e.loopPayload.findings.read.netBasis.rev = head; e.status.head = head; e.status.loopPayload.findings.read.netBasis.rev = head; }],
     ['card-only read', e => { e.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs']; }],
     ['settleable skip', e => { e.status.result = 'ran'; }],
+    ['scored historical status read', e => { delete e.status.loopPayload.findings.read.diffScored; }],
+    ['scored selected read', e => { delete e.loopPayload.findings.read.diffScored; }],
     ['matching status head', e => { e.status.head = 'c'.repeat(40); e.status.loopPayload.findings.read.netBasis.rev = e.status.head; }],
     ['no recorded result', e => { e.recorded = true; }],
     ['no recorded seat', e => { e.seatRecorded = true; }],
@@ -1871,7 +1873,7 @@ describe('R100 recovery regressions', () => {
       trusted(`✅ review — accepted\n<!-- reviewed-sha: ${old} -->`),
       trusted(`${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`),
       trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->\n<!-- numbering-restamp: from=${old} to=${head} -->`),
-    ] }], readEvidence: () => ({ inFlight: false, recorded: false }),
+    ] }], readEvidence: () => ({ loopPayload: { ...payload(), verdict: null }, inFlight: false, recorded: false }),
   });
 
   it.each(['carry', 'clear'].flatMap(action => [
@@ -2117,7 +2119,7 @@ describe('R100 recovery regressions', () => {
         .map(label => [status, verdict, label]))))(
     'refuses stored clear with status %s, verdict %s, label %s', (status, verdict, label) => {
       const o = runFixture({
-        readEvidence: () => ({ loopPayload: { verdict: { verdict }, findings: { read: { netBasis: { rev: head } } } },
+        readEvidence: () => ({ loopPayload: { verdict: { verdict }, findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev: head } } } },
           recorded: false, seatRecorded: false, status: status && ({ status, result: 'not-owed' }) }),
         readStatus: () => status && ({ status, result: 'not-owed' }),
       });

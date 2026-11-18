@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path';
 import { sharedRunsDir } from '../operations/run-store.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 
+import { redTeamReadReviewable } from './review-red-team-policy.mjs';
+
 const steps = ['intent', 'label', 'comment', 'done'];
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
 function identity({ repo, pr, head, kind = 'card-only' }) {
@@ -41,6 +43,8 @@ export function resumeRedTeamCarry(input, io) {
   mkdirSync(dirname(path), { recursive: true });
   return withFileLock(`${path}.lock`, () => {
     let state = readRedTeamCarry({ ...key, env });
+    if (!redTeamReadReviewable((state?.loopPayload ?? input.loopPayload)?.findings?.read))
+      throw Error('carry read has no scored nonempty diff; inspect the read before retrying');
     if (state?.step === 'done') return { outcome: 'already' };
     if (!state) {
       const payload = input.loopPayload;
@@ -50,7 +54,7 @@ export function resumeRedTeamCarry(input, io) {
       state = { ...key, version: 1, step: 'intent', loopPayload: { ...payload, verdict: null } };
     }
     const guard = () => {
-      if (io.eligible(state) !== true) throw Error('carry refused: policy, hold, head or review evidence changed; inspect before retrying');
+      if (!redTeamReadReviewable(state.loopPayload?.findings?.read) || io.eligible(state) !== true) throw Error('carry refused: policy, hold, head or review evidence changed; inspect before retrying');
     };
     const record = step => {
       state = { ...state, step: steps[Math.max(steps.indexOf(state.step), steps.indexOf(step))] };

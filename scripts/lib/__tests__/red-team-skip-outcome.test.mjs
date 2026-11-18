@@ -64,7 +64,7 @@ function fixture() {
   const markerDir = join(redTeamStatusDir(env), 'skip-published');
   const markers = () => existsSync(markerDir) ? readdirSync(markerDir) : [];
   function settle(redTeam, overrides = {}) {
-    return settleRedTeamSkip({ redTeam: arguments.length === 0 ? policy : redTeam, repo, pr, head, readHead: head, comments, io, ...overrides });
+    return settleRedTeamSkip({ redTeam: arguments.length === 0 ? policy : redTeam, repo, pr, head, readHead: head, read: { diffScored: true, diffText: '+card' }, comments, io, ...overrides });
   }
   return { io, comments, settle, markers, markerDir };
 }
@@ -213,7 +213,8 @@ describe('settleRedTeamSkip', () => {
 
   it('label planner end-to-end: a policy result yields red-team:clear and a non-policy skip does not', async () => {
     const f = fixture();
-    const labels = () => planRedTeamStatusLabels({ repo, pr, head, comments: f.comments, labels: ['red-team:pending'] });
+    const labels = () => planRedTeamStatusLabels({ repo, pr, head, comments: f.comments, labels: ['red-team:pending'],
+      evidence: { loopPayload: { findings: { read: { diffScored: true, diffText: '+card' } } } } });
     await f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(labels().add).not.toBe('red-team:clear');
     await f.settle();
@@ -287,7 +288,7 @@ describe('stored-review not-owed settlement context', () => {
 describe('stored-review not-owed rule (R730)', () => {
   const rule = 'stored-review-not-owed';
   const review = (rev, verdict = { verdict: 'changes', humanRequired: false }) =>
-    ({ newest: { verdict, findings: { read: { netBasis: { rev } } } } });
+    ({ newest: { verdict, findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev } } } } });
   const reasons = [
     ['reported not-owed', { status: 'not-owed' }],
     ['stored review does not owe', { status: 'skipped', reason: 'stored review does not owe a red team' }],

@@ -19,7 +19,7 @@ function fixture() {
   const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
   const input = { repo: 'owner/repo', pr: 42, head: 'a'.repeat(40), kind: 'card-only',
     loopPayload: { verdict: { verdict: 'accept' }, carriedFrom: 'b'.repeat(40),
-      findings: { read: { netBasis: { rev: 'a'.repeat(40) } } } } };
+      findings: { read: { diffScored: true, diffText: '+card', netBasis: { rev: 'a'.repeat(40) } } } } };
   const live = { hold: false, head: input.head, panel: false, label: false, comment: false, intent: false };
   const io = { env,
     eligible: vi.fn(() => !live.hold && live.head === input.head && !live.panel),
@@ -151,7 +151,7 @@ describe('resumable red-team not-owed carry', () => {
 
 function liveFixture() {
   const f = fixture(), from = f.input.loopPayload.carriedFrom;
-  f.input.loopPayload.findings.read = { netBasis: { rev: f.input.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'] };
+  f.input.loopPayload.findings.read = { diffScored: true, netBasis: { rev: f.input.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'] };
   const oldPayload = { ...f.input.loopPayload, carriedFrom: undefined, verdict: { verdict: 'changes' },
     findings: { read: { ...f.input.loopPayload.findings.read, netBasis: { rev: from } } } };
   const evidence = { loopPayload: oldPayload, recorded: false, seatRecorded: false, inFlight: false,
@@ -293,4 +293,19 @@ describe('carry production IO guards and marker postconditions', () => {
     expect(f.effects.postResult).toHaveBeenCalledTimes(1);
     expect(f.state().step).toBe('done');
   });
+});
+
+
+it.each([undefined, false])('refuses an unscored carry journal before every effect, including a done retry: %s', diffScored => {
+  const f = fixture();
+  expect(f.run()).toEqual({ outcome: 'policy-clear' });
+  const path = readdirSync(join(f.io.env.WE_SHARED_RUNS_DIR, '..', 'red-team-status', 'carry')).find(name => name.endsWith('.json'));
+  const file = join(f.io.env.WE_SHARED_RUNS_DIR, '..', 'red-team-status', 'carry', path);
+  const state = JSON.parse(readFileSync(file, 'utf8'));
+  state.loopPayload.findings.read.diffScored = diffScored;
+  writeFileSync(file, JSON.stringify(state));
+  vi.clearAllMocks();
+  expect(f.run).toThrow(/no scored nonempty diff/);
+  expect(f.io.applyLabel).not.toHaveBeenCalled();
+  expect(f.io.postResult).not.toHaveBeenCalled();
 });

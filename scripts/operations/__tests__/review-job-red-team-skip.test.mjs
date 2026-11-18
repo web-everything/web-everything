@@ -705,7 +705,7 @@ describe('review-job red-team skip settlement', () => {
       vi.stubEnv('WE_NEEDS_YOU_FEED', path);
       const exec = vi.fn(() => '');
       const production = createReviewJobIo({ env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, exec });
-      expect(production.settleRedTeamSkip({ repo, pr, head, readHead: head, redTeam: skipped, comments: [] }).outcome).toBe('policy-clear');
+      expect(production.settleRedTeamSkip({ repo, pr, head, readHead: head, read: payload().findings.read, redTeam: skipped, comments: [] }).outcome).toBe('policy-clear');
       expect(exec).toHaveBeenCalledTimes(1);
       expect(exec).toHaveBeenCalledWith('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'],
         expect.objectContaining({ input: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: card-only diff (policy redTeam.skipCardOnly)` }));

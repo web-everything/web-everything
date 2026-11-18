@@ -4580,3 +4580,8 @@ must include a scored, nonempty read. Test pending labels and non-policy settlem
 `review-job-red-team-skip.test.mjs` without weakening the no-call/no-publication assertions.
 Point `WE_SHARED_RUNS_DIR` at `<fixture>/runs`: status and skip markers are siblings of the runs
 directory, so pointing it at the fixture root leaks deduplication state across test cases.
+
+Historical card-only skips and their carry journals must pass `redTeamReadReviewable` on both
+stored status and selected read before settlement, policy clearance or pending removal. Keep
+real-file unscored legacy-string and carried-journal regressions; a historical exemption never
+substitutes for a scored nonempty read. Refusal retains pending and directs inspection of the read.

@@ -1,4 +1,5 @@
 /** Live guards and observable effects for the not-owed carry machine. */
+import { redTeamReadReviewable } from './review-red-team-policy.mjs';
 import { createHash } from 'node:crypto';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from './review-red-team-on-skip.mjs';
@@ -26,7 +27,7 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
   return {
     env, checkpoint, witness: () => witness,
     eligible(state) {
-      if (skipPolicy() !== true) return false;
+      if (!redTeamReadReviewable(state.loopPayload?.findings?.read) || skipPolicy() !== true) return false;
       live = readLive(key(state));
       comments = readComments(key(state));
       if (live?.headRefOid !== state.head || !Array.isArray(live.labels) || !Array.isArray(comments)) return false;

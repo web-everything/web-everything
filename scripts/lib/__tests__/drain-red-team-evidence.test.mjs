@@ -535,7 +535,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     'unfinished journal discovery handles %s without manufacturing a verdict', kind => {
       const f = fixture(), from = 'a'.repeat(40);
       const loopPayload = { verdict: null, carriedFrom: from, findings: { read: {
-        netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+        diffScored: true, netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
       } } };
       // Power loss immediately after the journal rename, before the compatibility status.
       expect(() => resumeRedTeamCarry({ ...f, loopPayload }, { env: f.env, eligible: () => true,
@@ -1182,7 +1182,7 @@ describe('bounded review evidence scans', () => {
   // An unfinished card-only carry journal for this head, written before its compatibility status (a crash).
   const carryJournal = (f, from) => {
     const loopPayload = { verdict: null, carriedFrom: from, findings: { read: {
-      netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'] } } };
+      diffScored: true, netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'] } } };
     expect(() => resumeRedTeamCarry({ ...f, loopPayload }, { env: f.env, eligible: () => true,
       intentRecorded: () => false, recordIntent: () => { throw Error('crash'); } })).toThrow('crash');
   };

@@ -26,7 +26,7 @@ const iso = ms => new Date(ms).toISOString();
 const trusted = (body, createdAt = iso(acceptedAt)) => ({ body, createdAt, author: { login: 'web-everything' } });
 const accept = (sha = head) => trusted(`✅ review — accepted\n<!-- reviewed-sha: ${sha} -->`);
 const payload = (verdict = 'needs-human', rev = head) => ({
-  verdict: { verdict, humanRequired: false }, findings: { read: { netBasis: { rev } } },
+  verdict: { verdict, humanRequired: false }, findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev } } },
 });
 const evidence = (over = {}) => ({
   loopPayload: payload(), inFlight: false, queued: false, recorded: false, seatRecorded: false, ...over,
@@ -59,7 +59,7 @@ function notOwedRunFixture(over = {}) {
   return runFixture({ ...f, now: () => f.now, ...over });
 }
 function carryFixture() {
-  const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
+  const f = fixture({ readEvidence: () => evidence({ loopPayload: payload() }) });
   f.rawPrs[0].comments = [accept(old),
     trusted(`${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`),
     trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->\n<!-- numbering-restamp: from=${old} to=${head} -->`)];
@@ -333,20 +333,20 @@ describe('head-bound default pending settlement', () => {
   }
   it('reads the live head and removes only pending', () => {
     const { provider, settle } = setup();
-    settle({ repo, pr, head, remove: ['keep-me'] });
+    settle({ repo, pr, head, read: payload().findings.read, remove: ['keep-me'] });
     expect(provider.readPrState).toHaveBeenCalledWith(repo, pr);
     expect(provider.setLabels).toHaveBeenCalledOnce();
     expect(provider.setLabels).toHaveBeenCalledWith(repo, pr, { remove: ['red-team:pending'] });
   });
   it('refuses a head moved since planning', () => {
     const { provider, settle } = setup({ headRefOid: old, labels: ['red-team:pending'] });
-    expect(settle({ repo, pr, head })).toEqual({ skipped: 'head-moved' });
+    expect(settle({ repo, pr, head, read: payload().findings.read })).toEqual({ skipped: 'head-moved' });
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it.each([['red-team:pending', 'red-team:blocked'], [{ name: 'red-team:pending' }, { name: 'red-team:blocked' }],
     ['keep-me'], undefined].map(labels => [labels]))('preserves blocked, absent or unreadable pending labels %j', labels => {
     const { provider, settle } = setup({ headRefOid: head, labels });
-    try { settle({ repo, pr, head }); } catch { /* Unreadable labels may throw, but never write. */ }
+    try { settle({ repo, pr, head, read: payload().findings.read }); } catch { /* Unreadable labels may throw, but never write. */ }
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('missing provenance escalates before attempting to read live state', () => {
@@ -770,3 +770,12 @@ describe('R640 default never-reviewed scan', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+
+it.each([undefined, { diffScored: false, diffText: '+card' }, { diffScored: true, diffText: ' ' }])(
+  'pending removal refuses an empty or unscored read before label IO: %j', read => {
+    const provider = { readPrState: vi.fn(), setLabels: vi.fn() };
+    expect(() => mod.settlePendingFor({ provider, env: {} })({ repo, pr, head, read })).toThrow(/pending unchanged/);
+    expect(provider.readPrState).not.toHaveBeenCalled();
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });

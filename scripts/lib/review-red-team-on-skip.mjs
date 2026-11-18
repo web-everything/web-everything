@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { pidExistence, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
   readCarriedCheckUnpublished, createCarriedCheckPublisher } from './drain-red-team-evidence.mjs';
 import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision } from './red-team-gate.mjs';
-import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { redTeamOwedFor, redTeamCardOnly, redTeamReadReviewable } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
@@ -344,7 +344,7 @@ export function redTeamSkipNeedsSettlement(status) {
   // a non-empty card-only read and matching pinned head, the producer's card-only
   // branch runs before every other applicable skip reason, so this combination
   // can only be a card-only skip. Never infer that provenance for object results.
-  return typeof read?.diffText === 'string' && read.diffText.trim().length > 0
+  return redTeamReadReviewable(read)
     && isRealHead(status?.head) && read.netBasis?.rev === status.head
     && status?.status === 'finished' && normalizeRedTeamResult(status.result).priorResult === 'skipped'
     && status.skipCardOnly === true && redTeamCardOnly(status.loopPayload?.findings?.read);
@@ -354,7 +354,7 @@ export function redTeamSkipNeedsSettlement(status) {
 export function cardOnlyHeadMoveCandidate(evidence, head) {
   const read = evidence?.loopPayload?.findings?.read;
   return !evidence?.carryConflict && isRealHead(read?.netBasis?.rev) && read.netBasis.rev !== head
-    && redTeamCardOnly(read) && redTeamSkipNeedsSettlement(evidence?.status)
+    && redTeamReadReviewable(read) && redTeamCardOnly(read) && redTeamSkipNeedsSettlement(evidence?.status)
     && evidence.status.head === read.netBasis.rev
     && evidence.recorded === false && evidence.seatRecorded === false
     && !evidence.inFlight && !evidence.queued;
@@ -364,7 +364,7 @@ export function cardOnlyHeadMoveCandidate(evidence, head) {
 export function cardOnlySkipSettlementCandidate(evidence, head) {
   const read = evidence?.loopPayload?.findings?.read;
   return !evidence?.carryConflict && isRealHead(head) && read?.netBasis?.rev === head
-    && redTeamCardOnly(read) && redTeamSkipNeedsSettlement(evidence?.status)
+    && redTeamReadReviewable(read) && redTeamCardOnly(read) && redTeamSkipNeedsSettlement(evidence?.status)
     && evidence.status.head === head
     && evidence.recorded === false && evidence.seatRecorded === false
     && !evidence.inFlight && !evidence.queued;
@@ -617,7 +617,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
           && comment && latestResultAt === rawPr.comments.indexOf(comment) && result && result.findings.length === 0
           // The parser's one canonical policy-clear rule (#6606), the same shape the live check publisher accepts.
-          && parsed.policyClear === true) {
+          && parsed.policyClear === true && redTeamReadReviewable(evidence?.loopPayload?.findings?.read)) {
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
           const refusal = publishableClearGuard(context);
           if (refusal) return guardedSkip(refusal);
@@ -655,7 +655,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             : rawPr.comments.some(comment => isLaterVerdictBody(comment?.body)));
         const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
           comments: rawPr.comments, reviews, settlesPending: true });
-        const canSettle = !hold && !refusal && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+        const canSettle = redTeamReadReviewable(evidence?.loopPayload?.findings?.read) && !hold && !refusal
+          && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
           && evidence.recorded === false && evidence.seatRecorded === false;
         const sealRefusal = canSettle
@@ -705,7 +706,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       }
       if (!movedCardOnly && !pendingCardOnly && (!owed || accepted || finishedNotOwed)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
-        if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+        if (redTeamReadReviewable(evidence?.loopPayload?.findings?.read)
+          && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && accepted
           && (() => {
             const status = readStatus({ repo, pr, head });
@@ -817,7 +819,8 @@ function holdGuardedProvider(provider, head) {
 
 /** Re-read the live head and labels before removing a stale pending status. */
 export function settlePendingFor({ provider, env = process.env } = {}) {
-  return ({ repo, pr, head }) => {
+  return ({ repo, pr, head, read }) => {
+    if (!redTeamReadReviewable(read)) throw Error('review has no scored nonempty diff; pending unchanged');
     if (!provider && (isUnderTest() || isUnderTest(env))) return;
     const labels = provider ?? createGhProvider({ exec: (args, options) => runGhSync(args,
       { ...options, env, encoding: 'utf8', timeout: 60_000 }) });
@@ -908,6 +911,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   // daemon never sets the env), and the writes run as that App, never this daemon's reviewer role (#6535, R907).
   const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : createPolicyClearPublisher({ env }));
   const publishPolicyClearCheck = (pr, head, resultComments) => {
+    if ((resultComments === undefined || redTeamResultCommentForHead(resultComments, pr, head)?.parsed?.policyClear)
+      && !redTeamReadReviewable(readEvidence({ repo, pr, head })?.loopPayload?.findings?.read))
+      throw Error('review has no scored nonempty diff; inspect the read before retrying');
     if (!publisher) return;
     let posted;
     try { posted = publisher({ repo, pr, headSha: head, ...(resultComments !== undefined ? { resultComments } : {}) }); }
@@ -1056,7 +1062,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                   continue;
                 }
                 publishPolicyClearCheck(row.prNumber, row.head);
-                settlePending({ ...key, remove: ['red-team:pending'] });
+                settlePending({ ...key, read: readEvidence(key)?.loopPayload?.findings?.read, remove: ['red-team:pending'] });
               }
             }
           }
@@ -1069,7 +1075,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           // One attempt per cooldown, success or not: each attempt costs a bounded handful of GitHub reads and writes.
           history.set(carriedCheckRetryKey(repo, row.prNumber, row.head), at);
           let out;
-          try { out = publishCarriedCheck({ pr: row.prNumber, headSha: row.head }); }
+          try {
+            const result = redTeamForHead(readComments({ repo, pr: row.prNumber }), row.prNumber, row.head);
+            if (result?.policyClear && !redTeamReadReviewable(readEvidence({ repo, pr: row.prNumber, head: row.head })?.loopPayload?.findings?.read))
+              throw Error('carried policy-clear has no scored nonempty read; inspect before retrying');
+            out = publishCarriedCheck({ pr: row.prNumber, headSha: row.head });
+          }
           catch (error) { out = { ok: false, reason: safeErrorText(error) }; }
           if (out?.ok === true) row.why = 'carried red-team check republished from live evidence';
           else {
@@ -1096,7 +1107,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             publishPolicyClearCheck(row.prNumber, row.head);
             runGhSync(['pr', 'comment', String(row.prNumber), `--repo=${repo}`, '--body-file', '-'],
               { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
-            syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note });
+            syncLabels({ repo, pr: row.prNumber, head: row.head, evidence: readEvidence({ repo, pr: row.prNumber, head: row.head }), env, log: note });
           } catch (error) { row.action = 'skip'; row.why = `carry failed: ${safeErrorText(error)}`; }
         }
       }
@@ -1113,6 +1124,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             let publishFailure = null;
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
+              read: readEvidence({ repo, pr: row.prNumber, head: row.head })?.loopPayload?.findings?.read,
               io: { env, log: note,
                 // settleRedTeamSkip reaches this only once it decided policy-clear and the head shows no result.
                 postComment: ({ repo, pr, body }) => {
@@ -1129,7 +1141,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 publishNeedsYou: publishAttention,
               } });
             if (['policy-clear', 'already'].includes(result?.outcome)) {
-              syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note, provider: holdGuardedProvider(provider, row.head) });
+              syncLabels({ repo, pr: row.prNumber, head: row.head, evidence: readEvidence({ repo, pr: row.prNumber, head: row.head }), env, log: note, provider: holdGuardedProvider(provider, row.head) });
             } else {
               row.action = 'skip';
               row.why = `clear failed: ${publishFailure ? `policy-clear comment failed: ${publishFailure}` : result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
