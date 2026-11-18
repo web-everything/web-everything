@@ -4587,7 +4587,12 @@ review-job and review-daemon suites.
 probation service. At adoption, `freezeProbation` takes the complete registered roster
 for one clone and `readClosure(daemon, sha)` snapshots at proven-good and adopted heads.
 A snapshot is `{ complete: true, files: { repoRelativePath: gitBlobId } }`; include
-all imported files. Unknown, incomplete, empty or unreadable snapshots owe proof.
+every tracked blob under `scripts/`, `skills-src/`, and the top-level directory of
+that daemon's entry, plus root `package.json` and `package-lock.json`. A root-level
+entry conservatively includes the whole repository. Unrelated siblings,
+CommonJS files, JSON configs and createRequire alias targets within this scope all
+owe proof when changed; files outside it (for example `docs/`) do not.
+Unknown, incomplete, empty or unreadable snapshots owe proof.
 An unknown or ambiguous roster refuses adoption: the operator must recover the roster.
 `owed` stays fixed for this adoption. `recordProof` stores independent daemon records;
 boot and completed tick evidence must name that daemon, agree on its PID and adopted
@@ -4603,9 +4608,9 @@ it does not establish production probation integration. `probation-io.mjs` now o
 their existing `withWriteLock` holds. It freezes launchd labels (stable daemon IDs),
 entry paths and SHA-specific Git blob closures in a per-clone `.probation.json`
 under `stateDir`. The previous smoke-adopted head supplies the legacy comparison
-baseline; this observer never promotes it. Unknown package/dynamic imports or
-failed closure reads conservatively owe proof. Roster failure produces an invalid
-record and requires operator recovery of registrations. Every persisted read is
+baseline; this observer never promotes it. Failed closure reads conservatively owe
+proof. Roster failure produces an invalid record and requires operator recovery of
+registrations. Every persisted read is
 validated; missing, unreadable and malformed records report invalid, never empty.
 Self-sync submits only its own immutable PID/start/boot-head and completed tick
 head after releasing its read lock; ambiguous process identity earns no proof.
@@ -4621,12 +4626,14 @@ invalid persistence and lock refusal: assert lifecycle results, rebuild state an
 protected marker bytes, not only the observer's return value. Prepare/planning and
 launchd identity are stubbed; probation persistence and the shared lock remain real.
 
-Probation closure evidence uses the installed Acorn parser: literal import/export-from,
-dynamic import and require edges must enter the Git blob map; unsupported syntax or
-unknown targets owe proof. Adoption may create a record only when none exists or the
+Probation closure evidence reads immutable blob IDs with bounded `git ls-tree -r`
+output, without parsing file contents or following dependencies. Git failure,
+truncation/output overflow, a scoped symlink (including an entry), or a missing entry
+makes the snapshot incomplete: all
+affected daemons owe proof, and an operator must inspect the scoped tree if evidence
+cannot be collected. A precise dependency walker is a later narrowing optimization.
+The IO tests exercise unrelated scoped changes, excluded docs, immutable snapshots,
+oversized Git output, and unchanged symlink blobs whose excluded/external targets
+change. Adoption may create a record only when none exists or the
 existing record validates. Invalid/unreadable records (including dangling symlinks)
 remain untouched and require operator recovery; they never reset the debt baseline.
-Retain loader kind through resolution: collision tests must distinguish exact ESM paths
-from CommonJS file/.js/.json/.node ordering; unsupported loaders/directories fail closed.
-The loader-form gate covers direct/member/computed calls and extracted loaders: computed
-require properties and unknown computed module access refuse complete closure evidence.

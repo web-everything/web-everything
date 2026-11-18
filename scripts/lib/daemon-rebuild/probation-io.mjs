@@ -1,10 +1,9 @@
 /** R986 S2a-1b: report-only probation IO. No result from here authorizes any lifecycle decision. */
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, realpathSync, lstatSync } from 'node:fs';
-import { join, dirname, relative, resolve, isAbsolute, basename } from 'node:path';
+import { join, dirname, relative, resolve, isAbsolute } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { parse } from 'acorn';
 import { freezeProbation, recordProof, evaluateProbation, validateProbation } from './probation.mjs';
 import { stateDir } from './state.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
@@ -15,42 +14,6 @@ import { readPlistAsJson } from '../../operations/daemon-status-io.mjs';
 export const probationPath = (root, env = process.env) => join(stateDir(env), `${cloneKey(root)}.probation.json`);
 const invalid = reason => ({ status: 'invalid', action: 'pending', reason: `${reason}; operator recovery required` });
 const canonical = p => realpathSync(p);
-
-// Parse syntax, never source spelling: comments, escapes and whitespace cannot hide edges.
-// Unsupported syntax and nonliteral loader targets throw into the incomplete fallback.
-function dependencies(text) {
-  const imports = [], jsonNames = new Set();
-  const literal = node => node?.type === 'Literal' && typeof node.value === 'string' ? node.value :
-    node?.type === 'TemplateLiteral' && node.expressions.length === 0 ? node.quasis[0].value.cooked : null;
-  const add = (node, kind = 'import') => {
-    const spec = literal(node);
-    if (!spec) throw new Error('unknown dependency; inspect imports');
-    imports.push({ spec, kind });
-  };
-  const visit = (node, parent) => {
-    if (!node || typeof node.type !== 'string') return;
-    const value = literal(node);
-    if (value?.endsWith('.json')) jsonNames.add(basename(value));
-    if (node.type === 'ImportDeclaration' || node.type === 'ExportAllDeclaration' ||
-        (node.type === 'ExportNamedDeclaration' && node.source)) add(node.source);
-    if (node.type === 'ImportExpression') add(node.source);
-    if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'require') {
-      if (node.arguments.length !== 1) throw new Error('unknown require arguments');
-      add(node.arguments[0], 'require');
-    }
-    if (node.type === 'MemberExpression' && node.computed &&
-        (literal(node.property) === 'require' || node.object.name === 'module'))
-      throw new Error('unknown member loader; inspect imports');
-    if (node.type === 'Identifier' && node.name === 'require' &&
-        !(parent?.type === 'CallExpression' && parent.callee === node)) throw new Error('unknown require form');
-    for (const child of Object.values(node)) {
-      if (Array.isArray(child)) child.forEach(n => visit(n, node));
-      else if (child && typeof child === 'object') visit(child, node);
-    }
-  };
-  visit(parse(text, { ecmaVersion: 2020, sourceType: 'module', allowHashBang: true }));
-  return { imports, jsonNames };
-}
 
 /** Launchd labels distinguish multiple services running the same entry on ONE clone. Unknown roster throws. */
 export function registeredDaemons(root, { env = process.env, exec = execFileSync, readdir = readdirSync } = {}) {
@@ -80,47 +43,30 @@ export function registeredDaemons(root, { env = process.env, exec = execFileSync
   });
 }
 
-/** Read only immutable Git objects. Unknown dynamic/package imports conservatively owe proof. */
+/** Conservative immutable snapshot; narrowing by dependency analysis is a later optimization. */
 export function readClosure(root, daemon, sha) {
   try {
     if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha)) return { complete: false };
-    const git = args => execFileSync('git', args, { cwd: root, encoding: 'utf8', timeout: 5000,
-      maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
-    const blobs = new Map(git(['ls-tree', '-rz', '--full-tree', sha]).split('\0').filter(Boolean).map(row => {
-      const [meta, file] = row.split('\t');
-      const [mode, type, blob] = meta.split(' ');
-      return [file, type === 'blob' && mode !== '120000' ? blob : null];
-    }));
-    const files = new Map(), jsonNames = new Set(), stack = [daemon.entry];
-    while (stack.length) {
-      const file = stack.pop();
-      if (files.has(file)) continue;
-      const blob = blobs.get(file);
-      if (!blob) return { complete: false };
-      files.set(file, blob);
-      const info = dependencies(git(['cat-file', 'blob', blob]));
-      for (const name of info.jsonNames) jsonNames.add(name);
-      for (const { spec, kind } of info.imports) {
-        if (spec.startsWith('node:')) continue;
-        if (!/^\.\.?\//.test(spec)) return { complete: false };
-        const base = relative(root, resolve(root, dirname(file), spec));
-        if (base.startsWith('..') || isAbsolute(base)) return { complete: false };
-        // Node ESM uses the exact path; CommonJS tries file, .js, .json, .node in order.
-        // Directory/package resolution and non-JS loaders require operator inspection.
-        const target = (kind === 'require' ? [base, `${base}.js`, `${base}.json`, `${base}.node`] : [base])
-          .find(p => blobs.has(p));
-        if (!target || !blobs.get(target) || (kind === 'require' && !/\.[cm]?js$/.test(target))) return { complete: false };
-        stack.push(target);
-      }
+    const entry = daemon.entry;
+    if (typeof entry !== 'string' || !entry || isAbsolute(entry) ||
+        entry.split('/').some(p => !p || p === '.' || p === '..')) return { complete: false };
+    const scope = entry.includes('/') ? entry.split('/')[0] + '/' : '.';
+    const paths = [...new Set(['scripts/', 'skills-src/', scope, 'package.json', 'package-lock.json'])];
+    const output = execFileSync('git', ['ls-tree', '-rz', '--full-tree', sha, '--',
+      ...paths.map(p => `:(literal)${p}`)], {
+      cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 8 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (!output.endsWith('\0')) return { complete: false };
+    const files = new Map();
+    for (const row of output.slice(0, -1).split('\0')) {
+      const tab = row.indexOf('\t'), meta = row.slice(0, tab), file = row.slice(tab + 1);
+      const match = /^(?:100644|100755) blob ([a-f0-9]{40}|[a-f0-9]{64})$/.exec(meta);
+      if (tab < 0 || !match || !file || files.has(file)) return { complete: false };
+      files.set(file, match[1]);
     }
-    for (const [file, blob] of blobs) {
-      if (file.endsWith('.json') && jsonNames.has(basename(file))) {
-        if (!blob) return { complete: false };
-        files.set(file, blob);
-      }
-    }
-    return { complete: true, files: Object.fromEntries(files) };
-  } catch { return { complete: false }; } // Includes Git/output bounds: operator can inspect imports; all daemons owe proof.
+    return files.has(entry) ? { complete: true, files: Object.fromEntries(files) } : { complete: false };
+  } catch { return { complete: false }; } // Git failure/output bounds owe proof; operator must inspect the scoped tree.
 }
 
 function readRecord(root, env, now) {

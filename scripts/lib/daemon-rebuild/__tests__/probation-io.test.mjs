@@ -9,7 +9,7 @@ const load = () => import('../probation-io.mjs');
 const at = Date.parse('2026-11-15T12:00:00Z');
 const iso = n => new Date(n).toISOString();
 let dir, root, env, git, good, head, opts;
-const registered = [{ id: 'X', entry: 'x.mjs' }, { id: 'Y', entry: 'y.mjs' }];
+const registered = [{ id: 'X', entry: 'workers/x.mjs' }, { id: 'Y', entry: 'services/y.mjs' }];
 const processRecord = (daemonId, pid) => ({ daemonId, pid, bootHead: head, tickHead: head,
   startedAt: iso(at + 1), lastTickDoneAt: iso(at + 2) });
 beforeEach(() => {
@@ -20,11 +20,12 @@ beforeEach(() => {
     encoding: 'utf8', env: { ...env, GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
       GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } }).trim();
   git(['init', '-q']);
-  writeFileSync(join(root, 'x.mjs'), "import './dep.mjs';\n");
-  writeFileSync(join(root, 'dep.mjs'), 'export default 1;');
-  writeFileSync(join(root, 'y.mjs'), 'export default 0;');
+  mkdirSync(join(root, 'workers')); mkdirSync(join(root, 'services'));
+  writeFileSync(join(root, 'workers/x.mjs'), "import './dep.mjs';\n");
+  writeFileSync(join(root, 'workers/dep.mjs'), 'export default 1;');
+  writeFileSync(join(root, 'services/y.mjs'), 'export default 0;');
   git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'good']);
-  writeFileSync(join(root, 'dep.mjs'), 'export default 2;');
+  writeFileSync(join(root, 'workers/dep.mjs'), 'export default 2;');
   git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'adopt']);
   git(['reset', '--hard', head]);
   opts = { root, env, registered, now: () => at + 3, log: { error() {} }, lockOpts: { waitMs: 1000, pollMs: 5 } };
@@ -38,7 +39,7 @@ describe('R986 report-only probation persistence', () => {
     const m = await load();
     const alias = join(dir, 'alias'); symlinkSync(root, alias, 'dir');
     const plists = Object.fromEntries([['com.we.X', root], ['com.we.Y', alias]].map(([id, path]) =>
-      [id, { Label: id, WorkingDirectory: path, ProgramArguments: ['node', 'x.mjs'] }]));
+      [id, { Label: id, WorkingDirectory: path, ProgramArguments: ['node', 'workers/x.mjs'] }]));
     const roster = m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
       readdir: () => Object.keys(plists).map(id => `${id}.plist`),
       exec: (_, args) => JSON.stringify(plists[basename(args.at(-1), '.plist')]) });
@@ -51,172 +52,103 @@ describe('R986 report-only probation persistence', () => {
     expect(() => m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
       readdir: () => mode === 'duplicate discovery' ? ['com.we.X.plist', 'com.we.X.plist'] : ['com.we.X.plist'],
       exec: () => JSON.stringify({ Label: mode === 'ambiguous label' ? 'com.we.Y' : 'com.we.X',
-        WorkingDirectory: root, ProgramArguments: ['node', 'x.mjs'] }) })).toThrow(/roster|identity/);
+        WorkingDirectory: root, ProgramArguments: ['node', 'workers/x.mjs'] }) })).toThrow(/roster|identity/);
   });
-  it('changed CommonJS required dependency is included and owes proof', async () => {
+  it('any tracked scoped file changes the snapshot and owes proof, while docs do not', async () => {
     const m = await load();
-    writeFileSync(join(root, 'entry.cjs'), "module.exports = require('./required.cjs');");
-    writeFileSync(join(root, 'required.cjs'), 'module.exports = 1;');
-    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'cjs before']);
-    writeFileSync(join(root, 'required.cjs'), 'module.exports = 2;');
-    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'cjs after']);
-    const roster = [{ id: 'CJS', entry: 'entry.cjs' }];
-    expect(m.readClosure(root, roster[0], head)).toEqual({ complete: true, files: {
-      'entry.cjs': git(['rev-parse', head + ':entry.cjs']),
-      'required.cjs': git(['rev-parse', head + ':required.cjs']),
-    } });
-    expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
-      .toMatchObject({ action: 'pending', owed: ['CJS'] });
-  });
-  it('CommonJS extensionless require tracks dep.js before dep.mjs and changing dep.js owes proof', async () => {
-    const m = await load();
-    writeFileSync(join(root, 'entry.cjs'), "module.exports = require('./dep');");
-    writeFileSync(join(root, 'dep.js'), 'module.exports = 1;');
-    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'require collision before']);
-    writeFileSync(join(root, 'dep.js'), 'module.exports = 2;');
-    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'require collision after']);
-    expect(execFileSync(process.execPath, ['-p', "require.resolve('./dep')"],
-      { cwd: root, encoding: 'utf8' }).trim()).toBe(join(root, 'dep.js'));
-    const roster = [{ id: 'CJS', entry: 'entry.cjs' }];
-    expect(m.readClosure(root, roster[0], head)).toEqual({ complete: true, files: {
-      'entry.cjs': git(['rev-parse', head + ':entry.cjs']), 'dep.js': git(['rev-parse', head + ':dep.js']),
-    } });
-    expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
-      .toMatchObject({ action: 'pending', owed: ['CJS'] });
-  });
-  it.each(['mjs only', 'cjs only', 'directory', 'JSON', 'native', 'symlink'])(
-    'CommonJS extensionless require fails closed for unsupported resolution: %s', async mode => {
-      const m = await load();
-      writeFileSync(join(root, 'entry.cjs'), "module.exports = require('./target');");
-      if (mode === 'directory') {
-        mkdirSync(join(root, 'target'));
-        writeFileSync(join(root, 'target/index.js'), 'module.exports = 1;');
-      } else if (mode === 'symlink') {
-        symlinkSync('dep.mjs', join(root, 'target'));
-        writeFileSync(join(root, 'target.js'), 'module.exports = 1;');
-      } else {
-        const ext = { 'mjs only': 'mjs', 'cjs only': 'cjs', JSON: 'json', native: 'node' }[mode];
-        writeFileSync(join(root, `target.${ext}`), '1');
+    const roster = [...registered, { id: 'Z', entry: 'workers/y.mjs' }];
+    const paths = ['scripts/unrelated-sibling.mjs', 'scripts/unrelated.cjs', 'scripts/config.json',
+      'scripts/alias-target.cjs', 'scripts/tab\tand\nnewline.bin', 'skills-src/brief.md', 'workers/nested/sibling.txt',
+      'package.json', 'package-lock.json', 'docs/guide.md'];
+    writeFileSync(join(root, 'workers/y.mjs'),
+      "import { createRequire } from 'node:module'; const alias = createRequire(import.meta.url); alias('../scripts/alias-target.cjs');");
+    for (const file of paths) {
+      mkdirSync(join(root, file, '..'), { recursive: true });
+      writeFileSync(join(root, file), 'before');
+    }
+    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'scope baseline']);
+    for (const file of paths) {
+      writeFileSync(join(root, file), 'after');
+      git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', file]);
+      const owed = [];
+      for (const daemon of roster) {
+        const ownDir = daemon.entry.split('/')[0];
+        const scoped = !file.startsWith('docs/') && (!file.startsWith('workers/') || ownDir === 'workers');
+        if (scoped) owed.push(daemon.id);
+        const before = m.readClosure(root, daemon, good), after = m.readClosure(root, daemon, head);
+        expect(before.complete).toBe(true); expect(after.complete).toBe(true);
+        expect(after.files).toEqual(Object.fromEntries(
+          [...(ownDir === 'workers' ? ['workers/x.mjs', 'workers/dep.mjs', 'workers/y.mjs'] : ['services/y.mjs']),
+            ...paths.filter(p => !p.startsWith('docs/') && (!p.startsWith('workers/') || ownDir === 'workers'))]
+            .map(p => [p, git(['rev-parse', `${head}:${p}`])])));
+        expect(after.files[file]).toBe(scoped ? git(['rev-parse', `${head}:${file}`]) : undefined);
+        expect(after.files).toEqual(scoped ? { ...before.files, [file]: after.files[file] } : before.files);
+        if (scoped) expect(after.files[file]).not.toBe(before.files[file]);
       }
-      git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'unsupported require']);
-      expect(m.readClosure(root, { entry: 'entry.cjs' }, sha)).toEqual({ complete: false });
-    });
-  it.each([
-    ["require('./loaded.cjs')", true],
-    ["module.require('./loaded.cjs')", false],
-    ["module['require']('./loaded.cjs')", false],
-    ['module["require"]("./loaded.cjs")', false],
-    ['module[`require`]("./loaded.cjs")', false],
-    ["module['requ\\u0069re']('./loaded.cjs')", false],
-    ["module['re' + 'quire']('./loaded.cjs')", false],
-    ["module[loader]('./loaded.cjs')", false],
-    ['module[`${loader}`]("./loaded.cjs")', false],
-    ["globalThis['require']('./loaded.cjs')", false],
-    ["const load = module['require']; load('./loaded.cjs')", false],
-  ])('CommonJS loader-form gate includes dependency or fails closed and retains changed dependency debt: %s',
-    async (source, complete) => {
-      const m = await load();
-      writeFileSync(join(root, 'entry.cjs'), source);
-      writeFileSync(join(root, 'loaded.cjs'), 'module.exports = 1;');
-      git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'loader form before']);
-      writeFileSync(join(root, 'loaded.cjs'), 'module.exports = 2;');
-      git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'loader form after']);
-      const roster = [{ id: 'CJS', entry: 'entry.cjs' }];
-      expect(m.readClosure(root, roster[0], head)).toEqual(complete ? { complete: true, files: {
-        'entry.cjs': git(['rev-parse', head + ':entry.cjs']), 'loaded.cjs': git(['rev-parse', head + ':loaded.cjs']),
-      } } : { complete: false });
+      rmSync(env.WE_DAEMON_STATE_DIR, { recursive: true, force: true });
       expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
-        .toMatchObject({ action: 'pending', owed: ['CJS'] });
-    });
-  it.each(['require(target)', 'module.require(target)', "require.resolve('./required.cjs')"])
-    ('unresolved CommonJS form %s fails closed', async source => {
-      const m = await load();
-      writeFileSync(join(root, 'y.mjs'), source); git(['add', '.']);
-      const sha = git(['commit-tree', git(['write-tree']), '-m', 'unresolved require']);
-      expect(m.readClosure(root, registered[1], sha)).toEqual({ complete: false });
-    });
-  it.each([
-    'import"./dep.mjs";',
-    "import'./dep.mjs';",
-    'import\n"./dep.mjs";',
-    'export*from"./dep.mjs";',
-    "export * /*c*/ from\n './dep.mjs';",
-    'import{default as value}from"./dep.mjs";',
-    'import(`./dep.mjs`);',
-    'import(\n`./dep.mjs`\n);',
-    "require('./dep.mjs');",
-    'require("./dep.mjs");',
-    'require /*c*/ ( /*c*/ `./dep.mjs` /*c*/ );',
-    "require( //c\n './dep.mjs'\n);",
-    'import /* comment */ "./dep.mjs";',
-    'import // comment\n "./dep.mjs";',
-    "export { default } from /*c*/ './dep.mjs';",
-    "import /*c*/ ( /*c*/ './dep.mjs' /*c*/ );",
-    "import( // comment\n './dep.mjs' // comment\n );",
-  ])('commented import includes its dependency and owes proof: %s', async source => {
-    const m = await load();
-    writeFileSync(join(root, 'x.mjs'), source);
-    writeFileSync(join(root, 'dep.mjs'), 'export default 1;');
-    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'comment before']);
-    writeFileSync(join(root, 'dep.mjs'), 'export default 2;');
-    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'comment after']);
-    expect(m.readClosure(root, registered[0], head)).toEqual({ complete: true, files: {
-      'x.mjs': git(['rev-parse', head + ':x.mjs']), 'dep.mjs': git(['rev-parse', head + ':dep.mjs']),
-    } });
-    expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
-      .toMatchObject({ action: 'pending', owed: ['X'] });
-    writeFileSync(join(root, 'x.mjs'), source.replaceAll('./dep.mjs', '../outside.mjs'));
-    writeFileSync(join(dir, 'outside.mjs'), 'export default 1;');
-    git(['add', '.']); const outside = git(['commit-tree', git(['write-tree']), '-m', 'outside import']);
-    expect(m.readClosure(root, registered[0], outside)).toEqual({ complete: false });
-  });
-  it('regex character-class slashes preserve the following import and owe proof for its changed dependency', async () => {
-    const m = await load();
-    writeFileSync(join(root, 'x.mjs'), "const re = /[//]/; import './dep.mjs';");
-    writeFileSync(join(root, 'dep.mjs'), 'export default 1;');
-    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'regex before']);
-    writeFileSync(join(root, 'dep.mjs'), 'export default 2;');
-    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'regex after']);
-    expect(m.readClosure(root, registered[0], head)).toEqual({ complete: true, files: {
-      'x.mjs': git(['rev-parse', head + ':x.mjs']), 'dep.mjs': git(['rev-parse', head + ':dep.mjs']),
-    } });
-    expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
-      .toMatchObject({ action: 'pending', owed: ['X'] });
+        .toMatchObject(owed.length ? { action: 'pending', owed } : { action: 'pass' });
+      expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).owed).toEqual(owed);
+      writeFileSync(join(root, file), 'before');
+    }
   });
   it.each([
-    'import`./dep.mjs`;', 'export * from `./dep.mjs`;',
-    "import('./dep.mjs' + suffix);", 'import(`./${target}.mjs`);',
-    "require('./dep.mjs' + suffix);", 'require(`./${target}.mjs`);',
-    'import"./missing.mjs";', 'import"./dep";', 'require("package-name");',
-    'import"./dep.mjs"; import"./missing.mjs";',
-  ])('unknown or unsupported dependency syntax fails closed: %s', async source => {
+    ['workers/x.mjs', 'excluded'], ['workers/x.mjs', 'external'],
+    ['workers/linked.mjs', 'excluded'], ['workers/linked.mjs', 'external'],
+    ['scripts/linked.mjs', 'excluded'], ['scripts/linked.mjs', 'external'],
+  ])('symlink target changes cannot bypass probation debt (%s, %s)', async (link, location) => {
     const m = await load();
-    writeFileSync(join(root, 'x.mjs'), source); git(['add', '.']);
-    const sha = git(['commit-tree', git(['write-tree']), '-m', 'incomplete syntax']);
-    expect(m.readClosure(root, registered[0], sha)).toEqual({ complete: false });
+    mkdirSync(join(root, 'docs')); mkdirSync(join(root, 'scripts'));
+    const target = location === 'excluded' ? join(root, 'docs/target.mjs') : join(dir, 'target.mjs');
+    writeFileSync(target, 'export default 1;');
+    rmSync(join(root, link), { force: true });
+    symlinkSync(location === 'excluded' ? '../docs/target.mjs' : '../../target.mjs', join(root, link));
+    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'symlink baseline']);
+    writeFileSync(target, 'export default 2;');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'target changed']);
+    expect(readFileSync(join(root, link), 'utf8')).toBe('export default 2;');
+    expect(git(['rev-parse', `${head}:${link}`])).toBe(git(['rev-parse', `${good}:${link}`]));
+    expect(git(['diff-tree', '--no-commit-id', '--name-only', '-r', good, head]))
+      .toBe(location === 'excluded' ? 'docs/target.mjs' : '');
+    const owed = link.startsWith('scripts/') ? ['X', 'Y'] : ['X'];
+    for (const daemon of registered) {
+      for (const sha of [good, head]) {
+        const snapshot = m.readClosure(root, daemon, sha);
+        if (owed.includes(daemon.id)) expect(snapshot).toEqual({ complete: false });
+        else expect(snapshot.complete).toBe(true);
+      }
+    }
+    expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
+      .toMatchObject({ action: 'pending', owed });
+    expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).owed).toEqual(owed);
   });
-  it('ignores loader-looking text in comments, strings, templates and regexes', async () => {
+  it('a root-level daemon entry conservatively snapshots the whole repository', async () => {
     const m = await load();
-    writeFileSync(join(root, 'y.mjs'), [
-      '// import"./missing.mjs";', '/* require("./missing.mjs"); */',
-      'const text = \'import"./missing.mjs"\';',
-      'const template = `require("./missing.mjs")`;', 'const re = /require("missing")/;',
-    ].join('\n'));
-    git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'inert text']);
-    expect(m.readClosure(root, registered[1], sha)).toEqual({ complete: true,
-      files: { 'y.mjs': git(['rev-parse', sha + ':y.mjs']) } });
+    writeFileSync(join(root, 'entry.mjs'), 'export default 1;');
+    git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'root entry']);
+    expect(m.readClosure(root, { entry: 'entry.mjs' }, sha)).toEqual({ complete: true,
+      files: Object.fromEntries(['entry.mjs', 'workers/x.mjs', 'workers/dep.mjs', 'services/y.mjs']
+        .map(p => [p, git(['rev-parse', `${sha}:${p}`])])) });
   });
-  it('unreadable comment syntax refuses a complete closure', async () => {
+  it('oversized Git tree output is incomplete and owes proof pending operator inspection', async () => {
     const m = await load();
-    writeFileSync(join(root, 'x.mjs'), "/* unterminated comment hiding import './dep.mjs';");
-    git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'unreadable syntax']);
-    expect(m.readClosure(root, registered[0], sha)).toEqual({ complete: false });
+    const blob = git(['rev-parse', `${good}:workers/x.mjs`]);
+    const input = Array.from({ length: 35000 }, (_, i) =>
+      `100644 blob ${blob}\t${String(i).padStart(6, '0')}${'x'.repeat(220)}\n`).join('');
+    expect(Buffer.byteLength(input)).toBeGreaterThan(8 * 1024 * 1024);
+    const tree = execFileSync('git', ['mktree'], { cwd: root, input, encoding: 'utf8' }).trim();
+    const sha = execFileSync('git', ['mktree'], { cwd: root,
+      input: `040000 tree ${tree}\tscripts\n`, encoding: 'utf8' }).trim();
+    expect(m.readClosure(root, { entry: 'scripts/000000' + 'x'.repeat(220) }, sha)).toEqual({ complete: false });
+    const roster = ['X', 'Y'].map((id, i) => ({ id, entry: `scripts/${String(i).padStart(6, '0')}${'x'.repeat(220)}` }));
+    expect(await m.createProbationObserver({ ...opts, registered: roster, readClosure: d => m.readClosure(root, d, sha) })
+      .adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
   });
   it.each(['preserved', 'reverted'])('successive freezes retain unproven X debt when its files are %s', async mode => {
     const m = await load(), observer = m.createProbationObserver(opts);
     expect(await observer.adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X'] });
     const first = adopted();
-    if (mode === 'reverted') writeFileSync(join(root, 'dep.mjs'), 'export default 1;');
+    if (mode === 'reverted') writeFileSync(join(root, 'workers/dep.mjs'), 'export default 1;');
     writeFileSync(join(root, 'unrelated.txt'), 'second adoption');
     git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', head, '-m', 'second']);
     expect(await observer.adopt(first, { head, at: iso(at + 1) }))
@@ -235,60 +167,43 @@ describe('R986 report-only probation persistence', () => {
       expect(readFileSync(file, 'utf8')).toBe(before);
     }, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'persistent-blocker' });
   });
-  it('snapshots runtime JSON names across directories so a changed config owes proof', async () => {
-    const m = await load();
-    writeFileSync(join(root, 'y.mjs'), "export const config = 'runtime.json';");
-    mkdirSync(join(root, 'config')); mkdirSync(join(root, 'other'));
-    writeFileSync(join(root, 'config/runtime.json'), '{"value":1}');
-    writeFileSync(join(root, 'other/runtime.json'), '{}');
-    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'json before']);
-    writeFileSync(join(root, 'config/runtime.json'), '{"value":2}');
-    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'json after']);
-    expect(m.readClosure(root, registered[1], head)).toEqual({ complete: true, files: {
-      'y.mjs': git(['rev-parse', head + ':y.mjs']),
-      'config/runtime.json': git(['rev-parse', head + ':config/runtime.json']),
-      'other/runtime.json': git(['rev-parse', head + ':other/runtime.json']),
-    } });
-    expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
-      .toMatchObject({ action: 'pending', owed: ['Y'] });
-  });
   it('shared-entry registrations retain distinct identities selected by differing process arguments', async () => {
     const { ownDaemonId } = await load();
     const roster = [
-      { id: 'X', entry: 'x.mjs', args: ['--pass=x'] },
-      { id: 'Y', entry: 'x.mjs', args: ['--pass=y'] },
+      { id: 'X', entry: 'workers/x.mjs', args: ['--pass=x'] },
+      { id: 'Y', entry: 'workers/x.mjs', args: ['--pass=y'] },
     ];
     for (const id of ['X', 'Y']) {
-      expect(ownDaemonId(root, 'x.mjs', { registered: roster, env: {},
-        argv: ['node', join(root, 'x.mjs'), `--pass=${id.toLowerCase()}`] })).toBe(id);
+      expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: {},
+        argv: ['node', join(root, 'workers/x.mjs'), `--pass=${id.toLowerCase()}`] })).toBe(id);
     }
-    expect(ownDaemonId(root, 'x.mjs', { registered: roster, env: {},
-      argv: ['node', join(root, 'x.mjs'), '--pass=unknown'] })).toBeNull();
-    expect(ownDaemonId(root, 'x.mjs', { registered: roster, env: {},
-      argv: ['node', join(root, 'x.mjs'), '--pass=x', '--extra'] })).toBeNull();
+    expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: {},
+      argv: ['node', join(root, 'workers/x.mjs'), '--pass=unknown'] })).toBeNull();
+    expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: {},
+      argv: ['node', join(root, 'workers/x.mjs'), '--pass=x', '--extra'] })).toBeNull();
   });
   it('XPC_SERVICE_NAME selects one shared-entry registration even when process arguments match both', async () => {
     const { ownDaemonId } = await load();
-    const roster = ['X', 'Y'].map(id => ({ id, entry: 'x.mjs', args: [] }));
-    expect(ownDaemonId(root, 'x.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'Y' },
-      argv: ['node', join(root, 'x.mjs')] })).toBe('Y');
-    expect(ownDaemonId(root, 'y.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'Y' },
-      argv: ['node', join(root, 'y.mjs')] })).toBeNull();
+    const roster = ['X', 'Y'].map(id => ({ id, entry: 'workers/x.mjs', args: [] }));
+    expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'Y' },
+      argv: ['node', join(root, 'workers/x.mjs')] })).toBe('Y');
+    expect(ownDaemonId(root, 'services/y.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'Y' },
+      argv: ['node', join(root, 'services/y.mjs')] })).toBeNull();
   });
   it('unknown XPC_SERVICE_NAME falls back to an unambiguous argument match', async () => {
     const { ownDaemonId } = await load();
-    const roster = ['X', 'Y'].map(id => ({ id, entry: 'x.mjs', args: [`--pass=${id}`] }));
-    expect(ownDaemonId(root, 'x.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'unknown' },
-      argv: ['node', join(root, 'x.mjs'), '--pass=X'] })).toBe('X');
+    const roster = ['X', 'Y'].map(id => ({ id, entry: 'workers/x.mjs', args: [`--pass=${id}`] }));
+    expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'unknown' },
+      argv: ['node', join(root, 'workers/x.mjs'), '--pass=X'] })).toBe('X');
   });
   it('ambiguous shared-entry identity cannot satisfy an owed proof through persistence', async () => {
     const m = await load();
     const observer = m.createProbationObserver(opts);
     await observer.adopt(previous(), adopted());
-    const roster = ['X', 'Y'].map(id => ({ id, entry: 'x.mjs', args: [] }));
+    const roster = ['X', 'Y'].map(id => ({ id, entry: 'workers/x.mjs', args: [] }));
     for (const identityEnv of [{}, { XPC_SERVICE_NAME: 'unknown' }]) {
-      const id = m.ownDaemonId(root, 'x.mjs', { registered: roster, env: identityEnv,
-        argv: ['node', join(root, 'x.mjs')] });
+      const id = m.ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: identityEnv,
+        argv: ['node', join(root, 'workers/x.mjs')] });
       expect(id).toBeNull();
       expect(await observer.proof(processRecord(id, 101))).toMatchObject({ action: 'pending', owed: ['X'] });
       expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).toEqual({});
@@ -325,7 +240,7 @@ describe('R986 report-only probation persistence', () => {
       let closureReads = 0;
       const later = m.createProbationObserver({ ...opts, readClosure() {
         closureReads++;
-        return { complete: true, files: { 'x.mjs': 'c'.repeat(40) } };
+        return { complete: true, files: { 'workers/x.mjs': 'c'.repeat(40) } };
       } });
       expect(await later.adopt(adopted(), next)).toMatchObject({ status: 'invalid', action: 'pending',
         reason: expect.stringContaining('operator recovery required') });
@@ -346,12 +261,11 @@ describe('R986 report-only probation persistence', () => {
     rmSync(file); mkdirSync(file);
     expect(await observer.status()).toMatchObject({ status: 'invalid', action: 'pending' });
   });
-  it('failed closure reads owe proof and unresolved relative imports are incomplete', async () => {
+  it('failed Git reads and missing or outside entries are incomplete and owe proof', async () => {
     const m = await load();
     expect(m.readClosure(root, registered[0], 'f'.repeat(40)).complete).toBe(false);
-    writeFileSync(join(root, 'y.mjs'), "import './missing.mjs';"); git(['add', '.']);
-    const broken = git(['commit-tree', git(['write-tree']), '-m', 'missing import']);
-    expect(m.readClosure(root, registered[1], broken).complete).toBe(false);
+    for (const entry of ['missing.mjs', '../outside.mjs', '/outside.mjs'])
+      expect(m.readClosure(root, { entry }, head)).toEqual({ complete: false });
     const observer = m.createProbationObserver({ ...opts, readClosure: () => ({ complete: false }) });
     expect(await observer.adopt(previous(), adopted())).toMatchObject({ owed: ['X', 'Y'] });
   });
@@ -388,8 +302,8 @@ describe('R986 report-only probation persistence', () => {
   });
   it('closure snapshots use Git blob IDs at each SHA, independent of working-tree bytes', async () => {
     const m = await load();
-    writeFileSync(join(root, 'dep.mjs'), 'uncommitted');
+    writeFileSync(join(root, 'workers/dep.mjs'), 'uncommitted');
     expect(m.readClosure(root, registered[0], good)).toEqual({ complete: true, files: {
-      'x.mjs': git(['rev-parse', good + ':x.mjs']), 'dep.mjs': git(['rev-parse', good + ':dep.mjs']) } });
+      'workers/x.mjs': git(['rev-parse', good + ':workers/x.mjs']), 'workers/dep.mjs': git(['rev-parse', good + ':workers/dep.mjs']) } });
   });
 });
