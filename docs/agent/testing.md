@@ -4583,19 +4583,24 @@ The continued R37 runtime rows require native resume evidence whenever a descrip
 selects a resume mode. Bound/native/proxy callables expose no inspectable bound arguments or
 receiver, so refuse them with the explicit unbound-primitive/literal-argv fallback.
 
-The structural gate uses a coarse capability boundary, not semantic JS data-flow analysis.
-`agent-launch-approved.json` freezes the previous 1,856-file migration membership plus the central
-launcher. Unknown packages, missing local modules, non-literal loaders, execution builtins,
+The structural gate uses a conservative binding dependency graph over the complete supplied local
+import tree. Every exported function or container that references a process-execution capability,
+or transitively references another such binding, carries that capability to its consumers.
+Definitions, assignments, returned closures, renamed/default/namespace imports, computed namespace
+members, local re-exports and cycles participate. Pure exports remain independent of unrelated
+execution imports in the same module. Namespace containers conservatively carry their exports.
+Unknown packages, missing local modules/exports, non-literal loaders, execution builtins,
 process execution/loader/evaluator/Worker references and capability containers require an approved file,
 regardless of arguments or whether a call occurs. Exact syntactic process data reads (`env`, `pid`,
 `argv`, etc.) and `module.exports` expose no execution entry point; taking either container or
-using another/computed member still requires review. Shadowing and unused imports grant no exemption.
-Detection is direct-only: importing/re-exporting an inspected local module is not itself a finding,
-even when that module is flagged or approved. Each module is judged on its own contents, including
-direct capability bindings; cycles do not propagate findings. The structural table documents the
-trade-off: an otherwise capability-free importer can call an imported wrapper without a finding
-of its own. No export, callee, argument, initializer or option value is resolved. Audit shorthand imports are added only
-when the snippet references them, so capability-free positive controls stay meaningful.
+using another/computed member still requires review. Unused named launcher imports and escaped
+references require review too. There is no importer exemption for inspected local launchers.
+The exception is the resolved `launchAgent` definition in `scripts/lib/agent-launch.mjs`, including
+renamed imports and re-exports; a same-named function elsewhere and wrappers of that definition
+do not inherit the exception. Additionally every call/constructor argument containing a de-quoted
+Claude/Codex word in a string, nested array/object literal or template requires that boundary,
+even when the callee appears benign. Approved callers still require their exact whole-module
+fingerprint. Audit shorthand imports are added only when the snippet references them.
 
 Every approved module has one `module-sha256-v2` fingerprint over its complete syntax/token tree,
 including all launching functions, callers, constructors, aliases and surrounding definitions.
@@ -4633,3 +4638,38 @@ current modes: the selected session cannot be proven. The diagnostic directs cal
 R37.15–16 historical structural controls with execution imports, literal unrelated commands or
 `shell:false` now refuse outside the approved boundary. Those argument-based exemptions were
 removed intentionally: a capability reference is sufficient, independent of argument semantics.
+
+
+## Caller-side launcher export audit (R37.17–18)
+
+The R37.17 structural table row refuses
+`spawnToCompletion('claude', ['--resume','unchecked-id'])`. The companion regression imports the
+real existing helper from a new unapproved module and proves that its caller is flagged even
+though every approved fingerprint is unchanged. The approved existing completion-wrapper control
+uses the real `scripts/lib/agent-launch.mjs` source and passes its unchanged inventory.
+R37.18 covers unknown and benign callees, nested literal arguments, de-quoted shell words,
+interpolated templates and a counterfeit `launchAgent`. Transitive-wrapper tests cover references
+without invocation, aliases, namespace access, defaults, local re-exports, require/dynamic imports,
+assignments and export containers. Missing exports and malformed source fail closed; use
+`launchAgent` or request human review of complete source and approval changes when evidence is
+incomplete. Existing agent-word positive controls now explicitly refuse; unrelated literal
+controls remain clear. No graph traversal cutoff silently treats incomplete evidence as safe.
+
+Approval additions for human review are limited to these unchanged, pre-PR sources (the original
+1,857-member prefix remains independently hash-pinned):
+
+| Approved existing file | Existing reference newly covered |
+| --- | --- |
+| `scripts/conveyor/health-smells-notify-list.mjs` | `new Set([... 'claude-auth-expired', ...])`: constructor argument contains an agent word. |
+| `scripts/conveyor/maintenance-marker.mjs` | `maintenanceMarkerPath` calls `join(homedir(), '.claude', 'conveyor', 'maintenance.json')`. |
+| `scripts/lib/daemon-rebuild/index.mjs` | Existing public re-exports of launcher wrappers, including `rebuildClone`, `materializeCandidate`, `removeCandidate`, `dryRunRebuild`, `previewOverlayConflict` and `resolveOverlayConflict`. |
+| `scripts/operations/reopen-items-io.mjs` | Re-exports `createReopenItemsReader` and `createReopenItemsSinks` from the existing close-items IO shell, whose defaults reach `execFileSync`. |
+| `scripts/lib/raised-by.mjs` | Existing named re-exports from `raised-by.cjs`. The graph conservatively classifies this shared CommonJS export group as capability-bearing in the full production tree; this is an approval for that existing facade, not a claim that its filesystem/formatting functions launch agents. |
+
+No new production call sites are approved by this change. Fingerprints for the analyzer itself
+and these explicitly listed existing files are refreshed in the inventory snapshot.
+
+The focused boundary run comprises `scripts/__tests__/agent-launch.test.mjs`,
+`scripts/__tests__/agent-launch-structure.test.mjs`,
+`scripts/lib/__tests__/spawn-to-completion.test.mjs` and
+`scripts/__tests__/codex-direct-task-resume.test.mjs`, always through heavy admission.

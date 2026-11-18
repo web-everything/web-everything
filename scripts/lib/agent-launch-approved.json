@@ -1855,5 +1855,10 @@
   "skills-src/inspect-codex-transcript/codex-transcript.mjs",
   "skills-src/jury/panel-fanout.mjs",
   "skills-src/jury/resolve-roster.mjs",
-  "skills-src/jury/subject-jury.workflow.js"
+  "skills-src/jury/subject-jury.workflow.js",
+  "scripts/conveyor/health-smells-notify-list.mjs",
+  "scripts/conveyor/maintenance-marker.mjs",
+  "scripts/lib/daemon-rebuild/index.mjs",
+  "scripts/operations/reopen-items-io.mjs",
+  "scripts/lib/raised-by.mjs"
 ]

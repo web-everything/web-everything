@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { relative, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { findAgentLaunches } from './fixtures/agent-launch-source.mjs';
 import { AGENT_LAUNCH_ALLOWLIST, findAgentLaunches as scanAgentLaunches, readAgentLaunchTree } from '../lib/agent-launch-structure.mjs';
 
@@ -41,6 +42,8 @@ function assertAllowlist(findings, allowlist) {
 
 describe('single agent launch boundary', () => {
   it.each([
+    { name: 'R37.17 existing exported helper cannot bypass the caller boundary',
+      source: "spawnToCompletion('claude', ['--resume','unchecked-id'])", bare: true, refused: true },
     ...["spawn('npx', ['claude'])", "spawn('pnpm', ['exec', 'codex'])",
       "spawn('custom-wrapper', ['claude'])", "spawn('echo x; claude', [], {shell:true})",
       "exec('echo x; claude')", "execSync('echo x; codex')",
@@ -75,7 +78,7 @@ describe('single agent launch boundary', () => {
       "import {spawn as start} from 'node:child_process'; const f=flag ? console.log : start; f('claude',[])",
       "let f=console.log; f=flag ? spawn : console.log; f('claude',[])",
     ].map(source => ({ name: `R37.7 primitive provenance: ${source}`, source, refused: true })),
-    { name: 'R37.7 non-primitive conditional control', source: "const f=flag ? console.log : console.info; f('claude',[])" },
+    { name: 'R37.7 non-primitive conditional with agent argument now refuses', source: "const f=flag ? console.log : console.info; f('claude',[])", refused: true },
     ...[
       "function factory(){return spawn} const start=factory(); start('claude',[])",
       "function factory(){return spawn} factory()('claude',[])",
@@ -105,10 +108,10 @@ describe('single agent launch boundary', () => {
       source: "function pass(){console.log(spawn)}", refused: true },
     { name: 'R37.10 unbound primitive-name callee', source: "spawn('git',[])", bare: true, refused: true },
     { name: 'R37.10 unbound namespace-name callee', source: "cp.spawn('git',[])", bare: true, refused: true },
-    { name: 'R37.10 local unrelated function control', source: "function start(){return 'ok'} start('claude',[])" },
-    { name: 'R37.10 local unrelated closure control', source: "const start=() => console.log('ok'); start('claude',[])" },
+    { name: 'R37.10 local function with agent argument now refuses', source: "function start(){return 'ok'} start('claude',[])", refused: true },
+    { name: 'R37.10 local closure with agent argument now refuses', source: "const start=() => console.log('ok'); start('claude',[])", refused: true },
     { name: 'R37.15 unknown imported primitive-name callee requires review', source: "import {spawn} from 'unrelated'; spawn('claude',[])", refused: true },
-    { name: 'R37.7 imported non-primitive control', source: "import {log as start} from 'node:console'; start('claude',[])" },
+    { name: 'R37.7 imported non-primitive with agent argument now refuses', source: "import {log as start} from 'node:console'; start('claude',[])", refused: true },
     ...['execa', 'cross-spawn', 'shelljs', 'zx', 'node-pty', 'tinyexec', 'nano-spawn',
       'foreground-child', '@npmcli/promise-spawn', 'execa/subpath'].map(module => ({
       name: `R37.15 process-exec module ${module} is never presumed benign`,
@@ -134,7 +137,7 @@ describe('single agent launch boundary', () => {
       `import launch from 'unknown-package'; launch(${JSON.stringify('co\\dex')},[])`,
       "import launch from 'unknown-package'; launch('git'); launch('claude')",
     ].map(source => ({ name: `R37.15 imported agent argument: ${source}`, source, refused: true })),
-    { name: 'R37.15 benign builtin positive control', source: "import {basename} from 'node:path'; basename('claude')" },
+    { name: 'R37.15 benign builtin with agent argument now refuses', source: "import {basename} from 'node:path'; basename('claude')", refused: true },
     { name: 'R37.15 unknown package without agent arguments now requires boundary', source: "import launch from 'unknown-package'; launch('git',[])", refused: true },
     { name: 'R37.15 agent substring now requires boundary', source: "import launch from 'unknown-package'; launch('claude-tools',['mycodex'])", refused: true },
     ...[
@@ -207,6 +210,122 @@ describe('single agent launch boundary', () => {
 
   const approvedFile = 'scripts/lib/agent-launch.mjs';
   const inventoryFor = source => launchInventory(scanAgentLaunches({ [approvedFile]: source }));
+  const helperFile = 'scripts/lib/spawn-to-completion.mjs';
+  const helperSource = readFileSync(resolve(root, helperFile), 'utf8');
+  it('R37.17 flags a new caller of the existing spawnToCompletion export without changing approved fingerprints', () => {
+    const sources = { [helperFile]: helperSource };
+    const before = scanAgentLaunches(sources);
+    const after = scanAgentLaunches({ ...sources,
+      'scripts/new-consumer.mjs': "import {spawnToCompletion} from './lib/spawn-to-completion.mjs'; spawnToCompletion('claude', ['--resume','unchecked-id'])" });
+    expect(after.find(f => f.file.endsWith('/new-consumer.mjs')).reason).toContain('launcher export reference: spawnToCompletion');
+    expect(after.filter(f => !f.file.endsWith('/new-consumer.mjs'))).toEqual(before);
+  });
+  it('R37.17 approved existing completion-wrapper caller passes its unchanged inventory', () => {
+    const sources = { [helperFile]: helperSource, [approvedFile]: readFileSync(resolve(root, approvedFile), 'utf8') };
+    const findings = scanAgentLaunches(sources);
+    expect(findings).toHaveLength(2);
+    expect(findings.every(f => f.reason === 'approved boundary inventory; exact module fingerprint required')).toBe(true);
+    assertAllowlist(findings, launchInventory(scanAgentLaunches(sources)));
+  });
+  it.each([
+    ['renamed import', "import {run as execute} from './bridge.mjs'; execute('git', [])"],
+    ['reference without invocation', "import {run} from './bridge.mjs'; const saved=run"],
+    ['namespace reference', "import * as bridge from './bridge.mjs'; accept(bridge)"],
+    ['namespace member', "import * as bridge from './bridge.mjs'; bridge.run('git', [])"],
+    ['computed namespace member', "import * as bridge from './bridge.mjs'; bridge['run']('git', [])"],
+    ['dynamic namespace member', "import * as bridge from './bridge.mjs'; bridge[key]('git', [])"],
+    ['default import', "import execute from './bridge.mjs'; execute('git', [])"],
+    ['required namespace', "const bridge=require('./bridge.mjs'); bridge.run('git', [])"],
+    ['dynamic import', "const bridge=await import('./bridge.mjs'); bridge.run('git', [])"],
+  ])('traces transitive wrappers and re-exports to the caller: %s', (_name, consumer) => {
+    const findings = scanAgentLaunches({
+      [helperFile]: helperSource,
+      'scripts/wrapper.mjs': "import {spawnToCompletion as complete} from './lib/spawn-to-completion.mjs'; const relay=(...args)=>complete(...args); export function execute(...args){return relay(...args)}",
+      'scripts/bridge.mjs': "export {execute as run, execute as default} from './wrapper.mjs'",
+      'scripts/consumer.mjs': consumer,
+    });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs')).reason).toContain('launcher export reference');
+  });
+  it.each([
+    "import {spawn as primitive} from 'node:child_process'; export default (...args)=>primitive(...args)",
+    "import {spawn as primitive} from 'node:child_process'; export default function(...args){return primitive(...args)}",
+    "import {spawn as primitive} from 'node:child_process'; let chosen; chosen=primitive; export function run(...args){return chosen(...args)}; export default run",
+    "import {spawn as primitive} from 'node:child_process'; let chosen; ({launch:chosen}={launch:primitive}); export default (...args)=>chosen(...args)",
+    "import {spawn as primitive} from 'node:child_process'; const choices=[]; choices.push(primitive); export default (...args)=>choices[0](...args)",
+    "import * as primitives from 'node:child_process'; const {spawn:run}=primitives; export default (...args)=>run(...args)",
+    "import {spawn as primitive} from 'node:child_process'; const run=(...args)=>primitive(...args); export default {run}",
+    "import {spawn as primitive} from 'node:child_process'; export default {run(...args){return primitive(...args)}}",
+    "import {spawn as primitive} from 'node:child_process'; export default class {run(...args){return primitive(...args)}}",
+    "import {spawn as primitive} from 'node:child_process'; module.exports=(...args)=>primitive(...args)",
+  ])('traces exported definitions, assignments and containers: %s', source => {
+    const findings = scanAgentLaunches({ 'scripts/local.mjs': source,
+      'scripts/consumer.mjs': "import run from './local.mjs'; accept(run)" });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs')).reason).toContain('launcher export reference');
+  });
+  it.each([
+    "opaque('claude', ['--resume','unchecked-id'])",
+    "opaque(['git', ['codex', 'exec', 'resume', 'unchecked-id']])",
+    'opaque(`claude --resume ${id}`)',
+    'opaque(`env ${prefix} codex exec resume unchecked-id`)',
+    `opaque(${JSON.stringify("clau'de' --resume unchecked-id")})`,
+    `opaque(${JSON.stringify('co\\dex exec resume unchecked-id')})`,
+    "console.log({command:'claude'})",
+    "function launchAgent(){}; launchAgent('claude', [])",
+    "import {basename} from 'node:path'; basename('claude')",
+  ])('R37.18 refuses agent-word literal arguments regardless of callee provenance: %s', source => {
+    expect(scanAgentLaunches({ 'scripts/consumer.mjs': source }))
+      .toMatchObject([{ reason: expect.stringContaining('agent-word argument outside launchAgent') }]);
+  });
+  it.each([
+    "import {launchAgent as run} from './lib/agent-launch.mjs'; run({}, null, 'claude', [])",
+    "import * as boundary from './lib/agent-launch.mjs'; boundary.launchAgent({}, null, 'codex', [])",
+    "import {run} from './bridge.mjs'; run({}, null, 'claude', [])",
+  ])('exempts the actual launchAgent export through aliases and re-exports: %s', source => {
+    const findings = scanAgentLaunches({
+      [approvedFile]: "import {spawn} from 'node:child_process'; export function launchAgent(...args){return spawn(...args)}",
+      'scripts/bridge.mjs': "export {launchAgent as run} from './lib/agent-launch.mjs'",
+      'scripts/consumer.mjs': source,
+    });
+    expect(findings.filter(f => !f.file.endsWith('/lib/agent-launch.mjs'))).toEqual([]);
+  });
+  it('does not exempt an exported wrapper of launchAgent', () => {
+    const findings = scanAgentLaunches({
+      [approvedFile]: "import {spawn} from 'node:child_process'; export function launchAgent(...args){return spawn(...args)}",
+      'scripts/wrapper.mjs': "import {launchAgent} from './lib/agent-launch.mjs'; export function run(...args){return launchAgent(...args)}",
+      'scripts/consumer.mjs': "import {run} from './wrapper.mjs'; run('git',[])" });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs')).reason).toContain('launcher export reference');
+  });
+  it('fails closed on a missing export of an inspected local module', () => {
+    const findings = scanAgentLaunches({ 'scripts/local.mjs': 'export const text="hello"',
+      'scripts/consumer.mjs': "import {missing} from './local.mjs'; missing('git',[])" });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs')).reason).toContain('launcher export reference');
+  });
+  it('fails closed for an opaque star re-export referenced as a namespace', () => {
+    const findings = scanAgentLaunches({ 'scripts/local.mjs': "export * from 'future-exec-package'",
+      'scripts/consumer.mjs': "import * as local from './local.mjs'; accept(local)" });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs')).reason).toContain('launcher export reference');
+  });
+  it('does not treat computed property keys or process data reads as execution bindings', () => {
+    const findings = scanAgentLaunches({
+      'scripts/local.mjs': "import {spawn} from 'node:child_process'; export const KEY='hello'; const bag={}; bag[KEY]=spawn; process.env.FLAG='yes'",
+      'scripts/consumer.mjs': "import {KEY} from './local.mjs'; export function pure(env=process.env){ return KEY+env.FLAG }" });
+    expect(findings.filter(f => f.file.endsWith('/consumer.mjs'))).toEqual([]);
+  });
+  it('keeps capability-free local exports and benign builtin re-exports clear', () => {
+    expect(scanAgentLaunches({ 'scripts/local.mjs': "export {log as output} from 'node:console'; export function pure(){return 'ok'}",
+      'scripts/consumer.mjs': "import {output, pure} from './local.mjs'; output(pure())" })).toEqual([]);
+  });
+  it('resolves pure CommonJS named re-exports without treating them as missing evidence', () => {
+    expect(scanAgentLaunches({ 'scripts/local.cjs': "function pure(){return 'ok'}; module.exports={pure}",
+      'scripts/bridge.mjs': "export {pure} from './local.cjs'",
+      'scripts/consumer.mjs': "import {pure} from './bridge.mjs'; pure('git')" })).toEqual([]);
+  });
+  it('traces CommonJS named launcher re-exports to the consumer', () => {
+    const findings = scanAgentLaunches({ 'scripts/local.cjs': "const {spawn:run}=require('node:child_process'); module.exports={run}",
+      'scripts/bridge.mjs': "export {run} from './local.cjs'",
+      'scripts/consumer.mjs': "import {run} from './bridge.mjs'; run('git')" });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs')).reason).toContain('launcher export reference');
+  });
   const probes = [
     { name: 'R37 argv element mutation',
       before: "import {spawn} from 'node:child_process'; function launch(){const argv=['git']; spawn('env',argv)}",
@@ -257,13 +376,13 @@ describe('single agent launch boundary', () => {
   });
 
   it.each([
-    "import {basename} from 'node:path'; basename('claude')",
-    "const {basename}=require('node:path'); basename('claude')",
+    "import {basename} from 'node:path'; basename('git')",
+    "const {basename}=require('node:path'); basename('git')",
     "import('node:path')", "export {basename} from 'node:path'",
     "const env=process.env; const pid=process.pid; module.exports={env,pid}",
     "const key='a'; const data={a:'hello'}; console.log(data[key])",
     "function launch(){return 'claude'} launch()",
-    "const launch=console.log; launch('claude')",
+    "const launch=console.log; launch('git')",
     "const pattern=/claude/; pattern.exec('hello')",
     "const start = opaque(); start('git',[])",
     "function relay(start){ return () => start('git',[]) }",
@@ -277,34 +396,34 @@ describe('single agent launch boundary', () => {
   it.each([
     ['local function', "export function launch(){return 'ok'}", false],
     ['benign re-export', "export {log as launch} from 'node:console'", false],
-    ['missing re-export', "export {launch} from './missing.mjs'", true],
-    ['execution re-export', "export {execa as launch} from 'execa'", true],
-    ['returned primitive', "import {spawn} from 'child_process'; export function launch(){return spawn}", true],
-    ['default primitive object', "import {spawn} from 'child_process'; export default {start:spawn}", true],
-    // Trade-off: imported modules are checked independently, without tracing their exports.
+    ['missing re-export', "export {launch} from './missing.mjs'", true, true],
+    ['execution re-export', "export {execa as launch} from 'execa'", true, true],
+    ['returned primitive', "import {spawn} from 'child_process'; export function launch(){return spawn}", true, true],
+    ['default primitive object', "import {spawn} from 'child_process'; export default {start:spawn}", true, true],
+    // Capability-free exports stay clear even alongside an unrelated execution import.
     ['importing a flagged module from an unflagged one is not itself a finding', "import 'child_process'; export const text='hello'", true],
-    ['malformed source', 'export const launch = (', true],
-  ])('judges %s by its own source without propagating to its importer', (_name, implementation, refused) => {
+    ['malformed source', 'export const launch = (', true, true],
+  ])('traces %s exports to a namespace reference', (_name, implementation, refused, consumerRefused = false) => {
     const findings = scanAgentLaunches({
       'scripts/local.mjs': implementation,
       'scripts/consumer.mjs': "import * as local from './local.mjs'; console.log(local)",
     });
     expect(findings.some(f => f.file.endsWith('/local.mjs'))).toBe(refused);
-    expect(findings.filter(f => f.file.endsWith('/consumer.mjs'))).toEqual([]);
+    expect(findings.some(f => f.file.endsWith('/consumer.mjs'))).toBe(consumerRefused);
   });
-  it('checks only direct references amid cyclic imports and renamed re-exports', () => {
+  it('propagates launcher references through cyclic imports and renamed re-exports', () => {
     const findings = scanAgentLaunches({
       'scripts/a.mjs': "export * from './b.mjs'; export * from './c.mjs'",
       'scripts/b.mjs': "export * from './a.mjs'",
       'scripts/c.mjs': "export {spawn as launch} from 'node:child_process'",
       'scripts/consumer.mjs': "import {launch as run} from './b.mjs'; run('git',[])",
     });
-    expect(findings.map(f => f.file)).toEqual([resolve('scripts/c.mjs')]);
+    expect(findings.map(f => f.file)).toEqual(['a', 'b', 'c', 'consumer'].map(n => resolve(`scripts/${n}.mjs`)));
   });
-  it('importing an approved module is not itself a capability reference', () => {
+  it('referencing a launcher in an approved module still flags its unapproved caller', () => {
     const findings = scanAgentLaunches({ [approvedFile]: "import {spawn as launch} from 'child_process'; export {launch}",
       'scripts/consumer.mjs': "import {launch as run} from './lib/agent-launch.mjs'; run('git',[])" });
-    expect(findings.map(f => f.file)).toEqual([resolve(approvedFile)]);
+    expect(findings.map(f => f.file)).toEqual([resolve(approvedFile), resolve('scripts/consumer.mjs')]);
   });
   it('a direct capability binding still flags the importer of an approved module', () => {
     const findings = scanAgentLaunches({ [approvedFile]: "import {spawn} from 'child_process'; export {spawn}",
@@ -364,9 +483,18 @@ describe('single agent launch boundary', () => {
     expect(findings[0].reason).toContain('outside approved boundary');
   });
   it('pins the original migration membership independently of fingerprints', () => {
-    expect(AGENT_LAUNCH_ALLOWLIST).toHaveLength(1857);
-    expect(new Set(AGENT_LAUNCH_ALLOWLIST).size).toBe(1857);
-    expect(createHash('sha256').update(JSON.stringify(AGENT_LAUNCH_ALLOWLIST)).digest('hex')).toBe('459d30e7bbc103ef4fe3ac70db57c2c4d964888c12ac17e581da8494b285dd06');
+    const reviewedExistingCallers = [
+      'scripts/conveyor/health-smells-notify-list.mjs',
+      'scripts/conveyor/maintenance-marker.mjs',
+      'scripts/lib/daemon-rebuild/index.mjs',
+      'scripts/operations/reopen-items-io.mjs',
+      'scripts/lib/raised-by.mjs',
+    ];
+    expect(AGENT_LAUNCH_ALLOWLIST).toHaveLength(1857 + reviewedExistingCallers.length);
+    expect(new Set(AGENT_LAUNCH_ALLOWLIST).size).toBe(AGENT_LAUNCH_ALLOWLIST.length);
+    expect(createHash('sha256').update(JSON.stringify(AGENT_LAUNCH_ALLOWLIST.slice(0, 1857))).digest('hex'))
+      .toBe('459d30e7bbc103ef4fe3ac70db57c2c4d964888c12ac17e581da8494b285dd06');
+    expect(AGENT_LAUNCH_ALLOWLIST.slice(1857)).toEqual(reviewedExistingCallers);
   });
   it('permits exactly the unmigrated allowlist throughout scripts/ and skills-src/', () => {
     const findings = scanAgentLaunches(readAgentLaunchTree(root));

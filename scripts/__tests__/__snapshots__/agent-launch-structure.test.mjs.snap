@@ -779,6 +779,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   },
   {
     "count": 1,
+    "file": "scripts/conveyor/health-smells-notify-list.mjs",
+    "sha256": "83a66fc6162ad806fdb4567bb43b27ecc543a04dc8c93fa2e4ea58318f770619",
+  },
+  {
+    "count": 1,
     "file": "scripts/conveyor/health-smells-shape.mjs",
     "sha256": "a4b9c3da445c72909f7da9b12d8778cdd7abaa2774ade1384b08ebf3a7072a4c",
   },
@@ -1381,6 +1386,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/conveyor/main-ref-sync.mjs",
     "sha256": "f510fac472efb0ee7a190452719671b15b6722b540e8004a67e3193f190561eb",
+  },
+  {
+    "count": 1,
+    "file": "scripts/conveyor/maintenance-marker.mjs",
+    "sha256": "7156b12fd1592e645f00176c2dae5c0b6228724f08e014ca867bcf68fe44517b",
   },
   {
     "count": 1,
@@ -4095,7 +4105,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/agent-launch-structure.mjs",
-    "sha256": "af12412acd0d00d7356776f60aaf306370233de724d8bf7e500a4de1c26f22c6",
+    "sha256": "4b27f5548db92929be9b366faab1e427f93ef6463db5403087d41f81afb5cba5",
   },
   {
     "count": 1,
@@ -4656,6 +4666,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/lib/daemon-rebuild/edge-fetch.mjs",
     "sha256": "04859429578b6363b004a5139b41f0a1423e3f9d7946caaafce276397b351ee5",
+  },
+  {
+    "count": 1,
+    "file": "scripts/lib/daemon-rebuild/index.mjs",
+    "sha256": "fd94b070561dc4f6be8cd449d202b38baa0583eacde3e26658faae8e9db5af45",
   },
   {
     "count": 1,
@@ -6236,6 +6251,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/lib/raised-by.cjs",
     "sha256": "c07eebb099aa0af2b49dc4207299c63d648d607e0419c51a322c73d8d18746bf",
+  },
+  {
+    "count": 1,
+    "file": "scripts/lib/raised-by.mjs",
+    "sha256": "381c1e056a070b3ac0a93b14ec5bbb4679e7cc1545a483cc1edbd254797a51a9",
   },
   {
     "count": 1,
@@ -8256,6 +8276,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/operations/registry.mjs",
     "sha256": "64bb78d17c6d7082b10b61e097618afc37596010e41281b862f52abef4b89390",
+  },
+  {
+    "count": 1,
+    "file": "scripts/operations/reopen-items-io.mjs",
+    "sha256": "97788515d7838310ea70df9fba8c1f73bd50c6320d5e6d01ec0c2926ab924946",
   },
   {
     "count": 1,
