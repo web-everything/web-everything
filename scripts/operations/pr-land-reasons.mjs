@@ -33,6 +33,7 @@ export const HOME_REASONS = Object.freeze({
   'bad-delegation': 'refused', 'bad-park': 'refused', 'bad-ref': 'refused', 'empty-body': 'refused', 'closing-keyword-body': 'refused', 'live-body-unconfirmed': 'refused', 'locus-prefix': 'refused',
   'no-ref': 'refused', 'no-such-src': 'refused', behind: 'refused', conflict: 'refused',
   'check-red': 'refused',
+  'canonical-audit-missing': 'refused', 'canonical-audit-weakened': 'refused',
   // Create-time soak declaration guard — add replay evidence or a body waiver before pushing.
   'soak-declaration': 'refused',
   // we:xniq7xs — the open-PR backpressure limit refused a NEW pr-land open over the per-repo cap (the ref

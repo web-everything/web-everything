@@ -1178,7 +1178,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
   });
   it.each([
     ['reason', ''], ['reason', '   '], ['actor', ''], ['actor', '   '],
-    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '9'],
+    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '0'], ['value', '17'], // 17: just past the 1..16 range
   ])('refuses unsafe CLI %s=%j before changing the host store', async (field, value) => {
     const dir = mkdtempSync(join(tmpdir(), 'operator-cli-refusal-'));
     const file = join(dir, 'operator-overrides.json');

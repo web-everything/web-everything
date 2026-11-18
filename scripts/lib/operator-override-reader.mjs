@@ -8,7 +8,7 @@ const epochMs = v => Number.isSafeInteger(v) && v > 0 && v <= Date.now() + 72 * 
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
 const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze({ validate, direction, failClosedFallback });
 export const CAPACITY_LEAVES = Object.freeze({
-  'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, 8), 'cap', 3),
+  'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, 16), 'cap', 3),
   'host.maxReviewDispatchPerTick': capacityLeaf(integer(1, 8), 'cap', 2),
   'resourceGate.fixCap.floor': capacityLeaf(integer(1, 12), 'cap', 2),
   'resourceGate.fixCap.ceiling': capacityLeaf(integer(1, 12), 'cap', 6),
