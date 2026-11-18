@@ -163,6 +163,7 @@ describe('query and gh row shape', () => {
     expect(q).toContain('repository(owner:"owner",name:"name")');
     expect(q).toContain('states:OPEN,first:20,orderBy:');
     expect(q).not.toContain('after:');
+    expect(q).toContain('commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{');
     expect([...q].filter(c => c === '{')).toHaveLength([...q].filter(c => c === '}').length);
     const after = 'cursor"\\\n';
     expect(buildOpenPrPageQuery({ repo, pageSize: 20, after })).toContain(`after:${JSON.stringify(after)}`);
