@@ -12,7 +12,7 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
-import { observeAdoptionLocked } from './probation-io.mjs';
+import { observeAdoption } from './probation-io.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 
 /**
@@ -383,7 +383,7 @@ export async function finalizeRebuild({
   releaseBuildLease(state, lease);
   const terminal = (result) => {
     writeState();
-    if (result.adopted) observeAdoptionLocked({ root, env: stEnv, now, log }, previousAdoption, state.adopted);
+    if (result.adopted) observeAdoption({ root, env: stEnv, now, log }, previousAdoption, state.adopted);
     const stale = staleAlertDetail(result, state);
     if (stale) alert('clone-held-stale', stale);
     // fix-rebuild-finalize — an adopted build leaves nothing passed-but-unadopted behind.

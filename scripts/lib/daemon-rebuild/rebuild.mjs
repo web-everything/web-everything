@@ -14,7 +14,7 @@ import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
-import { observeAdoptionLocked } from './probation-io.mjs';
+import { observeAdoption } from './probation-io.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
@@ -257,7 +257,7 @@ async function rebuildCloneInternal({
     const prepared = await prepareRebuild({
       root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
     });
-    observeAdoptionLocked({ root, env: stEnv, now, log }, previous, readRebuildState(root, stEnv).adopted);
+    observeAdoption({ root, env: stEnv, now, log }, previous, readRebuildState(root, stEnv).adopted);
     return prepared;
   }, readyOnHead ? finalizeLockOpts : admissionLockOpts);
 

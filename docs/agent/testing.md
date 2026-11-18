@@ -4617,16 +4617,27 @@ validated; missing, unreadable and malformed records report invalid, never empty
 Self-sync submits only its own immutable PID/start/boot-head and completed tick
 head after releasing its read lock; ambiguous process identity earns no proof.
 `createProbationObserver().status()` exposes pending/pass and reason under the
-shared write lock. Results are logged and have NO effect on tick, adoption,
+probation record lock. Results are logged and have NO effect on tick, adoption,
 proven-good, rollback or marker decisions. Missing records are not reconstructed
 by a sibling tick. No boot counting or probation deadline policy ships here.
-`probation-io.test.mjs` uses real Git objects, temp files and the shared clone lock
-to exercise repository-wide proof debt, invalid reads and concurrent proof writers.
+Probation uses the synchronous `withFileLock` primitive on `${probationPath}.lock`
+in the state directory, with a PID holder and a default 2000ms timeout (overrides:
+`options.lockOpts.timeoutMs` / `pollMs`). Adoption callers hold the clone lock first,
+then take the probation lock; probation never acquires the clone lock or clears
+writer-priority claims. Observer status/adopt/proof take only the probation lock.
+Lock timeout or failure reports invalid/pending with operator recovery required,
+leaving record bytes untouched; inspect the holder and recover before retrying.
+Every LaunchAgents `*.plist` must be readable and parseable, including filenames
+outside discovery's filter; otherwise the roster is incomplete and requires
+operator recovery of registrations.
+`probation-io.test.mjs` uses real Git objects, temp files, held clone/probation locks
+and separate proof processes to exercise repository-wide debt, invalid reads,
+preserved writer claims, lock timeouts and concurrent proof writers.
 `probation-callers.test.mjs` exercises the real observer through self-sync and the
 locked prepare/finalize callers. Telemetry-only hooks need caller tests for pass,
 invalid persistence and lock refusal: assert lifecycle results, rebuild state and
 protected marker bytes, not only the observer's return value. Prepare/planning and
-launchd identity are stubbed; probation persistence and the shared lock remain real.
+launchd identity are stubbed; probation persistence and both lock primitives remain real.
 
 Probation closure evidence reads only the root tree ID and the entry blob ID;
 it never buffers a recursive tree listing or scopes dependency paths. Any Git

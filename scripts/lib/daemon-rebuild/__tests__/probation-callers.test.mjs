@@ -9,13 +9,13 @@ vi.mock('../probation-io.mjs', async original => {
   const real = await original();
   return { ...real, ownDaemonId: () => 'X',
     createProbationObserver: opts => {
-      const observer = real.createProbationObserver(opts);
+      const observer = real.createProbationObserver({ ...opts, lockOpts: { timeoutMs: 20, pollMs: 2 } });
       return { ...observer, proof: async own => {
         const result = await observer.proof(own); hooks.proof(own, result); return result;
       } };
     },
-    observeAdoptionLocked: (opts, previous, adopted) => {
-      const result = real.observeAdoptionLocked({ ...opts, registered: [{ id: 'X', entry: 'x.mjs' }],
+    observeAdoption: (opts, previous, adopted) => {
+      const result = real.observeAdoption({ ...opts, registered: [{ id: 'X', entry: 'x.mjs' }],
         readClosure: () => ({ complete: true, files: { 'x.mjs': 'c'.repeat(40) } }) }, previous, adopted);
       hooks.adoption(opts, previous, adopted, result); return result;
     },
@@ -66,14 +66,15 @@ function seedPass() {
 const lockOpts = () => ({ lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, waitMs: 0 });
 
 describe('R986 production caller probation results remain telemetry only', () => {
-  it.each(['pass', 'invalid persistence', 'lock refusal'])('self-sync preserves tick result and lifecycle state on %s', async mode => {
+  it.each(['pass', 'invalid persistence', 'probation lock refusal', 'clone writer held'])('self-sync preserves tick result and lifecycle state on %s', async mode => {
     seedPass();
     if (mode === 'invalid persistence') writeFileSync(probationPath(root, env), '{}');
     const before = stateBytes(), protectedBefore = protectedBytes();
     const tickResult = { processed: 3, cursor: 'keep' };
     const onRestart = vi.fn(), releaseRead = vi.fn();
     const tick = vi.fn(async () => {
-      if (mode === 'lock refusal') expect(await acquireWrite(root, { ...lockOpts(), owner: 'other-writer' })).toEqual({ ok: true });
+      if (mode === 'probation lock refusal') writeFileSync(`${probationPath(root, env)}.lock`, `${process.pid}\n`);
+      if (mode === 'clone writer held') expect(await acquireWrite(root, { ...lockOpts(), owner: 'other-writer' })).toEqual({ ok: true });
       return tickResult;
     });
     const wrapped = withSelfSync({ tickOnce: tick }, {
@@ -96,8 +97,8 @@ describe('R986 production caller probation results remain telemetry only', () =>
       expect(releaseRead.mock.invocationCallOrder[0]).toBeLessThan(hooks.proof.mock.invocationCallOrder[0]);
       const [own, result] = hooks.proof.mock.calls[0];
       expect(own).toMatchObject({ daemonId: 'X', pid: process.pid, bootHead: HEAD, tickHead: HEAD });
-      expect(result).toMatchObject(mode === 'pass' ? { status: 'valid', action: 'pass' } : { status: 'invalid', action: 'pending' });
-      if (mode === 'lock refusal') expect(result.reason).toContain('concurrent-mover');
+      expect(result).toMatchObject(['pass', 'clone writer held'].includes(mode) ? { status: 'valid', action: 'pass' } : { status: 'invalid', action: 'pending' });
+      if (mode === 'probation lock refusal') expect(result.reason).toContain('timed out');
       expect(stateBytes()).toEqual(before);
       expect(protectedBytes()).toEqual(protectedBefore);
     } finally { releaseWrite(root, { ...lockOpts(), owner: 'other-writer' }); }

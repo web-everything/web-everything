@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { join, basename } from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { withWriteLock } from '../../daemon-clone-lock.mjs';
+import { execFileSync, spawn } from 'node:child_process';
+import { withWriteLock, cloneLockDirs } from '../../daemon-clone-lock.mjs';
 
 const load = () => import('../probation-io.mjs');
 const at = Date.parse('2026-11-15T12:00:00Z');
@@ -28,7 +29,7 @@ beforeEach(() => {
   writeFileSync(join(root, 'workers/dep.mjs'), 'export default 2;');
   git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'adopt']);
   git(['reset', '--hard', head]);
-  opts = { root, env, registered, now: () => at + 3, log: { error() {} }, lockOpts: { waitMs: 1000, pollMs: 5 } };
+  opts = { root, env, registered, now: () => at + 3, log: { error() {} }, lockOpts: { timeoutMs: 1000, pollMs: 5 } };
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const previous = () => ({ head: good, at: iso(at - 100) });
@@ -54,6 +55,21 @@ describe('R986 report-only probation persistence', () => {
     expect(() => m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
       readdir: () => Object.keys(files),
       exec: (_, args) => JSON.stringify(files[basename(args.at(-1))]) })).toThrow(/roster incomplete/);
+  });
+  it.each(['null', 'throw'])('refuses every unreadable plist when exec returns %s', async mode => {
+    const m = await load();
+    expect(() => m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
+      readdir: () => ['com.we.X.plist', 'other.plist'],
+      exec: (_, args) => {
+        if (basename(args.at(-1)) === 'other.plist') {
+          if (mode === 'throw') throw new Error('permission or timeout');
+          return null;
+        }
+        return JSON.stringify({ Label: 'com.we.X', WorkingDirectory: root, ProgramArguments: ['node', 'workers/x.mjs'] });
+      } })).toThrow('daemon roster incomplete: unreadable plist');
+  });
+  it('has no dependency on the production clone lock', () => {
+    expect(readFileSync(join(process.cwd(), 'scripts/lib/daemon-rebuild/probation-io.mjs'), 'utf8')).not.toContain('daemon-clone-lock');
   });
   it.each(['duplicate discovery', 'ambiguous label'])('refuses an incomplete roster on %s', async mode => {
     const m = await load();
@@ -125,15 +141,38 @@ describe('R986 report-only probation persistence', () => {
     expect(record.provenGood).toBe(good);
     expect(record.records).toEqual({});
   });
-  it('persistent lock contention exhausts five attempts and requests operator recovery without changing bytes', async () => {
-    const m = await load(), observer = m.createProbationObserver(opts);
+  it.each(['status', 'adopt', 'proof'])('held probation lock times out %s without changing record bytes', async method => {
+    const m = await load(), observer = m.createProbationObserver({ ...opts, lockOpts: { timeoutMs: 20, pollMs: 2 } });
     await observer.adopt(previous(), adopted());
     const file = m.probationPath(root, env), before = readFileSync(file, 'utf8');
-    await withWriteLock(root, async () => {
-      expect(await observer.proof(processRecord('X', 101))).toMatchObject({ status: 'invalid', action: 'pending',
-        reason: expect.stringMatching(/concurrent-mover.*5 attempts.*operator recovery required/) });
-      expect(readFileSync(file, 'utf8')).toBe(before);
-    }, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'persistent-blocker' });
+    writeFileSync(`${file}.lock`, `${process.pid}\n`);
+    const result = await (method === 'adopt' ? observer.adopt(previous(), adopted()) :
+      method === 'proof' ? observer.proof(processRecord('X', 101)) : observer.status());
+    expect(result).toMatchObject({ status: 'invalid', action: 'pending',
+      reason: expect.stringMatching(/timed out.*operator recovery required/) });
+    expect(readFileSync(file, 'utf8')).toBe(before);
+  });
+  it('adopt, proof and status succeed while the clone write lock is held', async () => {
+    const m = await load(), observer = m.createProbationObserver(opts);
+    const result = await withWriteLock(root, async () => {
+      expect(await observer.adopt(previous(), adopted())).toMatchObject({ status: 'valid', action: 'pending' });
+      expect(await observer.proof(processRecord('X', 101))).toMatchObject({ status: 'valid' });
+      expect(await observer.proof(processRecord('Y', 202))).toMatchObject({ action: 'pass' });
+      expect(await observer.status()).toMatchObject({ action: 'pass' });
+    }, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'fixture-writer' });
+    expect(result.ok).toBe(true);
+  });
+  it('observer proof preserves a pending adoption writer-priority claim byte for byte', async () => {
+    const m = await load(), observer = m.createProbationObserver(opts);
+    await observer.adopt(previous(), adopted());
+    const base = cloneLockDirs(root, env.WE_DAEMON_CLONE_LOCK_ROOT).base;
+    mkdirSync(base, { recursive: true });
+    const claim = join(base, 'writer-claim.json');
+    const bytes = JSON.stringify({ owner: 'pending-adoption', pid: process.pid, count: 3,
+      heldBy: 'tick', since: iso(Date.now()), lastAt: iso(Date.now()) }) + '\n';
+    writeFileSync(claim, bytes);
+    expect(await observer.proof(processRecord('X', 101))).toMatchObject({ status: 'valid' });
+    expect(readFileSync(claim, 'utf8')).toBe(bytes);
   });
   it('shared-entry registrations retain distinct identities selected by differing process arguments', async () => {
     const { ownDaemonId } = await load();
@@ -243,36 +282,34 @@ describe('R986 report-only probation persistence', () => {
     const observer = m.createProbationObserver({ ...opts, readClosure: () => ({ complete: false }) });
     expect(await observer.adopt(previous(), adopted())).toMatchObject({ owed: ['X', 'Y'] });
   });
-  it('concurrent independent writers serialize under the real shared write lock without losing either record', async () => {
-    const m = await load();
-    const both = { ...opts, readClosure: () => ({ complete: false }) };
-    const a = m.createProbationObserver(both), b = m.createProbationObserver(both);
-    await a.adopt(previous(), adopted());
-    let entered, release;
-    const held = new Promise(r => { entered = r; });
-    const blocker = withWriteLock(root, async () => { entered(); await new Promise(r => { release = r; }); },
-      { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'fixture-blocker' });
-    await held;
-    const first = a.proof(processRecord('X', 101)), second = b.proof(processRecord('Y', 202));
-    expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).toEqual({});
-    const samples = [];
-    const sample = () => {
-      try { samples.push(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8'))); }
-      catch (e) { samples.push({ error: e.message }); }
-    };
-    const timer = setInterval(sample, 1);
-    let results;
-    try { release(); await blocker; results = await Promise.all([first, second]); }
-    finally { clearInterval(timer); sample(); }
-    expect(samples.length).toBeGreaterThan(0);
-    for (const snapshot of samples) {
-      expect(snapshot.error).toBeUndefined();
-      expect((await import('../probation.mjs')).validateProbation(snapshot, at + 3)).toBeNull();
-    }
-    for (const r of results) expect(r.status).toBe('valid');
-    const onDisk = () => Object.keys(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).sort();
-    expect(await a.status()).toMatchObject({ action: 'pass' });
-    expect(onDisk()).toEqual(['X', 'Y']);
+  it('concurrent process proofs serialize under the probation lock without losing either record', async () => {
+    const m = await load(), observer = m.createProbationObserver(opts);
+    await observer.adopt(previous(), adopted());
+    const lock = `${m.probationPath(root, env)}.lock`;
+    writeFileSync(lock, `${process.pid}\n`);
+    const children = ['X', 'Y'].map((id, i) => {
+      const code = `import { createProbationObserver } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/daemon-rebuild/probation-io.mjs')).href)};
+        process.send('ready');
+        const result = await createProbationObserver({ ...${JSON.stringify({ root, env, lockOpts: { timeoutMs: 2000, pollMs: 2 } })}, now: () => ${at + 3} })
+          .proof(${JSON.stringify(processRecord(id, 101 + i))});
+        process.exit(result.status === 'valid' ? 0 : 1);`;
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      let stderr = '';
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      const ready = new Promise((resolve, reject) => { child.once('message', resolve); child.once('error', reject);
+        child.once('exit', () => reject(new Error(`worker exited before ready: ${stderr}`))); });
+      const done = new Promise((resolve, reject) => { child.once('error', reject);
+        child.once('exit', code => code === 0 ? resolve() : reject(new Error(stderr))); });
+      return { child, ready, done };
+    });
+    try {
+      await Promise.all(children.map(c => c.ready));
+      expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).toEqual({});
+      rmSync(lock);
+      await Promise.all(children.map(c => c.done));
+      expect(await observer.status()).toMatchObject({ action: 'pass' });
+      expect(Object.keys(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).sort()).toEqual(['X', 'Y']);
+    } finally { for (const { child } of children) if (child.exitCode === null) child.kill(); }
   });
   it('closure snapshots use immutable tree and entry IDs, independent of working-tree bytes', async () => {
     const m = await load();

@@ -1,13 +1,13 @@
 /** R986 S2a-1b: report-only probation IO. No result from here authorizes any lifecycle decision. */
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, realpathSync, lstatSync } from 'node:fs';
 import { join, dirname, relative, resolve, isAbsolute } from 'node:path';
-import { homedir, hostname } from 'node:os';
+import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { freezeProbation, recordProof, evaluateProbation, validateProbation } from './probation.mjs';
 import { stateDir } from './state.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
-import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { withFileLock } from '../atomic-json-file.mjs';
 import { resolveDaemonClones } from '../daemon-clones.mjs';
 import { readPlistAsJson } from '../../operations/daemon-status-io.mjs';
 
@@ -32,7 +32,10 @@ export function registeredDaemons(root, { env = process.env, exec = execFileSync
   // Discovery filters by filename; independently account for EVERY plist in the directory that runs from this clone.
   for (const name of readdir(dir).filter(n => n.endsWith('.plist'))) {
     let plist = null;
-    try { plist = readPlistAsJson(join(dir, name), { exec }); } catch { continue; } // unparsable plists cannot run
+    try { plist = readPlistAsJson(join(dir, name), { exec }); } catch {
+      throw new Error('daemon roster incomplete: unreadable plist');
+    }
+    if (!plist) throw new Error('daemon roster incomplete: unreadable plist');
     let wd = null;
     try { wd = typeof plist?.WorkingDirectory === 'string' ? canonical(plist.WorkingDirectory) : null; } catch { /* not this clone */ }
     if (wd === cloneRoot && !(typeof plist.Label === 'string' && labels.has(plist.Label) && name === `${plist.Label}.plist`))
@@ -92,8 +95,25 @@ function report(record, now) {
   return { status: 'valid', ...result, reason: result.reason || (result.action === 'pass' ? 'all owed proofs recorded' : 'owed daemon proof pending') };
 }
 
-/** Caller MUST already hold withWriteLock(root). Used by both locked rebuild adoption paths. */
-export function observeAdoptionLocked({ root, env = process.env, now = Date.now, log = console,
+/** Serialize only probation state; never acquire a production clone lock. The callback is synchronous. */
+export function withProbationLock(root, env, fn, { timeoutMs = 2000, pollMs } = {}) {
+  const path = probationPath(root, env);
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLock(`${path}.lock`, fn, { timeoutMs, pollMs, holderText: `${process.pid}\n` });
+}
+
+/** Caller holds the clone lock: lock order is clone then probation. Lock failure leaves the record untouched. */
+export function observeAdoption(options, previous, adopted) {
+  const { root, env = process.env, lockOpts, log = console } = options;
+  try { return withProbationLock(root, env, () => observeAdoptionRecord(options, previous, adopted), lockOpts); }
+  catch (e) {
+    const result = invalid(e.message);
+    log?.error?.(`daemon-probation: ${JSON.stringify(result)}`);
+    return result;
+  }
+}
+
+function observeAdoptionRecord({ root, env = process.env, now = Date.now, log = console,
   registered, readClosure: closure = (d, sha) => readClosure(root, d, sha) }, previous, adopted) {
   try {
     if (!adopted?.head || (previous?.head === adopted.head && previous?.at === adopted.at)) return;
@@ -120,20 +140,12 @@ export function observeAdoptionLocked({ root, env = process.env, now = Date.now,
   }
 }
 
-/** All public reads/mutations serialize with clone writers. Results are telemetry only. */
+/** Public reads/mutations serialize on the probation record. Results are telemetry only. */
 export function createProbationObserver(options) {
   const { root, env = process.env, now = Date.now, log = console, lockOpts = {} } = options;
   const locked = async fn => {
     try {
-      let result, attempts = 0;
-      do {
-        if (attempts) await new Promise(resolve => setTimeout(resolve, 10 * attempts));
-        attempts++;
-        result = await withWriteLock(root, fn, { ...lockOpts,
-          ...(env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {}),
-          owner: `${hostname()}:${process.pid}:probation:${randomUUID()}` });
-      } while (!result.ok && ['concurrent-mover', 'busy'].includes(result.reason) && attempts < 5);
-      const value = result.ok ? result.value : invalid(`probation lock refused: ${result.reason} after ${attempts} attempts`);
+      const value = withProbationLock(root, env, fn, lockOpts);
       log?.error?.(`daemon-probation: ${JSON.stringify(value)}`);
       return value;
     } catch (e) { const value = invalid(e.message); log?.error?.(`daemon-probation: ${JSON.stringify(value)}`); return value; }
@@ -141,7 +153,7 @@ export function createProbationObserver(options) {
   const status = () => { const p = readRecord(root, env, now()); return p.error ? invalid(p.error) : report(p.record, now()); };
   return {
     status: () => locked(status),
-    adopt: (previous, adopted) => locked(() => observeAdoptionLocked(options, previous, adopted) ?? status()),
+    adopt: (previous, adopted) => locked(() => observeAdoptionRecord(options, previous, adopted) ?? status()),
     proof: own => locked(() => {
       const p = readRecord(root, env, now());
       if (p.error) return invalid(p.error);
