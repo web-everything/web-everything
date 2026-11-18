@@ -75,18 +75,22 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
   try {
     const perRun = [];
     let count = 0;
-    const skipped = [];
+    const files = await listUnitTestFiles(repoRoot);
+    // Every run in the window must be complete and individually cover 90% of current files; no run may hide behind another.
     for (const runDir of dirs ?? [dir]) {
       const names = [];
       const reports = await foldReports(runDir, names);
       const problem = shardReportProblem(names, expectedUnitShards(repoRoot));
-      if (problem) { skipped.push(problem); continue; }
-      perRun.push(timingsFromReports(reports, repoRoot));
+      if (problem) return { ok: false, reason: `${problem}. Download all timing-unit-* artifacts from one successful full CI run.` };
+      const one = timingsFromReports(reports, repoRoot);
+      const reached = files.filter(file => Object.hasOwn(one, file)).length;
+      if (!files.length || reached / files.length < 0.9) {
+        return { ok: false, reason: `Unit timing coverage ${reached}/${files.length} is below 90% in one run. Use current successful full CI runs or rerun CI on main.` };
+      }
+      perRun.push(one);
       count += reports.length;
     }
-    if (!perRun.length) return { ok: false, reason: `${skipped.join('; ')}. Download all timing-unit-* artifacts from at least one successful full CI run.` };
     const measured = medianTimings(perRun);
-    const files = await listUnitTestFiles(repoRoot);
     // Keep current files only: a run built before a rename/delete still reports the old name.
     const timings = Object.fromEntries(files.filter(file => Object.hasOwn(measured, file)).map(file => [file, measured[file]]));
     const covered = Object.keys(timings).length;
@@ -94,15 +98,18 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
       return { ok: false, reason: `Unit timing coverage ${covered}/${files.length} is below 90%. Use a current successful full CI run or rerun CI on main.` };
     }
     const all = loadTimings(timingsFile);
-    const ratio = staleRatio(files, all.unit, timings, total);
+    // CI balances only the coverage-reaching group across the shards; the no-coverage group is one separate shard.
+    const { classifyTests } = await import('./coverage-reach.mjs');
+    // A fixture repo has no vitest coverage config to classify against, so its files all count as covered.
+    const split = io.classify ?? (repoRoot === REPO_ROOT ? classifyTests : async (all) => ({ covered: all }));
+    const ratio = staleRatio((await split(files)).covered, all.unit, timings, total);
     const balance = `stale ratio old-assignment-on-new-timings ${ratio.toFixed(2)}`;
-    const evidence = skipped.length ? ` Skipped ${skipped.length} incomplete runs: ${skipped.join('; ')}.` : '';
-    if (minStale !== undefined && ratio < minStale) return { ok: true, reason: `${balance}; assignment still balanced.${evidence}` };
+    if (minStale !== undefined && ratio < minStale) return { ok: true, reason: `${balance}; assignment still balanced.` };
     const output = formatUpdatedTimings(all, 'unit', timings);
     pending = `${timingsFile}.${randomUUID()}.pending`;
     await write(pending, output, { flag: 'wx' });
     await move(pending, timingsFile);
-    return { ok: true, reason: `Updated unit timings from ${count} reports: ${covered}/${files.length} current files covered. ${balance}.${evidence}` };
+    return { ok: true, reason: `Updated unit timings from ${count} reports: ${covered}/${files.length} current files covered. ${balance}.` };
   } catch (error) {
     return { ok: false, reason: `Timing refresh refused: ${error.message}. Check the downloaded reports and retry with complete CI evidence.` };
   } finally {

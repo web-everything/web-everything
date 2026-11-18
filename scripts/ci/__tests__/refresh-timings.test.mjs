@@ -349,14 +349,17 @@ describe('rolling timing refresh', () => {
     };
   }
 
-  it('downloads a bounded successful main push window in separate directories, skips an incomplete run and writes medians', async () => {
+  it('downloads a bounded successful main push window in separate directories, refuses when any run is incomplete and writes medians of complete runs', async () => {
     const calls = [];
-    expect(await main(['--runs=5'], { exec: rollingExec([1000, 3000, null, 2000, 99000], calls), timingsFile, repoRoot })).toBe(0);
+    expect(await main(['--runs=5'], { exec: rollingExec([1000, 3000, null, 2000, 99000], calls), timingsFile, repoRoot })).toBe(2);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+    calls.length = 0;
+    expect(await main(['--runs=5'], { exec: rollingExec([1000, 3000, 2000, 4000, 99000], calls), timingsFile, repoRoot })).toBe(0);
     expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=5', '--json=databaseId']);
     expect(calls.slice(1).map(c => c.args.slice(0, 4))).toEqual([100, 101, 102, 103, 104].map(id => ['run', 'download', String(id), '--pattern=timing-unit-*']));
     expect(new Set(calls.slice(1).map(c => c.args.at(-1))).size).toBe(5);
     expect(calls.every(c => c.cmd === 'gh' && c.options.timeout === 120000 && c.options.maxBuffer === 1024 * 1024 && !c.options.shell)).toBe(true);
-    expect(JSON.parse(readFileSync(timingsFile, 'utf8')).unit).toEqual(Object.fromEntries(files.map(file => [file, 2.5])));
+    expect(JSON.parse(readFileSync(timingsFile, 'utf8')).unit).toEqual(Object.fromEntries(files.map(file => [file, 3])));
   });
 
   it('requires at least one complete run and preserves bytes when every run is incomplete', async () => {
