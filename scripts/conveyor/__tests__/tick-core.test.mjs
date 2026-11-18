@@ -2489,7 +2489,7 @@ describe('card 80 — prepare just in time', () => {
 
   it('every dispatch-plan held reason is either excluded from the generic note or deliberately generic', () => {
     // Adding a HELD_REASONS entry forces a choice here, instead of silently doubling its note (the prepare-stale miss).
-    const GENERIC = ['already-done', 'blocked', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>',
+    const GENERIC = ['runtime-only', 'already-done', 'blocked', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>',
       'cleared-but-not-ready', 'dispatch-paused', 'pr-limit'];
     const unclassified = HELD_REASONS.filter((r) => !HELD_NOTE_EXCLUDED_REASONS.includes(r) && !GENERIC.includes(r));
     expect(unclassified).toEqual([]);

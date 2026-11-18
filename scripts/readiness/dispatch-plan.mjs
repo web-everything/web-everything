@@ -172,7 +172,7 @@ import { driftDefaults, findPocBranch, readRegistry } from '../lib/poc-branches.
  *  `planFixSpawns`/CI-heal sibling), which this function never touches, so it is never held by this. The
  *  operator gloss is {@link PR_LIMIT_HINT}. */
 export const HELD_REASONS = Object.freeze([
-  'already-done', 'blocked', 'unshaped-no-scope', 'no-size', 'needs-prepare', 'prepare-stale', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>', 'cleared-but-not-ready', 'dispatch-paused', 'pr-limit',
+  'runtime-only', 'already-done', 'blocked', 'unshaped-no-scope', 'no-size', 'needs-prepare', 'prepare-stale', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>', 'cleared-but-not-ready', 'dispatch-paused', 'pr-limit',
 ]);
 
 /** The operator-facing gloss for an `unshaped-no-scope` hold — surfaced beside the token in the CLI and the
@@ -460,8 +460,10 @@ export function dispatchPlan({ queue, buildPriority = {}, leases, freeLanes, dri
   // old-format `{paused:true}` — and every caller that still passes only the boolean — keep holding builds,
   // while `--kinds=fix` alone leaves builds launching.
   const buildPaused = resolvePausedKinds({ paused: dispatchPaused === true, pausedKinds: dispatchPausedKinds }).includes('build');
-  // Runtime membership must precede every lane and scope decision.
-  const items = filterRuntimeCandidates(Array.isArray(queue) ? queue.filter((it) => it && typeof it === 'object') : [], buildPriority);
+  // Keep unlisted items visible for live guard retention, but exclude them before any readiness,
+  // lane or scope decision so they cannot trigger new work or consume scheduling capacity.
+  const items = Array.isArray(queue) ? queue.filter((it) => it && typeof it === 'object') : [];
+  const runtimeCandidates = new Set(filterRuntimeCandidates(items, buildPriority));
   const activeLeases = (Array.isArray(leases) ? leases : [])
     .filter((l) => l && typeof l === 'object')
     .map((l) => ({ lane: l.lane ?? null, scope: normScope(l.scope) }));
@@ -490,6 +492,11 @@ export function dispatchPlan({ queue, buildPriority = {}, leases, freeLanes, dri
       if (trace) gates.push({ name, pass: !condition, observed });
       return condition;
     };
+
+    if (blocked('runtime-only', !runtimeCandidates.has(item), buildPriority.source)) {
+      held.push({ num, reason: 'runtime-only' });
+      continue;
+    }
 
     // 0. GROUND TRUTH (#3457/#3460) — a real merged PR already closes this item out. Checked FIRST, ahead of
     //    every other branch: `blocked`, `needs-slice`, `needs-decision` and the scope/overlap reads below are

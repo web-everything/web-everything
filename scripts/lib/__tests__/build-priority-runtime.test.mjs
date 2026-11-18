@@ -3,12 +3,53 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { readBuildPrioritySettings, filterIdsToRuntimeOnly, filterRuntimeCandidates, extraPrepareSlot } from '../build-queue.mjs';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
+import { dispatchPlan } from '../../readiness/dispatch-plan.mjs';
+import { planTick } from '../../conveyor/tick-core.mjs';
 
 const now = Date.parse('2026-11-17T12:00:00Z');
 const record = { ids: ['42', 'xxanl0v'], mode: 'only', setBy: 'operator', at: '2026-11-17T11:00:00Z', ttlHours: 2 };
 const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
 const options = { env: { WE_POLICY_CASCADE_LOG: '0' }, read: () => ({ build: { priority: ['9'] } }), now: () => now };
 const read = (value = record, overrides = {}) => readBuildPrioritySettings({ ...options, readRuntime: () => JSON.stringify(value), ...overrides });
+
+it.each([
+  ['prepare-item', 'story', 'needs-prepare', 'spawnPrepareItems'],
+  ['investigate', 'investigation', 'needs-investigation', 'spawnInvestigations'],
+])('real planner retains an unlisted %s guard across ticks and suppresses redispatch on relisting', (kind, cardKind, reason, spawnKey) => {
+  const queue = [{ num: '8001', kind: cardKind, scope: ['we:src/a.js'], size: 1 }];
+  const guard = { num: '8001', kind, lane: 4, spawnedTick: 0, sawPr: false };
+  const tick = (buildPriority, bookkeeping) => {
+    const plan = dispatchPlan({ queue, buildPriority, freeLanes: [5], preparePolicy: { requirePreparedDate: true } });
+    return { plan, result: planTick({ state: { queue, lanes: [], prs: [] }, plan, freeLanes: [5],
+      bookkeeping, config: { buildPriority }, now }) };
+  };
+  const unlisted = tick(read(), { tick: 1, prepareGuards: [guard] });
+  expect(unlisted.plan).toMatchObject({ launch: [], held: [{ num: '8001', reason: 'runtime-only' }] });
+  expect(unlisted.result.decisions.retireGuards.prepare).toEqual([]);
+  expect(unlisted.result.decisions[spawnKey]).toEqual([]);
+  expect(unlisted.result.nextState.prepareGuards).toContainEqual(expect.objectContaining(guard));
+
+  const restored = tick(read({ ...record, ids: ['8001'] }), unlisted.result.nextState);
+  expect(restored.plan.held).toEqual([{ num: '8001', reason }]);
+  expect(restored.result.decisions.retireGuards.prepare).toEqual([]);
+  expect(restored.result.decisions[spawnKey]).toEqual([]);
+  expect(restored.result.nextState.prepareGuards).toContainEqual(expect.objectContaining(guard));
+});
+
+it('real planner filters before lane assignment and scope overlap, accepting bornAs membership', () => {
+  const queue = [
+    { num: '9', scope: ['we:src/a.js'] },
+    { num: '8001', bornAs: 'xabcdef0', scope: ['we:src/a.js'] },
+  ];
+  expect(dispatchPlan({ queue, freeLanes: [5], buildPriority: read({ ...record, ids: ['xabcdef0'] }) }))
+    .toEqual({ launch: [{ num: '8001', lane: 5 }], held: [{ num: '9', reason: 'runtime-only' }] });
+});
+
+it('real planner holds every item on malformed runtime evidence without assigning a lane', () => {
+  expect(dispatchPlan({ queue: [{ num: '42' }, { num: '9', scope: ['we:src/a.js'] }],
+    freeLanes: [5], buildPriority: read(null) }))
+    .toEqual({ launch: [], held: [{ num: '42', reason: 'runtime-only' }, { num: '9', reason: 'runtime-only' }] });
+});
 
 describe('runtime build priority', () => {
   it('absent runtime deep-equals the previous repo-setting result', () => {
