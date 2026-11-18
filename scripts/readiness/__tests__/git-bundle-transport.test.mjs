@@ -73,6 +73,69 @@ const run = async ({ head = tip, bundle, runnerBase = runnerMain, sharedClone = 
 };
 
 describe('R593 bundle ingest on the runner', () => {
+  it.each(['matching', 'retargeted', 'missing-alias', 'extra-alias'])('stages only safe HEAD symlinks with matching projected aliases (%s)', async (projection) => {
+    // Store arbitrary targets as Git blobs so even NUL/newline refusals are
+    // tested without ever creating or following a filesystem symlink.
+    const links = [
+      ['.claude/agent-memory', '.././agent-memory-src/../agent-memory-src', false],
+      ['absolute', '/outside', false],
+      ['escaping', '../outside', false],
+      ['nested/escaping', '../../outside', false],
+      ['newline', 'agent-memory-src\n', false],
+      ['nul', 'agent-memory-src\0suffix', false],
+      ['no-alias', 'agent-memory-src', null],
+      ['prefix-only', 'agent-memory-src', null],
+      ['tracked-alias', 'agent-memory-src', true],
+    ];
+    const entries = [{ path: Buffer.from('tracked.txt'), sha256: hash('changed'), executable: false, tracked: true }];
+    const oids = new Map();
+    for (const [name, target, tracked] of links) {
+      const oid = (await exec({ file: 'git', args: ['hash-object', '-w', '--stdin'], cwd: lane, input: target })).stdout.toString().trim();
+      oids.set(name, oid);
+      git(lane, 'update-index', '--add', '--cacheinfo', `120000,${oid},${name}`);
+      if (tracked === null) continue;
+      const alias = `${name}/file.md`;
+      await fs.mkdir(join(work, name), { recursive: true });
+      await fs.writeFile(join(work, alias), 'projected');
+      entries.push({ path: Buffer.from(alias), sha256: hash('projected'), executable: false, tracked });
+    }
+    const addFile = async (path, content, tracked) => {
+      await fs.mkdir(join(work, path, '..'), { recursive: true });
+      await fs.writeFile(join(work, path), content);
+      entries.push({ path: Buffer.from(path), sha256: hash(content), executable: false, tracked });
+    };
+    await addFile('agent-memory-src/file.md', projection === 'retargeted' ? 'old target' : 'projected', true);
+    if (projection === 'retargeted') await addFile('different-src/file.md', 'projected', true);
+    if (projection === 'missing-alias') await addFile('agent-memory-src/extra.md', 'extra', true);
+    if (projection === 'extra-alias') await addFile('.claude/agent-memory/extra.md', 'extra', false);
+    await fs.writeFile(join(work, 'prefix-only-extra'), 'projected');
+    entries.push({ path: Buffer.from('prefix-only-extra'), sha256: hash('projected'), executable: false, tracked: false });
+    git(lane, ...ident, 'commit', '-qm', 'HEAD links');
+    if (projection === 'retargeted') {
+      await fs.mkdir(join(lane, '.claude'), { recursive: true });
+      await fs.symlink('../different-src', join(lane, '.claude/agent-memory'));
+      git(lane, 'add', '--', '.claude/agent-memory');
+    }
+    const head = git(lane, 'rev-parse', 'HEAD');
+    // Seed a local mirror with this verified HEAD; mode=none avoids widening
+    // the bundle-range policy, which continues to refuse new symlinks.
+    await fs.rm(join(root, 'repo.git'), { recursive: true, force: true });
+    git(root, 'clone', '--bare', lane, join(root, 'repo.git'));
+    git(join(root, 'repo.git'), 'update-ref', 'refs/remotes/origin/main', runnerMain);
+    entries.sort((a, b) => Buffer.compare(a.path, b.path));
+    const manifest = { ...manifestWire({ entries, excluded: [] }), git: { head } };
+    await materializeWorktree({ work, root, head, manifest, manifestDigest: digestManifest(manifest),
+      bundle: { mode: 'none', maxMainAgeMs: 600000 } });
+    const stagedLink = git(work, 'ls-files', '--stage', '--', '.claude/agent-memory');
+    if (projection === 'matching') expect(stagedLink).toBe(`120000 ${oids.get('.claude/agent-memory')} 0\t.claude/agent-memory`);
+    else expect(stagedLink).toBe('');
+    for (const [name] of links.slice(1)) {
+      const staged = git(work, 'ls-files', '--stage', '--', name);
+      expect(staged, name).not.toMatch(/^120000 /m);
+    }
+    expect((await fs.lstat(join(work, '.claude/agent-memory'))).isDirectory()).toBe(true);
+    expect(await fs.readFile(join(work, '.claude/agent-memory/file.md'), 'utf8')).toBe('projected');
+  });
   it('fetches a verified incremental bundle into a per-run clone and checks out the exact tip', async () => {
     const plan = await run();
     expect(plan.mode).toBe('incremental');
@@ -437,7 +500,7 @@ describe('R593 raw commit object scan (R559)', () => {
     if (r.status !== 0) throw new Error(r.stderr);
     return r.stdout.trim();
   };
-  const sig = (comment) => `gpgsig -----BEGIN PGP SIGNATURE-----\n Comment: ${comment}\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n`;
+  const sig = (comment) => `gpgsig -----${'BEGIN'} PGP SIGNATURE-----\n Comment: ${comment}\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n`;
   it('flags a token hidden in a multiline gpgsig header (empty child commit)', async () => {
     const head = rawCommit(sig('ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'));
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'commit-object', finding: 'github-token' });
