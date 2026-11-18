@@ -208,6 +208,40 @@ it('a clean complete index parses only indexed ids', () => {
   expect(result.loopPayload).toEqual(f.run);
   expect(io.count()).toBe(1);
 });
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('unchanged verification payload serves fallback within a one-read budget (%#)', reader => {
+  const f = fixture(); completeIndex(f);
+  const io = window(f);
+  const result = reader({ ...f, ...io, list: () => [f.run.id],
+    scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, platform: {}, env: {} } });
+  expect(result.loopPayload ?? result.newest).toEqual(f.run);
+  expect(io.count()).toBe(1);
+});
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('fallback rereads an atomic replacement even with unchanged mtime (%#)', reader => {
+  for (const maxParses of [1, 2]) {
+    const f = fixture();
+    f.run.findings.read.netBasis.rev = 'b'.repeat(40);
+    completeIndex(f);
+    const rejection = { ...f.run, findings: { read: { netBasis: { rev: f.head } } }, verdict: { verdict: 'changes' } };
+    let lists = 0, reads = 0;
+    const result = reader({ ...f, warn: () => {},
+      scanSettings: { file: { runs: { scan: { maxParses } } }, platform: {}, env: {} },
+      list: () => {
+        if (++lists === 2) {
+          const replacement = join(f.runsDir, 'replacement');
+          writeFileSync(replacement, JSON.stringify(rejection));
+          utimesSync(replacement, 2, 2);
+          renameSync(replacement, join(f.runsDir, `${f.run.id}.json`));
+        }
+        return [f.run.id];
+      },
+      read: id => { reads++; return readRun(id, f.runsDir); },
+    });
+    expect(lists).toBe(2);
+    if (maxParses === 1) expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    else expect(result.loopPayload ?? result.newest).toEqual(rejection);
+    expect(reads).toBe(maxParses);
+  }
+});
 
 it('legacy nonempty index without a watermark takes the bounded fallback', () => {
   const f = fixture();

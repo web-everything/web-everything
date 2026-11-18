@@ -4663,6 +4663,11 @@ directory resolution, must return the drain context unchanged on exceptions.
 For every bounded-read risk, the test plan must name a regression counting actual read attempts
 or asserting the read range, including the default shared budget across repositories. Inject a
 failure after a successful staged read to prove no partial completeness can be published.
+Index verification payloads may serve the bounded fallback only after rechecking the file
+identity captured before the read (mtime, device, inode, size, ctime and birthtime). Changed
+identities discard cached payloads and read errors; fresh attempts still consume the shared
+parse budget. The unchanged one-read fallback and unchanged-mtime atomic-replacement cases
+in `review-run-index.test.mjs` pin both reuse and stale-cache refusal for drain and recovery.
 Both backfills must count payload attempts before calling the reader and retain that count
 outside staging, so aborts, listing churn and failed persistence cannot refund the shared
 50-read drain budget. The `%s backfill preserves payload spend after %s` cases and the
