@@ -2017,6 +2017,68 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
   });
+  it.each(['both', 'first', 'second'])('merges failed-write fallback with durable refusals and retries persistence (%s fails)', async fails => {
+    const path = join(lockRoot, 'fallback-refusals.json');
+    let now = Date.parse('2026-11-18T12:00:00Z');
+    const effects = fixture();
+    effects.now = () => now;
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.readPrepareRefusals = options => readPrepareRefusals({ path, ...options });
+    effects.recordPrepareRefusal = vi.fn((row, options) => {
+      const call = effects.recordPrepareRefusal.mock.calls.length;
+      if (fails === 'both' || (fails === 'first' ? call === 1 : call === 2)) throw new Error('disk full');
+      recordPrepareRefusal(row, { path, ...options });
+    });
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.planTick = bk => ({ decisions: planPrepareSpawns({
+      needsPrepare: [{ num: '5028' }], prepareHeldNums: bk.prepareHeldNums,
+      availableLanes: [1], maxConcurrentItemPrepares: 1,
+    }), nextState: {} });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 2; i++) {
+        expect((await runBuildDispatchTick({ live: true, effects })).prepare.refused).toHaveLength(1);
+        now += 3_600_000;
+      }
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.planned).toEqual([]);
+      expect(tick.prepare.skippedRepeatRefusal).toEqual([{ num: '5028', refusals: 2,
+        lastReason: 'open prepare PR #91 (lane/5028d-prepare-x)' }]);
+      expect(effects.recordPrepareRefusal).toHaveBeenCalledTimes(2);
+      expect(effects.dispatch).not.toHaveBeenCalled();
+      now += 24 * 3_600_000;
+      expect((await runBuildDispatchTick({ live: true, effects })).prepare.refused).toHaveLength(1);
+      expect(effects.recordPrepareRefusal).toHaveBeenCalledTimes(3);
+    } finally { log.mockRestore(); }
+  });
+  it('durably counts planning-time merged-PR refusals and stops planning after two', async () => {
+    const path = join(lockRoot, 'planning-refusals.json');
+    let now = Date.parse('2026-11-18T12:00:00Z');
+    const effects = fixture();
+    effects.now = () => now;
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.readPrepareRefusals = options => readPrepareRefusals({ path, ...options });
+    effects.recordPrepareRefusal = vi.fn((row, options) => recordPrepareRefusal(row, { path, ...options }));
+    effects.listPreparePrs = () => [{ number: 91, state: 'MERGED', headRefName: 'lane/5028d-prepare-x',
+      mergedAt: '2026-11-18T11:00:00Z' }];
+    effects.planTick = bk => ({ decisions: planPrepareSpawns({
+      needsPrepare: [{ num: '5028' }], prepareHeldNums: bk.prepareHeldNums,
+      availableLanes: [1], maxConcurrentItemPrepares: 1,
+    }), nextState: {} });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 2; i++) {
+        expect((await runBuildDispatchTick({ live: true, effects })).prepare.skippedInPlanning).toHaveLength(1);
+        now += 3_600_000;
+      }
+      const tick = await runBuildDispatchTick({ live: true, effects: { ...effects } });
+      expect(tick.prepare.planned).toEqual([]);
+      expect(tick.prepare.skippedRepeatRefusal).toEqual([{ num: '5028', refusals: 2,
+        lastReason: 'merged prepare PR #91 (within 24h guard)' }]);
+      expect(effects.recordPrepareRefusal).toHaveBeenCalledTimes(2);
+      expect(effects.dispatch).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
   it('does not plan when durable refusal evidence is unreadable', async () => {
     const effects = fixture();
     effects.readPrepareRefusals = () => { throw new Error('prepare refusal history unavailable'); };

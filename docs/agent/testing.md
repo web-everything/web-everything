@@ -4583,6 +4583,10 @@ review-job and review-daemon suites.
 
 ## Prepare repeat refusal stop (R981)
 
+Planning and launch refusals share durable recording. Failed writes also count in a
+per-daemon fallback until their original TTL expires; the next refusal retries persistence.
+Coroner excludes only retirement PR-listing observation errors from failed attempts.
+
 `prepare-refusals.json` under the coordination state root keeps launch refusals across daemon
 restarts. `prepare.repeatRefusalMax` (2) refusals within `repeatRefusalWindowHours` (24)
 exclude a card before prepare planning and cost admission. Reads ignore expired records;

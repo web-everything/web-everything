@@ -1,3 +1,17 @@
+const fallbacks = new WeakMap();
+export function prepareRefusalFallback(scope) {
+  if (!fallbacks.has(scope)) fallbacks.set(scope, new Map());
+  return fallbacks.get(scope);
+}
+
+export function readFallbackPrepareRefusals(fallback, options) {
+  for (const [num, rows] of fallback) {
+    const active = activePrepareRefusals(rows, options);
+    if (active.length) fallback.set(num, active); else fallback.delete(num);
+  }
+  return [...fallback.values()].flat();
+}
+
 /** Pure rolling-window refusal history. Expiration never slides forward on a read. */
 export function activePrepareRefusals(rows, { now = Date.now(), repeatRefusalWindowHours = 24 } = {}) {
   return rows.filter(r => now - Date.parse(r.at) < repeatRefusalWindowHours * 3_600_000);

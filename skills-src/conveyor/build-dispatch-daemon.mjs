@@ -32,7 +32,7 @@
  */
 
 import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/build-dispatch-policy.mjs';
-import { repeatedPrepareRefusals } from '../../scripts/conveyor/prepare-refusal-stop.mjs';
+import { repeatedPrepareRefusals, prepareRefusalFallback, readFallbackPrepareRefusals, appendPrepareRefusal } from '../../scripts/conveyor/prepare-refusal-stop.mjs';
 import { readPrepareRefusals, recordPrepareRefusal } from '../../scripts/conveyor/prepare-refusal-stop-io.mjs';
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
@@ -349,6 +349,7 @@ export function releaseOwnPrepareHolds({ nums, holds, release }) {
 const LEDGER_HOLD_REASON = 'prepare-unstamped';
 
 async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, routingPolicy, effects, timer = createPhaseTimer() }) {
+  const refusalFallback = prepareRefusalFallback(effects);
   effects = timer.wrap(effects);
   const groupingSettings = readBuildGroupingSettings();
   console.error(formatBuildGroupingLine(groupingSettings));
@@ -482,7 +483,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const tickNowMs = effects.now?.() ?? Date.now();
   const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   const refusalOptions = { ...preparePolicy, now: tickNowMs };
-  const skippedRepeatRefusal = repeatedPrepareRefusals(await effects.readPrepareRefusals?.(refusalOptions) ?? [], refusalOptions);
+  const skippedRepeatRefusal = repeatedPrepareRefusals([
+    ...await effects.readPrepareRefusals?.(refusalOptions) ?? [],
+    ...readFallbackPrepareRefusals(refusalFallback, refusalOptions),
+  ], refusalOptions);
+  const recordRefusal = async (num, reason) => {
+    const options = { ...preparePolicy, now: effects.now?.() ?? Date.now() };
+    try { await effects.recordPrepareRefusal?.({ num, reason }, options); }
+    catch (e) {
+      refusalFallback.set(num, appendPrepareRefusal(refusalFallback.get(num) ?? [], { num, reason }, options));
+      console.error(`build-dispatch-daemon: prepare refusal persistence failed for #${num}: ${childFailure(e, { singleLine: true })}`);
+    }
+  };
   const repeatRefusalNums = new Set(skippedRepeatRefusal.map(r => normNum(r.num)));
   // An operator release or a stamp lifts a cached refusal at once.
   const freshRefusals = (Array.isArray(bookkeeping.prepareRefusals) ? bookkeeping.prepareRefusals : [])
@@ -575,6 +587,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       // Persist what the launch guard would: its PR precedence (an open prepare PR outranks the merge, so the
       // refusal probe still reads it) and reason. Claims, runs and parks stay the launch guard's own checks.
       const refusal = prepareLaunchRefusal({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
+      if (live) await recordRefusal(num, refusal.reason);
       const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
       const matched = prs.find(pr => pr?.number === refusingPr) ?? merged.pr;
       // Read the scope-drift hold from the plan that offered this card: a replan with it held may drop the hold.
@@ -1375,11 +1388,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       refusal = { reason: 'prepare PR listing unavailable' };
     }
     if (!refusal) return null;
-    try {
-      await effects.recordPrepareRefusal?.({ num, reason: refusal.reason }, { ...preparePolicy, now: effects.now?.() ?? Date.now() });
-    } catch (e) {
-      console.error(`build-dispatch-daemon: prepare refusal persistence failed for #${num}: ${childFailure(e, { singleLine: true })}`);
-    }
+    await recordRefusal(num, refusal.reason);
     refusedPrepares.add(num);
     prepare.refused.push({ num, ...refusal });
     console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);
