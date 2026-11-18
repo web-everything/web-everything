@@ -2387,7 +2387,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // A nested call rides the outer slot only when it resolved the SAME pool the outer was admitted to; otherwise
     // (outer charged installation 101 but the shim selected 202) it takes its own slot in the pool it resolved.
     const outerBucket = env[GH_OUTER_BUCKET_ENV] || process.env[GH_OUTER_BUCKET_ENV] || null;
-    const ridesOuter = !!outer && (outerBucket === null || outerBucket ===(/^\d+$/.test(String(bucket)) ? String(bucket) : 'shared'));
+    // No outer-bucket evidence means no proof the outer holds a slot in this pool: take our own.
+    const ridesOuter = !!outer && outerBucket !== null && outerBucket === (/^\d+$/.test(String(bucket)) ? String(bucket) : 'shared');
     const acq = gated && !ridesOuter ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
