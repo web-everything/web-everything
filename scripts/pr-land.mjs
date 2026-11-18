@@ -694,7 +694,7 @@ export function classifyChecks(rows) {
 }
 
 export function requireScoredNetDiff(signal) {
-  if (signal?.scored !== true) {
+  if (signal?.scored !== true || signal.needsReview?.length || signal.netDiffText?.needsReview?.length) {
     const error = new Error('Net diff is unscored; refusing review scoring and landing. Repair the checkout/read and rerun, or request human review of the full diff.');
     error.code = 'UNSCORED_NET_DIFF';
     throw error;

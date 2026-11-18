@@ -2430,9 +2430,9 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
   });
 
   it('#xuboo0q — shouldReparkForTestTampering: the actual re-park decision, extracted and independently testable', () => {
-    // No tampering, or an unscored diff (no local/sibling clone) → never re-park regardless of clearance state.
+    // Complete clean evidence clears; an unscored diff requires human review.
     expect(shouldReparkForTestTampering({ tampered: false, netDiffScored: true })).toBe(false);
-    expect(shouldReparkForTestTampering({ tampered: true, netDiffScored: false })).toBe(false);
+    expect(shouldReparkForTestTampering({ tampered: true, netDiffScored: false })).toBe(true);
     // Tampering on a scored diff, no clearance at all → re-park. This is the confirmed live bug: PR #1445
     // re-parked 4 times in ~50 minutes with no new commit in between, because nothing suppressed this branch.
     expect(shouldReparkForTestTampering({ tampered: true, netDiffScored: true })).toBe(true);

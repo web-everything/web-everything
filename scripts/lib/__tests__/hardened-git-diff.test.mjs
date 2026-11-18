@@ -118,3 +118,25 @@ describe('raw blob fingerprint identity', () => {
     expect(() => verifyRenderedDiff(() => record(), 'base', 'head', patch('x') + 'GIT binary patch\n')).toThrow(/human review required/);
   });
 });
+
+
+describe('per-path rendering evidence opt-in', () => {
+  it('keeps readable hunks and raw identities while surfacing only inconclusive paths', () => {
+    const needsReview = [];
+    const mixed = patch('text') + 'diff --git a/payload b/payload\nBinary files a/payload and b/payload differ\n';
+    const text = hardenedGitDiff((_cmd, args) => args.includes('--raw') ? record('text') + record('payload') : mixed,
+      ['diff', 'base', 'head'], {}, { needsReview });
+    expect(needsReview).toEqual(['payload']);
+    expect(text).toContain('@@ -1 +1 @@\n-old\n+new');
+    expect(text).toContain('we-raw-blob {"path":"payload"');
+  });
+  it('surfaces changed oids without hunks but never relaxes missing sections, gitlinks or unknown rendering', () => {
+    const needsReview = [];
+    expect(verifyRenderedDiff(() => record(), 'base', 'head', 'diff --git a/x b/x\n', { needsReview })).toEqual(['x']);
+    expect(needsReview).toEqual(['x']);
+    for (const [raw, text] of [[record(), ''], [record('x', { oldMode: '160000' }), patch('x')],
+      [record(), 'unknown renderer'], [record(), 'diff --git a/x b/x\nunknown renderer\n'], [record('other'), patch('x')], [record(), patch('x') + patch('extra')]]) {
+      expect(() => verifyRenderedDiff(() => raw, 'base', 'head', text, { needsReview: [] })).toThrow(/human review required/);
+    }
+  });
+});

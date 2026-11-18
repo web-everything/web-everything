@@ -7,12 +7,14 @@
  *   integration with `scoreEscalation`/`diffHunksFrom` from `scripts/lib/review-escalation.mjs`.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
+import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals, scanDrainTestTampering } from '../merge-ai-prs.mjs';
 import { requireScoredNetDiff } from '../pr-land.mjs';
-import { scoreEscalation, diffHunksFrom } from '../lib/review-escalation.mjs';
+import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 
 
 // Intent fixtures normalize only the shared global prefix. Real-Git policy tests
@@ -1019,5 +1021,38 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
     const { exec, calls } = fakeExec();
     expect(computeNetDiffPaths({ exec })).toEqual({ paths: [], base: null, rev: null, scored: false });
     expect(calls.length).toBe(0);
+  });
+});
+
+
+describe('mixed binary and readable test-removal evidence', () => {
+  it('retains test-removal hunks, surfaces only binary needsReview, and holds an accepted PR', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mixed-tamper-'));
+    const exec = (cmd, args, opts) => {
+      if (args[0] === 'fetch') throw new Error('offline fixture');
+      return execFileSync(cmd, args, { ...opts, cwd: root });
+    };
+    const git = (...args) => exec('git', args, { encoding: 'utf8' }).trim();
+    try {
+      git('init', '--quiet'); git('config', 'user.name', 'Fixture'); git('config', 'user.email', 'fixture@example.test');
+      writeFileSync(join(root, 'payload'), Buffer.from([0, 1, 2]));
+      writeFileSync(join(root, 'guard.test.mjs'), "it('guards the boundary', () => { expect(true).toBe(true); });\n");
+      git('add', '.'); git('commit', '--quiet', '-m', 'base');
+      git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+      writeFileSync(join(root, 'payload'), Buffer.from([0, 3, 4])); git('rm', 'guard.test.mjs');
+      git('add', '.'); git('commit', '--quiet', '-m', 'remove guard and change binary');
+      const sig = computeNetDiffSignals({ exec, rev: git('rev-parse', 'HEAD') });
+      expect(sig.netDiffText.scored).toBe(true);
+      expect(sig.netDiffText.needsReview).toEqual(['payload']);
+      expect(sig.netDiffText.text).toContain("-it('guards the boundary'");
+      expect(sig.netDiffText.text).toContain('we-raw-blob');
+      expect(sig.diffHunks).toBe(sig.netDiffText.text);
+      expect(() => requireScoredNetDiff(sig)).toThrow(/unscored/);
+      const gaming = scanDrainTestTampering(sig.netDiffText);
+      expect(gaming.tampered).toBe(true);
+      expect(gaming.reasons.join(' ')).toContain('payload');
+      expect(shouldReparkForTestTampering({ tampered: gaming.tampered,
+        netDiffScored: sig.netDiffText.scored && !sig.netDiffText.needsReview.length })).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

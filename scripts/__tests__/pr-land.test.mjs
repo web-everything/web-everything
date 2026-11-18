@@ -1102,7 +1102,7 @@ describe('accepted-head carry — a fresh hold verdict must not re-hold a PR alr
 describe('pr-land refuses incomplete net diff evidence before readiness', () => {
   it('requires an explicitly scored result, including retained cumulative evidence', async () => {
     const { requireScoredNetDiff } = await import('../pr-land.mjs');
-    for (const signal of [null, {}, { scored: false, changedFiles: ['README.md'] }]) {
+    for (const signal of [null, {}, { scored: false, changedFiles: ['README.md'] }, { scored: true, needsReview: ['payload'] }, { scored: true, netDiffText: { needsReview: ['payload'] } }]) {
       expect(() => requireScoredNetDiff(signal)).toThrow(/Repair the checkout/);
     }
     expect(requireScoredNetDiff({ scored: true })).toEqual({ scored: true });

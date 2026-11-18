@@ -69,6 +69,16 @@ describe('review read pins real Git evidence before merge-base', () => {
     expect(result.diff.text).not.toContain('card only');
   };
 
+  it('refuses paired scoring when binary paths need human review', () => {
+    git('checkout', '--quiet', '--detach', executable);
+    writeFileSync(join(root, 'payload'), Buffer.from([0, 255, 1]));
+    git('add', '.'); git('commit', '--quiet', '-m', 'binary alongside text');
+    git('update-ref', 'refs/remotes/origin/lane/security', git('rev-parse', 'HEAD'));
+    const { result } = read();
+    expect(result.diff).toMatchObject({ scored: false, text: '', reason: 'needs-human-review' });
+    expect(result.net.scored).toBe(false);
+  });
+
   it('keeps executable text and paths when the branch moves after merge-base and before scoring', () => {
     let raced = false;
     const { result, calls } = read(args => {

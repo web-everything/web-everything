@@ -2213,7 +2213,8 @@ export function headEverHumanCleared(comments, headSha, options) {
  * @returns {boolean}
  */
 export function shouldReparkForTestTampering({ tampered, netDiffScored, humanClearedSha = null, headSha = null } = {}) {
-  if (!tampered || !netDiffScored) return false;
+  if (netDiffScored !== true) return true; // incomplete evidence never clears the tampering hold
+  if (!tampered) return false;
   return !(humanClearedSha && headSha && humanClearedSha === headSha);
 }
 

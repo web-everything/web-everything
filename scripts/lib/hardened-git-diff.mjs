@@ -1,6 +1,7 @@
 /** Scoring evidence uses Git's built-in diff against an empty attribute tree.
  * Pure command construction, injectable execFileSync-shaped IO. Errors propagate:
  * callers must invalidate the complete score, never substitute empty evidence.
+ * The explicit needsReview collector retains readable paths but cannot grant clearance.
  * --attr-source also makes Git versions without attribute-source support refuse.
  */
 export const EMPTY_ATTRIBUTE_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
@@ -34,7 +35,7 @@ export function hardenedGitDiffCommand(args, opts = {}, env = {}) {
   };
 }
 
-export function hardenedGitDiff(exec, args, opts) {
+export function hardenedGitDiff(exec, args, opts, { needsReview = null } = {}) {
   const command = hardenedGitDiffCommand(args, opts, process.env);
   const output = exec('git', command.args, command.opts);
   if (args[0] === 'diff' && !args.some(a => ['--raw', '--numstat', '--name-only', '--quiet'].includes(a))) {
@@ -42,7 +43,7 @@ export function hardenedGitDiff(exec, args, opts) {
     const refs = args.slice(1, stop < 0 ? undefined : stop).filter(a => !a.startsWith('-'));
     if (refs.length !== 2) throw new Error('diff evidence requires two explicit trees; human review required');
     const records = [];
-    verifyRenderedDiff(exec, refs[0], refs[1], String(output), { opts, pathspec: stop < 0 ? [] : args.slice(stop + 1), records });
+    verifyRenderedDiff(exec, refs[0], refs[1], String(output), { opts, pathspec: stop < 0 ? [] : args.slice(stop + 1), records, needsReview });
     return bindRawBlobEvidence(String(output), records);
   }
   return output;
@@ -50,9 +51,11 @@ export function hardenedGitDiff(exec, args, opts) {
 
 /** Independent tree evidence. Unknown records and incomplete rendering require human review.
  * Mode-only records need a section but no hunk. Symlinks require ordinary hunks;
- * gitlinks have no blob text and always require human review when their oid changes.
+ * gitlinks have no blob text and always invalidate changed-oid evidence. A needsReview
+ * collector opts into partial text evidence for binary/hunkless paths only; all
+ * structural verification failures still throw and invalidate the whole read.
  */
-export function verifyRenderedDiff(exec, base, head, text, { opts, pathspec = [], paths = null, records: evidenceRecords = null } = {}) {
+export function verifyRenderedDiff(exec, base, head, text, { opts, pathspec = [], paths = null, records: evidenceRecords = null, needsReview = null } = {}) {
   const records = readRawBlobRecords(exec, base, head, { opts, pathspec });
   const chunks = String(text).split(/(?:^|\n)diff --git /);
   if (chunks[0].trim()) throw new Error('unknown diff rendering; human review required');
@@ -62,8 +65,16 @@ export function verifyRenderedDiff(exec, base, head, text, { opts, pathspec = []
     const section = sections.get(`${quote('a/' + record.path)} ${quote('b/' + record.path)}`);
     if (!section) throw new Error('missing diff section; human review required');
     if (record.oldOid !== record.newOid) {
-      if ([record.oldMode, record.newMode].includes('160000') || !/(?:^|\n)@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@/.test(section) || /(?:^|\n)(?:Binary files(?: .*?)? differ|GIT binary patch)/.test(section)) {
-        throw new Error('changed oid without reviewable blob hunks; human review required');
+      if ([record.oldMode, record.newMode].includes('160000')) throw new Error('changed gitlink; human review required');
+      const hasHunk = /(?:^|\n)@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@/.test(section);
+      const binary = /(?:^|\n)(?:Binary files(?: .*?)? differ|GIT binary patch)/.test(section);
+      if (!hasHunk && !binary && section.split('\n').slice(1).some(line =>
+        line && !/^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}|--- .*|\+\+\+ .*|we-raw-blob \{.*\})$/.test(line))) {
+        throw new Error('unknown diff rendering; human review required');
+      }
+      if (!hasHunk || binary) {
+        if (!needsReview) throw new Error('changed oid without reviewable blob hunks; human review required');
+        needsReview.push(record.path);
       }
     }
   }

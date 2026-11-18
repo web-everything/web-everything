@@ -421,8 +421,8 @@ export function readPr({
   let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
   let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
   // Fail closed: the two reads answer one question. If either is unscored, neither may stand as a scored read.
-  if (netText.scored !== true || netPaths.scored !== true) {
-    netText = { text: '', base: null, rev: null, scored: false, reason: netText.reason || netPaths.reason || 'diff-failed' };
+  if (netText.scored !== true || netText.needsReview?.length || netPaths.scored !== true) {
+    netText = { text: '', base: null, rev: null, scored: false, reason: netText.reason || (netText.needsReview?.length ? 'needs-human-review' : netPaths.reason) || 'diff-failed' };
     netPaths = { paths: [], base: null, rev: null, scored: false, reason: netPaths.reason || netText.reason || 'diff-failed' };
   }
 

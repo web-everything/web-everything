@@ -4472,9 +4472,12 @@ and delta failures have named negative tests requiring a wholly unscored result.
 Scorer rendering ignores inherited Git config and pins repository-local diff defaults,
 including `core.bigFileThreshold`, without forcing binary blobs into text. An independent NUL-delimited
 raw oid diff must match the listed paths and rendered sections; each changed blob
-needs a hunk. Mode-only sections are allowed; symlinks need hunks and changed
-submodules require human review. Empty renderers, binary summaries, unreadable raw
-evidence and output bounds leave the whole result unscored: repair and rerun or
+needs a hunk for automatic clearance. Mode-only sections are allowed; symlinks need hunks and changed
+submodules invalidate the complete read. The net-diff text reader opts into per-path
+`needsReview` for binary or changed-oid paths without hunks, retaining readable hunks
+and the stable `we-raw-blob` identities for every path. Strict readers still refuse those paths.
+Empty renderers, missing/mismatched sections, unreadable raw evidence and output bounds
+leave the whole result unscored: repair and rerun or
 request human review of the full diff. Pin these cases with real Git and an empty
 renderer stub in `review-pr-io-pinned-head.test.mjs` and `hardened-git-diff.test.mjs`.
 
@@ -4487,3 +4490,13 @@ An own-delta read failure retains the measured cumulative file set but stays
 `scored:false`; pr-land refuses that result before scoring or readiness labelling.
 Regression cases live in `hardened-git-diff.test.mjs`,
 `merge-ai-prs-net-diff-computation.test.mjs`, and `pr-land.test.mjs`.
+
+
+The drain's anti-test-gaming gate holds unscored and `needsReview` evidence for human review,
+including no-clone and file-list fallbacks; accepted review and matching old clearance cannot
+turn an inconclusive check into clearance. `merge-ai-prs-net-diff-computation.test.mjs` uses
+real Git with one binary change plus a deleted test to prove the readable removal still trips
+the detector. `merge-ai-prs-drain-verdict-ledger.test.mjs` covers incomplete-read holds;
+`hardened-git-diff.test.mjs` pins the per-path opt-in and unchanged whole-read backstops.
+Pr-land refuses partial signals; review-pr-io invalidates paired evidence and advisory
+conversion retains the strict reader. Run these scoped regressions through heavy-admission.

@@ -718,7 +718,7 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
   if (typeof readHeadDiff === 'function') {
     try { netDiffText = readHeadDiff(headSha); } catch { netDiffText = null; }
   }
-  if (!netDiffText?.scored || typeof netDiffText.text !== 'string' || !netDiffText.text) return unchanged('the live net diff is unscored; identity unproven', true);
+  if (!netDiffText?.scored || netDiffText.needsReview?.length || typeof netDiffText.text !== 'string' || !netDiffText.text) return unchanged('the live net diff is unscored; identity unproven', true);
   // PR #4631 round 7 (toctou-head-binding): the diff must be the live head's OWN — read at that SHA (`rev` is the commit
   // `computeNetDiffText` actually diffed). A diff read at the branch name can describe another commit than `headSha`.
   if (netDiffText.rev !== headSha) return unchanged('the net diff was not read at the live head; identity unproven', true);
@@ -4220,7 +4220,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
  * @param {{exec:Function, remote?:string, base?:string, rev:string, fetchExtraRefs?:string[], basis?:object|null}} opts
  *   `basis` — an already-resolved `resolveNetDiffBasis` result for this same ref (#2890-review-fix finding 3);
  *   pass it to share ONE fetch + candidate probe with `computeNetDiffChangedFiles` instead of resolving twice.
- * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
+ * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, needsReview?:string[], reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
 export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const unscored = { text: '', base: null, rev: null, scored: false };
@@ -4264,8 +4264,11 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // git's own diff output wholesale: verified, a one-line external driver made this return
     // `{text:'HIJACKED — no hunks here\n', scored:true}`. That text now feeds `diffHunks`, the anti-test-gaming
     // scan and the reviewer panel, none of which may read a user-configurable RENDERING of the diff.
-    const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
-    return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
+    // Readable paths remain evidence; opaque paths bind raw OIDs but cannot clear review.
+    // Structural/raw verification failures still throw and invalidate this entire result.
+    const needsReview = [];
+    const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }, { needsReview }) || '');
+    return { text, ...(needsReview.length ? { needsReview } : {}), base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
@@ -4336,10 +4339,21 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
     // whether it is the PR's own file set at all. `false` ONLY for the un-narrowed base-tip fallback.
     basisKind: basis.ok ? basis.basisKind : null,
     basisNarrowed: basis.ok ? basis.basisNarrowed !== false : false,
-    scored: net.scored && netDiffText.scored,
+    scored: net.scored && netDiffText.scored && !netDiffText.needsReview?.length,
     netDiffText,
     diffHunks: diffHunksFrom(netDiffText),
   };
+}
+
+/** Keep readable tamper findings while refusing incomplete evidence as clearance. */
+export function scanDrainTestTampering(netDiffText) {
+  const gaming = scanTestTampering({ diffText: netDiffText?.text || '' });
+  if (netDiffText?.scored !== true || netDiffText.needsReview?.length) {
+    gaming.reasons.push(netDiffText?.needsReview?.length
+      ? `test-tampering check inconclusive for: ${netDiffText.needsReview.join(', ')}; human review required`
+      : 'test-tampering check unscored; repair the diff read or request human review of the full diff');
+  }
+  return gaming;
 }
 
 /**
@@ -6327,7 +6341,7 @@ async function runCli() {
           // #3317 — and so is its line count: this IS the cumulative measurement on this path.
           cumulativeDiffLines = diffLines;
           basisNarrowed = true; // #3343 — the gh files list is already the PR's own (three-dot) file set
-        } catch { /* signal-fetch miss → score on the manifest signals alone */ }
+        } catch { /* signal-fetch miss: tamper evidence remains inconclusive and the human hold below still applies */ }
       }
       // #2890-review-fix finding 1 — `diffHunks` comes from `computeNetDiffSignals` above, which applies
       // `diffHunksFrom` (never a hand-rolled `scored ? text : null`): the text when it was actually computed,
@@ -6425,12 +6439,12 @@ async function runCli() {
       // check is only trustworthy if it wasn't manufactured by GAMING the tests (deleting/`.skip`/`.only`-ing a
       // failing test, or shrinking the case set). Scan this PR's NET diff text for those deterministic,
       // diff-visible tamper forms; on a hit, REFUSE the auto-land and park `review:human` — a test removal is a
-      // trust-chain concern the agent panel must not clear for itself; a human clears a legit removal. Best-
-      // effort like the manifest gate: only when a local/sibling clone is present to read the diff text (no
-      // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
+      // trust-chain concern the agent panel must not clear for itself; a human clears a legit removal.
+      // Unscored or partially readable evidence also parks for human review, including the no-clone
+      // and file-list fallback paths: scoring paths alone cannot clear a content-reading gate.
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
-      const gaming = scanTestTampering({ diffText: netDiffText.text });
+      const gaming = scanDrainTestTampering(netDiffText);
       // #xuboo0q — WAS THIS EXACT TAMPERING FINDING ALREADY HUMAN-CLEARED, AT THE CURRENT HEAD? Before #xuboo0q
       // this gate had no memory: it re-parked `review:human` on every drain pass that saw a tampering-shaped
       // diff, even seconds after a human ran the sanctioned `--to=clear-human` ceremony specifically to clear it
@@ -6447,7 +6461,7 @@ async function runCli() {
       // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
       // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
       let carryRetryable = false;
-      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
+      if (netDiffText.scored && !netDiffText.needsReview?.length && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
@@ -6480,7 +6494,7 @@ async function runCli() {
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored && !netDiffText.needsReview?.length, humanClearedSha, headSha: tamperHeadSha })) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
