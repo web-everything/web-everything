@@ -125,6 +125,9 @@ describe('lane-pool acquire reclaim log', () => {
     expect(code).toBe(1);
     expect(err).toContain('unrecognized flag(s)');
     expect(err).toContain('full flag list');
+    // The WHOLE diagnostic arrived, not a prefix: every flag, the closing sentence, and the final newline.
+    expect(err).toContain(flags[flags.length - 1]);
+    expect(err.endsWith('is exactly the footgun this check exists to close.\n')).toBe(true);
     expect(existsSync(pool)).toBe(false);
   }, 60_000);
 });
