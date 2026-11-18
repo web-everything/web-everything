@@ -97,6 +97,7 @@ export function validateUsageRow(row) {
 /** Compatibility conversion deliberately preserves the old quota, without new per-op caps. */
 export function legacyRequestFromSlotUnits(u, { kind = 'other', key = 'legacy' } = {}) {
   integer(u, 'slotUnits', 1);
+  if (u > 256) fail('slotUnits above the 256-slot ceiling');
   const request = { v: 1, kind, key, threads: u * 8, memBytes: u * 12 * G, source: 'legacy' };
   return validateRequest(request, { maxThreadsPerOp: Number.MAX_SAFE_INTEGER, maxMemPerOp: Number.MAX_SAFE_INTEGER });
 }

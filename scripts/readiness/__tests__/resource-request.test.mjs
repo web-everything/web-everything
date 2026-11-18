@@ -53,6 +53,11 @@ describe('thread-budget estimator acceptance', () => {
       threads: 16, memBytes: 24 * G, source: 'legacy',
     });
   });
+  it('rejects slotUnits above the 256-slot ceiling', () => {
+    expect(legacyRequestFromSlotUnits(256).threads).toBe(2048);
+    expect(() => legacyRequestFromSlotUnits(257)).toThrow();
+    expect(() => estimate({ kind: 'custom', rows: [], slotUnits: 257 })).toThrow();
+  });
   it('clamps explicit overrides and records declared provenance', () => {
     expect(estimate({ overrides: { threads: '99', mem: '100G' } })).toMatchObject({
       threads: 16, memBytes: 24 * G, source: 'declared',
