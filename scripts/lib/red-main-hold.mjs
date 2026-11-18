@@ -27,6 +27,8 @@ import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
 
 export const RED_MAIN_HOLD_REASON = 'red-main-hold';
+export const FREEZE_UNREADABLE_HOLD_REASON = 'freeze-unreadable-hold';
+export const freezeUnreadableOnly = signal => signal.sources?.length === 1 && signal.sources[0] === 'freeze-unreadable';
 export const RED_MAIN_HOLD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-main-hold.json');
 
 const norm = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'on' || x === 'off' ? x : null; };
@@ -87,7 +89,7 @@ export function redMainSignal({ mainRedState = null, priority = null, manualFree
 
 /** The stable (pass-to-pass identical) hold reason, so the drain's "reason changed" comment fires once. PURE. */
 export function redMainHoldReason(signal) {
-  if (signal.sources?.length === 1 && signal.sources[0] === 'freeze-unreadable') return `${RED_MAIN_HOLD_REASON}: freeze-unreadable — the shared red-main freeze could not be read, so nothing lands (main is NOT known red) until it is readable`;
+  if (freezeUnreadableOnly(signal)) return `${FREEZE_UNREADABLE_HOLD_REASON}: freeze unreadable — the shared freeze could not be read, so nothing lands (main is NOT known red) until it is readable`;
   const since = Number.isFinite(signal.since) ? ` since ${new Date(signal.since).toISOString()}` : '';
   const sha = signal.firstRedSha ? ` (first red ${String(signal.firstRedSha).slice(0, 9)})` : '';
   const fix = signal.fixPrs.length ? `only the main-fix PR ${signal.fixPrs.map((n) => `#${n}`).join(', ')} lands` : 'nothing lands (no main-fix PR published yet)';

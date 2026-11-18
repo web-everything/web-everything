@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import * as storeModule from '../run-scorecard-store.mjs';
 import {
-  validateScorecard, readStore, writeStore, appendScorecard, meanScore, MissingStoreError,
+  validateScorecard, readStore, writeStore, appendScorecard, meanScore,
   resolveScorecardStorePath, LEGACY_IN_TREE_STORE, LEGACY_MIGRATION_ID,
   mergeLegacyStores, migrateLegacyStore, readLegacyStoreTexts,
 } from '../run-scorecard-store.mjs';
@@ -457,23 +457,15 @@ describe('strict scorecard reads for red-team admission', () => {
     expect(() => readStore({ path: '/fixture/store', strict: true,
       read: () => { throw Object.assign(Error('denied'), { code: 'EACCES' }); } })).toThrow('denied');
   });
-  it('distinguishes a missing store from a present-empty store using real files; non-strict absence stays empty', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'strict-scorecards-'));
-    const path = join(dir, 'scorecards.json');
-    try {
-      expect(() => readStore({ path, strict: true })).toThrow(MissingStoreError);
-      expect(() => readStore({ path, strict: true, exists: existsSync })).toThrow(MissingStoreError);
-      try { readStore({ path, strict: true }); } catch (error) {
-        expect(error).toMatchObject({ code: 'SCORECARD_STORE_MISSING', path, cause: { code: 'ENOENT' } });
-        expect(error).not.toHaveProperty('records');
-      }
-      expect(readStore({ path })).toEqual({ version: 1, records: [] });
-      writeFileSync(path, JSON.stringify({ version: 1, records: [] }));
-      expect(readStore({ path, strict: true }).records).toEqual([]);
-      expect(readStore({ path, strict: true, exists: existsSync }).records).toEqual([]);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+  it('refuses absent admission history instead of converting ENOENT into zero seats', () => {
+    const read = () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); };
+    expect(() => readStore({ path: '/fixture/store', strict: true, read })).toThrow('absent');
+    expect(readStore({ path: '/fixture/store', exists: () => true, read }).records).toEqual([]);
+    expect(() => readStore({ path: '/fixture/store', strict: true, exists: () => false, read }))
+      .toThrow('scorecard store missing');
   });
-  it('returns existing records unchanged', () => {
+  it('returns present empty history and existing records unchanged for admission', () => {
+    expect(readStore({ path: '/fixture/store', strict: true, read: () => '{"records":[]}' }).records).toEqual([]);
     const records = [baseRow()];
     expect(readStore({ path: '/fixture/store', strict: true, read: () => JSON.stringify({ records }) }).records).toEqual(records);
   });

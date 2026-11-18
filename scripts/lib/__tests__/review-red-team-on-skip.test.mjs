@@ -1,6 +1,3 @@
-import { afterEach } from 'vitest';
-import { emptyDiffFixture } from './red-team-empty-net-diff-fixture.mjs';
-import { execFileSync } from 'node:child_process';
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
 import { publishRedTeamPolicyClearCheck, POLICY_CLEAR_HOLD_OWED } from '../red-team-check-run.mjs';
@@ -20,12 +17,10 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
   readCarriedCheckUnpublished, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../drain-red-team-evidence.mjs';
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
   readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
-import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
-import { emptyDiffExemptionEvidence } from '../red-team-empty-net-diff.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { readFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -3182,188 +3177,41 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(o.dispatch).not.toHaveBeenCalled();
 });
 
-const emptyEvidenceRoots = [];
-afterEach(() => { for (const root of emptyEvidenceRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-function emptyStoreFor(head) {
-  const f = emptyDiffFixture({ repo, pr }); emptyEvidenceRoots.push(f.root);
-  f.writeStore([{ ...f.row, rev: head }]);
-  mkdirSync(join(f.root, '.conveyor'));
-  writeFileSync(join(f.root, '.conveyor', 'run-scorecards.json'), readFileSync(f.storePath));
-  return f;
-}
 
-describe('finished skipped empty net diff recovery', () => {
-  const options = () => {
+describe('finished non-policy skip retry', () => {
+  function options({ empty = false, legacyPolicy = false } = {}) {
     const loopPayload = payload();
-    Object.assign(loopPayload.findings.read, { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
-    const status = { repo, pr, head, status: 'finished', loopPayload, result: { status: 'skipped' } };
-    const store = emptyStoreFor(head);
-    const evidence = { status, loopPayload, recorded: false, seatRecorded: false, completedRecorded: false,
-      failedSeatCount: 0, inFlight: false, queued: false };
-    return { rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
-      comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
-      env: { CONVEYOR_STATE_ROOT: store.root }, storePath: store.storePath,
-      cwd: 'subject-checkout', gitExec: vi.fn((_file, args) => args.includes('rev-parse') || args.includes('merge-base') ? 'c'.repeat(40) : ''), readEvidence: () => evidence, readStatus: () => status };
-  };
-  it.each(['malformed', 'unreadable'])('empty-diff recovery fails closed for a %s seat store', kind => {
-    const dir = mkdtempSync(join(tmpdir(), 'empty-diff-seat-store-'));
-    try {
-      const env = { CONVEYOR_STATE_ROOT: dir, WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-      const store = resolveScorecardStorePath(env);
-      mkdirSync(join(dir, '.conveyor'));
-      // A directory deterministically fails readFileSync, even under a privileged test runner.
-      if (kind === 'unreadable') mkdirSync(store);
-      else writeFileSync(store, '{broken');
-      const o = options();
-      recordRedTeamStatus({ repo, pr, status: 'finished', loopPayload: o.readStatus().loopPayload,
-        result: { status: 'skipped' } }, { env });
-      o.readEvidence = key => readDrainRedTeamEvidence({ ...key, env, lookup: () => ({ ok: true, run: null }) });
-      expect(decide({ ...o, env })).toMatchObject({ action: 'skip',
-        why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
-      expect(o.gitExec).not.toHaveBeenCalled();
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-  it('empty-diff recovery clears with a well-formed store and a matching prior seat', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'empty-diff-seat-store-'));
-    try {
-      const env = { CONVEYOR_STATE_ROOT: dir, WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-      mkdirSync(join(dir, '.conveyor'));
-      writeFileSync(resolveScorecardStorePath(env), JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'advisory', repo, pr, rev: head }] }));
-      const o = options();
-      recordRedTeamStatus({ repo, pr, status: 'finished', loopPayload: o.readStatus().loopPayload,
-        result: { status: 'skipped' } }, { env });
-      o.readEvidence = key => readDrainRedTeamEvidence({ ...key, env, lookup: () => ({ ok: true, run: null }) });
-      expect(decide({ ...o, env })).toMatchObject({ action: 'clear', policy: 'empty-net-diff' });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-  it('refuses an empty claim when a replace ref makes the recorded merge base equal head (real git)', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'empty-diff-replaced-base-'));
-    let gitClock = 1700000000;
-    const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8',
-      env: { ...process.env, GIT_AUTHOR_DATE: `@${++gitClock} +0000`, GIT_COMMITTER_DATE: `@${gitClock} +0000` } }).trim();
-    const commit = message => git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
-      '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-am', message);
-    try {
-      git('init', '--quiet');
-      writeFileSync(join(dir, 'file.txt'), 'base\n');
-      git('add', 'file.txt');
-      commit('base');
-      const base = git('rev-parse', 'HEAD');
-      writeFileSync(join(dir, 'file.txt'), 'head change\n');
-      commit('head');
-      const rev = git('rev-parse', 'HEAD');
-      // Replace an independent main tip so the planted graph has no ancestry cycle.
-      const mainTip = git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
-        'commit-tree', `${base}^{tree}`, '-p', base, '-m', 'main tip');
-      const planted = git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
-        'commit-tree', `${base}^{tree}`, '-p', rev, '-m', 'planted base');
-      git('replace', mainTip, planted);
-      git('update-ref', 'refs/remotes/origin/main', mainTip);
-      const poisonedBase = git('merge-base', 'origin/main', rev);
-      expect(poisonedBase).toBe(rev);
-      expect(git('--no-replace-objects', 'merge-base', 'origin/main', rev)).toBe(base);
-      expect(git('--no-replace-objects', 'diff', '--name-only', `${base}..${rev}`)).toBe('file.txt');
-      const read = { netBasis: { base: poisonedBase, rev, scored: true },
-        netChangedFiles: [], diffText: '', diffScored: true };
-      const f = emptyStoreFor(rev);
-      const exec = vi.fn(execFileSync);
-      expect(emptyDiffExemptionEvidence({ ...f.proof, repo, pr, read, head: rev, seatRecord: { ...f.status, head: rev }, cwd: dir, exec })).toEqual({ exempt: false, reason: 'base-mismatch' });
-      expect(exec.mock.calls.at(-1)[1]).toContain('merge-base');
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-  it('heals a legacy finished skipped object using a config-independent emptiness probe', () => {
-    const o = options();
-    expect(decide(o)).toMatchObject({ action: 'clear', policy: 'empty-net-diff', why: 'red team skipped: empty net diff' });
-    expect(o.gitExec).toHaveBeenCalledWith('git', expect.arrayContaining([
-      '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
-    ]), expect.anything());
-    // A global git option only binds before the subcommand.
-    expect(o.gitExec.mock.calls[0][1][0]).toBe('--no-replace-objects');
-  });
-  it('clears an empty net diff in the subject repo when the daemon repo lacks both revisions (real git, two repositories)', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'red-team-subject-cwd-'));
-    const daemonCwd = join(dir, 'daemon'), subjectCwd = join(dir, 'subject');
-    const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-    try {
-      for (const cwd of [daemonCwd, subjectCwd]) {
-        mkdirSync(cwd);
-        git(cwd, 'init', '--quiet');
-      }
-      const commit = message => git(subjectCwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
-        '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', message);
-      commit('subject base');
-      const base = git(subjectCwd, 'rev-parse', 'HEAD');
-      git(subjectCwd, 'update-ref', 'refs/remotes/origin/main', base);
-      commit('subject head');
-      const rev = git(subjectCwd, 'rev-parse', 'HEAD');
-      for (const sha of [base, rev]) expect(() => git(daemonCwd, 'cat-file', '-e', sha)).toThrow();
-      const o = options();
-      o.cwd = subjectCwd;
-      // Reproduce a daemon whose implicit Git cwd is a different repository, without changing Vitest's cwd.
-      o.gitExec = (file, args, opts) => execFileSync(file, args, { ...opts, cwd: opts.cwd ?? daemonCwd,
-        stdio: ['ignore', 'pipe', 'pipe'] });
-      const status = o.readStatus();
-      status.head = rev;
-      const store = emptyStoreFor(rev);
-      o.env = { CONVEYOR_STATE_ROOT: store.root };
-      Object.assign(status.loopPayload.findings.read.netBasis, { base, rev });
-      o.rawPrs[0].headRefOid = rev;
-      o.rawPrs[0].comments[0].body = `✅ review — accepted\n<!-- reviewed-sha: ${rev} -->`;
-      const input = fixture({ ...o, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: rev }] });
-      expect(planRedTeamOnSkip(input)[0]).toMatchObject({ action: 'clear', policy: 'empty-net-diff' });
-      expect(planRedTeamOnSkip({ ...input, cwd: daemonCwd })[0]).toMatchObject({ action: 'skip',
-        why: 'empty net diff not proven for this head; inspect stored evidence' });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-  it('holds empty-net-diff recovery without an explicit subject cwd and asks to inspect stored evidence', () => {
-    const o = options();
-    delete o.cwd;
-    expect(decide(o)).toMatchObject({ action: 'skip', why: 'empty net diff not proven for this head; inspect stored evidence' });
-    expect(o.gitExec).not.toHaveBeenCalled();
-  });
+    Object.assign(loopPayload.findings.read, { diffText: empty ? '' : '+code',
+      netChangedFiles: empty ? [] : ['scripts/example.mjs'], diffScored: false });
+    const status = { head, status: 'finished', loopPayload,
+      result: { status: 'skipped', ...(legacyPolicy ? { policy: 'empty-net-diff' } : {}) } };
+    const evidence = { status, loopPayload, recorded: false, seatRecorded: false,
+      completedRecorded: false, failedSeatCount: 0, inFlight: false, queued: false };
+    return { readStatus: () => status, readEvidence: () => evidence,
+      rawPrs: [{ number: pr, headRefOid: head, reviews: [], labels: ['review:accepted', 'red-team:pending'],
+        comments: [{ author: { login: 'web-everything' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->` }] }] };
+  }
   it.each([
-    ['unscored', o => { delete o.readStatus().loopPayload.findings.read.netBasis.scored; }],
-    ['unscored text', o => { o.readStatus().loopPayload.findings.read.diffScored = false; }],
-    ['missing paths', o => { delete o.readStatus().loopPayload.findings.read.netChangedFiles; }],
-    ['nonempty paths', o => { o.readStatus().loopPayload.findings.read.netChangedFiles = ['scripts/example.mjs']; }],
-    ['wrong head', o => { o.readStatus().head = 'b'.repeat(40); }],
-    ['unknown policy', o => { o.readStatus().result.policy = 'other'; }],
-    ['missing acceptance', o => { o.rawPrs[0].comments = []; }],
-    ['review hold', o => { o.rawPrs[0].labels.push('review:changes'); }],
-    ['seat exists', o => { o.readEvidence().seatRecorded = true; }],
-  ])('does not clear %s', (_, mutate) => {
-    const o = options(); mutate(o);
-    expect(decide(o).action).not.toBe('clear');
-  });
-  it('re-arms an owed non-policy finished skip once, then holds on the spent retry', () => {
-    const o = options();
-    Object.assign(o.readStatus().loopPayload.findings.read, { diffText: '+code', netChangedFiles: ['scripts/example.mjs'] });
+    ['nonempty diff', {}], ['empty diff', { empty: true }],
+    ['retired empty-diff policy', { empty: true, legacyPolicy: true }],
+  ])('dispatches one fresh retry for %s and holds when the retry is spent', (_, variant) => {
+    const o = options(variant);
     expect(decide(o)).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(decide(o)).not.toHaveProperty('settle');
     o.readStatus().retryCount = 1;
     expect(decide(o)).toMatchObject({ action: 'skip', why: 'red-team retry already spent; inspect stored evidence' });
   });
-});
-
-
-it.each(['nonempty after recording', 'probe failure'])('R979 recovery refuses %s before clear', kind => {
-  const loopPayload = payload();
-  const base = 'c'.repeat(40);
-  Object.assign(loopPayload.findings.read, { netBasis: { base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
-  const status = { head, status: 'finished', loopPayload, result: { status: 'skipped' } };
-  const gitExec = vi.fn((_file, args) => {
-    if (args.includes('rev-parse') || args.includes('merge-base')) return base;
-    expect(args).toContain(`${base}..${head}`);
-    if (kind === 'probe failure') throw Error('unreadable');
-    return 'code.mjs\0';
+  it.each([
+    ['missing read', o => { delete o.readStatus().loopPayload.findings.read; }],
+    ['mismatched head', o => { o.readStatus().loopPayload.findings.read.netBasis.rev = 'b'.repeat(40); }],
+    ['unknown seats', o => { delete o.readEvidence().failedSeatCount; }],
+    ['unreadable evidence', o => { o.readEvidence().ok = false; o.readEvidence().reason = 'unreadable'; }],
+    ['completed seat', o => { o.readEvidence().completedRecorded = true; }],
+    ['guard deferral', o => { o.readStatus().result.deferredByGuard = true; }],
+    ['cap deferral', o => { o.readStatus().result.deferredByCap = true; }],
+  ])('never clears or retries an empty-diff skip with %s', (_, mutate) => {
+    const o = options({ empty: true }); mutate(o);
+    expect(decide(o).action).toBe('skip');
+    expect(decide(o)).not.toHaveProperty('settle');
   });
-  const store = emptyStoreFor(head);
-  const result = decide({ gitExec, env: { CONVEYOR_STATE_ROOT: store.root }, cwd: 'subject-checkout',
-    rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
-      comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
-    readStatus: () => status, readEvidence: () => ({ status, loopPayload, recorded: false, seatRecorded: false,
-      completedRecorded: false, failedSeatCount: 0, inFlight: false, queued: false }) });
-  expect(result).toMatchObject({ action: 'skip', why: 'empty net diff not proven for this head; inspect stored evidence' });
-  expect(gitExec).toHaveBeenCalledTimes(3);
-  expect(gitExec.mock.calls[1][1]).toEqual(['--no-replace-objects', 'merge-base', '--all', '--end-of-options', 'origin/main', head]);
-  expect(gitExec.mock.calls[2][1]).toContain('diff');
 });

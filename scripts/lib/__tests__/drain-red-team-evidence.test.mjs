@@ -1,5 +1,4 @@
 // @vitest-environment node
-import { emptyDiffFixture } from './red-team-empty-net-diff-fixture.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as ghThrottle from '../gh-throttle.mjs';
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
@@ -502,8 +501,7 @@ describe('status persistence and check publication share one claim', () => {
 });
 
 describe('historical fallback predicate clauses', () => {
-  const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped',
-    loopPayload: { findings: { read: { diffText: '+card', netChangedFiles: ['backlog/123-card.md'] } } } },
+  const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped' },
     recorded: false, inFlight: false, queued: false });
   it('accepts a finished unrecorded policy skip', () => {
     expect(historicalCardOnlySkipCandidate(evidence())).toBe(true);
@@ -511,7 +509,6 @@ describe('historical fallback predicate clauses', () => {
   it.each([
     ['finished status', e => { e.status.status = 'running'; }],
     ['historical policy', e => { e.status.skipCardOnly = false; }],
-    ['card-only read', e => { e.status.loopPayload.findings.read.netChangedFiles = []; }],
     ['skipped result', e => { e.status.result = 'ran'; }],
     ['no recorded seat', e => { e.recorded = true; }],
     ['not in flight', e => { e.inFlight = true; }],
@@ -778,7 +775,9 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
     writeRun(run, f.runsDir);
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    // A finished non-policy skip supersedes the run's status, but still owes its accepted head a pass.
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false, recorded: false });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
   });
   it('an earlier finished status on the same head never supersedes a newer accepting run', () => {
     const f = fixture();
@@ -790,9 +789,10 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     writeRun({ ...newRunRecord({ id: 'review-pr-2', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) }, f.runsDir);
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
-    // The re-review's own later status supersedes the run again.
+    // The re-review's own later skip supersedes the run again without granting clearance.
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false, recorded: false });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
   });
   it('a newer accepting run does not hide a finished but unpublished result on the same head', () => {
     const f = fixture();
@@ -1203,7 +1203,7 @@ describe('bounded review evidence scans', () => {
     expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
     // The scheduler reads the resolvable carry instead of skipping the PR on a capped witness.
     let evidenceReads = 0;
-    const rows = planRedTeamOnSkip({ env: f.env, repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
+    const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
       rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
       readWitness: key => readRecoveryWitness({ ...args, ...key }),
       readEvidence: key => { evidenceReads++; return readDrainRedTeamEvidence({ ...args, ...key }); },
@@ -1354,7 +1354,7 @@ describe('fail-closed run scan evidence', () => {
   it('recovery and skipped-PR scheduling explicitly refuse capped evidence', () => {
     expect(planRedTeamRecovery({ ok: false, reason: 'scan-capped' })).toMatchObject({ mode: 'skip', why: 'scan-capped' });
     const f = fixture();
-    const rows = planRedTeamOnSkip({ env: f.env, repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
+    const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
       rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
       readEvidence: () => ({ ok: false, reason: 'scan-capped' }), readStatus: () => null,
       setting: { enabled: true }, lastDispatch: new Map(), now: 0 });
@@ -1363,7 +1363,7 @@ describe('fail-closed run scan evidence', () => {
   it.each(['scan-capped', 'review-unfinished', 'run-start-missing'])('skipped-PR scheduling skips one PR on a %s witness instead of reading its writer', reason => {
     const f = fixture();
     let evidenceReads = 0;
-    const rows = planRedTeamOnSkip({ env: f.env, repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
+    const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
       rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
       readWitness: () => ({ ok: false, reason }), readEvidence: () => { evidenceReads++; return {}; }, readStatus: () => null,
       setting: { enabled: true }, lastDispatch: new Map(), now: 0 });
@@ -1836,18 +1836,5 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(result).toEqual({ ok: false, reason: 'review-unfinished' });
     expect(result.settleBounds.unreadBoundaryAt).toBeDefined();
     expect(planRedTeamRecovery(result)).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
-  });
-});
-
-describe('legacy empty net diff historical evidence', () => {
-  it('retains a finished skipped status only with exact-head empty net proof', () => {
-    const f = emptyDiffFixture(); roots.push(f.root);
-    const head = f.head;
-    const old = { status: { head, status: 'finished', result: { status: 'skipped' },
-      loopPayload: { findings: { read: { netBasis: { base: f.base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } },
-      recorded: false, inFlight: false, queued: false };
-    expect(historicalCardOnlySkipCandidate(old, f.proof)).toBe(true);
-    delete old.status.loopPayload.findings.read.netChangedFiles;
-    expect(historicalCardOnlySkipCandidate(old, f.proof)).toBe(false);
   });
 });

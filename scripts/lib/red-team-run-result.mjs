@@ -23,8 +23,8 @@ export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
       && !Array.isArray(row.result.findings) && !row.result.provider && !row.result.model);
 }
 
-/** One evidenced failed execution may retry. `ran` is the historical failure encoding; new writers use
- * `failed`. Both require exactly one failed seat, no completed seat, and an unspent durable retry.
+/** One evidenced failed execution or non-policy skip may retry. `ran` is the historical failure encoding;
+ * new writers use `failed`. Failures require one failed seat; skips require zero seats. Both spend one retry.
  */
 export function failedRedTeamRetry(status, proof = {}) {
   if (proof?.ok === false) return false;
@@ -36,17 +36,17 @@ export function failedRedTeamRetry(status, proof = {}) {
     && (result?.comment?.status ?? result?.comment) !== 'posted'));
 }
 
-/** A deterministic non-policy skip launched no seat. Its single fresh retry still spends the durable budget. */
+/** A non-policy skip launched no seat. Retired/unknown policies never clear it; retry spends the durable budget. */
 export function skippedRedTeamRetry(status, proof = {}) {
   if (proof?.ok === false) return false;
   const { failedSeatCount, completedRecorded } = proof;
   const result = status?.result;
   const read = status?.loopPayload?.findings?.read;
   return status?.status === 'finished' && (typeof result === 'string' ? result : result?.status) === 'skipped'
-    && !result?.policy && !result?.deferredByGuard && !result?.deferredByCap
+    && result?.policy !== 'card-only' && !result?.deferredByGuard && !result?.deferredByCap
     && (result?.comment?.status ?? result?.comment) !== 'posted'
     && completedRecorded === false && failedSeatCount === 0
     && typeof status.head === 'string' && /^[a-f0-9]{40}$/i.test(status.head)
-    && read?.netBasis?.rev === status.head && typeof read.diffText === 'string' && read.diffText.trim().length > 0
+    && read?.netBasis?.rev === status.head && typeof read.diffText === 'string'
     && redTeamOwedFor(status.loopPayload);
 }

@@ -1210,11 +1210,11 @@ export function sendBackReason(labels) {
 }
 
 /** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
-export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}, proof = {}) {
-  return redTeamOwedOnHead({ ...proof, env, read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
+  return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
-export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly, status, cwd, exec, storePath } = {}) {
+export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
   const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
@@ -1227,7 +1227,7 @@ export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head
   // comment cannot release it either.
   if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
   if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly, status }, { repo, pr, cwd, exec, storePath }) || disposition.result) return null;
+  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
   return 'post-accept red team has no recorded result on the live head';
 }
 

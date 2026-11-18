@@ -2141,6 +2141,43 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Forge client telemetry and remote admission
 
+Admission reaper fixtures pass through the real telemetry parser: use `easternTimestamp()` for
+timestamps and include receipt `stageMs: {install, run}`. Reaper-only fixtures do not prove that
+health admission accepts the same sample. Release logs keep their original five-key JSON and
+byte order for markers without new provenance or exit evidence; PID accompanies new evidence,
+and unknown optional values are omitted rather than logged as null or `no-exit-record`.
+
+R1017 (under R1012): for a host-bound marker with a provably dead local owner, preserve the
+marker grace and death-sample margin. With a persisted 32-hex nonce and fresh integer receipt
+(including 97/254) still listed active, finish on the owner's behalf before claiming/removing
+the marker. Bound SSH and output; failed or timed-out finishes retain capacity, log once and
+retry no faster than 30 seconds per run. Legacy nonce-less markers keep their existing rules.
+For 97/254, finishing on behalf requires a persisted numbered worker slot (`forge-exec-N`, N >= 1), since only that finish path proves descendant cleanup; missing, legacy or malformed slots keep the marker held.
+A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
+rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
+old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and
+a parseable start in `recent` for EVERY active id, strictly outside the inclusive ownership
+window `[marker.at - CLOCK_SKEW_MS, diedBy + CLOCK_SKEW_MS]`. Any in-window null-code or 97/254
+receipt retains the marker.
+
+The accepted residual risk is a request the dead client already dispatched that Forge starts
+MORE than 15 minutes after owner death. Observed start lag is about one minute; client SSH
+calls are short and bounded by `ConnectTimeout`. The dead client never issues `run`, so only
+a prepared run can exist. The grace is an operator ruling, not an enforced remote start
+deadline. If this residual occurs, the consequence is one extra concurrent Forge run until it
+finishes (Forge enforces its own cap). No run is killed and no result is lost: the owner is dead
+and cannot collect one. Pin that accepted behaviour explicitly: release at 15 minutes even if
+a delayed request starts later and remains active at 28 minutes.
+
+Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
+operator-confirmed cleanup remain the fallback while capacity is retained.
+Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
+finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
+lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
+and stuck-slot detail carry these tags plus the exit record, or `no-exit-record` for a client
+that had no chance to log. Remove `.exit` with its marker; operator-confirmed cleanup remains
+the fallback when evidence stays incomplete.
+
 For selected `npx vitest run` phases, verify-lane's remote admission plan rewrites plain
 arguments to `npm run test:unit -- ...`; spawn that planned command without a local slot
 or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and local fallback.
@@ -2575,12 +2612,19 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 Queue-state fixtures must use the same candidate repository identity when writing and asserting keys:
 an omitted `repo` uses `cwd#<pr>`, while an explicit `repo` uses `<repo>#<pr>`.
-Empty-net-diff policy clearance requires a readable scorecard store proving no prior completed row
-needs recovery; test unreadable stores with both `resumeOnly` modes and preserve the hold for inspection.
 Non-policy skip recovery tests must round-trip the prior verdict and read through the admission file
 and runner guard, asserting one seat and a spent retry even when no seat rows survive. Missing reads,
 mismatched pinned heads and incomplete advisory acceptance must refuse before provider work.
-Keep the pinned-SHA read and the clear-time empty-net-diff recheck intact when changing retry admission.
+Empty or unscored diffs still owe a red-team run on an accepted head. Keep the empty-read runner
+and bounded skipped-retry cases in `scripts/operations/__tests__/review-job-red-team-skip.test.mjs`,
+the no-clear/retry cases in `scripts/lib/__tests__/review-red-team-on-skip.test.mjs`, and the
+once-per-head stall notice in `scripts/lib/__tests__/drain-merge-strategy.test.mjs`.
+Review evidence readers must pin one SHA before reading text and paths, and leave both unscored on either
+failure. Keep `review-pr-io.test.mjs`'s deterministic moving-ref regression when changing those readers.
+Admission history must be read strictly: a missing, malformed or unreadable scorecard store is unknown,
+never zero-seat proof. Keep the deterministic reader/planner/queued-admission/runner matrix in
+`scripts/lib/__tests__/strict-scorecard-callers.test.mjs`; positive fixtures must supply a present empty
+store explicitly. Unknown history holds for operator inspection without spending a retry or launching a seat.
 
 Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
 the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
@@ -4424,6 +4468,12 @@ Exercise pending CI after timing settings change, revoked clearance, green compl
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
 
+## Drain freeze read recovery
+
+The named failed-cache-replacement regression seeds a clear, observes a live freeze while replacement fails, then forces a transient read before TTL expiry. Failed writes remove old evidence and block reuse in-process even when removal fails; only a successful cache write restores eligibility.
+
+`freeze-last-good.test.mjs` exercises transient-read retries and persistent successful reads with an injected clock, sleep and temporary cache path. Reused evidence must keep its original fetch timestamp: rewriting it during reuse would let an outage extend a cached clear indefinitely. Expired, future-dated, corrupt or missing evidence holds the line. Permanent errors never reuse the cache. `freeze-unreadable-hold` retains the `red-main-hold` skip kind and `redMainHold` flag so pass-level admission and PR-comment suppression still apply. Run these tests through heavy admission.
+
 ## Bounded red-team probe fairness
 
 `red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
@@ -4444,57 +4494,3 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
-
-### Empty-diff base provenance
-
-Empty-net-diff recovery must re-derive the merge-base of `origin/main` and the pinned
-writer head using `merge-base --all` with replacement objects disabled, then require the
-stored base to belong to that set and an empty diff against every base. The real-Git
-evidence table builds criss-cross merges with two bases: matching only one tree refuses
-with `diff-nonempty-vs-base`; a stored base outside the set refuses with `base-ambiguous`.
-Matching every tree still exempts, as does the single-base control. This uses the review
-reader's `resolveNetDiffBasis` default base ref. A stored base distinct from head can still carry the same tree as head; the
-`base === head` refusal alone does not establish provenance. Preserve real-Git controls
-showing both the poisoned empty range and the legitimate changed range in
-`scripts/lib/__tests__/red-team-empty-net-diff.test.mjs`. Failed, malformed, unmatched,
-or oversized merge-base output retains the existing hold: inspect stored evidence
-and re-run the reader against the legitimate base before retrying clearance. Negative
-diff tests must return a valid matching merge-base and assert the diff call occurs.
-
-
-### Complete empty-net-diff exemption evidence
-
-`scripts/lib/red-team-empty-net-diff.mjs#emptyDiffExemptionEvidence` owns the exemption.
-Callers supply the subject repository's checkout explicitly; no cwd means no exemption.
-The function uses `readStore({ strict: true })`, which throws `MissingStoreError` on
-ENOENT and preserves other read/parse failures. A parseable store must
-contain a review-seat row for the same repository, PR and pinned head. Payload shape,
-a historical skip, or an empty record array alone never grants clearance. A queued or
-running writer refuses with `writer-active`; any red-team seat row for that head refuses
-with `red-team-result-recorded`, regardless of the row's outcome. Clearance revalidation
-requires a finished skip by default (`requireSkip: true`). Only creation of a producer
-skip or projection of a pre-status carry journal opts out explicitly; both still enforce
-the writer/result guards. Every Git
-probe disables replace objects, re-derives the merge-base and verifies the pinned range.
-Missing or unreadable evidence retains recovery's hold; inspect stored evidence before
-retrying, including after the bounded Git probe reports oversized output.
-
-The table in `red-team-empty-net-diff.test.mjs` starts from complete on-disk evidence
-and removes or corrupts one item at a time, asserting the named refusal reason and
-that the intended Git step ran. Keep replacement-aware control probes deterministic
-with increasing commit dates. `review-job-red-team-skip.test.mjs` exercises production
-ENOENT handling through `speculateRedTeam` and proves no provider work starts.
-`red-team-skip-outcome.test.mjs` reproduces the running-writer plus completed-red-team
-audit probe with real status/store files and Git, refusing policy-clear and retaining
-the pending label. Its otherwise-complete positive evidence must pass before mutation.
-
-### Strict scorecard caller matrix
-
-`scripts/lib/__tests__/strict-scorecard-callers.test.mjs` keeps one table row per strict
-scorecard read site, including legacy publication, plus the retry, recovery planner and
-review-job consumers of those readers. Each row uses a real temporary store path in both
-missing and present-empty states. Missing history keeps recovery owed, refuses retry and
-exemption evidence, and holds publication for operator inspection. Present-empty history
-retains its previous behavior. `run-scorecard-store.test.mjs` separately pins the typed
-missing error and unchanged non-strict fallback. Run these and the affected red-team
-suites through heavy admission only.

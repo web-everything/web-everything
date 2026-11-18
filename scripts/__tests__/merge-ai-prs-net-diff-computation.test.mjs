@@ -6,7 +6,7 @@
  *   resolveNetDiffBasis, and computeNetDiffSignals — all exported from `scripts/merge-ai-prs.mjs` — plus their
  *   integration with `scoreEscalation`/`diffHunksFrom` from `scripts/lib/review-escalation.mjs`.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -904,6 +904,26 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
 });
 
 describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain paths, SAME basis as the score/text)', () => {
+  it('reads paths from the supplied pinned basis without resolving mutable refs again', () => {
+    const head = 'a'.repeat(40), base = 'b'.repeat(40);
+    const calls = [];
+    const basis = { ok: true, diffBase: base, candidate: head,
+      requestedFor: { remote: 'origin', base: 'main', rev: head } };
+    const result = computeNetDiffPaths({ rev: head, basis, exec: (cmd, args) => {
+      calls.push([cmd, args]);
+      return 'code.mjs\0';
+    } });
+    expect(result).toEqual({ paths: ['code.mjs'], base, rev: head, scored: true });
+    expect(calls).toEqual([['git', ['diff', '--name-only', '-z', '--end-of-options', `${base}..${head}`]]]);
+  });
+  it.each(['remote', 'base', 'rev'])('refuses a shared basis with mismatched %s before reading paths', field => {
+    const exec = vi.fn();
+    const basis = { ok: true, diffBase: 'base', candidate: 'head',
+      requestedFor: { remote: 'origin', base: 'main', rev: 'head', [field]: 'other' } };
+    expect(computeNetDiffPaths({ exec, rev: 'head', basis }))
+      .toEqual({ paths: [], base: null, rev: null, scored: false, reason: 'basis-mismatch' });
+    expect(exec).not.toHaveBeenCalled();
+  });
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {

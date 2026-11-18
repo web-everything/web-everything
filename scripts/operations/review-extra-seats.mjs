@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
-import { emptyDiffExemptionEvidence, EMPTY_NET_DIFF_SKIP } from '../lib/red-team-empty-net-diff.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
@@ -89,7 +88,7 @@ import { renameSourcePaths } from './review-pr.mjs';
 import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
 export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
-import { appendScorecard, MissingStoreError, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
@@ -1737,7 +1736,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
   try {
     records = io.readRecords({ strict: true });
     if (!Array.isArray(records)) throw Error('invalid scorecards');
-  } catch (error) { return refuse(error instanceof MissingStoreError ? 'scorecard store missing' : 'scorecard store unreadable'); }
+  } catch { return refuse('scorecard store unreadable'); }
   try {
     status = io.readRedTeamStatus({ pr, repo, head });
     if (status === undefined) throw Error('missing status evidence');
@@ -1819,22 +1818,14 @@ export async function speculateRedTeam({
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    const emptyClaim = read?.diffText === '';
-    let seatRecord;
-    try { seatRecord = io.readRedTeamStatus?.({ repo, pr, head: read?.netBasis?.rev }); } catch { /* missing evidence refuses exemption */ }
-    const emptyEvidence = emptyDiffExemptionEvidence({ repo, pr, read, head: read?.netBasis?.rev, seatRecord,
-      // The producer is deciding whether to create a skip; active/recorded passes still refuse.
-      requireSkip: false, env, storePath: io.storePath, cwd: lanePath, exec: io.gitExec });
-    if (!emptyClaim && (!read || typeof read.diffText !== 'string' || !read.diffText.trim())) return { status: 'skipped', reason: 'the review printed no diff' };
+    if (!read || typeof read.diffText !== 'string') return { status: 'skipped', reason: 'the review printed no diff' };
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };
     const settings = readRedTeamProbes({ env, log: io.log });
     const now = io.now();
     let records = [];
-    try { records = io.readRecords({ strict: emptyClaim }); } catch (e) {
+    try { records = io.readRecords(); } catch (e) {
       if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
-      if (emptyClaim && e instanceof MissingStoreError) return { status: 'skipped', reason: 'empty net diff not proven (store-missing) — inspect stored evidence before retrying; no call launched' };
-      if (emptyClaim) return { status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' };
       io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
     }
     const prior = priorRedTeamRow(records, pr, rev, repo);
@@ -1843,8 +1834,6 @@ export async function speculateRedTeam({
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
     if (prior && !resume) return { status: 'prior-row', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
     if (prior) return await resumeRedTeam({ pr, repo, rev, title: read.title, prior, records, post, record }, io);
-    if (emptyEvidence.exempt) return { ...EMPTY_NET_DIFF_SKIP };
-    if (emptyClaim) return { status: 'skipped', reason: `empty net diff not proven (${emptyEvidence.reason}) — inspect stored evidence before retrying; no call launched` };
     // Launch policy applies only to new calls: a recorded pass must finish its effects even if policy changed.
     // The net path list names only rename/copy destinations. Include sources so
     // moving executable code into backlog/ cannot turn the probe off. Unknown
@@ -2177,7 +2166,6 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   }));
   return {
     ...base,
-    storePath: storePath ?? resolveScorecardStorePath(env),
     readAiRouting,
     readRecords: ({ strict = false } = {}) => strict
       ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),

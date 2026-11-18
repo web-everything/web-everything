@@ -245,6 +245,16 @@ describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () =>
     expect(r.ok).toBe(false);
   });
 
+  it('freeze unreadable records a drain hold without a PR verdict and deduplicates it', () => {
+    const reason = 'freeze-unreadable-hold: freeze unreadable — nothing lands until readable';
+    expect(recordDrainHold({ repo: 'o/n', pr: 704, reason })).toMatchObject({ ok: true, appended: true });
+    expect(recordDrainHold({ repo: 'o/n', pr: 704, reason })).toMatchObject({ ok: true, appended: false });
+    expect(events('o/n').filter(e => e.type === 'hold')).toEqual([expect.objectContaining({
+      pr: 704, reasonCode: 'freeze-unreadable-hold', holdSource: 'drain', source: 'merge-ai-prs',
+    })]);
+    expect(foldRepo('o/n').get(704)).toBeUndefined();
+  });
+
   it('drainHoldReasonCode masks numbers and shas so a counter change is not a reason change', () => {
     expect(drainHoldReasonCode('pending (2/5) abcdef1234')).toBe(drainHoldReasonCode('pending (3/5) 0123456789'));
     expect(drainHoldReasonCode('')).toBe('unspecified');

@@ -1,11 +1,10 @@
-import { EMPTY_NET_DIFF_SKIP, emptyDiffExemptionEvidence } from './red-team-empty-net-diff.mjs';
 /** Settle skipped red teams: explicit policy produces a result; everything else needs an operator. */
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
-import { readRecoveryWitness, readRedTeamStatus, redTeamStatusDir } from './drain-red-team-evidence.mjs';
+import { readRecoveryWitness, redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
@@ -49,7 +48,7 @@ export function classifyRedTeamSkip(redTeam) {
     ? 'red team reported not-owed on an accepted head'
     : valid && typeof redTeam.reason === 'string' && redTeam.reason.trim()
       ? redTeam.reason : 'unknown red-team outcome';
-  return { kind: valid && redTeam.status === 'skipped' && ['card-only', 'empty-net-diff'].includes(redTeam.policy)
+  return { kind: valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
     && !deferred
     ? 'policy' : 'non-policy', reason };
 }
@@ -165,17 +164,8 @@ export function settleRedTeamSkip(input = {}) {
     // Ordinary job settlement retains its contradictory-not-owed refusal.
     const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
-    let classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
+    const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
       : classifyRedTeamSkip(redTeam);
-    if (classified.kind === 'policy' && redTeam?.policy === EMPTY_NET_DIFF_SKIP.policy) {
-      let proven = false;
-      try {
-        const stored = (io.readStatus ?? readRedTeamStatus)({ repo, pr, head, env: io.env ?? process.env });
-        proven = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: stored, env: io.env, storePath: io.storePath,
-          exec: io.gitExec, cwd: io.cwd, requireSkip: true }).exempt;
-      } catch { /* unreadable proof retains the operator hold */ }
-      if (!proven) classified = { kind: 'non-policy', reason: 'empty net diff not proven for this head; inspect stored evidence' };
-    }
     // R730: a non-policy skip may still settle when the exact-head stored review owes no red team.
     // The carry machine only models a card-only skip, so a carry settlement never takes this rule: it would be
     // recorded as card-only with the rule unnamed. It keeps its existing refusal instead (fail closed).
@@ -199,7 +189,7 @@ export function settleRedTeamSkip(input = {}) {
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
-        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${rule ? `not owed (stored review; rule ${rule})` : storedClear ? 'not owed (stored review)' : redTeam.policy === EMPTY_NET_DIFF_SKIP.policy ? 'not-owed: empty net diff' : 'card-only diff (policy redTeam.skipCardOnly)'}` });
+        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${rule ? `not owed (stored review; rule ${rule})` : storedClear ? 'not owed (stored review)' : 'card-only diff (policy redTeam.skipCardOnly)'}` });
         return { outcome: 'policy-clear', ...(rule ? { rule } : {}) };
       } catch (error) {
         reason = `policy-clear comment failed: ${safeErrorText(error)}`;

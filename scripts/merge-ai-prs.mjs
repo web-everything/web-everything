@@ -239,7 +239,7 @@ import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from '.
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-freeze-shared.mjs';
-import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
+import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON, freezeUnreadableOnly } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
@@ -4102,8 +4102,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // newline in a would-be single revision arg, making it an invalid `git diff` argument (a "continue" to
       // the next candidate, or a `null` resolve if both candidates hit it — always the safe over-scoring
       // fallback, never wrong data, but avoidable).
-      // A replace ref must never choose the base stamped into an empty-diff payload.
-      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' } }) || '').split('\n')[0].trim();
+      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
       if (mb) { diffBase = mb; basisKind = 'merge-base'; }
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
@@ -4227,7 +4226,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
       // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
       if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
       diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' } }) || '').split('\n')[0].trim();
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
       if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
       candidate = revSha;
     } catch (err) {
@@ -4347,8 +4346,9 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
  * `'ref-unresolved'` (neither candidate resolves — legitimately absent, unfixable, correctly falls back), or
  * `'diff-failed'` (the basis resolved but this name-only diff itself then failed). Existing consumers that read
  * only `scored` are untouched.
- * @param {{exec:Function, remote?:string, base?:string, rev:string, fetchExtraRefs?:string[]}} opts
- * @returns {{paths:string[], base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'}}
+ * A shared basis must answer this exact request, as with the text reader; otherwise leave the paths unscored.
+ * @param {{exec:Function, remote?:string, base?:string, rev:string, fetchExtraRefs?:string[], basis?:object}} opts
+ * @returns {{paths:string[], base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
 export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
   const unscored = { paths: [], base: null, rev: null, scored: false };
@@ -4992,15 +4992,13 @@ async function runCli() {
           if (!Array.isArray(comments)) throw Error('complete comments unreadable');
           const safety = readDrainQueueSafety({ log });
           if (safety.value.waitForRedTeamBeforeEnqueue) {
-            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha,
-              cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo), gitExec: exec });
+            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
             const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
               readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
               cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
               unedited: target => readUneditedCommentIds(target, { gh }),
             });
-            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling, exec,
-              cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo) })) return false;
+            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
           }
           // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
           const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,
@@ -6789,9 +6787,11 @@ async function runCli() {
           const d = quarantine && isLocalRepo(v.repo)
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
             : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
-          if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
+          if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen && !freezeUnreadableOnly(sig) ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
         }
-        if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
+        if (!AS_JSON) process.stderr.write(freezeUnreadableOnly(sig)
+          ? `  🛑 freeze-unreadable-hold: freeze unreadable — ${held} PR(s) held until the shared freeze is readable\n`
+          : `  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
       }
     }
   }

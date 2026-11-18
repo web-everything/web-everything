@@ -1,7 +1,6 @@
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import { cliReviewTickOpts, defaultReviewHostAdmission, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
@@ -10,9 +9,8 @@ import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.m
 import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
 import * as gateCatchUp from '../../../scripts/lib/red-team-gate-catchup.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
-import * as repoProfiles from '../../../scripts/lib/repo-profile.mjs';
 import * as hostSample from '../../../scripts/lib/host-sample.mjs';
-import * as policyCascade from '../../../scripts/lib/policy-cascade.mjs';
+import * as operatorOverrideReader from '../../../scripts/lib/operator-override-reader.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
 
@@ -27,12 +25,13 @@ beforeEach(() => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '2');
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT', '10');
   vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
+  // Hermetic: the host's real operator overrides (e.g. redTeamQueue.minConcurrent) must not raise the pinned floor.
+  vi.spyOn(operatorOverrideReader, 'readOperatorOverrides').mockReturnValue({ readable: true, values: {} });
 });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
 it('CLI catches up gates after label repair, before capacity recovery, and survives catch-up exceptions', () => {
-  const repo = 'frontier-ui/frontierui', rawPrs = [], repaired = [], refusals = [];
-  vi.spyOn(repoProfiles, 'repoProfile').mockReturnValue({ checkoutPath: 'subject-checkout' });
+  const repo = 'web-everything/web-everything', rawPrs = [], repaired = [], refusals = [];
   const order = [];
   vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(() => {
     order.push('labels'); return { rawPrs: repaired };
@@ -49,7 +48,6 @@ it('CLI catches up gates after label repair, before capacity recovery, and survi
     const input = { repo, rawPrs, plan: { refusals } };
     expect(() => production.redTeamOnSkip(input)).not.toThrow();
     expect(order).toEqual(['labels', 'gate', 'capacity']);
-    expect(redTeamRecovery.runRedTeamOnSkip).toHaveBeenCalledWith(expect.objectContaining({ repo, cwd: 'subject-checkout' }));
     const history = catchUp.mock.calls[0][0].history;
     expect(catchUp).toHaveBeenCalledWith({ repo, refusals, rawPrs: repaired, history, log: expect.any(Function) });
     production.redTeamOnSkip(input);
@@ -196,7 +194,6 @@ it('CLI label repair exception preserves original PRs and still dispatches red-t
 
 it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head in %s mode', mode => {
   const repo = 'web-everything/web-everything', head = (mode === 'fresh' ? 'c' : 'd').repeat(40), pr = 5762;
-  vi.spyOn(repoProfiles, 'repoProfile').mockReturnValue({ checkoutPath: 'subject-checkout' });
   const readEvidence = vi.spyOn(redTeamEvidence, 'readDrainRedTeamEvidence').mockReturnValue({
     recorded: mode === 'resume', seatRecorded: mode === 'resume', completedRecorded: mode === 'resume', loopPayload: {
       verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
@@ -219,7 +216,7 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
       tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
     });
     expect(out.redTeamOnSkip?.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode }]);
-    expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head, env: process.env, cwd: 'subject-checkout', gitExec: execFileSync });
+    expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
     expect(readStatus).toHaveBeenCalledWith({ repo, pr, head });
     expect(dispatch).toHaveBeenCalledOnce();
     expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: mode });
@@ -248,7 +245,7 @@ it.each(['fresh', 'resume'])('real reconcile recovers a queued accepted head in 
       readStatus: () => mode === 'resume' ? { status: 'finished', result: 'ran' } : null,
       setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map() }),
   });
-  expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head, env: process.env, cwd: undefined, gitExec: execFileSync });
+  expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
   expect(out.redTeamOnSkip.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode }]);
 });
 
@@ -343,9 +340,7 @@ it('a throwing host check blocks recovery-only starts', () => {
   expect(recoveryDispatch).not.toHaveBeenCalled();
 });
 
-it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
-  // Pin the policy input as well as the environment floor: an operator DB override outranks env.
-  vi.spyOn(policyCascade, 'readOperatorPolicy').mockReturnValue({ minConcurrent: 2 });
+it.each([38, 5, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
     if (idle === 'throws') throw new Error('sample unavailable');
@@ -362,7 +357,7 @@ it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves
     });
     expect(hostSample.sampleHost).toHaveBeenCalledOnce();
     expect(recovery.mock.calls[0][0].capacity).toBe(capacity);
-    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 'throws' ? 1 : 2, budget: { left: 3 } });
+    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 38 ? 2 : 1, budget: { left: 3 } });
     expect(capacity.budget).toBe(budget);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });

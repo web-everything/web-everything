@@ -1124,7 +1124,7 @@ describe('red-team-only review job', () => {
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']], ['red-team'],
         ]);
         expect(out.redTeam.status).toBe('ran');
-        expect(io.readRedTeamOnlyPayload).toHaveBeenCalledWith({ pr, repo, head, lanePath: '/lanes/lane-7' });
+        expect(io.readRedTeamOnlyPayload).toHaveBeenCalledWith({ pr, repo, head });
       } else {
         expect(out.outcome).toBe('blocked-on-infra');
         expect(out.label).toMatch(/inspect|retry/);

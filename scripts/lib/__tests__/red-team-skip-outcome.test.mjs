@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
@@ -9,8 +9,6 @@ import { parseRedTeamComment, redTeamForHead, redTeamMarker } from '../red-team-
 import { readRecoveryWitness as witness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
-import { emptyDiffFixture } from './red-team-empty-net-diff-fixture.mjs';
-import { emptyDiffExemptionEvidence } from '../red-team-empty-net-diff.mjs';
 
 vi.mock('../drain-red-team-evidence.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -43,6 +41,7 @@ const nonPolicyCases = [
   ['policy missing', { status: 'skipped', reason: 'policy field missing' }],
   ['reason string card-only WITHOUT policy field', { status: 'skipped', reason: 'red team skipped: card-only' }],
   ['unknown policy', { status: 'skipped', policy: 'other', reason: 'card-only' }],
+  ['retired empty-diff policy', { status: 'skipped', policy: 'empty-net-diff' }],
   ['malformed policy', { status: 'skipped', policy: ['card-only'], reason: 'card-only' }],
 ];
 
@@ -59,9 +58,7 @@ function fixture() {
   const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
   vi.stubEnv('WE_SHARED_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
   const comments = [];
-  const storePath = join(root, 'scorecards.json');
-  writeFileSync(storePath, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'advisory', repo, pr, rev: head }] }));
-  const io = { env, storePath, cwd: 'subject-checkout', log: vi.fn(),
+  const io = { env, log: vi.fn(),
     postComment: vi.fn(({ body }) => { comments.push({ body, author: { login: 'web-everything' } }); }),
     publishNeedsYou: vi.fn(),
   };
@@ -406,130 +403,4 @@ describe('stored-review not-owed rule (R730)', () => {
       expect(f.settle({ status: 'not-owed' }, { readHead: head.toUpperCase() })).toMatchObject({ outcome: 'policy-clear', rule });
     });
   });
-});
-
-describe('empty net diff policy settlement', () => {
-  it.each([
-    ['writer queued', 'queued', false, 'writer-active'],
-    ['writer running', 'running', false, 'writer-active'],
-    ['completed red-team evidence', 'finished', true, 'red-team-result-recorded'],
-    ['audit probe: running writer plus completed red-team evidence', 'running', true, 'writer-active'],
-    ['finished writer without a skip result', 'finished', false, 'skip-record-invalid'],
-  ])('refuses policy-clear and preserves pending for %s (real files/Git)', (_name, writerStatus, recorded, reason) => {
-    const proof = emptyDiffFixture({ repo, pr }); roots.push(proof.root);
-    // Positive control: this exact checkout/store/read has a genuinely empty pinned range.
-    expect(emptyDiffExemptionEvidence(proof.proof)).toEqual({ exempt: true, reason: 'empty-net-diff' });
-    const f = fixture();
-    Object.assign(f.io, { storePath: proof.storePath, cwd: proof.root });
-    const status = { ...proof.status, status: writerStatus,
-      result: writerStatus === 'finished' && recorded ? proof.status.result : null };
-    const path = join(redTeamStatusDir(f.io.env), `${encodeURIComponent(repo)}-${pr}-${proof.head}.json`);
-    mkdirSync(redTeamStatusDir(f.io.env), { recursive: true });
-    const bytes = JSON.stringify(status);
-    writeFileSync(path, bytes);
-    if (recorded) proof.writeStore([proof.row, { ...proof.row, seat: 'red-team' }]);
-    expect(emptyDiffExemptionEvidence({ ...proof.proof, seatRecord: status })).toEqual({ exempt: false, reason });
-    expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }, { head: proof.head, readHead: proof.head }))
-      .toMatchObject({ outcome: 'non-policy' });
-    expect(f.io.postComment).not.toHaveBeenCalled();
-    expect(f.comments).toEqual([]);
-    expect(f.io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
-      head: proof.head, reason: expect.stringContaining('inspect stored evidence'),
-    }));
-    expect(readFileSync(path, 'utf8')).toBe(bytes);
-    const labels = planRedTeamStatusLabels({ repo, pr, head: proof.head, comments: f.comments,
-      labels: ['red-team:pending'], env: f.io.env, cwd: proof.root, storePath: proof.storePath,
-      evidence: { status, loopPayload: proof.loopPayload, recorded,
-        inFlight: writerStatus === 'running', scheduled: ['queued', 'running'].includes(writerStatus) } });
-    expect(labels).toEqual({ add: null, remove: [] });
-  });
-
-  it('publishes the terminal policy-clear reason exactly once using a config-independent emptiness probe', () => {
-    const f = fixture();
-    f.io.readStatus = () => ({ head, status: 'finished', result: { status: 'skipped', policy: 'empty-net-diff' }, loopPayload: { findings: { read: { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
-    f.io.gitExec = vi.fn((_file, args) => args.includes('rev-parse') || args.includes('merge-base') ? 'c'.repeat(40) : '');
-    const skip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
-    expect(classifyRedTeamSkip(skip).kind).toBe('policy');
-    expect(f.settle(skip).outcome).toBe('policy-clear');
-    expect(f.comments[0].body).toContain('Red team not required on this head: not-owed: empty net diff');
-    expect(f.settle(skip).outcome).toBe('already');
-    expect(f.io.postComment).toHaveBeenCalledTimes(1);
-    expect(f.io.gitExec.mock.calls[2][1]).toContain(`${'c'.repeat(40)}..${head}`);
-    expect(f.io.gitExec.mock.calls[2][1][0]).toBe('--no-replace-objects');
-    expect(f.io.gitExec.mock.calls[2][1]).toEqual(expect.arrayContaining([
-      '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
-    ]));
-  });
-});
-
-it.each(['absent', 'unreadable', 'wrong head', 'unscored text', 'nonempty'])('empty net diff settlement refuses %s stored proof', kind => {
-  const f = fixture();
-  const read = { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
-  f.io.readStatus = () => {
-    if (kind === 'unreadable') throw Error('unreadable');
-    if (kind === 'absent') return null;
-    if (kind === 'unscored text') read.diffScored = false;
-    if (kind === 'nonempty') read.diffText = '+code';
-    return { head: kind === 'wrong head' ? 'b'.repeat(40) : head, status: 'finished', result: { status: 'skipped' }, loopPayload: { findings: { read } } };
-  };
-  const result = f.settle({ status: 'skipped', policy: 'empty-net-diff' });
-  expect(result.outcome).not.toBe('policy-clear');
-  expect(f.io.postComment).not.toHaveBeenCalled();
-  expect(f.io.publishNeedsYou).toHaveBeenCalled();
-});
-
-
-it.each(['nonempty after recording', 'probe error', 'oversized probe', 'missing base'])('R979 refuses empty-net settlement on %s', kind => {
-  const f = fixture();
-  const base = 'c'.repeat(40);
-  const read = { netBasis: { base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
-  if (kind === 'missing base') delete read.netBasis.base;
-  f.io.readStatus = () => ({ head, status: 'finished', result: { status: 'skipped' }, loopPayload: { findings: { read } } });
-  const probeError = Error('git diff failed');
-  const bufferError = Object.assign(Error('stdout maxBuffer length exceeded'), { code: 'ENOBUFS' });
-  f.io.gitExec = vi.fn()
-    .mockReturnValueOnce(`${base}\n`)
-    .mockReturnValueOnce(`${base}\n`)
-    .mockImplementation((_file, _args, options) => {
-      if (kind === 'probe error') throw probeError;
-      const output = kind === 'oversized probe' ? 'x'.repeat(1024 * 1024 + 1) : 'code.mjs\0';
-      if (Buffer.byteLength(output) > options.maxBuffer) throw bufferError;
-      return output;
-    });
-  expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }).outcome).toBe('non-policy');
-  if (kind === 'missing base') {
-    expect(f.io.gitExec).not.toHaveBeenCalled();
-  } else {
-    // Assert outside the verifier's catch so a failed mock assertion cannot prove refusal.
-    const options = expect.objectContaining({ maxBuffer: 1024 * 1024 });
-    expect(f.io.gitExec).toHaveBeenCalledTimes(3);
-    expect(f.io.gitExec).toHaveBeenNthCalledWith(1, 'git', [
-      '--no-replace-objects', 'rev-parse', '--verify', '--end-of-options', `${base}^{commit}`,
-    ], options);
-    expect(f.io.gitExec).toHaveBeenNthCalledWith(2, 'git', [
-      '--no-replace-objects', 'merge-base', '--all', '--end-of-options', 'origin/main', head,
-    ], options);
-    expect(f.io.gitExec).toHaveBeenNthCalledWith(3, 'git', [
-      '--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
-      '--ignore-submodules=none', '--name-only', '-z', '--end-of-options', `${base}..${head}`, '--',
-    ], options);
-    expect(f.io.gitExec.mock.results[2]).toEqual(kind === 'nonempty after recording'
-      ? { type: 'return', value: 'code.mjs\0' }
-      : { type: 'throw', value: kind === 'probe error' ? probeError : bufferError });
-  }
-  expect(f.io.postComment).not.toHaveBeenCalled();
-  expect(f.io.publishNeedsYou).toHaveBeenCalled();
-});
-
-
-it('R979 refuses an advanced nonempty head between recording and settlement', () => {
-  const f = fixture();
-  const advancedHead = 'b'.repeat(40);
-  f.io.readStatus = () => ({ head: advancedHead, status: 'finished', result: { status: 'skipped' }, loopPayload: { findings: { read: {
-    netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true,
-  } } } });
-  f.io.gitExec = vi.fn(() => 'code.mjs\0');
-  expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }, { head: advancedHead, readHead: advancedHead }).outcome).toBe('non-policy');
-  expect(f.io.postComment).not.toHaveBeenCalled();
-  expect(f.io.publishNeedsYou).toHaveBeenCalled();
 });

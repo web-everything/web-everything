@@ -1,4 +1,3 @@
-import { emptyDiffExemptionEvidence, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
@@ -498,8 +497,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   };
 }
 
-/** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection.
- * Strict store errors (including MissingStoreError) propagate before any zero-seat proof is built. */
+/** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
@@ -920,16 +918,15 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
 }
 
 /** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
-export function historicalCardOnlySkipCandidate(old, proof = {}) {
+export function historicalCardOnlySkipCandidate(old) {
   const prior = old?.status;
-  return prior?.status === 'finished' && ((prior.skipCardOnly === true && redTeamCardOnly(prior.loopPayload?.findings?.read)) || emptyDiffExemptionEvidence({ repo: prior.repo, pr: prior.pr, ...proof, head: prior.head, seatRecord: prior, requireSkip: true }).exempt)
+  return prior?.status === 'finished' && prior.skipCardOnly === true
     && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
     && !old.recorded && !old.inFlight && !old.queued;
 }
 
-/** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass.
- * Missing/unreadable scorecards throw: callers must hold, never infer a clear or retry from zero seats. */
-export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env, cwd, gitExec,
+/** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
+export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
@@ -957,30 +954,20 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env, cw
     if (latestHit.ok === false) return latestHit;
     const latest = latestHit.run;
     const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
-    // An empty-net-diff carry is its own policy: its stored skip is proven by the head-bound read, not by the
-    // writer's card-only setting, so it stays the carry's own status with that setting disabled.
-    const emptyOwn = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: status, env, cwd, exec: gitExec, requireSkip: true }).exempt;
     const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
-      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && (status.skipCardOnly === true || emptyOwn)))
+      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && status.skipCardOnly === true))
       && status.status === 'finished'
-      && (status.result === 'skipped' || (status.result?.status === 'skipped' && (status.result.policy === 'card-only' || emptyOwn))));
+      && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
     if (laterPanel || (carry && !ownStatus) || recorded) {
       return { loopPayload: latest, status, carryConflict: true, inFlight: false,
         recorded, ...seatEvidence, scheduled: false };
     }
     if (carry) {
       // The journal survives a crash before the compatibility status exists. Never invent an accept.
-      // Project the carry's own policy: an empty-net-diff carry never claims the card-only setting.
-      const empty = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: status, loopPayload: carry.loopPayload,
-        // Project a journal that can precede its compatibility skip record.
-        requireSkip: false, env, cwd, exec: gitExec }).exempt;
-      if (!empty && carry.loopPayload?.findings?.read?.diffText === '')
-        return { ok: false, reason: 'empty-net-diff-unproven' };
-      const skipCardOnly = empty ? status?.skipCardOnly === true : true;
       const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
-        result: empty ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'skipped', policy: 'card-only' }, skipCardOnly };
+        result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true };
       return { carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
-        recorded: false, ...seatEvidence, scheduled: false, skipCardOnly };
+        recorded: false, ...seatEvidence, scheduled: false, skipCardOnly: true };
     }
   }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
@@ -1019,8 +1006,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env, cw
     // Settlement provenance cannot stand in for a panel verdict, even if an older
     // writer retained one. Keep the status intact for recovery's provenance checks.
     const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
+    // A skip with no policy settlement still owes its pass while recovery retries or escalates.
+    const skippedOwed = resultStatus === 'skipped' && redTeamOwedFor(loopPayload)
+      && !(status.skipCardOnly === true && redTeamCardOnly(loopPayload?.findings?.read));
     return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
-      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: skippedOwed || ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const exactHit = latestRun();
   if (exactHit.ok === false) return exactHit;
@@ -1030,9 +1020,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env, cw
     const older = olderHit.run;
     const oldHead = older?.findings?.read?.netBasis?.rev;
     if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
-      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, cwd, gitExec, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn, now,
+      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn, now,
         isAlive, host, namespace, readPidStart, readScorecards });
-      if (historicalCardOnlySkipCandidate(old, { env, cwd, exec: gitExec })) return old;
+      if (historicalCardOnlySkipCandidate(old)) return old;
     }
   }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
