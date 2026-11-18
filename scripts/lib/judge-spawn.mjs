@@ -690,6 +690,28 @@ export function buildJudgeArgv({
   ];
 }
 
+// The shared hold matcher intentionally recognizes a prefix. Only these complete
+// reset shapes prove quota-only failure here; unknown formats remain countable.
+function wholeQuotaMessage(value) {
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  return Boolean(quotaHoldRow({ provider: 'claude', error: text, now: 0 }))
+    && /^You've hit your (?:weekly|daily|5-hour|session) limit · resets (?:tomorrow|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [1-9][0-9]? at (?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm) \([A-Za-z_]+(?:\/[A-Za-z_]+)+\)|(?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm)(?: \([A-Za-z_]+(?:\/[A-Za-z_]+)+\))?)$/.test(text);
+}
+
+function quotaOnlyEvent(event) {
+  // Presence matters, including null, empty arrays/objects, and empty strings.
+  // Exactly one diagnostic field may carry the complete quota message.
+  const fields = ['error', 'errors', 'message', 'result', 'stderr', 'details', 'code']
+    .filter(key => Object.hasOwn(event, key));
+  if (fields.length !== 1 || !['error', 'message', 'result'].includes(fields[0])) return false;
+  if (Object.hasOwn(event, 'subtype') && !['error', 'success'].includes(event.subtype)) return false;
+  let value = event[fields[0]];
+  if (fields[0] === 'error' && value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 1 && Object.hasOwn(value, 'message')) value = value.message;
+  return wholeQuotaMessage(value);
+}
+
 /** Strict, synchronous acceptance of the complete CLI document or event stream.
  * `exit` carries process evidence plus optional budget, timing, observation timestamp (`now`) and stderr diagnostics.
  * Oversized output is terminal: the operator must inspect the full run; no verdict is accepted.
@@ -739,6 +761,9 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
   let failure;
   let result;
   let results = 0;
+  let failureEvents = 0;
+  let whitelistedFailureEvents = 0;
+  let otherEvents = 0;
   for (const event of events) {
     if (!event || typeof event !== 'object' || Array.isArray(event)) {
       recordFailure('invalid-event', 'Expected a JSON object (content redacted); no verdict.');
@@ -750,23 +775,24 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     const bad = event.type === 'error' || event.is_error || event.error
       || (isResult && 'subtype' in event && event.subtype !== 'success');
     if (bad) {
+      failureEvents += 1;
+      const whitelisted = quotaOnlyEvent(event);
+      if (whitelisted) whitelistedFailureEvents += 1;
       // Classify each diagnostic independently: quota in one field cannot excuse
       // execution evidence in another. Envelope flags (type/is_error) carry no cause.
       const diagnosticValues = value => value && typeof value === 'object'
         ? Object.keys(value).length ? Object.values(value).flatMap(diagnosticValues) : [value]
         : [value];
-      const evidence = [event.result, event.message, event.error,
+      const evidence = [event.result, event.message, event.error, event.errors, event.details,
         ...(Object.hasOwn(event, 'subtype') && event.subtype !== 'success' ? [event.subtype] : []),
         event.code, event.stderr]
         .filter(value => value !== undefined && value !== '')
         .flatMap(diagnosticValues);
       const texts = evidence.filter(text => typeof text === 'string');
       let eventQuota = false;
-      let nonQuotaEvidence = false;
       for (const text of evidence) {
         const holdRow = quotaHoldRow({ provider: 'claude', error: text, now: exit.now ?? 0 });
         if (holdRow) eventQuota = true;
-        else nonQuotaEvidence = true;
         if (holdRow && !quota) quota = Object.assign(new Error(`judge-spawn: the juror failed: ${text}`), {
           quota: true, holdRow, telemetry: { failureKind: 'provider-quota', failureText: text.slice(0, 500) },
         });
@@ -780,14 +806,14 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
           stopReason: event.stop_reason, result: text, stderr });
         recordFailure('budget', 'Juror budget exhausted or exceeded (content redacted).');
       }
-      else if (!eventQuota || nonQuotaEvidence) recordFailure('execution-error',
+      else if (!eventQuota || !whitelisted) recordFailure('execution-error',
         'Juror emitted an execution error or unsuccessful result (content redacted); no verdict.');
       failure ??= event.is_error
         ? new Error(text ? `judge-spawn: the juror failed: ${text}`
           : `judge-spawn: the juror failed with no result text. parsed: ${JSON.stringify({ ...event, structured_output: undefined }).slice(0, 600)}\n`
             + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`)
         : fail('judge-spawn: the juror emitted a JSON error event or unsuccessful result (content redacted); no verdict.');
-    }
+    } else otherEvents += 1;
     if (isResult) {
       results += 1; result ??= event;
       if (!bad) {
@@ -808,14 +834,19 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     }
   }
   if (quota) {
-    if (String(stderr).trim() && !quotaHoldRow({ provider: 'claude', error: String(stderr), now: exit.now ?? 0 })) {
-      recordFailure('execution-error', 'Juror stderr contains non-quota diagnostics (content redacted); no verdict.');
+    if (String(stderr).trim()) {
+      recordFailure('execution-error', 'Juror stderr contains additional diagnostics (content redacted); no verdict.');
     }
+    if (otherEvents && !otherFailures.length) recordFailure('execution-error', 'Juror emitted additional JSON events; no verdict.');
+    if (failureEvents > 1 && !otherFailures.length) recordFailure('execution-error', 'Juror emitted multiple failure events; no verdict.');
     if (results > 1) recordFailure('result-count', 'Expected exactly one result event; no verdict.');
+    const quotaOnly = failureEvents === 1 && whitelistedFailureEvents === 1
+      && otherEvents === 0 && code === 0 && signal === null && !timedOut
+      && !String(stderr).trim() && !malformed && otherFailures.length === 0;
     quota.telemetry = { ...quota.telemetry,
       // reviewRunEvidence exempts only rows whose failureKind is provider-quota.
-      failureKind: otherFailures.length ? 'mixed-failure' : 'provider-quota',
-      quotaOnly: otherFailures.length === 0, otherFailures, otherFailuresOmitted,
+      failureKind: quotaOnly ? 'provider-quota' : 'mixed-failure',
+      quotaOnly, otherFailures, otherFailuresOmitted,
       ...(otherFailuresOmitted ? { otherFailuresNote: 'Diagnostics truncated; inspect the full run manually; no verdict.' } : {}),
     };
     throw quota;
