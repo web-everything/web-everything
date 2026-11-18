@@ -4262,8 +4262,16 @@ so a crashed re-review cannot hold a PR forever. A run waiting on a pending step
 abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
 Unreadable records still throw, never skip.
 
-The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
-test `settings-files`; use heavy admission.
+Review discovery first tries the bounded `<runs-dir-name>-review-index.json` sidecar beside the
+resolved runs directory. The run-store writer updates it fail-soft under a file lock; drain's complete
+open-PR context advances one persisted backfill cursor (50 review records total per tick). Partial
+backfills are staged, never published. Indexed payloads still pass the same PR/head, ordering and
+unfinished-review checks. Missing/corrupt/unverified/overflowed hints take the original bounded scan;
+`scan-capped` still holds. Index bounds are 512 PR keys, 32 ids per key and 1 MiB per file. Per-PR
+overflow becomes an empty sentinel, forcing fallback instead of silently discarding a review.
+On a persistent backfill error or overflow, inspect omitted records manually; the index cannot clear
+unknown evidence. The scoped regressions are `review-run-index`, `drain-red-team-evidence`,
+`stream-filter-runs`, and the settings layout test `settings-files`; use heavy admission.
 
 
 ## Refused referral reviews re-read standing rulings
