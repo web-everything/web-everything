@@ -93,6 +93,9 @@ export async function acquireSmokeSlot({
   env = process.env, log = console,
   stateDir = env.WE_DAEMON_SMOKE_STATE_DIR || join(homedir(), '.claude', 'daemon-self-sync-state'),
   pid = process.pid, isAlive = processAlive, now = Date.now, sleep = setTimeout, onWait,
+  // A priority caller (an active force-adopt build, or a degraded daemon) queues ahead of routine waiters, behind
+  // other priority waiters. It never preempts a holder and the queue timeout still applies.
+  priority = false,
 } = {}) {
   if (!positive(pid)) throw new Error('daemon-live-smoke: invalid slot pid');
   const cap = setting(env, log, 'smokeMaxConcurrent', 'WE_DAEMON_SMOKE_MAX_CONCURRENT', 2);
@@ -164,7 +167,7 @@ export async function acquireSmokeSlot({
       const state = readState(path);
       state.holders = state.holders.filter(e => isAlive(e.pid));
       state.waiters = state.waiters.filter(e => isAlive(e.pid) && now() - e.at <= maxWait + 60_000)
-        .sort((a, b) => a.ticket - b.ticket);
+        .sort((a, b) => (b.priority === true) - (a.priority === true) || a.ticket - b.ticket);
       const result = update(state);
       const temporary = join(lock, temporaryFile);
       fs.writeFileSync(temporary, JSON.stringify(state));
@@ -237,7 +240,10 @@ export async function acquireSmokeSlot({
         if (mine === undefined) {
           if (!positive(state.nextTicket + 1)) throw new Error('daemon-live-smoke: slot tickets exhausted; inspect state before retrying');
           mine = state.nextTicket++;
-          state.waiters.push({ pid, ticket: mine, at: now(), id });
+          const entry = { pid, ticket: mine, at: now(), id, ...(priority ? { priority: true } : {}) };
+          const firstRoutine = state.waiters.findIndex(e => e.priority !== true);
+          if (priority && firstRoutine >= 0) state.waiters.splice(firstRoutine, 0, entry);
+          else state.waiters.push(entry);
         }
         const index = state.waiters.findIndex(e => e.id === id);
         if (index < 0) throw new Error('daemon-live-smoke: own smoke ticket missing');

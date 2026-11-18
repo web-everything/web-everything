@@ -12,7 +12,7 @@ import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
-import { runForceWatchTick } from '../daemon-force-adopt.mjs';
+import { runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
@@ -293,7 +293,10 @@ async function rebuildCloneInternal({
 
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
   try {
-    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep,
+    // An active force-adopt request for this clone (or the degraded-daemon hook env) goes to the FRONT of the host smoke
+    // queue; the queue timeout is unchanged and a holder is never preempted.
+    const priority = !!readForceAdopt(root, stEnv, now) || stEnv?.WE_DAEMON_SMOKE_PRIORITY === '1';
+    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep, priority,
       onWait: async () => {
         const renewed = await withWriteLock(root, () => {
           const st = readRebuildState(root, stEnv);

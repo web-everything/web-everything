@@ -181,6 +181,34 @@ describe('daemon smoke slots', () => {
     expect(order).toEqual([12, 13]);
   });
 
+  it('a priority caller queues ahead of routine waiters, behind other priority waiters, and never preempts a holder', async () => {
+    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' };
+    const a = await acquire(11, { env });
+    const order = [];
+    const routine = acquire(12, { env }).then(slot => { order.push('routine12'); return slot; });
+    await wake();
+    const urgent1 = acquire(13, { env, priority: true }).then(slot => { order.push('urgent13'); return slot; });
+    await wake();
+    const urgent2 = acquire(14, { env, priority: true }).then(slot => { order.push('urgent14'); return slot; });
+    await wake();
+    expect(state().holders.map(e => e.pid)).toEqual([11]); // the holder keeps its slot
+    expect(state().waiters.map(e => e.pid)).toEqual([13, 14, 12]);
+    await a.release(); await wake();
+    const first = await urgent1; await first.release(); await wake();
+    const second = await urgent2; await second.release(); await wake();
+    await (await routine).release();
+    expect(order).toEqual(['urgent13', 'urgent14', 'routine12']);
+  });
+
+  it('a priority caller still times out like any other waiter', async () => {
+    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1000' };
+    await acquire(11, { env });
+    let t = 123;
+    const slot = await acquire(12, { env, priority: true, now: () => (t += 600), sleep: async () => {} });
+    expect(slot.acquired).toBe(false);
+    expect(state().waiters).toEqual([]);
+  });
+
   it('admits FIFO with cap 2 when both holders release and the later waiter polls first', async () => {
     const a = await acquire(11), b = await acquire(12);
     const order = [];
