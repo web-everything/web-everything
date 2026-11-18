@@ -82,17 +82,20 @@ export function readReviewCiGateFactsFirst({ repo, pr, lookup = lookupReviewFact
     readHead: (a) => (heads++ === 0 ? facts.headSha : liveHead(a)),
     readChecks: ({ headSha }) => {
       if (headSha !== facts.headSha) throw new Error('facts head differs');
-      return facts.checks.map((c) => ({ name: c.name, status: 'completed', conclusion: c.conclusion, head_sha: facts.headSha }));
+      // The mirror omits pending runs and all legacy statuses; it never attests completeness.
+      return Object.assign(facts.checks.map((c) => ({ name: c.name, status: 'completed', conclusion: c.conclusion, head_sha: facts.headSha })),
+        { rowsHead: facts.headSha, rowsComplete: false });
     },
   });
-  if (viaStore.allowed) return { ...viaStore, factsSource: 'store' };
   // A refusal is trusted only when every affected check is a COMPLETED non-success. 'missing' / 'pending' / an
   // unreadable gate can be a store gap (the store lists completed GitHub check runs only, never legacy statuses),
   // so those re-read GitHub. A merge-gate refusal also needs live job IDs and labels to evaluate candidacy holds.
   const affected = viaStore.affected;
-  const completedFailure = viaStore.reason === 'required-checks-not-successful' && Array.isArray(affected) && affected.length > 0
-    && affected.every((a) => a.name !== 'merge-gate' && !['missing', 'pending', 'malformed', 'wrong-head'].includes(a.reason));
-  if (completedFailure) return { ...viaStore, factsSource: 'store' };
+  const completedFailure = viaStore.allowed === false && typeof viaStore.reason === 'string'
+    && viaStore.reason.split(',').every(reason => ['rows-incomplete', 'failure', 'error', 'neutral', 'skipped', 'timed_out', 'action_required', 'startup_failure'].includes(reason))
+    && Array.isArray(affected) && affected.length > 0
+    && affected.every((a) => a.name !== 'merge-gate' && ['failure', 'error', 'neutral', 'skipped', 'timed_out', 'action_required', 'startup_failure'].includes(a.reason));
+  if (completedFailure) return { ...viaStore, reason: 'required-checks-not-successful', factsSource: 'store' };
   return live({ repo, pr, ...rest });
 }
 

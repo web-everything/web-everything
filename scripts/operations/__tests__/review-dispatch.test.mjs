@@ -1,4 +1,4 @@
-import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
+import { readReviewCiGate } from '../../lib/__tests__/helpers/review-checks.mjs';
 /**
  * @file review-dispatch.test.mjs — `#3279`: dispatch an independent review to a fresh session.
  *

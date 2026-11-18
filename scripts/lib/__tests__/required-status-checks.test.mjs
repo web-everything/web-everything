@@ -476,7 +476,7 @@ describe('defaultReadRequiredStatusChecks', () => {
   });
 
   it('a rules access denial keeps an expired live cache (ruleset-only check kept, file untouched) and the review gate still refuses its red', async () => {
-    const { readReviewCiGate } = await import('../review-ci-gate-io.mjs');
+    const { readReviewCiGate } = await import('./helpers/review-checks.mjs');
     const cachePath = join(dir, 'cache.json');
     const repo = 'web-everything/web-everything';
     getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });
@@ -645,11 +645,14 @@ describe('adding a required check never stalls reviews (live 2026-10-07, `integr
     expect(w(req, [{ name: 'test', status: 'completed', conclusion: 'failure' }])).toEqual(req);
     expect(w(req, [ok('test'), { name: 'integration', status: 'completed', conclusion: 'failure' }])).toEqual(req);
   });
-  it('the review gate and the check reducer accept a head that predates the job', async () => {
+  it('the review gate waits for a missing required integration even when test is green', async () => {
     const { reviewCiGate } = await import('../review-ci-gate.mjs');
     const { reduceCheckState } = await import('../../operations/pr-status.mjs');
     const req = ['test', 'integration'];
-    expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [ok('test')] }).allowed).toBe(true);
+    // Historical implication still exists in the legacy reducer, but cannot admit review.
+    expect(reviewCiGate({ headSha: 'a'.repeat(40), rowsHead: 'a'.repeat(40), rowsComplete: true,
+      rosterSource: 'live', requiredChecks: req, checks: [ok('test')] })).toMatchObject({ allowed: false,
+      reason: 'required-checks-not-successful', affected: [{ name: 'integration', reason: 'missing' }] });
     expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [] }).allowed).toBe(false);
     expect(reduceCheckState([ok('test')], req).state).toBe('green');
   });

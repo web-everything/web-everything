@@ -1,6 +1,6 @@
 import * as reviewDispatch from '../review-dispatch.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
-import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
+import { readReviewCiGate } from '../../lib/__tests__/helpers/review-checks.mjs';
 /**
  * x26lw6u — the review arc as a deterministic job (we:scripts/operations/review-job.mjs) and its job-record
  * store (we:scripts/operations/review-job-store.mjs). Every effect is faked: no lane pool, no `claude`, no `gh`.

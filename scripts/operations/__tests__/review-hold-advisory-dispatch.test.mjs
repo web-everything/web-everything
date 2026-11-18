@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { dispatchReviewByMode } from '../review-job.mjs';
-import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
+import { readReviewCiGate } from '../../lib/__tests__/helpers/review-checks.mjs';
 
 const REPO = 'frontier-ui/frontierui'; // No default fast-check list: use this repo's required checks.
 const HEAD = 'a'.repeat(40);
