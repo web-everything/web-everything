@@ -71,6 +71,7 @@ export function computeForgeShare({ now, windowMs, target, expectedLocalReasons 
     const t = Date.parse(row?.ts);
     if (!Number.isFinite(t) || t > now) continue;
     const reason = normalizeFallbackReason(row.reason);
+    if (reason.startsWith('local-')) continue; // R830/R823: a local-by-design reason row is not a failed remote attempt
     const isExpected = expected.has(reason);
     if (!isExpected) { if (t > from) byReason[reason] = (byReason[reason] ?? 0) + 1; continue; }
     const key = laneKey(row.lane);

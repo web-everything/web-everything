@@ -12,6 +12,9 @@ const MAX_BYTES = 512 * 1024;
 const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
 
 export const ADVISORY_REASONS = new Set(['credential-warn']);
+/** R830/R823: a run that is local by design (flag, container, policy, threshold) logs `local-*`. It is a reason, not a
+ *  failed remote attempt, so it never counts as a real fallback cause. */
+export const isLocalByDesignReason = reason => typeof reason === 'string' && reason.startsWith('local-');
 
 /** Pure aggregation. Unknown reasons remain real; ties keep the first encountered cause. */
 export function summarize(rows) {
@@ -22,7 +25,7 @@ export function summarize(rows) {
   for (const row of rows) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
     const reason = typeof row.reason === 'string' && row.reason ? row.reason : 'unknown';
-    const isAdvisory = ADVISORY_REASONS.has(reason);
+    const isAdvisory = ADVISORY_REASONS.has(reason) || isLocalByDesignReason(reason);
     const counts = isAdvisory ? advisoryCounts : realCounts;
     counts.set(reason, (counts.get(reason) ?? 0) + 1);
     total++;
