@@ -41,7 +41,8 @@ export async function replay(sourceRoot = ROOT) {
   try {
     const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
     const { createReviewPrSinks, reviewBodyPath } = await load(SOURCE);
-    const { REVIEW_EFFECTS } = await load('scripts/operations/review-pr.mjs');
+    const { REVIEW_EFFECTS, REVIEW_PR_OP } = await load('scripts/operations/review-pr.mjs');
+    const { resolveOperation } = await load('scripts/operations/run.mjs');
     const { bodyFileRoots, checkBodyFileLocation } = await load('scripts/review-set-label.mjs');
     const root = join(fixture, 'checkout-a'), cwd = join(fixture, 'checkout-b'), scratch = join(fixture, 'temp');
     for (const dir of [root, cwd, scratch]) mkdirSync(dir);
@@ -50,7 +51,8 @@ export async function replay(sourceRoot = ROOT) {
       reviewedHead: 'a'.repeat(40) };
     const staged = reviewBodyPath({ root, runId, bodyFile });
     let calls = 0, copy;
-    const sinks = createReviewPrSinks({ root, cwd, tmpDir: scratch,
+    const { sinks } = resolveOperation(REVIEW_PR_OP, { cwd,
+      sinkFactory: controls => createReviewPrSinks({ root, ...controls, tmpDir: scratch,
       runStore: { read: () => ({ id: runId, effects: [
         { type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile, body } },
       ] }) },
@@ -66,7 +68,7 @@ export async function replay(sourceRoot = ROOT) {
         check(readFileSync(copy, 'utf8') === body, 'body bytes changed');
         check((statSync(copy).mode & 0o777) === 0o600, 'copy is not private');
         return '{"ok":true}';
-      } });
+      } }) });
     await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile, body }, { runId });
     check(!checkBodyFileLocation(staged, bodyFileRoots(cwd, scratch)).ok, 'fixture did not separate checkout/temp roots');
     await sinks[REVIEW_EFFECTS.LABEL](payload, { runId });

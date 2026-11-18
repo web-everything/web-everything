@@ -768,7 +768,8 @@ describe('the label sink', () => {
     // Model distinct checkout/temp roots even though the fixture itself lives in the host temp dir.
     expect(checkBodyFileLocation(staged, bodyFileRoots(cwd, scratch)).ok).toBe(false);
     let copy;
-    const sinks = createReviewPrSinks({ root, cwd, tmpDir: scratch,
+    const { sinks } = resolveOperation(REVIEW_PR_OP, { cwd,
+      sinkFactory: controls => createReviewPrSinks({ root, ...controls, tmpDir: scratch,
       publishGate: () => ({ allowed: true, headSha: payload.reviewedHead }),
       runNode: (argv, opts) => {
         expect(opts.cwd).toBe(cwd);
@@ -779,7 +780,7 @@ describe('the label sink', () => {
         expect(readFileSync(copy, 'utf8')).toBe('# verdict');
         expect(statSync(copy).mode & 0o777).toBe(0o600);
         return '{"ok":true,"pr":7,"to":"accepted"}';
-      } });
+      } }) });
     await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toMatchObject({ ok: true });
     expect(existsSync(copy)).toBe(false);
     expect(readFileSync(staged, 'utf8')).toBe('# verdict');
