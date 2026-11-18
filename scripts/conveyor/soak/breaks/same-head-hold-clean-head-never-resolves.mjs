@@ -16,7 +16,7 @@ const src = process.env.SOAK_SOURCE_ROOT;
 const imp = rel => import(pathToFileURL(join(src, rel)).href);
 const { enrichPrsWithReferralHolds, enrichPrsWithReferralHoldAutoResolve } = await imp('${HOLD_PATH}');
 const { planReconcile } = await imp('scripts/conveyor/reconcile-core.mjs');
-const repo = 'web-everything/web-everything';
+const repo = 'o/n';
 // Synthetic full SHA preserving the observed prefix; no captured full SHA is available.
 const head = '494d81b6c'.padEnd(40, '0');
 const base = 'b'.repeat(40);
