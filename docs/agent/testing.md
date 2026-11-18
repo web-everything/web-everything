@@ -4580,3 +4580,13 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+
+## Juror CLI result replay
+
+`accept-juror-replay.test.mjs` replays two real successful CLI envelopes. The closed
+`JUROR_RESULT_KEYS` list requires explicit review on CLI upgrades; unknown fields
+are terminal failures. Preserve captured structure when adding fixtures, replacing
+only session/UUID/credential-expiry identifiers. Quota result envelopes undergo the
+same session, schema and success checks, so contradictory verdicts remain countable.
+Stderr warnings are allowed; only `JUROR_FATAL_STDERR` classes invalidate a clean exit.

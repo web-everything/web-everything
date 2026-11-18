@@ -690,6 +690,60 @@ export function buildJudgeArgv({
   ];
 }
 
+// Closed set captured from two real successful CLI results (replayed in fixtures).
+// Unknown keys fail on purpose: a CLI upgrade requires reviewing and updating this constant.
+export const JUROR_RESULT_KEYS = Object.freeze([
+  'duration_api_ms', 'stop_reason', 'session_id', 'total_cost_usd', 'usage', 'modelUsage',
+  'permission_denials', 'terminal_reason', 'fast_mode_state', 'fast_mode_disabled_reason',
+  'subagent_stats', 'safety_stops', 'is_error', 'num_turns', 'subtype', 'api_error_status',
+  'result', 'structured_output', 'ttft_ms', 'type', 'duration_ms', 'uuid', 'ttft_stream_ms',
+  'time_to_request_ms', 'first_content_frame_ms', 'queued_turn_count', 'result_index',
+  'credential_expires_at',
+]);
+
+// CLI warnings are routine. Only these fatal/error classes invalidate a clean exit.
+export const JUROR_FATAL_STDERR = Object.freeze([
+  /^\s*(fatal|error)\b/i, /Traceback/, /unhandled (rejection|exception)/i, /\bpanic\b/i,
+]);
+
+function validateJurorResult(result, sessionId, schema) {
+  const reject = (kind, message) => { throw Object.assign(new Error(message), {
+    kind, unparseableStdout: true, verdictIntegrity: true,
+  }); };
+  if (Object.keys(result).some(key => !JUROR_RESULT_KEYS.includes(key))) {
+    reject('result-keys', 'judge-spawn: unknown result key; review the CLI upgrade and update JUROR_RESULT_KEYS; no verdict.');
+  }
+  if (!Object.hasOwn(result, 'session_id') || result.session_id !== sessionId) {
+    reject('session-mismatch', 'judge-spawn: result session_id missing or session_id mismatch; no verdict.');
+  }
+  let validate;
+  try { validate = compileJurorSchema(schema); }
+  catch (error) {
+    reject('schema-compilation', `judge-spawn: schema compilation failed (${error instanceof JurorSchemaError ? error.message : 'details redacted'}); correct the schema before retrying; no verdict.`);
+  }
+  const value = result.structured_output;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    const stopReason = ['end_turn', 'tool_use', 'max_tokens'].includes(result.stop_reason) ? result.stop_reason : 'unknown';
+    reject('schema-violation', `structured_output schema violation: expected an object; no structured_output (stop_reason=${stopReason}).`);
+  }
+  if (!validate(value) || !Object.keys(value).length) {
+    const violation = validate.errors?.[0];
+    reject('schema-violation', violation ? `structured_output schema violation at ${violation.schemaPath}: ${violation.message}`
+      : 'structured_output schema violation: expected a nonempty object');
+  }
+  // Main accepted legacy envelopes omitting type/subtype/is_error. Preserve only
+  // those omissions; every supplied flag must have the exact successful value.
+  if ((Object.hasOwn(result, 'type') && result.type !== 'result')
+    || (Object.hasOwn(result, 'subtype') && result.subtype !== 'success')
+    || (Object.hasOwn(result, 'is_error') && result.is_error !== false)
+    || (Object.hasOwn(result, 'api_error_status') && result.api_error_status !== null)
+    || (Object.hasOwn(result, 'permission_denials')
+      && (!Array.isArray(result.permission_denials) || result.permission_denials.length))) {
+    reject('result-envelope', 'judge-spawn: unsuccessful result envelope; no verdict.');
+  }
+  return value;
+}
+
 // The shared hold matcher intentionally recognizes a prefix. Only these complete
 // reset shapes prove quota-only failure here; unknown formats remain countable.
 function wholeQuotaMessage(value) {
@@ -738,6 +792,8 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     if (otherFailures.length < 20) otherFailures.push({ kind, message: message.slice(0, 200), redacted: true });
     else otherFailuresOmitted += 1;
   };
+  const fatalStderr = String(stderr).split(/\r?\n/).some(line => JUROR_FATAL_STDERR.some(pattern => pattern.test(line)));
+  if (fatalStderr) recordFailure('execution-error', 'Juror stderr contains a fatal/error diagnostic (content redacted); no verdict.');
   if (processFailure) recordFailure(processFailure instanceof JudgeTimeoutError ? 'timeout' : 'process-failure',
     processFailure instanceof JudgeTimeoutError ? 'Juror process timed out or lacked a clean exit.' : `Juror process exited with code ${code}.`);
   if (Buffer.byteLength(stdout) > 8 * 1024 * 1024) recordFailure('output-limit',
@@ -770,7 +826,8 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
       failure ??= fail('judge-spawn: invalid JSON event: expected a JSON object (content redacted); no verdict.');
       continue;
     }
-    const isResult = event.type === 'result' || (event.type === undefined
+    const isResult = event.type === 'result' || 'structured_output' in event || 'session_id' in event
+      || (event.type === undefined
       && ('structured_output' in event || 'is_error' in event || 'session_id' in event || 'result' in event || 'stop_reason' in event));
     const bad = event.type === 'error' || event.is_error || event.error
       || (isResult && 'subtype' in event && event.subtype !== 'success');
@@ -816,15 +873,14 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     } else otherEvents += 1;
     if (isResult) {
       results += 1; result ??= event;
-      if (!bad) {
-        if (event.session_id !== sessionId) recordFailure('session-mismatch', 'Result session_id missing or mismatched; no verdict.');
-        try {
-          const validate = compileJurorSchema(schema);
-          const value = event.structured_output;
-          if (!value || typeof value !== 'object' || Array.isArray(value) || !validate(value) || !Object.keys(value).length) {
-            recordFailure('schema-violation', 'Structured output violates the schema (content redacted); no verdict.');
-          }
-        } catch { recordFailure('schema-compilation', 'Schema compilation failed; correct the schema before retrying; no verdict.'); }
+      // A quota message never bypasses the same complete result validation.
+      // Failed result envelopes (including contradictory verdicts) remain countable.
+      if (!bad || quotaOnlyEvent(event)) {
+        try { validateJurorResult(event, sessionId, schema); }
+        catch (error) {
+          recordFailure(error.kind, error.message);
+          if (!bad && ['result-keys', 'result-envelope'].includes(error.kind)) failure ??= error;
+        }
       }
     }
     else if (results && !['system', 'rate_limit_event', 'rate_limit'].includes(event.type)) {
@@ -834,15 +890,12 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     }
   }
   if (quota) {
-    if (String(stderr).trim()) {
-      recordFailure('execution-error', 'Juror stderr contains additional diagnostics (content redacted); no verdict.');
-    }
     if (otherEvents && !otherFailures.length) recordFailure('execution-error', 'Juror emitted additional JSON events; no verdict.');
     if (failureEvents > 1 && !otherFailures.length) recordFailure('execution-error', 'Juror emitted multiple failure events; no verdict.');
     if (results > 1) recordFailure('result-count', 'Expected exactly one result event; no verdict.');
     const quotaOnly = failureEvents === 1 && whitelistedFailureEvents === 1
       && otherEvents === 0 && code === 0 && signal === null && !timedOut
-      && !String(stderr).trim() && !malformed && otherFailures.length === 0;
+      && !fatalStderr && !malformed && otherFailures.length === 0;
     quota.telemetry = { ...quota.telemetry,
       // reviewRunEvidence exempts only rows whose failureKind is provider-quota.
       failureKind: quotaOnly ? 'provider-quota' : 'mixed-failure',
@@ -861,24 +914,12 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
   if (malformed && (events.length || /^\s*[\[{]/m.test(stdout))) {
     throw fail('judge-spawn: the juror did not emit parseable JSON: malformed JSON object line on stdout (content redacted); no verdict.');
   }
+  if (fatalStderr) throw fail('judge-spawn: fatal/error diagnostic on stderr (content redacted); no verdict.');
   if (failure) throw failure;
   if (!events.length) throw Object.assign(new Error('judge-spawn: the juror did not emit parseable JSON on stdout.\n'
     + `stdout[0..600]: ${stdout.slice(0, 600)}\nstderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`), { unparseableStdout: true });
   if (results !== 1) throw fail('judge-spawn: expected exactly one result event; no verdict.');
-  if (!Object.hasOwn(result, 'session_id') || result.session_id !== sessionId) throw fail('judge-spawn: result session_id missing or session_id mismatch; no verdict.');
-  let validate;
-  try { validate = compileJurorSchema(schema); }
-  catch (error) { throw fail(`judge-spawn: schema compilation failed (${error instanceof JurorSchemaError ? error.message : 'details redacted'}); correct the schema before retrying; no verdict.`); }
-  const value = result.structured_output;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    const stopReason = ['end_turn', 'tool_use', 'max_tokens'].includes(result.stop_reason) ? result.stop_reason : 'unknown';
-    throw fail(`structured_output schema violation: expected an object; no structured_output (stop_reason=${stopReason}).`);
-  }
-  if (!validate(value) || !Object.keys(value).length) {
-    const violation = validate.errors?.[0];
-    throw fail(violation ? `structured_output schema violation at ${violation.schemaPath}: ${violation.message}`
-      : 'structured_output schema violation: expected a nonempty object');
-  }
+  const value = validateJurorResult(result, sessionId, schema);
   return { value, sessionId: result.session_id, costUsd: typeof result.total_cost_usd === 'number' ? result.total_cost_usd : 0,
     durationMs: typeof result.duration_ms === 'number' ? result.duration_ms : 0,
     numTurns: typeof result.num_turns === 'number' ? result.num_turns : 0,

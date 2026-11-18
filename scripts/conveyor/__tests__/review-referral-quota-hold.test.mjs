@@ -205,7 +205,7 @@ describe('incomplete quota evidence after the seat phase', () => {
   );
 
   it.each([
-    ['quota alone', '', 0, true],
+    ['quota result missing session and schema evidence', '', 0, false],
     ['execution error and quota', JSON.stringify({ type: 'error', message: 'execution failed' }) + '\n', 0, false],
     ['malformed line and quota', '{broken\n', 0, false],
     ['nonzero exit and quota', '', 1, false],

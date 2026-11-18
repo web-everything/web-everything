@@ -591,7 +591,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
         otherFailures: [
           { kind: 'process-failure', message: expect.any(String), redacted: true },
           ...((result.endsWith('resets ') || result.includes('\n'))
-            ? [{ kind: 'execution-error', message: expect.any(String), redacted: true }] : []),
+            ? [{ kind: 'execution-error', message: expect.any(String), redacted: true }]
+            : [{ kind: 'session-mismatch', message: expect.any(String), redacted: true }]),
         ] });
       expect(error.telemetry.failureText).toContain(result);
       expect(error.quota).toBe(true);
