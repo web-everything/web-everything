@@ -72,7 +72,8 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 }
 
 /** No known required set means no evidence that CI is green. Pure. */
-export function ciGreenForEscalation({ rollup, requiredChecks }) {
+export function ciGreenForEscalation({ rollup, requiredChecks, headSha, rowsHead, rowsComplete, rosterSource }) {
+  if (rowsComplete !== true || (rowsHead !== undefined && rowsHead !== headSha)) return false;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
   const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
   return !red.length && !pending.length && !missing.length;

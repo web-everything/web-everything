@@ -16,8 +16,10 @@ function statusAsCheckRow(row) {
   return row;
 }
 
-export function reviewCiGate({ headSha, requiredChecks, checks } = {}) {
+export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead, rowsComplete } = {}) {
   const refuse = (reason, affected = []) => ({ allowed: false, headSha: headSha ?? null, reason, affected });
+  if (rowsComplete !== true || (rowsHead !== undefined && rowsHead !== headSha))
+    return { ...refuse('rows-incomplete'), unknown: true };
   if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
   if (!Array.isArray(requiredChecks) || !requiredChecks.length
       || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return refuse('unknown-required-set');

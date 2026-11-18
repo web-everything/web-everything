@@ -12,7 +12,7 @@ const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
   it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
     const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
-    const result = reviewStartGate({ headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
+    const result = reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
     expect(result.affected).toEqual([{ name: 'standards', reason: 'missing' }]);
   });
   // Red team on f4ed5360 (#6326): a green LEGACY commit status (`{context, state}`) must imply integration in the
@@ -22,41 +22,41 @@ describe('pending-CI start policy', () => {
     const requiredChecks = ['test', 'integration'];
     it.each([['shadow', 'success'], ['on', 'success'], ['shadow', 'SUCCESS'], ['on', 'SUCCESS']])('startEarly=%s state=%s', (startEarly, state) => {
       const checks = [{ context: 'test', state }];
-      expect(reviewCiGate({ headSha: head, checks, requiredChecks })).toMatchObject({ allowed: true });  // the strict gate already accepts
-      expect(reviewStartGate({ headSha: head, requiredChecks, checks, policy: policy(startEarly) })).toMatchObject({ allowed: true });
+      expect(reviewCiGate({ rowsComplete: true, rowsHead: head, headSha: head, checks, requiredChecks })).toMatchObject({ allowed: true });  // the strict gate already accepts
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks, checks, policy: policy(startEarly) })).toMatchObject({ allowed: true });
     });
     it.each(['pending', 'failure', 'error'])('a %s legacy status implies nothing', state => {
-      const result = reviewStartGate({ headSha: head, requiredChecks, checks: [{ context: 'test', state }], policy: policy('shadow') });
+      const result = reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks, checks: [{ context: 'test', state }], policy: policy('shadow') });
       expect(result.allowed).toBe(false);
     });
     it.each(['shadow', 'on'])('a status row carrying status:null is not normalized, as in the strict gate (startEarly=%s)', startEarly => {
       const checks = [{ context: 'test', state: 'success', status: null }];
-      expect(reviewCiGate({ headSha: head, checks, requiredChecks }).allowed).toBe(false);
-      expect(reviewStartGate({ headSha: head, requiredChecks, checks, policy: policy(startEarly) }).allowed).toBe(false);
+      expect(reviewCiGate({ rowsComplete: true, rowsHead: head, headSha: head, checks, requiredChecks }).allowed).toBe(false);
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks, checks, policy: policy(startEarly) }).allowed).toBe(false);
     });
     // Self-review on 9d3b3764: a contradictory aggregate (`state` red/pending, `conclusion: success`) is NOT green to
     // the strict gate (its `state` wins), so it must not imply integration in the registration gate either.
     it.each([['failure', 'shadow'], ['error', 'on'], ['pending', 'shadow'], ['FAILURE', 'on']])(
       'a contradictory status (state=%s, conclusion=success) implies nothing (startEarly=%s)', (state, startEarly) => {
         const checks = [{ context: 'test', state, conclusion: 'success' }];
-        expect(reviewCiGate({ headSha: head, checks, requiredChecks: ['integration'] }).allowed).toBe(false);
-        expect(reviewStartGate({ headSha: head, requiredChecks: ['integration'], checks, policy: policy(startEarly) }).allowed).toBe(false);
+        expect(reviewCiGate({ rowsComplete: true, rowsHead: head, headSha: head, checks, requiredChecks: ['integration'] }).allowed).toBe(false);
+        expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['integration'], checks, policy: policy(startEarly) }).allowed).toBe(false);
       });
   });
   it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
-    expect(reviewStartGate({ headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
       policy: { ...review, startAfter: 'ci-green', startEarly: 'off' } })).toEqual({ allowed: false,
       headSha: head, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] });
   });
   it('off preserves strict fast-check failure diagnostics when the required set is unknown', () => {
-    expect(reviewStartGate({ headSha: head, checks: [check('test', 'failure')],
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks: [check('test', 'failure')],
       policy: { ...review, startAfter: 'fast-checks', fastChecks: ['test'], startEarly: 'off' } })).toEqual({
       allowed: false, headSha: head, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] });
   });
   it.each(['push', 'fast-checks', 'ci-green'])('requires every prerequisite registered on this head under %s', startAfter => {
     const names = ['standards', 'test'];
     for (const startEarly of ['on', 'shadow']) {
-      const input = { headSha: head, requiredChecks: names, policy: { ...review, startAfter, startEarly, fastChecks: names } };
+      const input = { rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: names, policy: { ...review, startAfter, startEarly, fastChecks: names } };
       for (const checks of [[check('unrelated', null, { status: 'queued' })], [check('test', null, { status: 'queued' })]]) {
         const result = reviewStartGate({ ...input, checks });
         expect(result).toMatchObject({ allowed: false, reason: 'ci-not-registered' });
@@ -73,12 +73,12 @@ describe('pending-CI start policy', () => {
     }
   });
   it.each(['push', 'fast-checks', 'ci-green'])('refuses unknown prerequisites under %s', startAfter => {
-    expect(reviewStartGate({ headSha: head, checks: [check('unrelated', null, { status: 'queued' })],
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks: [check('unrelated', null, { status: 'queued' })],
       requiredChecks: [], policy: { ...review, fastChecks: null, startAfter, startEarly: 'on' } }))
       .toMatchObject({ allowed: false, reason: 'unknown-required-set' });
   });
   it('keeps the off-mode strict refusal for missing and pending prerequisites', () => {
-    expect(reviewStartGate({ headSha: head, checks: [check('test', null, { status: 'queued' })],
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks: [check('test', null, { status: 'queued' })],
       requiredChecks: ['standards', 'test'], policy: { ...review, startAfter: 'ci-green', startEarly: 'off' } }))
       .toMatchObject({ allowed: false, reason: 'required-checks-not-successful', affected: [
         { name: 'standards', reason: 'missing' }, { name: 'test', reason: 'pending' }] });
@@ -93,7 +93,7 @@ describe('pending-CI start policy', () => {
     expect(resolved.review.startAfter).toBe(startAfter);
     expect(resolved.sources.review.startAfter).toBe('env');
   });
-  const args = { headSha: head, repo: 'we', requiredChecks: ['integration'],
+  const args = { rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', requiredChecks: ['integration'],
     checks: [check('standards'), check('test-shard (1)', null, { status: 'in_progress' })] };
   it('starts early only in on mode; shadow reports the opportunity and off is unchanged', () => {
     const run = startEarly => reviewStartGate({ ...args, policy: { ...review, startEarly } });
@@ -127,16 +127,16 @@ describe('pending-CI start policy', () => {
   });
   it('push mode waits for registered head CI and refuses unknown-set healable red', () => {
     const policy = { ...review, startAfter: 'push', fastChecks: ['test'] };
-    expect(reviewStartGate({ headSha: head, checks: [], verifyGreen: true, policy: { ...policy, startBeforeCi: true } }))
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks: [], verifyGreen: true, policy: { ...policy, startBeforeCi: true } }))
       .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [{ name: 'test', reason: 'missing' }] });
     for (const checks of [[], undefined, null]) {
-      expect(reviewStartGate({ headSha: head, checks, policy }))
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks, policy }))
         .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [{ name: 'test', reason: 'missing' }] });
     }
     for (const requiredChecks of [undefined, null, []]) {
-      expect(reviewStartGate({ headSha: head, checks: [check('test', 'failure')], requiredChecks, policy }))
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks: [check('test', 'failure')], requiredChecks, policy }))
         .toMatchObject({ allowed: false, reason: 'ci-red', affected: [] });
-      expect(reviewStartGate({ headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks, policy }))
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks, policy }))
         .toMatchObject({ allowed: true, reason: 'push', headSha: head });
     }
   });
@@ -216,22 +216,22 @@ describe('pending-CI start policy', () => {
 describe('parallel review start and void', () => {
   it('starts after only fast checks, with full CI still pending', () => {
     const checks = [...fast.map(n => check(n)), check('integration', null, { status: 'in_progress' })];
-    expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(true);
-    expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter: 'ci-green' } }).allowed).toBe(false);
-    expect(reviewStartGate({ headSha: head, repo: 'we', checks: [], policy: { ...review, startAfter: 'push' } }))
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(true);
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter: 'ci-green' } }).allowed).toBe(false);
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', checks: [], policy: { ...review, startAfter: 'push' } }))
       .toMatchObject({ allowed: false, reason: 'ci-not-registered' });
   });
   it('requires each fast check on the head and refuses a red non-fast check', () => {
     for (const checks of [[], [check('standards')], fast.map(n => check(n, 'success', { head_sha: 'b'.repeat(40) })),
       [...fast.map(n => check(n)), check('integration', 'failure')]])
-      expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(false);
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(false);
   });
   it('a repo whose CI publishes no fast checks waits on its own required checks', () => {
     expect(fastChecksFor(review.fastChecks, 'web-everything/web-everything')).toEqual(fast);
     for (const [repo, required] of [['frontierui', ['test']], ['plateauapp/plateau-app', ['test', 'e2e']], [undefined, ['test']]]) {
       expect(fastChecksFor(review.fastChecks, repo)).toBeNull();
-      expect(reviewStartGate({ headSha: head, repo, checks: required.map(n => check(n)), requiredChecks: required }).allowed).toBe(true);
-      expect(reviewStartGate({ headSha: head, repo, checks: [check('test', null, { status: 'in_progress' }), check('e2e')], requiredChecks: required }))
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo, checks: required.map(n => check(n)), requiredChecks: required }).allowed).toBe(true);
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo, checks: [check('test', null, { status: 'in_progress' }), check('e2e')], requiredChecks: required }))
         .toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
     }
     // An explicit list still applies to every repo.
@@ -280,7 +280,7 @@ describe('parallel review start and void', () => {
     expect(ciRedOnHead({ headSha: head, checks, requiredChecks })).toBe(healable);
     expect(fixReadiness({ headSha: head, checks, requiredChecks }).ciFailed).toBe(healable);
     for (const startAfter of ['fast-checks', 'push'])
-      expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks, policy: { ...review, startAfter } }).allowed).toBe(!healable);
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', checks, requiredChecks, policy: { ...review, startAfter } }).allowed).toBe(!healable);
     expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(healable);
   });
   it('a review-dependent gate is never healable red, even when branch protection requires it', () => {
@@ -289,7 +289,7 @@ describe('parallel review start and void', () => {
     expect(ciRedOnHead({ headSha: head, checks: gates, requiredChecks })).toBe(false);
     expect(fixReadiness({ headSha: head, checks: gates, requiredChecks }).ciFailed).toBe(false);
     for (const startAfter of ['fast-checks', 'push'])
-      expect(reviewStartGate({ headSha: head, repo: 'we', checks: [...gates, ...fast.map(n => check(n))], requiredChecks,
+      expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', checks: [...gates, ...fast.map(n => check(n))], requiredChecks,
         policy: { ...review, startAfter } }).allowed).toBe(true);
     expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks: gates, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(false);
     // A required non-gate red still counts.
@@ -301,12 +301,12 @@ describe('parallel review start and void', () => {
   });
   it.each(['fast-checks', 'push'])('ignores optional red checks under %s but blocks healable required failures', startAfter => {
     const checks = [...fast.map(n => check(n)), check('CodeQL', 'failure')];
-    const args = { headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter } };
+    const args = { rowsComplete: true, rowsHead: head, headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter } };
     expect(reviewStartGate(args).allowed).toBe(true);
     expect(reviewStartGate({ ...args, checks: [...checks, check('integration', 'failure')] })).toMatchObject({ allowed: false, reason: 'ci-red' });
   });
   it('push ignores optional failures even when their names are configured as fast checks', () => {
-    expect(reviewStartGate({ headSha: head, checks: [check('standards', 'failure'), check('integration')],
+    expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, checks: [check('standards', 'failure'), check('integration')],
       requiredChecks: ['integration'], policy: { ...review, startAfter: 'push' } }).allowed).toBe(true);
   });
 });
@@ -364,7 +364,7 @@ it('logs each timing setting with its effective source, including enabled defaul
 
 describe('verified early review', () => {
   it.each(['fast-checks', 'ci-green'])('starts with an exact-head verification under %s', startAfter => {
-    const args = { headSha: head, checks: [], requiredChecks: ['test'], verifyGreen: true,
+    const args = { rowsComplete: true, rowsHead: head, headSha: head, checks: [], requiredChecks: ['test'], verifyGreen: true,
       policy: { ...review, startAfter, startBeforeCi: true } };
     expect(reviewStartGate(args)).toMatchObject({ allowed: true, reason: 'verify-marker' });
     for (const verifyGreen of [false, undefined, 'true'])
@@ -405,7 +405,7 @@ it('push gating refuses unknown required evidence and waits for remaining requir
 describe('R359 early start shadow (xtxt36v / xrz0ezn)', () => {
   const policy = { ...review, earlyStartShadow: true, earlyStartCare: ['none', 'low'],
     earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: ['code'] };
-  const args = { headSha: head, checks: [check('test', null, { status: 'in_progress' })],
+  const args = { rowsComplete: true, rowsHead: head, headSha: head, checks: [check('test', null, { status: 'in_progress' })],
     requiredChecks: ['test'], verifyGreen: true, care: 'low', lines: 100, files: 3,
     kinds: ['code'], isDraft: false, policy };
   const shadow = overrides => reviewTiming.earlyStartShadow({ ...args, ...overrides });
@@ -516,5 +516,28 @@ describe('R359 early start shadow (xtxt36v / xrz0ezn)', () => {
     const before = structuredClone(input);
     expect(reviewTiming.earlyStartShadow(input)).toEqual(reviewTiming.earlyStartShadow(input));
     expect(input).toEqual(before);
+  });
+});
+
+describe('hydrated evidence before timing relaxations', () => {
+  describe.each([
+    { startAfter: 'ci-green', startEarly: 'off' },
+    { startAfter: 'ci-green', startEarly: 'on' },
+    { startAfter: 'fast-checks', startEarly: 'on', fastChecks: ['test'] },
+    { startAfter: 'push' },
+    { startAfter: 'ci-green', startBeforeCi: true },
+  ])('policy %j', policy => {
+    it.each([
+      { rowsComplete: undefined, rowsHead: head },
+      { rowsComplete: false, rowsHead: head },
+      { rowsComplete: true, rowsHead: 'other' },
+      { rowsComplete: true, rowsHead: null },
+    ])('refuses unproved rows %j', evidence => {
+      const input = { headSha: head, requiredChecks: ['test'], checks: [check('test')], verifyGreen: true,
+        policy: { ...review, ...policy }, rowsComplete: true, rowsHead: head };
+      expect(reviewStartGate(input).allowed).toBe(true);
+      expect(reviewStartGate({ ...input, ...evidence }))
+        .toMatchObject({ allowed: false, reason: 'rows-incomplete', unknown: true, affected: [] });
+    });
   });
 });

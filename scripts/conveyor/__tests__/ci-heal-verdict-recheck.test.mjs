@@ -10,7 +10,7 @@ import { latestCheckNamed } from '../../lib/rollup-collapse.mjs';
 import { latestAttempts } from '../../lib/check-state-predicate.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
-const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
+const input = { rowsComplete: true, rowsHead: fixture.headRefOid, escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
@@ -686,11 +686,11 @@ describe('void needs-human settings and green evidence', () => {
   it('requires a known, settled required set, excluding review-gate', () => {
     const checks = ['test', 'review-gate'];
     const rollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }];
-    expect(ciGreenForEscalation({ rollup, requiredChecks: checks })).toBe(true);
-    for (const conclusion of ['FAILURE', 'TIMED_OUT']) expect(ciGreenForEscalation({ rollup: [{ ...rollup[0], conclusion }], requiredChecks: checks })).toBe(false);
-    expect(ciGreenForEscalation({ rollup: [{ ...rollup[0], status: 'IN_PROGRESS' }], requiredChecks: checks })).toBe(false);
-    expect(ciGreenForEscalation({ rollup: [], requiredChecks: checks })).toBe(false);
-    expect(ciGreenForEscalation({ rollup, requiredChecks: [] })).toBe(false);
+    expect(ciGreenForEscalation({ rowsComplete: true, headSha: input.headSha, rowsHead: input.headSha, rollup, requiredChecks: checks })).toBe(true);
+    for (const conclusion of ['FAILURE', 'TIMED_OUT']) expect(ciGreenForEscalation({ rowsComplete: true, headSha: input.headSha, rowsHead: input.headSha, rollup: [{ ...rollup[0], conclusion }], requiredChecks: checks })).toBe(false);
+    expect(ciGreenForEscalation({ rowsComplete: true, headSha: input.headSha, rowsHead: input.headSha, rollup: [{ ...rollup[0], status: 'IN_PROGRESS' }], requiredChecks: checks })).toBe(false);
+    expect(ciGreenForEscalation({ rowsComplete: true, headSha: input.headSha, rowsHead: input.headSha, rollup: [], requiredChecks: checks })).toBe(false);
+    expect(ciGreenForEscalation({ rowsComplete: true, headSha: input.headSha, rowsHead: input.headSha, rollup, requiredChecks: [] })).toBe(false);
   });
 });
 
@@ -744,7 +744,7 @@ describe('R272 fail-closed evidence across every row', () => {
           ? 'red' : bucket;
         expected[expectedBucket] = ['test'];
         expect(requiredCheckStates({ rollup, requiredChecks: ['test'] })).toEqual(expected);
-        expect(ciGreenForEscalation({ rollup, requiredChecks: ['test'] })).toBe(bucket === 'green');
+        expect(ciGreenForEscalation({ rowsComplete: true, headSha: input.headSha, rowsHead: input.headSha, rollup, requiredChecks: ['test'] })).toBe(bucket === 'green');
       }
     }
   });
@@ -764,5 +764,16 @@ describe('R272 fail-closed evidence across every row', () => {
         pr: { headRefOid: input.headSha, statusCheckRollup: rollup }, requiredChecks: ['test'] }))
         .toContain('red: CodeQL');
     }
+  });
+});
+
+describe('hydrated CI evidence for escalation retirement', () => {
+  it.each([
+    { rowsComplete: undefined }, { rowsComplete: false }, { rowsHead: 'other' }, { rowsHead: null },
+  ])('does not call green rows complete for this head: %j', evidence => {
+    const complete = { headSha: input.headSha, rowsHead: input.headSha, rowsComplete: true,
+      requiredChecks: ['test'], rollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    expect(ciGreenForEscalation(complete)).toBe(true);
+    expect(ciGreenForEscalation({ ...complete, ...evidence })).toBe(false);
   });
 });

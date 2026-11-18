@@ -66,7 +66,7 @@ const prZeroFindingsReview = (over = {}) => ({
   number: 3002,
   state: 'OPEN',
   headRefName: 'lane/xilx617-zero-findings',
-  headRefOid: '3002'.repeat(10).slice(0, 40),
+  headRefOid: '3002'.repeat(10).slice(0, 40), rowsHead: over.headRefOid ?? '3002'.repeat(10).slice(0, 40), rowsComplete: true,
   labels: lbl('review:pending'),
   mergeStateStatus: 'CLEAN',
   statusCheckRollup: greenRollup,

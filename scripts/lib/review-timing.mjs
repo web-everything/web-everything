@@ -134,8 +134,8 @@ function readableEarlyChecks(checks, headSha) {
 }
 
 /** Pending is the only relaxation: every prerequisite needs its own readable row on this head. */
-function registeredStartGate({ headSha, checks, requiredChecks }) {
-  const strict = reviewCiGate({ headSha, checks, requiredChecks });
+function registeredStartGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete }) {
+  const strict = reviewCiGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete });
   if (!checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
   // Same implication rule as the strict gate: a green aggregate (test) proves a split-out job (integration). The
@@ -174,12 +174,13 @@ function registeredStartGate({ headSha, checks, requiredChecks }) {
 }
 
 /** Start permission only. Merge/ready decisions must continue using their strict CI gates. */
-export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
-  const strict = () => reviewCiGate({ headSha, checks, requiredChecks });
+export function reviewStartGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  const strict = () => reviewCiGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete });
+  if (rowsComplete !== true || (rowsHead !== undefined && rowsHead !== headSha)) return strict();
   // Rollback preserves the original strict CI-green result, including its reason and affected rows.
   if (policy.startEarly === 'off' && !policy.startBeforeCi && policy.startAfter === 'ci-green') return strict();
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;
-  const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites });
+  const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites, rowsHead, rowsComplete });
   const pendingStart = gate => {
     const mode = policy.startEarly ?? REVIEW_TIMING_DEFAULTS.startEarly;
     if (!['shadow', 'on'].includes(mode)) return gate;
@@ -217,7 +218,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyG
     return { allowed: true, headSha, reason: 'verify-marker', affected: [] };
   }
   if (policy.startAfter === 'ci-green') return pendingStart(strict());
-  return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: prerequisites }));
+  return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: prerequisites, rowsHead, rowsComplete }));
 }
 export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks, requiredChecks }));
