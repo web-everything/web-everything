@@ -39,7 +39,11 @@ export function agentResumeId(argv = []) {
   return resumeIds(typeof argv === 'string' ? shellWords(argv) : argv)[0] ?? null;
 }
 
-function resumeIds(argv) {
+function resumeIds(allWords) {
+  // `--` ends option parsing: everything after it is prompt text, never a resume flag. A resume flag
+  // directly before it therefore has no value (reads as '' and is refused as a missing native id).
+  const delimiter = allWords.indexOf('--');
+  const argv = delimiter < 0 ? allWords : allWords.slice(0, delimiter);
   let hasExec = false;
   return argv.flatMap((word, i) => {
     if (word === 'exec') hasExec = true;

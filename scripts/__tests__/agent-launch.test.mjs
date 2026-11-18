@@ -167,6 +167,38 @@ describe('resume validation across execution forms', () => {
     expect(agentResumeId(`exec resume '${SID}'`)).toBe(SID);
     expect(agentResumeId('--print hello')).toBeNull();
   });
+  // Everything after the `--` end-of-options delimiter is prompt text, never a resume flag.
+  const afterDelimiter = [
+    ['claude', ['-p', '--', '--resume']],
+    ['claude', ['-p', '--', '--resume', SID]],
+    ['claude', ['-p', '--', '-r', SID]],
+    ['claude', ['-p', '--', '--session-id', SID]],
+    ['claude', ['-p', '--', `--resume=${SID}`]],
+    ['claude', ['-p', '--', `--session-id=${SID}`]],
+    ['codex', ['exec', '--', 'resume', SID]],
+    ['claude', '-p -- --resume'],
+    ['claude', `-p -- --resume ${SID}`],
+    ['claude -p -- --resume'],
+    ['sh', ['-c', 'claude -p -- --resume']],
+    [`claude -p -- -r ${SID} ; codex exec -- resume ${SID}`],
+  ];
+  it.each(afterDelimiter.map(args => [JSON.stringify(args), args]))('treats text after -- as prompt, not a resume flag, for %s', (_label, args) => {
+    const result = {}, primitive = vi.fn(() => result);
+    expect(launchAgent({ mode: 'claude-print', resumeId: null }, primitive, ...args)).toBe(result);
+    expect(primitive).toHaveBeenCalledTimes(1);
+  });
+  it('agentResumeId ignores resume-looking words after the delimiter but keeps ones before it', () => {
+    expect(agentResumeId(['-p', '--', '--resume'])).toBeNull();
+    expect(agentResumeId('-p -- --resume')).toBeNull();
+    expect(agentResumeId(['--resume', SID, '--', '--resume', 'other'])).toBe(SID);
+    expect(agentResumeId(['--', '--resume', SID])).toBeNull();
+  });
+  it('still checks resume flags that precede the delimiter, and a resume flag whose value would be the delimiter', () => {
+    const primitive = vi.fn(), log = vi.fn();
+    expect(() => launchAgent({ mode: 'claude-resume', resumeId: SID, log }, primitive, 'claude', ['--resume', SID, '--', '-r', 'other'])).not.toThrow();
+    expect(() => launchAgent({ mode: 'claude-resume', resumeId: SID, log }, primitive, 'claude', ['-r', 'other', '--', '--resume', SID])).toThrow('native resume id');
+    expect(() => launchAgent({ mode: 'claude-resume', resumeId: null, log }, primitive, 'claude', ['--resume', '--', 'prompt'])).toThrow('native resume id');
+  });
   it.each([['--resume'], ['-r'], ['--session-id'], ['--session-id='], ['--profile', 'fixture', 'exec', 'resume']])
   ('refuses missing native resume ids before execution (%j)', (...argv) => {
     const primitive = vi.fn(), log = vi.fn();
