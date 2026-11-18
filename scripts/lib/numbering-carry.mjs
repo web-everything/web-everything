@@ -17,6 +17,7 @@ import { isAutomationAuthored } from './marker-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { execFileSync } from 'node:child_process';
+import { laneGitHardeningEnv, scrubInheritedGitEnv } from './lane-git-hardening.mjs';
 import { BORN_AS_RE } from '../backlog/id.mjs';
 import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
 import { isKnownMachineBody, latestAcceptRecord, laterReviewHold, resolveAcceptCarryForward } from './accept-carry-forward.mjs';
@@ -222,18 +223,6 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   return { ok: true, pairs: [...map], renames };
 }
 
-/** IO: a missing commit is never fetched through the lane's own remotes (a lane origin.uploadpack/vcs/URL rewrite is
- *  agent-writable and would run or redirect). Only an injected, isolated `fetchMissing` may fetch; with none, the
- *  commit stays unreadable and the proof fails closed (retryable). */
-function ensureReadable(git, sha, fetchMissing) {
-  try { git(['cat-file', '-e', `${sha}^{commit}`]); }
-  catch (missing) {
-    if (typeof fetchMissing !== 'function') throw Error('commit unreadable in the lane and no isolated fetch is available', { cause: missing });
-    fetchMissing(sha);
-    git(['cat-file', '-e', `${sha}^{commit}`]);
-  }
-}
-
 /** IO: main's bornAs aliases are optional evidence; failed reads must not settle a refusal that needs them. */
 export function readExtraMap(git, mainRef) {
   const map = new Map();
@@ -267,20 +256,26 @@ function readExistingNumbers(git, ref) {
 }
 
 /**
- * IO (read-only git proof, apart from fetching missing objects): verify every new commit is drain numbering
+ * IO (local-only, read-only git proof): verify every new commit is drain numbering
  * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
- * @param {{exec:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string,fetchMissing?:(sha:string)=>void}} o
+ * @param {{exec?:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o — exec is retained for compatibility only.
  * @returns {{ok:true,commits:string[],pairs:Array<[string,string]>,reason:string}|{ok:false,reason:string,retryable?:boolean}}
  */
-export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd, fetchMissing } = {}) {
+export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd } = {}) {
   try {
-    if (typeof exec !== 'function' || !fromSha || !toSha) return refuse('no git reader or head');
+    if (!fromSha || !toSha) return refuse('no head');
     if (fromSha === toSha) return refuse('no head move');
     // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
     // dropping it would itself conceal a non-numbering byte change.
     const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    // The proof owns its runner: caller IO/env must never turn an object read into a lazy fetch.
+    const env = { ...laneGitHardeningEnv(scrubInheritedGitEnv()), GIT_NO_REPLACE_OBJECTS: '1',
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent',
+      GIT_TERMINAL_PROMPT: '0' };
+    const pins = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false'];
     const gitBytes = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
-      const output = exec('git', args, {
+      const output = execFileSync('git', [...pins, ...args], {
+        env,
         encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
         ...(cwd === undefined ? {} : { cwd }),
       }) ?? Buffer.alloc(0);
@@ -297,8 +292,18 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
       if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'NUMBERING_BYTES_NOT_EXACT' });
       return text;
     };
-    ensureReadable(git, fromSha, fetchMissing);
-    ensureReadable(git, toSha, fetchMissing);
+    // No matching keys is config's normal status 1; every other config failure refuses the proof.
+    let promisors = '';
+    try { promisors = git(['config', '--get-regexp', '^remote\\..*\\.promisor']); }
+    catch (error) { if (error?.status !== 1) throw error; }
+    for (const line of promisors.split('\n').filter(Boolean)) {
+      const key = /^(remote\..*\.promisor)\s/.exec(line)?.[1];
+      if (!key) throw Error('unreadable promisor config key');
+      pins.push('-c', `${key}=false`);
+    }
+    // Missing commits/objects stay missing: the outer boundary returns a retryable refusal.
+    git(['cat-file', '-e', `${fromSha}^{commit}`]);
+    git(['cat-file', '-e', `${toSha}^{commit}`]);
     // rev-list prints full shas: compare the chain's first parent against the resolved accepted head, not its spelling.
     fromSha = git(['rev-parse', '--verify', `${fromSha}^{commit}`]).trim();
     const lines = git(['rev-list', `--max-count=${MAX_NUMBERING_COMMITS + 1}`, '--topo-order', '--reverse', '--parents', toSha, `^${fromSha}`]).trim().split('\n').filter(Boolean);

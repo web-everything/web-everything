@@ -828,6 +828,12 @@ commits and changed trees through the writer, alongside refusal cases with zero 
 
 ## Human clearance across drain numbering
 
+`proveNumberingOnlyMove` owns its hardened local Git runner; its compatibility `exec` argument
+is ignored. Pass `cwd` explicitly through callers. Use real repositories and remove loose objects
+to test unreadable evidence; use Trace2 only to observe reads, never to replace them. Promisor
+regressions also run without `GIT_TRACE*` and assert no upload-pack marker is written. Missing
+objects refuse with `retryable: true`; restore local evidence before retrying.
+
 An approved human-surface head hold suppresses rebasing, never pending-card numbering before
 enqueue. Regress that preparation predicate with an approved human-only head carrying a hash card,
 and run real branch numbering with workflow edits while unqueued. Queued human-only or
