@@ -550,18 +550,19 @@ it('uses the PR snapshot to tag awaiting-base and clears it on promotion', () =>
 describe('concluded head review with a lingering process', () => {
   const accepted = ['review:accepted', 'red-team:clear'];
   const headRefOid = 'ad05aa50' + 'a'.repeat(32);
-  const comment = { author: { login: 'chalbert' },
-    body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` };
-  const subject = { headRefOid, comments: [comment] };
   const now = Date.parse('2026-11-18T12:00:00Z');
+  const comment = { author: { login: 'chalbert' }, createdAt: now - 180_000,
+    body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->` };
+  const gate = { author: comment.author, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` };
+  const subject = { number: 7099, headRefOid, comments: [gate, comment] };
   const row = { name: 'review-7099', state: 'working', pid: 12345, startedAt: now - 600_000 };
   const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
-    reviewConcluded: true, now, agents: [{ ...row, ...fields }], ...options });
+    reviewConcluded: reviewConcluded(accepted, subject), now, agents: [{ ...row, ...fields }], ...options });
 
   it('requires both labels in either supported label shape', () => {
-    expect(reviewConcluded(accepted, subject)).toBe(true);
-    expect(reviewConcluded(accepted.map(name => ({ name })), subject)).toBe(true);
-    expect(reviewConcluded(accepted, { ...subject, headRefOid: headRefOid.toUpperCase() })).toBe(true);
+    expect(reviewConcluded(accepted, subject)).toEqual({ createdAt: comment.createdAt });
+    expect(reviewConcluded(accepted.map(name => ({ name })), subject)).toEqual({ createdAt: comment.createdAt });
+    expect(reviewConcluded(accepted, { ...subject, headRefOid: headRefOid.toUpperCase() })).toEqual({ createdAt: comment.createdAt });
   });
   it.each(['review:pending', 'review:changes', 'review:human', 'red-team:pending',
     'red-team:blocked', 'review-status:draft-withdrawn'])('fails closed on %s alongside acceptance', blocker => {
@@ -575,9 +576,9 @@ describe('concluded head review with a lingering process', () => {
     { ...subject, headRefOid: headRefOid.slice(0, 8) }, { ...subject, headRefOid: headRefOid + 'a' },
     { headRefOid }, { headRefOid, comments: [] }, { headRefOid, comments: {} },
     { ...subject, headRefOid: 'b'.repeat(40) },
-    { headRefOid, comments: [{ ...comment, author: { login: 'stranger' } }] },
-    { headRefOid, comments: [{ body: comment.body }] },
-    { headRefOid, comments: [{ ...comment, body: comment.body.replace(headRefOid, headRefOid.slice(0, 8)) }] },
+    { ...subject, comments: [gate, { ...comment, author: { login: 'stranger' } }] },
+    { ...subject, comments: [gate, { body: comment.body }] },
+    { ...subject, comments: [gate, { ...comment, body: comment.body.replace(headRefOid, headRefOid.slice(0, 8)) }] },
   ])('fails closed on missing, stale, partial or untrusted head evidence %j', pr => {
     expect(reviewConcluded(accepted, pr)).toBe(false);
   });
@@ -587,18 +588,51 @@ describe('concluded head review with a lingering process', () => {
     expect(derive({}, { reviewConcluded: false })).toEqual({ role: 'review', state: 'reviewing' });
     expect(derive({}, { reviewConcluded: 'true' })?.state).toBe('reviewing');
   });
-  it.each(['startedAt', 'updatedAt'])('uses %s with a two-minute inclusive bound in epoch, numeric string and ISO shapes', key => {
-    for (const stamp of [now - 120_000, String(now - 120_000), new Date(now - 120_000).toISOString()]) {
-      expect(derive({ [key]: stamp })).toBeNull();
+  it('uses the verdict age with an inclusive two-minute bound in epoch, numeric string and ISO shapes', () => {
+    for (const createdAt of [now - 120_000, String(now - 120_000), new Date(now - 120_000).toISOString()]) {
+      expect(derive({}, { reviewConcluded: { createdAt } })).toBeNull();
     }
-    expect(derive({ [key]: now - 119_999 })?.state).toBe('reviewing');
+    expect(derive({}, { reviewConcluded: { createdAt: now - 119_999 } })?.state).toBe('reviewing');
   });
-  it.each([null, '', 'unreadable', Infinity, Number.MAX_VALUE, 0, now + 1])('retains the reviewing hold on invalid/future timestamp %j', startedAt => {
-    expect(derive({ startedAt })?.state).toBe('reviewing');
+  it.each([undefined, null, '', 'unreadable', Infinity, Number.MAX_VALUE, 0, now + 1])('retains the reviewing hold on invalid/future start or verdict timestamp %j', stamp => {
+    expect(derive({ startedAt: stamp })?.state).toBe('reviewing');
+    expect(derive({}, { reviewConcluded: { createdAt: stamp } })?.state).toBe('reviewing');
   });
-  it('does not let an old sibling or start hide a fresh review row/update', () => {
-    expect(derive({ startedAt: now - 600_000, updatedAt: now })?.state).toBe('reviewing');
-    expect(derive({}, { agents: [{ ...row, startedAt: now - 600_000 }, { ...row, startedAt: now }] })?.state).toBe('reviewing');
+  it('keeps a review started after or at the verdict live even when its start is older than two minutes', () => {
+    expect(derive({ startedAt: now - 150_000 })?.state).toBe('reviewing');
+    expect(derive({ startedAt: comment.createdAt })?.state).toBe('reviewing');
+    expect(derive({}, { agents: [row, { ...row, startedAt: now - 150_000 }] })?.state).toBe('reviewing');
+  });
+  it('uses only startedAt, never updatedAt as the start or completion evidence', () => {
+    expect(derive({ startedAt: undefined, updatedAt: now - 600_000 })?.state).toBe('reviewing');
+    expect(derive({ updatedAt: now })).toBeNull();
+  });
+  it.each(['sent-back', 'round-cap'])('keeps reviewing on the head gate outcome %s despite a clear gate', outcome => {
+    const evidence = reviewConcluded(accepted, { ...subject, comments: [gate, comment,
+      { ...gate, body: gate.body.replace('outcome=clear', `outcome=${outcome}`) }] });
+    expect(evidence).toBe(false);
+    expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
+  });
+  it('allows card-queued gate evidence', () => {
+    expect(reviewConcluded(accepted, { ...subject, comments: [
+      { ...gate, body: gate.body.replace('outcome=clear', 'outcome=card-queued') }, comment,
+    ] })).toEqual({ createdAt: comment.createdAt });
+  });
+  it.each(['> ', 'quoted\n', '```\n'])('keeps reviewing when advisory or gate markers are embedded behind %j', prefix => {
+    for (const target of [gate, comment]) {
+      const evidence = reviewConcluded(accepted, { ...subject, comments: [gate, comment].map(c =>
+        c === target ? { ...c, body: prefix + c.body } : c) });
+      expect(evidence).toBe(false);
+      expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
+    }
+  });
+  it('keeps reviewing on wrong PR markers or missing PR context', () => {
+    for (const target of [gate, comment]) {
+      expect(reviewConcluded(accepted, { ...subject, comments: [gate, comment].map(c =>
+        c === target ? { ...c, body: c.body.replace('pr=7099', 'pr=7105') } : c) })).toBe(false);
+    }
+    expect(reviewConcluded(accepted, { ...subject, number: undefined })).toBe(false);
+    expect(reviewConcluded(accepted, subject, 7105)).toBe(false);
   });
   it('keeps live fix claims, fix sessions, CI healing and draft states', () => {
     expect(derive({}, { fixClaim: {} })).toEqual({ role: 'fix', state: 'fixing' });

@@ -21,10 +21,28 @@ export default {
     };
     const accepted = ['review:accepted', 'red-team:clear'];
     const headRefOid = 'a'.repeat(40);
-    const comments = [{ author: { login: 'chalbert' },
-      body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` }];
+    const now = Date.now();
+    const advisory = { author: { login: 'chalbert' }, createdAt: new Date(now - 180_000).toISOString(),
+      body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->` };
+    const gate = { author: advisory.author,
+      body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` };
+    const comments = [gate, advisory];
     for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}] of [
       [accepted, null, 'ready-to-merge'],
+      [accepted, null, 'ready-to-merge', { comments: [
+        { ...gate, body: gate.body.replace('outcome=clear', 'outcome=card-queued') }, advisory] }],
+      ...[gate, advisory].flatMap(target => [
+        [accepted, 'reviewing', 'red-team', { comments: comments.map(c => c === target ? { ...c, body: `quoted\n${c.body}` } : c) }],
+        [accepted, 'reviewing', 'red-team', { comments: comments.map(c => c === target ? { ...c, body: c.body.replace('pr=7099', 'pr=7105') } : c) }],
+      ]),
+      ...['sent-back', 'round-cap'].map(outcome => [accepted, 'reviewing', 'red-team',
+        { comments: [...comments, { ...gate, body: gate.body.replace('outcome=clear', `outcome=${outcome}`) }] }]),
+      [accepted, 'reviewing', 'red-team', {}, { startedAt: now - 150_000 }],
+      [accepted, 'reviewing', 'red-team', {}, { startedAt: undefined, updatedAt: now - 600_000 }],
+      [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, createdAt: undefined }] }],
+      [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, createdAt: new Date(now - 60_000).toISOString() }] }],
+      [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, author: { login: 'stranger' } }] }],
+      [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, body: advisory.body.replace(headRefOid, 'b'.repeat(40)) }] }],
       [accepted, 'reviewing', 'red-team', { headRefOid: 'b'.repeat(40) }],
       [accepted, 'reviewing', 'red-team', { headRefOid: undefined }],
       [accepted, 'reviewing', 'red-team', { comments: undefined }],
@@ -47,7 +65,7 @@ export default {
       };
       const result = tagReviewStatus({ pr: 7099, repo: 'we', provider,
         agents: [{ name: 'review-7099', state: 'working', pid: 7099,
-          startedAt: Date.now() - 600_000, ...agentFields }],
+          startedAt: now - 600_000, ...agentFields }],
         prState: { number: 7099, state: 'OPEN', isDraft: false, baseRefName: 'main',
           headRefOid, mergeable: 'MERGEABLE', comments,
           statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...prFields },

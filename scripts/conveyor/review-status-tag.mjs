@@ -28,6 +28,7 @@
  */
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 import { trustedAdvisoryComments } from '../lib/advisory-labels.mjs';
+import { parseRedTeamGateMarker, gateOutcomesForHead } from '../lib/red-team-gate.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -100,30 +101,40 @@ export const STATUS_LABEL_RE = /^review-status:(reviewing|review-stalled|fixing|
 const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
 
 /** Head-bound acceptance is complete only with an unambiguous red-team clearance. */
-export function reviewConcluded(labels, subject) {
+export function reviewConcluded(labels, subject, pr = subject?.number) {
   const head = subject?.headRefOid;
-  if (!Array.isArray(labels) || typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return false;
+  if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
+    || !Array.isArray(labels) || typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return false;
   const names = Array.from(labels, l => typeof l === 'string' ? l : l?.name);
   if (names.some(name => typeof name !== 'string' || !name)) return false;
-  return names.includes('review:accepted') && names.includes('red-team:clear')
-    && !names.some(name => ['review:pending', 'review:changes', 'review:human',
-      'red-team:pending', 'red-team:blocked', 'review-status:draft-withdrawn'].includes(name))
-    && trustedAdvisoryComments(subject?.comments).some(comment => typeof comment.body === 'string'
-      && [...comment.body.matchAll(/<!-- we:red-team-gate pr=\d+ rev=([a-f0-9]{40})\s[^<>]*-->/gi)]
-        .some(match => match[1].toLowerCase() === head.toLowerCase()));
+  if (!names.includes('review:accepted') || !names.includes('red-team:clear')
+    || names.some(name => ['review:pending', 'review:changes', 'review:human',
+      'red-team:pending', 'red-team:blocked', 'review-status:draft-withdrawn'].includes(name))) return false;
+  const comments = trustedAdvisoryComments(subject?.comments);
+  const outcomes = gateOutcomesForHead(comments, pr, head);
+  if (outcomes.has('sent-back') || outcomes.has('round-cap') || !comments.some(comment => {
+    const marker = parseRedTeamGateMarker(comment.body);
+    return marker?.pr === Number(pr) && marker.rev === head.toLowerCase() && outcomes.has(marker.outcome);
+  })) return false;
+  const advisory = comments.findLast(comment => {
+    const marker = /^<!-- we:red-team-advisory pr=(\d+) rev=([a-f0-9]{40}) -->/i.exec(comment.body ?? '');
+    return marker && Number(marker[1]) === Number(pr) && marker[2].toLowerCase() === head.toLowerCase();
+  });
+  return advisory ? { createdAt: advisory.createdAt } : false;
 }
 
-// A newly dispatched review can briefly coexist with the preceding verdict labels.
-// Preserve its visible reviewing hold for two minutes; malformed/future dates keep that hold
-// until the evidence is repaired. Timestamp-less rows also keep that hold.
-const REVIEW_START_GRACE_MS = 120_000;
-function concludedReviewRow(row, now) {
-  const stamps = [row.startedAt, row.updatedAt].filter(value => value !== undefined);
-  return stamps.length > 0 && stamps.every(value => {
-    const ms = typeof value === 'number' ? value : typeof value === 'string'
-      ? (/^\d+$/.test(value.trim()) ? Number(value) : Date.parse(value)) : NaN;
-    return Number.isFinite(ms) && ms > 0 && Number.isFinite(now) && now - ms >= REVIEW_START_GRACE_MS;
-  });
+// Only a verdict posted after this row began can conclude it. Missing timestamps
+// retain the visible hold; allow two minutes after the verdict for process cleanup.
+const REVIEW_VERDICT_GRACE_MS = 120_000;
+function timestampMs(value) {
+  return typeof value === 'number' ? value : typeof value === 'string'
+    ? (/^\d+$/.test(value.trim()) ? Number(value) : Date.parse(value)) : NaN;
+}
+function concludedReviewRow(row, evidence, now) {
+  const start = timestampMs(row.startedAt);
+  const verdict = timestampMs(evidence?.createdAt);
+  return Number.isFinite(start) && start > 0 && Number.isFinite(verdict) && verdict > start
+    && Number.isFinite(now) && now - verdict >= REVIEW_VERDICT_GRACE_MS;
 }
 
 /**
@@ -140,7 +151,7 @@ function concludedReviewRow(row, now) {
  * (`we:scripts/conveyor/reconcile-core.mjs#classifyPr`'s `ci-red` phase is its own branch ahead of the
  * `OWED`/`OWED_ELSEWHERE` table), so the ordering is precedence-in-name-only — it never actually shadows a
  * real ci-heal for a PR that also has a stale review/fix session row sitting in `claude agents --json`.
- * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null, reviewConcluded?:boolean, now?:number}} o
+ * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null, reviewConcluded?:{createdAt?:string|number}|false, now?:number}} o
  * @returns {{role:'review'|'fix'|'ci-heal'|'draft', state:'reviewing'|'review-stalled'|'fixing'|'fix-stalled'|'fixing-conflict'|'fixing-conflict-stalled'|'healing-ci'|'ci-heal-stalled'|'awaiting-ci'|'awaiting-base'|'draft-scope-change'|'draft-withdrawn'|'needs-human'}|null}
  */
 export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = false, baseRefName, defaultBranch = 'main', mergeConflicted = false, fixClaim = null, escalation = null, reviewConcluded = false, now = Date.now() } = {}) {
@@ -170,7 +181,7 @@ export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = fal
   // other row is simply not a candidate at all — see LIVE_STATES.
   const liveFor = (name) => {
     const matches = list.filter((a) => a?.name === name && Object.hasOwn(LIVE_STATES, a.state) && !isFinishedOverride(a)
-      && !(name === reviewName && reviewConcluded === true && concludedReviewRow(a, now)));
+      && !(name === reviewName && concludedReviewRow(a, reviewConcluded, now)));
     return matches.find((a) => a.state === 'working') ?? matches[0] ?? null;
   };
   if (escalation?.outcome === 'needs-human') return { role: 'ci-heal', state: 'needs-human' };
@@ -304,7 +315,7 @@ export function tagReviewStatus({
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
-    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: reviewConcluded(currentLabels, subject) });
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: reviewConcluded(currentLabels, subject, pr) });
   const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
     add: null,
     remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)
