@@ -742,6 +742,8 @@ function judgeTelemetryFrom(outcome, effective) {
     usage: outcome.usage,
     transcriptFile: outcome.transcriptFile,
     timedOut: outcome.timedOut,
+    lastEvents: outcome.lastEvents,
+    lastToolCall: outcome.lastToolCall,
     // Held item 223 — a seat the provider had to retry (`judgeSpawn`'s unparseable-stdout retry) says so on the record.
     attempts: outcome.attempts,
     effectiveEffort: outcome.effort,

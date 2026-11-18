@@ -4441,3 +4441,13 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Claude juror stream diagnostics
+
+Claude jurors use verbose `stream-json`; only the terminal `result` supplies the verdict.
+Keep the last 50 bounded event projections and a redacted last-tool summary through both
+error telemetry and the run-record whitelist. Never persist raw tool inputs as event evidence.
+Detached jurors own a process group: kill that group at timeout and clean up leftovers on close.
+`scripts/lib/__tests__/judge-spawn.stream.test.mjs` exercises real grandchild cleanup,
+chunked results, missing results, oversized events, redaction, and non-interactive Bash bounds.
+Run it with the other `judge-spawn*.test.mjs` files through heavy-admission.

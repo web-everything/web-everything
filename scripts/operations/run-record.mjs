@@ -135,7 +135,7 @@ export function newJobRunRecord({ id, kind, input = {}, codeMode, maxAttempts, c
  * `usage` is handled separately (it is an object of counters, not a scalar).
  */
 const TELEMETRY_NUMBERS = Object.freeze(['costUsd', 'durationMs', 'wallMs', 'numTurns', 'loadedContextTokens', 'exitCode', 'attempts']);
-const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision', 'signal', 'stderrTail', 'failure', 'failureKind', 'failureText']);
+const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision', 'signal', 'stderrTail', 'failure', 'failureKind', 'failureText', 'lastToolCall']);
 /**
  * Held item 223 — WHY A SEAT FAILED, not only what it cost. `exitCode`, `signal`, `attempts`, `failure` and a
  * `stderrTail` come from `we:scripts/lib/judge-spawn.mjs#JudgeUnparseableError`'s telemetry. Before they were on this
@@ -143,7 +143,7 @@ const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'mod
  * could say whether the juror was killed, crashed or printed nothing. `stderrTail` is bounded here as well as at the
  * source, because this row is written on every `advance`.
  */
-const TELEMETRY_STRING_MAX = Object.freeze({ stderrTail: 1000, failureText: 500 });
+const TELEMETRY_STRING_MAX = Object.freeze({ stderrTail: 1000, failureText: 500, lastToolCall: 160 });
 /**
  * THE FLAGS, recorded only when TRUE. A `timedOut: false` on every row is noise; the fact being recorded is
  * the exception, and its absence is the ordinary case (#3203). Without it a juror that hit the wall and a
@@ -181,6 +181,14 @@ export function normalizeJudgeTelemetry({ step = '', stepIndex = null, telemetry
   }
   for (const k of TELEMETRY_FLAGS) {
     if (src[k] === true) row[k] = true;
+  }
+  if (Array.isArray(src.lastEvents)) {
+    row.lastEvents = Object.freeze(src.lastEvents.slice(-50).filter(isPlainObject).map(event => Object.freeze({
+      type: typeof event.type === 'string' ? event.type.slice(0, 40) : 'unrecognized',
+      ...(event.truncated === true ? { truncated: true } : {}),
+      ...(Array.isArray(event.tools) ? { tools: Object.freeze(event.tools.slice(-8)
+        .filter(t => typeof t === 'string').map(t => t.slice(0, 160))) } : {}),
+    })));
   }
   const usage = {};
   if (isPlainObject(src.usage)) {

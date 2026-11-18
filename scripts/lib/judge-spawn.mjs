@@ -230,18 +230,78 @@ function stderrSnippet(stderr) {
   return String(stderr).trim().replace(/\s+/g, ' ').slice(-160);
 }
 
+/** Fixed bounds also apply when the caller supplies a more permissive environment. */
+export function buildJudgeEnv(env = process.env) {
+  return markWorkerEnv({ ...sanitizeSpawnEnv(env),
+    GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
+    GIT_TERMINAL_PROMPT: '0', CI: '1',
+    BASH_DEFAULT_TIMEOUT_MS: '300000', BASH_MAX_TIMEOUT_MS: '600000',
+  });
+}
+
+const STREAM_LIMIT = 8 * 1024 * 1024;
+const SAFE_COMMAND_WORDS = new Set('git status diff log show rev-parse node npm npx test run vitest rg sed ls pwd head tail find bash sh sleep'.split(' '));
+
+// Keep command structure, never arbitrary arguments, paths, output, or credentials.
+function toolSummary(block) {
+  const name = typeof block.name === 'string' ? block.name.replace(/[^\w:.-]/g, '').slice(0, 60) : '[unknown tool]';
+  const command = block.input?.command;
+  const input = typeof command === 'string'
+    ? command.split(/\s+/).slice(0, 12).map(w => SAFE_COMMAND_WORDS.has(w) ? w : '[redacted]').join(' ').slice(0, 120)
+    : '[input redacted]';
+  return `${name}: ${input}`;
+}
+
+function streamEvidence() {
+  const lastEvents = [];
+  let pending = '';
+  let oversized = false;
+  let lastToolCall = null;
+  const line = (text) => {
+    let event;
+    try { event = JSON.parse(text); } catch { event = null; }
+    const tools = Array.isArray(event?.message?.content)
+      ? event.message.content.filter(b => b?.type === 'tool_use').slice(-8).map(toolSummary) : [];
+    if (tools.length) lastToolCall = tools.at(-1);
+    // A projection bounds each event and excludes arbitrary model/tool text.
+    const type = ['system', 'assistant', 'user', 'result', 'stream_event'].includes(event?.type) ? event.type : 'unrecognized';
+    lastEvents.push({ type, ...(tools.length ? { tools } : {}), ...(oversized ? { truncated: true } : {}) });
+    if (lastEvents.length > 50) lastEvents.shift();
+  };
+  return {
+    lastEvents,
+    get lastToolCall() { return lastToolCall; },
+    add(chunk) {
+      for (const [i, part] of String(chunk).split('\n').entries()) {
+        if (i) { line(pending); pending = ''; oversized = false; }
+        if (pending.length + part.length > STREAM_LIMIT) oversized = true;
+        pending = (pending + part).slice(0, STREAM_LIMIT);
+      }
+    },
+    finish() { if (pending || oversized) { line(pending); pending = ''; oversized = false; } },
+  };
+}
+
+function killJudgeGroup(child, fallback = true) {
+  if (Number.isInteger(child.pid) && child.pid > 0) {
+    try { process.kill(-child.pid, 'SIGKILL'); return; } catch { /* fallback below */ }
+  }
+  if (fallback) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+}
+
 /** Final unparseable output, with evidence from every failed attempt. */
 export class JudgeUnparseableError extends Error {
-  constructor({ attempt, attempts, exitCode, signal, stdout, stderr, wallMs, sessionId, failedAttempts }) {
+  constructor({ attempt, attempts, exitCode, signal, stdout, stderr, wallMs, sessionId, failedAttempts, lastEvents = [], lastToolCall = null }) {
     const bytes = stdout.length;
     const snippet = stderrSnippet(stderr);
     const tail = String(stderr).trim().slice(-600);
     exitCode = exitCode ?? null;
     signal = signal ?? null;
     super(
-      `judge-spawn: the juror did not emit parseable JSON on stdout (attempt ${attempt}/${attempts}, exit ${exitCode ?? 'none'}, signal ${signal ?? 'none'}, stdout ${bytes} bytes${snippet ? `, stderr: ${snippet}` : ''}).\n`
-      + `stdout[0..600]: ${String(stdout).slice(0, 600)}\n`
-      + (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
+      `judge-spawn: the juror did not emit parseable JSON on stdout (attempt ${attempt}/${attempts}, exit ${exitCode ?? 'none'}, signal ${signal ?? 'none'}, stdout ${bytes} bytes${snippet ? `, stderr: ${snippet}` : ''}${lastToolCall ? `, last tool: ${lastToolCall}` : ''}).\n`
+      + `stdout[0..600]: ${lastEvents.some(e => e.type !== 'unrecognized' || e.truncated) ? JSON.stringify(lastEvents).slice(0, 600) : String(stdout).slice(0, 600)}\n`
+      + (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>')
+      + (lastEvents.some(e => e.truncated) ? '\nStream diagnostics were truncated; rerun with a narrower mandate to inspect the step.' : ''),
     );
     this.name = 'JudgeUnparseableError';
     this.unparseable = true;
@@ -253,7 +313,9 @@ export class JudgeUnparseableError extends Error {
     this.wallMs = wallMs;
     this.sessionId = sessionId;
     this.failedAttempts = failedAttempts;
-    this.telemetry = { sessionId, wallMs, exitCode, signal, stderrTail: this.stderrTail, attempts, failure: 'unparseable-stdout' };
+    this.lastEvents = lastEvents;
+    this.lastToolCall = lastToolCall;
+    this.telemetry = { sessionId, wallMs, exitCode, signal, stderrTail: this.stderrTail, attempts, lastEvents, lastToolCall, failure: 'unparseable-stdout' };
   }
 }
 
@@ -266,18 +328,24 @@ export class JudgeUnparseableError extends Error {
  * tool-bearing juror has usually done most of the review, and discarding that is the loss this exists to end.
  */
 export class JudgeTimeoutError extends Error {
-  constructor({ timeoutMs, wallMs, stdout = '', stderr = '' }) {
+  constructor({ timeoutMs, wallMs, stdout = '', stderr = '', sessionId, lastEvents = [], lastToolCall = null }) {
     super(
-      `judge-spawn: the juror exceeded ${timeoutMs}ms and was killed (ran ${wallMs}ms). `
+      `judge-spawn: the juror exceeded ${timeoutMs}ms and was killed (ran ${wallMs}ms)${lastToolCall ? `; last tool: ${lastToolCall}` : ''}. `
       + 'Its output did not parse, so no partial verdict is available — but this is a BOUND being hit, not a '
       + `crash: see JUDGE_TIMEOUT_MS for what the bound was derived from.\n`
-      + `stdout[0..600]: ${String(stdout).slice(0, 600)}\n`
-      + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`,
+      + `stdout[0..600]: ${lastEvents.some(e => e.type !== 'unrecognized' || e.truncated) ? JSON.stringify(lastEvents).slice(0, 600) : String(stdout).slice(0, 600)}\n`
+      + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`
+      + (lastEvents.some(e => e.truncated) ? '\nStream diagnostics were truncated; rerun with a narrower mandate to inspect the step.' : ''),
     );
     this.name = 'JudgeTimeoutError';
     this.timedOut = true;
     this.timeoutMs = timeoutMs;
     this.wallMs = wallMs;
+    this.sessionId = sessionId;
+    this.lastEvents = lastEvents;
+    this.lastToolCall = lastToolCall;
+    this.telemetry = { sessionId, wallMs, timedOut: true, lastEvents, lastToolCall,
+      stderrTail: String(stderr).trim().slice(-1000), failure: 'timeout' };
     this.partialStdout = String(stdout);
     this.partialStderr = String(stderr);
   }
@@ -674,7 +742,8 @@ export function buildJudgeArgv({
     : ['--allowedTools', ...allowedTools];
   return [
     '-p',
-    '--output-format', 'json',
+    '--output-format', 'stream-json',
+    '--verbose',
     '--safe-mode',                    // NOT --bare: see FORBIDDEN_ARGV and the header's trap section.
     ...toolArgs,
     '--model', model,
@@ -722,13 +791,15 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
   let parsed;
   try {
     parsed = JSON.parse(String(stdout));
+    if (parsed?.type && parsed.type !== 'result') throw new Error('missing result event');
   } catch {
+    parsed = undefined;
     for (const line of String(stdout).split(/\r?\n/).reverse()) {
       if (!line.trim()) continue;
       try {
         const candidate = JSON.parse(line);
         if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
-          && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result')) {
+          && (candidate.type === 'result' || (!candidate.type && ('structured_output' in candidate || 'is_error' in candidate)))) {
           parsed = candidate;
           break;
         }
@@ -921,10 +992,11 @@ export async function judgeSpawn({
     // already written — and a tool-bearing juror at the wall has usually done most of the review. Killing and
     // then settling with the accumulated streams turns total loss into a parse attempt: often the answer IS
     // there and only the process failed to exit.
+    const evidence = streamEvidence();
     const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
       let child;
       try {
-        child = spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'] });
+        child = spawnFn(cli, argv, { cwd: spawnCwd, env: buildJudgeEnv(env), detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
       } catch (e) {
         reject(new Error(`judge-spawn: could not start \`${cli}\`: ${e.message}`));
         return;
@@ -946,7 +1018,7 @@ export async function judgeSpawn({
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           killed = true;
-          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          killJudgeGroup(child);
           // Settling on `close` rather than here is what preserves the partial output: Node delivers the
           // buffered `data` events first. The grace timer only covers a `close` that never arrives.
           grace = setTimeout(() => settle({ stdout: out, stderr: err, code: null, signal: null, timedOut: true }), JUDGE_TIMEOUT_GRACE_MS);
@@ -954,19 +1026,26 @@ export async function judgeSpawn({
         }, timeoutMs);
         if (typeof timer.unref === 'function') timer.unref();
       }
-      child.stdout?.on('data', (d) => { out += d; });
-      child.stderr?.on('data', (d) => { err += d; });
+      child.stdout?.setEncoding?.('utf8');
+      child.stderr?.setEncoding?.('utf8');
+      child.stdout?.on('data', (d) => { evidence.add(d); out = (out + d).slice(-STREAM_LIMIT); });
+      child.stderr?.on('data', (d) => { err = (err + d).slice(-STREAM_LIMIT); });
       child.on('error', (e) => {
         if (timer) clearTimeout(timer);
         if (grace) clearTimeout(grace);
         reject(new Error(`judge-spawn: \`${cli}\` failed to run: ${e.message}`));
       });
-      child.on('close', (c, signal) => settle({ stdout: out, stderr: err, code: c, signal, timedOut: killed }));
+      child.on('close', (c, signal) => {
+        killJudgeGroup(child, false);
+        settle({ stdout: out, stderr: err, code: c, signal, timedOut: killed });
+      });
       // The judged material rides stdin — see the header on ARG_MAX and the variadic `--tools`.
       child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
       child.stdin?.end(input);
     });
 
+    evidence.finish();
+    const { lastEvents, lastToolCall } = evidence;
     const thisAttemptMs = Date.now() - startedAt;
     wallMs += thisAttemptMs;
     // A KILLED JUROR IS TRIED, NOT DISCARDED. The wall is a bound on runaway, and a juror that emitted its
@@ -976,8 +1055,12 @@ export async function judgeSpawn({
     if (timedOut) {
       let outcome = null;
       try { outcome = parseJudgeOutcome(stdout, stderr, budget); } catch { outcome = null; }
-      if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
-      return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: true, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
+      if (!outcome) {
+        const error = new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr, sessionId: thisSid, lastEvents, lastToolCall });
+        log(error.message.split('\n')[0]);
+        throw error;
+      }
+      return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: true, lastEvents, lastToolCall, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
     }
     // `parseJudgeOutcome` throws with the CLI's own words; a non-zero exit with unparseable stdout lands there too.
     let outcome;
@@ -987,17 +1070,19 @@ export async function judgeSpawn({
       if (error.unparseableStdout !== true) throw error;
       failedAttempts.push({
         attempt, sessionId: thisSid, exitCode: code ?? null, signal: signal ?? null,
-        stdoutBytes: stdout.length, stderrTail: stderr.trim().slice(-1000), wallMs: thisAttemptMs,
+        stdoutBytes: stdout.length, stderrTail: stderr.trim().slice(-1000), wallMs: thisAttemptMs, lastEvents, lastToolCall,
       });
       if (attempt < total) {
         const snippet = stderrSnippet(stderr);
         const nextSid = retrySessionId(sid, attempt + 1);
-        log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
+        log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}${lastToolCall ? `, last tool: ${lastToolCall}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
         continue;
       }
-      throw new JudgeUnparseableError({
-        attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts,
+      const failure = new JudgeUnparseableError({
+        attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts, lastEvents, lastToolCall,
       });
+      log(failure.message.split('\n')[0]);
+      throw failure;
     }
     return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: false, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
   }

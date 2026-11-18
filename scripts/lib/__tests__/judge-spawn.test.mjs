@@ -124,7 +124,8 @@ describe('buildJudgeArgv — the recipe, pinned exactly (#3028)', () => {
     });
     expect(argv).toEqual([
       '-p',
-      '--output-format', 'json',
+      '--output-format', 'stream-json',
+      '--verbose',
       '--safe-mode',
       '--tools', '',
       '--model', 'opus',
@@ -544,7 +545,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     const { fn, seen } = fakeSpawn(okJson);
     await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, cwd: '/tmp/juror', env: { A: '1' }, spawnFn: fn });
     expect(seen.opts.cwd).toBe('/tmp/juror');
-    expect(seen.opts.env).toEqual({ A: '1', WE_CONVEYOR_WORKER: '1' }); // #3383: a juror is a worker, marked so tick-once refuses in it
+    expect(seen.opts.env).toEqual({ A: '1', WE_CONVEYOR_WORKER: '1', GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
+      GIT_TERMINAL_PROMPT: '0', CI: '1', BASH_DEFAULT_TIMEOUT_MS: '300000', BASH_MAX_TIMEOUT_MS: '600000' }); // #3383: a juror is a worker, marked so tick-once refuses in it
   });
 
   // #landing-freeze-2779 — live incident regression guard: this spawn used to forward the caller's `env`
@@ -557,7 +559,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, cwd: '/tmp/juror',
       env: { A: '1', GH_TOKEN: 'stale-static-token', GITHUB_TOKEN: 'stale-static-token-2' }, spawnFn: fn,
     });
-    expect(seen.opts.env).toEqual({ A: '1', WE_CONVEYOR_WORKER: '1' });
+    expect(seen.opts.env).toEqual({ A: '1', WE_CONVEYOR_WORKER: '1', GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
+      GIT_TERMINAL_PROMPT: '0', CI: '1', BASH_DEFAULT_TIMEOUT_MS: '300000', BASH_MAX_TIMEOUT_MS: '600000' });
   });
 
   it('throws the juror\'s OWN failure text rather than a paraphrase', async () => {
