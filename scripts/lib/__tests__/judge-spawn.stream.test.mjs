@@ -71,6 +71,52 @@ describe('Claude stream diagnostics', () => {
     }
   });
 
+  it('uses the last result event even when an earlier result has a verdict', () => {
+    const last = { ...result, structured_output: { verdict: 'reject' } };
+    expect(parseJudgeOutcome(jsonl([result, last, { type: 'system' }])).value)
+      .toEqual({ verdict: 'reject' });
+  });
+
+  it.each([
+    ['non-JSON trailer', 'incomplete output\n', /did not emit parseable JSON/],
+    ['truncated result', '{"type":"result","structured_output":', /did not emit parseable JSON/],
+    ['error result', jsonl([{ type: 'result', is_error: true, result: 'terminal failure' }]), /terminal failure/],
+    ['empty error result', jsonl([{ type: 'result', is_error: true }]), /no result text/],
+    ['missing structured output', jsonl([{ type: 'result' }]), /structured_output/],
+    ['invalid structured output', jsonl([{ type: 'result', structured_output: null }]), /structured_output/],
+  ])('refuses an earlier verdict after a terminal %s', async (_name, trailer, message) => {
+    const stdout = jsonl([result]) + trailer;
+    expect(() => parseJudgeOutcome(stdout)).toThrow(message);
+    await expect(judgeSpawn({ ...request, ...fake([], { chunks: [stdout] }), log: () => {} }))
+      .rejects.toThrow(message);
+  });
+
+  it.each([false, true])('redacts and bounds CLI error diagnostics (empty result=%s)', async empty => {
+    const secret = 'private-cli-credential';
+    const text = `SECRET_TOKEN=${secret} ${'x'.repeat(5000)}`;
+    const event = { type: 'result', is_error: true, result: empty ? '' : text,
+      session_id: text, metadata: { nested: [text] } };
+    const stderr = `${'x'.repeat(5000)} SECRET_TOKEN=${secret}`;
+    const error = await judgeSpawn({ ...request, ...fake([event], { stderr }), log: () => {} })
+      .catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    const diagnostics = inspect(error, { depth: null });
+    expect(diagnostics).not.toContain(secret);
+    expect(error.message).toContain('<redacted');
+    expect(error.message.length).toBeLessThan(1400);
+    expect(error.message).toContain(empty ? 'no result text' : 'the juror failed:');
+  });
+
+  it('redacts quota failure telemetry as well as the CLI error message', () => {
+    const text = "You've hit your weekly limit · resets tomorrow SECRET_TOKEN=private-quota-credential";
+    let error;
+    try { parseJudgeOutcome(jsonl([{ type: 'result', is_error: true, result: text }])); }
+    catch (e) { error = e; }
+    expect(error.quota).toBe(true);
+    expect(error.telemetry.failureText).toContain('<redacted');
+    expect(inspect(error, { depth: null })).not.toContain('private-quota-credential');
+  });
+
   it.each([false, true])('redacts credential tool names and replaces invalid or oversized names (timeout=%s)', async hang => {
     const names = ['ghp_abcdefghijklmnopqrstuvwxyz1234567890', 'sk-abcdefghijklmnop',
       'Bash invalid', 'x'.repeat(41), '', null];
@@ -234,6 +280,24 @@ describe('Claude stream diagnostics', () => {
 });
 
 describe('Claude non-interactive environment', () => {
+  it.each([
+    { GIT_SSH: 'custom-ssh' },
+    { GIT_SSH: '' },
+    { GIT_SSH_COMMAND: '' },
+    { GIT_SSH_COMMAND: 'custom-command', GIT_SSH: 'custom-ssh' },
+    { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.sshCommand', GIT_CONFIG_VALUE_0: 'custom-ssh' },
+    { GIT_CONFIG_COUNT: '0' },
+    { GIT_CONFIG_PARAMETERS: "'core.sshCommand=custom-ssh'" },
+    { GIT_CONFIG_PARAMETERS: '' },
+  ])('leaves caller SSH settings untouched without injecting a higher-precedence command: %j', async env => {
+    const original = { ...env };
+    const f = fake([result]);
+    await judgeSpawn({ ...request, ...f, env });
+    expect(f.options().env).toMatchObject(original);
+    expect(f.options().env.GIT_SSH_COMMAND).toBe(original.GIT_SSH_COMMAND);
+    expect(env).toEqual(original);
+  });
+
   it('preserves stricter caller Bash timeout bounds in the spawned environment', async () => {
     const env = { BASH_DEFAULT_TIMEOUT_MS: '1000', BASH_MAX_TIMEOUT_MS: '2000' };
     const f = fake([result]);

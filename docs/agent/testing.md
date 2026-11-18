@@ -4445,6 +4445,9 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 ## Claude juror stream diagnostics
 
 Claude jurors use verbose `stream-json`; only the terminal `result` supplies the verdict.
+An error or incomplete last result, or malformed output after it, invalidates any earlier verdict.
+CLI failure excerpts must be redacted before truncation, including quota telemetry and metadata.
+Default `GIT_SSH_COMMAND` only when no caller SSH command, SSH executable, or environment Git config is set.
 Keep the last 50 bounded event projections and a redacted last-tool summary through both
 error telemetry and the run-record whitelist. Never persist raw tool inputs as event evidence.
 Detached jurors own a process group: kill that group at timeout and clean up leftovers on close.

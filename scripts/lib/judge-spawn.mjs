@@ -241,7 +241,9 @@ export function buildJudgeEnv(env = process.env) {
     return String(Number.isFinite(existing) && existing > 0 ? Math.min(existing, cap) : cap);
   };
   return markWorkerEnv({ ...sanitizeSpawnEnv(env),
-    GIT_SSH_COMMAND: env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes -o ConnectTimeout=10',
+    ...(['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS']
+      .every(key => env[key] === undefined)
+      ? { GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10' } : {}),
     GIT_TERMINAL_PROMPT: env.GIT_TERMINAL_PROMPT ?? '0', CI: env.CI ?? '1',
     BASH_DEFAULT_TIMEOUT_MS: capTimeout('BASH_DEFAULT_TIMEOUT_MS', 300000),
     BASH_MAX_TIMEOUT_MS: capTimeout('BASH_MAX_TIMEOUT_MS', 600000),
@@ -794,7 +796,7 @@ function markQuotaFailure(error, text) {
   const holdRow = quotaHoldRow({ provider: 'claude', error: text });
   if (holdRow) {
     Object.assign(error, { quota: true, holdRow,
-      telemetry: { ...error.telemetry, failureKind: 'provider-quota', failureText: text.slice(0, 500) } });
+      telemetry: { ...error.telemetry, failureKind: 'provider-quota', failureText: redactSpawnText(text).slice(0, 500) } });
   }
   return error;
 }
@@ -804,7 +806,7 @@ function markQuotaFailure(error, text) {
  *
  * FAILS LOUD AND FAILS WITH THE SPAWN'S OWN WORDS. When the CLI reports an error it carries its own text
  * in `result` (that is how the `--bare` trap surfaces as "Not logged in · Please run /login"), and this
- * function throws exactly that rather than a paraphrase.
+ * function preserves those words in bounded, redacted excerpts.
  *
  * IT ALSO NAMES THE BUDGET KILL, which is the one failure the CLI's own words do NOT explain (#3187). That
  * needs the ceiling, which is not in stdout — so `budget` is passed in. It is OPTIONAL and defaults to `null`
@@ -825,16 +827,19 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     if (parsed?.type !== 'result') throw new Error('missing result event');
   } catch {
     parsed = undefined;
-    for (const line of String(stdout).split(/\r?\n/).reverse()) {
+    for (const line of String(stdout).split(/\r?\n/)) {
       if (!line.trim()) continue;
       try {
         const candidate = JSON.parse(line);
         if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
           && candidate.type === 'result') {
           parsed = candidate;
-          break;
         }
-      } catch { /* stray stdout lines are not result objects */ }
+      } catch {
+        // A warning before a result is tolerable; malformed output after it may be
+        // an incomplete terminal result. Only a later result can restore a verdict.
+        parsed = undefined;
+      }
     }
     if (parsed === undefined) {
       const evidence = streamEvidence();
@@ -880,19 +885,19 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       });
     }
     if (parsed.result) {
-      // The CLI's OWN error text, verbatim — never reworded.
-      const error = new Error(`judge-spawn: the juror failed: ${parsed.result}`);
-      throw markQuotaFailure(error, parsed.result);
+      const text = typeof parsed.result === 'string' ? parsed.result : JSON.stringify(parsed.result);
+      const error = new Error(`judge-spawn: the juror failed: ${redactSpawnText(text).slice(0, 600)}`);
+      throw markQuotaFailure(error, text);
     }
     // `result` is empty — the CLI gave no error text at all (reproduced twice in one night, cause
     // unknown, resolved both times by a blind retry). A bare "<no result text>" placeholder left the
-    // caller nothing to act on, so surface everything else that IS available: the raw parsed object
+    // caller nothing to act on, so surface bounded, redacted excerpts of the parsed object
     // (stop_reason, subtype, session_id, whatever else the CLI emitted) plus the stderr stream the
     // caller passed in — including its `exit code N` fallback when the process produced no stderr.
-    const tail = String(stderr).trim().slice(-600);
+    const tail = redactSpawnText(String(stderr)).trim().slice(-600);
     throw new Error(
       `judge-spawn: the juror failed with no result text. ` +
-      `parsed: ${JSON.stringify(parsed).slice(0, 600)}\n` +
+      `parsed: ${JSON.stringify(redactJudgeMetadata(parsed)).slice(0, 600)}\n` +
       (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
     );
   }
