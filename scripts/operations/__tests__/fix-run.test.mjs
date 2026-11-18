@@ -618,6 +618,72 @@ describe('runFixCli', () => {
     expect(m.owed.sha).toBe('b'.repeat(40));
     expect(m.pendingRearm.clear).not.toHaveBeenCalled();
   });
+  it.each(['same', 'fresh'])('recovers a pushed red-team hand-back without executing or charging again (%s launch)', async retry => {
+    const head = 'a'.repeat(40), pushed = 'b'.repeat(40);
+    const m = mk([head, pushed]);
+    const pr = acceptedRedTeamPr();
+    const comments = [...pr.comments];
+    const launchArgv = [...redTeamArgv, '--launch-id=failed-hand-back'];
+    const run = (cmd, args, opts) => {
+      const result = m.run(cmd, args, opts);
+      if (cmd === 'gh' && args.includes('comment') && args.includes('--body-file')) {
+        comments.push({ author: { login: 'web-everything' }, body: readFileSync(args.at(-1), 'utf8') });
+      }
+      if (args[0] === '/we/scripts/conveyor/rearm-review.mjs') throw new Error('hand-back unavailable');
+      return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+    };
+    expect((await runFixCli(launchArgv, { ...m.io, run, readComments: async () => comments })).code).toBe(1);
+    expect(m.spawn).toHaveBeenCalledOnce();
+    expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
+    expect(m.owed.sha).toBe(pushed);
+    expect(countRedTeamFixComments(comments)).toBe(1);
+
+    // A new process sees the pushed tip, but the gate evidence still names the old head.
+    const m2 = mk([pushed]);
+    pr.headRefOid = pushed;
+    // Cover current push markers as well as the legacy records without a kind.
+    m.pendingRearm.read.mockImplementation(() => m.owed.sha
+      ? { sha: m.owed.sha, ...(retry === 'fresh' ? { kind: 'push' } : {}) } : null);
+    const runRetry = (cmd, args, opts) => {
+      const result = m2.run(cmd, args, opts);
+      return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+    };
+    const result = await runFixCli([...redTeamArgv, `--launch-id=${retry === 'same' ? 'failed-hand-back' : 'new-hand-back'}`], {
+      ...m2.io, run: runRetry, pendingRearm: m.pendingRearm, readComments: async () => comments,
+    });
+    expect(result.code).toBe(0);
+    expect(result.result).toContain('already pushed');
+    expect(m2.spawn).not.toHaveBeenCalled();
+    expect(m2.calls.some(c => c.includes('push') || c.includes('comment'))).toBe(false);
+    expect(m2.calls.filter(c => c[1] === '/we/scripts/conveyor/rearm-review.mjs')).toEqual([
+      ['node', '/we/scripts/conveyor/rearm-review.mjs', '7', '--repo=o/r', '--round=red-team', `--expect-head=${pushed}`],
+    ]);
+    expect(countRedTeamFixComments(comments)).toBe(1);
+    expect(m.owed.sha).toBeNull();
+    expect(m.pendingRearm.clear).toHaveBeenCalledOnce();
+  });
+  it.each(['missing', 'different tip', 'evidence', 'unknown kind'])('does not recover a spent red-team launch with a %s pending marker', async kind => {
+    const m = mk(['a'.repeat(40)]);
+    const pr = acceptedRedTeamPr();
+    publishRedTeamFixLaunch({ comments: pr.comments, pr: 7, head: pr.headRefOid, attemptId: 'spent', chargedRounds: 0,
+      publish: body => pr.comments.push({ author: { login: 'web-everything' }, body }) });
+    m.pendingRearm.read.mockReturnValue(kind === 'missing' ? null : {
+      sha: kind === 'different tip' ? 'b'.repeat(40) : pr.headRefOid,
+      kind: kind === 'evidence' ? 'evidence' : kind === 'unknown kind' ? 'unknown' : 'push',
+    });
+    const run = (cmd, args, opts) => {
+      const result = m.run(cmd, args, opts);
+      return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+    };
+    const writeErr = vi.fn();
+    expect((await runFixCli([...redTeamArgv, '--launch-id=spent'], {
+      ...m.io, run, writeErr, readComments: async () => pr.comments,
+    })).code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('launch already spent'));
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('push') || c.includes('comment') || c.some(a => String(a).endsWith('rearm-review.mjs')))).toBe(false);
+    expect(m.pendingRearm.clear).not.toHaveBeenCalled();
+  });
   it('refuses execution and push if the counted red-team launch cannot be posted', async () => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     const pr = acceptedRedTeamPr();

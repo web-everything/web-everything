@@ -762,33 +762,41 @@ export async function runFixCli(argv = [], {
       } finally { release(); }
     };
     const comments = await readComments(pr, { repo: launch.repo });
-    if (hasRedTeamFixLaunch(comments, launch.launchId)) {
-      throw new LauncherError('launch already spent; a new dispatch is required');
-    }
-    // The plan owns accounting. Publish before context rendering or execution, including
-    // when the accepted/blocked labels have already changed to review:changes.
-    if (redTeamRepair) await chargeRedTeamLaunch();
-    else if (hasRedTeamSentBackLabels(prHead, launch.repairKind)
-      && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0) {
-      throw new LauncherError('red-team repair requires --planned-repair-mode=red-team-sent-back; reconcile again');
-    }
-    if (launch.repairKind === 'ci-heal') {
-      const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
-      if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
-      prContext = renderCiHealContext(inputs);
-    } else {
-      openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
-      const safety = resolveFixSafety();
-      for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
-      repeatPlan = repeatedFindingPlan(comments, { enabled: safety.value.resetOnRepeatedFinding });
-      if (repeatPlan.action === 'stand-down') {
-        const body = buildStandDownComment({ reason: 'repeated-finding', head: prHeadSha, detail: 'Record scope-baseline: <full sha> in an operator decision comment before another repair.' });
-        withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
-        throw new LauncherError('repeated finding: operator scope-baseline required');
+    const pending = pendingRearm.read(launch.repo, pr);
+    // Finishing a pushed repair is not another execution. Its gate evidence names the old
+    // head and its launch is already spent. Admit only push debt at the live tip here;
+    // the owned lane/HEAD checks below still precede recovery, which must return before execution.
+    const recoverRedTeamPush = redTeamRepair && Boolean(prHeadSha) && pending?.sha === prHeadSha
+      && (pending.kind === undefined || pending.kind === 'push');
+    if (!recoverRedTeamPush) {
+      if (hasRedTeamFixLaunch(comments, launch.launchId)) {
+        throw new LauncherError('launch already spent; a new dispatch is required');
       }
-      prContext = target && !redTeamRepair && !hasRedTeamSentBackLabels(prHead) && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
-        ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
-        : renderPrContext({ ...prHead, number: Number(pr), comments, commentsComplete: true }, { plannedRepairMode: launch.plannedRepairMode });
+      // The plan owns accounting. Publish before context rendering or execution, including
+      // when the accepted/blocked labels have already changed to review:changes.
+      if (redTeamRepair) await chargeRedTeamLaunch();
+      else if (hasRedTeamSentBackLabels(prHead, launch.repairKind)
+        && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0) {
+        throw new LauncherError('red-team repair requires --planned-repair-mode=red-team-sent-back; reconcile again');
+      }
+      if (launch.repairKind === 'ci-heal') {
+        const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
+        if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
+        prContext = renderCiHealContext(inputs);
+      } else {
+        openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
+        const safety = resolveFixSafety();
+        for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
+        repeatPlan = repeatedFindingPlan(comments, { enabled: safety.value.resetOnRepeatedFinding });
+        if (repeatPlan.action === 'stand-down') {
+          const body = buildStandDownComment({ reason: 'repeated-finding', head: prHeadSha, detail: 'Record scope-baseline: <full sha> in an operator decision comment before another repair.' });
+          withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+          throw new LauncherError('repeated finding: operator scope-baseline required');
+        }
+        prContext = target && !redTeamRepair && !hasRedTeamSentBackLabels(prHead) && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
+          ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
+          : renderPrContext({ ...prHead, number: Number(pr), comments, commentsComplete: true }, { plannedRepairMode: launch.plannedRepairMode });
+      }
     }
     // Wait before the repair so failures from the previous head can join the same agent run and push.
     // The push boundary below reuses this deadline rather than starting a second wait budget.
@@ -885,7 +893,6 @@ export async function runFixCli(argv = [], {
     };
     // Recover only at the recorded tip. An evidence marker precedes publication, so it alone cannot prove that
     // publication succeeded: unresolved requests must go through the agent/evidence path again.
-    const pending = pendingRearm.read(launch.repo, pr);
     const pendingEvidence = pending?.kind === 'evidence';
     const recoverPending = pending?.sha === before && (!pendingEvidence || !openOperatorSendBacks({
       comments: await readComments(pr, { repo: launch.repo }), headRefOid: prHeadSha,
@@ -900,6 +907,7 @@ export async function runFixCli(argv = [], {
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
     }
+    if (recoverRedTeamPush) throw new LauncherError('pending red-team push no longer matches the lane head; reconcile again');
     const provider = await resolveProvider(launch.provider);
     const git = (...args) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv });
     // Never let git open a lane path to stage it: `git add` and `commit -- paths` run with OUR read access, not the

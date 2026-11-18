@@ -4591,10 +4591,18 @@ shared-cap accounting, and missing/stale conflict-fallback finding cases in
 
 A dispatch receipt also spends its launch ID: replay must exit non-zero before any
 repair executor runs, including after failed or no-change repairs. There is no
-crash-restart exemption without proof that execution never started. Recovery uses a
+crash-restart exemption for executing the repair again. A new execution uses a
 new dispatch and launch ID, consuming another round under the shared cap. Keep the
 failed/no-change/executor-fallback replay refusal and fresh-launch assertions in
 `fix-run.test.mjs`.
+
+An already-pushed repair with pending push debt at the live PR head may finish its
+hand-back using either the spent launch ID or a fresh one. It retains the lane lease
+and HEAD checks, then calls the red-team rearm wrapper without another executor,
+push, or dispatch receipt. `scripts/operations/__tests__/fix-run.test.mjs` covers this
+with `recovers a pushed red-team hand-back without executing or charging again`;
+`does not recover a spent red-team launch with a %s pending marker` rejects missing,
+different-tip, evidence-only, and unknown-kind markers.
 
 ### Tick red-team durable floor admission
 
