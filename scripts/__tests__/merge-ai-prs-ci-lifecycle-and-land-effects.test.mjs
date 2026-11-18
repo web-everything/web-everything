@@ -589,15 +589,15 @@ describe('resolveRepos (#2257/#2287 — the single /drain lander sweeps all 3 co
     expect(resolveRepos({ singleRepo: true, self: 'web-everything/web-everything' })).toEqual([null]);
   });
   it('default derives the owner from self and dedupes (self is not listed twice)', () => {
-    const r = resolveRepos({ self: 'acme/frontierui' });
+    const r = resolveRepos({ self: 'acme/frontierui', resolveProfile: () => ({ capabilities: { review: true } }) });
     expect(r[0]).toBe('acme/frontierui');                        // self first
     expect(r).toEqual(['acme/frontierui', 'acme/web-everything', 'acme/plateau-app']);
     expect(new Set(r).size).toBe(r.length);                      // no dupes
   });
-  it('an underivable owner (no self, or self without a slash) falls back to single-repo [null] — safe', () => {
-    expect(resolveRepos()).toEqual([null]);
-    expect(resolveRepos({})).toEqual([null]);
-    expect(resolveRepos({ self: 'noslug' })).toEqual([null]);
+  it('an unidentified dispatch target is denied', () => {
+    expect(resolveRepos()).toEqual([]);
+    expect(resolveRepos({})).toEqual([]);
+    expect(resolveRepos({ self: 'noslug' })).toEqual([]);
   });
   it('--repos=a,b → exactly those slugs (explicit override, trims + drops blanks)', () => {
     expect(resolveRepos({ repos: 'frontier-ui/frontierui, plateauapp/plateau-app' }))
@@ -605,16 +605,16 @@ describe('resolveRepos (#2257/#2287 — the single /drain lander sweeps all 3 co
     expect(resolveRepos({ repos: ' , frontier-ui/frontierui , ' })).toEqual(['frontier-ui/frontierui']);
   });
   it('--repos wins over the default/--this-repo when given', () => {
-    expect(resolveRepos({ repos: 'x/y', self: 'a/web-everything' })).toEqual(['x/y']);
-    expect(resolveRepos({ repos: 'x/y', singleRepo: true, self: 'a/web-everything' })).toEqual(['x/y']);
+    expect(resolveRepos({ repos: 'frontier-ui/frontierui', self: 'a/web-everything' })).toEqual(['frontier-ui/frontierui']);
+    expect(resolveRepos({ repos: 'frontier-ui/frontierui', singleRepo: true, self: 'a/web-everything' })).toEqual(['frontier-ui/frontierui']);
   });
   it('`--all-repos` is a harmless no-op alias of the default (unknown key ignored → still constellation)', () => {
     expect(resolveRepos({ allRepos: true, self: 'web-everything/web-everything' }))
       .toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
   });
-  it('an empty/whitespace --repos falls back to the single-repo default', () => {
-    expect(resolveRepos({ repos: '' })).toEqual([null]);
-    expect(resolveRepos({ repos: '   ' })).toEqual([null]);
+  it('an empty/whitespace --repos without an identified self is denied', () => {
+    expect(resolveRepos({ repos: '' })).toEqual([]);
+    expect(resolveRepos({ repos: '   ' })).toEqual([]);
   });
 });
 
@@ -1489,18 +1489,18 @@ it('excludes review-disabled repos from the default lander, even when self is di
 
 it('filters explicit lander repos and refuses a disabled single-repo drain', () => {
   const resolveProfile = key => key === 'frontierui' ? { capabilities: { review: false } } : capabilityProfile(key);
-  expect(resolveRepos({ repos: 'frontierui,longshoreai/longshore,outside/repo', resolveProfile })).toEqual(['outside/repo']);
+  expect(resolveRepos({ repos: 'frontierui,longshoreai/longshore,outside/repo', resolveProfile })).toEqual([]);
   expect(resolveRepos({ repos: 'frontierui', resolveProfile })).toEqual([]);
   expect(resolveRepos({ repos: 'longshore', self: 'web-everything/web-everything', resolveProfile })).toEqual([]);
   for (const self of ['frontier-ui/frontierui', 'longshoreai/longshore']) {
     expect(resolveRepos({ self, singleRepo: true, resolveProfile })).toEqual([]);
   }
-  expect(resolveRepos({ self: 'outside/repo', singleRepo: true, resolveProfile })).toEqual([null]);
+  expect(resolveRepos({ self: 'outside/repo', singleRepo: true, resolveProfile })).toEqual([]);
 });
 
 it('filters review-disabled self and derived repos in the owner-times-names fallback', () => {
   const resolveProfile = repo => ['acme/fork', 'acme/frontierui'].includes(repo)
-    ? { capabilities: { review: false } } : capabilityProfile(repo);
+    ? { capabilities: { review: false } } : { capabilities: { review: true } };
   expect(resolveRepos({ self: 'acme/fork', resolveProfile })).toEqual(['acme/web-everything', 'acme/plateau-app']);
   expect(resolveRepos({ self: 'acme/web-everything', resolveProfile })).toEqual(['acme/web-everything', 'acme/plateau-app']);
 });

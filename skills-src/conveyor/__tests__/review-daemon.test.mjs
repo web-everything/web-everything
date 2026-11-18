@@ -49,9 +49,9 @@ vi.mock('../../../scripts/lib/author-stamp-restore.mjs', async (importOriginal) 
 });
 
 import {
-  runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
+  runDaemonLoop, runReviewTick, runReviewTickAllRepos as realrunReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
-  explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos,
+  explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos as realrunConvertAdvisoryTickAllRepos,
   resolveConvertAdvisoryEnabled, sweepReviewHolds, operatorHoldsFromPlan, formatOperatorHoldsRecord, OPERATOR_HOLD_KINDS,
   countLiveReviewRounds,
 } from '../review-daemon.mjs';
@@ -71,6 +71,14 @@ const noPrepReview = () => null;
 /** The `review-status:*` writes only (the same writer also keeps the one `status:*` label, pr-status-label.mjs). */
 const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ?? '').startsWith('status:')
   || (!c.spec?.add && (c.spec?.remove ?? []).length && c.spec.remove.every((r) => r.startsWith('status:')))));
+
+
+// Historical orchestration fixtures declare their synthetic repos explicitly; unknown targets stay denied.
+const fixtureProfile = key => ['repo-a', 'repo-b', 'repo-c', 'repo-bad', 'repo-good',
+  'review-cap-fixture/healthy', 'a/b', 'a', 'b', 'c', 'fui'].includes(key)
+  ? { capabilities: { review: true, fix: true, ciHeal: true } } : capabilityProfile(key);
+const runReviewTickAllRepos = options => realrunReviewTickAllRepos({ resolveProfile: fixtureProfile, ...options });
+const runConvertAdvisoryTickAllRepos = options => realrunConvertAdvisoryTickAllRepos({ resolveProfile: fixtureProfile, ...options });
 
 describe('live review cap with Node configuration options', () => {
   it.each([
@@ -1095,7 +1103,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
       const effects = buildCliDaemonEffects({ owner: 'test', log: { error: () => {} }, reapSessions: () => null,
         runPrepReview: noPrepReview, convertAdvisoryEnabled: false,
-        reviewTickOpts: (args) => ({ ...cliReviewTickOpts(args), tick, repos: ['repo-a'], authGateOverride: () => ({ paused: false, reason: null }) }) });
+        reviewTickOpts: (args) => ({ ...cliReviewTickOpts(args), tick, repos: ['web-everything/web-everything'], authGateOverride: () => ({ paused: false, reason: null }) }) });
       await effects.tickOnce();
       expect(tick).toHaveBeenCalledTimes(1);
       expect(seen[0].hostAdmission()).toMatchObject({ admitted: true, maxPerTick: 2 });
@@ -3053,9 +3061,9 @@ it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('filters review
   expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
 });
 
-it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('refuses explicit pending and disabled review targets but preserves unknown targets', async run => {
+it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('refuses explicit pending and disabled review targets and unknown targets', async run => {
   const tick = vi.fn(() => ({ dispatched: [], failed: [] }));
   await run({ repos: ['longshoreai/longshore', 'longshore', 'frontier-ui/frontierui', 'outside/repo'],
     resolveProfile: key => key === 'frontierui' ? { capabilities: { review: false } } : capabilityProfile(key), tick });
-  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['outside/repo']);
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual([]);
 });

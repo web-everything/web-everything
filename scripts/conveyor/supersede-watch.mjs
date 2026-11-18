@@ -11,7 +11,6 @@
  * read skips the repo for this tick (reported, never thrown). Usage as a one-off: `node supersede-watch.mjs
  * [--repo=<owner/name>] [--apply]` (dry run without `--apply`).
  */
-import { constellationRepoKeysWith, repoHasCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,12 +104,9 @@ export function defaultPostHold({ repo, hold, exec = execFileSync }) {
 export function runSupersedeWatch({
   repo, apply = true, settings = resolveSupersedeSettings(), now = Date.now(),
   readMergedPrs = defaultReadMergedPrs, readOpenNumbers = defaultReadOpenNumbers, readPr = defaultReadPr, postHold = defaultPostHold,
-  readBodyEdit = defaultReadBodyEdit, resolveProfile = repoProfile, forFixDispatch = false,
+  readBodyEdit = defaultReadBodyEdit,
 } = {}) {
   if (!settings?.hold) return { repo, holds: [], applied: [], skipped: 'supersede hold is off' };
-  // Fix dispatch needs supersede protection even when standalone review automation is disabled.
-  if (!repoHasCapability(repo, forFixDispatch ? 'fix' : 'review', { resolveProfile, allowUnknown: true }))
-    return { repo, holds: [], applied: [], skipped: 'supersede capability is off' };
   try {
     const openNumbers = readOpenNumbers({ repo });
     const { rows: mergedPrs, failures: bodyEditFailures } = withBodyEdits({
@@ -142,15 +138,10 @@ export function formatSupersedeLines(result) {
   return lines;
 }
 
-export function supersedeSweepRepos(resolveProfile = repoProfile, repo) {
-  return (typeof repo === 'string' ? [repo] : constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug))
-    .filter(repo => repoHasCapability(repo, 'review', { resolveProfile, allowUnknown: true }));
-}
-
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const flags = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')).map(([k, v]) => [k, v ?? true]));
-  const repos = supersedeSweepRepos(repoProfile, flags.repo);
+  const repos = typeof flags.repo === 'string' ? [flags.repo] : Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
   const result = { repos: repos.map((repo) => runSupersedeWatch({ repo, apply: flags.apply === true })) };
   for (const line of formatSupersedeLines(result)) process.stderr.write(`${line}\n`);
   process.stdout.write(`${JSON.stringify(result)}\n`);

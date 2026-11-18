@@ -10,7 +10,6 @@
  * and recoveries.jsonl only in apply. Paths may be overridden by flags or WE_LIVENESS_SWEEP_*
  * environment variables. All IO is injectable; importing this module runs no sweep.
  */
-import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, realpathSync, openSync, closeSync, fstatSync, readSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
@@ -155,9 +154,7 @@ export async function gatherSnapshot(options = {}, deps = {}) {
   const optional = async (source, fn) => { try { return await fn(); } catch (e) { if (e?.code !== 'ENOENT') errors.push({ source, error: message(e) }); } };
   const fields = 'number,title,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,comments';
   const completeRepos = new Set();
-  const repos = deps.repos ?? CONSTELLATION_REPOS;
-  for (const key of constellationRepoKeysWith('review', { repos, resolveProfile: deps.resolveProfile ?? repoProfile })) {
-    const repo = repos[key].slug;
+  for (const { slug: repo } of Object.values(deps.repos ?? CONSTELLATION_REPOS)) {
     let prs = await optional(`prs:${repo}:shared`, () => (deps.readSharedOpenPrs ?? readSharedOpenPrs)({ repo, fields: fields.split(','), env }));
     if (prs == null) prs = await optional(`prs:${repo}:gh`, () => JSON.parse(exec('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', fields], { encoding: 'utf8', timeout: 60_000 })));
     if (Array.isArray(prs)) { snapshot.prs.push(...prs.map(p => normalizePr(p, repo))); completeRepos.add(repo); }

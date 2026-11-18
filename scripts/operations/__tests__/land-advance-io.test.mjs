@@ -231,12 +231,3 @@ describe('mechanical session verdicts (#3383 item 11)', () => {
     expect(inputs.sessions.every((s) => s.verdict === undefined)).toBe(true);
   });
 });
-
-import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
-it('excludes review-disabled repos from persisted swept-repos before PR reads', () => {
-  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
-  const run = vi.fn((cmd) => cmd === 'gh' ? '[]' : cmd === 'git' ? '0 0' : '/lane');
-  const result = createLandAdvanceReader(readerPorts({ resolveProfile, run }))();
-  expect(result.prs).toEqual([]);
-  expect(run.mock.calls.filter(([cmd]) => cmd === 'gh').map(([,args]) => args[args.indexOf('--repo') + 1])).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
-});

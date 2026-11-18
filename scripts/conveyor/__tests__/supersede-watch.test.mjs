@@ -137,7 +137,7 @@ describe('supersede daemon wiring', () => {
     const fixTick = ({ repo: slug }) => { order.push(`fix:${slug}`); return noopDispatch(); };
     const result = await runTickAllRepos({ ...tickFakes(), supersedeTick, fixTick });
     expect(order).toEqual([`supersede:${repo}`, `fix:${repo}`]);
-    expect(supersedeTick).toHaveBeenCalledWith({ repo, resolveProfile: capabilityProfile, forFixDispatch: true });
+    expect(supersedeTick).toHaveBeenCalledWith({ repo });
     expect(result.supersede.repos[0].holds).toEqual([hold]);
   });
   it('never invokes the real supersede watcher in an injected test tick', async () => {
@@ -151,43 +151,19 @@ describe('supersede daemon wiring', () => {
   });
 });
 
-import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
-import { supersedeSweepRepos } from '../supersede-watch.mjs';
-it('excludes review-disabled repos from the CLI supersede roster', () => {
-  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
-  expect(supersedeSweepRepos(resolveProfile)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
-});
 
-it('protects fix-enabled repos even with review disabled in default and explicit daemon rosters', () => {
-  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+it('supersede safety evidence and holds cover disabled and unknown repos', () => {
+  for (const repo of ['frontier-ui/frontierui', 'longshoreai/longshore', 'outside/repo']) {
+    const opts = { ...fakes(), repo, resolveProfile: () => null };
+    expect(runSupersedeWatch(opts).holds).toEqual([hold]);
+    expect(opts.readMergedPrs).toHaveBeenCalledWith(expect.objectContaining({ repo }));
+    expect(opts.postHold).toHaveBeenCalledWith({ repo, hold });
+  }
+});
+it('default supersede safety sweep observes every constellation repo', () => {
   const tick = vi.fn(() => ({ holds: [], applied: [] }));
-  runSupersedeAllRepos({ resolveProfile, tick });
-  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
-  const opts = fakes();
-  expect(runSupersedeAllRepos({ ...opts, resolveProfile, repos: ['frontier-ui/frontierui'] }).repos[0].holds).toEqual([hold]);
-  expect(opts.postHold).toHaveBeenCalledOnce();
-});
-
-it('filters explicit CLI supersede targets by review capability, including pending repos', () => {
-  const resolveProfile = key => key === 'frontierui' ? { capabilities: { review: false, fix: true } } : capabilityProfile(key);
-  for (const repo of ['frontierui', 'frontier-ui/frontierui', 'longshoreai/longshore'])
-    expect(supersedeSweepRepos(resolveProfile, repo)).toEqual([]);
-  expect(supersedeSweepRepos(resolveProfile, 'outside/repo')).toEqual(['outside/repo']);
-});
-
-it.each([false, undefined])('standalone backstop skips review=%s before any read or hold write', review => {
-  const opts = fakes();
-  const result = runSupersedeWatch({ ...opts, resolveProfile: () => ({ capabilities: { review, fix: true } }) });
-  expect(result).toMatchObject({ skipped: 'supersede capability is off', holds: [], applied: [] });
-  for (const fn of [opts.readMergedPrs, opts.readOpenNumbers, opts.readPr, opts.postHold]) expect(fn).not.toHaveBeenCalled();
-});
-
-it('fix-dispatch backstop refuses disabled fix capability even when review is enabled', () => {
-  const opts = fakes();
-  expect(runSupersedeWatch({ ...opts, forFixDispatch: true, resolveProfile: () => ({ capabilities: { fix: false, review: true } }) }))
-    .toMatchObject({ skipped: 'supersede capability is off', holds: [] });
-  expect(opts.postHold).not.toHaveBeenCalled();
-  const tick = vi.fn();
-  runSupersedeAllRepos({ repos: ['frontierui', 'longshoreai/longshore'], resolveProfile: () => ({ capabilities: { fix: false, review: true } }), tick });
-  expect(tick).not.toHaveBeenCalled();
+  runSupersedeAllRepos({ resolveProfile: () => null, tick });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual([
+    'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
+  ]);
 });

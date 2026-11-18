@@ -1020,3 +1020,14 @@ describe('merge-ai-prs — #2502 headSha real-value wiring (buildDrainVerdicts -
     expect(verdicts[0].headSha).toBe('sha-c');
   });
 });
+
+
+it('couple evidence keeps all repos when dispatch is disabled or the local repo is unknown', () => {
+  expect(resolveContextRepos([], 'web-everything/web-everything')).toEqual([
+    'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
+  ]);
+  expect(resolveRepos({ self: 'outside/fork' })).toEqual([]);
+  expect(resolveContextRepos([], 'outside/fork')).toEqual([
+    'outside/fork', 'outside/web-everything', 'outside/frontierui', 'outside/plateau-app',
+  ]);
+});

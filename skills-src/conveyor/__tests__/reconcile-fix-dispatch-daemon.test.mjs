@@ -14,12 +14,12 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   runDaemonLoop, buildCliDaemonEffects, realSleep, RECONCILE_FIX_DISPATCH_LEASE_KEY, DEFAULT_INTERVAL_MS,
-  runReconcileFixDispatchAllRepos, FIX_DISPATCH_DAEMON_REPOS, hasStaleMainRefusal,
-  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, createReconcilePlanCache, readPlanFingerprints, readPlanClaims, formatRefusalLine,
-  runHungCiRecoveryAllRepos, formatHungActionLine,
-  runMainRedRebaseAllRepos, formatMainRedRebaseActionLine,
-  runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
-  runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
+  runReconcileFixDispatchAllRepos as realrunReconcileFixDispatchAllRepos, FIX_DISPATCH_DAEMON_REPOS, hasStaleMainRefusal,
+  runReconcileCiHealDispatchAllRepos as realrunReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, createReconcilePlanCache, readPlanFingerprints, readPlanClaims, formatRefusalLine,
+  runHungCiRecoveryAllRepos as realrunHungCiRecoveryAllRepos, formatHungActionLine,
+  runMainRedRebaseAllRepos as realrunMainRedRebaseAllRepos, formatMainRedRebaseActionLine,
+  runMissingRunRecoveryAllRepos as realrunMissingRunRecoveryAllRepos, formatMissingRunActionLine,
+  runPromoteDraftDispatchAllRepos as realrunPromoteDraftDispatchAllRepos, formatPromoteActionLine,
   defaultTagDispatchStatus, withFixDispatchClaimRefresh, defaultReadNotesForRepo, runReconcileNotesAllRepos,
   buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
   resolveFixPassBudgets, formatPassPhaseTiming,
@@ -47,6 +47,18 @@ import * as unsupportedRepo from '../../../scripts/conveyor/unsupported-repo.mjs
 import * as rulingStandDown from '../../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { FIX_END_MARKER } from '../../../scripts/conveyor/fix-procedure.mjs';
 
+
+// Historical orchestration fixtures declare their synthetic repos explicitly; unknown targets stay denied.
+const fixtureProfile = key => ['repo-a', 'repo-b', 'repo-c', 'repo-bad', 'repo-good',
+  'review-cap-fixture/healthy', 'a/b', 'a', 'b', 'c', 'fui'].includes(key)
+  ? { capabilities: { review: true, fix: true, ciHeal: true } } : capabilityProfile(key);
+const runReconcileFixDispatchAllRepos = options => realrunReconcileFixDispatchAllRepos({ resolveProfile: fixtureProfile, ...options });
+const runReconcileCiHealDispatchAllRepos = options => realrunReconcileCiHealDispatchAllRepos({ resolveProfile: fixtureProfile, ...options });
+const runPromoteDraftDispatchAllRepos = options => realrunPromoteDraftDispatchAllRepos({ resolveProfile: fixtureProfile, ...options });
+const runHungCiRecoveryAllRepos = options => realrunHungCiRecoveryAllRepos({ resolveProfile: fixtureProfile, ...options });
+const runMainRedRebaseAllRepos = options => realrunMainRedRebaseAllRepos({ resolveProfile: fixtureProfile, ...options });
+const runMissingRunRecoveryAllRepos = options => realrunMissingRunRecoveryAllRepos({ resolveProfile: fixtureProfile, ...options });
+
 describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
   it.each([
     ['standard default', {}, {}, {}, true, 'standard'],
@@ -67,7 +79,7 @@ describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
 
 // These historical fixtures exercise other daemon halves with R123 explicitly disabled.
 // stand-down-auto-proceed-daemon.test.mjs exercises the production policy defaults and writer.
-const runTickAllRepos = options => realRunTickAllRepos({ allowStandDownAutoProceed: false, ...options });
+const runTickAllRepos = options => realRunTickAllRepos({ allowStandDownAutoProceed: false, resolveProfile: fixtureProfile, ...options });
 
 // #3383 bug 1 — wired into withSelfSync's `hasStaleRefusal` option in main(); tested here in isolation
 // (pure, no IO) against the exact shape `runReconcileFixDispatchAllRepos` returns.
@@ -2951,10 +2963,10 @@ it.each([
   [runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal'],
   [runPromoteDraftDispatchAllRepos, 'review'], [runHungCiRecoveryAllRepos, 'ciHeal'],
   [runMainRedRebaseAllRepos, 'ciHeal'], [runMissingRunRecoveryAllRepos, 'ciHeal'],
-])('refuses explicit pending and disabled targets while preserving unknown targets (%s, %s)', async (run, capability) => {
+])('refuses explicit pending and disabled targets and unknown targets (%s, %s)', async (run, capability) => {
   const tick = vi.fn(() => ({}));
   await run({ repos: ['longshoreai/longshore', 'longshore', 'frontier-ui/frontierui', 'outside/repo'],
     resolveProfile: key => key === 'frontierui' ? { capabilities: { [capability]: false } } : capabilityProfile(key),
     tick, createLedger: () => ({}) });
-  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['outside/repo']);
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual([]);
 });

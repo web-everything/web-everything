@@ -187,12 +187,12 @@ export async function runDaemonLoop({
  *  today ({@link ../../scripts/lib/repo-profile.mjs}'s `capabilities.fix`/`ciHeal` — turning them on for the
  *  couple repos is a later slice), but every repo is now actually TICKED, so the existing `unsupported-repo`
  *  refusal + ledger write run and are recorded for them instead of being skipped silently. */
-export const FIX_DISPATCH_DAEMON_REPOS = constellationRepoKeysWith('fix').map((key) => CONSTELLATION_REPOS[key].slug);
+export const FIX_DISPATCH_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
 const reposWith = (capability, resolveProfile) => constellationRepoKeysWith(capability, { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug);
-// Keep lazy budget iterables lazy. Explicit non-constellation targets retain their existing validation path.
+// Keep lazy budget iterables lazy; every dispatch target requires an explicit capability.
 function* eligibleRepos(repos, capability, resolveProfile) {
   for (const repo of repos) {
-    if (repoHasCapability(repo, capability, { resolveProfile, allowUnknown: true })) yield repo;
+    if (repoHasCapability(repo, capability, { resolveProfile })) yield repo;
   }
 }
 
@@ -645,9 +645,9 @@ export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequir
  * card xiqtf7w — the supersede half: per repo, hold (stand down + label) every open PR a merged PR declares it
  * supersedes. Runs BEFORE the fix/ci-heal halves so the hold is on the thread before they plan. Never throws.
  */
-export function runSupersedeAllRepos({ resolveProfile = repoProfile, repos = reposWith('fix', resolveProfile), tick = runSupersedeWatch, ...tickOpts } = {}) {
-  return { repos: [...eligibleRepos(repos, 'fix', resolveProfile)].map((repo) => {
-    try { return tick({ ...tickOpts, repo, resolveProfile, forFixDispatch: true }); } catch (e) { return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] }; }
+export function runSupersedeAllRepos({ repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug), tick = runSupersedeWatch, ...tickOpts } = {}) {
+  return { repos: repos.map((repo) => {
+    try { return tick({ ...tickOpts, repo }); } catch (e) { return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] }; }
   }) };
 }
 
@@ -1103,7 +1103,7 @@ const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCu
  *   unpaused — the login break does not touch them.
  */
 export async function runTickAllRepos({
-  repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
+  resolveProfile = repoProfile, repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   authGateOverride,
   fixSettings = resolveFixSettings(),
   // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
@@ -1411,7 +1411,7 @@ export async function runTickAllRepos({
     ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo)) : [];
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
+    : runReconcileFixDispatchAllRepos({ resolveProfile, repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
       tick: boundedPrTick('fix', sharedTick('fix', fixTick ?? runReconcileFixDispatch)),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   for (const repo of orphanGuardDeferred) fix.refusals.push({ repo, prNumber: null,
@@ -1443,28 +1443,28 @@ export async function runTickAllRepos({
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick ? {} : { queueAdmission, dispatchThrottle }),
+    : await runReconcileCiHealDispatchAllRepos({ resolveProfile, repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick ? {} : { queueAdmission, dispatchThrottle }),
       ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
   ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
   planCache?.markTouched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
-  const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
+  const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ resolveProfile, repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
   planCache?.markTouched(hungCi);
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
+  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ resolveProfile, repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
   planCache?.markTouched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
   // already do — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const missingRun = stepTimed('missing-run', () => runMissingRunRecoveryAllRepos({ repos: stepRepos.get('missing-run'), tick: sharedTick('missing-run', missingRunTick ?? sweepMissingRunRecovery) }));
+  const missingRun = stepTimed('missing-run', () => runMissingRunRecoveryAllRepos({ resolveProfile, repos: stepRepos.get('missing-run'), tick: sharedTick('missing-run', missingRunTick ?? sweepMissingRunRecovery) }));
   planCache?.markTouched(missingRun);
   // draft-first PRs (operator-approved 2026-09-27) — the SEVENTH half this daemon now owns: see
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
-  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: boundedPrTick('promote-draft', sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch)) }));
+  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ resolveProfile, repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: boundedPrTick('promote-draft', sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch)) }));
   promoteDraft.budgetSkipped = budgets['promote-draft'].skipped;
   planCache?.markTouched(promoteDraft);
   // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus

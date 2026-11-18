@@ -895,7 +895,7 @@ export function refreshScopeBloatedPr({ headRefName, defaultBranch = 'main', ref
  *  watching it, live-caught 2026-09-22, #xvyuwtg). Kept as a plain exported list, not inlined into the loop
  *  below, so a future per-user configurable repo list (plateau as a product letting an operator choose which
  *  repos to integrate) is a source swap here, not a redesign of {@link runReviewTickAllRepos}. */
-export const REVIEW_DAEMON_REPOS = constellationRepoKeysWith('review').map((key) => CONSTELLATION_REPOS[key].slug);
+export const REVIEW_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
 
 /**
  * App auth for this daemon is PER-OWNER: it sweeps every constellation repo in one process, and each org has its
@@ -955,7 +955,7 @@ export function sharedHostBudget(hostAdmission, log = console.error) {
 }
 
 export function runReviewTickAllRepos({ resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
-  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile, allowUnknown: true }));
+  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile }));
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -1135,7 +1135,7 @@ export async function runConvertAdvisoryTickAllRepos({
   resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runConvertAdvisoryTick,
   concurrency = resolveReviewTickSharing().repoConcurrency, ...tickOpts
 } = {}) {
-  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile, allowUnknown: true }));
+  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile }));
   const perRepo = new Array(repos.length);
   const limit = Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8
     ? concurrency : resolveReviewTickSharing().repoConcurrency;

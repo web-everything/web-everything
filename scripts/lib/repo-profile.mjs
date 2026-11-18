@@ -153,12 +153,12 @@ export function constellationRepoKeysWith(capability, { repos = CONSTELLATION_RE
   });
 }
 
-/** Explicit targets honor registered profiles too; only legacy callers may allow truly unknown repos. */
-export function repoHasCapability(repo, capability, { resolveProfile = repoProfile, allowUnknown = false } = {}) {
+/** Explicit targets honor registered profiles too; unknown repos have no capabilities. */
+export function repoHasCapability(repo, capability, { resolveProfile = repoProfile } = {}) {
   if (!['review', 'fix', 'ciHeal', 'build'].includes(capability)) return false;
   try {
     const profile = resolveProfile(repoKeyForSlug(repo) ?? repo);
-    if (profile == null) return allowUnknown && repoProfile(repo) === null;
+    if (profile == null) return false;
     const value = profile.capabilities?.[capability];
     return capability === 'build' ? value === 'couple' || value === 'direct' : value === true;
   } catch { return false; }

@@ -324,16 +324,14 @@ describe('liveness gather paths and human output', () => {
   });
 });
 
-import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
-it('excludes review-disabled repos from liveness PR recovery evidence', async () => {
-  const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
+
+it('liveness evidence observes every repo even when dispatch capabilities are absent', async () => {
   const listed = [];
-  const { snapshot } = await gatherSnapshot({ now, noMovementStore: true }, {
-    resolveProfile, env: {}, homedir: () => process.env.TMPDIR,
-    readSharedOpenPrs: ({repo}) => { listed.push(repo); return []; },
+  await gatherSnapshot({ now, noMovementStore: true }, {
+    resolveProfile: () => null, env: {}, homedir: () => process.env.TMPDIR,
+    readSharedOpenPrs: ({ repo }) => { listed.push(repo); return []; },
     cachedClaudeAgents: () => '[]', daemonCloneRoots: () => [],
     readTail: () => '', readFile: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); },
   });
-  expect(snapshot.prs).toEqual([]);
-  expect(listed).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+  expect(listed).toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
 });

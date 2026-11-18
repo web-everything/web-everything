@@ -294,11 +294,30 @@ it.each(['review', 'fix', 'ciHeal', 'build'])('requires exact capability values 
 it('explicit capability checks fail closed for missing, malformed or unreadable registered profiles', () => {
   for (const resolveProfile of [() => null, () => false, () => ({}), () => ({ capabilities: { review: 'false' } }),
     () => { throw new Error('unreadable profile'); }]) {
-    expect(repoHasCapability('frontier-ui/frontierui', 'review', { resolveProfile, allowUnknown: true })).toBe(false);
-    expect(repoHasCapability('longshoreai/longshore', 'review', { resolveProfile, allowUnknown: true })).toBe(false);
+    expect(repoHasCapability('frontier-ui/frontierui', 'review', { resolveProfile })).toBe(false);
+    expect(repoHasCapability('longshoreai/longshore', 'review', { resolveProfile })).toBe(false);
   }
-  expect(repoHasCapability('outside/repo', 'review', { allowUnknown: true, resolveProfile: () => false })).toBe(false);
+  expect(repoHasCapability('outside/repo', 'review', { resolveProfile: () => false })).toBe(false);
   expect(repoHasCapability('outside/repo', 'review')).toBe(false);
-  expect(repoHasCapability('outside/repo', 'review', { allowUnknown: true })).toBe(true);
-  expect(repoHasCapability('we', 'unknown', { allowUnknown: true })).toBe(false);
+  expect(repoHasCapability('we', 'unknown')).toBe(false);
+});
+
+
+import { CONSTELLATION_REPOS, PENDING_REPOS } from '../constellation-repos.mjs';
+it("pins today's complete registered repo set and its exact capabilities", () => {
+  const expected = {
+    we: { review: true, fix: true, ciHeal: true, build: 'direct' },
+    frontierui: { review: true, fix: true, ciHeal: true, build: 'couple' },
+    'plateau-app': { review: true, fix: true, ciHeal: true, build: 'couple' },
+    longshore: { review: false, fix: false, ciHeal: false, build: 'none' },
+  };
+  expect(Object.fromEntries(Object.entries({ ...CONSTELLATION_REPOS, ...PENDING_REPOS })
+    .map(([key, { slug }]) => {
+      expect(repoProfile(slug)?.capabilities).toEqual(expected[key]);
+      return [key, repoProfile(key)?.capabilities];
+    }))).toEqual(expected);
+});
+it.each(['review', 'fix', 'ciHeal', 'build'])('denies unknown repos the %s capability', capability => {
+  expect(repoProfile('outside/repo')).toBeNull();
+  expect(repoHasCapability('outside/repo', capability)).toBe(false);
 });

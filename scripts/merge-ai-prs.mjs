@@ -3791,7 +3791,7 @@ const CONSTELLATION_REPO_NAMES = ['web-everything', 'frontierui', 'plateau-app']
  */
 export function resolveRepos({ repos, singleRepo, self: rawSelf, resolveProfile = repoProfile } = {}) {
   const self = typeof rawSelf === 'string' ? canonicalizeSlug(rawSelf) : rawSelf;
-  const reviewEnabled = repo => repoHasCapability(repo, 'review', { resolveProfile, allowUnknown: true });
+  const reviewEnabled = repo => repoHasCapability(repo, 'review', { resolveProfile });
   if (typeof repos === 'string' && repos.trim()) {
     // #xc7p3q9 (R10) — NORMALIZE every `--repos` entry to `owner/name`. A short-name `--repos=frontierui` otherwise
     // yields a bogus `frontierui` alongside the canonical `frontier-ui/frontierui`: its listing throws, and (pre-R3)
@@ -3812,7 +3812,7 @@ export function resolveRepos({ repos, singleRepo, self: rawSelf, resolveProfile 
   if (self && repoKeyForSlug(self) && !declared.includes(self)) return declared;
   if (self && declared.includes(self)) return [self, ...declared.filter((s) => s !== self)];
   const owner = self && self.includes('/') ? self.split('/')[0] : null;
-  if (!owner) return [null]; // can't derive the constellation without an owner → stay single-repo (safe)
+  if (!owner) return reviewEnabled(self) ? [null] : []; // unknown dispatch targets fail closed
   const slugs = CONSTELLATION_REPO_NAMES.map((n) => `${owner}/${n}`);
   return [...new Set([self, ...slugs.filter((s) => s !== self)])].filter(reviewEnabled); // self first (the local clone), then the rest
 }
@@ -3835,7 +3835,10 @@ export function resolveContextRepos(repos, self) {
   const base = Array.isArray(repos) ? repos : [];
   const localToken = base.includes(null) ? null : self;   // the form REPOS uses for the local repo
   // Context reads must still see disabled repos for couple/dependency guards.
-  const context = repoKeyForSlug(self) ? Object.values(CONSTELLATION_REPOS).map((r) => r.slug) : resolveRepos({ self });
+  const owner = self?.includes('/') ? self.split('/')[0] : null;
+  const context = repoKeyForSlug(self)
+    ? Object.values(CONSTELLATION_REPOS).map((r) => r.slug)
+    : owner ? [self, ...CONSTELLATION_REPO_NAMES.map((name) => `${owner}/${name}`)] : [null];
   return [...new Set([...base, ...context].map((r) => (r == null || r === self) ? localToken : r))];
 }
 
