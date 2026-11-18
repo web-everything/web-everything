@@ -141,7 +141,7 @@ export function estimateRequest({ kind, key, rows = [], now, selectedFileCount,
     // The binding single-thread acceptance case takes precedence over ceil(1 * 1.2).
     let threads = mean <= 1 ? 1 : Math.ceil(mean * 1.2);
     if (recent.filter(r => r.throttledUsec / (r.runMs * 1000) > 0.2).length >= 3)
-      threads = Math.ceil(1.5 * history.at(-1).threadsGranted);
+      threads = Math.max(threads, Math.ceil(1.5 * history.at(-1).threadsGranted));
     let memBytes = Math.max(G, Math.ceil(percentile(history.map(r => r.memoryPeakBytes), 0.95) * 1.3 / HALF_G) * HALF_G);
     if (recent.some(r => r.oomKills > 0)) memBytes *= 2;
     req = makeRequest({ kind, key, threads: clamp(threads, cap.maxThreadsPerOp),

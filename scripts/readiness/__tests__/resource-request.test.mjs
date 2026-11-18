@@ -21,6 +21,10 @@ describe('thread-budget estimator acceptance', () => {
   it('requests six threads after five throttled runs granted four', () => {
     expect(estimate({ rows: rows(5, { throttledUsec: 300000 }) }).threads).toBe(6);
   });
+  it('keeps the p90 demand as a floor when growth would request fewer threads', () => {
+    const throttled = rows(5, { cpuUsec: 10000000, throttledUsec: 300000, threadsGranted: 1 });
+    expect(estimate({ rows: throttled }).threads).toBe(12);
+  });
   it('doubles the rounded memory estimate after an OOM', () => {
     const normal = estimate();
     expect(normal.memBytes).toBe(1.5 * G);
