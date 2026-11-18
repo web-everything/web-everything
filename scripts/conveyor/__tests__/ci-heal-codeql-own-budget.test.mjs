@@ -18,6 +18,7 @@ const AUTOMATION = { login: 'web-everything' };
 const pr4453 = (comments) => ({
   number: 4453, state: 'OPEN', headRefName: 'lane/prep-review', headRefOid: FX.headRefOid,
   mergeStateStatus: 'UNSTABLE', mergeable: 'MERGEABLE', comments,
+  rowsHead: FX.headRefOid, rowsComplete: true, rosterSource: 'live',
   labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
   statusCheckRollup: [
     { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-09T07:30:00Z' },
