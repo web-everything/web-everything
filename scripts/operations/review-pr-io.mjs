@@ -88,7 +88,7 @@ import { REVIEW_EFFECTS, FULL_REVIEW_ANCHOR } from './review-pr.mjs';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
-import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
+import { REVIEW_LABELS, hasReviewLabel, parseReviewedSha } from '../lib/review-escalation.mjs';
 
 export { PR_VIEW_FIELDS, prViewFileName };
 
@@ -2070,6 +2070,8 @@ export function createReviewPrSinks({
     if (!payload || !Number.isInteger(payload.pr) || payload.pr <= 0
       || !nonempty(payload.repo) || !nonempty(payload.reviewedHead) || !nonempty(payload.addLabel)
       || !Array.isArray(payload.removeLabels) || !payload.removeLabels.every(nonempty)) return null;
+    const attemptedAt = nonempty(entry.lastAttemptAt) ? Date.parse(entry.lastAttemptAt) : NaN;
+    if (!Number.isFinite(attemptedAt) || typeof labelProvider.readComments !== 'function') return null;
     try {
       const head = await readHead({ repo: payload.repo, pr: payload.pr });
       if (head !== payload.reviewedHead) return null;
@@ -2079,7 +2081,14 @@ export function createReviewPrSinks({
       if (!names.every(nonempty)) return null;
       const added = names.includes(payload.addLabel);
       const removed = payload.removeLabels.filter(label => names.includes(label));
-      if (added && removed.length === 0) return 'applied';
+      if (!added || removed.length !== 0) return null;
+      // LABEL couples the swap with a verdict comment, in either writeOrder. Old labels/markers cannot
+      // prove this attempt finished both writes. Always read the complete thread through the provider.
+      const comments = await labelProvider.readComments(payload.repo, payload.pr);
+      if (!Array.isArray(comments)) return null;
+      if (comments.some(comment => isTrustedMarkerAuthor(comment)
+        && parseReviewedSha([comment]) === payload.reviewedHead
+        && typeof comment.createdAt === 'string' && Date.parse(comment.createdAt) >= attemptedAt)) return 'applied';
       return null;
     } catch { return null; }
   };

@@ -30,13 +30,17 @@ export default {
     const registry = createRegistry();
     registry.register(op('observe-label', { land: effect({ effects: () => [{ type: REVIEW_EFFECTS.LABEL, payload }] }) }));
 
-    for (const state of ['same-head', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'not-applied']) {
+    for (const state of ['same-head', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'not-applied']) {
       const store = createMemoryRunStore();
       const run = advance(startRun({ op: 'observe-label', id: `observe-${state}`, registry }), { registry });
-      Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: response lost' });
+      Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: response lost',
+        lastAttemptAt: '2026-11-18T19:15:30.155Z' });
       store.write(run);
       let writes = 0;
       const sinks = createReviewPrSinks({ runStore: store,
+        labelProvider: { readComments: () => state === 'no-comment' ? [] : [{
+          author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${HEAD} -->`, createdAt: '2026-11-18T19:16:30Z',
+        }] },
         readHead: () => state === 'moved-head' ? 'b'.repeat(40) : HEAD,
         readLabels: () => state === 'unreadable-labels' ? null
           : state === 'source-labels-still-present' ? ['review:pending', 'ready-to-merge'] : labels,

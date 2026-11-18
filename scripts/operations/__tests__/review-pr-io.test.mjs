@@ -4398,23 +4398,60 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
 
 
 describe('pending label swap observation', () => {
-  // Persisted PR #7109 shape: the label write landed but its response did not.
+  // Persisted PR #7109 shape: both writes landed but the response did not.
   const entry = {
-    status: 'pending', attempts: 1,
+    status: 'pending', attempts: 1, lastAttemptAt: '2026-11-18T19:15:30.155Z',
     payload: { pr: 7109, repo: 'o/n', reviewedHead: 'd20084f7c427cdb0000c40f298fff4f6bdff3179',
       addLabel: 'review:accepted', removeLabels: ['review:pending'], to: 'accepted' },
   };
   const live = ['ready-to-merge', 'review:accepted', 'review-round:1', 'status:ready-to-merge', 'red-team:pending'];
+  const comment = { author: { login: 'web-everything' },
+    body: '<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->', createdAt: '2026-11-18T19:16:30Z' };
   const observer = (options = {}) => createReviewPrSinks({ root,
-    readHead: async () => entry.payload.reviewedHead, readLabels: async () => live, ...options,
+    readHead: async () => entry.payload.reviewedHead, readLabels: async () => live,
+    labelProvider: { readComments: () => [comment] }, ...options,
   })[REVIEW_EFFECTS.LABEL].observeOutcome;
 
   it('observes PR 7109 applied on its reviewed head using the live forge readers', async () => {
     const readHead = vi.fn(() => entry.payload.reviewedHead);
     const readLabels = vi.fn(() => live.map(name => ({ name })));
-    await expect(observer({ readHead, readLabels })(entry)).resolves.toBe('applied');
+    const readComments = vi.fn(() => [comment]);
+    await expect(observer({ readHead, readLabels, labelProvider: { readComments } })(entry)).resolves.toBe('applied');
     expect(readHead).toHaveBeenCalledWith({ repo: 'o/n', pr: 7109 });
     expect(readLabels).toHaveBeenCalledWith('o/n', 7109);
+    expect(readComments).toHaveBeenCalledWith('o/n', 7109);
+  });
+
+  it.each([
+    ['no verdict comment', []],
+    ['untrusted author', [{ ...comment, author: { login: 'someone' } }]],
+    ['missing author', [{ ...comment, author: undefined }]],
+    ['older verdict', [{ ...comment, createdAt: '2026-11-18T19:15:30.154Z' }]],
+    ['another head', [{ ...comment, body: `<!-- reviewed-sha: ${'b'.repeat(40)} -->` }]],
+    ['missing timestamp', [{ ...comment, createdAt: undefined }]],
+    ['unparsable timestamp', [{ ...comment, createdAt: 'invalid' }]],
+    ['unreadable comments', null],
+    ['incomplete comments result', { comments: [comment], complete: false }],
+  ])('keeps matching labels unknown with %s', async (_name, comments) => {
+    await expect(observer({ labelProvider: { readComments: () => comments } })(entry)).resolves.toBeNull();
+  });
+
+  it('accepts a trusted verdict created exactly at the attempt timestamp', async () => {
+    await expect(observer({ labelProvider: { readComments: () => [{ ...comment, createdAt: entry.lastAttemptAt }] } })(entry)).resolves.toBe('applied');
+  });
+
+  it.each([undefined, null, '', 'invalid'])('fails closed for missing or unparsable lastAttemptAt %s', async lastAttemptAt => {
+    await expect(observer()({ ...entry, lastAttemptAt })).resolves.toBeNull();
+  });
+
+  it('fails closed without a complete comments reader', async () => {
+    await expect(observer({ labelProvider: {} })(entry)).resolves.toBeNull();
+  });
+
+  it('fails closed when the complete comments reader throws or rejects', async () => {
+    for (const readComments of [() => { throw new Error('unreadable'); }, async () => { throw new Error('unreadable'); }]) {
+      await expect(observer({ labelProvider: { readComments } })(entry)).resolves.toBeNull();
+    }
   });
 
   it('keeps the same PR 7109 labels unknown on a moved head', async () => {
