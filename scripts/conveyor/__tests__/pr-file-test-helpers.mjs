@@ -50,7 +50,8 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
       const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
       execFileSync.mockReset().mockReturnValue(JSON.stringify(fixture));
       execFileSyncThrottled.mockClear();
-      expect(mod[reader]({ repo: 'owner/repo' })).toEqual(fixture);
+      expect(mod[reader]({ repo: 'owner/repo' })).toEqual(reconcile
+        ? fixture.map(pr => ({ ...pr, rowsHead: null, rowsComplete: false })) : fixture);
       expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
       expect(execFileSyncThrottled).toHaveBeenCalledWith('gh',
         ['pr', 'list', '--state', 'open', '--limit', '200', '--json', fields, '--repo', 'owner/repo'], expect.any(Object));

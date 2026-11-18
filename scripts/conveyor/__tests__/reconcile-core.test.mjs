@@ -82,7 +82,13 @@ const AUTOMATION = { login: 'web-everything' };
 
 const lbl = (...names) => names.map((name) => ({ name }));
 // These fixtures model a repository whose one required check is gate. Specific CI cases override the set.
-const planReconcile = options => planReconcileCore({ reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'], ...options });
+// Default to a complete live read for this head; explicit missing/stale evidence stays intact.
+const withCheckRows = pr => ({ rowsHead: pr.headRefOid, rowsComplete: true, rosterSource: 'live', ...pr });
+const planReconcile = options => planReconcileCore({
+  reviewTiming: { startAfter: 'ci-green' }, ...options,
+  requiredChecks: options.requiredChecks === undefined ? ['gate'] : options.requiredChecks,
+  prs: options.prs?.map(withCheckRows),
+});
 const greenRollup = [{ name: 'gate', status: 'completed', conclusion: 'success' }];
 const pendingRollup = [{ name: 'gate', status: 'in_progress', conclusion: null }];
 const redRollup = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
@@ -90,7 +96,7 @@ const finding = (text = 'the cap is not derived from the PR; derive it from the 
   ({ body: `🔁 human review — changes requested\n\n${text}` });
 
 /** PR #1563 — open 2026-08-25T22:00:51Z, merged 16:39:23Z, 18 h 39 m and TWELVE review rounds against a cap of 5. */
-const pr1563 = (over = {}) => ({
+const pr1563 = (over = {}) => withCheckRows({
   number: 1563,
   state: 'OPEN',
   headRefName: 'lane/2612-converge-pr-drive',
@@ -3745,6 +3751,7 @@ it('xxh4zw8 complete hydrated cancellation heals while caps, claims and stand-do
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
   const pr = { number: 3336, isDraft: true, headRefName: 'lane/3336-replay', headRefOid: '4ecb5deb362c81aa28de162db4616bb4c2009347',
     labels: [], comments: [], statusCheckRollup: requiredChecks.map((name, i) => ({ id: 100 + i, name,
+      run_id: 7, run_attempt: 1, detailsUrl: `https://github.com/o/r/actions/runs/7/job/${100 + i}`,
       status: 'COMPLETED', conclusion: name === 'smoke' ? 'CANCELLED' : 'SUCCESS' })) };
   const plan = override => planReconcile({ prs: [{ ...pr, ...override }], requiredChecks, agents: [], now: NOW });
   expect(plan({}).dispatch.map(d => d.kind)).toEqual(['ci-heal']);
@@ -3756,7 +3763,7 @@ it('xxh4zw8 complete hydrated cancellation heals while caps, claims and stand-do
     expect(plan(override).dispatch).toEqual([]);
     expect(plan(override).refusals.map(r => r.kind)).toContain(kind);
   }
-  const latest = { id: 200, name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' };
+  const latest = { ...pr.statusCheckRollup[1], id: 200, run_attempt: 2, name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' };
   for (const statusCheckRollup of [[latest, ...pr.statusCheckRollup], [...pr.statusCheckRollup, latest]]) {
     expect(plan({ statusCheckRollup }).dispatch.map(d => d.kind)).toEqual(['promote-draft']);
   }
@@ -3962,12 +3969,23 @@ it('x6n7c2p required checks before review — repaired ready head waits', () => 
 
 it.each([[], [finding()]])('x6n7c2p required checks before review — fail closed with findings %j', comments => {
   for (const over of [{ requiredChecks: null }, { requiredChecks: [] },
+    { prs: [pr1563({ labels: lbl('review:pending'), comments, rowsComplete: false })] },
+    { prs: [pr1563({ labels: lbl('review:pending'), comments, rowsComplete: undefined })] },
+    { prs: [pr1563({ labels: lbl('review:pending'), comments, rosterSource: undefined })] },
     { prs: [pr1563({ labels: lbl('review:pending'), comments, statusCheckRollup: [] })] },
     { prs: [pr1563({ labels: lbl('review:pending'), comments, statusCheckRollup: pendingRollup })] },
     { prs: [pr1563({ labels: lbl('review:pending'), comments, headRefOid: null })] }]) {
     const plan = planReconcile({ prs: [pr1563({ labels: lbl('review:pending'), comments })], agents: [], now: NOW, ...over });
     expect(plan.dispatch.filter(row => row.kind === 'review')).toEqual([]);
     expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+    if (over.requiredChecks === null || over.requiredChecks?.length === 0
+        || (over.prs && over.prs[0].rosterSource === undefined)) {
+      expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+        ci: expect.objectContaining({ reason: 'unknown-required-set' }) }));
+    } else if (over.prs && over.prs[0].rowsComplete !== true) {
+      expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+        ci: expect.objectContaining({ reason: 'rows-incomplete' }) }));
+    }
   }
 });
 it('required review-gate conflict refuses without repeatedly healing review completion', () => {
@@ -4359,7 +4377,7 @@ describe('green-head needs-human retirement (#5012)', () => {
       body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human' }) }],
     statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: name === 'review-gate' ? 'FAILURE' : 'SUCCESS' })),
   };
-  const plan = (row = pr, on = true) => planReconcileCore({ prs: [row], requiredChecks, verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
+  const plan = (row = pr, on = true) => planReconcileCore({ prs: [withCheckRows(row)], requiredChecks, verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
   it('emits one moot note outside ci-red without changing dispatch/refusals', () => {
     const on = plan(), off = plan(pr, false);
     expect(on.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([expect.objectContaining({ prNumber: 5012, headSha: head, outcome: 'needs-human' })]);
@@ -4384,8 +4402,8 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
   const reviewTiming = { startAfter: 'fast-checks', fastChecks: ['test', 'integration', 'standards'] };
   const head = 'a'.repeat(40);
-  const rows = requiredChecks.map(name => ({
-    name, status: 'completed', conclusion: 'success', head_sha: head,
+  const rows = [...requiredChecks, 'integration'].map((name, index) => ({
+    name, status: 'completed', conclusion: 'success', head_sha: head, id: index + 1, run_id: 1, run_attempt: 2,
   }));
   const pr = (over = {}) => pr1563({ headRefOid: head, baseRefName: 'main', comments: [],
     labels: lbl('review:pending'), statusCheckRollup: rows, reviewTiming, ...over });
@@ -4396,7 +4414,7 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     prs: [pr(over)], agents: [], now: NOW, requiredChecks, reviewTiming, mainSha: 'b'.repeat(40), ...options,
   });
 
-  it('finds standards on settled live-shape CI, respecting implied integration', () => {
+  it('finds standards on settled live-shape CI with explicit integration evidence', () => {
     expect(repair()).toEqual({ missing: ['standards'] });
     expect(repair({ baseRefName: undefined })).toEqual({ missing: ['standards'] });
   });
@@ -4421,7 +4439,7 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     expect(repair({}, required)).toBeNull();
   });
   it('collapses superseded failures and ignores other-head rows', () => {
-    expect(repair({ statusCheckRollup: [{ ...rows[0], conclusion: 'failure' }, ...rows,
+    expect(repair({ statusCheckRollup: [{ ...rows[0], conclusion: 'failure', run_attempt: 1 }, ...rows,
       { name: 'other', status: 'queued', head_sha: 'old' }] })).toEqual({ missing: ['standards'] });
   });
   it.each([

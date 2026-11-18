@@ -470,6 +470,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     });
     if (isGhDeferred(out)) return JSON.parse(String(out));
     const parsed = parseListOutput(out, { repo });
+    for (const pr of parsed) Object.assign(pr, { rowsHead: null, rowsComplete: false });
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
     if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
     // `gh pr list` rollups carry no posting app; the planner's external-check exemption needs it (#6926). An unreadable
@@ -1528,14 +1529,15 @@ export function readStackedPrCheckPolicy(env = process.env) {
   return env.WE_STACKED_PR_CHECK_POLICY === 'strict' ? 'strict' : 'await-base';
 }
 
-function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch }) {
+function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, defaultBranch }) {
   const cache = new Map();
   const ready = [], refusals = [], notes = [], owedTriggers = [];
   const stackedPolicy = readStackedPrCheckPolicy();
-  for (const pr of prs) {
+  for (const rawPr of prs) {
+    const pr = { ...rawPr, rosterSource };
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = withoutImpliedRequiredChecks(requiredChecks ?? [], runs).filter(name => !runs.some(run => run?.name === name));
-    if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
+    if (pr.rowsComplete !== false && runs.length < 100 && !missing.length) { ready.push(pr); continue; }
     if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)
       && runs.length < 100 && missing.length === (requiredChecks ?? []).length) {
       const basePrNumber = prs.find(candidate => candidate.headRefName === pr.baseRefName)?.number ?? null;
@@ -1580,7 +1582,8 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
         const absent = withoutImpliedRequiredChecks(requiredChecks ?? [], rows).filter(name => !rows.some(row => row.name === name));
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
-        cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
+        cache.set(key, { rowsHead: rows.rowsHead === undefined ? sha : rows.rowsHead,
+          rowsComplete: rows.rowsComplete === undefined ? true : rows.rowsComplete === true, rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
           detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
           conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });
@@ -1612,8 +1615,10 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
-    ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
-      ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
+    ready.push({ ...pr, rowsHead: refused || neverStarted ? pr.rowsHead : result.rowsHead,
+      rowsComplete: !refused && !neverStarted && result.rowsComplete === true,
+      statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
+      ...((refused || neverStarted || result.rowsComplete !== true) ? { rollupIncomplete: true } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
 }
@@ -1783,7 +1788,7 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+  const { checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
     ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
@@ -1791,7 +1796,7 @@ export function runReconcilePass({
   // #4501 — `requiredChecks` now threaded through so this enrichment judges the SAME live-required set
   // `planReconcile` uses below, instead of silently falling back to `DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS`.
   const hydrated = step('hydrate-checks', () => hydrateChecks(rawPrs, {
-    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
+    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, rosterSource, readChecks, defaultBranch,
   }));
   // Evidence is applied before every downstream CI reader, including main-red attribution.
   const autoProceedPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
