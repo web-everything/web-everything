@@ -11,12 +11,12 @@ const require = createRequire(import.meta.url);
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { AUTO_POLICY_ACTOR, buildOperatorRulingComment, readReferralRecords, REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
+import { AUTO_POLICY_ACTOR, buildOperatorRulingComment, readReferralRecords,REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
 import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { openReferralFindings } from '../../operations/record-referral-ruling.mjs';
 import {
   decideReferralHoldAutoResolve, enrichPrsWithReferralHoldAutoResolve, enrichPrsWithReferralHolds, resolveReferralHoldAutoResolve,
-  REFERRAL_HOLD_AUTO_RESOLVE_STANDARD,
+  GH_LIST_COMMENT_CAP, REFERRAL_HOLD_AUTO_RESOLVE_STANDARD,
   referralHoldSendBackBody,
 } from '../review-referral-hold.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
@@ -229,6 +229,66 @@ describe('send-back prose is rendered as HTML text', () => {
   });
 });
 
+describe('same-head holds with no referral finding (#7012)', () => {
+  const fx = FX[5775];
+  const advisory = fx.comments.find(c => c.body.includes('ADVISORY REVIEW') && c.body.includes(fx.headRefOid));
+  const comments = [advisory];
+  const held = () => enrich({ ...fx, comments, runs: fx.runs.filter(r => r.head === fx.headRefOid).slice(-1),
+    labels: ['review:human', 'advisory:accepted', 'red-team:clear'] });
+  const recordComment = change => ({ ...advisory,
+    body: `<!-- mandatory-referrals-v1: ${encodeURIComponent(JSON.stringify({ ...liveRecord(fx), ...change }))} -->` });
+  const resolved = pr => enrichPrsWithReferralHoldAutoResolve([pr], { repo, env: {}, decide })[0];
+
+  it('a current advisory and no referral record reaches already-reviewed-head instead of review-referrals-pending', () => {
+    const pr = held();
+    expect(readReferralRecords(pr.comments).records).toEqual([]);
+    expect(pr.referralHold).toMatchObject({ kind: 'same-head', head: fx.headRefOid, count: 1 });
+    expect(pr.referralHoldAutoResolve).toEqual({ outcome: 'resume', head: fx.headRefOid, findings: [], counts: {},
+      why: `no referral finding exists on head ${fx.headRefOid.slice(0, 9)}; no ruling is owed` });
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals.map(r => r.kind)).toEqual(['already-reviewed-head']);
+    expect(pr.labels.map(l => l.name)).toContain('review:human');
+  });
+
+
+  it.each([
+    ['missing comments', undefined, {}, /thread is unreadable/],
+    ['non-array comments', {}, {}, /thread is unreadable/],
+    ['comments at the list cap', Array.from({ length: GH_LIST_COMMENT_CAP }, () => advisory), {}, /may be truncated/],
+    ['comments above the list cap', Array.from({ length: GH_LIST_COMMENT_CAP + 1 }, () => advisory), {}, /may be truncated/],
+    ['malformed referral', [...comments, { ...advisory, body: '<!-- mandatory-referrals-v1: broken -->' }], {}, /malformed/],
+    ['pending referral', [...comments, recordComment({ rulings: [], carried: [], superseded: [] })], {}, /no readable ruling/],
+    ['referral-kind hold without records', comments, { kind: 'referral' }, /no referral record names/],
+    ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
+    ['no verdict', comments, { noVerdict: {} }, /no verdict ever landed/],
+    ['ledger cause', comments, { cause: 'ledger-unreadable' }, /ledger cannot answer/],
+    ['hold on another head', comments, { head: 'a'.repeat(40) }, /not on the live head/],
+  ])('%s stays review-referrals-pending', (_name, thread, change, reason) => {
+    const pr = held();
+    // Bypass the planner's earlier unmarked-page refusal to exercise the referral guard even on a marked full read.
+    const out = resolved({ ...pr, comments: thread, commentsComplete: true, referralHold: { ...pr.referralHold, ...change } });
+    expect(out.referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(reason) });
+    const p = plan(out);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
+  });
+
+  it('an unreadable live referral state keeps the hold', () => {
+    const pr = held();
+    Object.defineProperty(pr, 'body', { get() { throw new Error('thread read failed'); } });
+    expect(decide(pr, pr.referralHold)).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/state is unreadable/) });
+  });
+
+  it('re-derives the decision when a pending referral appears on the next pass', () => {
+    const pr = held();
+    expect(pr.referralHoldAutoResolve.outcome).toBe('resume');
+    const next = resolved({ ...pr, comments: [...comments, recordComment({ rulings: [], carried: [], superseded: [] })] });
+    expect(next.referralHoldAutoResolve.outcome).toBe('stay');
+    expect(plan(next).refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
+  });
+});
+
 describe('fail closed: anything unproven keeps the pause, and says why', () => {
   const fx = FX[5775];
   const pr = asPr(fx);
@@ -264,13 +324,12 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
     const out = decide(asPr(fx, [...fx.comments, bad]), hold);
     expect(out.outcome).toBe('stay');
   });
-  it('an operator ruling for a different head only (the live head has no ruling of its own) does not count', () => {
+  it('records only on an older head leave no referral finding owed by a clean same-head hold', () => {
     const f = FX[5800];
     const r = liveRecord(f);
     const other = '1'.repeat(40);
     const prOther = asPr({ ...f, headRefOid: other });
-    // A pause on a head with no records at all: nothing proves anything.
-    expect(decide(prOther, { ...hold, head: other })).toMatchObject({ outcome: 'stay', why: 'no referral record names the live head' });
+    expect(decide(prOther, { ...hold, head: other })).toMatchObject({ outcome: 'resume', findings: [], counts: {} });
     expect(r.head).toBe(f.headRefOid);
   });
   it('an operator carry the gate backs (source ruling on an older head) counts; the same ruling without the carry does not', () => {

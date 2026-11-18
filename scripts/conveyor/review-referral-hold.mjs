@@ -607,7 +607,7 @@ const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:
  * `seatDisabled` (importing the seat policy closes a cycle): an unruled finding of a since-disabled seat keeps the
  * pause, the conservative side. Outcomes:
  * - `send-back`: some live-head finding is ruled `block` (operator or policy or reviewer) and none is pending.
- * - `resume`: every live-head finding is ruled `card` or `not-real`.
+ * - `resume`: every live-head finding is ruled `card` or `not-real`, or a same-head hold has no referral finding.
  * - `stay` (fail closed, with `why`): anything unreadable, pending, missing, malformed, or not on the live head.
  * Never accepts and never touches `review:human`: the caller acts on the outcome.
  * @returns {null | {outcome:'send-back'|'resume'|'stay', head:string|null, why:string,
@@ -625,6 +625,12 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   if (hold.persistenceFailed) return stay('the referral save failed on this head; its own retry budget owns the pause');
   if (hold.noVerdict) return stay('no verdict ever landed on this head; the no-verdict retries own the pause');
   if (hold.cause) return stay(`the verdict ledger cannot answer for this PR (${hold.cause})`);
+  if (!Array.isArray(pr.comments)) return stay('the comment thread is unreadable; read the full thread before resuming');
+  if (pr.comments.length >= GH_LIST_COMMENT_CAP) return stay('the comment thread may be truncated; read the full thread before resuming');
+  const noFinding = why => hold.kind === 'same-head'
+    ? { outcome: 'resume', head, findings: [], counts: {},
+      why: `no referral finding exists on head ${head.slice(0, 9)}; no ruling is owed` }
+    : stay(why);
   let live;
   try { live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable }); }
   catch (e) { return stay(`the referral state is unreadable (${String(e?.message ?? e).split('\n')[0]})`); }
@@ -635,7 +641,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
       + (named.length ? ` (${named.join(', ')})` : ` (${live.pendingReasons.join(', ')})`));
   }
   const records = live.records.filter(r => r.head === head && r.repo === repo && r.pr === Number(pr.number));
-  if (!records.length) return stay('no referral record names the live head');
+  if (!records.length) return noFinding('no referral record names the live head');
   const findings = [];
   for (const record of records) {
     const state = referralRecordState(record, { repo, pr: Number(pr.number), head, body: typeof pr.body === 'string' ? pr.body : '',
@@ -662,7 +668,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
         actor: named.operator ? named.actor : 'reviewer', rationale: named.rationale ?? named.reason ?? '' });
     }
   }
-  if (!findings.length) return stay('the live-head records name no active referral');
+  if (!findings.length) return noFinding('the live-head records name no active referral');
   const counts = {};
   for (const f of findings) counts[f.result] = (counts[f.result] ?? 0) + 1;
   const blocked = findings.filter(f => f.result === 'block');
