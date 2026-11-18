@@ -167,3 +167,15 @@ export function shadowSeatStatus(settings, { repo, pr, earnedShape, careLevel, r
   // Integer threshold always leaves at least one hash bucket out, even for a rate just below 1.
   return bucket < Math.floor(rate * 2 ** 32) ? 'sampled' : 'off (sample)';
 }
+
+/** Count actual panel vendors; shadows keep their Claude seat. Unknown evidence refuses. */
+export function assertCrossVendorPanel(providers, builder) {
+  const vendors = { claude: 'Anthropic', shadow: 'Anthropic', codex: 'OpenAI', carbon: 'Google', 'agy-gemini': 'Google', 'agy-claude': 'Anthropic' };
+  const vendorOf = p => Object.hasOwn(vendors, p) ? vendors[p] : null;
+  const panel = providers.map(vendorOf);
+  const vendor = vendorOf(builder);
+  if (!panel.length || panel.some(v => !v) || (vendor ? !panel.some(v => v !== vendor) : new Set(panel).size < 2)) {
+    throw new Error('review panel lacks proven cross-vendor independence; operator must replace an existing seat before review');
+  }
+  return true;
+}
