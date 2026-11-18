@@ -397,6 +397,16 @@ export async function finalizeRebuild({
     return { ...result, alerts: alertsList };
   };
 
+  // I2: an unsettled drop intent (or an unreadable record) blocks a finalize that changes the applied registration set.
+  // A recovery/rollback that keeps the set unchanged still finalizes.
+  let dropsPending = false;
+  try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
+  const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
+  if (dropsPending && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
+    alert('drop-pending-unsettled', { target: plan.finalSha });
+    return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
+
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
@@ -449,16 +459,6 @@ export async function finalizeRebuild({
       alert('untracked-collision', { paths: colliding });
       return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
     }
-  }
-
-  // I2: an unsettled drop intent (or an unreadable record) blocks a finalize that changes the applied registration set.
-  // A recovery/rollback that keeps the set unchanged still finalizes.
-  let dropsPending = false;
-  try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
-  const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
-  if (dropsPending && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
-    alert('drop-pending-unsettled', { target: plan.finalSha });
-    return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
   }
 
   // ── The ONE `reset --hard` this module performs — always AFTER a passing smoke, never before. ──────────
