@@ -769,7 +769,7 @@ describe('R272 fail-closed evidence across every row', () => {
 
 describe('hydrated CI evidence for escalation retirement', () => {
   it.each([
-    { rowsComplete: undefined }, { rowsComplete: false }, { rowsHead: 'other' }, { rowsHead: null },
+    { rowsComplete: undefined }, { rowsComplete: false }, { rowsHead: undefined }, { rowsHead: 'other' }, { rowsHead: null },
   ])('does not call green rows complete for this head: %j', evidence => {
     const complete = { headSha: input.headSha, rowsHead: input.headSha, rowsComplete: true,
       requiredChecks: ['test'], rollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };

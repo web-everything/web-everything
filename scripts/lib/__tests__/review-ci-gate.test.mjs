@@ -50,8 +50,22 @@ describe('hydrated rollup evidence', () => {
     expect(reviewCiGate({ headSha, checks: [success('test')], requiredChecks: ['test'], rowsComplete, rowsHead: headSha }))
       .toEqual({ allowed: false, headSha, reason: 'rows-incomplete', unknown: true, affected: [] });
   });
-  it.each(['other', null])('refuses complete rows hydrated for another head: %j', rowsHead => {
+  it.each([undefined, 'other', null])('refuses complete rows hydrated for another head: %j', rowsHead => {
     expect(reviewCiGate({ headSha, checks: [success('test')], requiredChecks: ['test'], rowsComplete: true, rowsHead }))
       .toMatchObject({ allowed: false, reason: 'rows-incomplete', unknown: true });
+  });
+});
+
+describe('aggregate head binding before implication', () => {
+  it.each([
+    { name: 'test', status: 'completed', conclusion: 'success' },
+    { context: 'test', state: 'success' },
+  ])('refuses a wrong-head aggregate even when only integration is required: %j', aggregate => {
+    const input = { headSha, rowsHead: headSha, rowsComplete: true, requiredChecks: ['integration'] };
+    expect(reviewCiGate({ ...input, checks: [{ ...aggregate, head_sha: headSha }] }).allowed).toBe(true);
+    const result = reviewCiGate({ ...input, checks: [{ ...aggregate, head_sha: 'other' }] });
+    expect(result).toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
+    expect(result.affected).toContainEqual({ name: 'test', reason: 'wrong-head' });
+    expect(result.affected).toContainEqual({ name: 'integration', reason: 'missing' });
   });
 });

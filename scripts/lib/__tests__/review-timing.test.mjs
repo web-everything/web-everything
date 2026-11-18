@@ -530,6 +530,7 @@ describe('hydrated evidence before timing relaxations', () => {
     it.each([
       { rowsComplete: undefined, rowsHead: head },
       { rowsComplete: false, rowsHead: head },
+      { rowsComplete: true, rowsHead: undefined },
       { rowsComplete: true, rowsHead: 'other' },
       { rowsComplete: true, rowsHead: null },
     ])('refuses unproved rows %j', evidence => {

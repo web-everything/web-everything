@@ -45,5 +45,6 @@ export async function probe(root) {
   if (reviews({ rowsComplete: true, rowsHead: HEAD }) !== 1) violations.push('complete rows for the head: review not dispatched');
   if (reviews({ rowsComplete: false, rowsHead: HEAD }) !== 0) violations.push('incomplete rows: review dispatched');
   if (reviews({ rowsComplete: true, rowsHead: 'd'.repeat(40) }) !== 0) violations.push('rows for another head: review dispatched');
+  if (reviews({ rowsComplete: true }) !== 0) violations.push('rows without a head binding: review dispatched');
   return violations;
 }
