@@ -279,7 +279,7 @@ describe('daemon-overlay.mjs retire', () => {
   });
 });
 
-describe('guarded urgent-failed unload', () => {
+describe.each(['unique-commits-not-on-main', 'pr-open'])('guarded urgent-failed unload with a %s keep verdict', reason => {
   async function urgent({ outcome = 'held', snapshot = 'same' } = {}) {
     const f = fixture();
     const tip = f.push('lane/urgent', 'urgent.txt', 'unmerged urgent work\n');
@@ -289,6 +289,7 @@ describe('guarded urgent-failed unload', () => {
     const args = { root: f.clone, ref: entry.ref, expectedTip: tip,
       expectedEntry: snapshot === 'missing' ? undefined : snapshot === 'changed' ? { ...entry, addedAt: 'newer' } : entry,
       mode: 'urgent-failed', trackingId: 'urgent-attempt', env: f.env, deps: {
+        ...(reason === 'pr-open' ? { prove: () => ({ action: 'keep', reason, tip }) } : {}),
         readUrgentLoads: () => {
           expect(readdirSync(f.env.WE_DAEMON_OVERLAY_DIR).some(n => n.endsWith('.add-guard.lock'))).toBe(true);
           return [{ type: 'prototype-load.urgent', trackingId: 'urgent-attempt',
@@ -316,7 +317,15 @@ describe('guarded urgent-failed unload', () => {
     expect(f.events().at(-1)).toMatchObject({ reason: 'urgent-failed', evidence: { urgentUnload: true } });
     expect(f.events().at(-1).operatorReason).toBeUndefined();
   });
-  it.each(['pinned-closed-pr', 'edge-resolution-recorded', 'pr-open', 'fetch-failed', 'history-unreadable', 'pr-state-unknown', 'unprovable'])('preserves the %s keep verdict for an authorized urgent request', async reason => {
+  it('preserves the keep verdict without urgent-failed mode', async () => {
+    const { f, args } = await urgent();
+    expect(await retireRegistration({ ...args, mode: 'retired' })).toMatchObject({
+      retired: false, refused: 'not-proved', proof: { action: 'keep', reason },
+    });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['pinned-closed-pr', 'edge-resolution-recorded', 'fetch-failed', 'history-unreadable', 'pr-state-unknown', 'unprovable', 'unknown'])('preserves the %s keep verdict for an authorized urgent request', async reason => {
     const { f, args, tip } = await urgent();
     args.deps.prove = () => ({ action: 'keep', reason, tip });
     expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'not-proved', proof: { reason } });

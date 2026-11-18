@@ -458,7 +458,7 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
  * the registration is restored (`tip-moved-restored`). A push after the check is a push to an unregistered ref.
  * Runs under the add-guard lock (no guarded add can interleave) with a durable drop intent (see settlePendingDrops).
  * Library-only `mode: 'urgent-failed'` permits a failed/expired urgent CI load to withdraw even when
- * retirement proof says unique-commits-not-on-main. Requires an explicit entry snapshot, exact live tip,
+ * retirement proof says unique-commits-not-on-main or pr-open. Requires an explicit entry snapshot, exact live tip,
  * and a matching trackingId in the coordination urgent-loads ledger via deps.readUrgentLoads.
  * Other keep verdicts still refuse. This mode never supplies operator retirement evidence.
  * `deps.readUrgentLoads` reads the bounded coordination ledger; {prove, tip, afterDrop} are test seams.
@@ -490,7 +490,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
         && r.registration.ref === ref && r.registration.sha === expectedTip)) return refuse('urgent-tracking-required');
     }
     let proof = prove(entry);
-    if (proof.action === 'keep' && proof.reason === 'unique-commits-not-on-main' && mode === 'urgent-failed') {
+    if (proof.action === 'keep' && ['unique-commits-not-on-main', 'pr-open'].includes(proof.reason) && mode === 'urgent-failed') {
       // CI failure / expired verdict authorizes withdrawal, not a claim that the work landed.
       let current;
       try { current = tip(ref); } catch { /* unreadable evidence refuses below */ }

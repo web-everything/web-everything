@@ -83,11 +83,11 @@ describe('urgent CI sweep', () => {
     expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
     expect(f.d.remove).not.toHaveBeenCalled();
   });
-  it('raises NEEDS-YOU when guarded expiry retirement refuses a protected overlay', async () => {
+  it.each(['pinned-closed-pr', 'edge-resolution-recorded', 'history-unreadable'])('raises NEEDS-YOU when guarded expiry retirement refuses a %s overlay', async reason => {
     const f = fixture();
     f.d.now = () => '2026-11-19T13:00:00Z';
     f.d.checks.mockImplementation(() => { throw new Error('API unavailable'); });
-    f.d.remove.mockReturnValue({ retired: false, refused: 'not-proved' });
+    f.d.remove.mockReturnValue({ retired: false, refused: 'not-proved', proof: { action: 'keep', reason } });
     expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: 'overlay removal refused: not-proved' }] });
     expect(f.events).toEqual([]);
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['overlay removal refused: not-proved'] }));

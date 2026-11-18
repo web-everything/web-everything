@@ -4723,8 +4723,10 @@ Named fault-injection tests cover each sink failure and each progress-write inte
 Urgent CI failure and expired-verdict unloads use `retireRegistration` with the library-only
 `urgent-failed` mode after `recoverDrops` for the clone. Pass the loaded registration SHA
 (`registration.sha`, which may differ from the source SHA) and the observed full entry snapshot.
-The normal retirement proof still runs; a keep verdict may authorize urgent withdrawal only with
-an exact live tip. Keep regression cases for changed entries, moved/unreadable tips, the lock and
+The normal retirement proof still runs; only `unique-commits-not-on-main` and `pr-open` keep
+verdicts may authorize urgent withdrawal, with a matching tracking record, SHA and exact live tip.
+Pinned, edge-resolution and unreadable keep verdicts still refuse. Keep regression cases for changed
+entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
