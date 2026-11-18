@@ -795,6 +795,9 @@ export function seatSettingsForRun(record, settings) {
 
 const OPTIONAL_SEATS = Object.freeze([ADVISORY_JUDGE_SEAT, CORRECTNESS_ADVISORY_SEAT, ANTIGRAVITY_REVIEW_SEAT, AGY_CORRECTNESS_SEAT]);
 
+// Commit 5517171b5d0143e44359f4c6ead42c74e5876a68 first persisted read.seatSteps/minNonClaudeSeats.
+export const REVIEW_SEAT_POLICY_PERSISTED_AT = '2026-10-17T01:48:10.000Z';
+
 /**
  * Rebuild a saved run's roster for a resume at ANY cursor position, independently of current flags and minimums.
  * New runs persist it in `findings.read.seatSteps`. A run saved before that keeps every seat it answered or is
@@ -833,8 +836,12 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
     : reached.includes(seat.step) || prefilled.includes(seat.step) || (i > furthest && liveFlags[seat.step]));
   const [codexAdvisory, correctnessAdvisory, antigravityReview, agyCorrectnessAdvisory] = OPTIONAL_SEATS.map(seated);
   // Before roster/minimum persistence, reviews had no diversity requirement. Do not apply a
-  // new minimum to those historical panels; a modern record with incomplete policy stays fail-closed.
-  const historicalMinimum = !Object.hasOwn(read, 'seatSteps') && !Object.hasOwn(read, 'minNonClaudeSeats');
+  // new minimum only when the persisted read-step start proves the panel predates that policy.
+  // Schema v1 spans the cutover; absent/invalid timing cannot prove age and keeps the live minimum.
+  const startedAt = record.stepTimings?.find((timing) => timing?.step === 'read')?.startedAt;
+  const historicalMinimum = !Object.hasOwn(read, 'seatSteps') && !Object.hasOwn(read, 'minNonClaudeSeats')
+    && typeof startedAt === 'string' && Number.isFinite(Date.parse(startedAt))
+    && Date.parse(startedAt) < Date.parse(REVIEW_SEAT_POLICY_PERSISTED_AT);
   return {
     securitySeat: securitySeatFromRun(record),
     cardOnlyLight: read.cardOnlyLight === true,
