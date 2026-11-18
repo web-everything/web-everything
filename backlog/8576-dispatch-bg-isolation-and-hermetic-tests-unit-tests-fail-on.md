@@ -1,15 +1,16 @@
 ---
+bornAs: xa7d41n
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/lib/agent-launch.mjs", "we:scripts/__tests__/agent-launch.test.mjs"]
+scope: ["we:scripts/lib/__tests__/dispatch-bg-isolation.test.mjs", "we:scripts/lib/__tests__/hermetic-tests.test.mjs"]
 dateOpened: "2026-11-17"
 tags: []
 ---
 
-# Runtime launch assertion: agent-launch stamps an env marker and launched sessions refuse to start without it
+# dispatch-bg-isolation and hermetic-tests unit tests fail on origin/main
 
-Real enforcement follow-up to the agent-launch lint (R1019): we:scripts/lib/agent-launch.mjs stamps an env marker on every launch it makes, and launched claude/codex sessions refuse to start without it, so a launch that bypasses the module fails at runtime. The structural test we:scripts/__tests__/agent-launch-structure.test.mjs is a lint for literal launches only.
+Pre-existing failures on plain main: we:scripts/lib/__tests__/dispatch-bg-isolation.test.mjs (3 tests in the repo guard hooks group, missing remote settings) and we:scripts/lib/__tests__/hermetic-tests.test.mjs (1 real-hooks expected-failure test). Found while building the agent-launch module; unrelated to it.
 
 ## Acceptance
 
