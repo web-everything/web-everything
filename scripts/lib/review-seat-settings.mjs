@@ -113,16 +113,18 @@ export function resolveShadowTrialReviews({ env = process.env, file = REVIEW_SET
   return { value: null, source: 'default' };
 }
 
-/** Reporting only: env > settings > 10 agreeing PRs. Promotion remains manual; no seat or gate changes. */
-export function resolveShadowPromotionPrs({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
-  const valid = (v) => {
+/** Reporting only: env > settings > 10 agreeing PRs, with a ruled floor of 10 (R1062). */
+export function resolveShadowPromotionPrs({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8'), log = (m) => console.error(m) } = {}) {
+  const valid = (v, source) => {
     const n = typeof v === 'number' ? v : (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : NaN);
-    return Number.isSafeInteger(n) && n > 0 ? n : null;
+    if (Number.isSafeInteger(n) && n >= 10) return n;
+    if (v !== undefined) log(`review.shadowSeats.antigravity.promotionAgreeingPrs: invalid ${source} layer ignored (requires a safe integer >= 10); falling through`);
+    return null;
   };
-  const fromEnv = valid(env?.WE_REVIEW_SHADOW_AGY_PROMOTION_PRS);
+  const fromEnv = valid(env?.WE_REVIEW_SHADOW_AGY_PROMOTION_PRS, 'env');
   if (fromEnv) return { value: fromEnv, source: 'env' };
   try {
-    const value = valid(JSON.parse(readFile(file))?.shadowSeats?.antigravity?.promotionAgreeingPrs);
+    const value = valid(JSON.parse(readFile(file))?.shadowSeats?.antigravity?.promotionAgreeingPrs, 'settings');
     if (value) return { value, source: 'settings' };
   } catch { /* built-in */ }
   return { value: 10, source: 'default' };

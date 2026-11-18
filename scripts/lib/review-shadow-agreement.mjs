@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { bindFindingIds, deriveVerdict, findingIdentityEntry, normalizeFindings } from './jury-core.mjs';
 import { findingDefectClass } from './review-round-rules.mjs';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
+import { assertCrossVendorPanel, loadReviewSeatSettings, sanitizeReviewLog } from './review-seat-provider.mjs';
 import { resolveShadowPromotionPrs, resolveShadowPromotionReplaces } from './review-seat-settings.mjs';
 
 /** A quota hold/exhaustion is the agy backend being out of budget: no juror ran, so it is neither a failure of the seat nor evidence about agy. */
@@ -99,7 +100,7 @@ export function buildShadowRow({ at, repo, pr, head, lens, runId, model, agyRun,
   const findings = normalizeFindings(agyAnswer?.findings);
   return {
     at, repo: repo ?? null, pr: pr ?? null, head: head ?? null, lens, runId: runId ?? null,
-    provider: 'agy', model,
+    provider: 'agy', model, servedModel: agyRun.servedModel ?? null,
     status: agyRun.status,
     ...(agyRun.reasons?.length ? { reasons: agyRun.reasons.slice(0, 5).map((r) => String(r).slice(0, 300)) } : {}),
     agySessionId: agyRun.sessionId ?? null,
@@ -182,33 +183,50 @@ export function summarizeShadowAgreement(rows = []) {
   }));
 }
 
-/** Count PRs with unanimous compared Carbon verdict agreement across every head/lens/run. PURE. */
+/** Count PRs with unanimous served-Carbon verdict and finding agreement across every head/lens/run. PURE. */
 export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
   if (!Number.isSafeInteger(threshold) || threshold <= 0) throw new RangeError('promotion threshold must be a positive safe integer');
   const prs = new Map();
   for (const row of rows) {
-    if (typeof row?.model !== 'string' || !row.model.includes('carbon') || row.status !== 'ok'
+    if (typeof row?.servedModel !== 'string' || !row.servedModel.toLowerCase().includes('carbon') || row.status !== 'ok'
       || !row.overlap || Object.hasOwn(row, 'fellBackTo') || row.repo == null || row.pr == null) continue;
     const key = `${row.repo}#${row.pr}`;
-    prs.set(key, (prs.get(key) ?? true) && row.verdictAgree === true);
+    const findingsAgree = row.overlap.matched > 0 || (row.overlap.claudeCount === 0 && row.overlap.agyCount === 0);
+    prs.set(key, (prs.get(key) ?? true) && row.verdictAgree === true && findingsAgree);
   }
   const agreeingPrs = [...prs.values()].filter(Boolean).length;
   return { agreeingPrs, comparedPrs: prs.size, threshold, reached: agreeingPrs >= threshold };
 }
 
-/** The report as text lines. PURE. */
-export function renderShadowReport(summary, carbonPromotion = summarizeCarbonPromotion([]), promotionReplaces = 'claude') {
+/** Advisory report: evaluate a proposed replacement without changing or gating any seat. */
+export function renderShadowReport(summary, carbonPromotion = summarizeCarbonPromotion([]), promotionReplaces = 'claude', settings) {
   const c = carbonPromotion;
   const replacement = `Carbon promotion would replace one existing ${promotionReplaces} seat; panel size stays fixed.`;
   const promotion = `Carbon vs Claude: ${c.agreeingPrs} of ${c.comparedPrs} PRs agree; promotion threshold ${c.threshold} agreeing PRs: ${c.reached ? 'reached' : 'not reached'} (promotion is manual; the orchestrator flips it)`;
-  if (!summary.length) return ['agy shadow agreement: no shadow runs recorded yet', promotion, replacement];
+  let panel, refusal;
+  try {
+    settings ??= loadReviewSeatSettings();
+    panel = Object.values(settings.seatProvider);
+    if (settings.agyCorrectnessAdvisory) panel.push('agy');
+    const index = panel.findIndex(p => (p === 'shadow' ? 'claude' : p) === promotionReplaces);
+    if (index < 0) throw new Error('replacement target absent; operator must replace an existing seat');
+    panel[index] = 'carbon';
+  } catch (error) { refusal = error.message; }
+  const checks = ['claude', 'codex', 'agy'].map(builder => {
+    try {
+      if (refusal) throw new Error(refusal);
+      assertCrossVendorPanel(panel, builder);
+      return `Post-promotion cross-vendor panel for ${builder} builder: pass`;
+    } catch (error) { return `Post-promotion cross-vendor panel for ${builder} builder: refused — ${sanitizeReviewLog(error.message)}`; }
+  });
+  if (!summary.length) return ['agy shadow agreement: no shadow runs recorded yet', promotion, replacement, ...checks];
   const pct = (v) => (v == null ? 'n/a' : `${Math.round(v * 100)}%`);
   return [
     'agy shadow agreement, per seat (only the Claude verdict counted on these runs):',
     ...summary.map((s) => `  ${s.lens}: ${s.runs} run(s) on ${s.prs} PR(s) — ${s.compared} compared, `
       + `${s.voided} voided (escaped its lane), ${s.failed} failed, ${s.held} held (agy quota), ${s.skipped} skipped; verdict agreement ${pct(s.verdictAgreement)}, `
       + `mean finding overlap ${pct(s.meanFindingOverlap)}`),
-    promotion, replacement,
+    promotion, replacement, ...checks,
   ];
 }
 

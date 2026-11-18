@@ -7,7 +7,7 @@ import { resolveReviewSeatSafeguards, resolveShadowSeatModel, resolveShadowPromo
 import { resolveProviderCap } from '../review-seat-caps.mjs';
 import { assertCrossVendorPanel, settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
-import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement } from '../review-shadow-agreement.mjs';
+import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport } from '../review-shadow-agreement.mjs';
 import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
 import { buildTrialReport } from '../agy-shadow-trial-report.mjs';
 import { reserveShadowSession } from '../review-shadow-budget.mjs';
@@ -59,6 +59,15 @@ describe('Carbon promotion settings and advisory guards', () => {
     expect(resolve({ WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: value })).toEqual({ value: 20, source: 'settings' });
     expect(resolve({}, () => JSON.stringify({ shadowSeats: { antigravity: { promotionAgreeingPrs: value } } })))
       .toEqual({ value: 10, source: 'default' });
+  });
+  it('ignores and logs env=1 and settings=1, preserving the ruled floor of ten', () => {
+    const logs = [];
+    const readFile = () => JSON.stringify({ shadowSeats: { antigravity: { promotionAgreeingPrs: 1 } } });
+    expect(resolveShadowPromotionPrs({ env: { WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: '1' }, readFile, log: m => logs.push(m) }))
+      .toEqual({ value: 10, source: 'default' });
+    expect(logs.join(' ')).toMatch(/invalid env.*falling through.*invalid settings.*falling through/);
+    expect(resolveShadowPromotionPrs({ env: {}, readFile, log: () => {} })).toEqual({ value: 10, source: 'default' });
+    expect(resolve({ WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: '1' })).toEqual({ value: 20, source: 'settings' });
   });
   it('unreadable or malformed settings use the built-in threshold', () => {
     for (const read of [() => '{', () => { throw new Error('unreadable'); }]) {
@@ -291,11 +300,25 @@ describe('Carbon replacement target', () => {
   it('unreadable settings fall back to one Claude seat', () => {
     expect(resolveShadowPromotionReplaces({ env: {}, readFile: () => { throw Error('unreadable'); } })).toEqual({ value: 'claude', source: 'default' });
   });
-  it.each(['claude', 'codex', 'agy'])('one Carbon replacement preserves size and independence from %s builder', builder => {
-    const original = ['claude', 'claude', 'codex'];
-    const promoted = ['carbon', ...original.slice(1)];
-    expect(promoted).toHaveLength(original.length);
-    expect(assertCrossVendorPanel(promoted, builder)).toBe(true);
+  it('reports a one-seat replacement against every builder through the production renderer', () => {
+    const settings = { seatProvider: { correctness: 'shadow', security: 'claude', simplicity: 'codex' } };
+    const before = structuredClone(settings);
+    const lines = renderShadowReport([], undefined, 'claude', settings);
+    for (const builder of ['claude', 'codex', 'agy']) {
+      expect(lines).toContain(`Post-promotion cross-vendor panel for ${builder} builder: pass`);
+    }
+    expect(settings).toEqual(before);
+  });
+  it('reports refused without throwing for same-vendor, unknown or absent replacement evidence', () => {
+    for (const [seatProvider, target, builder] of [
+      [{ correctness: 'shadow' }, 'claude', 'agy'],
+      [{ correctness: 'shadow', security: 'unknown' }, 'claude', 'codex'],
+      [{ correctness: 'claude' }, 'codex', 'claude'],
+    ]) {
+      const lines = renderShadowReport([], undefined, target, { seatProvider });
+      expect(lines.join('\n')).toContain(`Post-promotion cross-vendor panel for ${builder} builder: refused`);
+      expect(lines.join('\n')).toContain('operator must replace an existing seat');
+    }
   });
   it('refuses same-vendor and unknown evidence with an operator replacement fallback', () => {
     for (const [panel, builder] of [[['codex'], 'codex'], [['agy'], 'agy'], [['shadow'], 'claude'], [['unknown', 'codex'], 'claude'], [['claude'], 'unknown']]) {
@@ -329,4 +352,14 @@ it.each([0, 1])('Carbon shadow respects daily cap %i separately from shared and 
     expect(callsUsedTodayForProvider(rows, 0, 'agy-gemini')).toBe(0);
     expect(reviewSeatCapUsage(rows, 0, {})).toEqual(reviewSeatCapUsage([], 0, {}));
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('persists served-model evidence through the shadow runner for promotion counting', async () => {
+  const servedModel = 'gemini-4-carbon-high';
+  const result = await run([{ ...ok, servedModel }], { model: servedModel });
+  expect(result.rows[0].servedModel).toBe(servedModel);
+  expect(summarizeCarbonPromotion(result.rows).agreeingPrs).toBe(1);
+  const legacy = await run([ok], { model: servedModel });
+  expect(legacy.rows[0].servedModel).toBeNull();
+  expect(summarizeCarbonPromotion(legacy.rows).comparedPrs).toBe(0);
 });
