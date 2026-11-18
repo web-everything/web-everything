@@ -4025,6 +4025,34 @@ describe('required review-gate conflict still refuses a superseded-verdict conve
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'required-review-gate-conflict' }) })]);
   });
+  it.each([
+    ['missing provenance', { rosterSource: undefined, rowsHead: undefined, rowsComplete: undefined }],
+    ['unknown roster', { rosterSource: 'fallback' }],
+    ['incomplete rows', { rowsComplete: false }],
+    ['missing completeness', { rowsComplete: undefined }],
+    ['foreign head', { rowsHead: 'b'.repeat(40) }],
+    ['missing row head', { rowsHead: undefined }],
+    ['malformed row head', { rowsHead: 'invalid' }],
+  ])('pending required review-gate with %s refuses conversion visibly', (_, evidence) => {
+    const pr = { number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD,
+      labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
+      statusCheckRollup: [{ name: 'review-gate', status: 'in_progress', conclusion: null }], ...evidence };
+    const plan = planReconcile({ requiredChecks: ['review-gate'], prs: [pr], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci',
+      ci: expect.objectContaining({ allowed: false }) })]);
+  });
+  // A complete-evidence required failure is owned by the ci-heal path, so only in-flight CI is pinned here.
+  it.each(['in_progress'])('conversion still ignores ordinary required CI in %s state (#xconv1)', state => {
+    const pr = { number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD,
+      labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
+      statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'success' },
+        { name: 'test', status: state === 'failure' ? 'completed' : state, conclusion: state === 'failure' ? state : null }],
+      rosterSource: 'live', rowsHead: HEAD, rowsComplete: true };
+    const plan = planReconcile({ requiredChecks: ['test', 'review-gate'], prs: [pr], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'convert-advisory' })]);
+    expect(plan.refusals).toEqual([]);
+  });
 });
 
 

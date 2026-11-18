@@ -1496,7 +1496,7 @@ export function formatReport({ dispatch = [], refusals = [], notes = [], owedTri
   return lines.join('\n');
 }
 
-/** Read the complete exact-head REST feed, including main-red attribution evidence. */
+/** Read exact-head REST check runs; this reader does not prove exhaustive check/status coverage. */
 export function defaultReadChecks({ repo, sha }, { exec = execFileSyncThrottled } = {}) {
   return parseJsonLines(exec('gh', checksArgv({ repo, sha }), {
     encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
@@ -1583,7 +1583,7 @@ function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, de
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
         cache.set(key, { rowsHead: rows.rowsHead === undefined ? sha : rows.rowsHead,
-          rowsComplete: rows.rowsComplete === undefined ? true : rows.rowsComplete === true, rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
+          rowsComplete: rows.rowsComplete === true, rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
           detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
           conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });

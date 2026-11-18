@@ -1724,7 +1724,11 @@ function dispatchReviewRow({
       // (the early planner refusal no longer reaches a `needs-human` PR). Other required-check states are
       // deliberately NOT applied here: converting a superseded verdict never waited on CI (#xconv1).
       const convertCi = reviewCiGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr?.statusCheckRollup });
-      if (convertCi.reason === 'required-review-gate-conflict') {
+      // Unknown provenance cannot prove the required review-gate is clear. Only a refusal known to concern
+      // other checks preserves #xconv1's CI exemption; unknown refusal reasons fail closed too.
+      if (convertCi.reason === 'required-review-gate-conflict'
+        || (!convertCi.allowed && requiredChecks?.includes('review-gate')
+          && convertCi.reason !== 'required-checks-not-successful')) {
         refuse('review-ci', {
           ...withPhase, ...extra, ci: convertCi,
           why: `${convertCi.reason}: ${convertCi.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,

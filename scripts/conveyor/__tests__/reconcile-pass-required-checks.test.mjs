@@ -40,7 +40,7 @@ it.each([false, true])('Plateau #198 green checks promote with repo-local 403 fa
     }));
     const pr = { ...xxPr(), number: 198, headRefName: 'lane/198-replay',
       statusCheckRollup: hydrate ? rows.filter(row => row.name !== 'e2e') : rows };
-    const readChecks = vi.fn(() => rows);
+    const readChecks = vi.fn(() => Object.assign(rows, { rowsComplete: true }));
     const readRequiredChecks = args => getRequiredStatusChecks({ ...args,
       cachePath: join(dir, 'cache.json'), readChecks: () => {
         throw new Error('HTTP 403: Upgrade to GitHub Pro or make this repository public to enable this feature');

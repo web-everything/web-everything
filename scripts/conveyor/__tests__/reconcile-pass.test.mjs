@@ -1075,8 +1075,9 @@ it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-
 
 const XX_REQUIRED = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
 const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c2009347';
-const xxRuns = () => XX_REQUIRED.map((name, i) => ({ id: 110460009383 + i, name, status: 'completed',
-  conclusion: name === 'smoke' ? 'cancelled' : 'success', completed_at: '2026-10-01T10:00:00Z' }));
+const completeRows = rows => Object.assign(rows, { rowsHead: XX_HEAD, rowsComplete: true });
+const xxRuns = () => completeRows(XX_REQUIRED.map((name, i) => ({ id: 110460009383 + i, name, status: 'completed',
+  conclusion: name === 'smoke' ? 'cancelled' : 'success', completed_at: '2026-10-01T10:00:00Z' })));
 const xxPr = () => ({ rowsHead: XX_HEAD, rowsComplete: false, number: 3336, headRefOid: XX_HEAD, headRefName: 'lane/3336-replay', isDraft: true,
   labels: [], comments: [], statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({
     name: i ? 'review-gate' : 'soak-replay-gate', status: 'COMPLETED', conclusion: 'SUCCESS',
@@ -1100,8 +1101,8 @@ it('hydrated REST check origins reach timeout enrichment', async () => {
   const detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/10/job/20';
   const read = vi.fn(() => ({ eligible: false, reason: 'fixture-not-timeout' }));
   const plan = runReconcilePass({ ...xxOptions(),
-    readChecks: () => xxRuns().map(row => ({ ...row,
-      conclusion: row.name === 'smoke' ? 'failure' : 'success', details_url: detailsUrl })),
+    readChecks: () => completeRows(xxRuns().map(row => ({ ...row,
+      conclusion: row.name === 'smoke' ? 'failure' : 'success', details_url: detailsUrl }))),
     enrichTimeouts: (prs, opts) => enrichPrsWithTimeoutEvidence(prs, { ...opts, enabled: true,
       read, readBudget: () => ({ confirmed: 0, pending: false }) }),
   });
@@ -1114,7 +1115,7 @@ it('hydrated REST check origins reach timeout enrichment', async () => {
   expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
 });
 
-it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and numeric rerun IDs', async () => {
+it('production REST hydration preserves attribution but missing completeness metadata fails closed', async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -1125,7 +1126,7 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
     const path = join(dir, 'prs.json');
     writeFileSync(path, JSON.stringify([xxPr()]));
     const exec = vi.fn(() => xxRuns().map(row => JSON.stringify(row)).join('\n'));
-    const plan = runReconcilePass({ ...xxOptions(), readPrs: () => readPrsFromFile(path),
+    const plan = runReconcilePass({ ...xxOptions(), readOnly: true, readPrs: () => readPrsFromFile(path),
       readChecks: args => defaultReadChecks(args, { exec }),
       enrichMainRed: (prs, opts) => {
         expect(prs[0].statusCheckRollup[1]).toMatchObject({ id: 110460009384,
@@ -1135,7 +1136,10 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
         expect(enriched.prs[0].requiredCheckCompletedAt).toBe('2026-10-01T10:00:00Z');
         return enriched;
       } });
-    expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+    expect(plan.enrichedPrs[0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+      evidenceReason: expect.stringContaining('rows-incomplete') }));
     expect(exec.mock.calls[0][1]).toContain('--paginate');
     expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs`);
     expect(exec.mock.calls[0][1].at(-1)).toContain('completed_at');
@@ -1195,7 +1199,7 @@ it.each([
 
 it('xxh4zw8 an authoritative cancelled check with absent required jobs still heals', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
-  const readChecks = () => xxRuns().filter(row => row.name === 'smoke');
+  const readChecks = () => completeRows(xxRuns().filter(row => row.name === 'smoke'));
   const plan = runReconcilePass({ ...xxOptions(), readChecks });
   expect(plan.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'ci-heal']]);
   expect(plan.refusals).toEqual([]);
@@ -1284,7 +1288,7 @@ it('xxh4zw8 hydration preserves proven rerun lineage for superseded cancellation
     { ...runs[0], id: 1, run_attempt: 1, status: 'in_progress', conclusion: null }];
   rows[0] = { ...rows[0], run_attempt: 2 };
   for (const ordered of [rows, [...rows].reverse()]) {
-    expect(runReconcilePass({ ...xxOptions(), readChecks: () => ordered }).dispatch.map(d => d.kind)).toEqual(['promote-draft']);
+    expect(runReconcilePass({ ...xxOptions(), readChecks: () => completeRows(ordered) }).dispatch.map(d => d.kind)).toEqual(['promote-draft']);
   }
 });
 
@@ -2190,6 +2194,19 @@ it('successful hydration replaces stale read provenance; a failed refresh cannot
   expect(failed.enrichedPrs[0]).toMatchObject({ rowsHead: pr.rowsHead, rowsComplete: false, rosterSource: 'live' });
   expect(failed.dispatch).toEqual([]);
   expect(failed.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed' }));
+});
+
+it.each([undefined, false, true])('hydrated rows are complete only with explicit true metadata (%s)', async rowsComplete => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const rows = xxRuns().map(row => ({ ...row, conclusion: 'success' }));
+  if (rowsComplete !== undefined) rows.rowsComplete = rowsComplete;
+  const pr = { ...xxPr(), isDraft: false, labels: [{ name: 'review:pending' }] };
+  const plan = runReconcilePass({ ...xxOptions(), readOnly: true, readPrs: () => [pr],
+    env: { WE_REVIEW_START_AFTER: 'ci-green' }, readChecks: () => rows });
+  expect(plan.enrichedPrs[0].rowsComplete).toBe(rowsComplete === true);
+  expect(plan.dispatch.some(row => row.kind === 'review')).toBe(rowsComplete === true);
+  if (rowsComplete !== true) expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+    ci: expect.objectContaining({ reason: 'rows-incomplete' }) }));
 });
 
 
