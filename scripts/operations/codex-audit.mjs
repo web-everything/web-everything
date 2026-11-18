@@ -43,17 +43,17 @@ const SCOPE_SETTINGS_FILE = new URL('../settings/audit-scope.json', import.meta.
 const MAX_INVARIANTS_BYTES = 64 * 1024;
 const validScopeMode = value => value === 'open' || value === 'invariants';
 
-/** Resolve the trusted tool setting over platform policy; absent/invalid layers fall through to standard open. */
+/** Resolve the trusted tool setting over platform policy; absent/invalid layers fall through to standard open.
+ * The environment is deliberately NOT a source of scope mode: an env var must never loosen a gate, and tightening
+ * is already the default (open = full scope). `env` only feeds the shared cascade's provenance logging. */
 export function resolveAuditScope({ env = process.env, readFile = readFileSync, platform, log } = {}) {
   let tool;
   try {
     const configured = JSON.parse(readFile(SCOPE_SETTINGS_FILE, 'utf8'))?.mode;
     if (validScopeMode(configured)) tool = { mode: configured };
   } catch { /* unreadable tool settings leave platform and standard policy in effect */ }
-  const override = env.WE_AUDIT_SCOPE_MODE;
   const { value } = cascadePolicy('auditScope', tool, {
     standard: { mode: 'open' }, platform, env, log,
-    envValues: override === undefined ? {} : { mode: validScopeMode(override) ? override : 'open' },
     valid: { mode: validScopeMode },
   });
   return validScopeMode(value?.mode) ? value.mode : 'open';
@@ -116,6 +116,8 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (hasConflictingVerdict(record.verdict, [
       ...(Array.isArray(record.findings) ? record.findings : []),
+      // `demoted` holds full verbatim lines; `followUps` is the earlier prefix-stripped shape, still checked on old records.
+      ...(Array.isArray(record.demoted) ? record.demoted : []),
       ...(Array.isArray(record.followUps) ? record.followUps.map(line => `FOLLOW-UP: ${line}`) : []),
     ])) continue;
     // A self-reported time more than FUTURE_SKEW_MS ahead of now is untrustworthy: unusable (and, for a current-question
@@ -205,12 +207,16 @@ export async function main(argv, deps) {
     if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
     const cleaned = lines.filter(line => line.trim()).map(clean);
-    const followUps = scoped ? cleaned.filter(line => line.startsWith('FOLLOW-UP:')).map(line => line.slice('FOLLOW-UP:'.length).trim()) : [];
+    // Scoped mode demotes out-of-scope FOLLOW-UP lines to nonblocking. Each is kept verbatim (control characters
+    // stripped, nothing else) in the ledger record and printed, and the verdict line is labelled so it is never
+    // mistaken for an open NOT WEAKENED.
+    const demoted = scoped ? cleaned.filter(line => line.startsWith('FOLLOW-UP:')) : [];
     const findings = scoped ? cleaned.filter(line => !line.startsWith('FOLLOW-UP:')) : cleaned;
-    const scopeFields = scoped ? { followUps } : {};
+    const scopeFields = scoped ? { demoted } : {};
+    const verdictLine = scoped && verdict === 'NOT WEAKENED' ? `NOT WEAKENED (scoped; ${demoted.length} demoted)` : verdict;
     // Scoped evidence is labelled and bound to the exact invariants text, so a scoped pass is never mistaken for an open one.
     const scopeBinding = scoped ? { scope: 'invariants', invariantsHash: createHash('sha256').update(invariants).digest('hex') } : {};
-    const result = { verdict, base, head, questionHash: QUESTION_HASH, findings, ...scopeFields };
+    const result = { verdict, base, head, questionHash: QUESTION_HASH, findings, ...scopeFields, ...(verdictLine !== verdict ? { verdictLine } : {}) };
     // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
     let fingerprint = null;
     try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
@@ -221,7 +227,7 @@ export async function main(argv, deps) {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;
     }
-    deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[verdict, ...findings, ...followUps.map(line => `FOLLOW-UP: ${line}`)].join('\n')}\n`);
+    deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[verdictLine, ...findings, ...demoted].join('\n')}\n`);
     return verdict === 'NOT WEAKENED' ? 0 : 1;
   } catch {
     (deps?.stderr ?? (text => process.stderr.write(text)))('UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n');

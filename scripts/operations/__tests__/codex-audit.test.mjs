@@ -127,7 +127,7 @@ describe('R968 invariant-scoped audit', () => {
     expect(prompt).toContain(invariant);
     expect(prompt).toContain('Answer WEAKENED only if the diff breaks a listed invariant');
     expect(prompt).toContain('FIRST line must still be exactly NOT WEAKENED or WEAKENED');
-    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: ['guard.mjs:1 accepts unknown evidence'], followUps: [], scope: 'invariants', invariantsHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: ['guard.mjs:1 accepts unknown evidence'], demoted: [], scope: 'invariants', invariantsHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
     expect(f.output.join('')).toBe('WEAKENED\nguard.mjs:1 accepts unknown evidence\n');
   });
 
@@ -138,13 +138,39 @@ describe('R968 invariant-scoped audit', () => {
     expect(JSON.parse(f.output.join('')).verdict).toBe('WEAKENED');
   });
 
-  it.each([false, true])('retains every FOLLOW-UP in records and output (json=%s)', async json => {
+  it.each([false, true])('records every demoted finding verbatim and prints it (json=%s)', async json => {
     const f = scoped('NOT WEAKENED\nFOLLOW-UP: \x1b[31mx.mjs:3 card\x1b[0m\x07\nx.mjs:1 observation\nFOLLOW-UP: WEAKENED\nFOLLOW-UP:');
     expect(await main([...scopeArgs, ...(json ? ['--json'] : [])], f.deps)).toBe(0);
-    expect(f.records[0]).toMatchObject({ findings: ['x.mjs:1 observation'], followUps: ['x.mjs:3 card', 'WEAKENED', ''] });
+    const demoted = ['FOLLOW-UP: x.mjs:3 card', 'FOLLOW-UP: WEAKENED', 'FOLLOW-UP:'];
+    // The ledger verdict stays the machine value; only the printed/reported line carries the scoped label.
+    expect(f.records[0]).toMatchObject({ verdict: 'NOT WEAKENED', findings: ['x.mjs:1 observation'], demoted });
+    expect(f.records[0]).not.toHaveProperty('followUps');
     expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(f.records[0]);
-    if (json) expect(JSON.parse(f.output.join('')).followUps).toEqual(['x.mjs:3 card', 'WEAKENED', '']);
-    else expect(f.output.join('')).toBe('NOT WEAKENED\nx.mjs:1 observation\nFOLLOW-UP: x.mjs:3 card\nFOLLOW-UP: WEAKENED\nFOLLOW-UP: \n');
+    if (json) {
+      const out = JSON.parse(f.output.join(''));
+      expect(out).toMatchObject({ verdict: 'NOT WEAKENED', verdictLine: 'NOT WEAKENED (scoped; 3 demoted)', demoted });
+    } else expect(f.output.join('')).toBe('NOT WEAKENED (scoped; 3 demoted)\nx.mjs:1 observation\nFOLLOW-UP: x.mjs:3 card\nFOLLOW-UP: WEAKENED\nFOLLOW-UP:\n');
+  });
+
+  it.each([false, true])('a scoped pass never prints plain NOT WEAKENED, even with nothing demoted (json=%s)', async json => {
+    const f = scoped('NOT WEAKENED');
+    expect(await main([...scopeArgs, ...(json ? ['--json'] : [])], f.deps)).toBe(0);
+    expect(f.records[0]).toMatchObject({ verdict: 'NOT WEAKENED', demoted: [], scope: 'invariants' });
+    if (json) expect(JSON.parse(f.output.join('')).verdictLine).toBe('NOT WEAKENED (scoped; 0 demoted)');
+    else expect(f.output.join('')).toBe('NOT WEAKENED (scoped; 0 demoted)\n');
+  });
+
+  it('open review keeps the plain verdict line and records no demoted list', async () => {
+    const f = fixture('NOT WEAKENED\nFOLLOW-UP: kept as an ordinary finding');
+    expect(await main([...ARGS, '--json'], f.deps)).toBe(0);
+    expect(f.records[0]).not.toHaveProperty('demoted');
+    expect(JSON.parse(f.output.join(''))).not.toHaveProperty('verdictLine');
+    expect(JSON.parse(f.output.join('')).findings).toEqual(['FOLLOW-UP: kept as an ordinary finding']);
+  });
+
+  it('a stored record whose demoted list contradicts its verdict is unusable', () => {
+    const rec = { at: AT, base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], scope: 'invariants', invariantsHash: 'c'.repeat(64), demoted: ['FOLLOW-UP: x', 'WEAKENED'] };
+    expect(findAudit([rec], { base: BASE, head: HEAD, questionHash: QUESTION_HASH, priorQuestionHashes: [], now: Date.parse(AT) })).toBeNull();
   });
 
   it.each(['NOT WEAKENED\nFOLLOW-UP: card\nWEAKENED', 'NOT WEAKENED\nFOLLOW-UP: card\u2028WEAKENED'])('checks conflicting verdicts before separating follow-ups: %j', async answer => {
@@ -159,7 +185,7 @@ describe('R968 invariant-scoped audit', () => {
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.runCodex).toHaveBeenCalledWith(openPrompt);
     expect(f.output).toEqual(['NOT WEAKENED\n']);
-    expect(f.records[0]).not.toHaveProperty('followUps');
+    expect(f.records[0]).not.toHaveProperty('demoted');
     expect(f.records[0]).not.toHaveProperty('scope');
     expect(f.errors).toHaveLength(1);
     expect(f.errors[0]).toBe('Audit invariants mode requires an invariants file; using open review.\n');
@@ -174,7 +200,7 @@ describe('R968 invariant-scoped audit', () => {
     };
     expect(await main(scopeArgs, f.deps)).toBe(0);
     expect(f.deps.runCodex).toHaveBeenCalledWith(openPrompt);
-    expect(f.records[0]).not.toHaveProperty('followUps');
+    expect(f.records[0]).not.toHaveProperty('demoted');
     expect(f.errors).toEqual(['Audit invariants file is unreadable, empty, or exceeds 64 KiB; using open review.\n']);
   });
 
@@ -207,7 +233,7 @@ describe('R968 invariant-scoped audit', () => {
       expect(bytesRead).toBe(65537);
       expect(f.deps.runCodex).toHaveBeenCalledWith(openPrompt);
       expect(f.errors).toEqual(['Audit invariants file is unreadable, empty, or exceeds 64 KiB; using open review.\n']);
-      expect(f.records[0]).not.toHaveProperty('followUps');
+      expect(f.records[0]).not.toHaveProperty('demoted');
     } finally {
       vi.mocked(realFs.readSync).mockImplementation(actualFs.readSync);
       realFs.rmSync(dir, { recursive: true, force: true });
@@ -273,8 +299,18 @@ describe('R968 invariant-scoped audit', () => {
     expect(resolveAuditScope({ readFile, platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log })).toBe('invariants');
     expect(String(readFile.mock.calls[0][0])).toBe(new URL('../../settings/audit-scope.json', import.meta.url).href);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('mode="invariants" (tool)'));
-    expect(resolveAuditScope({ readFile, platform: {}, env: { WE_AUDIT_SCOPE_MODE: 'open' } })).toBe('open');
-    expect(resolveAuditScope({ readFile, platform: {}, env: { WE_AUDIT_SCOPE_MODE: 'invalid' } })).toBe('open');
+  });
+
+  it.each(['invariants', 'open', 'invalid'])('the environment never changes the scope mode (WE_AUDIT_SCOPE_MODE=%s)', value => {
+    const env = { WE_AUDIT_SCOPE_MODE: value };
+    // Scope mode comes only from the audit-scope setting: env can neither loosen nor tighten it.
+    expect(resolveAuditScope({ readFile: () => '{"mode":"open"}', platform: {}, env })).toBe('open');
+    expect(resolveAuditScope({ readFile: () => '{"mode":"invariants"}', platform: {}, env })).toBe('invariants');
+  });
+
+  it('is OFF by default: the shipped setting, with the invariants env set, resolves to open', () => {
+    expect(resolveAuditScope({ platform: {}, env: { WE_AUDIT_SCOPE_MODE: 'invariants' } })).toBe('open');
+    expect(resolveAuditScope({ platform: null, env: {}, readFile: () => { throw new Error('unreadable'); } })).toBe('open');
   });
 });
 
