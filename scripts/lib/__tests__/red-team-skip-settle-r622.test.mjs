@@ -3,7 +3,7 @@
 // unknown run evidence (review-unfinished / scan-capped). A trusted result comment bound to the exact
 // head settles those two reasons; a recorded break still sends back; missing evidence still fails closed.
 import { describe, expect, it, vi } from 'vitest';
-import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, UNREAD_SETTLE_MARGIN_MS, RUN_MTIME_SLACK_MS } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence as readActualDrainRedTeamEvidence, settleUnknownEvidenceByComment, UNREAD_SETTLE_MARGIN_MS, RUN_MTIME_SLACK_MS } from '../drain-red-team-evidence.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
@@ -14,6 +14,12 @@ import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 const head = 'a'.repeat(40), other = 'b'.repeat(40), pr = 6244;
+// The old comment-only owed predicate needed no current scored read. These temporal fixtures now
+// supply that independent head-bound evidence, while the real reader still supplies all scan bounds.
+const readDrainRedTeamEvidence = args => Object.defineProperties({
+  read: { diffScored: true, diffText: '+fixture', netBasis: { rev: args.head } },
+}, Object.getOwnPropertyDescriptors(readActualDrainRedTeamEvidence(args)));
+
 const comment = (rev = head, findings = [], login = 'web-everything') => ({ author: { login }, createdAt: '2026-11-05T12:00:00Z',
   body: renderRedTeamComment({ pr, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
@@ -22,7 +28,7 @@ const T = Date.parse('2026-11-05T12:00:00Z');
 // They also default to a reader that reported a COMPLETE same-PR, same-head read with nothing blocking; the
 // complete-read requirement itself is pinned in its own describe below.
 const cleanRead = () => ({ complete: true, blocked: false });
-const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, unfinishedActiveAt: T - 3 * 3600e3, evaluatedAt: T, completeHeadRead: cleanRead, ...bounds }, enumerable: false });
+const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason, read: { diffScored: true, diffText: '+fixture' } }, 'settleBounds', { value: { unfinishedUndecided: true, unfinishedActiveAt: T - 3 * 3600e3, evaluatedAt: T, completeHeadRead: cleanRead, ...bounds }, enumerable: false });
 // An unread record quiet for longer than the settle margin (slack + abandon horizon) before the comment.
 const OLD = T - 3 * 3600e3;
 const older = { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: OLD };
@@ -83,7 +89,7 @@ describe('R622 unknown run evidence settled by a head-bound result comment', () 
 
 describe('R622 the evidence reader bounds a resumed unfinished review by its resume stamp', () => {
   const rev = head;
-  const run = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev } } },
+  const run = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev } } },
     stepTimings: [{ step: 'read', startedAt: new Date(T - 7200e3).toISOString() }], verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, ...extra });
   const read = r => readDrainRedTeamEvidence({ repo: 'o/r', pr, head: rev, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
     runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs: T - 2 * 3600e3 }), read: () => r, readScorecards: () => [], now: T });
@@ -99,7 +105,7 @@ describe('R622 the evidence reader bounds a resumed unfinished review by its res
 
 describe('R622 a re-review that already decided is not released by an earlier job\'s clean comment', () => {
   // The break: a re-review started before the comment, recorded a rejection, and only its label effect is still open.
-  const base = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: head } } },
+  const base = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: head } } },
     stepTimings: [{ step: 'read', startedAt: new Date(T - 3600e3).toISOString() }], ...extra });
   const read = (r, mtimeMs = T - 2 * 3600e3) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
     runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs }), read: () => r, readScorecards: () => [], now: T });
@@ -146,7 +152,7 @@ describe('R622 a re-review that already decided is not released by an earlier jo
 });
 
 describe('R622 several unfinished reviews', () => {
-  const mk = (id, startedAt, extra = {}) => ({ id, run: { op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: head } } },
+  const mk = (id, startedAt, extra = {}) => ({ id, run: { op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: head } } },
     stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, ...extra } });
   const settledFor = runs => settleUnknownEvidenceByComment(readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
     runsDir: '/runs', list: () => runs.map(r => r.id), stat: () => ({ mtimeMs: T - 2 * 3600e3 }), read: id => runs.find(r => r.id === id).run, readScorecards: () => [], now: T }), [comment()], pr, head);
@@ -295,7 +301,7 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
   });
 
   const rec = ({ prNum = pr, rev = head, startedAt = T - 7200e3, repo = 'o/r', ...extra } = {}) => ({ op: 'review-pr', input: { repo, pr: prNum },
-    findings: { read: { netBasis: { rev } } }, stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], ...extra });
+    findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev } } }, stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], ...extra });
   const open = { effects: [{ status: 'pending' }] };
   const idOf = p => p.split('/').pop().replace('.json', '');
   const read = (runs, maxParses, read = id => { const r = runs[id].run; if (r instanceof Error) throw r; return r; }) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head,
@@ -426,6 +432,9 @@ describe('R622 abandoned startable crashes after the result comment', () => {
     const runs = {
       'review-pr-decoy1': { mtime: now - 60e3, run: { op: 'review-pr', input: { repo: 'o/r', pr: pr + 1 } } },
       'review-pr-decoy2': { mtime: now - 120e3, run: { op: 'review-pr', input: { repo: 'o/r', pr: pr + 1 } } },
+      'review-pr-accepted': { mtime: T - 4 * HOUR, run: { op: 'review-pr', input: { repo: 'o/r', pr },
+        verdict: { verdict: 'accept' }, findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: head } } },
+        stepTimings: [{ step: 'read', startedAt: new Date(T - 5 * HOUR).toISOString() }] } },
       'review-pr-crash': { mtime, run: { op: 'review-pr', input: { repo: 'o/r', pr }, pending: null, effects: [],
         stepTimings: [{ step: 'read', startedAt: new Date(T + 10 * HOUR).toISOString() }], ...extra } },
     };
@@ -435,7 +444,7 @@ describe('R622 abandoned startable crashes after the result comment', () => {
       list: () => Object.keys(runs), read: id => runs[id].run,
       stat: path => ({ mtimeMs: runs[path.split('/').pop().replace('.json', '')].mtime }) });
     expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
-    expect(evidence.settleBounds.completeHeadRead({ pr, head, at: T })).toEqual({ complete: true, blocked: !ok });
+    expect(evidence.settleBounds.completeHeadRead({ pr, head, at: T })).toEqual({ complete: true, blocked: !ok, ...(ok ? { loopPayload: runs['review-pr-accepted'].run } : {}) });
     expect(settleUnknownEvidenceByComment(evidence, [comment()], pr, head)).toMatchObject({ ok });
   });
 });
@@ -443,7 +452,7 @@ describe('R622 abandoned startable crashes after the result comment', () => {
 describe('R622 review follow-ups: decided-run guard, liveness, id universe, cache size key, complete-read failures', () => {
   const HOUR = 3600e3;
   const rec = ({ rev = head, startedAt = T - 7200e3, ...extra } = {}) => ({ op: 'review-pr', input: { repo: 'o/r', pr },
-    findings: { read: { netBasis: { rev } } }, stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], ...extra });
+    findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev } } }, stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], ...extra });
   const open = { effects: [{ status: 'pending' }] };
   const reject = { verdict: { verdict: 'changes' }, ...open };
   const idOf = p => p.split('/').pop().replace('.json', '');
@@ -499,7 +508,7 @@ describe('R622 review follow-ups: decided-run guard, liveness, id universe, cach
     });
     it('a bound with no read time, no write time, or an unreadable (NaN) write time never settles', () => {
       const base = { unfinishedStartedAt: T - HOUR, unreadBoundaryAt: T - 3 * HOUR, unfinishedUndecided: true, completeHeadRead: () => ({ complete: true, blocked: false }) };
-      const go = extra => settle(Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: { ...base, ...extra }, enumerable: false }));
+      const go = extra => settle(Object.defineProperty({ ok: false, reason: 'review-unfinished', read: { diffScored: true, diffText: '+fixture' } }, 'settleBounds', { value: { ...base, ...extra }, enumerable: false }));
       expect(go({ unfinishedActiveAt: T - 3 * HOUR, evaluatedAt: T })).toMatchObject({ ok: true });
       for (const extra of [{}, { evaluatedAt: T }, { unfinishedActiveAt: T - 3 * HOUR }, { unfinishedActiveAt: NaN, evaluatedAt: T }, { unfinishedActiveAt: T - 3 * HOUR, evaluatedAt: NaN }]) {
         expect(go(extra)).toMatchObject({ ok: false, reason: 'review-unfinished' });
@@ -558,7 +567,7 @@ describe('R622 review follow-ups: decided-run guard, liveness, id universe, cach
 describe('R639 present-verdict check, capped-scan settlement through the complete read, newest completed review per head', () => {
   const HOUR = 3600e3;
   const rec = ({ rev = head, prNum = pr, startedAt = T - 7200e3, withStart = true, ...extra } = {}) => ({ op: 'review-pr', input: { repo: 'o/r', pr: prNum },
-    findings: { read: { netBasis: { rev } } }, ...(withStart ? { stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }] } : {}), ...extra });
+    findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev } } }, ...(withStart ? { stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }] } : {}), ...extra });
   const open = { effects: [{ status: 'pending' }] };
   const idOf = p => p.split('/').pop().replace('.json', '');
   const reader = (runs, maxParses, nowAt = T) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r639' }, runsDir: '/runs',

@@ -87,6 +87,7 @@ describe('red-team check run contract', () => {
         readLive: vi.fn(() => ({ headRefOid: HEAD, labels: [] })),
         readComments: vi.fn(() => [resultComment()]),
         readStandingRuling: vi.fn(() => null),
+        readEvidence: vi.fn(() => ({ read: { diffScored: true, diffText: '+fixture', netBasis: { rev: HEAD } }, recorded: false, scheduled: false })),
         holdFn: vi.fn(() => null),
         gh: vi.fn((args, options) => {
 
@@ -107,6 +108,21 @@ describe('red-team check run contract', () => {
     const statusPosts = io => allPosts(io).filter(([args]) => args.includes(`repos/o/r/statuses/${HEAD}`));
     const payloads = io => posts(io).map(([, options]) => JSON.parse(options.input));
     const publish = io => api.publishRedTeamCheckFromLive(io);
+
+    it.each([true, false])('live publication reads full evidence and refuses an unscored carry (scored=%s)', diffScored => {
+      const io = fixture();
+      delete io.holdFn; // Exercise the real admission policy, not the transport fixture's stand-in.
+      const read = { diffScored: true, diffText: '+fixture', netBasis: { rev: HEAD } };
+      io.readEvidence = vi.fn(() => ({ read, recorded: false, scheduled: false,
+        carry: { loopPayload: { findings: { read: { ...read, diffScored } } } } }));
+      const result = publish(io);
+      expect(result.ok, JSON.stringify(result)).toBe(diffScored);
+      expect(io.readEvidence).toHaveBeenCalledWith({ repo: 'o/r', pr: 7, head: HEAD, env: io.env });
+      if (!diffScored) {
+        expect(result.reason).toContain('no recorded result');
+        expect(allPosts(io)).toHaveLength(0);
+      }
+    });
 
     it.each(['', '\n', '\n### Post-accept red team — no break found', '\nrecorded verdict `accept`.'])
     ('refuses an advisory marker without completed review content: %j', async suffix => {
@@ -821,7 +837,7 @@ describe('red-team check run contract', () => {
       expect(io.readComments.mock.calls.length).toBeGreaterThanOrEqual(2);
       expect(io.readStandingRuling).toHaveBeenCalled();
       expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/r', pr: 7,
-        head: HEAD, comments, recorded: true, standingRuling }));
+        head: HEAD, comments, recorded: false, read: expect.objectContaining({ diffScored: true }), standingRuling }));
       for (const reader of [io.readLive, io.readComments, io.readStandingRuling, io.holdFn])
         expect(reader.mock.invocationCallOrder[0]).toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.findIndex(([args]) => args.includes('POST'))]);
     });
@@ -837,7 +853,7 @@ describe('red-team check run contract', () => {
       const io = fixture();
       io.holdFn.mockReturnValue('post-accept red team confirmed a break requiring send-back');
       expect(await publish(io)).toMatchObject({ ok: false });
-      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ recorded: true, head: HEAD }));
+      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ recorded: false, head: HEAD, read: expect.objectContaining({ diffScored: true }) }));
       expect(posts(io)).toEqual([]);
     });
 
@@ -2048,7 +2064,8 @@ function sealed(status, fn) {
   const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
   const path = sealedStatusPath({ repo: 'o/r', pr: 7, head: HEAD }, env);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify({ repo: 'o/r', pr: 7, head: HEAD, status: 'finished', result: 'ran', ...status }));
+  writeFileSync(path, JSON.stringify({ repo: 'o/r', pr: 7, head: HEAD, status: 'finished', result: 'ran',
+    loopPayload: { findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: HEAD } } } }, ...status }));
   try { fn(env); } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
@@ -2067,7 +2084,9 @@ describe('sealed result check recovery writer', () => {
 
 
 describe('result recovery uses the drain sealed disposition and trusted check identity', () => {
-  const comments = () => [{ body: `${redTeamMarker(7, HEAD)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }];
+  // A sealed ran row is an executed round, not a policy exemption. Keep the result evidence consistent.
+  const comments = () => [{ body: renderRedTeamComment({ pr: 7, rev: HEAD, provider: 'codex', model: 'fixture',
+    findings: [], recheckStatus: 'ok', foldedVerdict: 'accept' }), author: { login: 'web-everything' } }];
   // Merged with #6606's hold-first writer: the publication hold (commit statuses) has its own route, stored newest
   // first, so `posts` and `runs` stay check runs only.
   const isCheckRunCall = args => /\/check-runs/.test(String(args[1] ?? ''));

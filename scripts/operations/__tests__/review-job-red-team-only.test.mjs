@@ -1284,6 +1284,7 @@ describe('red-team-only review job', () => {
           postComment: ({ body }) => comments.push({ author: { login: 'web-everything' }, body }),
           log: () => {},
           syncStatusLabels: input => syncRedTeamStatusLabels({ ...input, provider,
+            evidence: { loopPayload: { findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: head } } } } },
             env: { WE_RED_TEAM_STATUS_LABELS: '1' }, standingRuling: null }),
         });
         process.stdout.write(JSON.stringify({ result, labels: [...labels], mutations, effects }));

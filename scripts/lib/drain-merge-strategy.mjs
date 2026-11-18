@@ -1,5 +1,5 @@
 import { redTeamForHead } from './red-team-gate.mjs';
-import { redTeamCardOnly, redTeamReadReviewable } from './review-red-team-policy.mjs';
+import { redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { candidateQueueClass } from './merge-queue.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
@@ -504,8 +504,7 @@ export function createDrainMergeStrategy({
           && admissionLabels.includes('review:accepted') && admissionLabels.includes('red-team:pending')
           && !redTeamForHead(pages.flat(), c.num, headSha)
           && !evidence.inFlight && !evidence.queued && !evidence.recorded
-          && !(writer.skipCardOnly === true && redTeamReadReviewable(writer.loopPayload?.findings?.read)
-            && redTeamCardOnly(writer.loopPayload?.findings?.read))
+          && !redTeamOwedDecision({ fullEvidence: evidence }).cardOnlyBypassEligible
           && (writer.result === 'skipped' || writer.result?.status === 'skipped');
         if (stalled && publishNote) {
           before.redTeamStallNotices ??= {};

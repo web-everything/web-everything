@@ -1,4 +1,4 @@
-import { redTeamCardOnly, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
+import { redTeamOwedDecision, redTeamEnabled } from '../lib/review-red-team-policy.mjs';
 import { readRedTeamProbes } from '../lib/red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
@@ -2362,9 +2362,9 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
 
 // Shared by every acceptance publication path, including comment-only effects.
 function acceptanceRedTeamOwed(verdict, read) {
-  return redTeamOwedFor({ verdict, findings: { read } })
-    && !(readRedTeamProbes({ env: process.env }).value.skipCardOnly && redTeamCardOnly(read))
-    && redTeamEnabled(process.env);
+  const decision = redTeamOwedDecision({ fullEvidence: { loopPayload: { verdict, findings: { read } },
+    scheduled: true, skipCardOnly: readRedTeamProbes({ env: process.env }).value.skipCardOnly } });
+  return decision.panelOwed && decision.owed && redTeamEnabled(process.env);
 }
 
 /**

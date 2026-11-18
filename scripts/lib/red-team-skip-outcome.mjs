@@ -5,10 +5,7 @@ import { dirname, join } from 'node:path';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { readRecoveryWitness, redTeamStatusDir } from './drain-red-team-evidence.mjs';
-import { VERDICTS } from './jury-core.mjs';
-import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
-import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
-import { redTeamOwedFor, redTeamReadReviewable } from './review-red-team-policy.mjs';
+import { redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
@@ -61,23 +58,19 @@ const STORED_NOT_OWED_REASON = 'stored review does not owe a red team';
  * exact head (read here, never parsed from a message) has a verdict and states no red team is owed.
  * Anything unreadable, missing, older-head or owed fails closed to the operator.
  */
-function storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam }) {
+function storedReviewNotOwedEvidence(io, { repo, pr, head, redTeam }) {
   const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
   const candidate = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam) && !deferred
     && (redTeam.status === 'not-owed'
       || (redTeam.status === 'skipped' && !redTeam.policy && redTeam.reason === STORED_NOT_OWED_REASON));
-  if (!candidate) return false;
+  if (!candidate) return null;
   try {
     const stored = io.readStoredReview
       ? io.readStoredReview({ repo, pr, head })
       : readRecoveryWitness({ repo, pr, head, env: io.env ?? process.env });
     const payload = stored?.ok === false ? null : stored?.newest;
-    const verdict = payload?.verdict;
-    return Boolean(verdict) && typeof verdict === 'object' && Object.values(VERDICTS).includes(verdict.verdict) && payload?.findings?.read?.netBasis?.rev === head
-      && redTeamReadReviewable(payload?.findings?.read) && !redTeamOwedFor(payload)
-      // A human-required needs-human verdict is only positively not-owed when its advisory lens says changes.
-      && (verdict.verdict !== VERDICTS.NEEDS_HUMAN || verdict.humanRequired !== true
-        || advisoryLabelOutcome({ read: payload.findings.read, verdict }) === ADVISORY_OUTCOMES.CHANGES);
+    return payload?.findings?.read?.netBasis?.rev === head
+      && redTeamOwedDecision({ fullEvidence: { ...stored, loopPayload: payload } }).storedReviewNotOwed ? stored : null;
   } catch { return false; }
 }
 
@@ -169,16 +162,17 @@ export function settleRedTeamSkip(input = {}) {
     // R730: a non-policy skip may still settle when the exact-head stored review owes no red team.
     // The carry machine only models a card-only skip, so a carry settlement never takes this rule: it would be
     // recorded as card-only with the rule unnamed. It keeps its existing refusal instead (fail closed).
-    const ruleApplies = classified.kind !== 'policy' && !input.carry && realHead && isRealHead(input.readHead)
+    const storedReview = classified.kind !== 'policy' && !input.carry && realHead && isRealHead(input.readHead)
       && input.readHead.toLowerCase() === head.toLowerCase()
-      && storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam });
+      && storedReviewNotOwedEvidence(io, { repo, pr, head, redTeam });
+    const ruleApplies = !!storedReview;
     const rule = ruleApplies ? STORED_NOT_OWED_RULE : undefined;
     let { reason } = ruleApplies ? { reason: 'not owed (stored review)' } : classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
     if ((ruleApplies || classified.kind === 'policy') && !boundRead) {
       reason = 'policy skip head not bound to the reviewed read';
-    } else if ((ruleApplies || classified.kind === 'policy') && !redTeamReadReviewable(input.read ?? input.carry?.loopPayload?.findings?.read)) {
+    } else if ((ruleApplies || classified.kind === 'policy') && !redTeamOwedDecision({ fullEvidence: { ...input, storedReview } }).settlementEligible) {
       reason = 'review has no scored nonempty diff; inspect the read before retrying';
     } else if ((ruleApplies || classified.kind === 'policy')) {
       try {

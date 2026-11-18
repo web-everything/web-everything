@@ -4581,7 +4581,14 @@ must include a scored, nonempty read. Test pending labels and non-policy settlem
 Point `WE_SHARED_RUNS_DIR` at `<fixture>/runs`: status and skip markers are siblings of the runs
 directory, so pointing it at the fixture root leaks deduplication state across test cases.
 
-Historical card-only skips and their carry journals must pass `redTeamReadReviewable` on both
-stored status and selected read before settlement, policy clearance or pending removal. Keep
+All owed, clearance and settlement decisions use `redTeamOwedDecision({ fullEvidence })` in
+`review-red-team-policy.mjs`. Pass the entire evidence object, including status, carry and seats;
+retain the original status when adding a live reread. Every selected/status/carry read must be
+scored and nonempty before clearance, settlement or pending removal. A historical policy-clear
+cannot override current debt. `red-team-owed-decision.test.mjs` pins every consumer call site and
+mutates each call independently so an import or another call cannot hide a removed guard.
+Check publishers must forward the full evidence read to admission; a synthetic `recorded: true`
+is not execution evidence. Comment recovery keeps one full scored-read witness alongside the
+complete scan, using the existing mtime/size identity so cache and chronology guarantees survive. Keep
 real-file unscored legacy-string and carried-journal regressions; a historical exemption never
 substitutes for a scored nonempty read. Refusal retains pending and directs inspection of the read.

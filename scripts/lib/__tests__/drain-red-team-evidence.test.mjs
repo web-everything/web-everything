@@ -37,7 +37,7 @@ const sealAtFinish = (f, { findings = [], comments = [cleanResultComment(f)], ca
     listComments: () => comments, postComment: () => { throw Error('seal at finish never posts'); },
     readSeatRow: () => seatRow(key.head, findings), publishNeedsYou: () => {} });
 };
-const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { diffScored: true, diffText: '+code', netBasis: { rev: head } } } });
 
 describe('status persistence and check publication share one claim', () => {
   it.each(['pending', 'running', 'finished'])('under-test %s writes without an injected publisher never call gh or create a publication hold', status => {
@@ -501,7 +501,8 @@ describe('status persistence and check publication share one claim', () => {
 });
 
 describe('historical fallback predicate clauses', () => {
-  const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped' },
+  const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped',
+    loopPayload: { findings: { read: { diffScored: true, diffText: '+card', netChangedFiles: ['backlog/123-card.md'] } } } },
     recorded: false, inFlight: false, queued: false });
   it('accepts a finished unrecorded policy skip', () => {
     expect(historicalCardOnlySkipCandidate(evidence())).toBe(true);
@@ -760,8 +761,9 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
     const evidence = readDrainRedTeamEvidence(f);
-    // #5439/#5443: an acceptance label alone cannot invent scheduler work that never existed.
-    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toBeNull();
+    // Labels still schedule nothing; the central decision now holds the missing read independently.
+    expect(evidence.scheduled).toBe(false);
+    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
     // A persisted accepting verdict holds before the job publishes its first status: the loop applies the labels
     // before the job can write one. It is not a live queue entry, so the never-scheduled deadline still applies.
     const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
@@ -994,7 +996,7 @@ it('surfaces a finished old card-only skip when the live head has no read', () =
   const f = fixture(), oldHead = 'b'.repeat(40);
   f.head = 'a'.repeat(40);
   const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
-    netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+    diffScored: true, netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
   } } };
   writeRun({ ...newRunRecord({ id: 'review-pr-old-card', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
     ...loopPayload, stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] }, f.runsDir);
@@ -1012,7 +1014,7 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
   'historical fallback refuses %s and returns no live-head read', variant => {
     const f = fixture(), oldHead = 'c'.repeat(40);
     const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
-      netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+      diffScored: true, netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
     } } };
     if (variant === 'non-card read') loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
     if (variant === 'missing read paths') delete loopPayload.findings.read.netChangedFiles;
@@ -1410,7 +1412,7 @@ it('historical card-only fallback shares the total parse budget: the recursion p
   const f = fixture(), oldHead = 'c'.repeat(40);
   f.head = 'a'.repeat(40);
   const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
-    netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+    diffScored: true, netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
   } } };
   writeRun({ ...newRunRecord({ id: 'review-pr-old-card', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
     ...loopPayload, stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] }, f.runsDir);
@@ -1616,7 +1618,8 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
   const started = T + 6 * 60e3; // unfinished review began after the result
   const bounds = o => ({ unfinishedUndecided: true, unfinishedStartedAt: started, unfinishedActiveAt: T + 16 * 60e3, evaluatedAt: T + 2 * 3600e3,
     completeHeadRead: () => ({ complete: true, blocked: false }), ...o });
-  const unknown = o => Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: bounds(o), enumerable: false });
+  const unknown = o => Object.defineProperty({ ok: false, reason: 'review-unfinished',
+    read: { diffScored: true, diffText: '+fixture', netBasis: { rev: head } } }, 'settleBounds', { value: bounds(o), enumerable: false });
   const settle = (ev, comments, reviews = []) => settleUnknownEvidenceByComment(ev, comments, pr, head, reviews);
   const review = (state, at, login = 'chalbert') => ({ state, submittedAt: iso(at), author: { login } });
 

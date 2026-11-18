@@ -57,15 +57,78 @@ export function redTeamReadReviewable(read) {
 }
 
 /**
- * Is a red-team result owed on this head? A pass that started or finished is always owed its result. A card-only
- * head is exempt only while the producer skips it: the skip decision the producer's process recorded with the
- * head's status (`evidence.skipCardOnly`) wins over `skipCardOnly`, the caller's own resolved setting.
+ * One full-evidence decision for admission, publication and recovery. Never reduce evidence before calling:
+ * a status/carry read can contradict the selected read, and a historical policy-clear cannot pay current debt.
+ * `panelOwed` describes the panel verdict only; `owed` includes execution/publication debt and unknown reads.
+ * Head/provenance/live-hold checks remain the caller's responsibility before performing an effect.
  */
+export function redTeamOwedDecision({ fullEvidence = {} } = {}) {
+  const e = fullEvidence ?? {};
+  const status = Object.hasOwn(e, 'liveStatus') ? e.liveStatus : e.status ?? e.rawWriter?.parsed ?? e.rawWriter;
+  const payload = e.loopPayload ?? e.storedReview?.newest ?? e.newest ?? e.carry?.loopPayload ?? status?.loopPayload;
+  const read = e.read ?? payload?.findings?.read;
+  const reads = [read];
+  if (Object.hasOwn(e, 'read')) reads.push(e.read);
+  if (e.carry != null) reads.push(e.carry.loopPayload?.findings?.read);
+  for (const source of [e.loopPayload, e.status?.loopPayload, e.liveStatus?.loopPayload, e.rawWriter?.parsed?.loopPayload, e.rawWriter?.loopPayload, e.storedReview?.newest, e.carry?.loopPayload]) {
+    if (source != null) reads.push(source.findings?.read);
+  }
+  const readReviewable = reads.every(redTeamReadReviewable);
+  const panelOwed = redTeamOwedFor(payload);
+  const cardOnly = redTeamCardOnly(read);
+  const skip = e.skipCardOnly ?? status?.skipCardOnly ?? e.defaultSkipCardOnly ?? true;
+  const result = status?.result;
+  const prior = typeof result === 'string' ? result : result?.status;
+  const executing = !!(e.inFlight || e.recorded || e.seatRecorded || e.completedRecorded
+    || e.cleanRecorded || e.seats?.length || ['ran', 'resumed'].includes(prior));
+  const unknown = e.ok === false || !!e.carryConflict;
+  const deferred = value => value?.deferredByGuard || value?.deferredByCap;
+  const policySkip = value => value?.status === 'skipped' && value.policy === 'card-only' && !deferred(value);
+  const cardOnlyExempt = skip === true && (cardOnly || (read?.netChangedFiles == null
+    && (policySkip(e.redTeam) || policySkip(result) || e.carry?.kind === 'card-only' || e.kind === 'card-only')));
+  const notOwedStatus = candidate => candidate?.status === 'finished'
+    && (typeof candidate.result === 'string' ? candidate.result : candidate.result?.status) === 'not-owed'
+    && !deferred(candidate.result);
+  const finishedNotOwed = notOwedStatus(status)
+    && (!Object.hasOwn(e, 'liveStatus') || notOwedStatus(e.status));
+  const verdict = payload?.verdict;
+  const storedNotOwed = Object.values(VERDICTS).includes(verdict?.verdict) && !panelOwed
+    && (verdict.verdict !== VERDICTS.NEEDS_HUMAN || verdict.humanRequired !== true
+      || advisoryLabelOutcome({ read: payload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.CHANGES);
+  const owed = !readReviewable || unknown || executing
+    || (!cardOnlyExempt && !!(e.scheduled || e.queued || (prior === 'skipped' && panelOwed)));
+  const historicalResult = e.disposition?.result ?? e.historicalResult;
+  const settlementEligible = !owed && !e.queued
+    && (cardOnlyExempt || finishedNotOwed || storedNotOwed || historicalResult?.policyClear === true || (e.storedReviewPolicyClear === true && e.accepted === true));
+  // Settlement provenance is narrower than "nothing owed": only a finished, head-bound card skip can carry.
+  const statusRead = status?.loopPayload?.findings?.read;
+  const skipNeedsSettlement = settlementEligible && cardOnly && status?.status === 'finished'
+    && prior === 'skipped' && (typeof result === 'string' || result?.policy === 'card-only')
+    && status.skipCardOnly === true && /^[a-f0-9]{40}$/i.test(status.head ?? '')
+    && statusRead?.netBasis?.rev === status.head && redTeamCardOnly(statusRead);
+  const carrySettlementEligible = skipNeedsSettlement && e.recorded === false && e.seatRecorded === false;
+  const storedReviewSettlementEligible = settlementEligible && e.inFlight === false
+    && e.recorded === false && e.seatRecorded === false;
+  const cardOnlyBypassEligible = settlementEligible && cardOnlyExempt && !e.scheduled && !result?.foldedVerdict;
+  const historicalSkipCandidate = readReviewable && !unknown && !executing && !e.queued && cardOnly
+    && status?.status === 'finished' && status.skipCardOnly === true && prior === 'skipped';
+  const cardOnlySkipped = cardOnlyBypassEligible && status?.status === 'finished'
+    && policySkip(result) && e.skipCardOnly === true;
+  const folded = status?.status === 'finished' ? result?.foldedVerdict : null;
+  const cleared = readReviewable && !unknown && (historicalResult
+    ? historicalResult.policyClear !== true || !owed
+    : folded === 'accept');
+  const hasWork = e.scheduled || executing || status || e.carry || historicalResult;
+  const statusLabel = folded === 'changes' ? 'red-team:blocked' : cleared ? 'red-team:clear'
+    : owed && (readReviewable || hasWork) ? 'red-team:pending' : null;
+  const reason = !readReviewable ? 'unreviewable-read' : unknown ? 'evidence-unknown'
+    : executing ? 'execution-owed' : finishedNotOwed ? 'finished-not-owed'
+      : cardOnlyExempt ? 'card-only-exempt' : owed ? 'pass-owed' : 'no-pass-owed';
+  return { owed, cleared: !!cleared, settlementEligible, skipNeedsSettlement, panelOwed, cardOnly,
+    readReviewable, carrySettlementEligible, storedReviewSettlementEligible, cardOnlyBypassEligible, cardOnlySkipped, historicalSkipCandidate, finishedNotOwed, statusLabel, storedReviewNotOwed: settlementEligible && storedNotOwed, reason };
+}
+
+/** Compatibility entry; all decisions still consume the complete evidence. */
 export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
-  if (evidence.inFlight || evidence.recorded) return true;
-  if (!redTeamReadReviewable(read) && (evidence.scheduled || evidence.status?.result === 'skipped'
-    || evidence.status?.result?.status === 'skipped' || evidence.loopPayload?.carriedFrom != null)) return true;
-  const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
-  if (skip && redTeamCardOnly(read)) return false;
-  return !!evidence.scheduled;
+  return redTeamOwedDecision({ fullEvidence: { ...evidence, read, defaultSkipCardOnly: skipCardOnly } }).owed;
 }

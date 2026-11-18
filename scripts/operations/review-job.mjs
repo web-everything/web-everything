@@ -95,7 +95,7 @@ import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, r
 
 import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
-import { redTeamReadReviewable } from '../lib/review-red-team-policy.mjs';
+import { redTeamOwedDecision } from '../lib/review-red-team-policy.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -128,7 +128,7 @@ import { resolveProviderCap } from './review-seat-policy.mjs';
 import { INFRA_RETRY_COOLOFF_MS, markSelfReportedDone } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs, quotaHoldOrProbe, callsUsedTodayForProvider,
+  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, resolveSeatTimeoutMs, quotaHoldOrProbe, callsUsedTodayForProvider,
 } from './review-extra-seats.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
@@ -399,11 +399,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // separately requires the stored read's netBasis.rev to equal status.head.
           // A null result is eligible only when normalized from the original queued
           // writer above. An ordinary finished/null prior must reach the guard intact.
-          const retry = recovery ? recovery.retry : input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
+          const admissionEvidence = input.redTeamMode === 'fresh' ? witness ?? readEvidence(key) : null;
+          const retry = recovery ? recovery.retry : input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, admissionEvidence);
           if (input.redTeamMode === 'fresh'
             && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
             && !retry
-            && (redTeamSkipNeedsSettlement(admissionPrior)
+            && (redTeamSkipNeedsSettlement(admissionPrior, admissionEvidence)
             || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult, admissionId, ...(retry ? { retryCount: 1 } : {}) };
@@ -877,7 +878,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const spec = seatsBox.speculative ?? null;
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
-  const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
+  const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedDecision({ fullEvidence: seatsBox.input }).panelOwed;
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -977,7 +978,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
-          head, readHead, read: seatsBox.input.loopPayload?.findings?.read, runId: out.runId });
+          ...seatsBox.input, head, readHead, runId: out.runId });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
@@ -1147,11 +1148,12 @@ function runReviewArc({
               // decided before any restamp, owed marker or comment. Anything else re-reviews instead of stranding.
               const carriedAdvisory = prior.advisoryBody
                 ? prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha)) : null;
-              if (parseRedTeamComment(carriedAdvisory)?.policyClear
-                && !redTeamReadReviewable(io.readRedTeamOnlyPayload?.({ repo: planned.repo, pr: planned.pr, head: prior.sha })?.loopPayload?.findings?.read))
-                throw Error('carried policy-clear has no scored nonempty read; inspect before retrying');
-              if (!isPublishableRedTeamResult(parseRedTeamComment(carriedAdvisory)))
+              const carriedResult = parseRedTeamComment(carriedAdvisory);
+              if (!isPublishableRedTeamResult(carriedResult))
                 throw Error('carried red-team result is not publishable on the new head');
+              const sourceEvidence = io.readRedTeamOnlyPayload?.({ repo: planned.repo, pr: planned.pr, head: prior.sha });
+              if (!redTeamOwedDecision({ fullEvidence: { ...sourceEvidence, historicalResult: carriedResult } }).cleared)
+                throw Error('carried red-team result has no scored nonempty read or still owes a pass; inspect before retrying');
               const stamped = io.restampVerdict({ pr: planned.pr, repo: planned.repo, newHead: evidence.headSha,
                 reason: `${decision.reason}; from ${prior.sha}; patch-id ${headPatchId}` });
               if (!stamped?.ok) throw Error(`restamp refused: ${stamped?.reason ?? 'unknown error'}`);
@@ -1217,7 +1219,7 @@ function runReviewArc({
       if (refusal) { classified = refusal; return result({ ...refusal, lanePath }); }
       seatsBox.laneHead = head;
       // Both modes persist and verify admission while the job claim still excludes another writer.
-      if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
+      if (input && redTeamOwedDecision({ fullEvidence: input }).panelOwed && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
         try {
           const queued = io.redTeamStatus({ ...input, status: 'queued',
             ...(seatsBox.speculative ? { speculativePid: seatsBox.speculative.pid } : {}) });
@@ -1243,7 +1245,7 @@ function runReviewArc({
       let cardOnlyRecovery = false;
       const movedCardOnly = redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head);
       const pendingCardOnly = redTeamMode === 'fresh' && stored?.head === head
-        && (!redTeamOwedFor(loopPayload) || loopPayload?.carriedFrom != null)
+        && (!redTeamOwedDecision({ fullEvidence: { ...stored, loopPayload } }).panelOwed || loopPayload?.carriedFrom != null)
         && cardOnlySkipSettlementCandidate(stored, head);
       // Re-prove at execution: planner evidence may have changed since dispatch. Never run
       // a model against the old read; this path only settles the card-only policy exemption.
@@ -1263,11 +1265,11 @@ function runReviewArc({
         loopPayload = { ...loopPayload, carriedFrom: loopPayload.carriedFrom ?? head, verdict: null };
       }
       const pinned = stored?.head === head && loopPayload?.findings?.read?.netBasis?.rev === head;
-      if (!redTeamReadReviewable(loopPayload?.findings?.read)) {
+      if (!redTeamOwedDecision({ fullEvidence: { ...stored, loopPayload } }).readReviewable) {
         classified = { outcome: 'red-team-not-owed', reason: 'stored review has no scored nonempty diff; inspect the read before retrying' };
         return result({ ...classified, lanePath });
       }
-      if (!pinned || (!cardOnlyRecovery && (loopPayload?.carriedFrom != null || !redTeamOwedFor(loopPayload)))) {
+      if (!pinned || (!cardOnlyRecovery && (loopPayload?.carriedFrom != null || !redTeamOwedDecision({ fullEvidence: { ...stored, loopPayload } }).panelOwed))) {
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
         return result({ ...classified, lanePath });
       }
@@ -1295,8 +1297,8 @@ function runReviewArc({
         // Carry publication owns its journal, compatibility status, label and comment while
         // this job still holds the lane/claim. It never enters queued model admission.
         const redTeam = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
-        const settled = io.settleRedTeamSkip({ repo: planned.repo, pr: planned.pr, head, readHead: head,
-          read: loopPayload.findings.read, redTeam, carry: { loopPayload, lanePath } });
+        const settled = io.settleRedTeamSkip({ ...stored, repo: planned.repo, pr: planned.pr, head, readHead: head,
+          loopPayload, redTeam, carry: { loopPayload, lanePath } });
         classified = { outcome: 'red-team-only' };
         return result({ ...classified, lanePath, redTeam: { ...redTeam, ...settled } });
       }

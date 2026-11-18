@@ -1,5 +1,5 @@
 /** Live guards and observable effects for the not-owed carry machine. */
-import { redTeamReadReviewable } from './review-red-team-policy.mjs';
+import { redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { createHash } from 'node:crypto';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from './review-red-team-on-skip.mjs';
@@ -27,7 +27,7 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
   return {
     env, checkpoint, witness: () => witness,
     eligible(state) {
-      if (!redTeamReadReviewable(state.loopPayload?.findings?.read) || skipPolicy() !== true) return false;
+      if (!redTeamOwedDecision({ fullEvidence: state }).cardOnlyBypassEligible || skipPolicy() !== true) return false;
       live = readLive(key(state));
       comments = readComments(key(state));
       if (live?.headRefOid !== state.head || !Array.isArray(live.labels) || !Array.isArray(comments)) return false;
@@ -49,7 +49,7 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
       const disposition = readRedTeamDisposition({ ...key(state), comments });
       if (disposition.held.length || disposition.sendBack.length) return false;
       const evidence = readEvidence(key(state));
-      if (evidence?.carryConflict || !(cardOnlyHeadMoveCandidate(evidence, state.head)
+      if (!redTeamOwedDecision({ fullEvidence: { ...evidence, carry: state } }).cardOnlyBypassEligible || !(cardOnlyHeadMoveCandidate(evidence, state.head)
         || cardOnlySkipSettlementCandidate(evidence, state.head))) return false;
       // Once per execution, including a retry whose pinned read already names the new head.
       if (!proved) proved = from === state.head || proveMove({ fromSha: from, toSha: state.head, cwd: lanePath })?.ok === true;

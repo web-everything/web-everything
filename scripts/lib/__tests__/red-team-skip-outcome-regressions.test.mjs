@@ -19,7 +19,7 @@ function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'red-team-skip-regressions-'));
   roots.push(root);
   const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
-  const input = { repo: 'web-everything/web-everything', pr: 5872, head: 'a'.repeat(40), readHead: 'a'.repeat(40), comments: [] };
+  const input = { repo: 'web-everything/web-everything', pr: 5872, head: 'a'.repeat(40), readHead: 'a'.repeat(40), read: { diffScored: true, diffText: '+card' }, comments: [] };
   const io = { env, postComment: vi.fn(), publishNeedsYou: vi.fn(), log: vi.fn() };
   const markerDir = join(redTeamStatusDir(env), 'skip-published');
   const markers = () => existsSync(markerDir) ? readdirSync(markerDir) : [];

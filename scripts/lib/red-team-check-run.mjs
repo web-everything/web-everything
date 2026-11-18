@@ -111,13 +111,13 @@ export function resolveWeAppId({ env = process.env, path = new URL('../settings/
 }
 
 /** The daemon's policy-clear writer: resolve the trusted App id, then publish as that App (never the caller's role). */
-export function createPolicyClearPublisher({ env = process.env, run = runGhSync, publish = publishRedTeamPolicyClearCheck,
+export function createPolicyClearPublisher({ env = process.env, run = runGhSync, publish = publishRedTeamPolicyClearCheck, readEvidence,
   resolveAppId = () => resolveWeAppId({ env }) } = {}) {
   const gh = (ghArgs, options = {}) => run(ghArgs, { env, ...options });
   return args => {
     const app = resolveAppId();
     if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
-    return publish({ ...args, appId: app.appId, env, gh });
+    return publish({ ...args, ...(readEvidence ? { readEvidence } : {}), appId: app.appId, env, gh });
   };
 }
 
@@ -259,7 +259,7 @@ export function publishRedTeamPolicyClearCheck(options = {}) {
 }
 
 function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
-  clearHold = clearLivePublicationHold, resultComments, readResultHold = redTeamEnqueueHold,
+  clearHold = clearLivePublicationHold, resultComments, readResultHold = redTeamEnqueueHold, readEvidence = () => ({}),
   readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }) } = {}) {
   const recovery = resultComments !== undefined;
   // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence. A caller's own child env
@@ -288,8 +288,9 @@ function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh =
     const sealed = sealedFromStatus(status, headSha);
     const recorded = sealed !== null && !sealed.unreadable && !sealed.unsealed;
     if (!recorded) return 'sealed result evidence missing, unreadable or unsealed for this head; inspect stored evidence and retry publication';
-    return readResultHold({ repo, pr, head: headSha, comments,
-      ok: true, scheduled: true, recorded, env });
+    const evidence = readEvidence({ repo, pr, head: headSha, env });
+    return readResultHold({ ...evidence, status: evidence.status ?? status, liveStatus: status,
+      loopPayload: evidence.loopPayload ?? status.loopPayload, repo, pr, head: headSha, comments, env });
   };
   // Recovery of an existing result never overwrites any run, including this writer's own orphan yield.
   // The drain's sealed-result disposition is authoritative; a comment alone cannot authorize success.
@@ -406,7 +407,7 @@ export function publishRedTeamCheckFromLive(options = {}) {
 
 function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
-  holdFn = redTeamEnqueueHold, beforeHold, onConfirmed, clearHold = clearLivePublicationHold } = {}) {
+  holdFn = redTeamEnqueueHold, readEvidence = () => ({}), beforeHold, onConfirmed, clearHold = clearLivePublicationHold } = {}) {
   let published = false, holdSet = false, holdPosted = false, holdIntent = '';
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
@@ -431,7 +432,8 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
       // decision in review-job reads the same predicate, so it never carries what this refuses.
       if (!isPublishableRedTeamResult(disposition.result))
         throw Error('red-team result lacks completed review content; operator must inspect the full result');
-      const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
+      const evidence = readEvidence({ repo, pr, head: headSha, env });
+      const hold = holdFn({ ...evidence, repo, pr, head: headSha, comments, standingRuling, env });
       if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);
       const history = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
       if (!history.ok) throw Error(history.reason);

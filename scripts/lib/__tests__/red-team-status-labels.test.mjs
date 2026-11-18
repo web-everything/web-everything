@@ -10,7 +10,7 @@ const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
 const broken = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break';
 const scoredPayload = { findings: { read: { diffScored: true, diffText: '+card', netBasis: { rev: head } } } };
-const input = { repo: 'o/n', pr: 42, head, env: {}, labels: ['red-team:clear'] };
+const input = { repo: 'o/n', pr: 42, head, env: {}, evidence: { loopPayload: scoredPayload }, labels: ['red-team:clear'] };
 describe('head-bound red-team operator labels', () => {
   it('shows scheduled/in-flight as pending and provisions through the label provider', () => {
     const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
@@ -81,7 +81,7 @@ describe('finished stored results without a marker', () => {
     ['accept', 3, 'red-team:clear'],
   ])('finished %s with %s confirmed becomes %s, never pending', (foldedVerdict, confirmedMissCount, desired) => {
     expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [],
-      evidence: { scheduled: true, status: { status: 'finished', result: { foldedVerdict, confirmedMissCount } } } }))
+      evidence: { loopPayload: scoredPayload, scheduled: true, status: { status: 'finished', result: { foldedVerdict, confirmedMissCount } } } }))
       .toEqual({ add: desired, remove: ['red-team:pending'] });
   });
   it('keeps existing scheduling behavior for a finished result without a verdict', () => {

@@ -177,7 +177,7 @@ describe('merge-queue same-head failure admission', () => {
           readDrainRedTeamEvidence: () => {
             stages.push('red-team');
             if (outcome === 'unreadable evidence') throw Error('red-team evidence unreadable');
-            return { scheduled: outcome === 'red-team hold', skipCardOnly: false };
+            return { read: { diffScored: true, diffText: '+code' }, scheduled: outcome === 'red-team hold', skipCardOnly: false };
           },
           // Exercise all nested standing-ruling read adapters even without a grant in this thread.
           readStandingRuling, readOperatorIssues, headBelongsToPr, readUneditedCommentIds,
@@ -1291,7 +1291,14 @@ describe('merge-queue same-head failure admission', () => {
 });
 const bot = { author: { login: 'web-everything' } };
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
-const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+// Earlier local-predicate fixtures omitted the scored diff; keep that diff explicit at the shared boundary.
+const hold = (over = {}) => {
+  const read = { diffScored: true, diffText: '+code' };
+  const loopPayload = over.loopPayload === null ? null : { verdict: { verdict: 'accept' }, ...over.loopPayload };
+  if (loopPayload && !Object.hasOwn(loopPayload, 'findings')) loopPayload.findings = { read };
+  return redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human',
+    read: over.read ?? loopPayload?.findings?.read ?? read, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over, loopPayload });
+};
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 // The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.

@@ -13,6 +13,7 @@ const gateA = redTeamGateMarker(1, a, 'card-queued', redTeamResultId(parseRedTea
 function fixture() {
   return { root: '.', now: () => 0, claim: () => ({ ok: true }), unclaim: vi.fn(), report: vi.fn(), log: vi.fn(),
     redTeamStatus: () => {},
+    readRedTeamOnlyPayload: () => ({ loopPayload: { findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: a } } } } }),
     readPrevCompletion: () => null, newActorId: () => 'actor', prepareLane: () => ({ head: 'a'.repeat(40) }), acquireLane: () => ({ lanePath: 'fake-lane' }), updateRecord: vi.fn(), releaseLane: vi.fn(),
     carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
     readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(clearA), trusted(gateA)] }),
@@ -140,7 +141,7 @@ describe('review job carried check outbox wiring', () => {
   it.each(['review job', 'on-skip recovery'])('the %s default publisher resolves the App id from the setting and POSTs the check as today\'s App', async site => {
     const { createReviewJobIo } = await import('../review-job.mjs');
     const { carriedCheckPublisher } = await import('../../lib/review-red-team-on-skip.mjs');
-    const { readCarriedCheckUnpublished } = await import('../../lib/drain-red-team-evidence.mjs');
+    const { readCarriedCheckUnpublished, recordRedTeamStatus } = await import('../../lib/drain-red-team-evidence.mjs');
     const { renderRedTeamComment } = await import('../review-extra-seats.mjs');
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { join } = await import('node:path');
@@ -153,6 +154,8 @@ describe('review job carried check outbox wiring', () => {
     const body = renderRedTeamComment({ pr: 1, rev: b, provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
     const runs = [], writes = [];
     try {
+      recordRedTeamStatus({ repo, pr: 1, head: b, status: 'finished', result: 'not-owed',
+        loopPayload: { findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: b } } } } }, { env });
       const exec = vi.fn((file, args, options = {}) => {
         expect(file).toBe('gh');
         if (args.includes('POST')) {

@@ -26,7 +26,7 @@ export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
     throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
   }
 }
-import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly, redTeamReadReviewable } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -195,9 +195,10 @@ export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, 
 /** The production carried-check publisher both the review job and the on-skip recovery pass use (#6606): the live
  * writer from {@link createLiveCheckPublisher} (resolved App id, writer env wins) behind the durable outbox.
  * `run(args, options)` is the caller's gh runner; `writer` is injectable for tests. */
-export function createCarriedCheckPublisher({ env = process.env, run = runGhSync, writer = createLiveCheckPublisher({ env, run }) } = {}) {
+export function createCarriedCheckPublisher({ env = process.env, run = runGhSync, writer = createLiveCheckPublisher({ env, run }),
+  readEvidence = readDrainRedTeamEvidence } = {}) {
   return ({ repo, pr, headSha }) => publishCarriedCheckDurably({ repo, pr, head: headSha, env,
-    publish: hooks => writer.publish({ repo, pr, headSha, ...hooks }),
+    publish: hooks => writer.publish({ repo, pr, headSha, readEvidence, ...hooks }),
     clearHold: () => writer.clearHold({ repo, pr, headSha }) });
 }
 
@@ -300,6 +301,8 @@ const settleKind = run => {
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
 // changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).
 const summaryCache = new WeakMap();
+// One full witness per reader; retain the summary cache's mtime/size identity without retaining every diff.
+const completeReadWitness = new WeakMap();
 // Identity fields are normalised strictly: a PR number is a positive integer or a digit string (never null, '' or
 // false, which Number() turns into 0); a head that is not a clean 40-hex sha reads as unknown (null), which matches
 // every head, so a blocking record with a damaged head still holds; repo names compare case-insensitively.
@@ -329,14 +332,17 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
     const want = String(head).toLowerCase(), wantRepo = String(repo).trim().toLowerCase();
     // Same id universe as the bounded scan and every other review-run reader: the `review-pr-` id minted for the op.
     // A review run given another id by `--run-id` is invisible to all of them before settlement is ever asked.
+    let candidatePayload;
+    let readCandidate = null; // full pinned evidence is reread once, never kept in the summary cache
     let newest = null; // the newest completed review of this exact head: { at, rejects }
     for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
       const st = stat(join(runsDir, `${id}.json`));
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
       const key = `${runsDir}|${id}`; // one entry per record: a rewrite replaces it, so the cache never outgrows the store
-      let hit = cache.get(key);
+      let hit = cache.get(key), payload;
       if (!hit || hit.mtimeMs !== st.mtimeMs || hit.size !== st.size) {
-        hit = { mtimeMs: st.mtimeMs, size: st.size, summary: summarizeRun(read(id, runsDir)) };
+        payload = read(id, runsDir);
+        hit = { mtimeMs: st.mtimeMs, size: st.size, summary: summarizeRun(payload) };
         cache.set(key, hit);
       }
       const s = hit.summary;
@@ -344,6 +350,10 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if (s.rev !== null && s.rev !== want) continue;
+      if (s.rev === want && (!readCandidate || st.mtimeMs > readCandidate.mtimeMs)) {
+        readCandidate = { id, mtimeMs: st.mtimeMs, size: st.size };
+        candidatePayload = payload;
+      }
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
         const quiet = now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
@@ -370,7 +380,17 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (!newest || at > newest.at) newest = { at, rejects };
       else if (at === newest.at) newest.rejects ||= rejects;
     }
-    return { complete: true, blocked: newest?.rejects === true };
+    let loopPayload = null;
+    if (readCandidate) {
+      const witness = completeReadWitness.get(read);
+      loopPayload = candidatePayload ?? (witness?.runsDir === runsDir && witness.id === readCandidate.id
+        && witness.mtimeMs === readCandidate.mtimeMs && witness.size === readCandidate.size
+        ? witness.loopPayload : read(readCandidate.id, runsDir));
+      const current = stat(join(runsDir, `${readCandidate.id}.json`));
+      if (current.mtimeMs !== readCandidate.mtimeMs || current.size !== readCandidate.size) return incomplete;
+      completeReadWitness.set(read, { ...readCandidate, runsDir, loopPayload });
+    }
+    return { complete: true, blocked: newest?.rejects === true, ...(loopPayload ? { loopPayload } : {}) };
   } catch { return incomplete; }
 }
 
@@ -919,10 +939,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
 
 /** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
 export function historicalCardOnlySkipCandidate(old) {
-  const prior = old?.status;
-  return prior?.status === 'finished' && prior.skipCardOnly === true
-    && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
-    && !old.recorded && !old.inFlight && !old.queued;
+  return redTeamOwedDecision({ fullEvidence: old }).historicalSkipCandidate;
 }
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
@@ -939,7 +956,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
   // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
   // never-scheduled deadline still applies when no job ever picks it up.
-  const owes = run => redTeamEnabled(env) && redTeamOwedFor(run);
+  const owes = run => redTeamEnabled(env) && redTeamOwedDecision({ fullEvidence: { loopPayload: run } }).panelOwed;
   let status, statusAt = 0;
   try {
     status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
@@ -1007,9 +1024,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // writer retained one. Keep the status intact for recovery's provenance checks.
     const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
     // A skip with no policy settlement still owes its pass until settlement publishes a result or escalates.
-    const skippedOwed = resultStatus === 'skipped' && redTeamOwedFor(loopPayload)
-      && !(status.skipCardOnly === true && redTeamReadReviewable(loopPayload?.findings?.read)
-        && redTeamCardOnly(loopPayload?.findings?.read));
+    const skippedOwed = resultStatus === 'skipped' && redTeamOwedDecision({ fullEvidence: {
+      status, loopPayload, ...seatEvidence, recorded, inFlight: live, seats,
+    } }).owed;
     return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: skippedOwed || ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
@@ -1020,7 +1037,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const olderHit = latestRun(false);
     const older = olderHit.run;
     const oldHead = older?.findings?.read?.netBasis?.rev;
-    if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
+    if (oldHead && oldHead !== head && redTeamOwedDecision({ fullEvidence: { loopPayload: older } }).cardOnly) {
       const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn, now,
         isAlive, host, namespace, readPidStart, readScorecards });
       if (historicalCardOnlySkipCandidate(old)) return old;
@@ -1083,6 +1100,10 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head, rev
   let complete = null;
   try { complete = typeof bounds.completeHeadRead === 'function' ? bounds.completeHeadRead({ pr, head, at }) : null; } catch { /* unreadable: stays held */ }
   if (complete?.complete !== true || complete.blocked !== false) return evidence;
-  return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
-    queued: false, recorded: true, skipCardOnly: false };
+  const fullEvidence = { ...evidence, ok: true, settledByComment: evidence.reason,
+    ...(complete.loopPayload ? { loopPayload: complete.loopPayload } : {}),
+    historicalResult: redTeamForHead(comments, pr, head) };
+  if (!redTeamOwedDecision({ fullEvidence }).cleared) return evidence;
+  return { ...fullEvidence, scheduled: false, inFlight: false, queued: false,
+    recorded: fullEvidence.historicalResult.policyClear !== true, skipCardOnly: false };
 }

@@ -11,7 +11,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { redTeamCardOnly, redTeamReadReviewable } from '../lib/review-red-team-policy.mjs';
+import { redTeamOwedDecision } from '../lib/review-red-team-policy.mjs';
 import { acquireSeatSlot, cleanGitEnv, pruneSeatPool } from '../lib/review-seat-pool.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
@@ -85,7 +85,7 @@ import {
   findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding,
 } from '../lib/jury-core.mjs';
 import { renameSourcePaths } from './review-pr.mjs';
-import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
+import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled } from '../lib/review-red-team-policy.mjs';
 export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
@@ -1708,7 +1708,7 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
 export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, resumeOnly = false, redTeamMode, redTeamAdmission } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (!redTeamOwedDecision({ fullEvidence: { loopPayload } }).panelOwed) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
     let recovery;
     if (redTeamMode !== undefined) {
@@ -1818,7 +1818,7 @@ export async function speculateRedTeam({
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamReadReviewable(read)) return { status: 'skipped', reason: 'the review printed no scored nonempty diff; inspect the read before retrying' };
+    if (!redTeamOwedDecision({ fullEvidence: { read } }).readReviewable) return { status: 'skipped', reason: 'the review printed no scored nonempty diff; inspect the read before retrying' };
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };
     const settings = readRedTeamProbes({ env, log: io.log });
@@ -1838,7 +1838,7 @@ export async function speculateRedTeam({
     // The net path list names only rename/copy destinations. Include sources so
     // moving executable code into backlog/ cannot turn the probe off. Unknown
     // or empty destination lists and malformed source lists must still probe.
-    if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
+    if (redTeamOwedDecision({ fullEvidence: { read, records, prior, skipCardOnly: settings.value.skipCardOnly } }).cardOnlyBypassEligible) {
       io.log('red team skipped: card-only');
       return { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
     }
@@ -2007,7 +2007,7 @@ export async function speculateRedTeam({
  */
 export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true, record = true } = {}, io = createRedTeamIo()) {
   try {
-    if (!redTeamReadReviewable(loopPayload?.findings?.read)) return { status: 'skipped', reason: 'the review printed no scored nonempty diff; inspect the read before retrying' };
+    if (!redTeamOwedDecision({ fullEvidence: { loopPayload, pass } }).readReviewable) return { status: 'skipped', reason: 'the review printed no scored nonempty diff; inspect the read before retrying' };
     const verdict = loopPayload?.verdict?.verdict ?? null;
     const claudeFindings = claudeFindingsFromLoop(loopPayload);
     const { rev, provider, model, effort, callId, call, parsed, evidence, quota, durationMs } = pass;
@@ -2081,7 +2081,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
 export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, env = process.env, post = true } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (!redTeamOwedDecision({ fullEvidence: { loopPayload } }).panelOwed) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     if (pass?.status !== 'speculated') return { status: 'stale', reason: `the speculative pass is ${pass?.status ?? 'missing'}, not speculated` };
     const read = loopPayload?.findings?.read;
     const fp = redTeamReadFingerprint(read);

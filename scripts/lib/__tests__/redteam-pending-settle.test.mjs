@@ -333,20 +333,20 @@ describe('head-bound default pending settlement', () => {
   }
   it('reads the live head and removes only pending', () => {
     const { provider, settle } = setup();
-    settle({ repo, pr, head, read: payload().findings.read, remove: ['keep-me'] });
+    settle({ ...evidence(), repo, pr, head, read: payload().findings.read, remove: ['keep-me'] });
     expect(provider.readPrState).toHaveBeenCalledWith(repo, pr);
     expect(provider.setLabels).toHaveBeenCalledOnce();
     expect(provider.setLabels).toHaveBeenCalledWith(repo, pr, { remove: ['red-team:pending'] });
   });
   it('refuses a head moved since planning', () => {
     const { provider, settle } = setup({ headRefOid: old, labels: ['red-team:pending'] });
-    expect(settle({ repo, pr, head, read: payload().findings.read })).toEqual({ skipped: 'head-moved' });
+    expect(settle({ ...evidence(), repo, pr, head, read: payload().findings.read })).toEqual({ skipped: 'head-moved' });
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it.each([['red-team:pending', 'red-team:blocked'], [{ name: 'red-team:pending' }, { name: 'red-team:blocked' }],
     ['keep-me'], undefined].map(labels => [labels]))('preserves blocked, absent or unreadable pending labels %j', labels => {
     const { provider, settle } = setup({ headRefOid: head, labels });
-    try { settle({ repo, pr, head, read: payload().findings.read }); } catch { /* Unreadable labels may throw, but never write. */ }
+    try { settle({ ...evidence(), repo, pr, head, read: payload().findings.read }); } catch { /* Unreadable labels may throw, but never write. */ }
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('missing provenance escalates before attempting to read live state', () => {

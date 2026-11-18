@@ -90,7 +90,17 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
   const s = createDrainMergeStrategy({
     ...strategyExtra,
     writeFile: strategyExtra.writeFile ?? vi.fn(),
-    dryRun, env, labelProvider, readRedTeamEvidence: strategyExtra.readRedTeamEvidence ?? (() => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }), requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, labelProvider, readRedTeamEvidence: strategyExtra.readRedTeamEvidence ?? (() => {
+      if (evidence.readError) throw new Error('evidence unreadable');
+      // These fixtures formerly exercised scheduling/result predicates without a scored read.
+      // Supply the unchanged head's diff; explicit invalid reads in audit cases are retained.
+      const read = evidence.read ?? evidence.loopPayload?.findings?.read
+        ?? { diffScored: true, diffText: '+fixture', netBasis: { rev: HEAD }, netChangedFiles: changedFiles };
+      const fullEvidence = { read, ...evidence, ...(evidence.loopPayload && !Object.hasOwn(evidence.loopPayload, 'findings')
+        ? { loopPayload: { ...evidence.loopPayload, findings: { read } } } : {}) };
+      if (evidence.settleBounds) Object.defineProperty(fullEvidence, 'settleBounds', { value: evidence.settleBounds });
+      return fullEvidence;
+    }), requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(strategyExtra.statePath ? { statePath: strategyExtra.statePath, readFile: readFileSync, writeState: undefined } : {}), ...(withLock ? { withLock } : {}),
   });
@@ -345,7 +355,7 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
       const h = checkRunHarness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'],
         onView: { readLive: () => {
           if (++reads === 2) recordRedTeamStatus({ repo: LOCAL, pr: 5283, status: 'running',
-            loopPayload: { findings: { read: { netBasis: { rev: HEAD } } } } }, {
+            loopPayload: { findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: HEAD } } } } }, {
             env, gh: () => '', log: () => {}, postCheckRun: () => ({ ok: false, reason: 'outage' }),
           });
           return { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] };
@@ -361,7 +371,7 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
       const env = { WE_UNDER_TEST: '1', WE_SHARED_RUNS_DIR: join(root, 'runs') };
       const key = { repo: LOCAL, pr: 5283, head: HEAD, env };
       const input = { repo: LOCAL, pr: 5283, loopPayload: { verdict: { verdict: 'accept' },
-        findings: { read: { netBasis: { rev: HEAD } } } } };
+        findings: { read: { diffScored: true, diffText: '+fixture', netBasis: { rev: HEAD } } } } };
       const runs = [], attempts = [], appId = 5037855;
       const clean = [{ author: { login: 'web-everything' }, body:
         `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` }];
@@ -782,6 +792,7 @@ describe('drain merge strategy — github-merge-queue', () => {
     const logs = [];
     const s = createDrainMergeStrategy({
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec,
+      readRedTeamEvidence: () => ({ read: { diffScored: true, diffText: '+fixture' }, scheduled: false }),
       log: { write: (l) => logs.push(l) },
       readFile: () => { if (broken) return '{"pending": ['; return JSON.stringify(stored); },
       writeState: (_p, st) => { writes++; stored = JSON.parse(JSON.stringify(st)); },
@@ -795,6 +806,7 @@ describe('drain merge strategy — github-merge-queue', () => {
     const exec2 = (cmd, args) => (args.some(a => a.includes('isInMergeQueue')) ? JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: true, headRefOid: HEAD } } } }) : exec(cmd, args));
     const s2 = createDrainMergeStrategy({
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec: exec2,
+      readRedTeamEvidence: () => ({ read: { diffScored: true, diffText: '+fixture' }, scheduled: false }),
       log: { write: (l) => logs.push(l) }, readFile: () => JSON.stringify(stored),
       writeState: (_p, st) => { writes++; stored = JSON.parse(JSON.stringify(st)); },
     });
@@ -1120,6 +1132,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
       expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
       expect(syncRedTeamStatusLabels({ repo: LOCAL, pr: 5283, head: HEAD, env,
         live: { headRefOid: HEAD, labels }, comments: thread, provider: labelProvider, standingRuling: null,
+        evidence: { read: { diffScored: true, diffText: '+fixture' } },
       })).toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
       expect(labels).toContain('red-team:clear');
       expect(labels).not.toContain('red-team:blocked');
