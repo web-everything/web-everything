@@ -280,6 +280,22 @@ describe('stale stageVerdict referral refusal', () => {
 });
 
 describe('ordinary review-pr CLI resume preserves the saved roster', () => {
+  it('restores a historical minimum only when both persisted policy fields are absent', () => {
+    const settings = { minNonClaudeSeats: 2 };
+    const historical = { findings: { read: {}, judge: {}, judgeSecurity: {} }, pending: { step: 'reduce' } };
+    expect(reviewSeatOptionsForRun(historical, settings)).toMatchObject({ minNonClaudeSeats: 0 });
+    for (const policy of [{ minNonClaudeSeats: 1 }, { minNonClaudeSeats: 2 }, { minNonClaudeSeats: 0 }]) {
+      expect(reviewSeatOptionsForRun({ ...historical, findings: { ...historical.findings, read: policy } }, settings))
+        .toMatchObject(policy);
+    }
+    for (const policy of [{ seatSteps: ['judge', 'judgeSecurity'] }, { minNonClaudeSeats: null }]) {
+      const options = reviewSeatOptionsForRun({ ...historical, findings: { ...historical.findings, read: policy } }, settings);
+      expect(options).not.toHaveProperty('minNonClaudeSeats');
+      expect(options.seatSettings.minNonClaudeSeats).toBe(2);
+    }
+    expect(reviewSeatOptionsForRun({ findings: {} }, settings).seatSettings.minNonClaudeSeats).toBe(2);
+  });
+
   it.each([
     {},
     { codexAdvisory: true },

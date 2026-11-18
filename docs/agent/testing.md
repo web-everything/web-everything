@@ -1107,7 +1107,10 @@ positive integers, and adds the Codex simplicity and then correctness advisory s
 as needed. These answers stay advisory. A skipped/unavailable answer does not count;
 a shortfall (including a minimum above the two available Codex lenses) is recorded on
 the verdict and printed in both the verdict write-up and human advisory note. Saved
-runs retain their original roster, with the same explicit shortfall reporting.
+runs retain their original roster and persisted minimum. Historical runs saved before
+both `seatSteps` and `minNonClaudeSeats` existed resume with their original zero minimum;
+incomplete modern policy records still use the live minimum. `review-ruling-resume.test.mjs`
+pins that migration and drives a historical two-seat panel through reduction.
 These settings resolve through standard → platform `review` → tool
 `scripts/settings/review.json` → env, logging effective values and sources.
 Validate each complete scalar before cascading: nested and empty objects, arrays,

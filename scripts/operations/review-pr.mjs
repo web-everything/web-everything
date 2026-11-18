@@ -832,11 +832,15 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
   const seated = (seat, i) => (saved ? saved.includes(seat.step)
     : reached.includes(seat.step) || prefilled.includes(seat.step) || (i > furthest && liveFlags[seat.step]));
   const [codexAdvisory, correctnessAdvisory, antigravityReview, agyCorrectnessAdvisory] = OPTIONAL_SEATS.map(seated);
+  // Before roster/minimum persistence, reviews had no diversity requirement. Do not apply a
+  // new minimum to those historical panels; a modern record with incomplete policy stays fail-closed.
+  const historicalMinimum = !Object.hasOwn(read, 'seatSteps') && !Object.hasOwn(read, 'minNonClaudeSeats');
   return {
     securitySeat: securitySeatFromRun(record),
     cardOnlyLight: read.cardOnlyLight === true,
     codexAdvisory, correctnessAdvisory, antigravityReview,
-    ...(Number.isSafeInteger(read.minNonClaudeSeats) && read.minNonClaudeSeats >= 0 ? { minNonClaudeSeats: read.minNonClaudeSeats } : {}),
+    ...(Number.isSafeInteger(read.minNonClaudeSeats) && read.minNonClaudeSeats >= 0
+      ? { minNonClaudeSeats: read.minNonClaudeSeats } : historicalMinimum ? { minNonClaudeSeats: 0 } : {}),
     seatSettings: { ...(settings ?? {}), agyCorrectnessAdvisory, preserveSavedRoster: true },
   };
 }
@@ -2398,7 +2402,7 @@ export function reviewPrOperation({
 } = {}) {
   if (!Number.isSafeInteger(minNonClaudeSeats) || minNonClaudeSeats < 0) throw new TypeError('review-pr: invalid minNonClaudeSeats');
   // New reviews always include a separate Codex session. Saved runs keep their original step roster;
-  // the reducer reports their shortfall rather than inventing an answer during resume.
+  // their saved minimum still applies rather than inventing an answer during resume.
   if (!seatSettings?.preserveSavedRoster) {
     if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) codexAdvisory = true;
     if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) correctnessAdvisory = true;
