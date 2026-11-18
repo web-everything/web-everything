@@ -72,6 +72,7 @@ const cell = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').rep
 class GithubUnavailable extends Error {}
 const githubUnavailable = (error) => /HTTP 5\d\d|Gateway Timeout|Bad Gateway|Service Unavailable|ETIMEDOUT|ECONNRESET/i
   .test([error.message, error.stderr, error.stdout, error.code].join(' '));
+const httpStatus = (error) => /\bHTTP (\d{3})\b/i.exec([error.message, error.stderr, error.stdout].join(' '))?.[1];
 
 export function runTick(options = {}) {
   try { return observeTick(options); }
@@ -167,24 +168,39 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
       prs = JSON.parse(gh(listArgs));
     }
     let required = state.requiredChecks[repo];
-    if (!required || required.version !== 2 || !Number.isFinite(required.at) || nowMs < required.at || nowMs - required.at >= 60 * 60000
-      || !(required.names === null || (Array.isArray(required.names) && required.names.length && required.names.every((name) => typeof name === 'string' && name)))) {
+    let unavailableReason;
+    if (!required || required.version !== 3 || !Number.isFinite(required.at) || nowMs < required.at || nowMs - required.at >= 60 * 60000
+      || !(Array.isArray(required.names) && required.names.length && required.names.every((name) => typeof name === 'string' && name))) {
       const names = [];
-      const valid = (value) => Array.isArray(value) && value.length && value.every((name) => typeof name === 'string' && name.length);
+      const failures = [];
+      const valid = (value) => Array.isArray(value) && value.every((name) => typeof name === 'string' && name.length);
+      const failed = (source, error) => failures.push(`${source} lookup failed: ${error instanceof SyntaxError ? 'invalid JSON' : httpStatus(error) ?? cell(error.message)}`);
       try {
         const value = JSON.parse(gh(['api', `repos/${repo}/branches/main/protection/required_status_checks`, '--jq', '[.contexts[], (.checks[]?.context)]']));
-        if (valid(value)) names.push(...value);
-      } catch (error) { if (error instanceof GithubUnavailable) throw error; /* Still read the additive ruleset requirements. */ }
+        if (!valid(value)) throw new Error('invalid response');
+        names.push(...value);
+      } catch (error) {
+        if (error instanceof GithubUnavailable) throw error;
+        if (error instanceof SyntaxError || httpStatus(error) !== '404') failed('classic', error);
+      }
       try {
         const rules = JSON.parse(gh(['api', `repos/${repo}/rules/branches/main`]));
         const value = rules.filter((rule) => rule.type === 'required_status_checks')
           .flatMap((rule) => rule.parameters.required_status_checks.map((check) => check.context));
-        if (valid(value)) names.push(...value);
-      } catch (error) { if (error instanceof GithubUnavailable) throw error; /* Explicit fallback below keeps the missing evidence visible. */ }
-      // Version 2 caches the union; older classic-only caches must be refreshed.
-      required = state.requiredChecks[repo] = { version: 2, at: nowMs, names: names.length ? [...new Set(names)] : null };
+        if (!valid(value)) throw new Error('invalid response');
+        names.push(...value);
+      } catch (error) {
+        if (error instanceof GithubUnavailable) throw error;
+        failed('ruleset', error);
+      }
+      // Version 3 excludes older caches that may contain a partial lookup.
+      required = { version: 3, at: nowMs, names: !failures.length && names.length ? [...new Set(names)] : null };
+      if (required.names === null) {
+        delete state.requiredChecks[repo];
+        unavailableReason = failures.join('; ') || 'no required checks found';
+      } else state.requiredChecks[repo] = required;
     }
-    if (required.names === null) warnings.push(`required checks unavailable for ${repo}; using all checks`);
+    if (required.names === null) warnings.push(`required checks unavailable for ${repo}; using all checks (${unavailableReason})`);
     const requiredNames = required.names === null ? null : new Set(required.names);
     if (!Array.isArray(prs)) throw new Error('Incomplete PR list evidence');
     const truncated = prs.length >= PR_LIST_LIMIT;
@@ -345,7 +361,8 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
   return { summary, reports, badClaims };
 }
 
-async function main(argv) {
+export async function main(argv, { runner = createTickRunner, stderr = (line) => process.stderr.write(line),
+  exit = (code) => { process.exitCode = code; }, schedule = setTimeout } = {}) {
   const options = {};
   let loop = false;
   let interval = 300000;
@@ -362,15 +379,22 @@ async function main(argv) {
   }
   if (!Number.isFinite(interval) || interval <= 0 || interval > 2147483647) throw new Error('Invalid interval-ms');
   if (options.repos?.some((repo) => !/^[\w.-]+\/[\w.-]+$/.test(repo))) throw new Error('Invalid repo slug');
-  const run = createTickRunner({ ...options, interval });
+  const run = runner({ ...options, interval });
   const tick = () => {
     let delay = interval;
-    try { delay = run().delayMs; }
-    catch (error) {
-      process.stderr.write(`assistant tick failed: ${cell(error.message)}\n`);
-      if (!loop) process.exitCode = 1;
+    try {
+      const result = run();
+      delay = result.delayMs;
+      if (!loop && result.summary.type === 'tick-skipped') {
+        stderr('tick skipped: github 5xx\n');
+        exit(75);
+      }
     }
-    if (loop) setTimeout(tick, delay);
+    catch (error) {
+      stderr(`assistant tick failed: ${cell(error.message)}\n`);
+      if (!loop) exit(1);
+    }
+    if (loop) schedule(tick, delay);
   };
   tick();
 }

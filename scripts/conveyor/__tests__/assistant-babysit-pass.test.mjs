@@ -1,7 +1,7 @@
 /** Hermetic IO fixtures: report-only, no actions, no GitHub writes. */
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
-import { runTick, createTickRunner, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
+import { runTick, createTickRunner, main, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
 
 const nowMs = Date.parse('2026-01-01T12:00:00Z');
 const old = '2026-01-01T10:00:00Z';
@@ -40,11 +40,11 @@ function fixture() {
     if (args[0] === 'pr') return JSON.stringify(world.prs);
     if (args[1].includes('/protection/required_status_checks')) {
       if (world.required instanceof Error) throw world.required;
-      return JSON.stringify(world.required);
+      return world.requiredJson ?? JSON.stringify(world.required);
     }
     if (args[1].includes('/rules/branches/main')) {
       if (world.rules instanceof Error) throw world.rules;
-      return JSON.stringify(world.rules);
+      return world.rulesJson ?? JSON.stringify(world.rules);
     }
     if (args[1].includes('/events?')) {
       if (world.eventError) throw world.eventError;
@@ -111,18 +111,21 @@ describe('precision and explanation budgets', () => {
     w.prs[0].statusCheckRollup = [{ name: 'ruleset', conclusion: 'FAILURE' }];
     expect(w.tick().reports.map((report) => report.rule)).toEqual(['gate-red-stalled']);
     expect(apiReads(w)).toHaveLength(2);
-    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks['web-everything/web-everything']).toMatchObject({ version: 2, names: ['classic', 'ruleset'] });
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks['web-everything/web-everything']).toMatchObject({ version: 3, names: ['classic', 'ruleset'] });
   });
-  it.each([[], new Error('denied')])('reads rulesets after empty or failed protection evidence %j', (required) => {
+  it.each([[], Object.assign(new Error('branch not protected'), { stderr: 'gh: Not Found (HTTP 404)' })].map((required) => [required]))('reads rulesets after empty or classic 404 protection evidence %j', (required) => {
     const w = fixture();
     w.required = required;
     w.rules = [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'checks' }] } }, { type: 'other' }];
-    w.tick();
+    w.prs[0].labels = [{ name: 'review-status:ci-heal-stalled' }];
+    w.prs[0].statusCheckRollup = [{ name: 'checks', conclusion: 'SUCCESS' }];
+    expect(w.tick().reports.map((report) => report.rule)).toContain('sticky-label');
+    expect(decisions(w).some((decision) => decision.action === 'update-branch')).toBe(true);
     expect(apiReads(w)).toHaveLength(2);
     expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks['web-everything/web-everything'].names).toEqual(['checks']);
     expect(w.files.get(join('output', 'digest.md'))).not.toContain('required checks unavailable');
   });
-  it.each([[], new Error('denied'), {}])('warns once per repo when required evidence is unavailable %j, including cached fallback', (value) => {
+  it.each([[], new Error('denied'), {}].map((value) => [value]))('warns once per repo and retries unavailable requirements %j without caching the fallback', (value) => {
     const w = fixture();
     w.required = value;
     w.rules = value;
@@ -131,10 +134,57 @@ describe('precision and explanation budgets', () => {
     const warning = 'required checks unavailable for web-everything/web-everything; using all checks';
     expect(w.tick().reports[0].rule).toBe('gate-red-stalled');
     expect(w.files.get(join('output', 'digest.md')).split(warning)).toHaveLength(2);
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks).not.toHaveProperty('web-everything/web-everything');
     w.calls.length = 0;
     w.tick({ nowMs: nowMs + 60000 });
-    expect(apiReads(w)).toHaveLength(0);
+    expect(apiReads(w)).toHaveLength(2);
     expect(w.files.get(join('output', 'digest.md'))).toContain(warning);
+  });
+  it.each([
+    ['ruleset 403 with classic requirements', { rules: new Error('HTTP 403') }, 'ruleset lookup failed: 403'],
+    ['classic 403 with ruleset requirements', { required: new Error('HTTP 403') }, 'classic lookup failed: 403'],
+    ['ruleset 404 with classic requirements', { rules: new Error('HTTP 404') }, 'ruleset lookup failed: 404'],
+    ['classic non-HTTP error', { required: new Error('denied') }, 'classic lookup failed: denied'],
+    ['ruleset non-HTTP error', { rules: new Error('denied') }, 'ruleset lookup failed: denied'],
+    ['classic JSON parse error', { requiredJson: '{' }, 'classic lookup failed: invalid JSON'],
+    ['classic JSON parse error containing HTTP 404', { requiredJson: 'HTTP 404' }, 'classic lookup failed: invalid JSON'],
+    ['ruleset JSON parse error', { rulesJson: '{' }, 'ruleset lookup failed: invalid JSON'],
+    ['classic invalid names', { required: ['classic', null] }, 'classic lookup failed: invalid response'],
+    ['ruleset invalid names', { rules: [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: '' }] } }] }, 'ruleset lookup failed: invalid response'],
+  ])('fails closed for %s on every PR and uses all rollup checks without caching', (_, patch, reason) => {
+    const w = fixture();
+    w.required = ['classic'];
+    w.rules = [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'ruleset' }] } }];
+    Object.assign(w, patch);
+    w.prs[0].labels = [{ name: 'review-status:ci-heal-stalled' }];
+    w.prs[0].statusCheckRollup = ['classic', 'ruleset', 'optional'].map((name) => ({ name, conclusion: 'SUCCESS' }));
+    w.prs.push({ ...w.prs[0], number: 2 });
+    expect(w.tick().reports.some((report) => report.rule === 'sticky-label')).toBe(false);
+    expect(decisions(w)).toEqual([]);
+    const warning = `required checks unavailable for web-everything/web-everything; using all checks (${reason})`;
+    expect(w.files.get(join('output', 'digest.md')).split(warning)).toHaveLength(2);
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks).not.toHaveProperty('web-everything/web-everything');
+    w.prs[0].statusCheckRollup[2].conclusion = 'FAILURE';
+    w.calls.length = 0;
+    expect(w.tick({ nowMs: nowMs + 60000 }).reports.map((report) => report.rule)).toEqual(['gate-red-stalled', 'gate-red-stalled']);
+    expect(apiReads(w)).toHaveLength(2);
+  });
+  it.each([
+    { version: 2, at: nowMs, names: ['classic'] },
+    { version: 2, at: nowMs, names: null },
+    { version: 3, at: nowMs - 60 * 60000, names: ['classic'] },
+  ])('discards persisted partial, fallback or expired cache %j when lookup fails', (cached) => {
+    const w = fixture();
+    w.files.set(join('output', 'state.json'), JSON.stringify({ requiredChecks: { 'web-everything/web-everything': cached } }));
+    w.required = ['classic'];
+    w.rules = new Error('HTTP 403');
+    w.prs[0].labels = [{ name: 'review-status:ci-heal-stalled' }];
+    w.prs[0].statusCheckRollup = [{ name: 'classic', conclusion: 'SUCCESS' }];
+    expect(w.tick().summary.wouldAct).toBe(0);
+    expect(apiReads(w)).toHaveLength(2);
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks).not.toHaveProperty('web-everything/web-everything');
+    w.rules = [];
+    expect(w.tick({ nowMs: nowMs + 60000 }).reports.map((report) => report.rule)).toContain('sticky-label');
   });
   it('refreshes required names at exactly 60 minutes', () => {
     const w = fixture();
@@ -784,6 +834,48 @@ describe('conflict file evidence', () => {
 });
 
 describe('GitHub backoff', () => {
+  it.each([[], ['--once']].map((argv) => [argv]))('CLI %j exits 75 and prints the skipped 5xx tick to stderr', async (argv) => {
+    const w = fixture();
+    const exits = [];
+    const errors = [];
+    const scheduled = [];
+    await main([...argv, '--out-dir=output', '--repos=org/repo'], {
+      runner: (options) => createTickRunner({ ...options, io: w.io, nowMs, whyCli: null,
+        exec: () => { throw new Error('HTTP 503'); } }),
+      exit: (code) => exits.push(code), stderr: (line) => errors.push(line),
+      schedule: (...args) => scheduled.push(args),
+    });
+    expect(exits).toEqual([75]);
+    expect(errors).toEqual(['tick skipped: github 5xx\n']);
+    expect(scheduled).toEqual([]);
+    expect(w.log()).toEqual([{ type: 'tick-skipped', at: new Date(nowMs).toISOString(), reason: 'github-5xx', backoffMs: 300000 }]);
+    expect(w.files.has(join('output', 'state.json'))).toBe(false);
+    expect(decisions(w)).toEqual([]);
+  });
+  it('CLI --loop keeps scheduling after a skipped 5xx tick and recovers without exiting', async () => {
+    const w = fixture();
+    w.prs[0].labels = [];
+    const exits = [];
+    const errors = [];
+    const scheduled = [];
+    let fail = true;
+    await main(['--loop', '--out-dir=output', '--repos=org/repo', '--interval-ms=150000'], {
+      runner: (options) => createTickRunner({ ...options, io: w.io, nowMs, whyCli: null,
+        exec: (...args) => { if (fail) throw new Error('HTTP 503'); return w.exec(...args); } }),
+      exit: (code) => exits.push(code), stderr: (line) => errors.push(line),
+      schedule: (...args) => scheduled.push(args),
+    });
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0][1]).toBe(150000);
+    scheduled[0][0]();
+    expect(scheduled[1][1]).toBe(300000);
+    fail = false;
+    scheduled[1][0]();
+    expect(scheduled[2][1]).toBe(150000);
+    expect(w.log().map((line) => line.type)).toEqual(['tick-skipped', 'tick-skipped', 'tick']);
+    expect(exits).toEqual([]);
+    expect(errors).toEqual([]);
+  });
   it.each(['HTTP 504', 'HTTP 500', 'Gateway Timeout', 'Bad Gateway', 'Service Unavailable', 'ETIMEDOUT', 'ECONNRESET'])('skips %s without changing digest or state', (text) => {
     const w = fixture();
     w.files.set(join('output', 'digest.md'), 'previous digest');
