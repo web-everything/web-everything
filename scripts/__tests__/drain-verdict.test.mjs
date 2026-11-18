@@ -214,6 +214,9 @@ describe('T3b: the dry-run ready-not-reached accounting row is not an admission 
     ['red-main-hold (real enqueue hold kind)', () => ({ skipReasons: buildSkipReasons({ verdicts: [merge(7)],
       enqueueOutcomes: [{ num: 7, repo: null, outcome: 'not-enqueued', kind: 'red-main-hold', reason: 'red-main-hold: main is red' }] }) }), 'red-main-hold'],
     ['red-main-hold (hand-built row)', () => ({ skipReasons: [{ ...row, kind: 'red-main-hold', reason: 'red-main-hold', source: 'skipped' }] }), 'red-main-hold'],
+    ['freeze-unreadable-hold (real skip reason)', () => ({ skipReasons: buildSkipReasons({ verdicts: [
+      { ...merge(7), decision: 'skip', reason: 'freeze-unreadable-hold: freeze unreadable' },
+    ] }) }), 'red-main-hold'],
     ['ready-not-reached from another source', () => ({ skipReasons: [{ ...row, kind: 'ready-not-reached', reason: 'x', source: 'skipped' }] }), 'ready-not-reached'],
     ['an unknown kind', () => ({ skipReasons: [{ ...row, kind: 'brand-new-hold', reason: 'x', source: 'unaccounted' }] }), 'brand-new-hold'],
     ['an accounting row plus a hold for the same target under the slug key', () => ({ skipReasons: [
