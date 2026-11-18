@@ -181,6 +181,7 @@ import { homedir, constants as osConstants } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
 import { URL as NodeURL, fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
 
 import { tryAcquireSlot, releaseOwnedSlot, admissionStatus, ADMISSION_LEASE_MINUTES } from '../readiness/heavy-admission.mjs';
 import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
@@ -1856,9 +1857,23 @@ function logFinishedCiHit(args, cls, throttle, env) {
 
 /** Permit ANSI-bearing job logs on gh 2.104+, without mutating the caller's argv. */
 export function allowJobLogEscapeSequences(args) {
-  return args[0] === 'api' && !args.includes('--allow-escape-sequences')
-    && args.some(arg => typeof arg === 'string' && !arg.startsWith('-') && /\/actions\/jobs\/\d+\/logs$/.test(arg))
+  return isJobLogRead(args) && !args.includes('--allow-escape-sequences')
     ? [...args, '--allow-escape-sequences'] : args;
+}
+
+function isJobLogRead(args) {
+  return args[0] === 'api'
+    && args.some(arg => typeof arg === 'string' && !arg.startsWith('-') && /\/actions\/jobs\/\d+\/logs$/.test(arg));
+}
+
+/** The gh safety override permits transport only; callers and caches receive plain logs. */
+function sanitizeJobLog(args, result, encoding) {
+  if (!isJobLogRead(args) || !(typeof result === 'string' || Buffer.isBuffer(result))) return result;
+  const codec = encoding && encoding !== 'buffer' ? encoding : 'utf8';
+  const text = Buffer.isBuffer(result) ? result.toString(codec) : result;
+  const withoutOsc = text.replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c)/g, '');
+  const clean = stripVTControlCharacters(withoutOsc).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+  return Buffer.isBuffer(result) ? Buffer.from(clean, codec) : clean;
 }
 
 /**
@@ -1866,7 +1881,8 @@ export function allowJobLogEscapeSequences(args) {
  * shaped failure. TRANSPARENT: on the attempt that finally returns or throws, this behaves EXACTLY like a
  * direct `execFileSync('gh', args, opts)` call — `opts` (everything except the separately-namespaced
  * `opts.throttle` bag below) is passed through UNCHANGED, so the return value and the thrown-error shape
- * (`.status`, `.stdout`, `.stderr`, `.message`) are byte-identical to the real binary's.
+ * (`.status`, `.stdout`, `.stderr`, `.message`) are byte-identical to the real binary's,
+ * except successful job-log reads have terminal escape/control sequences stripped.
  *
  * @param {string[]} args           the `gh` argv (exactly what `execFileSync('gh', args, opts)` would take)
  * @param {object} [opts]           execFileSync options, passed through verbatim, PLUS:
@@ -1913,7 +1929,7 @@ export function runGhSync(args, opts = {}) {
     const hit = lookupFinishedCi(cls, cache);
     if (hit !== null) {
       logFinishedCiHit(args, cls, throttle, cache.env);
-      return execOpts.encoding && execOpts.encoding !== 'buffer' ? hit.toString(execOpts.encoding) : hit;
+      return sanitizeJobLog(args, execOpts.encoding && execOpts.encoding !== 'buffer' ? hit.toString(execOpts.encoding) : hit, execOpts.encoding);
     }
   }
   let completedBeforeRead = false;
@@ -1966,7 +1982,7 @@ function runGhSyncReadMemo(args, opts = {}) {
       recordGhCallLogEntry(throttle.logPath || ghThrottleLogPath(lockRoot), {
         outcome: 'memo_hit', op: throttle.op || ghOpLabel(args), caller: deriveGhCaller(throttle, env), points: 0,
       });
-      return result;
+      return sanitizeJobLog(args, result, execOpts.encoding);
     }
   } catch { /* Unreadable entries are misses. */ }
 
@@ -2149,7 +2165,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     if (!failure) {
       // #gh-graphql-budget — a landed write makes the shared open-PR snapshot stale for that repo.
       if (isWrite) markPrSnapshotDirty({ repo: repoFromGhArgs(args), env });
-      return result;
+      return sanitizeJobLog(args, result, execOpts.encoding);
     }
 
     const text = `${failure && failure.stderr ? String(failure.stderr) : ''}\n${failure && failure.message ? String(failure.message) : ''}`;

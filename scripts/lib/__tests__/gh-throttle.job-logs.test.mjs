@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { allowJobLogEscapeSequences, runGhSync } from '../gh-throttle.mjs';
@@ -11,6 +11,44 @@ const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('job-log escape-sequence permission', () => {
+  it.each([
+    ['string', 'utf8'], ['string', 'latin1'], ['string', 'utf16le'],
+    ['Buffer', undefined], ['Buffer', 'buffer'], ['Buffer', 'latin1'], ['Buffer', 'utf16le'],
+  ])('sanitizes CSI, OSC and C0 controls while preserving %s output (encoding %s)', (type, encoding) => {
+    const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
+    const raw = '\u001b[31mhéllo\u001b[0m\u001b]0;hidden title\u0007\u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b\\'
+      + String.fromCharCode(...Array.from({ length: 32 }, (_, i) => i).filter(i => ![9, 10, 13].includes(i)))
+      + '\tline\r\n';
+    const clean = 'héllolink\tline\r\n';
+    const codec = encoding && encoding !== 'buffer' ? encoding : 'utf8';
+    const output = type === 'Buffer' ? Buffer.from(raw, codec) : raw;
+    const exec = vi.fn(() => output);
+    const opts = { encoding, throttle: { env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false, exec } };
+    const args = ['api', 'repos/o/r/actions/jobs/123/logs'];
+    const expected = type === 'Buffer' ? Buffer.from(clean, codec) : clean;
+    expect(runGhSync(args, opts)).toEqual(expected);
+    expect(runGhSync([...args, '--allow-escape-sequences'], opts)).toEqual(expected);
+    expect(runGhSync(['api', 'repos/o/r/actions/jobs/123'], opts)).toBe(output);
+  });
+
+  it('stores sanitized job logs in the read memo and sanitizes historical raw entries', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
+    const raw = '\u001b[32mhéllo\u001b[0m\u0000\n';
+    const exec = vi.fn(() => raw);
+    const opts = { encoding: 'utf8', throttle: {
+      env: { WE_GH_READ_MEMO_DIR: root, WE_GH_THROTTLE_COST_HEADERS: '0' },
+      lockRoot: join(root, 'locks'), logPath: join(root, 'calls.jsonl'), personalRoute: false, execFileSync: exec,
+    } };
+    const args = ['api', 'repos/o/r/actions/jobs/123/logs'];
+    expect(runGhSync(args, opts)).toBe('héllo\n');
+    const path = join(root, readdirSync(root).find(name => name.endsWith('.json')));
+    const entry = JSON.parse(readFileSync(path, 'utf8'));
+    expect(entry.stdout).toBe('héllo\n');
+    writeFileSync(path, JSON.stringify({ ...entry, stdout: raw }));
+    expect(runGhSync(args, opts)).toBe('héllo\n');
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
   it('adds permission to job-log reads without mutating caller arguments', () => {
     for (const args of [
       ['api', 'repos/o/r/actions/jobs/123/logs'],
