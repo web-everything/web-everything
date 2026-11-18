@@ -48,6 +48,8 @@ const log4965 = complete(log4965Raw);
 const candidacy = complete(log4965Raw.split('\n').filter(l => !l.includes('test-gaming')).join('\n'));
 const candidacyWithCodeqlHold = candidacy.replace(/^(  )pass(\s+codeql\s)/m, '$1hold$2');
 const sha = 'a'.repeat(40);
+// These injected REST snapshots represent exhausted SHA-specific pages.
+const completeRows = rows => Object.defineProperty(rows, 'rowsComplete', { value: true });
 const row = { name: 'merge-gate', id: 123, status: 'COMPLETED', conclusion: 'FAILURE' };
 const green = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
 const verdict = (log = candidacy) => ({ ...parsePrResultTable(log, log.includes('#5008') ? 5008 : 4965), head_sha: sha, completed_at: '2026-10-12T11:56:08Z' });
@@ -273,7 +275,7 @@ it('uses a rollup detailsUrl job id and case-insensitive head binding', () => {
 });
 it('missing labels, job id or completion never authorize excusal', () => {
   expect(excuseMergeGateRows([row], opts({ labels: undefined }))).toMatchObject({ excused: false, reviewHold: true,
-    rows: [{ ...row, mergeGateReviewHold: { holds: expect.any(Array), jobId: 123 } }] });
+    rows: [{ ...row, mergeGateReviewHold: { holds: expect.any(Array), holdIds: expect.any(Array), headSha: sha, jobId: 123 } }] });
   const noId = { ...row, id: undefined };
   expect(excuseMergeGateRows([noId], opts()).rows).toEqual([noId]);
   const pending = { ...row, status: 'IN_PROGRESS' };
@@ -331,7 +333,7 @@ describe('fresh review CI merge-gate holds', () => {
   function gate(extra = {}) {
     // Historical strict-CI fixture: keep its original refusal contract independent of shipped start timing.
     return readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo, pr: 4965, readHead: () => sha, readLabels: () => [],
-      readChecks: () => [rest, { context: 'legacy', state: 'success' }],
+      readChecks: () => completeRows([rest, { context: 'legacy', state: 'success' }]),
       readRequired: () => ({ source: 'live', checks: ['merge-gate', 'legacy'] }),
       readMergeGateVerdict: () => verdict(), readFreeze: () => ({ error: 'unused' }), mergeGateSetting: 'on', ...extra });
   }
@@ -340,7 +342,7 @@ describe('fresh review CI merge-gate holds', () => {
     expect(gate({ readMergeGateVerdict: readVerdict }).allowed).toBe(true);
     expect(readVerdict).toHaveBeenCalledWith({ repo, jobId: 123, prNumber: 4965 });
     expect(rest.conclusion).toBe('failure');
-    expect(gate({ readChecks: () => [rest, { context: 'legacy', state: 'failure' }] })).toMatchObject({
+    expect(gate({ readChecks: () => completeRows([rest, { context: 'legacy', state: 'failure' }]) })).toMatchObject({
       allowed: false, affected: [{ name: 'legacy', reason: 'failure' }],
     });
   });
@@ -413,8 +415,8 @@ describe('fresh review CI merge-gate holds', () => {
   });
   it('does not excuse a legacy merge-gate status', () => {
     const readMergeGateVerdict = vi.fn(() => verdict());
-    expect(gate({ readChecks: () => [{ context: 'merge-gate', state: 'failure' },
-      { context: 'legacy', state: 'success' }], readMergeGateVerdict })).toMatchObject({
+    expect(gate({ readChecks: () => completeRows([{ context: 'merge-gate', state: 'failure' },
+      { context: 'legacy', state: 'success' }]), readMergeGateVerdict })).toMatchObject({
       allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }],
     });
     expect(readMergeGateVerdict).not.toHaveBeenCalled();
@@ -442,7 +444,7 @@ merge-gate: HOLD — held`;
   const failed = { name: 'merge-gate', status: 'completed', conclusion: 'failure', head_sha: sha,
     details_url: 'https://github.com/owner/repo/actions/runs/100/job/123' };
   const probe = (extra = {}) => readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'owner/repo', pr: 4965,
-    readHead: () => sha, readLabels: () => [], readChecks: () => [failed, { name: 'test', status: 'completed', conclusion: 'success', head_sha: sha }],
+    readHead: () => sha, readLabels: () => [], readChecks: () => completeRows([failed, { name: 'test', status: 'completed', conclusion: 'success', head_sha: sha }]),
     readRequired: () => ({ source: 'live', checks: ['test', 'merge-gate'] }),
     readMergeGateVerdict: () => verdict(freshHead), readFreeze: () => ({ error: 'unused' }), mergeGateSetting: 'on', ...extra });
   it('lets the review that produces the red-team check start on a fresh head', () => {
@@ -528,13 +530,11 @@ describe('facts-first review CI merge-gate refusals', () => {
     expect(live).toHaveBeenCalledTimes(1);
     expect(live).toHaveBeenCalledWith({ repo, pr, readRequired, mergeGateSetting: 'on', policy: { startAfter: 'ci-green', startEarly: 'off' } });
   });
-  it('still trusts a completed test failure without reading the live gate', async () => {
+  it('rechecks a stored failure live when the snapshot cannot prove row completeness', async () => {
     const live = vi.fn(() => ({ allowed: true }));
-    expect(await gate('test', live)).toMatchObject({ allowed: false,
-      reason: 'required-checks-not-successful', factsSource: 'store',
-      affected: [{ name: 'test', reason: 'failure' }],
-    });
-    expect(live).not.toHaveBeenCalled();
+    // Completed-only store rows omit pending checks and legacy statuses; use the live gate.
+    expect(await gate('test', live)).toEqual({ allowed: true });
+    expect(live).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -610,7 +610,7 @@ describe('review-hold annotation (card 273, #5157)', () => {
   it('annotates the latest failing row without making CI green', () => {
     const readVerdict = () => ({ num: 4965, head_sha: sha, ok: false, results: [{ id: 'test-gaming', status: 'hold' }] });
     const out = excuseMergeGateRows([row], opts({ readVerdict }));
-    expect(out).toEqual({ excused: false, reviewHold: true, rows: [{ ...row, mergeGateReviewHold: { holds: ['test-gaming'], jobId: 123 } }] });
+    expect(out).toEqual({ excused: false, reviewHold: true, rows: [{ ...row, mergeGateReviewHold: { holds: ['test-gaming'], holdIds: ['test-gaming'], headSha: sha, jobId: 123 } }] });
     expect(excuseMergeGateRows([row], opts({ readVerdict, setting: 'off' }))).toEqual({ rows: [row], excused: false });
     const pr = { number: 4965, headRefOid: sha, labels: ['review:human'], statusCheckRollup: [row] };
     expect(excusePrMergeGateHolds([pr], { mergeGateSetting: 'on', readMergeGateVerdict: readVerdict })[0].statusCheckRollup).toEqual(out.rows);

@@ -59,6 +59,7 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
 import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation, sameSha } from './ci-heal-verdict-recheck.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { summarize } from '../lib/check-state-predicate.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -353,7 +354,7 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
-  const u = unsettledRequiredChecks({ rollup: pr?.statusCheckRollup, requiredChecks });
+  const u = unsettledRequiredChecks({ headSha: prHead, rowsHead: pr?.rowsHead, rowsComplete: pr?.rowsComplete === true, rollup: pr?.statusCheckRollup, requiredChecks });
   const parts = [];
   if (u.pending.length) parts.push(`still running: ${u.pending.join(', ')}`);
   if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);
@@ -370,8 +371,10 @@ export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   // A cancelled, stale, running, or missing required check may need human help.
   // Gate-only red describes failures, not whether the rest of CI finished green.
-  if (!ciGreenForEscalation({ rollup: pr?.statusCheckRollup, requiredChecks })) return null;
-  const { gateOnlyRed, red } = gateOnlyRedStates({ rollup: pr?.statusCheckRollup, requiredChecks });
+  const evidence = { headSha: pr.headRefOid, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete === true,
+    rollup: pr.statusCheckRollup, requiredChecks };
+  if (!ciGreenForEscalation(evidence)) return null;
+  const { gateOnlyRed, red } = gateOnlyRedStates(evidence);
   if (!gateOnlyRed) return null;
   return `Refusing needs-human: only ${red.join(', ')} is red on this head. This is not a CI break; ordinary review is owed.`;
 }
@@ -449,10 +452,12 @@ async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings 
     facts = await (readPr ?? (args => defaultReadPrChecks(args, prChecksOptions)))({ pr, repo });
     ({ checks } = await readRequired({ repo: repo ?? facts?.slug ?? null }));
   } catch (e) {
-    return { refusal: null, warning: warningFor(e) };
+    return { refusal: expectedOutcome === 'not-a-ci-break'
+      ? 'Cannot prove every required check green; inspect complete checks on the current head before retrying.' : null, warning: warningFor(e) };
   }
   // Only IO failures may use the warning fallback. Malformed check evidence must
   // reach the CLI's error handler before it can post an escalation.
+  summarize(facts?.statusCheckRollup, { requiredNames: [] });
   if (!readPr) facts = classifyPrChecks(facts, { pr, repo }, prChecksOptions);
   const refusal = facts?.readError && expectedOutcome === 'needs-human'
     ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
@@ -470,7 +475,15 @@ function defaultReadPrChecks({ pr, repo }, { runGh = runGhSync } = {}) {
   const raw = runGh(args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(raw || '{}'));
   const slug = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(parsed.url ?? '')?.[1] ?? null;
-  return { ...parsed, slug };
+  // The PR rollup is capped. Only exhausted SHA-specific REST pages prove completeness.
+  const pinnedRepo = repo ?? slug;
+  const run = argv => runGh(argv, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8',
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
+  if (!pinnedRepo || !/^[a-f0-9]{40}$/i.test(parsed.headRefOid ?? '')) throw new Error('missing repository or full head; inspect PR checks before retrying');
+  const checks = readReviewChecks({ repo: pinnedRepo, headSha: parsed.headRefOid, run });
+  const current = JSON.parse(String(run(args) || '{}'));
+  if (current.headRefOid !== parsed.headRefOid) throw new Error('head changed; retry with current PR head');
+  return { ...current, slug, statusCheckRollup: checks, rowsHead: parsed.headRefOid, rowsComplete: checks.rowsComplete === true };
 }
 
 function classifyPrChecks(parsed, { pr, repo }, {
@@ -506,7 +519,8 @@ function classifyPrChecks(parsed, { pr, repo }, {
     const excused = row.mergeGateHoldExcused;
     if (!excused?.holds?.length || !excused.holds.every(hold => hold.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(hold.id))) return row;
     return { ...row, conclusion: rows[index].conclusion,
-      mergeGateReviewHold: { holds: excused.holds.map(hold => hold.id), jobId: excused.jobId } };
+      mergeGateReviewHold: { holds: excused.holds.map(hold => hold.id), holdIds: excused.holds.map(hold => hold.id),
+        headSha: parsed.headRefOid, jobId: excused.jobId } };
   })) };
 }
 

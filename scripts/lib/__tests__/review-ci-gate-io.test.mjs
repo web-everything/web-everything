@@ -37,8 +37,8 @@ it.each(['fast-checks', 'push'])('uses required CI ownership under %s and report
   const policy = { startAfter, fastChecks: ['standards'] };
   const args = { repo: 'other/product', pr: 7, policy, readHead: () => headSha,
     readRequired: () => ({ source: 'live', checks: ['test'] }),
-    readChecks: () => [{ name: 'standards', status: 'completed', conclusion: 'success' },
-      { context: 'optional-status', state: 'failure' }] };
+    readChecks: () => Object.defineProperty([{ name: 'standards', status: 'completed', conclusion: 'success' },
+      { context: 'optional-status', state: 'failure' }], 'rowsComplete', { value: true }) };
   expect(readGate(args)).toMatchObject({ allowed: true, startAfter });
   expect(readGate({ ...args, readRequired: () => { throw Error('protection unavailable'); } }))
     .toMatchObject({ allowed: startAfter !== 'push', ...(startAfter === 'push' ? { reason: 'ci-red' } : {}), startAfter, source: 'timing-policy' });
