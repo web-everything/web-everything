@@ -71,6 +71,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     inputs: ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs'],
   },
   {
+    test: 'scripts/__tests__/pinned-diff-basis-structure.test.mjs',
+    scope: 'full',
+    why: 'ratchet over every non-test script: no new ref-string net-diff evidence reader outside the file:function allowlist',
+    matches: (f) => /\.mjs$/.test(f) && !skipped(f) && !/\.test\./.test(f) && inTree(f, ['scripts']),
+    inputs: ['scripts/__tests__/pinned-diff-basis-structure.test.mjs'],
+  },
+  {
     test: 'scripts/lib/__tests__/exec-output-guard.test.mjs',
     scope: 'files',
     why: 'captured gh/git reads cannot exceed the per-file unbounded-output baseline',

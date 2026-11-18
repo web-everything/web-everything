@@ -4692,6 +4692,42 @@ are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/s
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
 
+
+## Pinned diff basis (PR-A)
+
+Pinned diffs disable Unicode path quoting; C-quoted or malformed headers remain unscored
+and retain holds. Keep real-Git Unicode and quote/backslash test-deletion cases. Drain
+clearance carries re-read both heads under isolation and require the complete live basis
+to match the scored pass, matching bases and identical content; replace objects, unreadable
+heads or any basis drift refuse carry. Retry or request human review of the full diff.
+
+DRAIN and PR-LAND share `resolvePinnedDiffBasis`: one base fetch, a checked FETCH_HEAD,
+fully qualified tracking refs, exact head commits and SHA-only ancestry/diffs under isolated Git.
+Keep the real-Git shadow-ref, moved-ref, replacement-object and missing-head regressions in
+`pinned-diff-basis.test.mjs`. Unscored or head-mismatched evidence preserves the drain hold
+and refuses producer certification; retry with fresh evidence or request human review of the full diff.
+The structural ratchet scans executable call arguments throughout non-test `scripts/**/*.mjs`;
+its counted file:function allowlist records existing legacy sites. New sites fail, and removing
+a legacy site requires deleting its stale entry. Run these tests and affected drain/PR-LAND suites
+through heavy-admission with `--wait-ms=550000`.
+
+The base fetch must not request the producer head: PR-LAND resolves its cached basis before
+publishing. Keep the real local-remote unpublished-head regression (the remote must lack that
+object), the consumer's separate missing-head fetch, and the failed missing-head refusal.
+Only a missing local commit triggers the bounded second fetch; preserve the verified base's
+FETCH_HEAD with `--no-write-fetch-head` and never retry the base fetch.
+
+Real-drain CLI fixtures must model that pinned boundary too: full head commit IDs,
+Git's leading `-c key=value` options, distinct base/head identities, matching tracking-ref
+and FETCH_HEAD reads, and numstat plus content for the declared PR files. A shim that
+returns empty output for a pinned command correctly causes a hold, not a merge attempt.
+Keep the merge-failure-isolation regression proving an unreadable diff holds only that PR
+while a scored peer lands and the pass exits successfully. Preserve original argv in fixture
+logs so shadow/off comparisons still detect extra GitHub calls.
+
+For long subprocess-heavy selections, pass heavy-admission `--kind=FULL` with a bounded
+`--run-ceiling-ms`: the `files` kind retains its shorter fast-run timeout even when a larger
+run ceiling is supplied (the effective bound is the smaller timeout).
 ## Required-check evidence contract (PR1)
 
 `resolveRequiredChecks` ships without production callers. Its acceptance tests build

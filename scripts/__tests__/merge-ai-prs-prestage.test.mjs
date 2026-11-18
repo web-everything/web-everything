@@ -59,8 +59,18 @@ const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\\n');
+// Git accepts global config pins before the subcommand. Keep the original argv in the call log.
+while (a[0] === '-c') a.splice(0, 2);
+const pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const baseSha = 'd'.repeat(40);
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + process.env.PRESTAGE_REPO + '.git\\n');
-else if (a[0] === 'merge-base' || a[0] === 'rev-parse') process.stdout.write('${sha}\\n');
+else if (a[0] === 'merge-base') process.stdout.write(baseSha + '\\n');
+else if (a[0] === 'rev-parse') {
+  const ref = a.at(-1).replace(/\\^\\{commit\\}$/, '');
+  if (['refs/remotes/origin/main', 'FETCH_HEAD'].includes(ref)) process.stdout.write(baseSha + '\\n');
+  else if ([pr.headRefOid, pr.headRefName, 'HEAD'].includes(ref)) process.stdout.write(pr.headRefOid + '\\n');
+  else process.exit(1);
+}
 else if (a[0] === 'diff') {
   if (a.includes('--name-only')) process.stdout.write('README.md\\0');
   else if (a.includes('--numstat')) process.stdout.write('1\\t0\\tREADME.md\\n');
