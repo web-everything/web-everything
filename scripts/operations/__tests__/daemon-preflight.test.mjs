@@ -322,6 +322,24 @@ describe('preflight CLI IO hooks', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('cliIO.resolveRole forwards the remaining read deadline to every gh child and kills it on timeout', async () => {
+    const seen = [];
+    const homeDir = mkdtempSync(join(tmpdir(), 'preflight-deadline-'));
+    const io = cliIO({ ...ENV, HOME: homeDir }, { execFileSync: (file, args, options) => {
+      seen.push({ file, ...options });
+      throw new Error('stalled');
+    } });
+    try {
+      expect(await io.resolveRole({ thisHost: ME })).toMatchObject({ role: 'standby', reason: 'owner-unreadable' });
+      expect(seen.length).toBeGreaterThan(0);
+      for (const call of seen) {
+        expect(call).toMatchObject({ file: 'gh', killSignal: 'SIGKILL' });
+        expect(call.timeout).toBeGreaterThan(0);
+        expect(call.timeout).toBeLessThanOrEqual(15000);
+      }
+    } finally { rmSync(homeDir, { recursive: true, force: true }); }
+  });
+
   it('cliIO rejects unknown option keys instead of silently ignoring spies', () => {
     for (const key of ['readCache', 'writeCache', 'invalidateCache', 'execFileSyncc']) {
       expect(() => cliIO({}, { [key]: () => {} })).toThrow(`unknown cliIO option: ${key}`);

@@ -313,4 +313,69 @@ describe('GitHub ownership source', () => {
     expect(guard.runGhApi('fixture', { execFile: () => '{' }).ok).toBe(false);
     expect(guard.runGhApi('fixture', { execFile: () => { throw new Error('HTTP 403'); } })).toMatchObject({ ok: false, status: 403 });
   });
+
+  describe('synchronous production source honors the read deadline', () => {
+    // A real sync child (`exec sleep`) cannot be interrupted by a timer: only the child's own timeout can stop it.
+    function stubGh(seconds) {
+      const bin = join(home(), 'gh');
+      writeFileSync(bin, '#!/bin/sh\nexec sleep ' + seconds + '\n');
+      chmodSync(bin, 0o755);
+      return bin;
+    }
+    const syncSource = (bin) => guard.createGitHubOwnershipSource({
+      ghApi: (path, options) => guard.runGhApi(path, { ...options, execFile: (_file, args, opts) => execFileSync(bin, args, opts) }),
+    });
+
+    it('kills a stalled gh child at the deadline and fails closed', async () => {
+      const bin = stubGh(30);
+      const started = Date.now();
+      const decision = await guard.resolveHostRole({ thisHost: ME, source: syncSource(bin), timeoutMs: 300 });
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(decision).toMatchObject({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+    });
+
+    it('runGhApi caps the child timeout at the caller deadline and kills with SIGKILL', () => {
+      const exec = vi.fn(() => '{"ok":true}');
+      guard.runGhApi('fixture', { execFile: exec, timeoutMs: 250 });
+      expect(exec.mock.calls[0][2]).toMatchObject({ timeout: 250, killSignal: 'SIGKILL' });
+      guard.runGhApi('fixture', { execFile: exec, timeoutMs: 10 ** 9 });
+      expect(exec.mock.calls[1][2]).toMatchObject({ timeout: 15000, killSignal: 'SIGKILL' });
+      guard.runGhApi('fixture', { execFile: exec, timeoutMs: 0.2 });
+      expect(exec.mock.calls[2][2].timeout).toBe(1);
+      guard.runGhApi('fixture', { execFile: exec });
+      expect(exec.mock.calls[3][2]).toMatchObject({ timeout: 15000, killSignal: 'SIGKILL' });
+    });
+
+    it('gives each read only the time left before the shared deadline, and stops once it has passed', async () => {
+      let now = 1000;
+      const seen = [];
+      const api = vi.fn(async (path, options) => { seen.push(options.timeoutMs); now += 400; return path.includes('/git/ref/') ? ref : file(); });
+      const clock = () => now;
+      expect(await guard.createGitHubOwnershipSource({ ghApi: api }).readOwner({ deadline: 2000, clock })).toEqual(record());
+      expect(seen).toEqual([1000, 600]);
+      now = 1000;
+      api.mockClear();
+      await expect(guard.createGitHubOwnershipSource({ ghApi: api }).readOwner({ deadline: 1300, clock }))
+        .rejects.toThrow('owner read deadline');
+      expect(api).toHaveBeenCalledTimes(1);
+      now = 5000;
+      api.mockClear();
+      await expect(guard.createGitHubOwnershipSource({ ghApi: api }).readOwner({ deadline: 4000, clock }))
+        .rejects.toThrow('owner read deadline');
+      expect(api).not.toHaveBeenCalled();
+    });
+
+    it('resolveHostRole hands the source the read deadline derived from timeoutMs', async () => {
+      const readOwner = vi.fn(() => record());
+      await guard.resolveHostRole({ thisHost: ME, source: { readOwner }, timeoutMs: 700, clock: () => 50 });
+      expect(readOwner.mock.calls[0][0]).toMatchObject({ deadline: 750 });
+      expect(typeof readOwner.mock.calls[0][0].clock).toBe('function');
+    });
+
+    it('legacy hostname lookup also kills a stalled child', () => {
+      const exec = vi.fn(() => LEGACY_NAMES[0] + '\n');
+      guard.getLegacyHost({ exec, legacyOwnerValues: LEGACY_ALIASES });
+      expect(exec.mock.calls[0][2]).toMatchObject({ timeout: 15000, killSignal: 'SIGKILL' });
+    });
+  });
 });
