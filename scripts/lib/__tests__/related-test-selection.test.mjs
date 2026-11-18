@@ -5,7 +5,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { replaySelections, runReplayCli } from '../../readiness/selection-replay.mjs';
 import { selectTests } from '../../readiness/test-selection.mjs';
-import { buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile, resolvedImportsOf, loadCiSelection } from '../related-test-selection.mjs';
+import { buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile, resolvedImportsOf } from '../related-test-selection.mjs';
+import { loadCiSelection } from '../ci-selection-settings.mjs';
 
 const graph = files => buildReverseImportGraph({ files: Object.keys(files), readFile: path => files[path] });
 function hubFiles() {

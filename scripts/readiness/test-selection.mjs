@@ -58,7 +58,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { isBlastRadiusPath, isStatutePath, isGateSelfPath } from '../lib/review-escalation.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
-import { buildReverseImportGraph, selectRelatedTests, loadCiSelection, isVitestTestFile } from '../lib/related-test-selection.mjs';
+import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile } from '../lib/related-test-selection.mjs';
+import { loadCiSelection } from '../lib/ci-selection-settings.mjs';
 import { admittedArgv } from './heavy-admission.mjs';
 
 // ── the flag (NOT defaulted — DoD) ───────────────────────────────────────────────────────────────────────────

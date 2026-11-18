@@ -25,27 +25,9 @@
 
 import { readFileSync } from 'node:fs';
 import { posix } from 'node:path';
-import { cascadePolicy } from './policy-cascade.mjs';
 
-const DEFAULT_SELECTION = { maxTests: 0, maxTestsInCi: 0, staticEdges: { spawnPath: true, alias: true, literalRead: true } };
-/** WE_CI_SELECTION is a JSON selection block. Invalid leaves retain the lower layer. */
-export function loadCiSelection({ env = process.env, readFile = readFileSync, tool, platform, log } = {}) {
-  if (tool === undefined) {
-    try { tool = JSON.parse(readFile(new URL('../settings/ci-selection.json', import.meta.url), 'utf8')).ci.selection; }
-    catch { tool = {}; }
-  }
-  let override = {};
-  try { override = JSON.parse(env.WE_CI_SELECTION || '{}'); } catch { /* defaults */ }
-  const integer = v => Number.isSafeInteger(v) && v >= 0;
-  const edgeEnabled = v => typeof v === 'boolean' && (!(env.CI || env.GITHUB_ACTIONS) || v);
-  const bools = v => v && typeof v === 'object' && ['spawnPath', 'alias', 'literalRead'].every(k => edgeEnabled(v[k]));
-  const resolved = cascadePolicy('ci.selection', tool, { standard: DEFAULT_SELECTION, platform, env,
-    envValues: override && typeof override === 'object' ? override : {},
-    valid: { maxTests: integer, maxTestsInCi: v => v === DEFAULT_SELECTION.maxTestsInCi,
-      staticEdges: bools, 'staticEdges.spawnPath': edgeEnabled,
-      'staticEdges.alias': edgeEnabled, 'staticEdges.literalRead': edgeEnabled }, ...(log ? { log } : {}) });
-  return resolved.value;
-}
+/** Standard values; the configured ones come from ci-selection-settings.mjs (kept out of this widely imported module). */
+export const DEFAULT_SELECTION = { maxTests: 0, maxTestsInCi: 0, staticEdges: { spawnPath: true, alias: true, literalRead: true } };
 
 let aliases;
 function repoAliases() {
@@ -117,7 +99,7 @@ export function resolveSpecifier(fromFile, spec, fileSet) {
  * @returns {string[]}
  */
 export function resolvedImportsOf(fromFile, text, fileSet, options = {}) {
-  const { staticEdges = loadCiSelection().staticEdges, aliases = repoAliases() } = options;
+  const { staticEdges = DEFAULT_SELECTION.staticEdges, aliases = repoAliases() } = options;
   const out = new Set();
   for (const m of String(text ?? '').matchAll(SPECIFIER_RE)) {
     // m[5]: a template-literal dynamic import (`import(\`../x.mjs?v=${n}\`)`): the static prefix up to `${` is the path.
@@ -191,7 +173,7 @@ export function specifierBasesResolvingTo(path) {
  * @param {{files: string[], readFile: (path: string) => string}} args
  */
 export function buildReverseImportGraph({ files, readFile, ...options }) {
-  options.staticEdges ??= loadCiSelection().staticEdges;
+  options.staticEdges ??= DEFAULT_SELECTION.staticEdges;
   const sources = files.filter(isGraphSourceFile);
   const fileSet = new Set(files.filter((f) => !f.startsWith('node_modules/') && !f.includes('/node_modules/')));
   const reverse = new Map();
@@ -233,7 +215,7 @@ export function testDepths(starts, reverse) {
  *   depth: number|null, maxDepth: number, maxTests: number, tests: string[]|null, droppedCount: number,
  *   directTestCount: number, hubs: {file: string, direct: number, transitive: number}[], reason: string}}
  */
-export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth = 2, env = process.env, settings = loadCiSelection({ env }) }) {
+export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth = 2, env = process.env, settings = DEFAULT_SELECTION }) {
   maxTests = env.CI || env.GITHUB_ACTIONS ? settings.maxTestsInCi : (maxTests ?? settings.maxTests);
   const changed = [...new Set(changedFiles)];
   const depths = testDepths(changed, reverse);
