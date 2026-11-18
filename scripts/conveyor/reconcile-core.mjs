@@ -1,7 +1,7 @@
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
-import { reviewStartGate, isReviewHoldGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
+import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 import { runEligibilityShadow, eligibilityShadowDeps, reportShadowError } from './dispatch-eligibility-shadow.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
@@ -502,29 +502,31 @@ export function splitFailingChecks(rollup, requiredChecks) {
   const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
   const out = { required: [], nonRequired: [] };
   for (const name of failingCheckNames(collapseRollupToLatestPerName(rollup))) {
-    const isRequired = !isReviewHoldGate({ name })
-      && (required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name));
+    const isRequired = required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name);
     out[isRequired ? 'required' : 'nonRequired'].push(name);
   }
   return out;
 }
 
-/** PURE: every failing required check is a review/merge hold, never CI to heal. */
+/** PURE: every failing required check is a review-owned hold (review-gate, or an annotated merge-gate). */
 export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
   if (!Array.isArray(rollup)) return false;
   const latest = collapseRollupToLatestPerName(rollup);
   if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
-  const failing = failingCheckNames(latest).filter(name =>
-    !Array.isArray(requiredChecks) || !requiredChecks.length || requiredChecks.includes(name));
-  return failing.length > 0 && failing.every(name => isReviewHoldGate({ name }));
+  const failing = splitFailingChecks(latest, requiredChecks).required;
+  const mergeGate = latest.find(row => row?.name === 'merge-gate');
+  return failing.length > 0 && failing.every(name => name === 'review-gate'
+    || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
 }
 
 /** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
 export function reviewHoldOnlyRed(rollup, requiredChecks) {
   if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
   const latest = collapseRollupToLatestPerName(rollup);
-  // The CI reducer excludes admission gates, but still requires complete, readable real CI.
-  return reduceCheckState(latest, requiredChecks).state === 'green'
+  const failing = splitFailingChecks(latest, requiredChecks).required;
+  // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
+  return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
+    ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
     && reduceCheckState(latest, requiredChecks).counts.unreadable === 0;
 }
 
@@ -1557,13 +1559,33 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
     reviewPending: reviewCanFinish, requiredChecks });
 }
 
+/** Planner-only CI inputs: failed admission gates must not prevent a ready PR reaching review.
+ * Keep shared reducers and draft promotion strict, and retain all missing/pending/unknown real CI evidence.
+ */
+function reviewAdmissionCi(pr, requiredChecks) {
+  const checks = pr?.statusCheckRollup;
+  if (pr?.isDraft || !labelNames(pr?.labels).includes('review:pending') || !Array.isArray(checks))
+    return { checks, requiredChecks };
+  const ignored = collapseRollupToLatestPerName(checks)
+    .filter(row => String(row?.status).toUpperCase() === 'COMPLETED'
+      && FAILED_CHECK_CONCLUSIONS.includes(String(row?.conclusion).toUpperCase()))
+    .map(row => row.name ?? row.context).filter(name => name === 'merge-gate' || name === 'review-gate');
+  if (!ignored.length) return { checks, requiredChecks };
+  return {
+    checks: checks.filter(row => !ignored.includes(row?.name ?? row?.context)),
+    requiredChecks: Array.isArray(requiredChecks) ? requiredChecks.filter(name => !ignored.includes(name)) : requiredChecks,
+  };
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
-  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
+  const admissionCi = reviewAdmissionCi(pr, requiredChecks);
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, ...admissionCi, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
-  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
+  const allowed = ci.allowed || (admissionCi.checks === pr?.statusCheckRollup
+    && onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2797,14 +2819,14 @@ export function planReconcile({
     }
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
+    const admissionCi = reviewAdmissionCi(pr, requiredChecks);
     const phase = classifyPr({
       // The planner accepts strings and GraphQL label objects; the board classifier
       // accepts objects only. Never let a live send-back disappear behind an older accept.
       state: pr?.state, labels: labelNames(pr?.labels).map(name => ({ name })), mergeStateStatus: pr?.mergeStateStatus,
-      // Phase ownership follows CI, not review/merge admission holds.
-      statusCheckRollup: pr?.statusCheckRollup?.filter(row => !isReviewHoldGate(row)),
-    }, requiredChecks);
-    const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
+      statusCheckRollup: admissionCi.checks,
+    }, admissionCi.requiredChecks);
+    const check = reduceCheckState(admissionCi.checks, admissionCi.requiredChecks);
     const withPhase = { phase, check: check.state, labels: labelNames(pr?.labels) };
 
     // ── ALREADY-LANDED — its OWN branch, AHEAD OF EVERY OTHER CHECK IN THIS LOOP (`ci-red`, the advisory-fix
@@ -2973,6 +2995,13 @@ export function planReconcile({
       continue;
     }
 
+    // A required `review-gate` is red by design while a review label is held, so a `ci-red` PR whose ONLY
+    // failing required check is `review-gate` must not be healed (ci-heal cannot clear it; it would re-run
+    // every tick). Deliberately narrow: only the `ci-red` phase, and only when `review-gate` is the sole
+    // affected check. Any other failing required check, and every non-`ci-red` phase (a bounced PR owed a
+    // fixer, an advisory-fix PR), falls through so its repair ownership is intact; review emission is
+    // already gated separately by {@link reviewChecksAllow}.
+    const reviewCi = reviewCiGate({ headSha: pr?.headRefOid, ...admissionCi });
     // LIVE INCIDENT 2026-10-04, PR #3833: `classifyPr` ranks `review:human` ('needs-human') ABOVE `ci-red`, so a
     // `review:human` PR with a genuinely red required check never entered the `ci-red` branch below — the
     // main-red watch logged "owed a ci-heal" and the review row logged `review-ci`, and NOBODY planned the heal
@@ -2998,6 +3027,11 @@ export function planReconcile({
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
     const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
       || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
+    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
+        && reviewCi.affected.every(row => row.name === 'review-gate')) {
+      refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
+      continue;
+    }
 
     // ── `ci-red` (multi-repo slice 7) — its OWN branch, ahead of the generic `OWED`/`OWED_ELSEWHERE` table,
     // because it needs neither of that table's two remaining checks: REFUSAL 2 ("no findings, no fixer") does
@@ -3131,9 +3165,8 @@ export function planReconcile({
       continue;
     }
 
-    // Human handoffs retain their advisory/fix ownership; pending reviews proceed to admission.
-    const heldGates = failingCheckNames(collapseRollupToLatestPerName(pr?.statusCheckRollup)).filter(name => isReviewHoldGate({ name }));
-    const reviewHoldRed = (ciRepairOwed || phase === 'needs-human')
+    const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
+    const reviewHoldRed = ciRepairOwed && admissionCi.checks === pr?.statusCheckRollup
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {

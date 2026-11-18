@@ -9,7 +9,7 @@ export default {
   title: 'required admission gates leave review reachable and real CI repairable',
   card: 'review daemon admission deadlock',
   fixedBy: { sha: 'HEAD', where: 'working tree', paths: [
-    'scripts/conveyor/reconcile-core.mjs', 'scripts/operations/pr-status.mjs', 'scripts/lib/review-timing.mjs',
+    'scripts/conveyor/reconcile-core.mjs',
   ] },
   fixPresent(root) {
     // Probe the target tree's behavior, never a source-string signature of the fix.

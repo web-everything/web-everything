@@ -4667,8 +4667,9 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 
 ## Review admission gates and CI truth
 
-`merge-gate` and `review-gate` are admission holds even when branch protection requires them.
-Reconcile tests must exercise unannotated gate failures alongside passing real CI, and separately
-fail `test`, `smoke`, and `daemon-soak` to retain ci-heal ownership. Keep missing, pending,
-malformed, and wrong-head real CI refusal cases. The strict `reviewCiGate` used by merge callers
-continues to require admission-gate success; review admission uses the review-hold classification.
+Only the reconcile planner excludes failing `merge-gate`/`review-gate` rows and their required names
+for ready PRs carrying `review:pending`. Shared CI reducers, review timing and draft promotion retain
+their strict evidence semantics. Reconcile tests exercise unannotated failures alongside passing
+real CI, and separately fail `test`, `smoke`, and `daemon-soak` to retain ci-heal ownership.
+Keep missing, pending, malformed, wrong-head and unreadable real CI refusal cases, plus unchanged
+draft-promotion refusal for an unannotated merge-gate failure. The soak break probes behavior.

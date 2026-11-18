@@ -123,8 +123,7 @@ export const NON_BLOCKING_CONCLUSIONS = Object.freeze(['skipped', 'neutral']);
  * own `reduceCheckState`, `we:scripts/readiness/conveyor-state.mjs#ciRollup`, `we:scripts/operator/dispatch.mjs
  * #healCi`) — adding `soak-replay-gate` here is what fixes THOSE immediately, with no rewiring needed.
  */
-export const REVIEW_HOLD_CHECKS = Object.freeze(['review-gate', 'merge-gate']);
-export const CI_TRUTH_EXCLUDED_CHECKS = Object.freeze([...REVIEW_HOLD_CHECKS, 'soak-replay-gate']);
+export const CI_TRUTH_EXCLUDED_CHECKS = Object.freeze(['review-gate', 'soak-replay-gate']);
 
 /**
  * Conclusions that mean the check ran and did not succeed.
@@ -154,9 +153,9 @@ export const FAILING_CONCLUSIONS = Object.freeze([
  * A run with NO conclusion and a non-completed status is in flight. A run that is `completed` with no
  * conclusion at all is not a pass — it is unreadable, and unreadable joins `unchecked` rather than `green`.
  *
- * `requiredChecks`, when supplied non-empty, uses required-set inclusion while always excluding
- * review/merge holds (they are not CI). Other checks use required-set inclusion; without a required set,
- * the fallback exclusion list applies. Required soak-replay-gate remains a CI prerequisite.
+ * `requiredChecks`, when supplied non-empty, REPLACES the {@link CI_TRUTH_EXCLUDED_CHECKS} exclusion with the
+ * required-set inclusion this file's sibling `we:scripts/progress-board.mjs#ciFailed` documents in full —
+ * only a check named in `requiredChecks` is considered here at all. Omitted, behaviour is unchanged.
  *
  * COLLAPSED TO THE LATEST RUN PER CHECK NAME FIRST (`collapseRollupToLatestPerName`, #2925/#xkfv491) — see
  * `we:scripts/progress-board.mjs#ciFailed`'s own header for the full live incident (PR #2878, chalbert/
@@ -174,7 +173,7 @@ export function reduceCheckState(runs = [], requiredChecks) {
   const collapsed = collapseRollupToLatestPerName(runs);
   const requiredRaw = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
   // A required name implied by a green aggregate (`integration` by `test`) is not "missing" on a head that predates it.
-  const required = requiredRaw ? withoutImpliedRequiredChecks(requiredRaw, collapsed).filter(name => !REVIEW_HOLD_CHECKS.includes(name)) : null;
+  const required = requiredRaw ? withoutImpliedRequiredChecks(requiredRaw, collapsed) : null;
   const list = collapsed.filter((r) => {
     const name = String(r?.name ?? '');
     return required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name);

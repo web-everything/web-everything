@@ -44,8 +44,3 @@ describe('strict review CI prerequisite', () => {
         .toMatchObject({ allowed: false, affected: [{ name: 'legacy', reason }] });
     });
 });
-
-it.each(['review-gate', 'merge-gate'])('strict merge prerequisite still requires %s success', name => {
-  expect(reviewCiGate({ headSha, requiredChecks: ['test', name],
-    checks: [success('test'), { name, status: 'completed', conclusion: 'failure' }] }).allowed).toBe(false);
-});

@@ -31,7 +31,7 @@
 import { describe, it, expect } from 'vitest';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
-  splitFailingChecks, staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
+  staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
@@ -3668,7 +3668,6 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   it.each([
     ['annotated merge-gate and review-gate red', heldRollup],
     ['review-gate red only', reviewOnlyRollup],
-    ['unannotated merge-gate red', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
   ])('promotes a draft with %s instead of refusing review-hold-red', (_, rollup) => {
     const result = plan({ statusCheckRollup: rollup() });
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'promote-draft', prNumber: 1563 })]);
@@ -3676,6 +3675,7 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 
   it.each([
+    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
   ])('does not promote a draft with %s; CI healing still owns the failure', (_, rollup) => {
     const result = plan({ statusCheckRollup: rollup() });
@@ -3693,7 +3693,6 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
 
   it.each([
     ['annotated merge-gate and review-gate red', heldRollup],
-    ['unannotated merge-gate red', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
   ])('hands a non-draft with %s to the review daemon instead of the review-ci config-conflict refusal', (_, rollup) => {
     const result = plan({ isDraft: false, statusCheckRollup: rollup() });
     expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 1563 }));
@@ -3971,11 +3970,11 @@ it.each([[], [finding()]])('x6n7c2p required checks before review — fail close
     expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
   }
 });
-it('required review-gate alone refuses incomplete CI evidence without healing review completion', () => {
+it('required review-gate alone refuses unknown real CI without healing review completion', () => {
   const plan = planReconcile({ requiredChecks: ['review-gate'], agents: [], now: NOW,
     prs: [pr1563({ labels: lbl('review:pending'), statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })] });
   expect(plan.dispatch).toEqual([]);
-  expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ allowed: false }) })]);
+  expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'unknown-required-set' }) })]);
 });
 describe('required review-gate conflict is scoped to the review it gates', () => {
   const failed = name => ({ name, status: 'completed', conclusion: 'failure' });
@@ -4000,16 +3999,13 @@ describe('required review-gate conflict still refuses a superseded-verdict conve
     { author: { login: 'web-everything' }, createdAt: '2026-09-26T23:15:40Z',
       body: '**`review:accepted` removed — mutual exclusivity (#2766/#2767).**\n\nThis PR carried both `review:accepted` and `review:human` at once.' },
   ];
-  it.each([
-    ['failure', { kind: 'review-hold-red', why: 'review daemon owns held gates: review-gate' }],
-    ['in_progress', { kind: 'review-ci', ci: expect.objectContaining({ reason: 'required-review-gate-conflict' }) }],
-  ])('needs-human PR with a %s required review-gate stays held without ci-heal or convert-advisory', (state, refusal) => {
+  it.each(['failure', 'in_progress'])('needs-human PR with a %s required review-gate gets review-ci, not convert-advisory', state => {
     const pr = { number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
       statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' },
         state === 'failure' ? { name: 'review-gate', status: 'completed', conclusion: 'failure' } : { name: 'review-gate', status: 'in_progress', conclusion: null }] };
     const plan = planReconcile({ requiredChecks: ['test', 'review-gate'], prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toEqual([]);
-    expect(plan.refusals).toEqual([expect.objectContaining(refusal)]);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'required-review-gate-conflict' }) })]);
   });
 });
 
@@ -4818,7 +4814,7 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
   });
 });
 
- describe('unannotated admission gates cannot deadlock review', () => {
+describe('unannotated admission gates cannot deadlock review', () => {
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'merge-gate', 'review-gate'];
   const row = (name, conclusion = 'success') => ({ name, status: 'completed', conclusion });
   const checks = requiredChecks.map(name => row(name, name.endsWith('-gate') ? 'failure' : 'success'));
@@ -4827,6 +4823,28 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
   it('admits review with required merge-gate and review-gate red', () => {
     expect(plan().dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
     expect(plan().refusals).toEqual([expect.objectContaining({ kind: 'no-findings' })]);
+  });
+  it('still admits review after a head-bound not-a-ci-break escalation for plain merge-gate red', () => {
+    const result = planReconcile({ requiredChecks, now: NOW, agents: [], prs: [pr1563({
+      labels: lbl('review:pending'), statusCheckRollup: checks, comments: [{ author: AUTOMATION,
+        body: buildCiHealEscalationComment({ headSha: pr1563().headRefOid, outcome: 'not-a-ci-break', reason: 'review hold' }) }],
+    })] });
+    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
+    expect(result.dispatch.some(r => r.kind === 'ci-heal')).toBe(false);
+  });
+  it.each([null, undefined, []])('refuses review with unreadable rollup %j', evidence => {
+    const result = plan(evidence === undefined ? null : evidence);
+    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+  });
+  it('aborts planning on a nameless real CI row rather than admitting review', () => {
+    expect(() => plan([...checks, null])).toThrow('Check rows must have a non-empty string name or context');
+  });
+  it.each(['missing', 'pending', 'malformed'])('does not excuse %s merge-gate evidence', mode => {
+    const result = plan(checks.flatMap(r => r.name !== 'merge-gate' ? [r] : mode === 'missing' ? []
+      : [{ ...r, ...(mode === 'pending' ? { status: 'in_progress', conclusion: null } : { conclusion: 'unknown' }) }]));
+    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
   });
   it.each(['test', 'smoke', 'daemon-soak'])('owes ci-heal when required %s fails alongside gates', name => {
     const result = plan(checks.map(r => r.name === name ? row(name, 'failure') : r));
@@ -4840,10 +4858,4 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
     expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
   });
-});
-
-it('splits required admission holds away from healable required CI failures', () => {
-  const names = ['test', 'smoke', 'daemon-soak', 'merge-gate', 'review-gate'];
-  expect(splitFailingChecks(names.map(name => ({ name, status: 'completed', conclusion: 'failure' })), names))
-    .toEqual({ required: ['test', 'smoke', 'daemon-soak'], nonRequired: ['merge-gate', 'review-gate'] });
 });
