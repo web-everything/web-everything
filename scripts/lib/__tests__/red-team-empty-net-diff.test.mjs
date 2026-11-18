@@ -12,7 +12,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 function verify(read, head, options) {
   const f = emptyDiffFixture(); roots.push(f.root);
   f.writeStore([{ ...f.row, rev: head }]);
-  return emptyDiffExemptionEvidence({ ...f.proof, read, head, seatRecord: { head }, ...options }).exempt;
+  return emptyDiffExemptionEvidence({ ...f.proof, read, head, seatRecord: { ...f.status, head }, ...options }).exempt;
 }
 
 describe('empty net diff provenance probes', () => {
@@ -47,7 +47,7 @@ describe('empty net diff provenance probes', () => {
       .mockReturnValueOnce('').mockImplementationOnce(() => { throw Error('bad object'); });
     const f = emptyDiffFixture(); roots.push(f.root);
     f.writeStore([{ ...f.row, rev: head }]);
-    expect(emptyDiffExemptionEvidence({ ...f.proof, read, head, seatRecord: { head }, exec }))
+    expect(emptyDiffExemptionEvidence({ ...f.proof, read, head, seatRecord: { ...f.status, head }, exec }))
       .toEqual({ exempt: false, reason: 'diff-unreadable' });
     expect(exec.mock.calls.slice(2).map(([, args]) => args.at(-2))).toEqual([`${base}..${head}`, `${other}..${head}`]);
   });
@@ -154,6 +154,24 @@ describe('complete positive exemption evidence (real Git)', () => {
     ['wrong seat head', f => f.writeStore([{ ...f.row, rev: 'a'.repeat(40) }]), false, 'seat-record-missing'],
     ['wrong seat repo', f => f.writeStore([{ ...f.row, repo: 'other/repo' }]), false, 'seat-record-missing'],
     ['wrong seat PR', f => f.writeStore([{ ...f.row, pr: 123 }]), false, 'seat-record-missing'],
+    ['writer queued', f => { f.status.status = 'queued'; }, false, 'writer-active'],
+    ['writer running', f => { f.status.status = 'running'; }, false, 'writer-active'],
+    ['red-team result already recorded for the head', f => f.writeStore([f.row, { ...f.row, seat: 'red-team' }]),
+      false, 'red-team-result-recorded'],
+    ['missing skip record (default requires skip)', f => { delete f.proof.seatRecord; }, false, 'skip-record-invalid'],
+    ['missing skip result (default requires skip)', f => { delete f.status.result; }, false, 'skip-record-invalid'],
+    ['producer before skip record', f => { delete f.proof.seatRecord; f.proof.read = f.read; f.proof.requireSkip = false; },
+      true, 'empty-net-diff', 'diff'],
+    ['producer with writer queued', f => { f.status.status = 'queued'; f.proof.requireSkip = false; }, false, 'writer-active'],
+    ['producer with writer running', f => { f.status.status = 'running'; f.proof.requireSkip = false; }, false, 'writer-active'],
+    ['producer with recorded red-team result', f => { f.writeStore([f.row, { ...f.row, seat: 'red-team' }]); f.proof.requireSkip = false; },
+      false, 'red-team-result-recorded'],
+    ['red-team result for another head', f => f.writeStore([f.row, { ...f.row, seat: 'red-team', rev: f.base }]),
+      true, 'empty-net-diff', 'diff'],
+    ['red-team result for another repo', f => f.writeStore([f.row, { ...f.row, seat: 'red-team', repo: 'other/repo' }]),
+      true, 'empty-net-diff', 'diff'],
+    ['red-team result for another PR', f => f.writeStore([f.row, { ...f.row, seat: 'red-team', pr: 123 }]),
+      true, 'empty-net-diff', 'diff'],
     ['missing checkout', f => { delete f.proof.cwd; }, false, 'cwd-missing'],
     ['unresolvable base', f => { f.read.netBasis.base = 'missing-ref'; }, false, 'base-unresolvable', 'rev-parse'],
     ['missing main ref', f => f.git('update-ref', '-d', 'refs/remotes/origin/main'), false, 'base-unresolvable', 'merge-base'],

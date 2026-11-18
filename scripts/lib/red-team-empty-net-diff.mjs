@@ -15,7 +15,7 @@ const refused = reason => ({ exempt: false, reason });
  * operators must inspect stored evidence (including oversized Git output) before retrying.
  */
 export function emptyDiffExemptionEvidence({ repo, pr, head, seatRecord, loopPayload = seatRecord?.loopPayload,
-  read = loopPayload?.findings?.read, requireSkip = false, env = process.env,
+  read = loopPayload?.findings?.read, requireSkip = true, env = process.env,
   storePath = resolveScorecardStorePath(env), readFile = readFileSync, cwd, exec = execFileSync } = {}) {
   let store;
   try {
@@ -29,6 +29,12 @@ export function emptyDiffExemptionEvidence({ repo, pr, head, seatRecord, loopPay
       && typeof row.seat === 'string' && row.seat.length > 0 && row.repo === repo
       && ['number', 'string'].includes(typeof row.pr) && Number(row.pr) === Number(pr) && row.rev === head)) return refused('seat-record-missing');
   if (seatRecord && seatRecord.head !== head) return refused('seat-record-mismatch');
+  // A pass already admitted or recorded still owes its result, even on an empty range.
+  // These requirements also apply before a producer has persisted its skip record.
+  if (['queued', 'running'].includes(seatRecord?.status)) return refused('writer-active');
+  if (store.records.some(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
+    && row.repo === repo && ['number', 'string'].includes(typeof row.pr)
+    && Number(row.pr) === Number(pr) && row.rev === head)) return refused('red-team-result-recorded');
   if (requireSkip) {
     const result = seatRecord?.result;
     if (seatRecord?.status !== 'finished'

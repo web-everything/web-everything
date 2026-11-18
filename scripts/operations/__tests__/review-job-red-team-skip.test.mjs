@@ -1120,7 +1120,7 @@ describe('empty net diff terminal publication through the production carry path'
         const { GIT_NO_REPLACE_OBJECTS: _disabled, ...env } = options.env;
         return execFileSync(file, args.filter(arg => arg !== '--no-replace-objects'), { ...options, env });
       };
-      const proof = { repo, pr, read, head: c.sha, cwd: c.lanePath, env: c.key.env };
+      const proof = { repo, pr, read, head: c.sha, seatRecord: readRedTeamStatus(c.key), cwd: c.lanePath, env: c.key.env };
       expect(emptyDiffExemptionEvidence({ ...proof, exec: dropFlag }).exempt).toBe(true);
       expect(emptyDiffExemptionEvidence(proof)).toEqual({ exempt: false, reason: 'diff-nonempty' });
       // Production: the claim is refused — non-policy, no comment, label unchanged, no carry.

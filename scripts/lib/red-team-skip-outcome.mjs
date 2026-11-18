@@ -172,7 +172,7 @@ export function settleRedTeamSkip(input = {}) {
       try {
         const stored = (io.readStatus ?? readRedTeamStatus)({ repo, pr, head, env: io.env ?? process.env });
         proven = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: stored, env: io.env, storePath: io.storePath,
-          exec: io.gitExec, cwd: io.cwd }).exempt;
+          exec: io.gitExec, cwd: io.cwd, requireSkip: true }).exempt;
       } catch { /* unreadable proof retains the operator hold */ }
       if (!proven) classified = { kind: 'non-policy', reason: 'empty net diff not proven for this head; inspect stored evidence' };
     }

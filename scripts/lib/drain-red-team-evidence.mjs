@@ -971,7 +971,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env, cw
     if (carry) {
       // The journal survives a crash before the compatibility status exists. Never invent an accept.
       // Project the carry's own policy: an empty-net-diff carry never claims the card-only setting.
-      const empty = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: status, loopPayload: carry.loopPayload, env, cwd, exec: gitExec }).exempt;
+      const empty = emptyDiffExemptionEvidence({ repo, pr, head, seatRecord: status, loopPayload: carry.loopPayload,
+        // Project a journal that can precede its compatibility skip record.
+        requireSkip: false, env, cwd, exec: gitExec }).exempt;
       if (!empty && carry.loopPayload?.findings?.read?.diffText === '')
         return { ok: false, reason: 'empty-net-diff-unproven' };
       const skipCardOnly = empty ? status?.skipCardOnly === true : true;

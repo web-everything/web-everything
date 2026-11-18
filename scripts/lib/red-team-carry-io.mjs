@@ -29,7 +29,7 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
     let status;
     try { status = readStatus(key(state)); } catch { return false; }
     return emptyDiffExemptionEvidence({ ...key(state), loopPayload: state.loopPayload,
-      seatRecord: status, storePath, cwd: lanePath, exec: gitExec }).exempt;
+      seatRecord: status, storePath, cwd: lanePath, exec: gitExec, requireSkip: true }).exempt;
   };
   const policy = state => {
     if (empty(state)) return { ...EMPTY_NET_DIFF_SKIP };

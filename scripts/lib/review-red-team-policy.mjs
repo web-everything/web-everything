@@ -62,7 +62,8 @@ export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true, ..
   const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
   const emptyClaim = read?.diffText === '' || evidence.status?.result?.policy === EMPTY_NET_DIFF_SKIP.policy;
   if (!evidence.scheduled && emptyClaim) return !emptyDiffExemptionEvidence({
-    repo: evidence.status?.repo, pr: evidence.status?.pr, ...proof, read, head: read?.netBasis?.rev, seatRecord: evidence.status }).exempt;
+    repo: evidence.status?.repo, pr: evidence.status?.pr, ...proof, read, head: read?.netBasis?.rev,
+    seatRecord: evidence.status, requireSkip: true }).exempt;
   if (skip && redTeamCardOnly(read)) return false;
   return !!evidence.scheduled;
 }

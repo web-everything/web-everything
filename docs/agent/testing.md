@@ -4469,7 +4469,12 @@ Callers supply the subject repository's checkout explicitly; no cwd means no exe
 The function uses `readStore({ strict: true })`, which throws `MissingStoreError` on
 ENOENT and preserves other read/parse failures. A parseable store must
 contain a review-seat row for the same repository, PR and pinned head. Payload shape,
-a historical skip, or an empty record array alone never grants clearance. Every Git
+a historical skip, or an empty record array alone never grants clearance. A queued or
+running writer refuses with `writer-active`; any red-team seat row for that head refuses
+with `red-team-result-recorded`, regardless of the row's outcome. Clearance revalidation
+requires a finished skip by default (`requireSkip: true`). Only creation of a producer
+skip or projection of a pre-status carry journal opts out explicitly; both still enforce
+the writer/result guards. Every Git
 probe disables replace objects, re-derives the merge-base and verifies the pinned range.
 Missing or unreadable evidence retains recovery's hold; inspect stored evidence before
 retrying, including after the bounded Git probe reports oversized output.
@@ -4479,6 +4484,9 @@ and removes or corrupts one item at a time, asserting the named refusal reason a
 that the intended Git step ran. Keep replacement-aware control probes deterministic
 with increasing commit dates. `review-job-red-team-skip.test.mjs` exercises production
 ENOENT handling through `speculateRedTeam` and proves no provider work starts.
+`red-team-skip-outcome.test.mjs` reproduces the running-writer plus completed-red-team
+audit probe with real status/store files and Git, refusing policy-clear and retaining
+the pending label. Its otherwise-complete positive evidence must pass before mutation.
 
 ### Strict scorecard caller matrix
 

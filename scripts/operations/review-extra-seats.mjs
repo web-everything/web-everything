@@ -1823,7 +1823,8 @@ export async function speculateRedTeam({
     let seatRecord;
     try { seatRecord = io.readRedTeamStatus?.({ repo, pr, head: read?.netBasis?.rev }); } catch { /* missing evidence refuses exemption */ }
     const emptyEvidence = emptyDiffExemptionEvidence({ repo, pr, read, head: read?.netBasis?.rev, seatRecord,
-      env, storePath: io.storePath, cwd: lanePath, exec: io.gitExec });
+      // The producer is deciding whether to create a skip; active/recorded passes still refuse.
+      requireSkip: false, env, storePath: io.storePath, cwd: lanePath, exec: io.gitExec });
     if (!emptyClaim && (!read || typeof read.diffText !== 'string' || !read.diffText.trim())) return { status: 'skipped', reason: 'the review printed no diff' };
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };

@@ -3267,7 +3267,7 @@ describe('finished skipped empty net diff recovery', () => {
         netChangedFiles: [], diffText: '', diffScored: true };
       const f = emptyStoreFor(rev);
       const exec = vi.fn(execFileSync);
-      expect(emptyDiffExemptionEvidence({ ...f.proof, repo, pr, read, head: rev, seatRecord: { head: rev }, cwd: dir, exec })).toEqual({ exempt: false, reason: 'base-mismatch' });
+      expect(emptyDiffExemptionEvidence({ ...f.proof, repo, pr, read, head: rev, seatRecord: { ...f.status, head: rev }, cwd: dir, exec })).toEqual({ exempt: false, reason: 'base-mismatch' });
       expect(exec.mock.calls.at(-1)[1]).toContain('merge-base');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
