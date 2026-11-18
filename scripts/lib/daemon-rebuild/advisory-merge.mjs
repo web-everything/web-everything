@@ -1,6 +1,6 @@
 /** Narrow, fail-closed resolution of append-only advisory registries; never resolves source conflicts. */
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { lstatSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
@@ -40,6 +40,8 @@ export function mergeTimingsJson(baseText, oursText, theirsText) {
 function mergeRegistryLines(baseText, oursText, theirsText) {
   const lines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
   const base = lines(baseText), gaps = base.map(() => []);
+  const headerEnd = base.findIndex(line => line === ' */\n' || line === ' */');
+  if (base[0] !== '/**\n' || headerEnd < 1) return null;
   gaps.push([]);
   const added = gaps.map(() => new Map());
   for (const [side, text] of [oursText, theirsText].entries()) {
@@ -47,7 +49,7 @@ function mergeRegistryLines(baseText, oursText, theirsText) {
     for (const line of lines(text)) {
       if (cursor < base.length && line === base[cursor]) cursor++;
       else {
-        if (!/^ \* /.test(line) || line.includes('/*') || line.includes('*/')) return null;
+        if (cursor === 0 || cursor > headerEnd || !/^ \* /.test(line) || line.includes('/*') || line.includes('*/')) return null;
         const count = added[cursor].get(line) || 0;
         if (side === 1 && count > 0) added[cursor].set(line, count - 1);
         else {
@@ -128,23 +130,54 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     if (!advisoryOnly(paths)) return false;
     const mergeHead = git(['rev-parse', '--verify', 'MERGE_HEAD']);
     if (mergeHead.status !== 0 || !FULL_SHA_RE.test(String(mergeHead.stdout ?? '').trim())) return false;
-    const merged = paths.map(path => ({ path, text: readMerge(git, [':1', ':2', ':3'], path),
-      original: readFileSync(join(cwd, path)) }));
+    const merged = paths.map(path => ({ path, text: readMerge(git, [':1', ':2', ':3'], path) }));
     if (merged.some(({ text }) => text === null)) return false;
-    let stagingAttempted = false;
+    const checkedGit = args => {
+      const result = git(args);
+      if (result.status !== 0 || result.stdout == null) throw new Error('unreadable validation snapshot');
+      return String(result.stdout);
+    };
+    const status = () => [checkedGit(['status', '--porcelain=v1', '-z']), checkedGit(['ls-files', '-u', '-z'])];
+    const files = () => [...new Set(checkedGit(['ls-files', '--cached', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean))];
+    // Import validation executes code: retain checkout bytes and the index for rollback.
+    // Unknown file types refuse before any writes; the caller can leave resolution to an operator.
+    const snapshotFile = path => {
+      const fullPath = join(cwd, path);
+      const stat = lstatSync(fullPath, { throwIfNoEntry: false });
+      if (stat && !stat.isFile() && !stat.isSymbolicLink()) throw new Error('unsupported validation snapshot file');
+      return stat ? { link: stat.isSymbolicLink(),
+        data: stat.isSymbolicLink() ? readlinkSync(fullPath) : readFileSync(fullPath) } : null;
+    };
+    const originals = new Map(files().map(path => [path, snapshotFile(path)]));
+    const validated = new Map(originals);
+    for (const { path, text } of merged) validated.set(path, { link: false, data: Buffer.from(text) });
+    const indexPath = resolve(cwd, checkedGit(['rev-parse', '--git-path', 'index']).trim());
+    const originalIndex = readFileSync(indexPath);
     const restore = () => {
-      if (stagingAttempted) {
-        try { git(['checkout', '-m', '--', ...paths]); } catch { /* caller aborts the merge */ }
+      for (const path of files()) {
+        if (!originals.has(path)) rmSync(join(cwd, path), { force: true });
       }
-      for (const { path, original } of merged) writeFileSync(join(cwd, path), original);
+      for (const [path, original] of originals) {
+        const fullPath = join(cwd, path);
+        if (original === null) rmSync(fullPath, { force: true });
+        else {
+          const current = lstatSync(fullPath, { throwIfNoEntry: false });
+          if (original.link || (current && !current.isFile())) rmSync(fullPath, { recursive: true, force: true });
+          if (original.link) symlinkSync(original.data, fullPath);
+          else writeFileSync(fullPath, original.data);
+        }
+      }
+      writeFileSync(indexPath, originalIndex);
       return false;
     };
     try {
       for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
+      const beforeValidation = status();
       for (const { path } of merged) {
         if (path.endsWith('.mjs') && !validateModule(join(cwd, path))) return restore();
       }
-      stagingAttempted = true;
+      if (!isDeepStrictEqual(beforeValidation, status()) || [...validated].some(([path, expected]) =>
+        !isDeepStrictEqual(snapshotFile(path), expected))) return restore();
       if (git(['add', '--', ...paths]).status !== 0) return restore();
       const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
       if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return restore();

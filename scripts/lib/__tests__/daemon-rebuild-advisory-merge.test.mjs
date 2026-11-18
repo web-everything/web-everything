@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
@@ -280,6 +280,109 @@ describe('resolveAdvisoryInWorktree', () => {
     expect(readFileSync(join(f.root, INDEX), 'utf8')).toBe(indexBefore);
   });
 
+  it.each([
+    ['after the first header close', INDEX_BASE + 'export const value = 2\nINSERT * 1;\n/**\n * Later.\n */\n', ' * 3\n', ' * 4\n'],
+    ['in a multi-line expression without a header', 'export const value = 2\nINSERT * 1;\n', ' * 3\n', ' * 4\n'],
+    ['before the header', 'INSERT' + INDEX_BASE, ' * ours\n', ' * theirs\n'],
+    ['without a closing header line', '/**\n * Registry.\nINSERT', ' * ours\n', ' * theirs\n'],
+  ])('refuses comment-looking additions %s and preserves conflicts', async (_name, template, ours, theirs) => {
+    const { resolveAdvisoryInWorktree } = await advisory();
+    const f = fixture({ indexConflict: true, indexBase: template.replace('INSERT', ''),
+      indexOurs: template.replace('INSERT', ours), indexTheirs: template.replace('INSERT', theirs) });
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    const before = snapshot(f);
+    const indexBefore = readFileSync(join(f.root, INDEX));
+    expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+    expect(snapshot(f)).toEqual(before);
+    expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
+  });
+
+  it.each([
+    ['edits another tracked file', "writeFileSync(new URL('../../../../a.mjs', import.meta.url), 'changed');"],
+    ['creates an untracked file', "writeFileSync(new URL('../../../../side-effect.txt', import.meta.url), 'changed');"],
+    ['edits itself while status stays unmerged', "writeFileSync(new URL(import.meta.url), 'changed');"],
+    ['edits the other merged file while status stays unmerged', "writeFileSync(new URL('../../../ci/test-timings.json', import.meta.url), '{}');"],
+    ['stages itself', "(await import('node:child_process')).execFileSync('git', ['-C', new URL('../../../../', import.meta.url).pathname, 'add', '--', 'scripts/conveyor/soak/breaks/index.mjs']);"],
+  ])('refuses and restores when registry import %s', async (_name, effect) => {
+    const { resolveAdvisoryInWorktree } = await advisory();
+    const f = fixture({ indexConflict: true,
+      indexBase: INDEX_BASE + `import { writeFileSync } from 'node:fs';\n${effect}\n` });
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    const before = snapshot(f);
+    const indexBefore = readFileSync(join(f.root, INDEX));
+    const mergeHead = f.ok(['rev-parse', 'MERGE_HEAD']);
+    const git = vi.fn(f.git);
+    expect(resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
+    expect(git.mock.calls.some(([args]) => args[0] === 'add')).toBe(false);
+    expect(snapshot(f)).toEqual(before);
+    expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
+    expect(existsSync(join(f.root, 'side-effect.txt'))).toBe(false);
+    expect(f.ok(['rev-parse', 'MERGE_HEAD'])).toBe(mergeHead);
+  });
+
+  it.each([
+    ['an existing dirty tracked file', 'a.mjs'],
+    ['an existing untracked file', 'existing.txt'],
+  ])('refuses and restores import edits to %s even when porcelain status stays unchanged', async (_name, path) => {
+    const { resolveAdvisoryInWorktree } = await advisory();
+    const f = fixture({ indexConflict: true, indexBase: INDEX_BASE +
+      `import { writeFileSync } from 'node:fs';\nwriteFileSync(new URL('../../../../${path}', import.meta.url), 'changed');\n` });
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    writeFileSync(join(f.root, path), 'preexisting local contents');
+    const before = snapshot(f);
+    const indexBefore = readFileSync(join(f.root, INDEX));
+    const statuses = [];
+    const git = vi.fn(args => {
+      const result = f.git(args);
+      if (args[0] === 'status') statuses.push(result.stdout);
+      return result;
+    });
+    expect(resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
+    expect(statuses).toHaveLength(2);
+    expect(statuses[1]).toBe(statuses[0]);
+    expect(git.mock.calls.some(([args]) => args[0] === 'add')).toBe(false);
+    expect(readFileSync(join(f.root, path), 'utf8')).toBe('preexisting local contents');
+    expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
+    expect(snapshot(f)).toEqual(before);
+  });
+
+  it.each(['symlink target', 'file type', 'directory type'])(
+    'refuses and restores an import changing an existing untracked %s', async change => {
+      const { resolveAdvisoryInWorktree } = await advisory();
+      const effect = change === 'directory type' ? 'mkdirSync(path);' : "symlinkSync('ours-only.txt', path);";
+      const f = fixture({ indexConflict: true, indexBase: INDEX_BASE +
+        `import { mkdirSync, rmSync, symlinkSync } from 'node:fs';\n` +
+        `const path = new URL('../../../../existing', import.meta.url);\nrmSync(path);\n${effect}\n` });
+      expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+      if (change === 'symlink target') symlinkSync('a.mjs', join(f.root, 'existing'));
+      else writeFileSync(join(f.root, 'existing'), 'preexisting local contents');
+      const before = snapshot(f);
+      const indexBefore = readFileSync(join(f.root, INDEX));
+      expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+      if (change === 'symlink target') expect(readlinkSync(join(f.root, 'existing'))).toBe('a.mjs');
+      else expect(readFileSync(join(f.root, 'existing'), 'utf8')).toBe('preexisting local contents');
+      expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
+      expect(snapshot(f)).toEqual(before);
+    });
+
+  it.each(['status', 'ls-files'])('refuses unreadable post-validation %s evidence and restores conflicts', async command => {
+    const { resolveAdvisoryInWorktree } = await advisory();
+    const f = fixture({ indexConflict: true });
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    const before = snapshot(f);
+    const indexBefore = readFileSync(join(f.root, INDEX));
+    let reads = 0;
+    const git = args => {
+      if (args[0] === command && (command === 'status' || args.includes('-u')) && ++reads === 2) {
+        return { status: 1, stdout: '' };
+      }
+      return f.git(args);
+    };
+    expect(resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
+    expect(snapshot(f)).toEqual(before);
+    expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
+  });
+
   it.each(['export const = ;\n', "import './missing.mjs';\n", 'process.exit(0);\n'])(
     'refuses and restores conflicts when the base module cannot complete import: %s', async code => {
       const { resolveAdvisoryInWorktree } = await advisory();
@@ -311,6 +414,15 @@ describe('resolveAdvisoryInWorktree', () => {
     expect(f.ok(['status', '--porcelain=v1'])).toBe('');
     expect(readFileSync(join(f.root, INDEX), 'utf8')).toBe(registry(
       ' * foo uses the same automatic registration.\n * bar uses the same automatic registration.\n'));
+  });
+
+  it('accepts a checkout containing an existing symlink', async () => {
+    const { resolveAdvisoryInWorktree } = await advisory();
+    const f = fixture({ indexConflict: true });
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    symlinkSync('a.mjs', join(f.root, 'existing-link'));
+    expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(true);
+    expect(readlinkSync(join(f.root, 'existing-link'))).toBe('a.mjs');
   });
 
   it('refuses mixed conflicts without changing files, index, HEAD or merge state', async () => {
