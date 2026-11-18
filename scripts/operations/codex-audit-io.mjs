@@ -72,6 +72,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
   const deps = {
     preExistingMode: () => auditSettings().value.preExistingMode,
     baseRecheckMax: () => auditSettings().value.baseRecheckMax,
+    protectedPaths: () => [...auditSettings().value.raceBlockPaths, ...auditSettings().value.guardFloorPaths],
     readBaseFile: (path, base) => run('git', ['show', `${base}:${path}`], 30_000),
     readHeadFile: (path, head) => run('git', ['show', `${head}:${path}`], 30_000),
     diffText: (base, head) => run('git', ['diff', '-U0', `${base}...${head}`], 30_000),

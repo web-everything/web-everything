@@ -5,8 +5,8 @@ import { GUARD_FLOOR, AUDITOR_FLOOR, REVIEW_AUTH_FLOOR, LOCK_PRIMITIVES, LOCK_HO
 import { findingKey, parseFindingLocation, symbolAt, symbolRangeAt } from '../lib/audit-finding-key.mjs';
 
 export const PREEXISTING_ELIGIBLE = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
-const protectedPath = path => matchesSome(path, [...GUARD_FLOOR, ...AUDITOR_FLOOR, ...REVIEW_AUTH_FLOOR,
-  ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS]);
+const protectedPath = (path, extra = []) => matchesSome(path, [...GUARD_FLOOR, ...AUDITOR_FLOOR, ...REVIEW_AUTH_FLOOR,
+  ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS, ...extra]);
 
 const unknown = () => ({ status: 'UNDETERMINED' });
 const findingText = f => typeof f === 'string' ? f : f?.text;
@@ -58,7 +58,7 @@ export function parseReproAnswer(text, count) {
  * changedLines must be a Map; absent files in a complete diff have no changed lines.
  */
 export function classifyPreExisting({ findings, answers, baseSha, headSha, readBaseFile, changedLines, recheckMax, cardWritten,
-  isProtectedPath = protectedPath }) {
+  protectedPaths, isProtectedPath = path => !Array.isArray(protectedPaths) || protectedPath(path, protectedPaths) }) {
   return findings.map((finding, i) => {
     const block = reason => ({ blocking: true, reason: `${reason}; human review required` });
     try {

@@ -93,7 +93,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
 async function proveFindings(findings, base, head, deps) {
   const extra = { modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [] };
   try {
-    for (const name of ['reproOnBase', 'readBaseFile', 'readHeadFile', 'diffText', 'numstatText', 'baseRecheckMax', 'fileCard']) {
+    for (const name of ['reproOnBase', 'readBaseFile', 'readHeadFile', 'diffText', 'numstatText', 'baseRecheckMax', 'protectedPaths', 'fileCard']) {
       if (typeof deps[name] !== 'function') throw new Error('missing proof dependency');
     }
     const answers = parseReproAnswer(await deps.reproOnBase(`${REPRO_QUESTION(findings)}\nCompare with head ${head}: read git diff ${base}...${head} and answer WORSENED if it adds a reaching path, removes a guard, or makes the weakness easier to trigger.\n`, findings, base), findings.length);
@@ -115,7 +115,7 @@ async function proveFindings(findings, base, head, deps) {
       baseFiles.set(a.base.path, source);
     }
     const options = { findings: detailed, answers, baseSha: base, headSha: head,
-      readBaseFile: path => baseFiles.get(path), changedLines, recheckMax: deps.baseRecheckMax() };
+      readBaseFile: path => baseFiles.get(path), changedLines, recheckMax: deps.baseRecheckMax(), protectedPaths: deps.protectedPaths() };
     const candidates = classifyPreExisting({ ...options, cardWritten: () => true });
     const written = new Set();
     const date = new Date(deps.now()).toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });

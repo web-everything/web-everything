@@ -11,7 +11,7 @@ const answer = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') =>
 const diff = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n@@ -5 +5 @@\n-  return old();\n+  return fixed();\n';
 const stat = '1\t1\tlib/x.mjs\n';
 const options = over => ({ findings: [finding], answers: parseReproAnswer(answer(), 1), baseSha: 'base-sha', headSha: 'head-sha',
-  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, cardWritten: () => true, ...over });
+  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, protectedPaths: [], cardWritten: () => true, ...over });
 const classify = over => classifyPreExisting(options(over));
 
 describe('strict reproduction protocol', () => {
@@ -135,6 +135,10 @@ describe('pre-existing classification', () => {
     expect(classify({ answers: wrongLine })[0].blocking).toBe(true);
     const wrongPath = parseReproAnswer(answer().replace('BASE=lib/x.mjs', 'BASE=lib/y.mjs'), 1);
     expect(classify({ answers: wrongPath })[0].blocking).toBe(true);
+  });
+  it('configured protected paths and a missing list block', () => {
+    expect(classify({ protectedPaths: ['lib/x.mjs'] })[0].blocking).toBe(true);
+    expect(classify({ protectedPaths: undefined })[0].blocking).toBe(true);
   });
   it('a2 flagged changed head line blocks before carding', () => {
     const cardWritten = vi.fn();

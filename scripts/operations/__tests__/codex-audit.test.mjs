@@ -564,7 +564,7 @@ describe('R1053 prove mode', () => {
   const reply = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
   function proof(answer = reply()) {
     const f = fixture(`WEAKENED\n${finding}`);
-    Object.assign(f.deps, { preExistingMode: () => 'prove', baseRecheckMax: () => 6,
+    Object.assign(f.deps, { preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
       reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(() => true) });
