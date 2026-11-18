@@ -1,3 +1,7 @@
+import { reviewedRead, completedSeat, completedComment, completedExecution } from '../lib/__tests__/fixtures/red-team-owed.mjs';
+import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { newRunRecord, writeRun } from '../operations/run-store.mjs';
+import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -86,12 +90,22 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
       commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
       statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
       comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
+    // An environment switch cannot pay execution debt. Seed the real stores with a completed head/run proof.
+    const runsDir = join(dir, 'runs');
+    const evidenceEnv = { ...process.env, ...daemonAppEnv(dir), WE_UNDER_TEST: '1',
+      WE_SHARED_RUNS_DIR: runsDir, OPERATION_RUNS_DIR: runsDir, CONVEYOR_STATE_ROOT: dir };
+    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(sha) } };
+    writeRun({ ...newRunRecord({ id: 'prestage-review', op: 'review-pr', input: { repo: slug, pr: 42 } }), ...loopPayload }, runsDir);
+    const scorecards = resolveScorecardStorePath(evidenceEnv); mkdirSync(dirname(scorecards), { recursive: true });
+    writeFileSync(scorecards, JSON.stringify({ version: 1, records: [completedSeat(sha, { repo: slug, pr: 42 })] }));
+    recordRedTeamStatus({ repo: slug, pr: 42, loopPayload, status: 'finished', result: completedExecution(sha).result }, { env: evidenceEnv });
+    pr.comments.push({ ...completedComment(42, sha), createdAt: new Date().toISOString() });
     const run = (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off' } = {}) => {
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
       const r = spawnSync(process.execPath, [script, ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
         '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
         ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
-        env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
+        env: { ...evidenceEnv, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
           WE_COORDINATION_ROOT:coord, WE_ASYNC_DRAIN:shadowMode, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
           WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
           WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0',
@@ -420,7 +434,7 @@ describe('real drain pre-stage path', () => {
   }));
   it.each([true, false])('pending-CI manifest candidates cannot trigger head or review writes (accepted head=%s)', accepted => world(({pr,run,coord}) => {
     pr.body += '\n<!-- lane-manifest:begin -->\n```json\n' + JSON.stringify({ item:'xabc123', repos:[{repo:'we',ref:pr.headRefName}], blockedBy:[],stackParents:[] }) + '\n```\n<!-- lane-manifest:end -->';
-    if (!accepted) pr.comments = [];
+    if (!accepted) pr.comments = pr.comments.filter(comment => !comment.body.includes('reviewed-sha:'));
     const first = run(false, { rebaseDrop:true });
     expect(first.stderr).toContain('prepared while CI pending');
     expect(first.calls.filter(a => a[0] === 'git' && ['push','commit-tree','update-index','write-tree','read-tree'].includes(a[1]))).toEqual([]);
@@ -479,7 +493,7 @@ describe('real drain pre-stage path', () => {
   it.each(['off', 'shadow'])('a green-event enqueue runs the cascade pre-landing steps: stacked retarget and review-coverage notice (async drain: %s)', shadowMode => world(({pr,run}) => {
     expect(run(false, { shadowMode }).stderr).toContain('eligible=true');
     // The pre-landing read is fresh: the reviewed-sha record is gone by green time, so coverage is announced.
-    pr.comments = [];
+    pr.comments = pr.comments.filter(comment => !comment.body.includes('reviewed-sha:'));
     pr.stacked = [{ number: 43, baseRefName: pr.headRefName }];
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = run(true, { shadowMode });

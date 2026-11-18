@@ -92,8 +92,26 @@ export function normalizeRedTeamRuns({ raw, comments, head, pr, carry, noExecuti
     carry: carry ? [record(carryRecord, 'complete')] : [] };
 }
 
+/** The admission boundary requires explicit context and a complete snapshot; absence is never an empty read. */
+export const RED_TEAM_ADMISSION_INPUTS = Object.freeze({
+  repo: value => typeof value === 'string' && !!value.trim(),
+  pr: value => ['number', 'string'].includes(typeof value) && Number.isSafeInteger(Number(value)) && Number(value) > 0,
+  head: value => typeof value === 'string' && !!value,
+  labels: value => Array.isArray(value) && Array.from(value).every(label => typeof label === 'string' || typeof label?.name === 'string'),
+  comments: value => Array.isArray(value) && Array.from(value).every(comment => typeof comment?.body === 'string'),
+  settings: value => value !== null && typeof value === 'object',
+  'evidence.ok': value => typeof value === 'boolean',
+  'evidence.status': value => value === null || (typeof value === 'object' && !Array.isArray(value)),
+  'evidence.carry': value => value === null || (typeof value === 'object' && !Array.isArray(value)),
+  'evidence.loopPayload': value => value === null || (typeof value === 'object' && !Array.isArray(value)),
+  'evidence.seats': value => Array.isArray(value),
+  ...Object.fromEntries(['inFlight', 'queued', 'scheduled', 'recorded', 'skipCardOnly']
+    .map(key => [`evidence.${key}`, value => typeof value === 'boolean'])),
+});
+
 export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, repo, env = process.env,
-  labels = raw?.labels, standingRuling, confirmedBreaks, settingsPath = RED_TEAM_SETTINGS_FILE, readSettings = readFileSync, readSource = raw?.decisionInput?.readSource } = {}) {
+  labels, standingRuling, confirmedBreaks, settingsPath = RED_TEAM_SETTINGS_FILE, readSettings = readFileSync, readSource = raw?.decisionInput?.readSource } = {}) {
+  raw = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const disposition = readRedTeamDisposition({ comments, pr, head, repo, env, standingRuling, setting: confirmedBreaks });
   const hit = redTeamResultCommentForHead(comments, pr, head);
   const fromRev = hit?.carriedFrom ?? raw.carry?.loopPayload?.carriedFrom;
@@ -105,6 +123,9 @@ export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, r
   }
   const malformedCarry = raw.carry != null && !carry && !fromRev;
   const settings = admissionSettings({ env, settingsPath, readSettings });
+  const values = { repo, pr, head, labels, comments, settings, evidence: raw };
+  const missingInputs = Object.entries(RED_TEAM_ADMISSION_INPUTS).filter(([key, proven]) =>
+    !proven(key.split('.').reduce((value, part) => value != null && Object.hasOwn(value, part) ? value[part] : undefined, values))).map(([key]) => key);
   const status = raw.status, resultStatus = typeof status?.result === 'string' ? status.result : status?.result?.status;
   const noExecution = status === null || (status?.head === head && status.status === 'finished'
     && (resultStatus === 'not-owed' || (resultStatus === 'skipped'
@@ -121,7 +142,7 @@ export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, r
   const breakResolved = !hasBreak && releases.length > 0
     && releases.every(release => ['cleared', 'released carded', 'released not-real'].includes(release.state));
   const blocked = Array.isArray(labels) && labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:blocked');
-  return { head, read: raw.loopPayload?.findings?.read, seats: raw.seats, result: hit?.parsed ?? null, carry,
+  return { head, missingInputs, read: raw.loopPayload?.findings?.read, seats: raw.seats, result: hit?.parsed ?? null, carry,
     ok: raw.ok, reason: raw.reason, carryConflict: malformedCarry || (raw.carryConflict !== undefined && raw.carryConflict !== false ? raw.carryConflict : !!(fromRev && !carry)),
     hasBreak, blocked, storedVerdict, breakResolved, pendingPublish,
     runs: normalizeRedTeamRuns({ raw, comments, head, pr, carry, noExecution, hit }),

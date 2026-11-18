@@ -111,7 +111,7 @@ describe('merge-queue same-head failure admission', () => {
       f.requests = () => f.exec.mock.calls.filter(([, args]) => args.includes('PUT'));
       try { test(f); } finally { rmSync(dir, { recursive: true, force: true }); }
     }
-    it.each(['allowed', 'moved base/head', 'unreadable evidence', 'red-team hold', 'workflow hold', 'license disabled', 'approval hold'])(
+    it.each(['allowed', 'missing live labels', 'blocked live labels', 'moved base/head', 'unreadable evidence', 'red-team hold', 'workflow hold', 'license disabled', 'approval hold'])(
       'whole production refresh path ignores seeded stale memo: %s', outcome => fixture(f => {
         const memoDir = mkdtempSync(join(process.env.TMPDIR, 'refresh-memo-'));
         const memoPath = join(memoDir, 'stale.json');
@@ -133,10 +133,10 @@ describe('merge-queue same-head failure admission', () => {
           }
           const cached = (opts?.throttle?.env ?? process.env).WE_GH_READ_MEMO_DIR;
           calls.push({ args, opts, cached });
-          if (args.includes('headRefOid,baseRefName')) {
+          if (args.includes('headRefOid,baseRefName,labels')) {
             stages.push('head/base');
             return cached ? readFileSync(memoPath, 'utf8') : JSON.stringify({
-              headRefOid: outcome === 'moved base/head' ? prior : head, baseRefName: 'main',
+              headRefOid: outcome === 'moved base/head' ? prior : head, baseRefName: 'main', ...(outcome === 'missing live labels' ? {} : { labels: outcome === 'blocked live labels' ? ['red-team:blocked'] : ['review:accepted'] }),
             });
           }
           if (args.includes('headRefOid,labels,mergeable') || args.includes('headRefOid,labels')) {
@@ -211,7 +211,7 @@ describe('merge-queue same-head failure admission', () => {
             expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
             expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
           }
-          expect(stages).toContain('red-team');
+          if (outcome !== 'missing live labels' && outcome !== 'moved base/head') expect(stages).toContain('red-team');
           if (outcome === 'allowed') {
             expect(stages).toEqual(expect.arrayContaining(['head/base', 'workflow setting', 'license setting', 'approval', 'standing ruling']));
             expect(calls.filter(c => c.args.includes('PUT'))).toHaveLength(1);
@@ -1296,11 +1296,11 @@ const clean = (rev = head, login = 'web-everything', findings = []) => ({ author
 const hold = (over = {}) => {
   // Gate-action tests supply completed source proof as well as carried comment syntax.
   const hit = redTeamResultCommentForHead(over.comments, over.pr ?? 5283, over.head ?? head);
-  const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, ...runIdentity, proof: { head: hit.carriedFrom, runs: completedRuns(),
+  const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, ...runIdentity, proof: { head: hit.carriedFrom, missingInputs: [], runs: completedRuns(),
     read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
     result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
     scheduling: { skipCardOnly: false, inFlight: false, queued: false, commentsReadable: true, settingsReadable: true } } } : null;
-  return redTeamEnqueueHold({ ...idleEvidence(), ...(hit ? { status: completedExecution(over.head ?? head) } : {}), carry, scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(over.head ?? head) } }, seats: over.recorded || over.comments?.length ? [completedSeat(over.head ?? head)] : [], labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+  return redTeamEnqueueHold({ ...idleEvidence(), ...(hit ? { status: completedExecution(over.head ?? head) } : {}), carry, scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(over.head ?? head) } }, seats: over.recorded || over.comments?.length ? [completedSeat(over.head ?? head)] : [], labels: ['review:accepted'], comments: [], repo: 'fixture/repo', pr: 5283, head, env: {}, ...over });
 };
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });

@@ -8,7 +8,7 @@ import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs'
 import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
-import { reviewedRead, completedSeat, completedComment, runIdentity } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, completedComment, runIdentity, idleEvidence } from './fixtures/red-team-owed.mjs';
 import { redTeamOwedFor, RED_TEAM_HOLDS } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
@@ -23,7 +23,7 @@ function fixture() {
   roots.push(root);
   const runsDir = join(root, 'runs');
   return { repo: 'web-everything/web-everything', pr: 5439, head: 'b'.repeat(40), runsDir,
-    readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
+    labels: [], readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
 }
 const cleanResultComment = f => completedComment(f.pr, f.head);
 // Seal at finish (#6535, operator ruling R907): the seat's sealer is the shared publisher in seal-only mode over the
@@ -45,6 +45,22 @@ const unknownEvidence = (reason, reader = readDrainRedTeamEvidence) => ({ ok: fa
     decisionInput: expect.objectContaining({ ok: false, reason, seats: [] }) } : {}) });
 
 describe('status persistence and check publication share one claim', () => {
+  it.each(['clear', 'blocked', 'missing labels', 'label read error'])(
+    'canonical audit: card-only check publication carries live labels into admission (%s)', mode => {
+      const f = fixture(), checks = [];
+      const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(f.head, ['backlog/123-card.md']) } };
+      const options = { env: f.env, readScorecards: () => [], comments: [], log: () => {},
+        gh: args => {
+          if (mode === 'label read error' && args.includes('headRefOid,labels')) throw Error('live labels unreadable');
+          return JSON.stringify({ headRefOid: f.head, ...(mode === 'missing labels' ? {} : { labels: mode === 'blocked' ? ['red-team:blocked'] : [] }) });
+        }, postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; } };
+      expect(recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, options))
+        .toEqual({ published: true });
+      expect(checks).toHaveLength(1);
+      expect(checks[0].conclusion).toBe(mode === 'clear' ? 'success' : 'failure');
+      if (mode !== 'clear') expect(checks[0].output.summary).toContain(RED_TEAM_HOLDS[mode === 'blocked' ? 'break' : 'evidence-unknown'].message);
+    });
+
   it.each(['pending', 'running', 'finished'])('under-test %s writes without an injected publisher never call gh or create a publication hold', status => {
     const f = fixture();
     const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(() => { throw Error('real gh forbidden'); });
@@ -209,11 +225,11 @@ describe('status persistence and check publication share one claim', () => {
     it('pins the unsealed-hold prefix to the gate\'s own wording', () => {
       const f = fixture();
       recordRedTeamStatus(finished(f), { env: f.env });
-      const hold = redTeamEnqueueHold({ ...finished(f), status: readRedTeamStatus(f), inFlight: false, queued: false, seats: [completedSeat(f.head)], head: f.head, comments: [cleanResultComment(f)], scheduled: true,
+      const hold = redTeamEnqueueHold({ ...idleEvidence(), ...finished(f), status: readRedTeamStatus(f), inFlight: false, queued: false, seats: [completedSeat(f.head)], head: f.head, comments: [cleanResultComment(f)], scheduled: true,
         recorded: true, env: f.env });
       expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
       sealAtFinish(f, { comments: [] })({ repo: f.repo, pr: f.pr, head: f.head });
-      expect(redTeamEnqueueHold({ ...finished(f), status: readRedTeamStatus(f), inFlight: false, queued: false, seats: [], head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
+      expect(redTeamEnqueueHold({ ...idleEvidence(), ...finished(f), status: readRedTeamStatus(f), inFlight: false, queued: false, seats: [], head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
         .toBe(RED_TEAM_HOLDS['result-incomplete'].message);
     });
   });
@@ -760,7 +776,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
 
   it('does not invent an accept when no review run exists', () => {
     expect(readDrainRedTeamEvidence(fixture())).toEqual({ status: null, ok: true, carry: null, queued: false, loopPayload: null, recorded: false, seats: [], decisionInput: expect.objectContaining({ read: undefined, seats: [], result: null }),
-      seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false });
+      seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false, skipCardOnly: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
@@ -1037,7 +1053,7 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
     expect(evidence).toEqual({ status: null, ok: true, carry: null, queued: false, loopPayload: null, seats: variant === 'live-head seat' ? [expect.objectContaining({ rev: f.head, valid: true })] : [],
       decisionInput: expect.objectContaining({ head: f.head, read: undefined }), recorded: variant === 'live-head seat',
       seatRecorded: variant === 'live-head seat', completedRecorded: false,
-      failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false });
+      failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false, skipCardOnly: false });
   });
 
 it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(

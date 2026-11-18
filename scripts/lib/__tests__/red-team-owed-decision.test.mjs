@@ -8,6 +8,7 @@ import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { redTeamOwedDecision, RED_TEAM_HOLDS, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS, RED_TEAM_CLEARANCE_INPUTS, RED_TEAM_BREAK_INPUTS } from '../review-red-team-policy.mjs';
 import { redTeamAdmissionHold } from '../drain-queue-safety.mjs';
+import { drainRedTeamDecisionInput, RED_TEAM_ADMISSION_INPUTS } from '../drain-red-team-input.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { failedRedTeamRetry } from '../red-team-run-result.mjs';
 import { reviewedRead, completedSeat, completedComment, exemptInput, completedExecution, runIdentity } from './fixtures/red-team-owed.mjs';
@@ -24,7 +25,7 @@ function fixture(over = {}, rows = []) {
   writeFileSync(store, JSON.stringify({ version: 1, records: rows.map(row => ({ ...row, head })) }));
   writeRun({ ...newRunRecord({ id: 'review-pr-42', op: 'review-pr', input: { repo, pr } }), ...loopPayload }, runsDir);
   recordRedTeamStatus({ repo, pr, head, loopPayload, status: 'finished', result: rows.length ? completedExecution(head).result : { status: 'skipped', policy: 'card-only' } }, { env });
-  return { repo, pr, head, env, runsDir, comments: [] };
+  return { repo, pr, head, env, runsDir, comments: [], labels: [] };
 }
 const decide = f => redTeamOwedDecision(readDrainRedTeamEvidence(f).decisionInput);
 describe('PR-A v2 acceptance over persisted review, status and scorecard files', () => {
@@ -250,9 +251,37 @@ it.each([
   expect(redTeamOwedDecision(readDrainRedTeamEvidence({ ...f, evidence }).decisionInput).owed).toBe(true);
 });
 
+it.each(Object.keys(RED_TEAM_ADMISSION_INPUTS))('all admission boundaries reject omitted required input: %s', key => {
+  const f = fixture(), evidence = readDrainRedTeamEvidence(f);
+  const complete = { ...f, evidence };
+  const boundaries = {
+    'normalizer': options => redTeamOwedDecision(drainRedTeamDecisionInput(options)),
+    'reader used by publication/recovery/carry': options => redTeamOwedDecision(readDrainRedTeamEvidence(options).decisionInput),
+    'queue admission used by check-run/prestage/enqueue': options => redTeamAdmissionHold({ ...options.evidence, ...options }),
+    'status-label planner': options => planRedTeamStatusLabels(options),
+  };
+  for (const [caller, invoke] of Object.entries(boundaries)) {
+    const baseline = invoke(complete);
+    if (caller === 'status-label planner') expect(baseline.add).toBe('red-team:clear');
+    else if (caller.startsWith('queue')) expect(baseline).toBeNull();
+    else expect(baseline.cleared).toBe(true);
+    const missing = { ...complete, evidence: { ...evidence } };
+    if (key.startsWith('evidence.')) delete missing.evidence[key.slice('evidence.'.length)];
+    else if (key === 'settings') missing.settingsPath = join(f.env.CONVEYOR_STATE_ROOT, 'missing-settings.json');
+    else delete missing[key];
+    const actual = invoke(missing);
+    if (caller === 'status-label planner') expect(actual.add, `${caller}: ${key}`).not.toBe('red-team:clear');
+    else if (caller.startsWith('queue')) expect(actual, `${caller}: ${key}`).toMatchObject({ kind: 'evidence-unknown', blocking: true });
+    else {
+      expect(actual, `${caller}: ${key}`).toMatchObject({ owed: true, cleared: false });
+      expect(actual.reasons.map(hold => hold.kind), `${caller}: ${key}`).toContain('evidence-unknown');
+    }
+  }
+});
+
 // Parse the actual source: call deletion and prose-based routing must fail independently of runtime fixtures.
 const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs', 'drain-red-team-input.mjs', 'review-red-team-policy.mjs', 'red-team-status-labels.mjs', 'drain-red-team-evidence.mjs']
-  .map(file => [file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')]));
+  .map(file => [file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')]).concat([['merge-ai-prs.mjs', readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8')]]));
 const parse = (file, text) => ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 function all(node, predicate) {
   const found = [];
@@ -262,11 +291,23 @@ function all(node, predicate) {
 const calls = (node, name) => all(node, n => ts.isCallExpression(n) && n.expression.getText() === name);
 function assertStructure(source) {
   expect(source['drain-red-team-input.mjs']).toMatch(/recorded: raw\.recorded/);
+  expect(source['drain-red-team-input.mjs']).toContain('Object.entries(RED_TEAM_ADMISSION_INPUTS)');
+  expect(source['review-red-team-policy.mjs']).toContain('Array.isArray(input.missingInputs) && input.missingInputs.length === 0');
   const rowSource = source['drain-red-team-evidence.mjs'];
   expect(rowSource).toContain('Array.from(readScorecards(), (row, appendIndex) => ({ ...normalizeRedTeamSeatRow(row, false), appendIndex }))');
   expect(rowSource).toContain('.filter(row => row.valid === false ||');
   expect(rowSource).toContain('Array.from(raw.seats, row => normalizeRedTeamSeatRow(row))');
   expect(rowSource).toContain('if (!plain) return { valid: false }');
+  const publication = parse('drain-red-team-evidence.mjs', rowSource);
+  const publisher = all(publication, node => ts.isFunctionDeclaration(node) && node.name?.text === 'recordRedTeamStatus')[0];
+  const publicationRead = calls(publisher, 'readDrainRedTeamEvidence').find(call => call.arguments[0]?.properties?.some(property => property.name?.getText() === 'readScorecards'));
+  expect(publicationRead.arguments[0].properties.find(property => property.name?.getText() === 'labels')?.initializer?.getText()).toBe('live.labels');
+  expect(calls(publisher, 'readDrainRedTeamEvidence')).toHaveLength(1);
+  const refreshSource = parse('merge-ai-prs.mjs', source['merge-ai-prs.mjs']);
+  const refresh = all(refreshSource, node => ts.isFunctionDeclaration(node) && node.name?.text === 'enqueueWithSameHeadGuard')[0];
+  const refreshHold = calls(refresh, 'redTeamEnqueueHold')[0];
+  expect(refreshHold.arguments[0].properties.find(property => property.name?.getText() === 'labels')?.initializer?.getText()).toBe('live.labels');
+  expect(refresh.getText()).not.toContain('waitForRedTeamBeforeEnqueue');
   const policy = parse('review-red-team-policy.mjs', source['review-red-team-policy.mjs']);
   const holds = all(policy, n => ts.isPropertyAssignment(n) && ['pass-owed', 'pending-publish'].includes(n.name?.text));
   expect(holds.map(n => [n.name.text, n.initializer.elements[0].kind])).toEqual([
@@ -357,6 +398,7 @@ function assertStructure(source) {
     expect(fn).toHaveLength(1);
     expect(calls(fn[0], 'redTeamAdmissionHold')).toHaveLength(1);
     const decision = calls(fn[0], 'redTeamAdmissionHold')[0];
+    expect(decision.arguments[0].properties.map(property => property.name?.getText())).toEqual(expect.arrayContaining(['labels', 'comments', 'pr', 'head', 'repo', 'env']));
     const conditions = [];
     for (let parent = decision.parent; parent && parent !== fn[0]; parent = parent.parent) {
       if (ts.isIfStatement(parent)) conditions.push(parent.expression.getText());
@@ -386,6 +428,11 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
+  ['refresh labels omitted', 'merge-ai-prs.mjs', text => text.replace('redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, labels: live.labels,', 'redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments,')],
+  ['refresh setting bypass restored', 'merge-ai-prs.mjs', text => text.replace('if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, labels:', 'if (safety.value.waitForRedTeamBeforeEnqueue && redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, labels:')],
+  ['publication labels omitted', 'drain-red-team-evidence.mjs', text => text.replace('comments, labels: live.labels,', 'comments,')],
+  ['required input contract bypassed', 'drain-red-team-input.mjs', text => text.replace('Object.entries(RED_TEAM_ADMISSION_INPUTS)', 'Object.entries({})')],
+  ['completeness gate removed', 'review-red-team-policy.mjs', text => text.replace('Array.isArray(input.missingInputs) && input.missingInputs.length === 0', 'true')],
   ['run identity comparison removed', 'review-red-team-policy.mjs', text => text.replace('runs[key].at(-1).runId !== candidate.runId', 'false')],
   ['run order comparison removed', 'review-red-team-policy.mjs', text => text.replace('row.order > candidate.order', 'false')],
   ['run proof delegation removed', 'review-red-team-policy.mjs', text => text.replace('redTeamRunProof(input)', 'null')],

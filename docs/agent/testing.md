@@ -4702,3 +4702,13 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+Check publication passes the freshly read live labels into the same red-team admission
+normalizer as queue and label planning. A card-only skip never clears an unresolved
+blocked label. `RED_TEAM_ADMISSION_INPUTS` enumerates the required context, settings,
+status, carry, scored-read/seat snapshot and scheduling fields. Missing keys or an
+unreadable live label response yield `evidence-unknown`, including beside completed
+proof. Only the filesystem reader may attest explicit absence after successful IO;
+an injected partial snapshot cannot gain those defaults. Table regressions omit each
+required field at every boundary; structural mutations remove the publication labels
+and completeness checks.

@@ -159,6 +159,9 @@ export function redTeamOwedDecision(input = {}) {
   if (ok === false) reasons.push({ ...RED_TEAM_HOLDS['evidence-unknown'],
     message: `post-accept red team evidence unknown (${reason}); hold and inspect run evidence` });
   if (carryConflict) hold('carry-conflict');
+  const completeInput = Array.isArray(input.missingInputs) && input.missingInputs.length === 0;
+  if (!completeInput && !reasons.some(hold => hold.kind === 'evidence-unknown')) reasons.push({
+    ...RED_TEAM_HOLDS['evidence-unknown'], message: `${RED_TEAM_HOLDS['evidence-unknown'].message}; missing or invalid decision inputs: ${input.missingInputs?.join?.(', ') ?? 'input contract'}` });
   const reviewable = redTeamReadReviewable(read, head);
   if (pendingPublish) hold('pending-publish');
   if (!reviewable) hold('unreviewable-read');
@@ -168,7 +171,7 @@ export function redTeamOwedDecision(input = {}) {
   const exempt = !recordedBreak && Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input));
   let owed = !exempt || reasons.length > 0;
   const completedResult = isPublishableRedTeamResult(result) && result.completedReview === true && result.rev === head;
-  const runHold = !exempt ? redTeamRunProof(input) : null;
+  const runHold = !exempt ? completeInput ? redTeamRunProof(input) : 'evidence-unknown' : null;
   let carried = false;
   if (carry) {
     const sourceDecision = completedResult && carry.fromRev && carry.fromRev !== head && carry.proof

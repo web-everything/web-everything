@@ -5,7 +5,7 @@ import { parseRedTeamComment } from '../red-team-gate.mjs';
 import { reviewedRead, completedSeat, completedComment, exemptInput, completedRuns, runIdentity } from './fixtures/red-team-owed.mjs';
 
 const head = 'a'.repeat(40), fromRev = 'b'.repeat(40);
-const pass = (rev = head) => ({ head: rev, read: reviewedRead(rev), runs: completedRuns(),
+const pass = (rev = head) => ({ head: rev, missingInputs: [], read: reviewedRead(rev), runs: completedRuns(),
   seats: [{ ...completedSeat(rev), valid: true }], result: parseRedTeamComment(completedComment(42, rev).body),
   scheduling: { scheduled: true, inFlight: false, queued: false, skipCardOnly: true, commentsReadable: true, settingsReadable: true } });
 describe('redTeamOwedDecision', () => {
@@ -155,6 +155,10 @@ describe('redTeamOwedDecision', () => {
     expect(redTeamOwedDecision(input).cleared).toBe(true);
     input.runs.verdict.push({ runId: 'newer-changes-run', order: 1, outcome: 'changes' });
     expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+  });
+  it('completed proof cannot clear an omitted input-completeness attestation', () => {
+    const input = pass(); delete input.missingInputs;
+    expect(redTeamOwedDecision(input).reasons).toContainEqual(expect.objectContaining({ kind: 'evidence-unknown', blocking: true }));
   });
   it('uses fixed hold kinds with only pending-publish non-blocking; cleared is exactly absence of holds', () => {
     expect(Object.values(RED_TEAM_HOLDS).filter(h => !h.blocking).map(h => h.kind).sort()).toEqual(['pending-publish']);

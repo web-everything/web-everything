@@ -47,7 +47,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
     if (raw == null) return raw;
     if (raw?.readError) throw new Error('evidence unreadable');
     const hit = redTeamResultCommentForHead(liveComments, key.pr, key.head);
-    const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, ...runIdentity, proof: { head: hit.carriedFrom, runs: completedRuns(),
+    const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, ...runIdentity, proof: { head: hit.carriedFrom, missingInputs: [], runs: completedRuns(),
       read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
       result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
       scheduling: { skipCardOnly: false, inFlight: false, queued: false, commentsReadable: true, settingsReadable: true } } } : null;

@@ -10,7 +10,7 @@ import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
 /** Every label transition derives from the same normalized evidence decision as admission. */
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
+export function planRedTeamStatusLabels({ labels, comments, repo, pr, head, evidence, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
   const { decisionInput } = readDrainRedTeamEvidence({ repo, pr, head, env, comments, labels, standingRuling, evidence, settingsPath });
   // A failed head recheck or contradictory live files invalidate stored card-only proof.
   if (redTeamCardOnly(decisionInput.read) && (!headVerified || (headFiles !== null
@@ -18,7 +18,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   const decision = redTeamOwedDecision(decisionInput);
   const desired = decision.cleared ? 'red-team:clear'
     : decision.reasons.some(hold => hold.blocking && hold.kind === 'break') ? 'red-team:blocked' : 'red-team:pending';
-  const names = labels.map(label => typeof label === 'string' ? label : label?.name);
+  const names = (Array.isArray(labels) ? labels : []).map(label => typeof label === 'string' ? label : label?.name);
   // Pending evidence never erases a previously confirmed block.
   return { add: !names.includes(desired) && !(desired === 'red-team:pending' && names.includes('red-team:blocked')) ? desired : null,
     remove: names.filter(name => RED_TEAM_STATUS_LABELS.includes(name) && name !== desired

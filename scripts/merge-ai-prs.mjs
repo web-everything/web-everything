@@ -5007,21 +5007,18 @@ async function runCli() {
         try {
           const comments = readCompletePrComments(c.num, { repo, exec });
           if (!Array.isArray(comments)) throw Error('complete comments unreadable');
-          const safety = readDrainQueueSafety({ log });
-          if (safety.value.waitForRedTeamBeforeEnqueue) {
-            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
-            const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
-              readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
-              cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
-              unedited: target => readUneditedCommentIds(target, { gh }),
-            });
-            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
-          }
-          // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
           const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,
-            '--json', 'headRefOid,baseRefName'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+            '--json', 'headRefOid,baseRefName,labels'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
             stdio: ['ignore', 'pipe', 'pipe'] }));
-          if (live?.headRefOid !== sha || typeof live.baseRefName !== 'string' || !live.baseRefName) return false;
+          if (live?.headRefOid !== sha || typeof live.baseRefName !== 'string' || !live.baseRefName || !Array.isArray(live.labels)) return false;
+          const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
+            readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
+            cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
+            unedited: target => readUneditedCommentIds(target, { gh }),
+          });
+          const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha, comments, labels: live.labels, env: process.env, standingRuling });
+          if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, labels: live.labels, env: process.env, standingRuling })) return false;
+          // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
           const read = readPinnedChangedFiles({ headSha: sha, base: live.baseRefName, cwd: process.cwd(), exec });
           if (read.error) return false;
           const workflow = resolveDrainWorkflowEditHuman();

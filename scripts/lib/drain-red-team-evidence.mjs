@@ -26,7 +26,7 @@ export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
     throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
   }
 }
-import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly, redTeamOwedDecision } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly, redTeamOwedDecision, RED_TEAM_HOLDS } from './review-red-team-policy.mjs';
 import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -698,14 +698,16 @@ export function recordRedTeamStatus(input, options = {}) {
             const live = JSON.parse(gh(['pr', 'view', String(input.pr), '--repo', input.repo, '--json', 'headRefOid,labels'],
               { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
             if (live?.headRefOid !== head || !Array.isArray(live.labels)) throw Error('red-team live head or labels unreadable');
-            const evidence = readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head, env: options.env ?? process.env,
-              readScorecards: options.readScorecards });
-            const { decisionInput } = readDrainRedTeamEvidence({ evidence, repo: input.repo, pr: input.pr, head, comments, env: options.env ?? process.env });
+            const { decisionInput } = readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head, comments, labels: live.labels,
+              env: options.env ?? process.env, readScorecards: options.readScorecards, settingsPath: options.settingsPath, readSettings: options.readSettings });
             publicationPending = !decisionInput.result && persistedOwesPublication(path);
             const { reasons } = redTeamOwedDecision(decisionInput);
             admission = reasons.find(hold => hold.blocking) ?? reasons[0];
             hold = admission?.message ?? null;
-          } catch { /* unreadable evidence retains the hold */ }
+          } catch {
+            admission = RED_TEAM_HOLDS['evidence-unknown'];
+            hold = admission.message;
+          }
           // A result not yet sealed or not yet posted (the sealer failed, none was given, or its post failed) is no break:
           // it must not publish FAILURE (R907). It publishes the check as in progress, which still holds merge-gate
           // (fail closed) without naming a break. A confirmed break or unknown evidence keeps its failure.
@@ -953,7 +955,9 @@ export function readDrainRedTeamEvidence({ evidence, comments, carryHeads = [], 
   const candidate = evidence === undefined ? readDrainRedTeamSnapshot(options) : evidence;
   const readable = candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate);
   const raw = readable ? candidate : { ok: false, reason: 'snapshot-invalid' };
-  const snapshot = { ...raw, ...(evidence === undefined && raw.ok === undefined ? { ok: true, carry: raw.carry ?? null } : {}),
+  // Only our own successful filesystem read can establish absent status/journal/queue entries.
+  const snapshot = { ...(evidence === undefined && raw.ok !== false ? { ok: true, status: null, carry: null, loopPayload: null,
+    queued: false, inFlight: false, scheduled: false, recorded: false, skipCardOnly: false } : {}), ...raw,
     seats: Array.isArray(raw.seats) ? Array.from(raw.seats, row => normalizeRedTeamSeatRow(row)) : raw.seats };
   const readSource = ({ head, comments }) => {
     if (carryHeads.includes(head) || head === options.head) throw Error('carry cycle; inspect run evidence');
