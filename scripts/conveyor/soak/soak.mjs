@@ -29,7 +29,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { runScenario, scenario } from '../__tests__/sim/scenario.mjs';
-import { cloneFacts, checkTick, formatTickLine, DEFAULT_BOUNDS, OWED_KIND_DAEMON, sessionMatches } from './invariants.mjs';
+import { cloneFacts, checkTick, explainNoDispatch, formatTickLine, DEFAULT_BOUNDS, OWED_KIND_DAEMON, sessionMatches } from './invariants.mjs';
 import { seededRandom, stepBehaviours } from './behaviours.mjs';
 import { openChurnPr, seedDefaultFleet } from './fleet.mjs';
 
@@ -142,7 +142,8 @@ export async function runSoak({
           o.dispatchedAtTick = index;
         }
       }
-      const stillOwed = owed.filter((o) => !o.dispatched && OWED_KIND_DAEMON[o.kind] === daemon);
+      const stillOwed = owed.filter((o) => !o.dispatched && OWED_KIND_DAEMON[o.kind] === daemon)
+        .map((o) => ({ ...o, why: explainNoDispatch(entry, o.pr) }));
       const v = [
         ...checkTick({ daemon, index, entry, facts, stale: isStale, staleStreak: staleStreak[daemon], owed: stillOwed, bounds, totalTicks }),
         ...pendingHookViolations.splice(0),
