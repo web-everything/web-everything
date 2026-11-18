@@ -1,3 +1,4 @@
+import { hardenedGitDiff, verifyRenderedDiff } from '../lib/hardened-git-diff.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
@@ -342,12 +343,24 @@ export function readPr({
   // Held item 177 — the stack base for this PR (`we:scripts/conveyor/review-stack-base.mjs`), or null. Injectable;
   // the default reads the open PRs and git in this checkout and fails open to null (the main basis, as before).
   // Inert under test unless injected: the default reads `gh` and the network.
-  readStack = isUnderTest() ? () => null : ({ pr: n, cwd: dir }) => readStackBase({ pr: n, root: dir }),
-  stackRead = { files: stackNetFiles, text: stackNetDiffText },
+  readStack = null,
+  stackRead = null,
 } = {}) {
   // The net-diff helpers take no `cwd`, so it is baked into the injected `exec` (the drain does the same thing
   // for the opposite reason — see the `escCwd` note in `we:scripts/merge-ai-prs.mjs`).
-  const gitExec = exec || execFileIn(cwd);
+  const run = exec || execFileIn(cwd);
+  const gitExec = (cmd, args, opts) => run(cmd, args, {
+    ...opts, env: { ...(opts?.env ?? process.env), GIT_NO_REPLACE_OBJECTS: '1' },
+  });
+  const stackRun = (args, opts) => String(gitExec('git', args, {
+    encoding: 'utf8', timeout: 60e3, maxBuffer: 64 * 1024 * 1024, ...opts,
+  }));
+  // The synthetic stack base is built through the SAME replace-object-disabled executor as the diffs it is compared with.
+  const stackReader = readStack || (isUnderTest() ? () => null : ({ pr: n, cwd: dir }) => readStackBase({ pr: n, root: dir, run: stackRun }));
+  const stackDiffRead = stackRead || {
+    files: o => stackNetFiles({ ...o, run: stackRun }),
+    text: o => stackNetDiffText({ ...o, run: stackRun }),
+  };
   if (!Number.isInteger(pr) || pr <= 0) throw new TypeError(`review-pr-io: \`pr\` must be a positive integer, got ${JSON.stringify(pr)}`);
   if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
     throw new TypeError(`review-pr-io: \`repo\` must be <owner/name>, got ${JSON.stringify(repo)}`);
@@ -402,44 +415,53 @@ export function readPr({
 
   // ONE basis, shared. `fetchExtraRefs` carries the head ref so a lane branch this clone has never seen still
   // resolves — and NOTHING here moves HEAD (#2336): it fetches tracking refs and diffs two trees in place.
+  // This review selects and records the current branch tip as revSha before scoring.
   const basis = resolveNetDiffBasis({
-    exec: gitExec, rev: headRefName, fetchExtraRefs: headRefName ? [headRefName] : [],
+    exec: gitExec, rev: headRefName, fetchExtraRefs: headRefName ? [headRefName] : [], pinRev: true,
   });
-  let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
-  // `computeNetDiffPaths` resolves its own basis (it takes no `basis` param); the fetch above has already put
-  // the head ref in this clone, so the second resolution is a local probe, not a second network round trip.
-  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [] });
+  let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
+  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
+  // Fail closed: the two reads answer one question. If either is unscored, neither may stand as a scored read.
+  if (netText.scored !== true || netText.needsReview?.length || netPaths.scored !== true) {
+    netText = { text: '', base: null, rev: null, scored: false, reason: netText.reason || (netText.needsReview?.length ? 'needs-human-review' : netPaths.reason) || 'diff-failed' };
+    netPaths = { paths: [], base: null, rev: null, scored: false, reason: netPaths.reason || netText.reason || 'diff-failed' };
+  }
 
   const priorRounds = priorRoundsFor(repo, pr);
-  const revSha = revParseCommit(gitExec, netPaths.rev);
+  const revSha = basis.ok ? basis.revSha : null;
 
   // Held item 177 — A STACKED TOP IS JUDGED AGAINST ITS STACK BASE. Only when the stack was detected on the SAME
   // head this clone diffed (`revSha`); any mismatch or failed read keeps the main basis (today's behaviour).
   let stackBase = null;
   if (netPaths.scored === true && revSha) {
     let stack = null;
-    try { stack = readStack({ pr, repo, cwd }); } catch { stack = null; }
+    try { stack = stackReader({ pr, repo, cwd }); } catch { stack = null; }
     if (stack && stack.topHead === revSha) {
       try {
-        const text = String(stackRead.text({ tree: stack.tree, topHead: revSha, root: cwd }));
-        const paths = stackRead.files({ tree: stack.tree, topHead: revSha, root: cwd });
+        const text = String(stackDiffRead.text({ tree: stack.tree, topHead: revSha, root: cwd }));
+        const paths = stackDiffRead.files({ tree: stack.tree, topHead: revSha, root: cwd });
         const fingerprint = fingerprintOf(text);
         if (Array.isArray(paths) && fingerprint) {
+          verifyRenderedDiff(gitExec, stack.tree, revSha, text, { paths });
           netText = { text, base: stack.tree, rev: netText.rev ?? netPaths.rev, scored: true };
           netPaths = { ...netPaths, paths, base: stack.tree, scored: true };
           stackBase = { pr: stack.pr, ref: stack.ref, head: stack.head, contained: stack.contained, tree: stack.tree, fingerprint };
         }
-      } catch { stackBase = null; }
+      } catch {
+        stackBase = null;
+        netText = { text: '', scored: false, reason: 'diff-failed' };
+        netPaths = { paths: [], scored: false, reason: 'diff-failed' };
+      }
     }
   }
   const latestFix = readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha });
   let deltaReview = null;
-  if (latestFix.priorHead && !latestFix.error && latestFix.head === revSha && !outstandingVerdictSince(view.comments, latestFix.priorHead)) {
+  if (netPaths.scored && latestFix.priorHead && !latestFix.error && latestFix.head === revSha && !outstandingVerdictSince(view.comments, latestFix.priorHead)) {
     try {
-      const text = String(gitExec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', latestFix.priorHead, revSha],
+      const text = String(hardenedGitDiff(gitExec, ['diff', latestFix.priorHead, revSha],
         { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER }));
       const sizeSince = from => {
-        const stat = String(gitExec('git', ['diff', '--numstat', '-z', '--no-renames', from, revSha],
+        const stat = String(hardenedGitDiff(gitExec, ['diff', '--numstat', '-z', from, revSha],
           { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER })).split('\0').filter(Boolean);
         return { files: stat.length, lines: stat.reduce((sum, row) => {
           const [a, d] = row.split('\t');
@@ -456,7 +478,14 @@ export function readPr({
         deltaReview = { priorHead: latestFix.priorHead, head: revSha, lines, files, anchor, totalLines: total.lines, totalFiles: total.files, text,
           priorFindings: (view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && reviewedHeadsOf(c).includes(latestFix.priorHead)).map(c => c.body).join('\n\n') };
       }
-    } catch { /* unreadable delta requires full review */ }
+    } catch {
+      netText = { text: '', scored: false, reason: 'diff-failed' };
+      netPaths = { paths: [], scored: false, reason: 'diff-failed' };
+    }
+  }
+  if (latestFix.error === 'git-diff-failed') {
+    netText = { text: '', scored: false, reason: 'diff-failed' };
+    netPaths = { paths: [], scored: false, reason: 'diff-failed' };
   }
   const scopedMode = resolveScopedRereviewMode(scopedRereview);
   const budget = resolveRoundBudget(roundBudget);
@@ -481,14 +510,9 @@ export function readPr({
     // same predicate in two places, which is the drift #2644 forbids.
     createdAt: typeof view.createdAt === 'string' ? view.createdAt : '',
     clearerId: currentActorId(),
-    // PIN THE REV. `computeNetDiffPaths` reports `rev` as the candidate it resolved — `origin/<headRefName>`,
-    // a MUTABLE ref — so the recorded basis stopped describing the judged diff as soon as the lane pushed
-    // again. Resolve it here, in the io shell, where the git call belongs; `shapeReadFinding` keeps both the
-    // commit and the ref. It is the SAME candidate the diff was taken from and not the PR's `headRefOid`:
-    // `headRefOid` is GitHub's view of the head, which can differ from the ref this clone actually diffed, and
-    // recording it would pin the basis to a tree that was never read.
+    // Identity comes from the single pin taken BEFORE the shared basis and all diffs.
     comments: view.comments,
-    net: { ...netPaths, revSha },
+    net: { ...netPaths, revSha: netPaths.scored ? revSha : null },
     latestFix, deltaReview,
     diff: netText,
     ...(stackBase ? { stackBase } : {}),
@@ -729,7 +753,7 @@ export function readFixRange({ exec, priorHead, head } = {}) {
     if (!current) return { priorHead, error: 'head-unpinned' };
     let diff;
     try {
-      diff = String(exec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head], {
+      diff = String(hardenedGitDiff(exec, ['diff', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head], {
         // A rebase between rounds can make this diff several MB; the 1 MB default would throw and fall back to `all`.
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER,
       }) ?? '');

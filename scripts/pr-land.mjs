@@ -702,6 +702,15 @@ export function classifyChecks(rows) {
   return { status: 'passed', reason: 'all required checks passed' };
 }
 
+export function requireScoredNetDiff(signal, headSha) {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(headSha ?? '') || signal?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.scored !== true || signal?.scored !== true || signal.needsReview?.length || signal.netDiffText?.needsReview?.length) {
+    const error = new Error('Net diff is unscored; refusing review scoring and landing. Repair the checkout/read and rerun, or request human review of the full diff.');
+    error.code = 'UNSCORED_NET_DIFF';
+    throw error;
+  }
+  return signal;
+}
+
 /**
  * #2307 — resolve the review-escalation label pr-land should apply AT PR-OPEN (deterministically, never
  * lazily left to a later drain sweep — #2281's rule applied to the review dimension), from signals the
@@ -1235,30 +1244,32 @@ async function runCli() {
   // "successful" fetch, sweeping already-landed upstream commits (e.g. a gate-fix another lane merged onto
   // `main` between this lane's claim and its PR-open, live repro: PR #324) into the score as if the PR itself
   // touched them.
+  const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: REPO, ...opts });
+  // xnsk54v — prefer the SCRATCH manifest (--manifest-file, the new off-tree carrier); fall back to the
+  // legacy tree-committed `.lane-manifest.json` off the ref for a lane that still commits it. Loaded BEFORE
+  // the net diff so #2390's per-repo `base` can seed the diff basis.
+  let manifest = LANE_MANIFEST;
+  if (!manifest) {
+    const manifestRaw = tryGit(['show', `${refSha}:.lane-manifest.json`]);
+    if (manifestRaw) { try { manifest = JSON.parse(manifestRaw); } catch { /* malformed — degrade to no manifest signal */ } }
+  }
+  // #2390 — score this lane on its OWN delta from the manifest per-repo `base` (its predecessor's tip when
+  // overlap-stacked), NOT the cumulative diff vs main — the SAME basis the drain backstop uses (#2373's
+  // no-drift invariant). The repo key comes from this clone's origin slug; a sibling lane has no base → null →
+  // the unchanged `origin/main` basis.
+  const originSlug = (() => { try { const u = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); const m = u.match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/); return m ? m[1] : null; } catch { return null; } })();
+  const baseRev = manifestBaseForRepo(manifest, repoKeyFromSlug(originSlug));
+  // #2890-review-fix finding 3 / #2890-review-r2 finding 3 — ALL of the net-diff escalation inputs come from
+  // the ONE shared derivation in merge-ai-prs.mjs (`computeNetDiffSignals`), which the drain's scoring loop
+  // also calls. It resolves the basis ONCE (one `git fetch`, one candidate probe) and feeds both the
+  // changed-file shape and the diff TEXT off it: the first cut called them independently and re-ran the whole
+  // of `resolveNetDiffBasis`, measured 5 → 11 git subprocesses and 1 → 2 network fetches per PR open; sharing
+  // brings that to 6 subprocesses and 1 fetch. Assembling it here instead would leave that sharing — and the
+  // `diffHunks` mapping below — pinned by nothing a test can observe at this call site.
+  const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha, pinRev: true });
+  requireScoredNetDiff(sig, refSha);
+
   const applyReviewEscalationLabel = () => {
-    const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: REPO, ...opts });
-    // xnsk54v — prefer the SCRATCH manifest (--manifest-file, the new off-tree carrier); fall back to the
-    // legacy tree-committed `.lane-manifest.json` off the ref for a lane that still commits it. Loaded BEFORE
-    // the net diff so #2390's per-repo `base` can seed the diff basis.
-    let manifest = LANE_MANIFEST;
-    if (!manifest) {
-      const manifestRaw = tryGit(['show', `${refSha}:.lane-manifest.json`]);
-      if (manifestRaw) { try { manifest = JSON.parse(manifestRaw); } catch { /* malformed — degrade to no manifest signal */ } }
-    }
-    // #2390 — score this lane on its OWN delta from the manifest per-repo `base` (its predecessor's tip when
-    // overlap-stacked), NOT the cumulative diff vs main — the SAME basis the drain backstop uses (#2373's
-    // no-drift invariant). The repo key comes from this clone's origin slug; a sibling lane has no base → null →
-    // the unchanged `origin/main` basis.
-    const originSlug = (() => { try { const u = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); const m = u.match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/); return m ? m[1] : null; } catch { return null; } })();
-    const baseRev = manifestBaseForRepo(manifest, repoKeyFromSlug(originSlug));
-    // #2890-review-fix finding 3 / #2890-review-r2 finding 3 — ALL of the net-diff escalation inputs come from
-    // the ONE shared derivation in merge-ai-prs.mjs (`computeNetDiffSignals`), which the drain's scoring loop
-    // also calls. It resolves the basis ONCE (one `git fetch`, one candidate probe) and feeds both the
-    // changed-file shape and the diff TEXT off it: the first cut called them independently and re-ran the whole
-    // of `resolveNetDiffBasis`, measured 5 → 11 git subprocesses and 1 → 2 network fetches per PR open; sharing
-    // brings that to 6 subprocesses and 1 fetch. Assembling it here instead would leave that sharing — and the
-    // `diffHunks` mapping below — pinned by nothing a test can observe at this call site.
-    const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha });
     const changedFiles = sig.changedFiles;
     const diffLines = sig.diffLines;
     // #2390-review-fix — the CUMULATIVE origin/main…head basis the gate-self/human trigger scores over; a
@@ -1272,18 +1283,16 @@ async function runCli() {
     // #2890 — that same basis's TEXT (not just the changed-file/line-count shape above). #2890-review-fix
     // finding 1 — the shared derivation applies `diffHunksFrom`, so this is the text when it was really
     // computed and `null` when it was NOT; never a raw `.text`, which is `''` on every failure path and so
-    // indistinguishable from a genuinely content-free diff. Still best-effort — an unresolvable basis degrades
-    // to `null` and never blocks a green land — but the signal now SAYS it is absent instead of impersonating
-    // an empty diff.
+    // indistinguishable from a genuinely content-free diff. An unresolvable basis degrades
+    // to `null`; the preflight refusal above prevents incomplete evidence from reaching this score.
     const diffHunks = sig.diffHunks;
     const crossRepo = manifest && Array.isArray(manifest.repos) ? manifest.repos.length > 1 : false;
     const dismissedFindings = manifest && Number.isFinite(Number(manifest.dismissedFindings)) ? Number(manifest.dismissedFindings) : 0;
     let currentLabels = [];
     try { currentLabels = (forge.viewPr(prNum, 'labels').labels || []).map((l) => l.name); } catch { /* fresh PR — no labels yet */ }
     // #3343 — whether that cumulative basis is provably this PR's file set (merge-base / ancestry) or the
-    // un-narrowed base TIP. `scored:false` means nothing was measured at all, which is a different fact from a
-    // measurement taken on the wrong basis — don't stamp the un-narrowed reason on an empty score.
-    const basisNarrowed = sig.scored ? sig.basisNarrowed !== false : true;
+    // un-narrowed base TIP. Incomplete measurements have already been refused above.
+    const basisNarrowed = sig.basisNarrowed !== false;
     const rubric = resolveProducerReviewLabel({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, currentLabels, diffHunks, basisNarrowed, deviation: parseDeviationDisclosure(BODY), sizeAdmission: sizeAdmission });
 
     // #2635 — BIND + RECONCILE the jury roster against the REAL diff. The pre-registered roster (the item's
@@ -1375,7 +1384,7 @@ async function runCli() {
   // wants the drain to land it must use `--label-on-green` (wait → label when green → hand off).
   let sizeOpenVerdict = null;
   if (sizeAdmission.reviewLabel) {
-    try { sizeOpenVerdict = applyReviewEscalationLabel(); } catch { /* best-effort forge IO, as for other review labels */ }
+    try { sizeOpenVerdict = applyReviewEscalationLabel(); } catch { /* best-effort forge IO; net diff already validated above */ }
   }
 
   if (PLAN.mode === 'open-only') {
@@ -1384,7 +1393,7 @@ async function runCli() {
     // only sees fully-green merge candidates. PR #3902 went red before that and was never reviewed. The score
     // needs no green (net diff + manifest), so apply it AT OPEN, like every other producer mode. Best-effort.
     let openVerdict = null;
-    try { openVerdict = sizeOpenVerdict || applyReviewEscalationLabel(); } catch { /* a scoring miss never blocks the open */ }
+    try { openVerdict = sizeOpenVerdict || applyReviewEscalationLabel(); } catch { /* best-effort forge IO; net diff already validated above */ }
     if (openVerdict?.label && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · #${prNum} review-escalation at open → ${openVerdict.label}\n`);
     if (!AS_JSON && LABEL) process.stderr.write(`pr-land [${REPO}] · #${prNum} opened UNLABELLED (--no-wait): use --label-on-green so the ${LABEL} label is applied only when required checks pass; the drain's ci-lifecycle reconcile labels its checking/ci:failed/blocked state on its next sweep (#2421)\n`);
     emit({ repo: REPO, merged: false, reason: 'opened', pr: Number(prNum), ref: REF, label: null, labelApplied: false, ...(openVerdict?.label ? { reviewLabel: openVerdict.label, reviewLabelApplied: openVerdict.apply } : {}), detail: `opened self-approved PR #${prNum} for ${REF} (--no-wait, no ready-to-merge label yet — CI not confirmed green; the drain's ci-lifecycle reconcile covers its checking/ci:failed/blocked state, #2421)` }, 0);
@@ -1480,6 +1489,7 @@ async function runCli() {
   // #2307 — and the deterministic review-escalation label (review:human / review:pending), alongside
   // ready-to-merge — a green producer PR IS ready; the review label is the *landing gate*, which the drain
   // already honours (a couple with a human-required half withholds via the existing blockedBy/crossRepo path).
+
   const reviewVerdict = PLAN.labelWhenGreen ? applyReviewEscalationLabel() : { label: null, apply: false, reasons: [], humanRequired: false };
 
   // #2290 — pr-land NEVER merges: the drain is the SOLE writer to main. In the DEFAULT (land) mode, trigger a

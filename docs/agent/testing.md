@@ -4567,3 +4567,83 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Review diff identity races
+
+Review evidence must pin the head commit before merge-base and reuse that basis for
+text, paths and the recorded SHA. Disable Git replacement objects on every scoring
+read, including stack and fix-range diffs. A failed pin or merge-base stays unscored;
+the existing empty degraded-read refusal requires a resolvable checkout before review.
+`scripts/operations/__tests__/review-pr-io-pinned-head.test.mjs` uses real Git in a
+temporary repository, moves the tracking ref between merge-base and the first scoring
+diff, and covers replacement objects, missing commits and unrelated histories.
+
+Scorer diffs share `scripts/lib/hardened-git-diff.mjs`: fixed built-in rendering,
+no replacement objects, textconv, external drivers, renames or copies, and an empty
+attribute-source tree (including attributes committed in the head). The explicit
+`--attr-source` option refuses older Git rather than silently ignoring the environment.
+Every failed diff invalidates the paired text/path evidence; the operator must repair
+the checkout/read and rerun review, never treat partial evidence as clearance.
+The real-Git table in `review-pr-io-pinned-head.test.mjs` proves each hostile driver/
+attribute hides the executable hunk with the legacy plain diff before asserting the
+shared reader retains it. Replacement and ref-race cases reproduce origin/main's
+replace-enabled reads and mutable-ref scoring; half-failure cases reproduce its
+independently scored text/path reads. Run affected tests through heavy-admission.
+External-driver rows also assert the production command/environment policy:
+origin/main already used `--no-ext-diff` on text, but lacked environment removal
+and the shared hardening on numstat/path reads. Do not describe those existing
+text guards as a newly reproduced vulnerability. Bounded-output, stack, latest-fix
+and delta failures have named negative tests requiring a wholly unscored result.
+
+Scorer rendering ignores inherited Git config and pins repository-local diff defaults,
+including `core.bigFileThreshold`, without forcing binary blobs into text. An independent NUL-delimited
+raw oid diff must match the listed paths and rendered sections; each changed blob
+needs a hunk for automatic clearance. Mode-only sections are allowed; symlinks need hunks and changed
+submodules invalidate the complete read. The net-diff text reader opts into per-path
+`needsReview` for binary or changed-oid paths without hunks, retaining readable hunks
+and the stable `we-raw-blob` identities for every path. Strict readers still refuse those paths.
+Empty renderers, missing/mismatched sections, unreadable raw evidence and output bounds
+leave the whole result unscored: repair and rerun or
+request human review of the full diff. Pin these cases with real Git and an empty
+renderer stub in `review-pr-io-pinned-head.test.mjs` and `hardened-git-diff.test.mjs`.
+
+Raw full blob OIDs and modes for every changed path are bound into both strict and
+contribution fingerprints, independently of textual `index` headers, including mechanically excluded paths.
+Older fingerprints lacking raw identities cannot clear newly bound evidence; rerun
+review to record a fresh fingerprint. Binary output
+(including `GIT binary patch`) and changed OIDs without hunks require human review.
+An own-delta read failure retains the measured cumulative file set but stays
+`scored:false`; pr-land refuses that result before scoring or readiness labelling.
+Regression cases live in `hardened-git-diff.test.mjs`,
+`merge-ai-prs-net-diff-computation.test.mjs`, and `pr-land.test.mjs`.
+
+
+The drain's anti-test-gaming gate holds unscored and `needsReview` evidence for human review,
+including no-clone and file-list fallbacks; accepted review and matching old clearance cannot
+turn an inconclusive check into clearance. `merge-ai-prs-net-diff-computation.test.mjs` uses
+real Git with one binary change plus a deleted test to prove the readable removal still trips
+the detector. `merge-ai-prs-drain-verdict-ledger.test.mjs` covers incomplete-read holds;
+`hardened-git-diff.test.mjs` pins the per-path opt-in and unchanged whole-read backstops.
+Pr-land refuses partial signals; review-pr-io invalidates paired evidence and advisory
+conversion retains the strict reader. Run these scoped regressions through heavy-admission.
+
+Drain net-diff scoring pins the listing's `headRefOid` before merge-base and every diff,
+and compares both signal and text `revSha` with that head. Branch names only fetch objects.
+`merge-ai-prs-net-diff-computation.test.mjs` covers a moved clean branch, a mismatched
+resolved SHA, an unavailable head, and a matching SHA containing test removals. Missing or
+mismatched identity invalidates text and hunks as well as scoring: file-list fallbacks and
+old human clearance keep the tamper hold. Repair the read or request human review.
+
+Pr-land and other net-diff gates explicitly pin the intended full head SHA and compare
+signal/text `revSha` before accepting evidence. Full 40/64-hex revs always pin, even
+when an old caller passes `pinRev:false`; `origin/<sha>` is never a candidate.
+Identity/merge-base reads share the hardened diff environment with replacement objects
+disabled. Unreadable fork points or mismatched identity require repairing the read
+and rerunning, or human review of the full diff. `pr-land-pinned-sha.test.mjs`
+exercises moved refs, origin/SHA collisions, false replacement ancestry and all SHA reader defaults.
+
+Pinned-diff fixtures must answer identity and merge-base reads with full object IDs and
+provide raw blob records matching the rendered sections. Real-git CLI fixtures select
+the checkout through the subprocess `cwd` seam: hardened reads intentionally strip
+`GIT_DIR`. SHA spelling is canonicalized before identity comparisons; abbreviated
+fetch-parked heads bind to the verified full fetched identity, never a display ref.

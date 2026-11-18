@@ -1,3 +1,4 @@
+import { hardenedGitDiff, verifyRenderedDiff } from '../lib/hardened-git-diff.mjs';
 /**
  * @file scripts/conveyor/review-stack-base.mjs — stack-aware review (held item 177).
  *
@@ -333,9 +334,12 @@ export function stackBaseTree({ contained, topHead, root = ROOT, run = gitRun(ro
   } catch { return null; }
 }
 
-/** The top's own changed paths against the stack base tree. Throws on a failed read (the caller fails open). */
+/** The top's own changed paths against the stack base tree. Throws on a failed read (the scorer invalidates the paired evidence). */
 export function stackNetFiles({ tree, topHead, root = ROOT, run = gitRun(root) }) {
-  return run(['diff', '--name-only', '--no-renames', '--end-of-options', tree, topHead]).split('\n').filter(Boolean);
+  const exec = (_cmd, args, opts) => run(args, opts);
+  const paths = String(hardenedGitDiff(exec, ['diff', '--name-only', '-z', '--end-of-options', tree, topHead])).split('\0').filter(Boolean);
+  const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', tree, topHead]));
+  return verifyRenderedDiff(exec, tree, topHead, text, { paths });
 }
 
 /**
@@ -343,7 +347,7 @@ export function stackNetFiles({ tree, topHead, root = ROOT, run = gitRun(root) }
  * basis, so the fingerprint of a stacked review and of the same change after restack onto main are comparable.
  */
 export function stackNetDiffText({ tree, topHead, root = ROOT, run = gitRun(root) }) {
-  return run(['diff', '--no-ext-diff', '--end-of-options', tree, topHead]);
+  return hardenedGitDiff((_cmd, args, opts) => run(args, opts), ['diff', '--end-of-options', tree, topHead]);
 }
 
 /**
@@ -356,8 +360,8 @@ export function stackNetDiffText({ tree, topHead, root = ROOT, run = gitRun(root
 export function mainNetDiffText({ headRefName, headRefOid }, { root = ROOT } = {}) {
   if (!SHA.test(String(headRefOid ?? '')) || !LANE_REF.test(String(headRefName ?? ''))) return { text: '', base: null, rev: null, scored: false };
   const exec = (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: root, timeout: 120e3, maxBuffer: 64 * 1024 * 1024, ...o });
-  const net = computeNetDiffText({ exec, rev: headRefOid, fetchExtraRefs: [headRefName] });
-  return net?.scored && net.rev === headRefOid ? net : { text: '', base: null, rev: null, scored: false };
+  const net = computeNetDiffText({ exec, rev: headRefOid, fetchExtraRefs: [headRefName], pinRev: true });
+  return net?.scored && net.revSha === headRefOid ? net : { text: '', base: null, rev: null, scored: false };
 }
 
 /**
@@ -407,14 +411,16 @@ export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root)
         const parent = out(['rev-parse', '--verify', `${mc}^1`]);
         const fork = SHA.test(parent) ? out(['merge-base', '--end-of-options', head, parent]) : '';
         if (!SHA.test(fork)) return false;
-        const paths = run(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', fork, head]).split('\0').filter(Boolean);
-        return paths.length > 0 && ok(['diff', '--quiet', '--no-ext-diff', '--end-of-options', mc, base, '--', ...paths]);
+        const paths = hardenedGitDiff((_cmd, args, opts) => run(args, opts), ['diff', '--name-only', '-z', '--end-of-options', fork, head]).split('\0').filter(Boolean);
+        if (!paths.length) return false;
+        try { hardenedGitDiff((_cmd, args, opts) => run(args, opts), ['diff', '--quiet', '--end-of-options', mc, base, '--', ...paths]); return true; }
+        catch { return false; }
       },
       // The bottom's OWN change as the merge saw it: its head against its fork point from the merge commit's first parent.
       ownPatch: (sha, mc) => {
         const parent = out(['rev-parse', '--verify', `${mc}^1`]);
         const fork = SHA.test(parent) ? out(['merge-base', '--end-of-options', sha, parent]) : '';
-        const text = SHA.test(fork) ? run(['diff', '--no-ext-diff', '--end-of-options', fork, sha]) : '';
+        const text = SHA.test(fork) ? hardenedGitDiff((_cmd, args, opts) => run(args, opts), ['diff', '--end-of-options', fork, sha]) : '';
         return text.trim() ? fingerprintOf(text) : null;
       },
     };

@@ -17,6 +17,7 @@ import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../re
 import { redTeamGateMarker } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import * as redTeamGate from '../red-team-gate.mjs';
+import * as ghThrottle from '../gh-throttle.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { buildOperatorActionComment, planOperatorControl, CONTROL_OPS } from '../../operations/operator-controls.mjs';
@@ -373,7 +374,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   // carry the CLI makes is one the R706 reader accepts. `{ fingerprint: false }` is the diff-less plateau-app #217 shape.
   let clearedFpMemo = null;
   const clearedFp = () => clearedFpMemo ??= normalizeDiffFingerprint(readNetDiffAtHead({
-    exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } }),
+    exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir, env: { ...opts.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } }),
     headSha: heads.cleared, headRef: heads.cleared }).text);
   const clearComment = ({ fingerprint = true } = {}) => ({ id: 'IC_human_clearance', author: { login: 'chalbert' },
     body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n${fingerprint ? `${buildReviewedDiffMarker(clearedFp())}\n` : ''}<!-- cleared-human: chalbert -->` });
@@ -397,9 +398,13 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     };
     const chunks = [];
     const realExit = process.exit.bind(process);
-    const prev = { GIT_DIR: process.env.GIT_DIR, WE_ACCEPT_CARRY_FORWARD: process.env.WE_ACCEPT_CARRY_FORWARD };
+    const prev = { WE_ACCEPT_CARRY_FORWARD: process.env.WE_ACCEPT_CARRY_FORWARD };
+    // Production restamp children select their checkout with cwd, not stripped GIT_DIR.
+    const gitExec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation((cmd, args, opts) => {
+      if (cmd !== 'git') throw new Error('unexpected non-git read');
+      return execFileSync(cmd, args, { ...opts, cwd: dir });
+    });
     process.exit = (code) => { const e = new Error('process.exit'); e.exitCode = code; throw e; };
-    process.env.GIT_DIR = join(dir, '.git');
     process.env.WE_ACCEPT_CARRY_FORWARD = setting;
     let exitCode = 0;
     try {
@@ -414,6 +419,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
       });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; } finally {
       process.exit = realExit;
+      gitExec.mockRestore();
       for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     }
     return { exitCode, writes, reads, out: chunks.join('') };
@@ -1392,7 +1398,7 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
   const read = (texts, carrySetting = 'on', { comments = view.comments, readReviews = () => [] } = {}) => readDrainAcceptance({
     pr: 217, repo: 'plateauapp/plateau-app', cwd: '/clone', carrySetting, readReviews,
     exec: (cmd) => { if (cmd === 'gh') return JSON.stringify({ ...view, comments }); throw new Error('unexpected'); },
-    netDiff: ({ rev }) => (texts[rev] == null ? { scored: false } : { scored: true, text: texts[rev], rev }) });
+    netDiff: ({ rev }) => (texts[rev] == null ? { scored: false } : { scored: true, text: texts[rev], rev, revSha: rev }) });
 
   // PR #4631 round 7 (red-team): the derived fingerprint is only derived for an accept that still STANDS — the same
   // later-objection rule the restamp path applies. Each objection shape, and each read miss, leaves SHA identity.

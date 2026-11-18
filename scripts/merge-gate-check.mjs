@@ -271,8 +271,8 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
       catch { /* may already be present (merge group history); the cat-file probe below decides */ }
       try { gitExec('git', ['cat-file', '-e', `${pin.sha}^{commit}`], { stdio: ['ignore', 'ignore', 'pipe'] }); }
       catch (e) { throw new Error(`pinned head ${pin.sha.slice(0, 9)} is not fetchable: ${firstLine(e)}`); }
-      const sig = computeNetDiffSignals({ exec: gitExec, rev: pin.sha, baseRev: facts.manifest?.live?.base ?? null, fetchExtraRefs: [] });
-      if (!sig.scored || sig.netDiffText?.rev !== pin.sha) {
+      const sig = computeNetDiffSignals({ exec: gitExec, rev: pin.sha, baseRev: facts.manifest?.live?.base ?? null, fetchExtraRefs: [], pinRev: true });
+      if (!sig.scored || sig.revSha !== pin.sha || sig.netDiffText?.revSha !== pin.sha) {
         facts.netSignals = { scored: false, error: `net diff not computed at the pinned head ${pin.sha.slice(0, 9)} (${sig.netDiffText?.rev ? `resolved ${sig.netDiffText.rev}` : sig.netDiffText?.reason || 'unscored'})` };
       } else facts.netSignals = sig;
     } catch (e) { facts.netSignals = { scored: false, error: firstLine(e) }; }
@@ -290,7 +290,7 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
     else {
       try {
         const acc = readDrainAcceptance({ pr: num, repo, cwd, local: true, exec: (c, a, o) => exec(c, a, { cwd, ...o }),
-          netDiff: (o) => { const t = computeNetDiffText({ ...o, rev: pin.sha, fetchExtraRefs: [] }); return t?.rev === pin.sha ? t : { ...t, scored: false }; } });
+          netDiff: (o) => { const t = computeNetDiffText({ ...o, rev: pin.sha, fetchExtraRefs: [], pinRev: true }); return t?.revSha === pin.sha ? t : { ...t, scored: false }; } });
         facts.acceptance = acc?.headSha === pin.sha ? acc : { error: `acceptance read saw head ${String(acc?.headSha).slice(0, 9)}, not the pinned ${pin.sha.slice(0, 9)}` };
       } catch (e) { facts.acceptance = { error: firstLine(e) }; }
     }

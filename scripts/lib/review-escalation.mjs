@@ -1658,6 +1658,7 @@ export function normalizeDiffFingerprint(diffText) {
     const line = lines[i];
     // A `diff --git` header opens a new file section and therefore always ends any skip in progress.
     if (line.startsWith('diff --git ')) inManifestSection = isMechanicalDiffSection(lines, i);
+    if (line.startsWith('we-raw-blob ')) { kept.push(line); continue; }
     if (inManifestSection) continue;
     if (!keepIndexAt.has(i) && /^index [0-9a-f]+\.\.[0-9a-f]+/.test(line)) continue;
     kept.push(line);
@@ -1838,6 +1839,7 @@ export function normalizeContributionFingerprint(diffText) {
       if (!inManifestSection) kept.push(line);
       continue;
     }
+    if (line.startsWith('we-raw-blob ')) { kept.push(line); continue; }
     if (inManifestSection) continue;
     const hunk = HUNK_RE.exec(line);
     if (hunk) {
@@ -2211,7 +2213,8 @@ export function headEverHumanCleared(comments, headSha, options) {
  * @returns {boolean}
  */
 export function shouldReparkForTestTampering({ tampered, netDiffScored, humanClearedSha = null, headSha = null } = {}) {
-  if (!tampered || !netDiffScored) return false;
+  if (netDiffScored !== true) return true; // incomplete evidence never clears the tampering hold
+  if (!tampered) return false;
   return !(humanClearedSha && headSha && humanClearedSha === headSha);
 }
 

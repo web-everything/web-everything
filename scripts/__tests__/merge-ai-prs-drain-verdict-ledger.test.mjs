@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { recordDrainVerdict, recordParkVerdict, recordDrainHold, drainHoldReasonCode } from '../merge-ai-prs.mjs';
+import { recordDrainVerdict, recordParkVerdict, recordDrainHold, drainHoldReasonCode, scanDrainTestTampering } from '../merge-ai-prs.mjs';
 import { VERDICTS, AGREEMENT, readVerdictLedger, foldRepo, compareLedgerToLabels, parseLedgerEvents, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { REVIEW_LABELS, decideReviewGate } from '../lib/review-escalation.mjs';
 
@@ -279,4 +279,23 @@ describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () =>
     expect(src.slice(dry, dry + 900)).toContain('v.certifyLabel || v.aiGenerated');
     expect(src.indexOf('recordDrainHold({ repo:', dry)).toBeLessThan(src.indexOf("postDrainReasonComment(v.repo, v.num, 'skip'", dry));
   });
+});
+
+import { shouldReparkForTestTampering, decideParkToHuman } from '../lib/review-escalation.mjs';
+
+describe('drain refuses inconclusive anti-test-gaming evidence', () => {
+  it.each([{ text: '', scored: false, reason: 'no-clone' }, { text: '', scored: false, reason: 'diff-failed' },
+    { text: '', scored: true, needsReview: ['payload'] }])('parks accepted review after the file-list fallback: %j', net => {
+      const gaming = scanDrainTestTampering(net);
+      expect(gaming.reasons.join(' ')).toMatch(/human review/);
+      expect(shouldReparkForTestTampering({ tampered: gaming.tampered,
+        netDiffScored: net.scored && !net.needsReview?.length,
+        humanClearedSha: 'same', headSha: 'same' })).toBe(true);
+      const park = decideParkToHuman({ currentLabels: ['review:accepted'] });
+      expect(JSON.stringify(park)).toContain('review:human');
+      expect(JSON.stringify(park)).toContain('review:accepted');
+      const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+      expect(src).toContain('const gaming = scanDrainTestTampering(netDiffText)');
+      expect(src).toContain('netDiffScored: netDiffText.scored && !netDiffText.needsReview?.length');
+    });
 });
