@@ -247,7 +247,8 @@ describe('source log', () => {
     const options = { platform: null, env: { [POLICY_CASCADE_LOG_ENV]: '1' }, log: line => lines.push(line) };
     const generations = [];
     for (let i = 0; i < 2; i++) {
-      generations.push(writeOperatorOverride({ file: path, key: 'reviewConcurrency.maxLiveReviewRounds', value: 5, reason: 'repeat', actor: 'test' }).generation);
+      generations.push(writeOperatorOverride({ file: path, key: 'reviewConcurrency.maxLiveReviewRounds', value: 5, reason: 'repeat', actor: 'test',
+        readLogGenerations: () => ({ max: 0, complete: true }) }).generation);
       cascadePolicy('reviewConcurrency', {}, options);
       cascadePolicy('reviewConcurrency', {}, options);
     }

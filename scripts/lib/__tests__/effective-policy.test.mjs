@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { formatCascadeSourcesLine } from '../policy-cascade.mjs';
-import { parseCascadeLines, effectiveForKeys, shadowWarnings, readEffectivePolicies, writeWithEffective, effectiveOverrideReport } from '../effective-policy.mjs';
+import { readCascadeGenerationWatermark, parseCascadeLines, effectiveForKeys, shadowWarnings, readEffectivePolicies, writeWithEffective, effectiveOverrideReport } from '../effective-policy.mjs';
 import { discoverDaemonLogPaths } from '../../operations/daemon-log-paths.mjs';
 
 const key = 'reviewConcurrency.maxLiveReviewRounds';
@@ -113,10 +113,10 @@ describe('effective policy observations', () => {
         return { ProgramArguments: ['node', script, '--pass=audit'], StandardOutPath: `${script}.log` };
       },
     });
-    expect(paths.review).toBe('/review-daemon.mjs.log');
-    expect(paths.builder).toBe('/build-dispatch-daemon.mjs.log');
-    expect(paths['pass:audit']).toBe('/pass-daemon.mjs.log');
-    expect(paths.fix).toContain('fix-dispatch-daemon.log');
+    expect(paths.review.path).toBe('/review-daemon.mjs.log');
+    expect(paths.build.path).toBe('/build-dispatch-daemon.mjs.log');
+    expect(paths.pass.path).toBe('/pass-daemon.mjs.log');
+    expect(paths.fix.path).toContain('fix-dispatch-daemon.log');
   });
 });
 
@@ -137,4 +137,53 @@ it('a latest legacy or unknown line replaces earlier generation evidence', () =>
     const parsed = parseCascadeLines(line(8, 'operator-db', 4) + '\n' + line(8, 'operator-db', gen));
     expect(parsed.reviewConcurrency.gen).toBeNull();
   }
+});
+
+it('retains and waits for both labels of one daemon family', async () => {
+  const paths = discoverDaemonLogPaths({ home: 'home', coordinationRoot: 'coord',
+    listFiles: () => [], listPlists: () => ['review-one', 'review-two'],
+    readPlist: path => ({ ProgramArguments: ['node', '/review-daemon.mjs'], StandardOutPath: path + '.log' }),
+  });
+  expect(paths['review-one']).toEqual({ family: 'review', path: expect.stringContaining('review-one.plist.log') });
+  expect(paths['review-two']).toEqual({ family: 'review', path: expect.stringContaining('review-two.plist.log') });
+  let adopted = false;
+  const tail = vi.fn(path => ({ text: line(8, 'operator-db', path.includes('review-two') && !adopted ? 2 : 3) }));
+  const sleep = vi.fn(async () => { adopted = true; });
+  const result = await writeWithEffective({ waitMs: 1 }, {
+    read: () => readEffectivePolicies({ discover: () => paths, tail }),
+    write: () => ({ key, new: 8, generation: 3 }), now: () => 0, sleep, pollMs: 1,
+  });
+  expect(sleep).toHaveBeenCalledOnce();
+  expect(result.observation).toBe('observed');
+  expect(result.after[key]).toHaveProperty('review-one');
+  expect(result.after[key]).toHaveProperty('review-two');
+});
+
+it('generation recovery scans earlier higher lines across all discovered labels', () => {
+  const discover = () => ({ one: { family: 'review', path: 'one' }, two: { family: 'review', path: 'two' } });
+  const tail = vi.fn(path => ({ text: path === 'one' ? line(8, 'env', 9000) + '\n' + line(8, 'env', 2) : line(8, 'env', 10000) }));
+  expect(readCascadeGenerationWatermark({ discover, tail })).toEqual({ max: 10000, complete: true });
+  expect(tail.mock.calls.every(([, options]) => options.requireComplete)).toBe(true);
+});
+it.each(['unreadable', 'oversized', 'missing', 'unknown'])('generation recovery refuses %s evidence', mode => {
+  expect(readCascadeGenerationWatermark({ discover: () => ({ review: 'log' }), tail: () => {
+    if (mode === 'unreadable') throw Error('denied');
+    return mode === 'missing' ? null : { text: line(8, 'env', mode === 'unknown' ? null : 9000), truncated: mode === 'oversized' };
+  } }).complete).toBe(false);
+  expect(readCascadeGenerationWatermark({ discover: () => { throw Error('plist unavailable'); } }).complete).toBe(false);
+});
+it('oversized real logs leave recovery incomplete instead of trusting a bounded tail', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'generation-bound-'));
+  const path = join(dir, 'daemon.log');
+  try {
+    writeFileSync(path, line(8, 'env', 9000) + '\n' + line(8, 'env', 2));
+    expect(readCascadeGenerationWatermark({ discover: () => ({ review: path }), maxBytes: 32 })).toEqual({ max: 0, complete: false });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each([['empty', ''], ['non-cascade-only', 'daemon started\nwaiting for work\n']])('generation recovery requires evidence in every readable log: %s', (_name, text) => {
+  expect(readCascadeGenerationWatermark({
+    discover: () => ({ observed: 'observed', rotated: 'rotated' }),
+    tail: path => ({ text: path === 'observed' ? line(8, 'env', 9000) : text }),
+  })).toEqual({ max: 9000, complete: false });
 });

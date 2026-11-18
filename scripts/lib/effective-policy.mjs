@@ -63,10 +63,11 @@ export function effectiveOverrideReport(values, parsedByDaemon, generation = nul
 }
 
 /** Read a bounded tail from one descriptor. */
-function policyTail(path, { maxBytes }) {
+function policyTail(path, { maxBytes, requireComplete = false }) {
   const fd = openSync(path, 'r');
   try {
     const { size } = fstatSync(fd);
+    if (requireComplete && size > maxBytes) throw Error('log exceeds generation scan bound; inspect daemon logs');
     const start = Math.max(0, size - maxBytes), buffer = Buffer.alloc(size - start);
     const count = readSync(fd, buffer, 0, buffer.length, start);
     if (count !== buffer.length) throw Error('log truncated during read');
@@ -84,7 +85,7 @@ export function readEffectivePolicies({ discover = discoverDaemonLogPaths, tail 
   return Object.fromEntries(Object.entries(paths).map(([daemon, path]) => {
     let text = '';
     try {
-      const result = tail(path, { maxBytes });
+      const result = tail(typeof path === 'string' ? path : path.path, { maxBytes });
       if (result && !result.error) {
         text = result.text;
         if (result.truncated) text = text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '';
@@ -93,6 +94,33 @@ export function readEffectivePolicies({ discover = discoverDaemonLogPaths, tail 
     const parsed = parseCascadeLines(text);
     return [daemon, parsed];
   }));
+}
+
+/** Scan every retained cascade line, not just the latest policy observation.
+ * Oversized/unreadable logs make recovery unconfirmed; operators must restore evidence.
+ */
+export function readCascadeGenerationWatermark({ discover = discoverDaemonLogPaths, tail = policyTail,
+  maxBytes = 8 * 1024 * 1024 } = {}) {
+  let max = 0, complete = true;
+  try {
+    const paths = discover({ safe: (_source, fn) => fn() });
+    for (const entry of Object.values(paths)) {
+      try {
+        const result = tail(typeof entry === 'string' ? entry : entry.path, { maxBytes, requireComplete: true });
+        if (!result || result.error || result.truncated || typeof result.text !== 'string') throw Error('incomplete log');
+        let hasGeneration = false;
+        for (const line of result.text.split('\n')) {
+          if (!marker.test(line)) continue;
+          const suffix = line.match(/ · operator-gen=(\d+|unknown)$/);
+          const gen = suffix && Number(suffix[1]);
+          if (Number.isSafeInteger(gen) && gen >= 0) { max = Math.max(max, gen); hasGeneration = true; }
+          else complete = false;
+        }
+        if (!hasGeneration) complete = false;
+      } catch { complete = false; }
+    }
+  } catch { complete = false; }
+  return { max, complete };
 }
 
 /** Capture before publication; only committed generations confirm observation. Write errors propagate. */

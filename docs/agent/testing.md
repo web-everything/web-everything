@@ -4589,13 +4589,18 @@ review-job and review-daemon suites.
 Observation success requires every discovered daemon's latest policy line to report a value/source
 and `operator-gen` at least the generation returned by the write. Missing, unknown or lower
 generations, absent policy lines and unreadable logs remain unconfirmed; inspect daemon logs on
-timeout. Shadows still warn even when observation succeeds. The locked writer uses a monotonic counter seeded from the clock:
-`max(previous + 1, Date.now())`, a strictly increasing safe integer in epoch milliseconds.
-Losing generation evidence seeds from the clock rather than restarting at 1. The reserved
-`_generation` key and override values commit in one atomic file rename; a failed rename changes
-neither. Readers strip only this metadata before validating override keys. Legacy stores without
-it and missing, invalid or unreadable generation evidence report `null` (unconfirmed) until the
-next write. Counter exhaustion refuses the write and directs the operator to repair the store.
-Tests cover clock seeding/regression, lost evidence, failed set/clear commits, set/clear bumps,
-concurrent ordering, suffix round trips, shadows and bounded timeout.
+timeout. Shadows still warn even when observation succeeds. Discovery keys plist logs by unique
+label and retains their family; two instances of one family must both adopt.
+The locked writer advances above the stored generation, the clock and every retained cascade-log
+generation. Recovery scans all lines (not only the latest policy line), capped at 8 MiB per log.
+Every discovered log must contain a valid generation-bearing cascade line; readable empty or
+non-cascade-only logs are incomplete evidence. Missing metadata plus unreadable, oversized, unknown
+or incomplete daemon evidence commits a null
+generation and leaves set/clear unconfirmed; restore the metadata/log evidence and retry, or inspect
+daemon logs manually. A clock value alone cannot prove recovery. The reserved `_generation` key
+and override values commit in one atomic rename; a failed rename changes neither. Persisted-value
+assertions must read raw JSON and strip only `_generation`, never use the normalizing reader.
+Counter exhaustion refuses the write and directs the operator to repair the store. Tests cover
+clock regression, lost evidence, historical log maxima, incomplete/oversized logs, duplicate-family
+labels, failed set/clear commits, concurrent ordering, suffix round trips and bounded timeout.
 Run these tests through heavy-admission, using `--wait-ms=0` in store-only CLI fixtures.

@@ -2,6 +2,7 @@
  * Audit is appended before atomic publication; a failed audit never changes the store.
  */
 import { appendFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { readCascadeGenerationWatermark } from './effective-policy.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -15,7 +16,7 @@ function validateAttribution({ reason, actor }) {
     if (typeof value !== 'string' || !value.trim()) throw Error(`operator-override: ${key} must be non-empty`);
 }
 function publish({ file = operatorOverridesPath(), key, value, reason, actor,
-  io = { appendFileSync, writeFileSync, renameSync }, lockWaitMs = 5000 }, clear) {
+  io = { appendFileSync, writeFileSync, renameSync }, lockWaitMs = 5000, readLogGenerations = readCascadeGenerationWatermark }, clear) {
   validateKey(key);
   validateAttribution({ reason, actor });
   if (!clear && !CAPACITY_LEAVES[key].validate(value)) throw Error(`operator-override: invalid ${key}: type or value outside hard range`);
@@ -24,9 +25,13 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
   const locked = withNumberingLock(() => {
     const current = readOperatorSnapshot({ file, normalize: false });
     if (!current.readable || current.invalidPolicies?.length) throw Error('operator-override: unreadable or invalid store; repair it before writing');
-    // Monotonic counter seeded from epoch ms: losing generation evidence cannot restart at 1.
-    const generation = Math.max((current.generation ?? 0) + 1, Date.now());
-    if (!Number.isSafeInteger(generation))
+    let logs;
+    try { logs = readLogGenerations(); } catch { logs = null; }
+    const validMax = Number.isSafeInteger(logs?.max) && logs.max >= 0;
+    const candidate = Math.max((current.generation ?? 0) + 1, Date.now(), validMax ? logs.max + 1 : 0);
+    // Without metadata and complete logs the clock cannot prove a fresh generation.
+    const generation = current.generation === null && !(validMax && logs.complete === true) ? null : candidate;
+    if (!Number.isSafeInteger(candidate))
       throw Error('operator-override: exhausted generation; ask the operator to repair the store');
     const values = current.values;
     const before = { ...values };

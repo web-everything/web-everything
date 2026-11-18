@@ -99,7 +99,7 @@ export function createWhyReader({
     facts.backoffs = safe('build backoffs', () => readBackoffs(), []).filter(matches);
     facts.prepareFailures = Object.values(safe('prepare failures', readPrepareFailures, { failures: {} }).failures ?? {}).filter(matches).sort((a, b) => Number(Boolean(b.held && !b.completed)) - Number(Boolean(a.held && !a.completed)) || String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')));
     const paths = discoverDaemonLogPaths({ home, coordinationRoot, listFiles, listPlists, readPlist, safe });
-    facts.logs = Object.entries(paths).map(([name, path]) => ({ name, path, kb: 512, line: safe(`log ${name}`, () => {
+    facts.logs = Object.entries(paths).map(([label, { family: name, path }]) => ({ label, family: name, name, path, kb: 512, line: safe(`log ${name}`, () => {
       const result = tail(path, { maxBytes: 512 * 1024 }); if (!result || result.error) throw new Error(result?.error ?? 'log missing');
       return lastMentionLine(result.text, subject);
     }, null) }));

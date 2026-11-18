@@ -29,10 +29,11 @@ const writerIO = {
   },
 };
 
+const rawValues = path => { const data = JSON.parse(readFileSync(path, 'utf8')); delete data._generation; return data; };
 let dir, file, store;
 const key = 'reviewConcurrency.maxLiveReviewRounds';
 const actor = 'capacity operator';
-const write = (value, extra = {}) => store.writeOperatorOverride({ file, key, value, reason: 'capacity experiment', actor, io: writerIO, ...extra });
+const write = (value, extra = {}) => store.writeOperatorOverride({ file, key, value, reason: 'capacity experiment', actor, io: writerIO, readLogGenerations: () => ({ max: 0, complete: true }), ...extra });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'operator-overrides-'));
   file = join(dir, 'operator-overrides.json');
@@ -138,19 +139,19 @@ describe('capacity-only operator store', () => {
     vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
     expect(store.readOperatorOverrides().values).toEqual({ [key]: 2 });
     store.writeOperatorOverride({ key, value: 3, reason: 'fixed host path', actor });
-    expect(store.readOperatorOverrides({ file: fixed }).values).toEqual({ [key]: 3 });
+    expect(rawValues(fixed)).toEqual({ [key]: 3 });
     expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 5 });
     write(4);
     expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 4 });
-    expect(store.readOperatorOverrides({ file: fixed }).values).toEqual({ [key]: 3 });
+    expect(rawValues(fixed)).toEqual({ [key]: 3 });
     store.clearOperatorOverride({ key, reason: 'fixed host clear', actor });
-    expect(store.readOperatorOverrides({ file: fixed }).values).toEqual({});
+    expect(rawValues(fixed)).toEqual({});
     expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 4 });
   });
   it('stores flat dotted JSON, preserves siblings, and appends ISO audit records for set and clear', () => {
     write(2); write(3); write(7, { key: 'host.maxReviewDispatchPerTick' });
     store.clearOperatorOverride({ file, key, reason: 'experiment over', actor });
-    expect(store.readOperatorOverrides({ file }).values).toEqual({ 'host.maxReviewDispatchPerTick': 7 });
+    expect(rawValues(file)).toEqual({ 'host.maxReviewDispatchPerTick': 7 });
     const rows = readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(4);
     expect(rows[0]).toMatchObject({ actor, osUser: userInfo().username, reason: 'capacity experiment', key, old: null, new: 2, source: 'operator-cli' });
@@ -169,12 +170,12 @@ describe('capacity-only operator store', () => {
     expect(io.events[publish].slice(1)).toEqual([temporary, file]);
     expect(io.events.filter(([op]) => op === 'rename')).toHaveLength(1);
     expect(JSON.parse(readFileSync(file, 'utf8'))._generation).toBe(store.readOperatorGeneration({ file }));
-    expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 3 });
+    expect(rawValues(file)).toEqual({ [key]: 3 });
   });
   it('audit append failure preserves the existing override store and propagates failure', () => {
     write(2); const before = readFileSync(file); io.events = []; io.fail = 'append';
     expect(() => write(3)).toThrow(/audit unavailable/);
-    expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 2 });
+    expect(rawValues(file)).toEqual({ [key]: 2 });
     expect(readFileSync(file)).toEqual(before);
     expect(io.events.map(([op]) => op)).toEqual(['append']);
     io.fail = null; write(4); // Failure also releases the transaction lock.
@@ -241,7 +242,7 @@ describe('capacity-only operator store', () => {
       };
       syncBuiltinESMExports();
       writeOperatorOverride({ file: process.argv[1], key: process.argv[2], value: 3,
-        reason: 'concurrent regression', actor: 'test process' });
+        reason: 'concurrent regression', actor: 'test process', readLogGenerations: () => ({ max: 0, complete: true }) });
       process.disconnect();`;
     const children = [key, 'host.maxReviewDispatchPerTick'].map(k => {
       const child = spawn(process.execPath, ['--input-type=module', '-e', code, file, k],
@@ -307,8 +308,8 @@ it.each(['write', 'clear'])('R907 default %s ignores the env-selected path', ope
   const options = { key, value: 3, reason: 'fixed path regression', actor };
   if (operation === 'write') store.writeOperatorOverride(options);
   else store.clearOperatorOverride(options);
-  expect(store.readOperatorOverrides({ file: fixed }).values).toEqual(operation === 'write' ? { [key]: 3 } : {});
-  expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 5 });
+  expect(rawValues(fixed)).toEqual(operation === 'write' ? { [key]: 3 } : {});
+  expect(rawValues(file)).toEqual({ [key]: 5 });
 });
 
 const auditRows = () => readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
@@ -324,14 +325,14 @@ describe('normalized writes return and audit every effective change', () => {
   it('a floor write above the stored ceiling reports and audits the value actually stored', () => {
     write(1, { key: CEILING });
     const result = write(7, { key: FLOOR });
-    expect(store.readOperatorOverrides({ file }).values).toEqual({ [CEILING]: 1, [FLOOR]: 1 });
+    expect(rawValues(file)).toEqual({ [CEILING]: 1, [FLOOR]: 1 });
     expect(result).toMatchObject({ key: FLOOR, old: null, new: 1, requested: 7 });
     expect(auditRows().at(-1)).toMatchObject({ key: FLOOR, old: null, new: 1, requested: 7 });
   });
   it('a ceiling write below the stored floor audits the secondary floor change as its own row', () => {
     write(7, { key: FLOOR });
     const result = write(3, { key: CEILING });
-    expect(store.readOperatorOverrides({ file }).values).toEqual({ [FLOOR]: 3, [CEILING]: 3 });
+    expect(rawValues(file)).toEqual({ [FLOOR]: 3, [CEILING]: 3 });
     expect(result.changes).toEqual([
       { key: CEILING, old: null, new: 3 }, { key: FLOOR, old: 7, new: 3 },
     ]);
@@ -341,14 +342,14 @@ describe('normalized writes return and audit every effective change', () => {
     write(5, { key: FLOOR }); write(2, { key: CEILING }); write(9, { key: FLOOR }); write(4, { key: CEILING });
     store.clearOperatorOverride({ file, key: CEILING, reason: 'reset', actor, io: writerIO });
     write(6, { key: key });
-    expect(replayAudit(auditRows())).toEqual(store.readOperatorOverrides({ file }).values);
+    expect(replayAudit(auditRows())).toEqual(rawValues(file));
   });
 });
 
 it('a hand-edited inverted store audits the floor the normalising write actually lowers', () => {
   writeFileSync(file, JSON.stringify({ [FLOOR]: 7, [CEILING]: 1 }));
   write(3);
-  expect(store.readOperatorOverrides({ file }).values).toEqual({ [FLOOR]: 1, [CEILING]: 1, [key]: 3 });
+  expect(rawValues(file)).toEqual({ [FLOOR]: 1, [CEILING]: 1, [key]: 3 });
   expect(auditRows()).toMatchObject([{ key, old: null, new: 3 }, { key: FLOOR, old: 7, new: 1 }]);
 });
 
@@ -368,7 +369,7 @@ it.each(['store', 'audit'])('lost generation with existing %s remains unconfirme
   else writeFileSync(join(dir, 'operator-overrides.log.jsonl'), JSON.stringify({ generation: 50 }) + '\n');
   expect(store.readOperatorSnapshot({ file }).generation).toBeNull();
   const before = Date.now();
-  expect(write(3).generation).toBeGreaterThanOrEqual(before);
+  expect(write(3, { readLogGenerations: () => ({ max: 0, complete: true }) }).generation).toBeGreaterThanOrEqual(before);
 });
 it.each(['set', 'clear'])('a failed single commit preserves both values and generation on %s', operation => {
   write(2);
@@ -388,4 +389,63 @@ it.each(['set', 'clear'])('a failed single commit preserves both values and gene
 it('refuses exhausted generation with an operator fallback', () => {
   writeFileSync(file, JSON.stringify({ _generation: Number.MAX_SAFE_INTEGER, [key]: 2 }));
   expect(() => write(3)).toThrow('ask the operator to repair');
+});
+
+it('raw persisted assertions expose an inverted floor instead of normalizing it', () => {
+  writeFileSync(file, JSON.stringify({ [FLOOR]: 7, [CEILING]: 1, _generation: 9 }));
+  expect(rawValues(file)).toEqual({ [FLOOR]: 7, [CEILING]: 1 });
+});
+it.each([['set', false], ['clear', false], ['set', true], ['clear', true]])('lost metadata with regressed clock leaves %s unconfirmed (complete logs: %s)', async (operation, complete) => {
+  writeFileSync(file, JSON.stringify({ [key]: 8 }));
+  vi.spyOn(Date, 'now').mockReturnValue(1000);
+  try {
+    const { writeWithEffective, parseCascadeLines } = await import('../effective-policy.mjs');
+    const result = await writeWithEffective({ waitMs: 1 }, {
+      write: () => (operation === 'set' ? store.writeOperatorOverride : store.clearOperatorOverride)({
+        file, key, value: 8, reason: 'recovery', actor, readLogGenerations: () => ({ max: 2000, complete }),
+      }),
+      read: () => ({ stale: parseCascadeLines('policy-cascade · reviewConcurrency: maxLiveReviewRounds=8 (operator-db) · operator-gen=2000') }),
+      now: () => 0, sleep: async () => {}, pollMs: 1,
+    });
+    expect(result.generation).toBe(complete ? 2001 : null);
+    expect(result.observation).toBe('timeout');
+    expect(result.pending.join(' ')).toContain('unconfirmed');
+    expect(store.readOperatorGeneration({ file })).toBe(complete ? 2001 : null);
+    const { finishOperatorOverride, OPERATOR_OVERRIDE_EFFECT } = await import('../../operations/operator-override.mjs');
+    const output = finishOperatorOverride({ run: { effects: [{ type: OPERATOR_OVERRIDE_EFFECT, status: 'applied', result }] }, code: 0, lines: [] });
+    expect(output.lines.join(' ')).toContain('unconfirmed');
+    expect(output.lines.join(' ')).not.toContain('observation: observed');
+  } finally { vi.restoreAllMocks(); }
+});
+it('recovery advances above every reachable log generation despite a regressed clock', () => {
+  writeFileSync(file, JSON.stringify({ [key]: 8 }));
+  vi.spyOn(Date, 'now').mockReturnValue(1000);
+  try { expect(write(8, { readLogGenerations: () => ({ max: 2000, complete: true }) }).generation).toBe(2001); }
+  finally { vi.restoreAllMocks(); }
+});
+
+it.each([
+  ['set', 'empty', ''], ['clear', 'empty', ''],
+  ['set', 'non-cascade-only', 'daemon started\n'], ['clear', 'non-cascade-only', 'daemon started\n'],
+])('lost metadata on %s with a readable %s recovery log stays unconfirmed when stale evidence reappears', async (operation, _name, text) => {
+  writeFileSync(file, JSON.stringify({ [key]: 8 }));
+  vi.spyOn(Date, 'now').mockReturnValue(1000);
+  try {
+    const { readCascadeGenerationWatermark, writeWithEffective, parseCascadeLines } = await import('../effective-policy.mjs');
+    let published = false;
+    const result = await writeWithEffective({ waitMs: 1 }, {
+      write: () => { published = true; return (operation === 'set' ? store.writeOperatorOverride : store.clearOperatorOverride)({
+        file, key, value: 8, reason: 'recovery', actor,
+        readLogGenerations: () => readCascadeGenerationWatermark({
+          discover: () => ({ review: 'rotated' }), tail: () => ({ text }),
+        }),
+      }); },
+      read: () => ({ review: parseCascadeLines(published ? 'policy-cascade · reviewConcurrency: maxLiveReviewRounds=8 (operator-db) · operator-gen=2000' : text) }),
+      now: () => 0, sleep: async () => {}, pollMs: 1,
+    });
+    expect(result.generation).toBeNull();
+    expect(store.readOperatorGeneration({ file })).toBeNull();
+    expect(result.observation).toBe('timeout');
+    expect(result.pending.join(' ')).toContain('unconfirmed');
+  } finally { vi.restoreAllMocks(); }
 });
