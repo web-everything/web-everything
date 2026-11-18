@@ -89,6 +89,10 @@ describe('R1047 attack table', () => {
     expect(evaluate(ledger([pass(), weak()]), { waivers }).ok).toBe(true);
     expect(evaluate(ledger([pass(), weak(), weak()]), { waivers }).ok).toBe(false);
   });
+  it('rule 0: identical commits with differently cased shas are an empty range, never a pass', () => {
+    expect(evaluate(ledger([pass({ base: HEAD.toUpperCase() })])).ok).toBe(false);
+    expect(evaluate(ledger([pass({ head: HEAD.toUpperCase(), base: HEAD })]), { head: HEAD.toUpperCase() }).ok).toBe(false);
+  });
   it('rule 0: an invalid timestamp stays blocked even with a matching waiver', () => {
     const waivers = [{ sha: HEAD, auditId: 'id-1', findings: weak().findings }];
     expect(evaluate(ledger([weak({ at: 'not-a-time' })]), { waivers }).ok).toBe(false);

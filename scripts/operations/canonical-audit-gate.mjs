@@ -2,16 +2,19 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { canonicalAuditEvidence, validSha } from './prototype-load.mjs';
+import { validSha } from './prototype-load.mjs';
+import { evaluateAudit } from '../lib/audit-ledger.mjs';
+import { dirname, join } from 'node:path';
 import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
-import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
+import { legacyFindAudit, QUESTION_HASH } from './codex-audit.mjs';
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
 function wellFormedAudit(record) {
+  if (record?.kind === 'genesis') return true; // chain anchor; the v2 evaluator verifies it
   if (!record || typeof record !== 'object' || Array.isArray(record)
     || !validSha(record.head) || !validSha(record.base)
     || typeof record.questionHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.questionHash)
@@ -21,7 +24,7 @@ function wellFormedAudit(record) {
   // Validate verdict/contradiction syntax with the canonical parser, even for a
   // historical question. The original hash still determines evidence eligibility.
   const candidate = { ...record, head: record.head.toLowerCase(), base: record.base.toLowerCase(), questionHash: QUESTION_HASH };
-  return findAudit([candidate], { head: candidate.head, base: candidate.base, questionHash: QUESTION_HASH, priorQuestionHashes: [] }) === candidate;
+  return legacyFindAudit([candidate], { head: candidate.head, base: candidate.base, questionHash: QUESTION_HASH, priorQuestionHashes: [] }) === candidate;
 }
 
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
@@ -37,7 +40,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     message: 'cannot resolve the PR source to a full 40-hex sha; resolve it with git rev-parse, then run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' };
   const refuse = (reason, detail) => ({ ok: false, reason, record: null, sha: fullSha,
     message: `${detail}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${fullSha}, then retry opening the PR.` });
-  let records, config;
+  let records, config, rawLedger, hwm, hwmPresent = false;
   try {
     // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
     // these scripts, never <repo>/scripts/settings — a sibling-repo target has none (#7011).
@@ -51,7 +54,12 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();
     config = { ruledWeakened: loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened,
       tool: tool.ruledWeakened, fs: { readFileSync: readFile }, env: { ...env, HOME: home }, warn }) };
-    const contents = readFile(resolveAuditRecordPath(tool, { home, cwd: repo }), 'utf8');
+    const ledgerPath = resolveAuditRecordPath(tool, { home, cwd: repo });
+    const contents = rawLedger = readFile(ledgerPath, 'utf8');
+    try {
+      const sidecar = String(readFile(join(dirname(ledgerPath), 'audits.hwm.json'), 'utf8'));
+      if (sidecar.trim()) { hwm = JSON.parse(sidecar); hwmPresent = true; }
+    } catch (error) { if (error?.code !== 'ENOENT') { hwm = null; hwmPresent = true; } }
     try {
       records = String(contents).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
     } catch {
@@ -88,13 +96,15 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   let evidence;
   try {
     const fp = liveFingerprint(records);
-    evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
+    // Design rule 8: every consumer evaluates the raw ledger through the one v2 evaluator.
+    const evaluate = extra => evaluateAudit(rawLedger, { head: fullSha, covers, liveFp: fp, hwm, hwmPresent, ...extra });
+    evidence = evaluate();
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
         if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
-        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
+        const waived = evaluate({ ruledWeakened: {
           ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
         } });
         if (waived.ok) { evidence = waived; break; }

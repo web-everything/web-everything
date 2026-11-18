@@ -9,6 +9,7 @@ import { classifySubmit } from '../open-pr.mjs';
 import { admitCanonicalAudit } from '../../pr-land.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
+import { appendChained } from '../../lib/audit-ledger-chain.mjs';
 
 const sha = 'a'.repeat(40);
 const base = 'b'.repeat(40);
@@ -135,10 +136,29 @@ describe('open-pr canonical gate', () => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
     const { run, spawn } = runner(request => checkCanonicalAuditForOpen({ ...request,
       env: { WE_PLATFORM_PREFERENCES_FILE: '/prefs' }, exec: () => sha, fetchMain: () => {}, ancestor: () => true, liveFingerprint: () => null,
-      readFile: path => path === '/prefs' ? '{}' : path.endsWith('prototype-load.json') ? '{"auditRecordPath":"audit.jsonl"}' : JSON.stringify(record),
+      readFile: path => {
+        if (String(path).endsWith('audits.hwm.json')) throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+        return path === '/prefs' ? '{}' : path.endsWith('prototype-load.json') ? '{"auditRecordPath":"audit.jsonl"}' : JSON.stringify(record);
+      },
     }));
     expect(run({ argv: ['--ref=lane/audit', ...(dry ? ['--dry-run'] : [])] }).outcome).toBe('opened');
     expect(spawn.mock.calls[0][1]).toContain(`--sha=${sha}`);
+  });
+  it('admits a chained ledger through the v2 adapter and refuses once its sidecar is gone', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gate-v2-'));
+    try {
+      const ledger = join(dir, 'audit.jsonl');
+      await appendChained(ledger, { kind: 'genesis' });
+      await appendChained(ledger, { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED',
+        findings: [], fingerprint: 'c'.repeat(64) });
+      const check = () => checkCanonicalAuditForOpen({ sha, env: { WE_PLATFORM_PREFERENCES_FILE: '/prefs' }, exec: () => sha,
+        fetchMain: () => {}, ancestor: () => true, liveFingerprint: () => null,
+        readFile: (path, enc) => path === '/prefs' ? '{}' : String(path).endsWith('prototype-load.json') ? JSON.stringify({ auditRecordPath: ledger })
+          : readFileSync(path, enc) });
+      expect(check()).toMatchObject({ ok: true });
+      rmSync(join(dir, 'audits.hwm.json'));
+      expect(check()).toMatchObject({ ok: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('check failures and incomplete decisions refuse without spawning', () => {
     for (const check of [() => { throw new Error('unreadable'); }, () => undefined]) {

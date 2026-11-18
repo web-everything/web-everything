@@ -69,7 +69,7 @@ export function evaluateAudit(ledgerText, options = {}) {
   // Records sealed under a later reseal can still block, but their passes are never trusted again.
   const ownAny = entries.some(e => e.accepted && lower(e.r.head) === lower(head) && (e.r.verdict === 'WEAKENED' || e.r.verdict === 'NOT WEAKENED'));
   // Rule 0: ONE validity gate for every record that can authorize a load (pass or waived WEAKENED).
-  const valid = e => e.accepted && validSha(e.r.head) && validSha(e.r.base) && e.r.base !== e.r.head && carriesAcross(e.fp, e.fp)
+  const valid = e => e.accepted && validSha(e.r.head) && validSha(e.r.base) && lower(e.r.base) !== lower(e.r.head) && carriesAcross(e.fp, e.fp)
     && typeof e.r.at === 'string' && Number.isFinite(Date.parse(e.r.at)) && Date.parse(e.r.at) <= now + 300000
     && legacyFindAudit([e.r], { head: e.r.head, base: e.r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === e.r;
   const passes = entries.filter(e => valid(e) && e.trusted && !e.sealed && e.r.verdict === 'NOT WEAKENED');
