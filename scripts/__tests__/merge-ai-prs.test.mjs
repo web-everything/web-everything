@@ -400,12 +400,14 @@ it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => 
 describe('production fast-drain final admission wiring', () => {
   const repo = 'owner/repo', headSha = 'a'.repeat(40);
   const green = { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
-  const probe = ({ capped = false, conclusion = 'success', unreadable = false, requiredChecks = ['test'], state = 'OPEN', head = headSha } = {}) => {
-    const live = { number: 42, state, headRefOid: head, statusCheckRollup: [green,
+  const probe = ({ capped = false, conclusion = 'success', unreadable = false, requiredChecks = ['test'], state = 'OPEN', head = headSha, checks = [green], requiredCheck = 'test' } = {}) => {
+    const live = { number: 42, state, headRefOid: head, body: 'Describe the change', baseRefName: 'main',
+      mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [...checks,
       ...(capped ? Array.from({ length: 99 }, (_, i) => ({ ...green, name: `other-${i}` })) : [])] };
     const exec = vi.fn((_file, args) => {
       if (args[0] === 'pr') return JSON.stringify(live);
       if (unreadable) throw Error('pages unreadable');
+      if (args[1].includes('check_name=integration')) return JSON.stringify([{ total_count: 0, check_runs: [] }]);
       return JSON.stringify([{ total_count: 2, check_runs: [
         { id: 1, name: 'test', head_sha: headSha, status: 'completed', conclusion: 'success' },
         { id: 2, name: 'test', head_sha: headSha, status: conclusion === 'pending' ? 'in_progress' : 'completed', conclusion },
@@ -413,7 +415,7 @@ describe('production fast-drain final admission wiring', () => {
     });
     const readChecks = vi.fn(() => requiredChecks);
     // Call the shipped verifier: only GitHub I/O is injected, never the admission callback.
-    const verify = createFastDrainEnqueueVerifier({ localSlug: repo, queueEnqueueMode: true,
+    const verify = createFastDrainEnqueueVerifier({ localSlug: repo, requiredCheck, queueEnqueueMode: true,
       isLocalRepo: candidate => candidate == null || candidate === repo, defaultBranchOf: () => 'main', exec, readChecks });
     return { result: verify({ repo: null, num: 42 }, headSha), exec, readChecks };
   };
@@ -439,6 +441,19 @@ describe('production fast-drain final admission wiring', () => {
   it('holds an unreadable required-checks source', () => {
     expect(probe({ requiredChecks: null }).result.hold).toBe(true);
   });
+  it('holds green test plus missing required integration instead of accepting an implication', () => {
+    expect(probe({ requiredChecks: ['test', 'integration'] }).result).toMatchObject({
+      hold: true, line: expect.stringContaining('integration (missing)') });
+  });
+  it('holds red configured test even when protection requires only green lint', () => {
+    expect(probe({ requiredChecks: ['lint'], checks: [{ ...green, conclusion: 'FAILURE' }, { ...green, name: 'lint' }] }).result)
+      .toMatchObject({ hold: true, line: expect.stringContaining('required check "test" is not green') });
+  });
+  it('uses the configured check name alongside the protection requirements', () => {
+    expect(probe({ requiredCheck: 'custom', requiredChecks: ['lint'],
+      checks: [{ ...green, name: 'custom', conclusion: 'FAILURE' }, { ...green, name: 'lint' }] }).result)
+      .toMatchObject({ hold: true, line: expect.stringContaining('required check "custom" is not green') });
+  });
   it.each([{ state: 'CLOSED' }, { head: 'b'.repeat(40) }])('holds changed live identity (%j)', extra => {
     expect(probe(extra).result.hold).toBe(true);
   });
@@ -450,6 +465,7 @@ it('production final admission re-reads required checks and resolves every name 
   const readChecks = vi.fn(() => required);
   const exec = vi.fn((_file, args) => {
     if (args[0] === 'pr') return JSON.stringify({ number: 42, state: 'OPEN', headRefOid: headSha,
+      body: 'Describe the change', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }],
       statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun',
         name: i < 50 ? 'test' : 'lint', status: 'COMPLETED', conclusion: 'SUCCESS' })) });
     const name = args[1].includes('check_name=lint') ? 'lint' : 'test';

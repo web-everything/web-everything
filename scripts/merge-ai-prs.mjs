@@ -544,6 +544,7 @@ export function resolveListedChecks(repo, prs, { concurrency = 1, synchronous = 
 
 /** Production final-admission wiring; inject only the external reads in tests. */
 export function createFastDrainEnqueueVerifier({ localSlug, requiredCheck = 'test', exec = createMqLiveReader(),
+  escalationRelief = { prs: [], passWide: false }, label = null,
   ...requiredChecksOptions }) {
   return (candidate, headSha) => {
     try {
@@ -551,7 +552,7 @@ export function createFastDrainEnqueueVerifier({ localSlug, requiredCheck = 'tes
       const repo = candidate.repo ?? localSlug;
       const requiredChecks = queueRequiredChecksOf(candidate.repo);
       let live = JSON.parse(exec('gh', ['pr', 'view', String(candidate.num), '--repo', repo,
-        '--json', 'number,state,headRefOid,statusCheckRollup'], { encoding: 'utf8', timeout: 60_000,
+        '--json', 'number,state,title,body,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'], { encoding: 'utf8', timeout: 60_000,
         maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
       const original = live;
       // Every required name can have a newer run hidden beyond gh's rollup cap.
@@ -561,7 +562,10 @@ export function createFastDrainEnqueueVerifier({ localSlug, requiredCheck = 'tes
           exec: (file, args, options) => ({ stdout: exec(file, args, { ...options, timeout: 60_000 }) }) });
         if (live.requiredCheckReadError) throw new Error(live.requiredCheckReadError);
       }
-      return verifyFastDrainEnqueue({ headSha, requiredChecks, readLive: () => live });
+      return verifyFastDrainEnqueue({ headSha, requiredChecks, readLive: () => live, classifyPr,
+        classifyOptions: { requiredCheck,
+          defaultBranch: requiredChecksOptions.defaultBranchOf?.(candidate.repo) || null,
+          allowPendingReview: (escalationRelief.prs || []).includes(Number(candidate.num)) || (escalationRelief.passWide && !!label) } });
     } catch { return { hold: true, line: 'fast-drain: final live target unreadable — retry next pass' }; }
   };
 }
@@ -5283,7 +5287,7 @@ async function runCli() {
   const defaultBranchOf = (repo) => defaultBranchByRepo.get(repo) ?? null;
   const verifyFinalFastDrainEnqueue = createFastDrainEnqueueVerifier({
     localSlug, requiredCheck: REQUIRED, queueEnqueueMode: queueEnqueueModeFromPolicy(resolvedMergePolicy),
-    isLocalRepo, defaultBranchOf,
+    isLocalRepo, defaultBranchOf, escalationRelief, label,
   });
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
   // failure): the empty `[]` is a fallback, not a confirmed "no commits", so `fetchPrReadsCached` declines to cache

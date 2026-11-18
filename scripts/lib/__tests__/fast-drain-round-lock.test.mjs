@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { acquireWrite, releaseWrite } from '../daemon-clone-lock.mjs';
 import { readFastDrainRoundListing, readFastDrainRoundSnapshot, withFastDrainRoundLock, verifyFastDrainEnqueue } from '../fast-drain-scope.mjs';
 import { enqueuePr } from '../merge-queue-enqueue.mjs';
-import { buildLiveListingsByRepo } from '../../merge-ai-prs.mjs';
+import { buildLiveListingsByRepo, classifyPr } from '../../merge-ai-prs.mjs';
 
 const roots = [];
 afterEach(() => { vi.useRealTimers(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -18,6 +18,7 @@ const repo = 'owner/repo';
 const head = 'a'.repeat(40);
 const green = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
 const row = (number = 42) => ({ number, headRefOid: head, state: 'OPEN', baseRefName: 'main',
+  body: 'Describe the change', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
   labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [green] });
 const save = (path, rows = [row()], extra = {}) => writeFileSync(path, JSON.stringify({ repo, writtenAt: Date.now(), rows, defaultBranch: 'main', ...extra }));
 const options = path => ({ path, repo, onlyPr: 42, env: {}, log: () => {}, readTarget: async () => row() });
@@ -208,7 +209,7 @@ it.each(['head moved', 'red check', 'missing checks', 'unreadable'])('final LIVE
   const readLive = vi.fn(() => { if (kind === 'unreadable') throw Error('offline'); return live; });
   const result = enqueuePr({ repo, num: 42, headSha: candidate.headRefOid, exec, cwd: join(path, '..'),
     preparedSurface: { headSha: head, base: 'main', baseSha: tip, files: [] },
-    sameHeadAdmission: () => verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'],
+    sameHeadAdmission: () => verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], classifyPr,
       readLive }),
   });
   expect(readLive).toHaveBeenCalledOnce();
@@ -217,8 +218,17 @@ it.each(['head moved', 'red check', 'missing checks', 'unreadable'])('final LIVE
 });
 
 it('final live green checks on the pinned open head permit admission; an unknown required set refuses', () => {
-  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], readLive: () => row() }).hold).toBe(false);
-  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: null, readLive: () => row() }).hold).toBe(true);
+  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], classifyPr, readLive: () => row() }).hold).toBe(false);
+  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: null, classifyPr, readLive: () => row() }).hold).toBe(true);
+});
+
+it('final classifier holds green test when required integration has no row', () => {
+  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test', 'integration'], classifyPr,
+    readLive: () => row() })).toMatchObject({ hold: true, line: expect.stringContaining('integration (missing)') });
+});
+
+it('final verification holds when the standard classifier is unavailable', () => {
+  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], readLive: () => row() }).hold).toBe(true);
 });
 
 it.each([undefined, null, false])('refuses cached rows when the live target reader is missing (%s)', async readTarget => {
