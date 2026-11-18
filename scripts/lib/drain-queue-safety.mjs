@@ -857,7 +857,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             const named = /main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\)/.exec(holds[0]);
             freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
           }
-        }
+        } else blocked = true; // gate URL is not this repository's github.com job: unproven, no fallback
       } catch { freezeProven = freezePending = false; blocked = true; /* unreadable freeze evidence: the hold stays */ }
     }
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;

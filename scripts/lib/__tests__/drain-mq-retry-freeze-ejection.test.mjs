@@ -240,6 +240,12 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     freezeState = { frozen: true, kind: 'manual', reason: 'operator' };
     expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
   });
+  it('holds a gate URL naming another repository even when main was red at removal and is green now', () => {
+    const check = gate(fullLog());
+    check.details_url = 'https://github.com/other/repo/actions/runs/1/job/50';
+    freezeState = { frozen: true, kind: 'manual', reason: 'operator' };
+    expect(fixture([check], redAtRemoval).guard().hold).toBe(true);
+  });
   it('holds when the shared freeze is unreadable', () => {
     freezeState = { error: 'branch unreadable' };
     expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
