@@ -1218,6 +1218,7 @@
   "scripts/lib/__tests__/verify-base-rerun.test.mjs": 0.88,
   "scripts/lib/__tests__/verify-failures.test.mjs": 0.19,
   "scripts/lib/__tests__/verify-lane-gate.test.mjs": 3.28,
+  "scripts/lib/__tests__/verify-quarantine.test.mjs": 0.08,
   "scripts/lib/__tests__/verify-recovery-settings.test.mjs": 0.01,
   "scripts/lib/__tests__/verify-remote-routing-shard.test.mjs": 0.24,
   "scripts/lib/__tests__/verify-revert-red.test.mjs": 20.3,
