@@ -4454,3 +4454,6 @@ reflect check reruns on the same head. Explicit raw snapshots carry only their o
 annotations. Normal passes carry `plannerRequiredChecks` for validation.
 Derive red-only eligibility from the same head-aware CI classification: wrong-head,
 missing-head and unknown-required-set evidence must remain closed.
+Classify the full rollup to preserve wrong-head refusals, and require a second classification
+without wrong-head rows so their successes cannot imply missing required checks. Non-review-owned
+failures on any head must prevent red-only eligibility, including optional failures.

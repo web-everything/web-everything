@@ -112,7 +112,7 @@ describe('readPlannerRow', () => {
       rawPrs: [rawPr(checks)], requiredChecks: ['test', 'review-gate'] });
     expect(result.reviewOwnedChecks.onlyRed).toBe(false);
     expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [
-      { name: 'test', reason: 'missing' }, { name: 'review-gate', reason: 'missing' },
+      { name: 'test', reason: 'wrong-head' }, { name: 'review-gate', reason: 'wrong-head' },
     ] });
   });
 
@@ -127,13 +127,47 @@ describe('readPlannerRow', () => {
     expect(result.reviewOwnedChecks.onlyRed).toBe(false);
   });
 
-  it('same-head test success still implies missing integration before wrong-head reruns are collapsed', () => {
+  it('preserves the wrong-head refusal when a newer wrong-head test rerun shadows current success', () => {
     const checks = [check('test', 'success', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' }),
       check('test', 'failure', { head_sha: 'b'.repeat(40), id: 2, completedAt: '2026-11-17T11:00:00Z' })];
     const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
       rawPrs: [rawPr(checks)], requiredChecks: ['test', 'integration'] });
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: true, affected: [] });
-    expect(result.reviewOwnedChecks.required).toEqual([]);
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [
+      { name: 'test', reason: 'wrong-head' }, { name: 'integration', reason: 'missing' },
+    ] });
+    expect(result.reviewOwnedChecks.required).toEqual(['test']);
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it.each([false, true])('preserves wrong-head integration failure beside current test success (review hold=%s)', reviewHold => {
+    const checks = [check('test', 'success', { head_sha: head }),
+      check('integration', 'failure', { head_sha: 'b'.repeat(40) })];
+    const requiredChecks = ['test', 'integration'];
+    if (reviewHold) {
+      checks.push(check('review-gate', 'failure', { head_sha: head }));
+      requiredChecks.push('review-gate');
+    }
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
+    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
+    expect(result.reviewOwnedChecks.ci.affected).toContainEqual({ name: 'integration', reason: 'wrong-head' });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it.each([head, 'b'.repeat(40)])('rejects optional non-review red on any head for red-only eligibility: %s', failedHead => {
+    const checks = [check('test', 'success', { head_sha: head }), check('review-gate', 'failure', { head_sha: head }),
+      check('optional', 'failure', { head_sha: failedHead })];
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)],
+      requiredChecks: ['test', 'review-gate'] });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('preserves same-head test implication and review-only failures', () => {
+    const checks = [check('test', 'success', { head_sha: head })];
+    const input = { pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks: ['test', 'integration'] };
+    expect(readPlannerRow(input).reviewOwnedChecks.ci.allowed).toBe(true);
+    checks.push(check('review-gate', 'failure', { head_sha: head }));
+    input.requiredChecks.push('review-gate');
+    expect(readPlannerRow(input).reviewOwnedChecks).toMatchObject({ ci: { allowed: false }, onlyRed: true });
   });
 
   it('preserves unheaded rollup checks as current for the fetched PR head, including implication', () => {
@@ -207,6 +241,7 @@ describe('readPlannerRow', () => {
     ['missing head', { headRefOid: undefined }, ['review-gate'], 'missing-head'],
     ['missing required set', {}, null, 'unknown-required-set'],
     ['empty required set', {}, [], 'unknown-required-set'],
+    ['malformed required set', {}, {}, 'unknown-required-set'],
   ])('fails closed on red-only evidence with %s', (_, changed, requiredChecks, reason) => {
     const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')],
       rawPrs: [{ ...rawPr([check('review-gate')]), ...changed }], requiredChecks });
