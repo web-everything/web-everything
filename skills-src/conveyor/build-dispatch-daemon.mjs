@@ -48,6 +48,8 @@ import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispa
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { readCiJobLog } from '../../scripts/lib/gh-ci-log.mjs';
+import { stripVTControlCharacters } from 'node:util';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -2552,6 +2554,28 @@ function lastDraftAuthorActivity(candidate) {
   return dates.length ? Math.max(...dates) : NaN;
 }
 
+/** Attribute a diagnostic without filtering the whole log used by the CI-heal context pack.
+ * Missing/ambiguous step ownership leaves the check's published diagnostic as the fallback. */
+function firstFailedStepError(job, log) {
+  if (!Array.isArray(job?.steps) || !job.steps.some(step => step?.conclusion === 'failure')) return '';
+  const intervals = job.steps.filter(step => step?.conclusion !== 'skipped').map(step => ({
+    conclusion: step?.conclusion, start: Date.parse(step?.started_at), end: Date.parse(step?.completed_at),
+  }));
+  if (intervals.some(({ start, end }) => !Number.isFinite(start) || !Number.isFinite(end) || start > end)) return '';
+  let failedStep = false;
+  for (const line of stripVTControlCharacters(log).split('\n')) {
+    const timestamp = /^\uFEFF?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))(?=\s|$)/.exec(line);
+    if (timestamp) {
+      const at = Date.parse(timestamp[1]);
+      const owners = intervals.filter(({ start, end }) => start <= at && at <= end);
+      failedStep = owners.length > 0 && owners.every(step => step.conclusion === 'failure');
+    }
+    // Untimestamped continuations inherit the preceding timestamp's ownership.
+    if (failedStep && /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) return line;
+  }
+  return '';
+}
+
 /** Builder-only gate-failure recovery. Unknown liveness fails closed, including a crash between
  * reserving an attempt and recording its handle. The existing orphan retry policy supplies the cap.
  * State is PR-bound, never head-bound: a failed fix pushing another red head cannot reset its budget. */
@@ -2663,11 +2687,20 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
     let firstError = annotations.find(a => a.annotation_level === 'failure')?.message
       || failed.output?.summary || failed.output?.text || 'No error detail published by the check.';
-    // GitHub Actions often publishes no annotations; retrieve the job's actual first error.
+    // A whole job log contains passing-step errors too. Diagnose only attributable failed-step
+    // evidence; the existing CI-heal context pack stages the whole log separately for the fixer.
     const job = /\/job\/(\d+)/.exec(failed.details_url ?? '')?.[1];
     if (job && !annotations.some(a => a.annotation_level === 'failure')) {
-      const log = String(gh(['run', 'view', '--repo', repo, '--job', job, '--log-failed']));
-      firstError = log.split('\n').find(line => /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) || firstError;
+      const result = readCiJobLog({ repo, jobId: job,
+        // Forward the helper's exec options: without its maxBuffer a log over Node's 1 MiB default is ENOBUFS.
+        exec: (_command, args, opts) => gh(args, opts) });
+      // An unreadable log (over the buffer, timed out, expired) costs only this draft its log-derived
+      // diagnostic; it keeps the published one, like unreadable step metadata, and never aborts the pass.
+      if (result.ok) {
+        let metadata;
+        try { metadata = api(`actions/jobs/${job}`); } catch { /* Preserve the published diagnostic. */ }
+        firstError = firstFailedStepError(metadata, result.text) || firstError;
+      }
     }
     candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
       scope: (pr.files ?? []).map(f => `we:${f.path}`), isDraft: true, builderAuthored: true,

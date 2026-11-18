@@ -1731,8 +1731,9 @@ describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the clas
     const lines = stderr.split('\n');
     const usageAt = lines.findIndex(l => /^(?:\d{4}-\d\d-\d\dT\S+Z )?usage: build-dispatch-daemon\.mjs/.test(l));
     expect(usageAt).toBeGreaterThanOrEqual(0);
-    // Known host noise only: policy-cascade log lines and Node deprecation warnings; any other line (a startup error) fails.
-    expect(lines.slice(0, usageAt).every(l => l.startsWith('policy-cascade ·')
+    // Known host noise only: policy-cascade log lines, the operator-override reader's own store diagnostics (the
+    // host-wide store path cannot be redirected from a test) and Node deprecation warnings; any other line fails.
+    expect(lines.slice(0, usageAt).every(l => l.startsWith('policy-cascade ·') || l.startsWith('operator-override: ')
       || /^\(node:\d+\) \[DEP\d+\] DeprecationWarning: /.test(l) || l.startsWith('(Use `node --trace-deprecation'))).toBe(true);
     expect(status).toBe(2);
   });

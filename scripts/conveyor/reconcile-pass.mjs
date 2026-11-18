@@ -2110,7 +2110,13 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     return raw ? String(value) : JSON.parse(value);
   };
   const api = reader?.api ?? plainApi;
-  const readLog = reader?.readLog ?? ((job) => plainApi(`repos/${repo}/actions/jobs/${job.id}/logs`, true));
+  const rawLog = reader?.readLog ?? ((job) => plainApi(`repos/${repo}/actions/jobs/${job.id}/logs`, true));
+  const readLog = job => {
+    try { return rawLog(job); } catch (error) {
+      if (isEvidenceReadTimeout(error)) throw error;
+      throw Object.assign(new Error('log-unreadable'), { reason: 'log-unreadable', cause: error });
+    }
+  };
   const factsGate = reader || factsOverride ? (factsOverride ?? checkFixFacts)({ repo, number: pr.number, head: pr.headRefOid }) : null;
   if (factsGate?.stale) return { eligible: false, reason: `timeout-evidence:${factsGate.reason}` };
   const head = pr.headRefOid;
@@ -2205,7 +2211,9 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     return result;
   } catch (error) {
     if (isEvidenceReadTimeout(error)) return { eligible: false, unknown: true, reason: `timeout-evidence-unknown:${error.message}` };
-    return { eligible: false, reason: `timeout-evidence:${error.message}` };
+    return error.reason === 'log-unreadable'
+      ? { eligible: false, reason: 'log-unreadable' }
+      : { eligible: false, reason: `timeout-evidence:${error.message}` };
   }
 }
 
