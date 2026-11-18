@@ -440,13 +440,37 @@ describe('live red-team alert suppression', () => {
     expect(readCheckFact).not.toHaveBeenCalled();
   });
   const clearResult = rev => `${redTeamMarker(pr, rev)}\nAdvisory only: red team · recorded verdict \`accept\`.\nThe red team tried to break this change and reported nothing.`;
+  it.each([
+    ['validators confirm clear', {}, true],
+    ['newer run', { readCheckFact: () => ({ ok: false }) }, false],
+    ['publication hold', { readPublicationHoldFact: () => ({ ok: false }) }, false],
+    ['check reader throws', { readCheckFact: () => { throw Error('offline'); } }, false],
+    ['hold reader throws', { readPublicationHoldFact: () => { throw Error('offline'); } }, false],
+    ['check reader missing', { readCheckFact: null }, false],
+    ['hold reader missing', { readPublicationHoldFact: null }, false],
+    ['check evidence missing', { readCheckFact: () => undefined }, false],
+    ['hold evidence missing', { readPublicationHoldFact: () => undefined }, false],
+  ])('zero-finding comment with %s fails closed unless validated', (_kind, readers, clear) => {
+    const readLive = createLiveRedTeamReader({
+      provider: { readPrState: () => ({ headRefOid: head }) },
+      readComments: () => [{ body: clearResult(head), author: { login: 'web-everything' } }],
+      readCheckFact: () => ({ ok: true }),
+      readPublicationHoldFact: () => ({ ok: true }),
+      ...readers,
+    });
+    expect(readLive({ repo, pr, head })).toEqual({ clear });
+    const f = fixture();
+    f.io.readLiveRedTeam = readLive;
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(clear ? 0 : 1);
+  });
   it.each(['completed result', 'check', 'stale head'])('settles %s without publishing or retrying', kind => {
     const f = fixture();
     const provider = { readPrState: vi.fn(() => ({ headRefOid: kind === 'stale head' ? 'b'.repeat(40) : head,
       labels: [] })) };
     f.io.readLiveRedTeam = createLiveRedTeamReader({ provider,
       readComments: () => kind === 'completed result' ? [{ body: clearResult(head), author: { login: 'web-everything' } }] : [],
-      readCheckFact: () => ({ ok: kind === 'check' }),
+      readCheckFact: () => ({ ok: kind === 'check' || kind === 'completed result' }),
       readPublicationHoldFact: () => ({ ok: true }) });
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).not.toHaveBeenCalled();

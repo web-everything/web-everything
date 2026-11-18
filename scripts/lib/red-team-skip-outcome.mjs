@@ -96,10 +96,12 @@ export function createLiveRedTeamReader({ provider, readComments, env = process.
     if (!isRealHead(head)) return { clear: false };
     if (live.headRefOid.toLowerCase() !== head.toLowerCase()) return { clear: true };
     const result = redTeamForHead(readComments({ repo, pr }), pr, head);
-    if (result) return { clear: result.findings?.length === 0 && isPublishableRedTeamResult(result) };
+    if (result && !(result.findings?.length === 0 && isPublishableRedTeamResult(result))) return { clear: false };
     const key = { repo, pr, headSha: head };
-    // A successful check can still be covered by a failed or unfinished publication.
-    return { clear: readCheckFact(key)?.ok === true && readPublicationHoldFact(key)?.ok === true };
+    // Comments and successful checks can still be covered by a newer run or publication hold.
+    try {
+      return { clear: readCheckFact(key)?.ok === true && readPublicationHoldFact(key)?.ok === true };
+    } catch { return { clear: false }; }
   };
 }
 
