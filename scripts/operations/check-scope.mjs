@@ -5,7 +5,7 @@ import { collectFreeScope } from './free-scope-io.mjs';
 import { isProseScopeFile } from '../lib/prose-scope-globs.mjs';
 
 /** Collapse `a/../b` segments so a dotted path cannot dodge a claim; a path escaping the repo refuses (fail closed). */
-function normalizeQualified(qualified) {
+export function normalizeQualified(qualified) {
   if (!qualified) return qualified;
   const colon = qualified.indexOf(':');
   const path = posix.normalize(qualified.slice(colon + 1));

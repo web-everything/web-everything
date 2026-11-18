@@ -131,7 +131,7 @@ import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeL
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
 import { isProseScopeFile } from './lib/prose-scope-globs.mjs';
-import { checkScope } from './operations/check-scope.mjs';
+import { checkScope, normalizeQualified } from './operations/check-scope.mjs';
 import { registerScope, releaseScope } from './operations/free-scope.mjs';
 import { defaultRegistryPath, updateRegistry, collectFreeScope } from './operations/free-scope-io.mjs';
 import { normScope } from './readiness/scope-lease.mjs';
@@ -204,7 +204,7 @@ import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIde
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const LANE_SCOPE_TTL_HOURS = 12; // registry claim for a leased lane; cleared on release
-const parseScopeFlag =(v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
+const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')).map(normalizeQualified) : []);
 
 // ── tiny arg parsing ──────────────────────────────────────────────────────────────────────────────
 const [, , cmd, ...rest] = process.argv;
