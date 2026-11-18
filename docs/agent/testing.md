@@ -1,6 +1,22 @@
 # Testing — Three-Tier Strategy
 
+## Review PR fetch isolation (R37)
+
+Review PR transport runs in a fresh temporary bare repository with empty global/system
+config, never in the agent-writable lane. The lane contributes only alternate objects and
+one negotiation ref; a bounded binary pack/index-pack handoff imports the pinned commit.
+`review-job-fetch-security.test.mjs` replants hostile local/worktree/includeIf config after
+the scrub to prove isolation, and checks failed handoffs and moved heads leave the commit absent.
+
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
+## Review PR transport isolation (R37)
+
+`review-job-fetch-security.test.mjs` replants URL rewrites and transport settings after the lane
+scrub: the network fetch must run in a fresh bare repository with empty global/system config.
+Only object data crosses back through a bounded thin-pack handoff. Keep both review entry points,
+worktree/includeIf config, unborn HEAD, and refused pack/index-pack cases covered; a moved PR head
+must be refused before importing objects. Do not replace this boundary with more config reject rules.
 
 ## Human-only enqueue approval license (R212)
 
@@ -2199,6 +2215,8 @@ a delayed request starts later and remains active at 28 minutes.
 
 Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
 operator-confirmed cleanup remain the fallback while capacity is retained.
+Cancel-finish waits for the supervisor, then proves the reserved UID empty before clearing a stale
+`executing` lock; unprovable cleanup holds the marker and raises one needs-you alert naming the slot (throttled per slot).
 Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
 finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
 lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
@@ -3339,6 +3357,10 @@ reclamation: acquisition, prepare, execution, and finish hold shared leases on
 persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
 leases through scanning and deletion and proves UID process absence before
 removing a reservation.
+Cancel-finish clears a stale `executing` lock only with both proven UID emptiness and
+an `lstat` mtime age at least the hard max runtime, measured with the injected clock.
+Before that bound, even successful UID cleanup retains the lock and requires an operator
+to stop the reserved UID; failed cleanup also retains it past the bound.
 The root supervisor requires reservation evidence and rechecks it under its own shared lease;
 a forked child retains that lease through UID drop and closes it before task exec.
 Only reservations declaring `writerGuard: 1` participate; historical or uncertain
@@ -4566,6 +4588,34 @@ a successful earlier step can displace the failure summary used by live-smoke
 classification. The CLI timing regression covers a failed read after a successful
 step and successful JSON output; the GitHub-outage soak must hold as
 `smoke-env-unavailable` without writing a smoke rejection.
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
+Global and system config point at the same temporary empty file, system config is disabled, and
+inherited indexed config and config-source overrides are removed before applying the hardening
+pins. The empty file is removed on success or failure. Before scrubbing, reject effective
+`fetch.fsck.*`, `transfer.fsck.*`,
+`receive.fsck.*`, and `fsck.*` keys, including worktree and include/includeIf config
+(`git config --includes`, without `--local`): object-checking pins do not override severities or skip lists.
+An unreadable check refuses fetching; only status 1 with empty output proves no matches.
+Lane setup then reuses `scrubRiskyLaneConfig` before fetching, so removing include directives
+cannot hide prohibited fsck settings from the check.
+Retained `origin.uploadpack` and
+`origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
+with the lane-pool transport pins (`protocol.ext.allow=never` and
+`--upload-pack=git-upload-pack`), plus `submodule.recurse=false` and `--no-recurse-submodules`:
+populated submodules retain their own unscrubbed remote helpers. `review-job-fetch-security.test.mjs` uses real local repositories
+and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
+then exercises the production SSH URL without networking and verifies the marker stays absent.
+Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring
+lane inspection/repair. Only the scrubber's intentionally retained exact origin keys are exempt.
+SSH transport failure surfaces directly; there is no HTTPS fallback. The job suites
+cover unreadable/oversized config, inherited global and lane URL rewrites, no fallback, and terminal failure labels.
+
 Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
 Use an injected HOME and filesystem: the append-only ops store lives under
 `~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
