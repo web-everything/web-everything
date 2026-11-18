@@ -27,9 +27,9 @@ export function decideActions(snapshot, report, ctx = {}) {
       add('rerun-failed', ['gh', 'run', 'rerun', String(failed[0].runId), '--failed', `--repo=${repo}`], 'failed checks classified as infrastructure failures');
     }
   }
-  // An already-recorded applicable action still suppresses escalation.
-  if (!actions.length && ['no-worker', 'human-wait', 'gate-red-stalled', 'stale-claim'].includes(report?.rule)) {
-    escalations.push({ type: 'escalate', repo, pr, head, reason: report.reason, logLine });
+  const recorded = actions.some((action) => done instanceof Set ? done.has(actionKey(action)) : Object.hasOwn(done, actionKey(action)));
+  if ((!actions.length || recorded) && ['no-worker', 'human-wait', 'gate-red-stalled', 'stale-claim'].includes(report?.rule)) {
+    escalations.push({ type: 'escalate', repo, pr, head, reason: recorded ? 'action already recorded for this head; condition persists' : report.reason, logLine });
   }
   return { actions: actions.filter((action) => done instanceof Set ? !done.has(actionKey(action)) : !Object.hasOwn(done, actionKey(action))), escalations };
 }

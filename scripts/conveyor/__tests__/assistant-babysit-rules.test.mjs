@@ -36,6 +36,11 @@ describe('report rules and boundaries', () => {
   it.each([
     ['bad-claim', { badClaims: [{ path: 'bad/lock.json', problem: 'Invalid ttlMinutes' }] }, true],
     ['bad-claim', { badClaims: [] }, false],
+    ['gate-red-stalled', { inMergeQueue: true, ciFailing: true }, false],
+    ['ready-stalled', { inMergeQueue: true, labels: ['ready-to-merge'] }, false],
+    ['no-worker', { inMergeQueue: true, labels: ['review:changes'] }, false],
+    ['bad-claim', { inMergeQueue: true, badClaims: [{ problem: 'Invalid ttlMinutes' }] }, true],
+    ['contradiction', { inMergeQueue: true, labels: ['review:accepted', 'review:changes'] }, true],
     ['human-wait', { labels: ['review:human', 'review:changes'], headChangedAtMs: nowMs - 60 * 60000 }, true],
     ['human-wait', { labels: ['review:human', 'review:changes'], headChangedAtMs: nowMs - 60 * 60000 + 1 }, false],
     ['human-wait', { labels: ['status:stood-down'] }, true],

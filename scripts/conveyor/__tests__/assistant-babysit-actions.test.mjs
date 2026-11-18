@@ -61,14 +61,14 @@ describe('shadow action decisions', () => {
     expect(decide({}, {}).escalations[0].logLine).toBe('');
     expect(decide({}, {}, { rule: 'contradiction' }).escalations).toEqual([]);
   });
-  it.each(['set', 'object'])('dedupes by repo, PR, head and type with %s without mutation or escalation', (kind) => {
+  it.each(['set', 'object'])('dedupes by repo, PR, head and type with %s without mutation while escalating persistence', (kind) => {
     const action = decide().actions[0];
     const key = actionKey(action);
     expect(key).toBe('org/repo#2@abc:rearm');
     const context = { ...ctx, done: kind === 'set' ? new Set([key]) : { [key]: 1 } };
     const before = structuredClone(context);
     const source = structuredClone(snapshot);
-    expect(decideActions(source, report, context)).toEqual({ actions: [], escalations: [] });
+    expect(decideActions(source, report, context)).toEqual({ actions: [], escalations: [expect.objectContaining({ reason: 'action already recorded for this head; condition persists', logLine: ctx.why.fixLogLine })] });
     expect(context).toEqual(before);
     expect(source).toEqual(snapshot);
     expect(decide({ headSha: 'def' }, context).actions).toHaveLength(1);

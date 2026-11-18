@@ -38,9 +38,9 @@ export function classifyPr(snapshot, opts = {}) {
   const add = (rule, reason, age = minutes, detail = {}) => reports.push({ rule, repo, pr, reason, minutes: age, owner: nextActor(snapshot, opts.why), detail });
   const old = (threshold) => minutes !== null && minutes >= threshold;
   if (badClaims.length) add('bad-claim', badClaims[0].problem, null, { badClaims });
-  if (owed.length && !human(labels) && !worker && old(settings.noWorkerMin)) add('no-worker', 'owed work without a live worker', minutes, { owed });
+  if (!snapshot.inMergeQueue && owed.length && !human(labels) && !worker && old(settings.noWorkerMin)) add('no-worker', 'owed work without a live worker', minutes, { owed });
   if (!snapshot.isDraft && human(labels) && (owed.length || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l))) && old(settings.humanWaitMin)) add('human-wait', 'human-owned PR waiting on the operator');
-  if (snapshot.ciFailing && !worker && old(settings.gateRedStalledMin) && !reports.some((r) => r.rule === 'no-worker')) add('gate-red-stalled', 'required check red without a live worker');
+  if (!snapshot.inMergeQueue && snapshot.ciFailing && !worker && old(settings.gateRedStalledMin) && !reports.some((r) => r.rule === 'no-worker')) add('gate-red-stalled', 'required check red without a live worker');
   const stale = claims.find((c) => finite(c.claimedAtMs) && nowMs - c.claimedAtMs >= settings.staleClaimMin * 60000
     && ((finite(snapshot.headChangedAtMs) && snapshot.headChangedAtMs <= c.claimedAtMs)
       || (typeof snapshot.headSha === 'string' && snapshot.headSha === c.headShaAtClaim)));
@@ -60,6 +60,6 @@ export function classifyPr(snapshot, opts = {}) {
     if (owed.length) pair(label, 'owed work');
     if (has('ready-to-merge')) pair(label, 'ready-to-merge');
   }
-  if (has('ready-to-merge') && old(settings.readyStalledMin) && !reports.some((r) => r.rule === 'contradiction')) add('ready-stalled', 'ready-to-merge without recent change');
+  if (!snapshot.inMergeQueue && has('ready-to-merge') && old(settings.readyStalledMin) && !reports.some((r) => r.rule === 'contradiction')) add('ready-stalled', 'ready-to-merge without recent change');
   return { owed, reports };
 }

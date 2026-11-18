@@ -11,9 +11,9 @@ const makeClaim = (meta = {}, fields = {}) => ({ owner: 'fixer:test', heartbeatA
 function fixture() {
   const files = new Map();
   const calls = [];
-  const pr = { number: 1, labels: [{ name: 'review:changes' }], isDraft: false, mergeable: 'MERGEABLE',
+  const pr = { number: 1, isInMergeQueue: false, labels: [{ name: 'review:changes' }], isDraft: false, mergeable: 'MERGEABLE',
     headRefOid: 'abc', updatedAt: old, statusCheckRollup: [] };
-  const world = { files, calls, prs: [pr], events: [], commitDate: old, why: { verdict: { owner: 'fix operator', waitingFor: 'capacity', sections: [{ name: 'daemons', lines: ['review: idle', 'fix: waiting | capacity'] }] } }, claims: [] };
+  const world = { files, calls, required: ['checks', 'infra'], rules: [], prs: [pr], events: [], commitDate: old, why: { verdict: { owner: 'fix operator', waitingFor: 'capacity', sections: [{ name: 'daemons', lines: ['review: idle', 'fix: waiting | capacity'] }] } }, claims: [] };
   world.io = {
     mkdirSync() {},
     existsSync: (path) => path === 'why.mjs',
@@ -38,6 +38,14 @@ function fixture() {
       return JSON.stringify(world.why);
     }
     if (args[0] === 'pr') return JSON.stringify(world.prs);
+    if (args[1].includes('/protection/required_status_checks')) {
+      if (world.required instanceof Error) throw world.required;
+      return JSON.stringify(world.required);
+    }
+    if (args[1].includes('/rules/branches/main')) {
+      if (world.rules instanceof Error) throw world.rules;
+      return JSON.stringify(world.rules);
+    }
     if (args[1].includes('/events?')) {
       if (world.eventError) throw world.eventError;
       expect(args).toContain('--paginate');
@@ -52,6 +60,169 @@ function fixture() {
   return world;
 }
 
+describe('precision and explanation budgets', () => {
+  const apiReads = (w) => w.calls.filter((c) => c.args[1]?.includes('/required_status_checks') || c.args[1]?.includes('/rules/branches/main'));
+  it.each(['name', 'context'])('flags required red %s entries and ignores non-required red for reports and actions', (field) => {
+    const w = fixture();
+    w.prs[0].labels = [];
+    w.prs[0].statusCheckRollup = [{ [field]: 'optional', conclusion: 'TIMED_OUT', detailsUrl: 'https://github.com/org/repo/actions/runs/42' }];
+    expect(w.tick().summary).toMatchObject({ reports: 0, wouldAct: 0 });
+    w.prs[0].statusCheckRollup.push({ [field]: 'checks', conclusion: 'FAILURE' });
+    expect(w.tick().reports.map((r) => r.rule)).toEqual(['gate-red-stalled']);
+    expect(apiReads(w)).toHaveLength(2);
+  });
+  it('unions simultaneous classic and ruleset requirements so a ruleset-only red remains reportable and actionable', () => {
+    const w = fixture();
+    w.required = ['classic'];
+    w.rules = [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'ruleset' }, { context: 'classic' }] } }];
+    w.prs[0].labels = [];
+    w.prs[0].statusCheckRollup = [
+      { name: 'classic', conclusion: 'SUCCESS' },
+      { name: 'ruleset', conclusion: 'TIMED_OUT', detailsUrl: 'https://github.com/org/repo/actions/runs/42' },
+      { name: 'optional', conclusion: 'FAILURE' },
+    ];
+    const { reports, summary } = w.tick();
+    expect(reports.map((report) => report.rule)).toEqual(['gate-red-stalled']);
+    expect(summary.wouldAct).toBe(1);
+    const decisions = w.files.get(join('output', 'actions.jsonl')).trim().split('\n').map(JSON.parse);
+    expect(decisions[0]).toMatchObject({ action: 'rerun-failed', argv: ['gh', 'run', 'rerun', '42', '--failed', '--repo=web-everything/web-everything'] });
+    expect(apiReads(w)).toHaveLength(2);
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks['web-everything/web-everything'].names).toEqual(['classic', 'ruleset']);
+    w.calls.length = 0;
+    expect(w.tick({ nowMs: nowMs + 60000 }).reports[0].rule).toBe('gate-red-stalled');
+    expect(apiReads(w)).toHaveLength(0);
+  });
+  it('refreshes persisted classic-only requirement caches before filtering required reds', () => {
+    const w = fixture();
+    w.files.set(join('output', 'state.json'), JSON.stringify({ requiredChecks: {
+      'web-everything/web-everything': { at: nowMs, names: ['classic'] },
+    } }));
+    w.required = ['classic'];
+    w.rules = [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'ruleset' }] } }];
+    w.prs[0].labels = [];
+    w.prs[0].statusCheckRollup = [{ name: 'ruleset', conclusion: 'FAILURE' }];
+    expect(w.tick().reports.map((report) => report.rule)).toEqual(['gate-red-stalled']);
+    expect(apiReads(w)).toHaveLength(2);
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks['web-everything/web-everything']).toMatchObject({ version: 2, names: ['classic', 'ruleset'] });
+  });
+  it.each([[], new Error('denied')])('reads rulesets after empty or failed protection evidence %j', (required) => {
+    const w = fixture();
+    w.required = required;
+    w.rules = [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'checks' }] } }, { type: 'other' }];
+    w.tick();
+    expect(apiReads(w)).toHaveLength(2);
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).requiredChecks['web-everything/web-everything'].names).toEqual(['checks']);
+    expect(w.files.get(join('output', 'digest.md'))).not.toContain('required checks unavailable');
+  });
+  it.each([[], new Error('denied'), {}])('warns once per repo when required evidence is unavailable %j, including cached fallback', (value) => {
+    const w = fixture();
+    w.required = value;
+    w.rules = value;
+    w.prs[0].labels = [];
+    w.prs[0].statusCheckRollup = [{ name: 'optional', conclusion: 'FAILURE' }];
+    const warning = 'required checks unavailable for web-everything/web-everything; using all checks';
+    expect(w.tick().reports[0].rule).toBe('gate-red-stalled');
+    expect(w.files.get(join('output', 'digest.md')).split(warning)).toHaveLength(2);
+    w.calls.length = 0;
+    w.tick({ nowMs: nowMs + 60000 });
+    expect(apiReads(w)).toHaveLength(0);
+    expect(w.files.get(join('output', 'digest.md'))).toContain(warning);
+  });
+  it('refreshes required names at exactly 60 minutes', () => {
+    const w = fixture();
+    w.tick();
+    w.calls.length = 0;
+    w.tick({ nowMs: nowMs + 60 * 60000 - 1 });
+    expect(apiReads(w)).toHaveLength(0);
+    w.tick({ nowMs: nowMs + 60 * 60000 });
+    expect(apiReads(w)).toHaveLength(2);
+  });
+  it('passes merge queue membership to rules while retaining contradictions and bad claims', () => {
+    const w = fixture();
+    w.prs[0].isInMergeQueue = true;
+    w.prs[0].labels = [{ name: 'ready-to-merge' }, { name: 'review:changes' }];
+    w.prs[0].statusCheckRollup = [{ name: 'checks', conclusion: 'FAILURE' }];
+    w.claims = [makeClaim({ ttlMinutes: -1 })];
+    expect(w.tick().reports.map((r) => r.rule)).toEqual(['bad-claim', 'contradiction']);
+  });
+  it.each([
+    [{ autoMergeRequest: { enabledAt: old } }, false],
+    [{ autoMergeRequest: { enabledAt: old }, mergeStateStatus: 'BLOCKED' }, false],
+    [{ autoMergeRequest: { enabledAt: old }, mergeStateStatus: 'QUEUED' }, true],
+    [{ autoMergeRequest: null, mergeStateStatus: 'QUEUED', labels: [{ name: 'status:ready-to-merge' }] }, true],
+    [{ autoMergeRequest: null }, false],
+  ])('falls back only when gh rejects the queue field: %j', (patch, queued) => {
+    const w = fixture();
+    Object.assign(w.prs[0], patch, { statusCheckRollup: [{ name: 'checks', conclusion: 'FAILURE' }] });
+    delete w.prs[0].isInMergeQueue;
+    const exec = (command, args, options) => {
+      if (args[0] === 'pr' && args.at(-1).includes('isInMergeQueue')) throw new Error('Unknown JSON field: "isInMergeQueue"');
+      return w.exec(command, args, options);
+    };
+    const result = w.tick({ exec });
+    expect(result.reports.some((r) => ['no-worker', 'gate-red-stalled'].includes(r.rule))).toBe(!queued);
+    expect(w.calls.find((c) => c.args[0] === 'pr').args.at(-1)).toContain('autoMergeRequest');
+  });
+  it('does not turn an unrelated PR-list failure into a fallback read', () => {
+    const w = fixture();
+    let attempts = 0;
+    expect(() => w.tick({ exec: () => { attempts++; throw new Error('offline'); } })).toThrow('offline');
+    expect(attempts).toBe(1);
+  });
+  it.each([
+    ['no-worker', ['review:changes']],
+    ['gate-red-stalled', []],
+    ['ready-stalled', ['ready-to-merge']],
+  ])('older-gh auto-merge intent without queue membership retains %s with required checks red', (rule, labels) => {
+    const w = fixture();
+    Object.assign(w.prs[0], { autoMergeRequest: { enabledAt: old }, mergeStateStatus: 'BLOCKED',
+      labels: labels.map((name) => ({ name })), statusCheckRollup: [{ name: 'checks', conclusion: 'FAILURE' }] });
+    delete w.prs[0].isInMergeQueue;
+    const exec = (command, args, options) => {
+      if (args[0] === 'pr' && args.at(-1).includes('isInMergeQueue')) throw new Error('Unknown JSON field: "isInMergeQueue"');
+      return w.exec(command, args, options);
+    };
+    expect(w.tick({ exec }).reports.map((report) => report.rule)).toContain(rule);
+  });
+  it('reuses why on tick two, refreshes at 30 minutes, and refreshes for a new head', () => {
+    const w = fixture();
+    w.tick();
+    w.calls.length = 0;
+    expect(w.tick({ nowMs: nowMs + 30 * 60000 - 1 }).reports[0].fixLogLine).toBe('fix: waiting | capacity');
+    expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(0);
+    w.tick({ nowMs: nowMs + 30 * 60000 });
+    expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(1);
+    w.prs[0].headRefOid = 'def';
+    w.tick({ nowMs: nowMs + 30 * 60000 + 1 });
+    expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(2);
+  });
+  it('caps fresh why calls at six, retains reports, and prioritizes missing then oldest caches across repos', () => {
+    const w = fixture();
+    w.prs = Array.from({ length: 8 }, (_, index) => ({ ...w.prs[0], number: index + 1 }));
+    expect(w.tick({ repos: ['org/one', 'org/two'] }).summary).toMatchObject({ reports: 16, whySkipped: 10 });
+    expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(6);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('whySkipped: 10');
+    w.calls.length = 0;
+    w.tick({ repos: ['org/one', 'org/two'], nowMs: nowMs + 60000, maxWhy: 1 });
+    expect(w.calls.filter((c) => c.command === 'node').map((c) => c.args[2])).toEqual(['--pr=4']);
+    const state = JSON.parse(w.files.get(join('output', 'state.json')));
+    state.whyCache = Object.fromEntries(w.prs.map((pr) => [`org/one#${pr.number}@abc`, { at: nowMs - pr.number * 60000, verdict: { owner: 'operator' } }]));
+    w.files.set(join('output', 'state.json'), JSON.stringify(state));
+    w.calls.length = 0;
+    w.tick({ repos: ['org/one'], nowMs: nowMs + 60 * 60000, maxWhy: 1 });
+    expect(w.calls.filter((c) => c.command === 'node').map((c) => c.args[2])).toEqual(['--pr=8']);
+  });
+  it('allows a zero why budget and counts failed calls against the cap', () => {
+    const w = fixture();
+    expect(w.tick({ maxWhy: 0 }).summary.whySkipped).toBe(1);
+    expect(w.calls.some((c) => c.command === 'node')).toBe(false);
+    w.prs.push({ ...w.prs[0], number: 2 });
+    w.why = new Error('timeout');
+    expect(w.tick({ maxWhy: 1 }).summary).toMatchObject({ reports: 2, whySkipped: 1 });
+    expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(1);
+  });
+});
+
 describe('report-only tick', () => {
   it('appends JSONL, writes digest, enriches why, and makes NO GitHub write call', () => {
     const w = fixture();
@@ -62,7 +233,7 @@ describe('report-only tick', () => {
     expect(w.files.get(join('output', 'digest.md'))).toContain('| PR | rule | min | owner | reason | fix-log |');
     expect(w.files.get(join('output', 'digest.md'))).toContain('fix: waiting \\| capacity');
     const gh = w.calls.filter((call) => call.command === 'gh');
-    expect(gh).toHaveLength(3);
+    expect(gh).toHaveLength(5);
     for (const { args, options } of gh) {
       expect(args[0] === 'api' || args.slice(0, 2).join(' ') === 'pr list').toBe(true);
       if (args[0] === 'api') {
@@ -73,8 +244,8 @@ describe('report-only tick', () => {
       }
       expect(options).toMatchObject({ timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { GH_CALLER: 'wev-assistant', FIXTURE: 'yes' } });
     }
-    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '500', '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,updatedAt,statusCheckRollup']);
-    expect(w.calls.at(-1)).toMatchObject({ command: 'node', args: ['why.mjs', 'why', '--pr=1', '--repo=web-everything/web-everything', '--json'], options: { timeout: 90000 } });
+    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '500', '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,updatedAt,statusCheckRollup,isInMergeQueue']);
+    expect(w.calls.at(-1)).toMatchObject({ command: 'node', args: ['why.mjs', 'why', '--pr=1', '--repo=web-everything/web-everything', '--json'], options: { timeout: 20000 } });
   });
 
   it('caches unchanged detail and dedupes reports for exactly 60 minutes while retaining digest', () => {
@@ -89,7 +260,7 @@ describe('report-only tick', () => {
     expect(w.log().filter((line) => line.type === 'report')).toHaveLength(2);
     w.prs[0].updatedAt = '2026-01-01T11:00:00Z';
     w.calls.length = 0;
-    w.tick();
+    w.tick({ nowMs: nowMs + 60 * 60000 + 1 });
     expect(w.calls.filter((c) => c.command === 'gh' && c.args[0] === 'api')).toHaveLength(1);
   });
 
@@ -101,8 +272,8 @@ describe('report-only tick', () => {
     ];
     const { summary } = w.tick({ repos: ['org/first', 'org/second'], maxDetail: 1 });
     expect(summary).toMatchObject({ open: 4, owing: 4, skipped: 3 });
-    expect(w.calls.filter((c) => c.command === 'gh').map((c) => c.args[0])).toEqual(['pr', 'pr', 'api', 'api']);
-    expect(w.calls[2].args[1]).toContain('issues/1/events');
+    expect(w.calls.filter((c) => c.command === 'gh').map((c) => c.args[0])).toEqual(['pr', 'api', 'api', 'pr', 'api', 'api', 'api', 'api']);
+    expect(w.calls[6].args[1]).toContain('issues/1/events');
     expect(w.files.get(join('output', 'digest.md'))).toContain('Skipped PRs need operator inspection');
   });
 
@@ -287,7 +458,7 @@ describe('report-only tick', () => {
     expect(reports.map((r) => [r.repo, r.pr, r.rule])).toEqual([
       ['web-everything/web-everything', 1, 'bad-claim'], ['web-everything/web-everything', 99, 'bad-claim'], ['org/other', 1, 'bad-claim'],
     ]);
-    expect(w.calls.map((c) => c.args.slice(0, 2))).toEqual([['pr', 'list']]);
+    expect(w.calls.map((c) => c.args.slice(0, 2))).toEqual([['pr', 'list'], ['api', 'repos/web-everything/web-everything/branches/main/protection/required_status_checks'], ['api', 'repos/web-everything/web-everything/rules/branches/main']]);
   });
 
   it('handles missing claims directory and absent why CLI', () => {
@@ -364,14 +535,14 @@ describe('report-only tick', () => {
   it.each(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR'])('recognizes failing check %s', (state) => {
     const w = fixture();
     w.prs[0].labels = [{ name: 'status:ci-red' }];
-    w.prs[0].statusCheckRollup = [{ state }];
+    w.prs[0].statusCheckRollup = [{ context: 'checks', state }];
     expect(w.tick({ whyCli: null }).reports[0].owner).toBe('ci-heal');
   });
   it('does not request details or why for nonowing, nonready PRs', () => {
     const w = fixture();
     w.prs[0].labels = [{ name: 'status:ci-red' }];
     expect(w.tick().reports).toEqual([]);
-    expect(w.calls).toHaveLength(1);
+    expect(w.calls).toHaveLength(3);
   });
 
   it.each([
@@ -385,6 +556,8 @@ describe('report-only tick', () => {
     ['bad commit timestamp', (w) => { w.commitDate = 'unknown'; }],
     ['corrupt persisted state', (w) => { w.files.set(join('output', 'state.json'), '{'); }],
     ['invalid detail cap', () => {}, { maxDetail: -1 }],
+    ['invalid why cap', () => {}, { maxWhy: -1 }],
+    ['missing queue evidence', (w) => { delete w.prs[0].isInMergeQueue; }],
   ])('fails closed without a clean digest: %s', (_, change, options) => {
     const w = fixture();
     change(w);
@@ -417,12 +590,13 @@ describe('shadow action log', () => {
   it('logs would-act once per head, migrates old state, and logs again for a new head', () => {
     const w = rearming();
     expect(w.tick().summary).toMatchObject({ wouldAct: 1, escalated: 0 });
+    expect(w.tick().summary).toMatchObject({ wouldAct: 0, escalated: 1 });
     expect(w.tick().summary).toMatchObject({ wouldAct: 0, escalated: 0 });
     expect(actionLog(w)).toEqual([expect.objectContaining({ type: 'would-act', mode: 'shadow', action: 'rearm', head: 'abc',
-      argv: ['node', 'scripts/operations/run.mjs', 'rearm', '--pr=1', '--repo=web-everything/web-everything'] })]);
+      argv: ['node', 'scripts/operations/run.mjs', 'rearm', '--pr=1', '--repo=web-everything/web-everything'] }), expect.objectContaining({ type: 'escalate', reason: 'action already recorded for this head; condition persists', logLine: 'fix: refused at cap' })]);
     w.prs[0].headRefOid = 'def';
     expect(w.tick().summary.wouldAct).toBe(1);
-    expect(actionLog(w).map((line) => line.head)).toEqual(['abc', 'def']);
+    expect(actionLog(w).filter((line) => line.type === 'would-act').map((line) => line.head)).toEqual(['abc', 'def']);
     expect(w.files.get(join('output', 'digest.md'))).toContain('## Would act (shadow)');
     expect(w.log().at(-1).wouldAct).toBe(1);
   });
@@ -455,20 +629,31 @@ describe('shadow action log', () => {
       expect(command === 'node' ? args[1] === 'why' : command === 'gh' && (args[0] === 'api' || args.slice(0, 2).join(' ') === 'pr list')).toBe(true);
     }
   });
-  it('persists keys before append so an interrupted append cannot double-log', () => {
-    const w = rearming();
+  it.each(['action', 'escalation', 'report'])('append failure leaves the %s key unrecorded and the next tick logs it', (kind) => {
+    const w = kind === 'action' ? rearming() : fixture();
+    if (kind === 'escalation') w.why.verdict.sections[0].lines = ['fix: waiting | operator'];
+    w.prs.push({ ...w.prs[0], number: 2 });
     const append = w.io.appendFileSync;
+    const stderr = [];
+    let failed = false;
     w.io.appendFileSync = (path, data) => {
-      if (path.endsWith('actions.jsonl')) {
-        expect(Object.keys(JSON.parse(w.files.get(join('output', 'state.json'))).actions)).toHaveLength(1);
+      const line = JSON.parse(data);
+      if (!failed && line.pr === 1 && line.type === ({ action: 'would-act', escalation: 'escalate', report: 'report' })[kind]) {
+        failed = true;
         throw new Error('interrupted');
       }
       append(path, data);
     };
-    expect(() => w.tick()).toThrow('interrupted');
+    w.tick({ stderr: (line) => stderr.push(line) });
+    const state = JSON.parse(w.files.get(join('output', 'state.json')));
+    const keys = Object.keys(state[({ action: 'actions', escalation: 'escalations', report: 'lastReported' })[kind]]);
+    expect(keys).toHaveLength(1);
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toContain('interrupted');
     w.io.appendFileSync = append;
-    expect(w.tick().summary).toMatchObject({ wouldAct: 0, escalated: 0 });
-    expect(actionLog(w)).toEqual([]);
+    w.tick();
+    const log = kind === 'report' ? w.log() : actionLog(w);
+    expect(log.filter((line) => line.pr === 1 && line.type === ({ action: 'would-act', escalation: 'escalate', report: 'report' })[kind])).toHaveLength(1);
   });
   it('escalates with exact log, dedupes for 60 minutes, and keys by head and rule', () => {
     const w = fixture();
@@ -490,9 +675,9 @@ describe('shadow action log', () => {
     [[], true, true, 'gate-red-stalled'],
   ])('reads details and why for additional candidate %j', (labels, ciFailing, isDraft, rule) => {
     const w = fixture();
-    Object.assign(w.prs[0], { labels, isDraft, statusCheckRollup: ciFailing ? [{ conclusion: 'FAILURE' }] : [] });
+    Object.assign(w.prs[0], { labels, isDraft, statusCheckRollup: ciFailing ? [{ name: 'checks', conclusion: 'FAILURE' }] : [] });
     expect(w.tick().reports.some((r) => r.rule === rule)).toBe(true);
-    expect(w.calls.filter((c) => c.args[0] === 'api')).toHaveLength(2);
+    expect(w.calls.filter((c) => c.args[0] === 'api')).toHaveLength(4);
     expect(w.calls.some((c) => c.command === 'node')).toBe(true);
   });
   it.each(['https://github.com/org/repo/actions/runs/42', 'https://github.com/org/repo/actions/runs/42?check=1', 'unparseable'])('parses run evidence from %s', (detailsUrl) => {
@@ -505,7 +690,7 @@ describe('shadow action log', () => {
   it('bounds digest decisions to 30 and points to the complete log', () => {
     const w = rearming();
     w.prs = Array.from({ length: 31 }, (_, index) => ({ ...w.prs[0], number: index + 1 }));
-    expect(w.tick({ maxDetail: 31 }).summary.wouldAct).toBe(31);
+    expect(w.tick({ maxDetail: 31, maxWhy: 31 }).summary.wouldAct).toBe(31);
     const section = w.files.get(join('output', 'digest.md')).split('## Would act (shadow)')[1];
     expect(section.split('\n').filter((line) => line.startsWith('- '))).toHaveLength(30);
     expect(section).toContain('inspect actions.jsonl for the full log');
