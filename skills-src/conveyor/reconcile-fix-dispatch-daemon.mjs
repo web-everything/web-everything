@@ -102,6 +102,7 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { sweepMechanicalConflictRebases, createConflictRebaseLedger } from '../../scripts/conveyor/conflict-mechanical-rebase.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
@@ -753,6 +754,20 @@ export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, ti
   return { repos: perRepo, dispatched, refusals };
 }
 
+/** Independent mechanical half: no agent queue, auth pause, or fix phase budget. */
+export function runConflictRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS,
+  tick = sweepMechanicalConflictRebases, createLedger = createConflictRebaseLedger, ...options } = {}) {
+  const entries = forEachRepo(repos, repo => tick({ ...options, repo, apply: true,
+    ledger: options.ledger ?? createLedger({ repo }) }));
+  const dispatched = [], refusals = [];
+  for (const entry of entries) {
+    if (entry.error) { refusals.push({ repo: entry.repo, kind: 'tick-failed', why: entry.error }); continue; }
+    for (const row of entry.result.applied ?? []) dispatched.push({ ...row, repo: entry.repo, kind: 'conflict-rebase' });
+    for (const row of entry.result.refusals ?? []) refusals.push({ ...row, repo: entry.repo });
+  }
+  return { repos: entries, dispatched, refusals };
+}
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runMissingRunRecoveryAllRepos — xi4od2p (epic
  * #4075/#3383), LIVE INCIDENT 2026-09-26: PR web-everything/web-everything#2729 sat `review:accepted` + `MERGEABLE`
@@ -1096,7 +1111,7 @@ const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCu
  *   unpaused — the login break does not touch them.
  */
 export async function runTickAllRepos({
-  repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
+  repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, conflictRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   authGateOverride,
   fixSettings = resolveFixSettings(),
   // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
@@ -1146,7 +1161,7 @@ export async function runTickAllRepos({
   let completedRepo = false;
   const shouldYield = () => (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
   const passStart = now();
-  const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
+  const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, conflictRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
   const planCache = (reuseReconcilePlan ?? !anyTickInjected)
     ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
@@ -1322,7 +1337,7 @@ export async function runTickAllRepos({
   }
   const skippedSteps = [];
   const stepRepos = new Map();
-  for (const step of ['fix', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft']) {
+  for (const step of ['conflict-rebase', 'fix', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft']) {
     const active = repos.filter(repo => snapshots.get(repo)?.rows.length !== 0);
     stepRepos.set(step, active);
     if (repos.length && !active.length) {
@@ -1403,6 +1418,17 @@ export async function runTickAllRepos({
   const orphanGuardDeferred = requireOrphanGuard
     ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo)) : [];
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
+  const conflictRebase = stepTimed('conflict-rebase', () => runConflictRebaseAllRepos({
+    repos: stepRepos.get('conflict-rebase'),
+    tick: sharedTick('conflict-rebase', conflictRebaseTick ?? (anyTickInjected
+      ? (() => ({ applied: [], refusals: [] })) : sweepMechanicalConflictRebases)),
+  }));
+  phasePrCounts['conflict-rebase'] = { handled: conflictRebase.dispatched.filter(row => !row.deferred).length, deferred: 0 };
+  planCache?.markTouched(conflictRebase);
+  // Refresh discovery before fix plans against a head this mechanical step just moved.
+  for (const row of conflictRebase.dispatched) {
+    if (row.action === 'rebased') snapshots.delete(row.repo);
+  }
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
       tick: boundedPrTick('fix', sharedTick('fix', fixTick ?? runReconcileFixDispatch)),
@@ -1517,11 +1543,12 @@ export async function runTickAllRepos({
   return {
     repos: repos.map(repo => fix.repos.find(entry => entry.repo === repo)
       ?? { repo, result: { dispatched: [], refusals: [] }, skipped: true }),
-    dispatched: [...fix.dispatched, ...ciHeal.dispatched, ...hungCi.dispatched, ...mainRedRebase.dispatched, ...missingRun.dispatched, ...promoteDraft.dispatched],
-    refusals: [...fix.refusals, ...ciHeal.refusals, ...hungCi.refusals, ...mainRedRebase.refusals, ...missingRun.refusals, ...promoteDraft.refusals, ...notes.refusals],
+    dispatched: [...conflictRebase.dispatched, ...fix.dispatched, ...ciHeal.dispatched, ...hungCi.dispatched, ...mainRedRebase.dispatched, ...missingRun.dispatched, ...promoteDraft.dispatched],
+    refusals: [...conflictRebase.refusals, ...fix.refusals, ...ciHeal.refusals, ...hungCi.refusals, ...mainRedRebase.refusals, ...missingRun.refusals, ...promoteDraft.refusals, ...notes.refusals],
     reconcileRefusals: [...(fix.reconcileRefusals ?? []), ...(ciHeal.reconcileRefusals ?? []), ...(promoteDraft.reconcileRefusals ?? [])],
     ciHeal, // the ci-heal half's own detail, kept available rather than discarded once merged above
     hungCi, // the hung-ci-recovery half's own detail, same reason
+    conflictRebase,
     mainRedRebase, // the main-red-rebase half's own detail, same reason
     missingRun, // the missing-run-recovery half's own detail, same reason (xi4od2p, #4075/#3383)
     rulingStandDown,
@@ -1600,6 +1627,11 @@ export function formatHungActionLine(a) {
   const prLabel = a?.prNumber == null ? '(no PR)' : `PR #${a.prNumber}`;
   const outcome = a?.ok ? `applied ${a.action}` : `FAILED ${a.action}${a?.error ? ` (${a.error})` : ''}`;
   return `reconcile-fix-dispatch-daemon: hung-ci-recovery ${a?.repo ?? '?'} ${prLabel} run ${a?.runId ?? '?'} — ${outcome} — ${a?.why ?? '(no reason recorded)'}`;
+}
+
+/** One terminal-safe line per mechanical conflict refresh. */
+export function formatConflictRebaseActionLine(a) {
+  return `reconcile-fix-dispatch-daemon: conflict-rebase ${a?.repo ?? '?'} PR #${a?.prNumber ?? '?'} (${a?.headRefName ?? '?'}) — ${a?.ok ? a.action : `FAILED ${a?.action}`}`.replace(/[\x00-\x1f\x7f-\x9f]/g, '');
 }
 
 /**
@@ -1755,7 +1787,7 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }),
     onTick: (result) => {
       const {
-        repos = [], dispatched = [], refusals = [], reconcileRefusals = [], hungCi, mainRedRebase, missingRun, promoteDraft, notes = [], noteComments = [],
+        repos = [], dispatched = [], refusals = [], reconcileRefusals = [], hungCi, mainRedRebase, conflictRebase, missingRun, promoteDraft, notes = [], noteComments = [],
         authPaused = false, authPauseReason = null, statusTags = [], awaitVerify = null, stuckFixers = null, supersede = null,
       } = result || {};
       if (result?.rulingStandDown) {
@@ -1823,6 +1855,7 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
       for (const a of (hungCi?.dispatched ?? [])) log.error(formatHungActionLine(a));
       // x5uqim1 follow-up (#4075/#3383) — ONE LINE PER MECHANICAL-REBASE ACTION, same discipline as the
       // hung-run loop just above.
+      for (const a of (conflictRebase?.dispatched ?? [])) log.error(formatConflictRebaseActionLine(a));
       for (const a of (mainRedRebase?.dispatched ?? [])) log.error(formatMainRedRebaseActionLine(a));
       // xi4od2p (#4075/#3383) — ONE LINE PER MISSING-RUN-TRIGGER ACTION, same discipline as the two loops above.
       for (const a of (missingRun?.dispatched ?? [])) log.error(formatMissingRunActionLine(a));

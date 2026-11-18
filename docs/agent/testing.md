@@ -4614,3 +4614,12 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Mechanical conflict rebase isolation
+
+`conflict-mechanical-rebase.test.mjs` and `reconcile-fix-dispatch-daemon.test.mjs`
+cover the independent pre-fix mechanical step. Inject `conflictRebaseTick` in daemon
+fixtures; a refresh must invalidate shared PR discovery before fix planning. Keep
+restart/same-main-SHA ledger checks paired with failure-before-refresh checks:
+unreadable or unwritable attempt state leaves ownership with existing fix dispatch.
+Run these scoped suites through the host heavy-admission queue.

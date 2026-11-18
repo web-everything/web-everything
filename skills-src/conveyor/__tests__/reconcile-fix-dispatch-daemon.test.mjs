@@ -27,6 +27,7 @@ import {
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
 import * as fixDispatch from '../../../scripts/conveyor/reconcile-fix-dispatch.mjs';
+import * as conflictRebase from '../../../scripts/conveyor/conflict-mechanical-rebase.mjs';
 import * as recovery from '../../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import * as netScope from '../../../scripts/conveyor/net-scope.mjs';
 import * as prStack from '../../../scripts/conveyor/pr-stack.mjs';
@@ -432,7 +433,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
 
   const steps = {
     fix: 'fixTick', 'ci-heal': 'ciHealTick', 'hung-ci': 'hungCiTick',
-    'main-red-rebase': 'mainRedRebaseTick', 'missing-run': 'missingRunTick',
+    'conflict-rebase': 'conflictRebaseTick', 'main-red-rebase': 'mainRedRebaseTick', 'missing-run': 'missingRunTick',
     'promote-draft': 'promoteDraftTick', notes: 'notesTick',
   };
   const pr = (number, extra = {}) => ({
@@ -449,6 +450,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     authGateOverride: () => ({ paused: false, reason: null }),
     fixTick: vi.fn(() => ({ dispatched: [], refusals: [] })),
     ciHealTick: vi.fn(async () => ({ dispatched: [], refusals: [] })),
+    conflictRebaseTick: vi.fn(() => ({ applied: [], refusals: [] })),
     hungCiTick: vi.fn(noopHungCiTick), mainRedRebaseTick: vi.fn(noopMainRedRebaseTick),
     missingRunTick: vi.fn(noopMissingRunTick), promoteDraftTick: vi.fn(noopPromoteDraftTick),
     notesTick: vi.fn(noopNotesTick), ...extra,
@@ -470,6 +472,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        : step === 'conflict-rebase'
+          ? { repo: 'repo-a', apply: true, ledger: { read: expect.any(Function), write: expect.any(Function), claim: expect.any(Function) } }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
@@ -643,6 +647,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        : step === 'conflict-rebase'
+          ? { repo: 'repo-a', apply: true, ledger: { read: expect.any(Function), write: expect.any(Function), claim: expect.any(Function) } }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
@@ -750,6 +756,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(options).toEqual(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        : step === 'conflict-rebase'
+          ? { repo: 'repo-a', apply: true, ledger: { read: expect.any(Function), write: expect.any(Function), claim: expect.any(Function) } }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
@@ -1892,7 +1900,7 @@ describe('fix daemon pass timing', () => {
       authGateOverride: () => ({ paused: false, reason: null }),
     });
     expect(Object.keys(result.phaseMs).sort()).toEqual([
-      'fix', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes',
+      'conflict-rebase', 'fix', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes',
       'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down', 'orphan-guard',
     ].sort());
     for (const ms of Object.values(result.phaseMs)) expect(ms).toBeGreaterThan(0);
@@ -2110,6 +2118,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     vi.spyOn(awaitVerifyLoop, 'runTickAwaitVerify').mockResolvedValue({ rows: [] });
     vi.spyOn(stuckReclaim, 'runFixerStuckReclaimPass').mockResolvedValue({ rows: [] });
     vi.spyOn(supersedeWatch, 'runSupersedeWatch').mockReturnValue({ holds: [], applied: [] });
+    vi.spyOn(conflictRebase, 'sweepMechanicalConflictRebases').mockReturnValue({ applied: [], refusals: [] });
     vi.spyOn(recovery, 'sweepHungCiRecovery').mockImplementation(noopHungCiTick);
     vi.spyOn(recovery, 'sweepCiRedRecovery').mockImplementation(noopMainRedRebaseTick);
     vi.spyOn(recovery, 'sweepMissingRunRecovery').mockImplementation(noopMissingRunTick);

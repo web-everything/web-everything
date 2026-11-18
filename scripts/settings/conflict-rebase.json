@@ -1,0 +1,4 @@
+{
+  "$comment": "fix.conflictRebasePerPass: integer 0..100, standard 3; 0 or invalid disables mechanical conflict rebases, leaving existing fix dispatch/escalation in charge. Independent of fix phase time/PR budgets and auth pause. One attempt per PR/main SHA, persisted for 30 days. Cascade standard -> platform fix.conflictRebasePerPass -> this file -> WE_CONFLICT_REBASE_PER_PASS; effective value/source logged by policy-cascade.",
+  "fix": { "conflictRebasePerPass": 3 }
+}
