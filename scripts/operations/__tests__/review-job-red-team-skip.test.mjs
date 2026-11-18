@@ -704,6 +704,27 @@ describe('review-job red-team skip settlement', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('production suppression reads the live PR with memo-free child and throttle env', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fresh-skip-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_GH_READ_MEMO_DIR: 'tick-memo',
+      WE_PR_SNAPSHOT_STALE_OK_MS: '60000' };
+    const exec = vi.fn(() => JSON.stringify({ headRefOid: 'b'.repeat(40), labels: [] }));
+    try {
+      const io = createReviewJobIo({ env, exec });
+      io.settleRedTeamSkip({ repo, pr, head, redTeam: { status: 'error', reason: 'offline' } });
+      expect(exec).toHaveBeenCalledTimes(1);
+      const [file, args, options] = exec.mock.calls[0];
+      expect(file).toBe('gh');
+      expect(args.slice(0, 3)).toEqual(['pr', 'view', String(pr)]);
+      for (const actual of [options.env, options.throttle.env]) {
+        expect(actual).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+        expect(actual).not.toHaveProperty('WE_PR_SNAPSHOT_STALE_OK_MS');
+        expect(actual.WE_SHARED_RUNS_DIR).toBe(env.WE_SHARED_RUNS_DIR);
+      }
+      expect(env.WE_GH_READ_MEMO_DIR).toBe('tick-memo');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('createReviewJobIo exposes the settlement hook', () => {
     expect(createReviewJobIo({ env: {} }).settleRedTeamSkip).toEqual(expect.any(Function));
   });

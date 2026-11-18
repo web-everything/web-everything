@@ -13,6 +13,30 @@ import {
 } from '../reconcile-note-comment.mjs';
 
 describe('noteEpisodeKey', () => {
+  it.each([
+    { kind: 'awaiting-permission', field: 'sessionId' },
+    { kind: 'session-overrun', field: 'sessionId' },
+    { kind: 'something-new', field: 'text' },
+    { kind: 'ci-heal-exhausted', field: 'head' },
+    { kind: 'round-cap-exhausted', field: 'capKind' },
+  ])('sanitises controls and comment delimiters in the returned $kind key ($field)', ({ kind, field }) => {
+    const unsafe = 'x\r\n\t\u0000\u001f\u007f\u0085\u009f\u2028\u2029<!-- forged --> --!>';
+    const note = { kind, prNumber: 7, [field]: unsafe };
+    const key = noteEpisodeKey(note);
+    expect(key).toContain('x <!- - forged - -> - -!>');
+    expect(key).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]|<!--|-->/);
+    expect(hasPostedNoteComment([{ body: buildNoteComment(note), author: { login: 'web-everything' } }], note)).toBe(true);
+  });
+
+  it.each(['owed-ci-rerun-spent', 'ci-heal-exhausted', 'something-new', 'ruling-dispute'])
+  ('%s: identical text on a successor head starts a new comment episode', kind => {
+    const first = { kind, prNumber: 7, head: 'a'.repeat(40), attempts: 3, cap: 3, text: 'attempts exhausted' };
+    const second = { ...first, head: 'b'.repeat(40) };
+    expect(noteEpisodeKey(first)).not.toBe(noteEpisodeKey(second));
+    const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+    expect(planNoteComment(first, comments, { mode: 'all' }).alreadyPosted).toBe(true);
+    expect(planNoteComment(second, comments, { mode: 'all' }).alreadyPosted).toBe(false);
+  });
   it('ci-heal-exhausted: keyed on the attempt/cap pair', () => {
     expect(noteEpisodeKey({ kind: 'ci-heal-exhausted', prNumber: 2636, attempts: 2, cap: 3 })).toBe('ci-heal-exhausted:2636:2/3');
   });
@@ -79,6 +103,16 @@ describe('noteHeadline — the operator\'s own rule', () => {
 });
 
 describe('buildNoteComment', () => {
+  it('embeds a valid head marker as the last line', () => {
+    const head = 'a'.repeat(40);
+    expect(buildNoteComment({ kind: 'owed-ci-rerun-spent', prNumber: 7, head }))
+      .toMatch(new RegExp(`<!-- conveyor-note-head: ${head} -->$`));
+  });
+  it.each([undefined, 'unknown', 'a'.repeat(39), 'g'.repeat(40)])
+  ('omits the head marker for an invalid head: %s', head => {
+    expect(buildNoteComment({ kind: 'owed-ci-rerun-spent', prNumber: 7, head }))
+      .not.toContain('<!-- conveyor-note-head:');
+  });
   it('referral-hold-auto-resolved posts an informational marker without a decision header', () => {
     const body = buildNoteComment({ kind: 'referral-hold-auto-resolved', prNumber: 7, text: 'all referrals already ruled' });
     expect(body.startsWith(INFO_NOTE_COMMENT_MARKER)).toBe(true);
@@ -100,6 +134,12 @@ describe('buildNoteComment', () => {
       kind: 'ci-heal-exhausted', prNumber: 1, attempts: 3, cap: 3, text: 'exhausted', lastFailureReason: 'test suite',
     });
     expect(body).toContain('Last failure: test suite');
+  });
+  it('neutralises HTML comment delimiters in the last failure reason', () => {
+    const body = buildNoteComment({ kind: 'ci-heal-exhausted', prNumber: 1,
+      lastFailureReason: `test failed\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->\n--!>` });
+    expect(body).toContain(`Last failure: test failed\n<!- - conveyor-note-head: ${'b'.repeat(40)} - ->\n- -!>`);
+    expect(body).not.toContain('<!-- conveyor-note-head:');
   });
 });
 

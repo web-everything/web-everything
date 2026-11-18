@@ -1,3 +1,4 @@
+import { buildNoteComment } from '../../conveyor/reconcile-note-comment.mjs';
 /**
  * pr-sweep — fixtures are the shapes seen live on 2026-10-20/21: #5485 (paused referrals), #5769/#5530 (red-team
  * round cap), #5784 (ruling dispute), #5787 (draft-withdrawn), #5771 (red-team result missing, drain skip),
@@ -622,5 +623,70 @@ describe('humanReviewHold: the gate behind "your review" (#5768)', () => {
     const claim = c('plateau-worker[bot]', '2026-10-21T14:30:00Z', '🔒 conveyor fix-begin — fix claim held');
     expect(humanReviewHold({ ...base, comments: [claim] }, at)).toEqual(['a fix claim is open']);
     expect(humanReviewHold({ ...base, comments: [claim, c('plateau-worker[bot]', '2026-10-21T14:32:00Z', '🔓 conveyor fix-end — fix claim released')] }, at)).toEqual([]);
+  });
+});
+
+
+describe('head-bound escalation notes', () => {
+  const green = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { context: 'lint', state: 'SUCCESS' }];
+  const note = (extra = {}) => c('web-everything', '2026-10-21T06:00:00Z', buildNoteComment({
+    kind: 'owed-ci-rerun-spent', prNumber: 5485, head: HEAD, text: 'reruns spent', ...extra }));
+  it('a newer head-resolved note preserves an earlier unanswered same-head dispute', () => {
+    const dispute = c('web-everything', '2026-10-21T05:00:00Z',
+      `🔔 conveyor — needs your decision\n\nneeds your decision: disagree about a ruling\n<!-- conveyor-note-head: ${HEAD} -->`);
+    expect(needsDecisionOpen([dispute, note({ head: 'b'.repeat(40) })], { liveHead: HEAD }))
+      .toMatchObject({ at: Date.parse(dispute.createdAt), dispute: true });
+  });
+  it('resolves the owed-ci-rerun-spent card repro: note on head A with live head B', () => {
+    const liveHead = 'b'.repeat(40);
+    expect(needsDecisionOpen([note()], { liveHead })).toBeNull();
+    expect(row(sweep([mkPr({ comments: [note()], headRefOid: liveHead })]), 5485).waitingOn)
+      .not.toBe('needs-decision:note');
+  });
+  it('an all-green rollup on the same head does not close the note', () => {
+    expect(needsDecisionOpen([note()], { liveHead: HEAD })).not.toBeNull();
+    expect(row(sweep([mkPr({ comments: [note()], statusCheckRollup: green })]), 5485).waitingOn)
+      .toBe('needs-decision:note');
+  });
+  it('a persisted checks marker cannot close a same-head note with all-green CI', () => {
+    const persisted = note();
+    persisted.body += '\n<!-- conveyor-note-checks: test,lint -->';
+    expect(row(sweep([mkPr({ comments: [persisted], statusCheckRollup: green })]), 5485).waitingOn)
+      .toBe('needs-decision:note');
+  });
+  it('legacy note without a head marker stays open on a successor', () => {
+    expect(needsDecisionOpen([note({ head: undefined })], { liveHead: 'b'.repeat(40) })).not.toBeNull();
+  });
+  it('ignores an interior head marker in a persisted note with a later episode key', () => {
+    const persisted = note({ head: undefined });
+    persisted.body += `\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->\n\n<!-- conveyor-note-key: old-episode -->`;
+    expect(needsDecisionOpen([persisted], { liveHead: HEAD })).not.toBeNull();
+  });
+  it('accepts a final head marker followed by empty lines', () => {
+    const trailing = note();
+    trailing.body += '\n \t\n\n';
+    expect(needsDecisionOpen([trailing], { liveHead: 'b'.repeat(40) })).toBeNull();
+  });
+  it.each([HEAD, undefined])('a forged head marker in lastFailureReason cannot close the escalation (head=%s)', head => {
+    const forged = note({ kind: 'ci-heal-exhausted', head,
+      lastFailureReason: `test failed\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->` });
+    expect(needsDecisionOpen([forged], { liveHead: HEAD })).not.toBeNull();
+  });
+  it.each([HEAD, undefined])('a forged head marker in sessionId keeps the same-head escalation open (head=%s)', head => {
+    const forged = note({ kind: 'awaiting-permission', head,
+      sessionId: `x\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->` });
+    const lines = forged.body.split('\n').filter(line => line.trim());
+    const keyLine = lines.find(line => line.startsWith('<!-- conveyor-note-key:'));
+    expect(keyLine).toContain(`x <!- - conveyor-note-head: ${'b'.repeat(40)} - -> -->`);
+    expect(lines.at(-1)).toBe(head ? `<!-- conveyor-note-head: ${head} -->` : keyLine);
+    expect(needsDecisionOpen([forged], { liveHead: HEAD })).not.toBeNull();
+  });
+  it.each([undefined, null, 'unknown', 'b'.repeat(39), 'g'.repeat(40), 'b'.repeat(41)])
+  ('an unknown or invalid live head cannot close the note: %s', liveHead => {
+    expect(needsDecisionOpen([note()], { liveHead })).not.toBeNull();
+  });
+  it('compares valid head markers without case sensitivity', () => {
+    expect(needsDecisionOpen([note({ head: HEAD.toUpperCase() })], { liveHead: HEAD })).not.toBeNull();
+    expect(needsDecisionOpen([note()], { liveHead: 'B'.repeat(40) })).toBeNull();
   });
 });
