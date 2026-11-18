@@ -36,6 +36,7 @@
  * `overlay-main-sync-tests-stderr-tail.mjs` uses the same automatic registration.
  * `no-ask-note-not-needs-decision.mjs` uses the same automatic registration.
  * `rebuild-adopt-only-lease.mjs` registers the R830 adopt-only build lease break through discovery.
+ * `rebuild-job-ready-candidate-starvation.mjs` uses the same automatic registration.
  * `red-team-renamed-host-dead-owner-never-reaped.mjs` uses the same automatic registration.
  * `await-verify-delivered-previous-ci-never-retired.mjs` uses the same automatic registration.
  * `hung-ci-completed-run-reselect.mjs` uses the same automatic registration.
