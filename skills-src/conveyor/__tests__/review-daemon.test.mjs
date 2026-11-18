@@ -1246,6 +1246,46 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(recoveryLanes).toBe(Math.max(0, rawLanes - 1));
   });
 
+  it('PR #7023 red team: no ordinary reviews owed + one free lane ⇒ red-team-only recovery still starts (production readers)', async () => {
+    const { defaultAcquirableLaneNumbers, defaultRecoveryLaneNumbers } = await import('../review-daemon.mjs');
+    const readLanes = vi.fn(() => [7]);
+    const dispatch = vi.fn();
+    let seen;
+    const out = runReviewTick({ reconcile: () => owedPlan([]), dispatch,
+      acquirableLanes: opts => defaultAcquirableLaneNumbers(opts, { readLanes }),
+      recoveryAcquirableLanes: opts => defaultRecoveryLaneNumbers(opts, { readLanes }),
+      liveReviewBudget: { left: 4 },
+      redTeamOnSkip: ({ capacity }) => {
+        seen = { lanes: capacity.lanes, starts: capacity.remainingStarts };
+        if (capacity.lanes < 1 || capacity.remainingStarts < 1) return { dispatched: [], skipped: ['no review capacity left'] };
+        capacity.take(); capacity.lanes--; capacity.remainingStarts--;
+        return { dispatched: [{ prNumber: 900 }] };
+      },
+      hostAdmission: () => ({ admitted: true, maxPerTick: 4 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(seen).toEqual({ lanes: 1, starts: 4 });
+    expect(out.redTeamOnSkip.dispatched).toEqual([{ prNumber: 900 }]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.failed).toEqual([]);
+  });
+
+  it('a throwing recovery lane read fails closed to 0 recovery lanes and never aborts ordinary dispatch', () => {
+    const log = vi.fn();
+    let recoveryLanes;
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(1), dispatch, log,
+      acquirableLanes: () => 2, recoveryAcquirableLanes: () => { throw new Error('lane pool unreadable'); },
+      redTeamOnSkip: ({ capacity }) => { recoveryLanes = capacity.lanes; return { dispatched: [] }; },
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(recoveryLanes).toBe(0);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.dispatched.map(d => d.prNumber)).toEqual([100]);
+    expect(log.mock.calls.flat().join('\n')).toContain('recovery lane read failed (lane pool unreadable)');
+  });
+
   it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => '101 1 node scripts/operations/review-job.mjs --pr=1\n102 101 node x/review-loop-cli.mjs\n103 1 node other.mjs\n' });
