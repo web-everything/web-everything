@@ -34,6 +34,8 @@ export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect 
       }
     }
     if (snapshot.status === 'unknown') throw new Error('unknown scope snapshot');
+    // Registry claims written by older tools may hold dotted paths; normalize them the same way (escape = refuse).
+    snapshot.agents = snapshot.agents.map(entry => ({ ...entry, files: entry.files.map(f => normalizeQualified(qualifyFile(f))) }));
     const verdict = assessFreeScope({ ...snapshot, files, nowMs, excludeAgent, excludeOwner });
     const { live } = partitionRegistry(snapshot.agents, nowMs);
     const overlaps = verdict.files.filter(row => row.state === 'occupied').flatMap(row => row.holders.map(holder => {

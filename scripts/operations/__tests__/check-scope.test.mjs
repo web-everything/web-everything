@@ -33,6 +33,9 @@ describe('checkScope shared admission', () => {
     expect(run({ agents: [agent] }, { declaredFiles: ['we:scripts/../scripts/a.mjs'] }).ok).toBe(false);
     expect(run({}, { declaredFiles: ['we:../outside.mjs'] })).toMatchObject({ ok: false, reason: expect.stringContaining('escapes') });
   });
+  it('normalizes dotted paths in stored registry claims too', () => {
+    expect(run({ agents: [{ ...agent, files: ['we:src/../scripts/a.mjs'] }] }).ok).toBe(false);
+  });
   it('excludes only the named owner when supplied', () => {
     expect(run({ agents: [agent] }, { excludeAgent: agent.agent, excludeOwner: 'holder' }).ok).toBe(true);
     expect(run({ agents: [agent] }, { excludeAgent: agent.agent, excludeOwner: 'other' }).ok).toBe(false);
