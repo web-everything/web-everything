@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { quarantineEligible, quarantinedVerdict } from '../verify-quarantine.mjs';
+import { readFileSync } from 'node:fs';
+import { createFailureCollector } from '../verify-failures.mjs';
+import { applyRevertRedToVerdict } from '../verify-revert-red.mjs';
 import { reachesChanged } from '../red-cause.mjs';
 
 const now = Date.parse('2026-11-18T12:00:00Z');
@@ -8,8 +11,8 @@ const other = 'scripts/lib/__tests__/other.test.mjs';
 const entry = (test = file, extra = {}) => ({ test, brokenSha: 'abcdef123', owner: 'operator',
   reason: 'red on main', addedAt: now - 1000, expiresAt: now + 1000, ...extra });
 const phase = (files = [file], extra = {}) => ({ phase: 'vitest', result: { exitCode: 1,
-  failureDetails: { tests: files.map(file => ({ file, name: 'fails' })), truncated: false }, ...extra } });
-const input = (extra = {}) => ({ phaseResults: [phase()], now, changedFiles: [],
+  failureDetails: { tests: files.map(file => ({ file, name: 'fails' })), truncated: false, summary: `Test Files  ${new Set(files).size} failed` }, ...extra } });
+const input = (extra = {}) => ({ phaseResults: [phase()], now, changedFiles: [], onMain: false, runAllPhases: true,
   read: { ok: true, list: { version: 1, mode: 'quarantine', entries: [entry()] } }, ...extra });
 const verdict = (extra = {}) => quarantinedVerdict(input(extra));
 const withEntries = entries => ({ ok: true, list: { version: 1, mode: 'quarantine', entries } });
@@ -21,6 +24,59 @@ describe('verify post-hoc quarantine', () => {
       read: withEntries([entry(), entry(other)]) })).toEqual({
       excused: true, files: [file, other], why: expect.stringContaining('skipping 2'),
     });
+  });
+  it('keeps every branch red while a published main-fix PR is open', () => {
+    const result = verdict({ read: { ok: true, list: { ...input().read.list, fixPrs: [123] } } });
+    closed(result);
+    expect(result.why).toContain('main-fix PR is open');
+    expect(verdict({ read: { ok: true, list: { ...input().read.list, fixPrs: [] } } }).excused).toBe(true);
+  });
+  it.each([true, undefined, null])('keeps main or unknown branch red (%j)', onMain => closed(verdict({ onMain })));
+  it.each([false, undefined])('keeps red when later planned phases may have been skipped (%j)', runAllPhases => closed(verdict({ runAllPhases })));
+  it.each(['data.json', 'fixture.html', 'config.yaml', 'asset.svg', 'LICENSE'])('keeps runtime dependency evidence unknown for %s', changed => {
+    closed(verdict({ changedFiles: ['unrelated.mjs', changed], touchesDiff: () => false }));
+  });
+  it.each(['mjs', 'js', 'cjs', 'ts', 'tsx', 'md', 'mdx'])('allows proven outside %s edits', ext => {
+    expect(verdict({ changedFiles: [`unrelated.${ext}`], touchesDiff: () => false }).excused).toBe(true);
+  });
+  it('requires the distinct failing file count to match vitest, including duplicate test identities', () => {
+    for (const summary of ['', 'Test Files  2 failed', 'Test Files  0 failed']) {
+      closed(verdict({ phaseResults: [phase([file], { failureDetails: { tests: [{ file, name: 'fails' }], truncated: false, summary } })] }));
+    }
+    expect(verdict({ phaseResults: [phase([file, file])] }).excused).toBe(true);
+  });
+  it.each(['stdout', 'stderr'])('reconciles real collector output and %s counts', stream => {
+    const collector = createFailureCollector();
+    collector.push(` FAIL ${file} > fails\n`, 'stderr');
+    collector.push(' Test Files  1 failed | 2 passed (3)\n', stream);
+    const failureDetails = collector.finish();
+    expect(verdict({ phaseResults: [phase([file], { failureDetails, output: null })] }).excused).toBe(true);
+    closed(verdict({ phaseResults: [phase([file], { failureDetails, output: { [stream]: 'Test Files  2 failed' } })] }));
+    expect(verdict({ phaseResults: [phase([file], { failureDetails: { ...failureDetails, summary: '' }, output: { [stream]: 'Test Files  1 failed' } })] }).excused).toBe(true);
+  });
+  it('routes quarantined green through revert-red enforcement before diagnostics and markers', () => {
+    const source = readFileSync('scripts/verify-lane.mjs', 'utf8');
+    const start = source.indexOf('const diffFiles =');
+    const end = source.indexOf('// #5466 — the revert-red check, inside', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const decide = new Function('resolvedGate', 'editedDuringRun', 'tryGit', 'headSha', 'exitCode', 'signal', 'infrastructureNow', 'phaseTimeout',
+      'quarantineEligible', 'phaseResults', 'quarantinedVerdict', 'readQuarantine', 'REPO', 'runAllPhases', 'reachesChanged', 'readRepoFile', 'process',
+      'const failureDetails = undefined; ' + source.slice(start, end) + '; return { exitCode, quarantined };');
+    const run = (branch, mainTip) => decide({ decision: { changedFiles: [] } }, [], args => args[0] === 'symbolic-ref' ? branch : mainTip,
+      'head', 1, null, () => null, null, quarantineEligible, [phase()], args => quarantinedVerdict({ ...args, now }),
+      () => input().read, '.', true, () => 'outside', () => '', { stderr: { write() {} } });
+    // Lane clones keep a local branch named main, so only HEAD == origin/main's tip counts as main.
+    expect(run('lane/test', 'head').exitCode).toBe(1);
+    expect(run('main', 'base').exitCode).toBe(0);
+    const green = run('lane/test', 'base');
+    expect(green).toMatchObject({ exitCode: 0, quarantined: { files: [file] } });
+    const revert = source.indexOf('if (exitCode === 0 && !signal', end);
+    const apply = source.indexOf('applyRevertRedToVerdict({ exitCode, failureDetails, revertRed })', revert);
+    expect(revert).toBeGreaterThan(end);
+    expect(apply).toBeGreaterThan(revert);
+    expect(apply).toBeLessThan(source.indexOf('const diagnostic =', apply));
+    expect(applyRevertRedToVerdict({ ...green, revertRed: { mode: 'enforce', status: 'flagged', blocking: true, line: 'revert-red: flagged' } }).exitCode).not.toBe(0);
   });
   it('does not mutate the actual test outcomes', () => {
     const args = input();

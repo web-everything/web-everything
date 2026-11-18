@@ -1049,6 +1049,23 @@ try {
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
+// The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
+const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
+let quarantined = null;
+if (exitCode !== 0 && !signal && !infrastructureNow(exitCode, signal, failureDetails) && !phaseTimeout && quarantineEligible(phaseResults)) {
+  try {
+    const verdict = quarantinedVerdict({ phaseResults, read: readQuarantine({ board: REPO }), changedFiles: diffFiles, now: Date.now(), runAllPhases,
+      // Lane clones keep a local branch named `main` whatever they carry, so main means "HEAD is origin/main's tip".
+      onMain: tryGit(['rev-parse', 'origin/main']) === headSha,
+      touchesDiff: (file) => { const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } });
+    if (verdict.excused) {
+      quarantined = { files: verdict.files, why: verdict.why };
+      exitCode = 0;
+      process.stderr.write(`verify-lane: quarantined (not red): ${verdict.files.join(', ')}\n`);
+    }
+  } catch { /* Unreadable quarantine evidence leaves the gate red. */ }
+}
+
 // #5466 — the revert-red check, inside the fixer's own verify: on a GREEN gate for a fix push (the fix role's own await
 // record names exactly this head), revert the fix's source changes, run only the tests it added or changed, and record
 // which of them stay green. AFTER the gate and BEFORE the marker, so the harness's exact-sha / clean-tree push check
@@ -1092,20 +1109,6 @@ const infrastructureBase = verificationInfrastructureFailure({ exitCode, signal,
   ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 const infrastructure = infrastructureBase && killedOutputTail && ['verify-timeout', 'verify-signal'].includes(infrastructureBase.reason)
   ? { ...infrastructureBase, outputTail: killedOutputTail } : infrastructureBase;
-// The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
-const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
-let quarantined = null;
-if (exitCode !== 0 && !signal && !infrastructure && quarantineEligible(phaseResults)) {
-  try {
-    const verdict = quarantinedVerdict({ phaseResults, read: readQuarantine({ board: REPO }), changedFiles: diffFiles, now: Date.now(),
-      touchesDiff: (file) => { const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } });
-    if (verdict.excused) {
-      quarantined = { files: verdict.files, why: verdict.why };
-      exitCode = 0;
-      process.stderr.write(`verify-lane: quarantined (not red): ${verdict.files.join(', ')}\n`);
-    }
-  } catch { /* Unreadable quarantine evidence leaves the gate red. */ }
-}
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit, ...(quarantined ? { quarantined } : {}) };
 const retryDetail = describeIsolatedRetry(retryAudit) + (quarantined ? ` quarantined (not red): ${quarantined.files.join(', ')}.` : '');
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
