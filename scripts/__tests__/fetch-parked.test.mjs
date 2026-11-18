@@ -502,7 +502,7 @@ describe('resolveNetDiff — a `net` basis is CLAIMED only when it is PROVEN', (
     let baseFetches = 0;
     const bases = [];
     const exec = (cmd, args, opts) => {
-      if (args[0] === 'fetch' && args.includes('+main:refs/remotes/origin/main')) baseFetches++;
+      if (args[0] === 'fetch' && args.includes('+refs/heads/main:refs/remotes/origin/main')) baseFetches++;
       if (args[0] === 'rev-parse' && /(?:main|FETCH_HEAD)\^\{commit\}$/.test(args.at(-1))) {
         return (baseFetches > 1 ? 'f'.repeat(40) : OID) + '\n';
       }
@@ -532,7 +532,7 @@ describe('resolveNetDiff — a `net` basis is CLAIMED only when it is PROVEN', (
     expect(fetches.length).toBeGreaterThan(0);
     for (const c of fetches) {
       expect(c, `unguarded fetch argv: ${c}`).toContain('--end-of-options');
-      expect(c.indexOf('--end-of-options'), 'the guard must PRECEDE the ref').toBeLessThan(c.indexOf('lane/x'));
+      expect(c.indexOf('--end-of-options'), 'the guard must PRECEDE the ref').toBeLessThan(Math.max(c.indexOf('lane/x'), c.indexOf('+refs/heads/main:')));
     }
   });
 

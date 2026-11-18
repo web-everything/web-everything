@@ -88,7 +88,7 @@ export const REQUEST_DIR = `${TRANSPORT_BRANCH}/requests`;
  * most. `review-pr-io.mjs` re-exports both names, so every existing importer is unchanged.
  */
 export const PR_VIEW_FIELDS = Object.freeze([
-  'number', 'title', 'url', 'body', 'labels', 'comments', 'files', 'headRefName',
+  'number', 'title', 'url', 'body', 'labels', 'comments', 'files', 'headRefName', 'headRefOid',
   // #xwp8ioh — `state` rides the SAME call (one more json field, no extra hop). Without it `review-pr` could
   // not tell a live PR from a merged one, so it paid a juror to review PRs that had already landed.
   'state',

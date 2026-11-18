@@ -4678,3 +4678,14 @@ the incomplete-first-render probe, advancing-base pin, and mismatched pair ident
 `review-pr-io-pinned-head.test.mjs` exercises the same incomplete-render failure
 through the review reader. `merge-gate-ci.test.mjs` covers acceptance reusing the
 scored text after main advances and retaining unscored evidence when rendering fails.
+
+
+Scored net-diff readers take `resolvePinnedDiffBasis({ exec, baseRef, headSha })`'s
+basis object, never a revision string. The single hardened fetch carries the base
+first and the exact head; FETCH_HEAD must match the qualified tracking base.
+Text, paths, changed files and signals stamp `baseSha`, `headSha`, `mergeBaseSha`;
+paired reads compare all three plus the caller's expected head. Failed transport,
+missing objects or incomplete rendering remain unscored: repair and rerun, or seek
+human review of the full diff. `pinned-diff-basis.test.mjs` covers these closed paths;
+`pinned-diff-basis-structure.test.mjs` scans scripts and tests its own offender detector.
+Run both with the affected reader suites through heavy-admission (`--wait-ms=550000`).

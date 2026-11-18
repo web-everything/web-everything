@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolvePinnedDiffBasis, stampDiffBasis, sameDiffBasis, isPinnedDiffBasis } from '../lib/pinned-diff-basis.mjs';
 /**
  * @file scripts/conveyor/convert-advisory-dispatch.mjs
  * @description #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — the IO shell that turns
@@ -50,7 +51,6 @@ import {
 import { planAdvisoryLabels, ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
-import { resolveNetDiffBasis } from '../merge-ai-prs.mjs';
 import { hardenedGitDiff } from '../lib/hardened-git-diff.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
@@ -217,9 +217,9 @@ export function buildTargetedCheckInput({ acceptComment, escalation, evidence } 
  * @returns {{text:string, scored:boolean, reason?:string}}
  */
 export function fetchTestGamingDiffEvidence({
-  exec = execFileSync, remote = 'origin', base = 'main', rev, paths = [], repo = null, prNumber = null,
+  exec = execFileSync, remote = 'origin', basis, paths = [], repo = null, prNumber = null,
 } = {}) {
-  if (typeof exec !== 'function' || !rev || !Array.isArray(paths) || paths.length === 0) {
+  if (typeof exec !== 'function' || !basis || !Array.isArray(paths) || paths.length === 0) {
     return { text: '', scored: false, reason: 'no-paths' };
   }
   if (repo && !isLocalOriginRepo({ exec, remote, repo })) {
@@ -230,13 +230,12 @@ export function fetchTestGamingDiffEvidence({
     // Read in the subject checkout, or request human review of the full diff.
     return { text: '', scored: false, reason: 'raw-evidence-unavailable' };
   }
-  const basis = resolveNetDiffBasis({ exec, remote, base, rev, pinRev: true });
-  if (!basis.ok) return { text: '', scored: false, reason: basis.reason };
+  if (!isPinnedDiffBasis(basis)) return { text: '', scored: false, reason: basis.reason };
   try {
     const text = String(hardenedGitDiff(exec, [
-      'diff', '--end-of-options', basis.diffBase, basis.candidate, '--', ...paths,
+      'diff', '--end-of-options', basis.mergeBaseSha, basis.headSha, '--', ...paths,
     ]) || '');
-    return { text, scored: true, base: basis.diffBase, rev: basis.candidate };
+    return { text, scored: true, base: basis.mergeBaseSha, rev: basis.headSha, ...stampDiffBasis(basis) };
   } catch {
     return { text: '', scored: false, reason: 'diff-failed' };
   }
@@ -283,7 +282,7 @@ export function filterDiffToPaths(diffText, paths) {
  * @returns {Promise<{required: boolean, available: boolean, text: string, note?: string}>}
  */
 export async function resolveTargetedCheckEvidence({
-  escalation, headSha, comments = [], repo = null, prNumber = null, fetchEvidence = fetchTestGamingDiffEvidence,
+  escalation, headSha, comments = [], repo = null, prNumber = null, fetchEvidence = resolveAndFetchTestGamingEvidence,
 } = {}) {
   const kind = escalation?.kind;
   if (kind === 'heal-mutual-exclusivity') {
@@ -311,7 +310,7 @@ export async function resolveTargetedCheckEvidence({
       note: 'no test file path could be parsed from the escalation reason',
     };
   }
-  const result = await fetchEvidence({ rev: headSha, paths, repo, prNumber });
+  const result = await fetchEvidence({ headSha, paths, repo, prNumber });
   const available = !!(result && result.scored && typeof result.text === 'string' && result.text.trim().length > 0);
   return {
     required: true, available, text: available ? result.text : '',
@@ -472,7 +471,7 @@ function labelsUntouchedSinceNote({ noteAt, wanted, repo, prNumber, readLabelEve
  * @returns {Promise<object>}
  */
 export async function dispatchConvertAdvisory(d, {
-  repo, provider = createGhProvider(), runJudge = runTargetedCheck, fetchEvidence = fetchTestGamingDiffEvidence,
+  repo, provider = createGhProvider(), runJudge = runTargetedCheck, fetchEvidence = resolveAndFetchTestGamingEvidence,
   readLabelEvents = readAdvisoryLabelEvents, dryRun = false, force = false, comments = null, labels = null,
 } = {}) {
   const prNumber = Number(d?.prNumber);
@@ -623,4 +622,10 @@ if (IS_CLI) {
   }).then((result) => {
     writeAllSync(1, `${JSON.stringify(result, null, 2)}\n`);
   }).catch((e) => fail(String((e && e.message) || e).split('\n')[0]));
+}
+
+/** Transport boundary; the evidence reader itself only accepts a resolved basis. */
+function resolveAndFetchTestGamingEvidence({ headSha, paths, repo, prNumber }) {
+  const basis = resolvePinnedDiffBasis({ exec: execFileSync, headSha });
+  return fetchTestGamingDiffEvidence({ basis, paths, repo, prNumber });
 }

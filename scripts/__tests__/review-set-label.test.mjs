@@ -78,7 +78,7 @@ afterAll(() => { if (netDiffFixtureDir) { try { rmSync(netDiffFixtureDir, { recu
 const runReviewLabelCli = (cfg) => {
   const prev = process.env.GIT_DIR;
   process.env.GIT_DIR = netDiffFixtureGitDir();
-  try { return runReviewLabelCliRaw(cfg); } finally { if (prev === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = prev; }
+  try { return runReviewLabelCliRaw({ gitExec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: netDiffFixtureDir }), ...cfg }); } finally { if (prev === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = prev; }
 };
 
 const human = [{ name: REVIEW_LABELS.human }, { name: 'ready-to-merge' }];

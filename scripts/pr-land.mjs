@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolvePinnedDiffBasis, stampDiffBasis, sameDiffBasis } from './lib/pinned-diff-basis.mjs';
 /**
  * pr-land.mjs — the `/pr` PRODUCER: open a self-approved PR, wait for green, label it, and hand the merge to
  * the drain (#2138 Fork 5, #2153; #2290).
@@ -703,7 +704,7 @@ export function classifyChecks(rows) {
 }
 
 export function requireScoredNetDiff(signal, headSha) {
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(headSha ?? '') || signal?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.scored !== true || signal?.scored !== true || signal.needsReview?.length || signal.netDiffText?.needsReview?.length) {
+  if (!sameDiffBasis(signal, signal?.netDiffText) || !sameDiffBasis(signal, signal?.basis) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(headSha ?? '') || signal?.headSha !== headSha.toLowerCase() || signal?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.scored !== true || signal?.scored !== true || signal.needsReview?.length || signal.netDiffText?.needsReview?.length) {
     const error = new Error('Net diff is unscored; refusing review scoring and landing. Repair the checkout/read and rerun, or request human review of the full diff.');
     error.code = 'UNSCORED_NET_DIFF';
     throw error;
@@ -1267,7 +1268,7 @@ async function runCli() {
   // of `resolveNetDiffBasis`, measured 5 → 11 git subprocesses and 1 → 2 network fetches per PR open; sharing
   // brings that to 6 subprocesses and 1 fetch. Assembling it here instead would leave that sharing — and the
   // `diffHunks` mapping below — pinned by nothing a test can observe at this call site.
-  const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha, pinRev: true });
+  const sig = computeNetDiffSignals({ exec, basis: resolvePinnedDiffBasis({ exec, remote: REMOTE, baseRef: BASE, headSha: refSha }), baseRev });
   requireScoredNetDiff(sig, refSha);
 
   const applyReviewEscalationLabel = () => {

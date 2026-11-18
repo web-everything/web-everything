@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolvePinnedDiffBasis, stampDiffBasis, sameDiffBasis } from '../lib/pinned-diff-basis.mjs';
 /**
  * @file delegated-clear-human.mjs — R130 delegated clear-human pass.
  *
@@ -136,8 +137,8 @@ export async function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we')
   return {
     scoreNet: (pr) => {
       if (!/^[0-9a-f]{40}$/i.test(pr.headRefOid ?? '')) return { scored: false };
-      const sig = computeNetDiffSignals({ exec, rev: pr.headRefOid, baseRev: pr.baseRefName, fetchExtraRefs: [pr.headRefName], pinRev: true });
-      if (!sig.scored || sig.revSha !== pr.headRefOid || sig.netDiffText?.revSha !== pr.headRefOid) return { scored: false };
+      const sig = computeNetDiffSignals({ exec, basis: resolvePinnedDiffBasis({ exec, headSha: pr.headRefOid }), baseRev: pr.baseRefName });
+      if (!sig.scored || !sameDiffBasis(sig, sig.netDiffText) || !sameDiffBasis(sig, sig.basis) || sig.revSha !== pr.headRefOid || sig.netDiffText?.revSha !== pr.headRefOid) return { scored: false };
       const s = scoreEscalation({ changedFiles: sig.changedFiles, diffLines: sig.diffLines, humanBasisFiles: sig.humanBasisFiles,
         cumulativeDiffLines: sig.cumulativeDiffLines, diffHunks: sig.diffHunks, basisNarrowed: sig.basisNarrowed !== false });
       return { scored: true, humanRequired: s.humanRequired === true, files: sig.humanBasisFiles.length };

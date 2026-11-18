@@ -24,7 +24,7 @@ const STRAY = '7'.repeat(40); // 7fd6bba, shared by #4655 and #4686
 const TREE = '8'.repeat(40);
 const REPO = 'web-everything/web-everything';
 const BASE = { pr: 4624, ref: 'lane/red-main-contain', head: BOTTOM, contained: CONTAINED };
-const STACK = { ...BASE, tree: TREE, topHead: TOP };
+const STACK = { ...BASE, tree: TREE, topHead: TOP, diffBasis: { ok: true, baseSha: TREE, mergeBaseSha: TREE, headSha: TOP } };
 const DIFF = 'diff --git a/own.mjs b/own.mjs\n--- a/own.mjs\n+++ b/own.mjs\n@@ -1 +1 @@\n-old\n+new\n';
 const FINGERPRINT = fingerprintOf(DIFF);
 const DIFFERENT = fingerprintOf(DIFF.replace('+new', '+changed'));
@@ -490,7 +490,7 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
 
   it('finds the stack for two PRs by the same actor, from a list that carries no author', () => {
     for (const prs of [null, listed()]) {
-      expect(read({}, { prs }).get(4631)).toMatchObject({ pr: 4624, ref: BASE.ref, head: BOTTOM, contained: CONTAINED, tree: TREE, topHead: TOP });
+      expect(read({}, { prs }).get(4631)).toMatchObject({ pr: 4624, ref: BASE.ref, head: BOTTOM, contained: CONTAINED, tree: TREE, topHead: TOP, diffBasis: { ok: true, baseSha: TREE, mergeBaseSha: TREE, headSha: TOP } });
     }
   });
   it.each([
@@ -600,8 +600,8 @@ describe('the synthetic stack base on a real git graph', () => {
       expect(containedCommit(sets, b2, top)).toBe(b1); // the top holds b1, not the bottom's newer head b2
       const tree = stackBaseTree({ contained: b1, topHead: top, root: g.dir, run: g.run, base: 'main' });
       expect(tree).toMatch(/^[0-9a-f]{40}$/);
-      expect(stackNetFiles({ tree, topHead: top, root: g.dir, run: g.run }).sort()).toEqual(['shared.txt', 'top.txt']);
-      const text = stackNetDiffText({ tree, topHead: top, root: g.dir, run: g.run });
+      expect(stackNetFiles({ basis: { ok: true, baseSha: tree, mergeBaseSha: tree, headSha: top }, root: g.dir, run: g.run }).paths.sort()).toEqual(['shared.txt', 'top.txt']);
+      const text = stackNetDiffText({ basis: { ok: true, baseSha: tree, mergeBaseSha: tree, headSha: top }, root: g.dir, run: g.run }).text;
       expect(text).toContain('+T1');
       expect(text).toContain('+T8');
       expect(text).toContain('-s8');
@@ -619,7 +619,7 @@ describe('the synthetic stack base on a real git graph', () => {
       const sets = readOffMainSets([top, b2], { run: g.run, base: 'main' });
       expect(containedCommit(sets, b2, top)).toBe(b1);
       const tree = stackBaseTree({ contained: b1, topHead: top, run: g.run, base: 'main' });
-      expect(stackNetFiles({ tree, topHead: top, run: g.run }).sort()).toEqual(['shared.txt', 'top.txt']);
+      expect(stackNetFiles({ basis: { ok: true, baseSha: tree, mergeBaseSha: tree, headSha: top }, run: g.run }).paths.sort()).toEqual(['shared.txt', 'top.txt']);
     } finally { g.cleanup(); }
   });
 
@@ -628,7 +628,7 @@ describe('the synthetic stack base on a real git graph', () => {
     const { g, b2, top } = build();
     try {
       const wrong = stackBaseTree({ contained: b2, topHead: top, root: g.dir, run: g.run, base: 'main' });
-      expect(stackNetFiles({ tree: wrong, topHead: top, root: g.dir, run: g.run })).toContain('bottom.txt');
+      expect(stackNetFiles({ basis: { ok: true, baseSha: wrong, mergeBaseSha: wrong, headSha: top }, root: g.dir, run: g.run }).paths).toContain('bottom.txt');
     } finally { g.cleanup(); }
   });
 
@@ -866,7 +866,7 @@ describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)'
     return { refs, tips, sets, listed, fakeGit, read };
   };
   const expected = p => ({ pr: p.bottom, ref: p.baseRefName, head: p.baseTip,
-    contained: p.baseTip, tree: TREE, topHead: p.headRefOid });
+    contained: p.baseTip, tree: TREE, topHead: p.headRefOid, diffBasis: { ok: true, baseSha: TREE, mergeBaseSha: TREE, headSha: p.headRefOid } });
 
   it.each([MAIN, shapes[0].baseTip])('resolves a PR-less base already on main at %s without a containment diagnostic', head => {
     const f = fixture();
@@ -1122,7 +1122,7 @@ describe('readStackBases — PR-less exact tip and complete ownership evidence',
   it('resolves #5996 against the current PR-less base tip with 199 open PR refs', () => {
     const diag = new Map();
     expect(fixture(199).read({ diag }).get(5996)).toEqual({
-      pr: null, ref: baseRef, head: BOTTOM, contained: BOTTOM, tree: TREE, topHead: TOP,
+      pr: null, ref: baseRef, head: BOTTOM, contained: BOTTOM, tree: TREE, topHead: TOP, diffBasis: { ok: true, baseSha: TREE, mergeBaseSha: TREE, headSha: TOP },
     });
     expect(diag.has(5996)).toBe(false);
   });
@@ -1130,7 +1130,7 @@ describe('readStackBases — PR-less exact tip and complete ownership evidence',
   it.each([true, false])('preserves numbered base resolution at the limit with prlessBase:%s', prlessBase => {
     const diag = new Map();
     expect(fixture(200).read({ prlessBase, diag }).get(5997)).toEqual({
-      pr: 5981, ref: numberedBaseRef, head: RIGHT, contained: RIGHT, tree: TREE, topHead: LEFT,
+      pr: 5981, ref: numberedBaseRef, head: RIGHT, contained: RIGHT, tree: TREE, topHead: LEFT, diffBasis: { ok: true, baseSha: TREE, mergeBaseSha: TREE, headSha: LEFT },
     });
     expect(diag.has(5997)).toBe(false);
     if (!prlessBase) expect(diag.get(5996)).toEqual({ cause: 'base-branch-missing' });
@@ -1171,7 +1171,7 @@ describe('readStackBases — fork name collisions and missing individual records
     };
     return { number, refs, read, listed, prependCollision,
       expected: { pr: numbered ? 5981 : null, ref: baseRefName, head: BOTTOM,
-        contained: BOTTOM, tree: TREE, topHead: TOP } };
+        contained: BOTTOM, tree: TREE, topHead: TOP, diffBasis: { ok: true, baseSha: TREE, mergeBaseSha: TREE, headSha: TOP } } };
   };
 
   it.each([false, true])('preserves the numbered result despite an earlier fork name collision with prlessBase:%s', prlessBase => {

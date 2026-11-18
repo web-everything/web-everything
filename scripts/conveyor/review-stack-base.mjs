@@ -1,3 +1,4 @@
+import { resolvePinnedDiffBasis, stampDiffBasis, sameDiffBasis, isPinnedDiffBasis } from '../lib/pinned-diff-basis.mjs';
 import { hardenedGitDiff, verifyRenderedDiff } from '../lib/hardened-git-diff.mjs';
 /**
  * @file scripts/conveyor/review-stack-base.mjs — stack-aware review (held item 177).
@@ -342,19 +343,23 @@ export function stackBaseTree({ contained, topHead, root = ROOT, run = gitRun(ro
 }
 
 /** The top's own changed paths against the stack base tree. Throws on a failed read (the scorer invalidates the paired evidence). */
-export function stackNetFiles({ tree, topHead, root = ROOT, run = gitRun(root) }) {
+export function stackNetFiles({ basis, root = ROOT, run = gitRun(root) }) {
+  if (!isPinnedDiffBasis(basis)) throw new Error('stack basis missing; human review required');
+  const tree = basis.mergeBaseSha, topHead = basis.headSha;
   const exec = (_cmd, args, opts) => run(args, opts);
   const paths = String(hardenedGitDiff(exec, ['diff', '--name-only', '-z', '--end-of-options', tree, topHead])).split('\0').filter(Boolean);
   const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', tree, topHead]));
-  return verifyRenderedDiff(exec, tree, topHead, text, { paths });
+  return { paths: verifyRenderedDiff(exec, tree, topHead, text, { paths }), scored: true, ...stampDiffBasis(basis) };
 }
 
 /**
  * The top's own diff TEXT against the stack base tree, with the exact argv `computeNetDiffText` uses for the main
  * basis, so the fingerprint of a stacked review and of the same change after restack onto main are comparable.
  */
-export function stackNetDiffText({ tree, topHead, root = ROOT, run = gitRun(root) }) {
-  return hardenedGitDiff((_cmd, args, opts) => run(args, opts), ['diff', '--end-of-options', tree, topHead]);
+export function stackNetDiffText({ basis, root = ROOT, run = gitRun(root) }) {
+  if (!isPinnedDiffBasis(basis)) throw new Error('stack basis missing; human review required');
+  const text = String(hardenedGitDiff((_cmd, args, opts) => run(args, opts), ['diff', '--end-of-options', basis.mergeBaseSha, basis.headSha]));
+  return { text, scored: true, ...stampDiffBasis(basis) };
 }
 
 /**
@@ -367,7 +372,7 @@ export function stackNetDiffText({ tree, topHead, root = ROOT, run = gitRun(root
 export function mainNetDiffText({ headRefName, headRefOid }, { root = ROOT } = {}) {
   if (!SHA.test(String(headRefOid ?? '')) || !LANE_REF.test(String(headRefName ?? ''))) return { text: '', base: null, rev: null, scored: false };
   const exec = (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: root, timeout: 120e3, maxBuffer: 64 * 1024 * 1024, ...o });
-  const net = computeNetDiffText({ exec, rev: headRefOid, fetchExtraRefs: [headRefName], pinRev: true });
+  const net = computeNetDiffText({ exec, basis: resolvePinnedDiffBasis({ exec, headSha: headRefOid }) });
   return net?.scored && net.revSha === headRefOid ? net : { text: '', base: null, rev: null, scored: false };
 }
 
@@ -545,7 +550,7 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
     for (const [top, base] of bases) {
       const topHead = trusted.find((r) => r.pr === top).headRefOid;
       const tree = stackBaseTree({ contained: base.contained, topHead, root, run });
-      if (tree) out.set(top, { ...base, tree, topHead });
+      if (tree) out.set(top, { ...base, tree, topHead, diffBasis: { ok: true, baseSha: tree, headSha: topHead, mergeBaseSha: tree } });
       else diagnose(top, 'tree-unreadable');
     }
   } catch {

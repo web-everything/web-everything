@@ -1487,7 +1487,7 @@ const STACK_CARRY_FINGERPRINT = /^[0-9a-f]{64}$/;
 export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = process.env,
   readStack = (n) => readStackBase({ pr: n, root, env }),
   readThread = (n) => readStackThread(n, { repo, root }),
-  stackText = (base) => stackNetDiffText({ tree: base.tree, topHead: base.topHead, root }),
+  stackText = (base) => stackNetDiffText({ basis: base.diffBasis, root }).text,
   mainText = (pin) => mainNetDiffText(pin, { root }),
   readBottom = (marker) => readBottomLanded({ marker, repo, root }),
   carry = (n, decision) => carryStackAccept({ pr: n, repo, root, env, decision }),

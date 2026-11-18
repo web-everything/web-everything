@@ -1,3 +1,4 @@
+import { resolvePinnedDiffBasis, stampDiffBasis, sameDiffBasis } from '../lib/pinned-diff-basis.mjs';
 import { hardenedGitDiff, verifyRenderedDiff } from '../lib/hardened-git-diff.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
@@ -53,7 +54,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assembleReviewDetail } from '../review-detail.mjs';
-import { computeNetDiffPaths, computeNetDiffText, resolveNetDiffBasis, verifyNetDiffPair } from '../merge-ai-prs.mjs';
+import { computeNetDiffPaths, computeNetDiffText, verifyNetDiffPair } from '../merge-ai-prs.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { fingerprintOf, readStackBase, stackNetDiffText, stackNetFiles } from '../conveyor/review-stack-base.mjs';
 import { currentActorId, parseAuthorActorId } from '../lib/review-independence.mjs';
@@ -416,11 +417,9 @@ export function readPr({
   // ONE basis, shared. `fetchExtraRefs` carries the head ref so a lane branch this clone has never seen still
   // resolves — and NOTHING here moves HEAD (#2336): it fetches tracking refs and diffs two trees in place.
   // This review selects and records the current branch tip as revSha before scoring.
-  const basis = resolveNetDiffBasis({
-    exec: gitExec, rev: headRefName, fetchExtraRefs: headRefName ? [headRefName] : [], pinRev: true,
-  });
-  let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
-  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
+  const basis = resolvePinnedDiffBasis({ exec: gitExec, headSha: view.headRefOid });
+  let netText = computeNetDiffText({ exec: gitExec, basis });
+  let netPaths = computeNetDiffPaths({ exec: gitExec, basis });
   try {
     if (netText.scored === true && netPaths.scored === true) {
       verifyNetDiffPair({ exec: gitExec, basis, text: netText, paths: netPaths });
@@ -437,7 +436,7 @@ export function readPr({
   }
 
   const priorRounds = priorRoundsFor(repo, pr);
-  const revSha = basis.ok ? basis.revSha : null;
+  const revSha = basis.ok ? basis.headSha : null;
 
   // Held item 177 — A STACKED TOP IS JUDGED AGAINST ITS STACK BASE. Only when the stack was detected on the SAME
   // head this clone diffed (`revSha`); any mismatch or failed read keeps the main basis (today's behaviour).
@@ -447,13 +446,17 @@ export function readPr({
     try { stack = stackReader({ pr, repo, cwd }); } catch { stack = null; }
     if (stack && stack.topHead === revSha) {
       try {
-        const text = String(stackDiffRead.text({ tree: stack.tree, topHead: revSha, root: cwd }));
-        const paths = stackDiffRead.files({ tree: stack.tree, topHead: revSha, root: cwd });
+        const stackBasis = { ...basis, mergeBaseSha: stack.tree };
+        const stackText = stackDiffRead.text({ basis: stackBasis, root: cwd });
+        const stackPaths = stackDiffRead.files({ basis: stackBasis, root: cwd });
+        if (!sameDiffBasis(stackText, stackBasis) || !sameDiffBasis(stackPaths, stackBasis)) throw new Error('stack basis mismatch');
+        const text = stackText.text;
+        const paths = stackPaths.paths;
         const fingerprint = fingerprintOf(text);
         if (Array.isArray(paths) && fingerprint) {
           verifyRenderedDiff(gitExec, stack.tree, revSha, text, { paths });
-          netText = { text, base: stack.tree, rev: netText.rev ?? netPaths.rev, scored: true };
-          netPaths = { ...netPaths, paths, base: stack.tree, scored: true };
+          netText = { ...netText, text, base: stack.tree, scored: true, ...stampDiffBasis(stackBasis), basis: stampDiffBasis(stackBasis) };
+          netPaths = { ...netPaths, paths, base: stack.tree, scored: true, ...stampDiffBasis(stackBasis), basis: stampDiffBasis(stackBasis) };
           stackBase = { pr: stack.pr, ref: stack.ref, head: stack.head, contained: stack.contained, tree: stack.tree, fingerprint };
         }
       } catch {

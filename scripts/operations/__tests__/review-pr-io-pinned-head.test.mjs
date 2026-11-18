@@ -1,3 +1,4 @@
+import { resolvePinnedDiffBasis } from '../../lib/pinned-diff-basis.mjs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
@@ -60,7 +61,7 @@ describe('review read pins real Git evidence before merge-base', () => {
     };
     const result = readPr({ pr: 7, repo: 'o/n', cwd: root, exec, originRepo: () => 'o/n',
       readStack: () => null, readView: () => ({ number: 7, title: 'test', body: '',
-        headRefName: 'lane/security', comments: [], labels: [], files: [] }), ...overrides });
+        headRefName: 'lane/security', headRefOid: git('rev-parse', '--verify', 'refs/remotes/origin/lane/security'), comments: [], labels: [], files: [] }), ...overrides });
     return { result, calls };
   };
   it('invalidates both outputs when the first rendered text omits the later listed path', () => {
@@ -107,11 +108,11 @@ describe('review read pins real Git evidence before merge-base', () => {
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
     git('update-ref', 'refs/remotes/origin/main', executable);
-    const basis = resolveNetDiffBasis({ exec, rev: executable, pinRev: true });
-    expect(basis).toMatchObject({ ok: true, baseRef: base, baseSha: base, diffBase: base, candidate: executable });
+    const basis = resolvePinnedDiffBasis(pinRequest({ exec, rev: executable, pinRev: true }));
+    expect(basis).toMatchObject({ ok: true, baseSha: base, mergeBaseSha: base, headSha: executable });
     expect(calls[0][0]).toBe('fetch');
     expect(calls[1]).toEqual(['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/main^{commit}']);
-    const result = computeNetDiffText({ exec, rev: executable, basis, pinRev: true });
+    const result = computeNetDiffText(evidenceOptions({ exec, rev: executable, basis, pinRev: true }));
     expect(result).toMatchObject({ scored: true, base, revSha: executable });
     expect(result.text).toContain('security relevant');
   });
@@ -133,9 +134,9 @@ describe('review read pins real Git evidence before merge-base', () => {
       if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
-    expect(computeNetDiffText({ exec, rev: 'lane/security', pinRev })).toMatchObject({ scored: false, reason: 'ref-unresolved' });
+    expect(computeNetDiffText(evidenceOptions({ exec, rev: 'lane/security', pinRev }))).toMatchObject({ scored: false, reason: 'ref-unresolved' });
     git('update-ref', 'refs/heads/lane/security', executable);
-    const result = computeNetDiffText({ exec, rev: 'lane/security', pinRev });
+    const result = computeNetDiffText(evidenceOptions({ exec, rev: executable, pinRev }));
     expect(result.scored).toBe(true);
     expect(result.text).toContain('security relevant');
   });
@@ -185,7 +186,7 @@ describe('review read pins real Git evidence before merge-base', () => {
       if (args.includes('diff')) git('update-ref', 'refs/remotes/origin/lane/security', card);
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
-    const result = computeNetDiffText({ exec, rev: 'lane/security', pinRev: true });
+    const result = computeNetDiffText(evidenceOptions({ exec, rev: executable, pinRev: true }));
     expect(result).toMatchObject({ scored: true, revSha: executable, rev: executable, base });
     expect(result.text).toContain('security relevant');
     expect(pins).toBe(2);
@@ -242,8 +243,8 @@ describe('review read pins real Git evidence before merge-base', () => {
     const command = hardenedGitDiffCommand(['diff', '--end-of-options', base, executable], {}, env);
     const text = String(run('git', command.args, command.opts));
     expect(text).toContain('+console.log("security relevant");');
-    expect(stackNetDiffText({ tree: base, topHead: executable, run: (a, o) => String(run('git', a, o)) })).toContain('security relevant');
-    expect(stackNetFiles({ tree: base, topHead: executable, run: (a, o) => String(run('git', a, o)) })).toContain('executable.mjs');
+    expect(stackNetDiffText({ basis: { ok: true, baseSha: base, mergeBaseSha: base, headSha: executable }, run: (a, o) => String(run('git', a, o)) }).text).toContain('security relevant');
+    expect(stackNetFiles({ basis: { ok: true, baseSha: base, mergeBaseSha: base, headSha: executable }, run: (a, o) => String(run('git', a, o)) }).paths).toContain('executable.mjs');
     expect(readFixRange({ exec: run, priorHead: base, head: executable }).files).toHaveProperty('executable.mjs');
     const inherited = process.env.GIT_EXTERNAL_DIFF;
     let result;
@@ -296,8 +297,8 @@ describe('review read pins real Git evidence before merge-base', () => {
       if (args.includes('diff') && !args.some(a => ['--raw', '--numstat', '--name-only'].includes(a))) return '';
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
-    expect(computeNetDiffText({ exec, rev: 'lane/security' })).toMatchObject({ scored: false, text: '' });
-    expect(computeNetDiffPaths({ exec, rev: 'lane/security' })).toMatchObject({ scored: false, paths: [] });
+    expect(computeNetDiffText(evidenceOptions({ exec, rev: 'lane/security' }))).toMatchObject({ scored: false, text: '' });
+    expect(computeNetDiffPaths(evidenceOptions({ exec, rev: 'lane/security' }))).toMatchObject({ scored: false, paths: [] });
   });
 
   // origin/main allowed one half to remain scored when the other command threw.
@@ -375,9 +376,9 @@ describe('review read pins real Git evidence before merge-base', () => {
     expect(result.diff).toMatchObject({ scored: false, reason: 'diff-failed' });
   });
 
-  it('fails closed when neither candidate resolves', () => {
+  it('fails closed when the reported commit is unavailable', () => {
     git('update-ref', '-d', 'refs/remotes/origin/lane/security');
-    const { result } = read();
+    const { result } = read(null, { readView: () => ({ number: 7, headRefName: 'lane/security', headRefOid: 'f'.repeat(40), comments: [], labels: [], files: [] }) });
     expect(result.net).toMatchObject({ scored: false, revSha: null });
     expect(result.diff.scored).toBe(false);
   });
@@ -388,8 +389,16 @@ describe('review read pins real Git evidence before merge-base', () => {
       if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
-    const basis = resolveNetDiffBasis({ exec, rev: 'lane/security', pinRev: true });
+    const basis = resolvePinnedDiffBasis(pinRequest({ exec, rev: executable, pinRev: true }));
     expect(basis.ok).toBe(true);
-    expect(computeNetDiffPaths({ exec, rev: 'main', basis })).toMatchObject({ scored: false, reason: 'basis-mismatch' });
+    const paths = computeNetDiffPaths({ exec, basis: { ...basis, headSha: 'origin/main' } });
+    expect(paths).toMatchObject({ scored: false, reason: 'basis-mismatch' });
   });
 });
+
+function pinRequest(options) {
+  return { exec: options.exec, remote: options.remote, baseRef: options.base ?? 'main', headSha: options.rev };
+}
+function evidenceOptions(options) {
+  return { exec: options.exec, baseRev: options.baseRev, basis: options.basis ?? resolvePinnedDiffBasis(pinRequest(options)) };
+}

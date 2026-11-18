@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolvePinnedDiffBasis, stampDiffBasis, sameDiffBasis } from './lib/pinned-diff-basis.mjs';
 /**
  * @file scripts/merge-gate-check.mjs
  * @description The required `merge-gate` CI check: every gate the drain applies right before its merge write,
@@ -271,8 +272,8 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
       catch { /* may already be present (merge group history); the cat-file probe below decides */ }
       try { gitExec('git', ['cat-file', '-e', `${pin.sha}^{commit}`], { stdio: ['ignore', 'ignore', 'pipe'] }); }
       catch (e) { throw new Error(`pinned head ${pin.sha.slice(0, 9)} is not fetchable: ${firstLine(e)}`); }
-      const sig = computeNetDiffSignals({ exec: gitExec, rev: pin.sha, baseRev: facts.manifest?.live?.base ?? null, fetchExtraRefs: [], pinRev: true });
-      if (!sig.scored || sig.revSha !== pin.sha || sig.netDiffText?.revSha !== pin.sha) {
+      const sig = computeNetDiffSignals({ exec: gitExec, basis: resolvePinnedDiffBasis({ exec: gitExec, headSha: pin.sha }), baseRev: facts.manifest?.live?.base ?? null });
+      if (!sig.scored || !sameDiffBasis(sig, sig.netDiffText) || !sameDiffBasis(sig, sig.basis) || sig.revSha !== pin.sha || sig.netDiffText?.revSha !== pin.sha) {
         facts.netSignals = { scored: false, error: `net diff not computed at the pinned head ${pin.sha.slice(0, 9)} (${sig.netDiffText?.rev ? `resolved ${sig.netDiffText.rev}` : sig.netDiffText?.reason || 'unscored'})` };
       } else facts.netSignals = sig;
     } catch (e) { facts.netSignals = { scored: false, error: firstLine(e) }; }
@@ -289,7 +290,7 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
     if (pin.error) facts.acceptance = { error: `head not pinned: ${pin.error}` };
     else {
       try {
-        const acc = readDrainAcceptance({ pr: num, repo, cwd, local: true, exec: (c, a, o) => exec(c, a, { cwd, ...o }),
+        const acc = readDrainAcceptance({ pr: num, repo, cwd, local: true, netDiffBasis: { ok: true, ...facts.netSignals?.basis }, exec: (c, a, o) => exec(c, a, { cwd, ...o }),
           // Reuse the exact text already paired with the scored signals. A second
           // resolution could advance main while retaining the same pinned head.
           netDiff: () => {

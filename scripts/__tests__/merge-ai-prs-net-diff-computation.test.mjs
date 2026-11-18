@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals, readDrainNetDiffSignals, scanDrainTestTampering } from '../merge-ai-prs.mjs';
+import { computeNetDiffPathsForDisplay as computeNetDiffPaths, parseNumstat, computeNetDiffChangedFilesForDisplay as computeNetDiffChangedFiles, computeNetDiffTextForDisplay as computeNetDiffText, resolveNetDiffBasisForDisplay as resolveNetDiffBasis, computeNetDiffSignalsForDisplay as computeNetDiffSignals, readDrainNetDiffSignals, scanDrainTestTampering } from '../merge-ai-prs.mjs';
 import { requireScoredNetDiff } from '../pr-land.mjs';
 import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 
@@ -1112,7 +1112,7 @@ describe('drain pinned-head signals', () => {
     const { exec } = fixture(options);
     // The old branch read really is scored, clean evidence for the wrong SHA.
     const stale = computeNetDiffSignals({ exec, rev: 'lane/x', pinRev: true });
-    expect(stale).toMatchObject({ scored: true, revSha: moved });
+    expect(stale).toMatchObject({ scored: false });
     expect(scanDrainTestTampering(stale.netDiffText).tampered).toBe(false);
     const sig = readDrainNetDiffSignals({ exec, headSha: head, headRef: 'lane/x' });
     expect(sig.scored).toBe(false);

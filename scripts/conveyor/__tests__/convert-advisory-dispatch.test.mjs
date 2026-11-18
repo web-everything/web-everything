@@ -1,3 +1,4 @@
+import { resolvePinnedDiffBasis } from '../../lib/pinned-diff-basis.mjs';
 /** @file #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical executor for a
  *  `kind:'convert-advisory'` dispatch entry: post the converted advisory note, run ONE tool-free targeted-check
  *  judge seat, apply advisory:accepted|changes, clear review:awaiting-advisory. No `gh`, no real judge spawn,
@@ -121,8 +122,8 @@ describe('buildTargetedCheckMandate / buildTargetedCheckInput', () => {
 
 describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
   it('fetchTestGamingDiffEvidence: scored:false with no paths, no rev, or no exec — never a throw', () => {
-    expect(fetchTestGamingDiffEvidence({ rev: HEAD, paths: [] })).toEqual({ text: '', scored: false, reason: 'no-paths' });
-    expect(fetchTestGamingDiffEvidence({ rev: null, paths: ['a.test.mjs'] })).toEqual({ text: '', scored: false, reason: 'no-paths' });
+    expect(fetchTestGamingDiffEvidence(advisoryOptions({ rev: HEAD, paths: [] }))).toEqual({ text: '', scored: false, reason: 'no-paths' });
+    expect(fetchTestGamingDiffEvidence(advisoryOptions({ rev: null, paths: ['a.test.mjs'] }))).toEqual({ text: '', scored: false, reason: 'no-paths' });
   });
   it('fetchTestGamingDiffEvidence: an injected exec that resolves the basis returns the scoped diff text', () => {
     const calls = [];
@@ -135,8 +136,8 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args.includes('diff')) return FAKE_DIFF;
       return '';
     };
-    const result = fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] });
-    expect(result).toEqual({ text: FAKE_BOUND_DIFF, scored: true, base: 'd'.repeat(40), rev: HEAD });
+    const result = fetchTestGamingDiffEvidence(advisoryOptions({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] }));
+    expect(result).toEqual({ text: FAKE_BOUND_DIFF, scored: true, base: 'd'.repeat(40), rev: HEAD, baseSha: HEAD, headSha: HEAD, mergeBaseSha: 'd'.repeat(40) });
     expect(calls.some((c) => c.includes('review-loop-cli.test.mjs'))).toBe(true);
   });
   it('fetchTestGamingDiffEvidence: an unresolvable basis (no candidate resolves) reports scored:false', () => {
@@ -144,7 +145,7 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args[0] === 'fetch') return '';
       throw new Error('fatal: bad revision');
     };
-    expect(fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] }).scored).toBe(false);
+    expect(fetchTestGamingDiffEvidence(advisoryOptions({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] })).scored).toBe(false);
   });
 
   it('resolveTargetedCheckEvidence: not required for an unknown escalation kind', async () => {
@@ -165,10 +166,10 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (cmd === 'gh') return ghDiff;
       throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
     };
-    const result = fetchTestGamingDiffEvidence({
+    const result = fetchTestGamingDiffEvidence(advisoryOptions({
       exec, repo: 'frontier-ui/frontierui', prNumber: 77, rev: HEAD,
       paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'],
-    });
+    }));
     expect(result).toMatchObject({ scored: false, text: '', reason: 'raw-evidence-unavailable' });
     expect(calls.some(c => c.startsWith('gh '))).toBe(false);
     expect(calls.some((c) => c.startsWith('git fetch') || c.startsWith('git diff'))).toBe(false);
@@ -178,7 +179,7 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
       throw new Error('must not be reached');
     };
-    expect(fetchTestGamingDiffEvidence({ exec, repo: 'frontier-ui/frontierui', rev: HEAD, paths: ['a.test.mjs'] }))
+    expect(fetchTestGamingDiffEvidence(advisoryOptions({ exec, repo: 'frontier-ui/frontierui', rev: HEAD, paths: ['a.test.mjs'] })))
       .toMatchObject({ scored: false, reason: 'repo-not-local' });
   });
   it('fetchTestGamingDiffEvidence: a repo matching this checkout\'s origin keeps the local net-diff path', () => {
@@ -191,7 +192,7 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args.includes('diff')) return FAKE_DIFF;
       throw new Error(`unexpected ${cmd}`);
     };
-    expect(fetchTestGamingDiffEvidence({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] }))
+    expect(fetchTestGamingDiffEvidence(advisoryOptions({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] })))
       .toMatchObject({ scored: true, text: FAKE_BOUND_DIFF });
   });
   it('resolveTargetedCheckEvidence: heal-mutual-exclusivity REQUIRES the PR comment history and hands it to the judge (PR #2781 review)', async () => {
@@ -751,7 +752,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       repo: 'frontier-ui/frontierui', provider: provider(), runJudge: vi.fn(async () => ({ verdict: 'accept', note: 'ok' })),
       fetchEvidence, comments: [acceptComment], labels: [],
     });
-    expect(fetchEvidence).toHaveBeenCalledWith(expect.objectContaining({ repo: 'frontier-ui/frontierui', prNumber: 2766, rev: HEAD }));
+    expect(fetchEvidence).toHaveBeenCalledWith(expect.objectContaining({ repo: 'frontier-ui/frontierui', prNumber: 2766, headSha: HEAD }));
   });
 
   it('with no shared read handed in, fetches fresh PR state once up front, plus the ONE pre-write revalidation read', async () => {
@@ -783,3 +784,9 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     expect(argv[8]).toContain('$n == "review:awaiting-advisory" or $n == "review:pending"');
   });
 });
+
+function advisoryOptions(options) {
+  const basis = options.exec && options.rev && options.paths?.length
+    ? resolvePinnedDiffBasis({ exec: options.exec, headSha: options.rev }) : null;
+  return { ...options, basis };
+}

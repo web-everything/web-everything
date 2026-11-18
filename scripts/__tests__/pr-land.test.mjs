@@ -635,7 +635,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
   // producer at all, so the mis-mapping the review caught is not expressible here.
   it('#2890: derives the net-diff signals from the ONE shared function, and cannot hand-roll them', () => {
     expect(src).toMatch(/import \{ computeNetDiffSignals, recordParkVerdict \} from '\.\/merge-ai-prs\.mjs'/);
-    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha, pinRev: true \}\)/);
+    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, basis: resolvePinnedDiffBasis\(\{ exec, remote: REMOTE, baseRef: BASE, headSha: refSha \}\), baseRev \}\)/);
     // The raw producers are deliberately OUT of scope in this file.
     expect(src).not.toMatch(/\bcomputeNetDiffText\b\s*[,}]/);
     expect(src).not.toMatch(/\bresolveNetDiffBasis\b\s*[,}]/);
@@ -1106,7 +1106,11 @@ describe('pr-land refuses incomplete net diff evidence before readiness', () => 
       expect(() => requireScoredNetDiff(signal)).toThrow(/Repair the checkout/);
     }
     const head = 'a'.repeat(40);
-    const complete = { scored: true, revSha: head, netDiffText: { scored: true, revSha: head } };
+    const basis = { baseSha: 'b'.repeat(40), headSha: head, mergeBaseSha: 'c'.repeat(40) };
+    const complete = { ...basis, basis, scored: true, revSha: head, netDiffText: { ...basis, scored: true, revSha: head } };
+    for (const key of Object.keys(basis)) {
+      expect(() => requireScoredNetDiff({ ...complete, netDiffText: { ...complete.netDiffText, [key]: 'd'.repeat(40) } }, head)).toThrow(/unscored/);
+    }
     expect(requireScoredNetDiff(complete, head)).toEqual(complete);
     expect(() => requireScoredNetDiff(complete, 'b'.repeat(40))).toThrow(/unscored/);
     expect(() => requireScoredNetDiff({ scored: true }, head)).toThrow(/unscored/);

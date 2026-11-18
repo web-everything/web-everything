@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolvePinnedDiffBasis, stampDiffBasis, sameDiffBasis } from './lib/pinned-diff-basis.mjs';
 /**
  * fetch-parked.mjs — dump a stable per-PR review bundle reviewers currently hand-assemble from scattered `gh`
  * calls (#2434, one of three drain fetch/state helpers under `scripts/`).
@@ -31,7 +32,7 @@
 import { execFileSync } from 'node:child_process';
 // #2901 — the NET two-tree diff basis. merge-ai-prs.mjs guards its CLI behind `if (IS_CLI)`, so importing
 // this one function does not run the lander; the /review skill mandates the same import for the same reason.
-import { computeNetDiffText, computeNetDiffPaths, resolveNetDiffBasis, verifyNetDiffPair, collapseRollupToLatestPerName } from './merge-ai-prs.mjs';
+import { computeNetDiffText, computeNetDiffPaths, verifyNetDiffPair, collapseRollupToLatestPerName } from './merge-ai-prs.mjs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { classifyChecks } from './pr-land.mjs';
@@ -338,10 +339,10 @@ export function resolveNetDiff({ exec, headRef, headRefOid } = {}) {
   // Pin both ends once and share that basis: neither the head nor the fetched base
   // can move between the reads. `fetchExtraRefs` still carries the NAME for transport.
   const rev = pinnedHead;
-  const basis = resolveNetDiffBasis({ exec, rev, fetchExtraRefs: [headRef], pinRev: true });
-  const net = computeNetDiffText({ exec, rev, basis, pinRev: true });
+  const basis = resolvePinnedDiffBasis({ exec, headSha: rev });
+  const net = computeNetDiffText({ exec, basis });
   if (!net || !net.scored || net.revSha !== pinnedHead || typeof net.text !== 'string') return degraded;
-  const list = computeNetDiffPaths({ exec, rev, basis, pinRev: true });
+  const list = computeNetDiffPaths({ exec, basis });
   if (!list || !list.scored || list.revSha !== pinnedHead) return degraded;
   try { verifyNetDiffPair({ exec, basis, text: net, paths: list }); }
   catch { return degraded; }

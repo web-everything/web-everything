@@ -213,7 +213,7 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
   // was refused as scope-bloat until #4624 landed. Real git only when the other reads are real too (a test injecting
   // `readNet` never shells out); injectable; `null` = no stack detection (today).
   readStacks = readNet === readNetFiles ? ((list, { diag }) => readStackBases({ root, env, prs: list, prlessBase: true, diag })) : null,
-  readStackFiles = (base) => stackNetFiles({ tree: base.tree, topHead: base.topHead, root }),
+  readStackFiles = (base) => stackNetFiles({ basis: base.diffBasis, root }).paths,
   emitEvent = appendDaemonEvent } = {}) {
   if (!Array.isArray(prs) || (repo && repoKeyForSlug(repo) !== 'we')) return prs;
   const limits = scopeBloatLimits(env);

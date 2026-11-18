@@ -1,3 +1,4 @@
+import { resolvePinnedDiffBasis } from '../lib/pinned-diff-basis.mjs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -44,12 +45,11 @@ describe('pr-land pinned SHA evidence', () => {
       return exec(cmd, args, opts);
     };
     const options = { exec: failed, rev: head, pinRev: true };
-    expect(resolveNetDiffBasis(options)).toEqual({ ok: false, reason: 'base-fetch-failed',
-      requestedFor: { remote: 'origin', base: 'main', rev: head } });
+    expect(resolvePinnedDiffBasis(pinRequest(options))).toEqual({ ok: false, reason: 'base-fetch-failed' });
     for (const read of [computeNetDiffText, computeNetDiffPaths, computeNetDiffChangedFiles]) {
-      expect(read(options)).toMatchObject({ scored: false, reason: 'base-fetch-failed' });
+      expect(read(evidenceOptions(options))).toMatchObject({ scored: false, reason: 'base-fetch-failed' });
     }
-    const sig = computeNetDiffSignals(options);
+    const sig = computeNetDiffSignals(evidenceOptions(options));
     expect(sig).toMatchObject({ scored: false, diffHunks: null, netDiffText: { scored: false, reason: 'base-fetch-failed' } });
     expect(() => requireScoredNetDiff(sig, head)).toThrow(/unscored/);
     const drain = readDrainNetDiffSignals({ exec: failed, headSha: head });
@@ -57,7 +57,7 @@ describe('pr-land pinned SHA evidence', () => {
     const gaming = scanDrainTestTampering(drain.netDiffText);
     expect(shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: drain.scored })).toBe(true);
     expect(resolveNetDiff({ exec: failed, headRef: 'lane/x', headRefOid: head }).basis).toBe('three-dot');
-    expect(fetchTestGamingDiffEvidence({ exec: failed, rev: head, paths: ['guard.test.mjs'] }))
+    expect(fetchTestGamingDiffEvidence(advisoryOptions({ exec: failed, rev: head, paths: ['guard.test.mjs'] })))
       .toMatchObject({ scored: false, reason: 'base-fetch-failed' });
   });
 
@@ -70,13 +70,13 @@ describe('pr-land pinned SHA evidence', () => {
       }
       return exec(cmd, args, opts);
     };
-    const sig = computeNetDiffSignals({ exec: read, rev: head });
+    const sig = computeNetDiffSignals(evidenceOptions({ exec: read, rev: head }));
     expect(sig.netDiffText).toMatchObject({ scored: false, reason: 'base-fetch-failed' });
     expect(() => requireScoredNetDiff(sig, head)).toThrow(/unscored/);
   });
 
   it('moved ref and origin/SHA collision cannot clear another head', () => {
-    const sig = computeNetDiffSignals({ exec, rev: head, fetchExtraRefs: ['lane/x'], pinRev: true });
+    const sig = computeNetDiffSignals(evidenceOptions({ exec, rev: head, fetchExtraRefs: ['lane/x'], pinRev: true }));
     expect(requireScoredNetDiff(sig, head)).toBe(sig);
     expect(sig.changedFiles).toEqual(['guard.test.mjs']);
     expect(sig.netDiffText.text).toContain('-it(');
@@ -95,18 +95,18 @@ describe('pr-land pinned SHA evidence', () => {
     const unrelated = git('rev-parse', 'HEAD');
     git('replace', unrelated, head);
     expect(git('merge-base', 'origin/main', unrelated)).toBe(base); // proves the hostile fork exists
-    const sig = computeNetDiffSignals({ exec, rev: unrelated, pinRev: true });
+    const sig = computeNetDiffSignals(evidenceOptions({ exec, rev: unrelated, pinRev: true }));
     expect(sig.scored).toBe(false);
     expect(() => requireScoredNetDiff(sig, unrelated)).toThrow(/Repair the checkout/);
   });
 
   it.each([undefined, false])('all SHA readers pin even with pinRev=%s', pinRev => {
     const opts = { exec, rev: head, ...(pinRev === undefined ? {} : { pinRev }) };
-    expect(resolveNetDiffBasis(opts)).toMatchObject({ ok: true, candidate: head, revSha: head });
-    expect(computeNetDiffText(opts)).toMatchObject({ scored: true, revSha: head });
-    expect(computeNetDiffPaths(opts)).toMatchObject({ scored: true, revSha: head, paths: ['guard.test.mjs'] });
-    expect(computeNetDiffChangedFiles(opts)).toMatchObject({ scored: true, changedFiles: ['guard.test.mjs'] });
-    expect(computeNetDiffSignals(opts)).toMatchObject({ scored: true, revSha: head });
+    expect(resolvePinnedDiffBasis(pinRequest(opts))).toMatchObject({ ok: true, headSha: head, baseSha: base, mergeBaseSha: base });
+    expect(computeNetDiffText(evidenceOptions(opts))).toMatchObject({ scored: true, revSha: head });
+    expect(computeNetDiffPaths(evidenceOptions(opts))).toMatchObject({ scored: true, revSha: head, paths: ['guard.test.mjs'] });
+    expect(computeNetDiffChangedFiles(evidenceOptions(opts))).toMatchObject({ scored: true, changedFiles: ['guard.test.mjs'] });
+    expect(computeNetDiffSignals(evidenceOptions(opts))).toMatchObject({ scored: true, revSha: head });
   });
 
   it('64-hex defaults and explicit false cannot select origin/SHA candidates', () => {
@@ -121,15 +121,15 @@ describe('pr-land pinned SHA evidence', () => {
       throw new Error('unexpected read');
     };
     for (const pinRev of [undefined, false]) {
-      const sig = computeNetDiffSignals({ exec: read, rev: sha, pinRev });
+      const sig = computeNetDiffSignals(evidenceOptions({ exec: read, rev: sha, pinRev }));
       expect(requireScoredNetDiff(sig, sha)).toBe(sig);
     }
   });
 
   it('an old unpinned shared basis cannot be relabelled as pinned evidence', () => {
-    const basis = resolveNetDiffBasis({ exec, rev: 'lane/x', pinRev: false });
-    expect(basis.ok).toBe(true);
-    const opts = { exec, rev: 'lane/x', basis, pinRev: true };
+    const basis = resolvePinnedDiffBasis(pinRequest({ exec, rev: 'lane/x', pinRev: false }));
+    expect(basis).toEqual({ ok: false, reason: 'ref-unresolved' });
+    const opts = { exec, basis: { ok: true, candidate: 'refs/remotes/origin/lane/x', diffBase: base } };
     for (const read of [computeNetDiffText, computeNetDiffPaths, computeNetDiffChangedFiles]) {
       expect(read(opts)).toMatchObject({ scored: false, reason: 'basis-mismatch' });
     }
@@ -137,10 +137,10 @@ describe('pr-land pinned SHA evidence', () => {
 
 
   it.each(['missing', 'mutable'])('a shared basis with a %s base pin cannot grant clearance', kind => {
-    const basis = resolveNetDiffBasis({ exec, rev: head, pinRev: true });
-    expect(basis).toMatchObject({ ok: true, baseRef: base, baseSha: base });
+    const basis = resolvePinnedDiffBasis(pinRequest({ exec, rev: head, pinRev: true }));
+    expect(basis).toMatchObject({ ok: true, headSha: head, baseSha: base });
     if (kind === 'missing') delete basis.baseSha;
-    else basis.baseRef = 'origin/main';
+    else basis.baseSha = 'origin/main';
     for (const read of [computeNetDiffText, computeNetDiffPaths, computeNetDiffChangedFiles]) {
       expect(read({ exec, rev: head, basis, pinRev: true })).toMatchObject({ scored: false, reason: 'basis-mismatch' });
     }
@@ -148,22 +148,21 @@ describe('pr-land pinned SHA evidence', () => {
 
   it('mixed-case SHA readers bind canonical full identities to the requested commit', () => {
     const mixed = head.toUpperCase();
-    const sig = computeNetDiffSignals({ exec, rev: mixed });
+    const sig = computeNetDiffSignals(evidenceOptions({ exec, rev: mixed }));
     expect(requireScoredNetDiff(sig, mixed)).toBe(sig);
     expect(readNetDiffAtHead({ exec, headSha: mixed })).toMatchObject({ scored: true, rev: head, revSha: head });
     expect(readDrainNetDiffSignals({ exec, headSha: mixed })).toMatchObject({ scored: true, revSha: head });
   });
 
-  it.each(['abbreviated', 'origin display'])('ambiguous %s revs stay unscored unless they name an explicit branch', kind => {
+  it.each(['abbreviated', 'origin display'])('ambiguous %s revs and explicit branch strings cannot supply gate evidence', kind => {
     const rev = kind === 'abbreviated' ? head.slice(0, 12) : 'origin/lane/head';
     git('update-ref', 'refs/remotes/origin/lane/head', head);
-    const ambiguous = computeNetDiffSignals({ exec, rev, pinRev: true });
+    const ambiguous = computeNetDiffSignals(evidenceOptions({ exec, rev, pinRev: true }));
     expect(ambiguous.scored).toBe(false);
     expect(() => requireScoredNetDiff(ambiguous, head)).toThrow(/unscored/);
-    const sig = computeNetDiffSignals({ exec, rev: 'lane/head', pinRev: true });
-    expect(requireScoredNetDiff(sig, head)).toBe(sig);
-    expect(sig.changedFiles).toEqual(['guard.test.mjs']);
-    expect(sig.netDiffText.rev).toBe(head);
+    const sig = computeNetDiffSignals(evidenceOptions({ exec, rev: 'lane/head', pinRev: true }));
+    expect(sig.scored).toBe(false);
+    expect(() => requireScoredNetDiff(sig, head)).toThrow(/unscored/);
   });
 
   it.each(['abbreviated', 'mixed-case'])('fetch-parked binds a %s head to its verified full SHA', kind => {
@@ -190,17 +189,30 @@ describe('pr-land pinned SHA evidence', () => {
 
   it.each([41, 63])('a malformed %s-hex fork point refuses scoring', length => {
     const read = (cmd, args, opts) => args[0] === 'merge-base' ? 'b'.repeat(length) : exec(cmd, args, opts);
-    const sig = computeNetDiffSignals({ exec: read, rev: head });
+    const sig = computeNetDiffSignals(evidenceOptions({ exec: read, rev: head }));
     expect(sig.scored).toBe(false);
     expect(() => requireScoredNetDiff(sig, head)).toThrow(/Repair the checkout/);
   });
 
   it('missing head and dishonest resolved identity refuse scoring', () => {
     for (const read of [exec, (cmd, args, opts) => args[0] === 'rev-parse' ? base : exec(cmd, args, opts)]) {
-      const sig = computeNetDiffSignals({ exec: read, rev: 'f'.repeat(40), pinRev: true });
+      const sig = computeNetDiffSignals(evidenceOptions({ exec: read, rev: 'f'.repeat(40), pinRev: true }));
       expect(sig.scored).toBe(false);
       expect(sig.netDiffText.scored).toBe(false);
       expect(() => requireScoredNetDiff(sig, 'f'.repeat(40))).toThrow(/unscored/);
     }
   });
 });
+
+function pinRequest(options) {
+  return { exec: options.exec, remote: options.remote, baseRef: options.base ?? 'main', headSha: options.rev };
+}
+function evidenceOptions(options) {
+  return { exec: options.exec, baseRev: options.baseRev, basis: options.basis ?? resolvePinnedDiffBasis(pinRequest(options)) };
+}
+
+function advisoryOptions(options) {
+  const basis = options.exec && options.rev && options.paths?.length
+    ? resolvePinnedDiffBasis({ exec: options.exec, headSha: options.rev }) : null;
+  return { ...options, basis };
+}

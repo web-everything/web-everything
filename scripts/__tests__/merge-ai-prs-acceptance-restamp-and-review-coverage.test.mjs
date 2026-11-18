@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { readDrainAcceptance, decideDrainReviewGate, reconcileDrainReviewPending, classifyPr, needsAcceptanceRestamp, restampAcceptance, computeNetDiffSignals, drainReasonMarker, buildDrainReasonComment, hasDrainReasonComment, LAND_REASON, applyEscalationRelief, REVIEW_COVERAGE_KIND, REVIEW_COVERAGE_GAP_META, reviewRecordKind, recordedReviewRecords, readReviewRecord, reviewCoverageGaps, buildReviewCoverageReason } from '../merge-ai-prs.mjs';
+import { readDrainAcceptance, decideDrainReviewGate, reconcileDrainReviewPending, classifyPr, needsAcceptanceRestamp, restampAcceptance, computeNetDiffSignalsForDisplay as computeNetDiffSignals, drainReasonMarker, buildDrainReasonComment, hasDrainReasonComment, LAND_REASON, applyEscalationRelief, REVIEW_COVERAGE_KIND, REVIEW_COVERAGE_GAP_META, reviewRecordKind, recordedReviewRecords, readReviewRecord, reviewCoverageGaps, buildReviewCoverageReason } from '../merge-ai-prs.mjs';
 import { applyDrainParkLabel, drainGateInputs, permissionChangeForCandidate, removeDeescalatedHumanLabels } from '../merge-ai-prs.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, decideReviewGate, scoreEscalation, REVIEW_LABELS, acceptanceCoversHead } from '../lib/review-escalation.mjs';
 
@@ -397,18 +397,20 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
     const derive = vi.fn(() => ({ scored: false }));
     expect(readDrainAcceptance({ ...acceptanceOptions(view), netDiff: derive, carrySetting: 'on', readReviews: () => [] }).headReadFailed).toBe(false);
     expect(derive).toHaveBeenCalledTimes(1);
-    expect(derive.mock.calls[0][0].rev).toBe(REVIEWED);
+    expect(derive.mock.calls[0][0].basis.headSha).toBe(REVIEWED);
   });
 
   it('pins diff reads to the sibling clone', () => {
     const exec = vi.fn((cmd) => cmd === 'gh' ? JSON.stringify(acceptanceView()) : 'git result');
     readDrainAcceptance({ pr: 3432, repo: 'frontier-ui/frontierui', cwd: '/ws/frontierui', exec, readReviews: () => [],
-      netDiff: ({ exec: git, rev, fetchExtraRefs }) => {
+      resolveBasis: ({ headSha }) => ({ ok: true, baseSha: REVIEWED, headSha, mergeBaseSha: REVIEWED }),
+      netDiff: ({ exec: git, basis }) => {
+        const rev = basis.headSha;
         // PR #4631 round 7: the live read is AT the head SHA; the branch is only fetched for its objects.
         expect(rev).toBe(REBASED);
-        expect(fetchExtraRefs).toEqual(['lane/3432']);
+        expect(basis).toMatchObject({ baseSha: REVIEWED, headSha: REBASED, mergeBaseSha: REVIEWED });
         git('git', ['diff'], { encoding: 'utf8' });
-        return { scored: true, text: REVIEWED_DIFF, rev, revSha: rev };
+        return { ...basis, scored: true, text: REVIEWED_DIFF, rev, revSha: rev };
       },
     });
     expect(exec.mock.calls[1][2].cwd).toBe('/ws/frontierui');
@@ -561,7 +563,9 @@ function acceptanceOptions(view = acceptanceView()) {
     // The listing is only trusted with explicit completeness and the head it was read at (#6021).
     filesComplete: true, listedHeadSha: view.headRefOid,
     // `rev` echoes the commit asked for, as `computeNetDiffText` does: the read is bound to that SHA.
-    exec: () => JSON.stringify(view), netDiff: ({ rev }) => ({ scored: true, text: REVIEWED_DIFF, rev, revSha: rev }),
+    exec: () => JSON.stringify(view),
+    resolveBasis: ({ headSha }) => ({ ok: true, baseSha: REVIEWED, headSha, mergeBaseSha: REVIEWED }),
+    netDiff: ({ basis }) => ({ ...basis, scored: true, text: REVIEWED_DIFF, rev: basis.headSha, revSha: basis.headSha }),
     // PR #4631 round 11: a moved head covered by diff identity reads the PR's formal reviews (none here).
     readReviews: () => [] };
 }
@@ -672,8 +676,8 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
   it.each(['no markers', 'changed content', 'unreadable diff'])('does not clear pending without coverage: %s', (failure) => {
     const view = acceptanceView();
     if (failure === 'no markers') view.comments = [];
-    const options = { ...acceptanceOptions(view), netDiff: ({ rev }) => failure === 'unreadable diff'
-      ? { scored: false } : { scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed'), rev, revSha: rev } };
+    const options = { ...acceptanceOptions(view), netDiff: ({ basis }) => failure === 'unreadable diff'
+      ? { scored: false } : { ...basis, scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed'), rev: basis.headSha, revSha: basis.headSha } };
     const spawn = vi.fn();
     expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(false);
     expect(spawn).not.toHaveBeenCalled();

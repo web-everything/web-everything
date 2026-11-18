@@ -1149,6 +1149,7 @@ export function runReviewLabelCli({
   // Injected so the WRITE ARC — above all the #2964 ordering below — is assertable without `gh`,
   // which it never was: the suite could only reach this function's pure helpers and its refusals.
   provider = createLiveGhProvider(),
+  gitExec = execFileSyncThrottled,
   refreshGate = undefined,
   // Pinned re-arm marker retries are bounded to three attempts; tests inject a no-op delay.
   rearmRetrySleep = sleepSyncMs,
@@ -1649,7 +1650,7 @@ export function runReviewLabelCli({
       // no branch (the pin already names the commit). No branch name on an unguarded read (the hermetic fake-gh
       // suites) → no read at all, as before.
       const net = guardedRestamp || pinnedAccept || headRefName
-        ? readNetDiffAtHead({ exec: execFileSyncThrottled, headSha, headRef: guardedRestamp || pinnedAccept ? null : headRefName })
+        ? readNetDiffAtHead({ exec: gitExec, headSha, headRef: guardedRestamp || pinnedAccept ? null : headRefName })
         : null;
       diffScored = !!net?.scored;
       reviewedDiff = diffScored ? net.text : '';
@@ -1708,7 +1709,7 @@ export function runReviewLabelCli({
     let proofReadMissed = false;
     if (record && !record.diff && diffScored) {
       try {
-        const old = readNetDiffAtHead({ exec: execFileSyncThrottled, headSha: record.sha, headRef: record.sha });
+        const old = readNetDiffAtHead({ exec: gitExec, headSha: record.sha, headRef: record.sha });
         if (old.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) }; else proofReadMissed = true;
       } catch { proofReadMissed = true; }
     }
