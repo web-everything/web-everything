@@ -24,7 +24,8 @@ describe('selectScanTests', () => {
   it('selects the runtime admission spawn guard for every file in its shared scan inventory', () => {
     const files = RUNTIME_ADMISSION_SPAWN_SCAN.flatMap(entry => typeof entry === 'string' ? [entry]
       : readdirSync(join(root, entry.directory)).filter(f => entry.files.test(f)).map(f => `${entry.directory}/${f}`));
-    expect(files).toEqual(expect.arrayContaining(['scripts/conveyor/infra-blocked.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs']));
+    expect(files).toEqual(expect.arrayContaining(['scripts/conveyor/infra-blocked.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs',
+      'scripts/operations/dispatch-providers/build.mjs', 'scripts/operations/detached-dispatch.mjs']));
     for (const file of [...files, 'scripts/conveyor/build-dispatch-future.mjs', 'scripts/operations/dispatch-lane-future.mjs']) {
       const { scoped, scopedFiles } = selectScanTests({ changedFiles: [file] });
       expect(scoped.map(e => e.test), file).toContain('scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs');

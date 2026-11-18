@@ -4693,8 +4693,8 @@ Runtime-only admission validates `bornAs` with the build-priority settings valid
 ## Runtime admission keeps launch groups whole
 
 At dispatch and resume spawn boundaries, admit the lead and every `groupMembers`
-entry before reserving a lane, writing session settings, or persisting a resume
-attempt/marker. Refuse the whole group with `runtime-refused` evidence naming the
+entry before reserving a lane or writing session settings. A pending resume
+attempt/marker must be rolled back if the final spawn admission refuses. Refuse the whole group with `runtime-refused` evidence naming the
 refused members; never forward an admission-filtered group. Resume wrappers reload
 the original persisted group, and prompts already describe that whole group.
 The spawn inventory must reject member-dropping predicates and require an exiting
@@ -4726,3 +4726,14 @@ regression and the multi-entry elapsed-budget regression alongside the single-ch
 
 Aggregate only infra recovery's six array fields; scalar error/deadline metadata must not enter the
 collection loop. Mixed error/success child responses must retain earlier results and continue recovery.
+
+
+The final runtime admission read belongs immediately at the child-process primitive,
+inside the spawner after marker/log/environment setup. Provider checks are early-outs.
+Mechanical providers are included in the spawn inventory without exceptions. Keep
+`runtime-admission.test.mjs`'s marker-read revocation cases for both lead and member,
+and its log-open revocation probe at the detached primitive. Diagnostic card filing
+uses its explicit diagnostic spawner and stays available under an empty allowlist.
+Orphan resume pending writes must roll back on final refusal: remove the pending
+marker and restore any previous dead attempt count. The named final-refusal cases
+in `build-dispatch-orphan-adopt.test.mjs` prove a later tick sees dead work and recovers.

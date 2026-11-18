@@ -1,3 +1,4 @@
+import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/dispatch-providers/build.mjs
  * @description THE `build` LAUNCH KIND'S MECHANICAL DISPATCH PROVIDER (#3645) — and THE TEMPLATE every sibling
@@ -136,7 +137,9 @@ export function deliverItemDetachedProvider(request, {
   // never a static token) into the wrapper's OWN process env, so every child IT later spawns (which all build
   // their env off `process.env`) inherits it too. See `detached-dispatch.mjs#defaultSpawnDetached`'s own
   // docblock for the full incident and mechanism this closes.
-  const child = spawnDetached(argv, { cwd: request?.cwd ?? REPO_ROOT, logPath: logPathFor(sessionSlug), settingsEnv: request?.settingsEnv });
+  const spawnOptions = { cwd: request?.cwd ?? REPO_ROOT, logPath: logPathFor(sessionSlug), settingsEnv: request?.settingsEnv, card: request };
+  const child = withRuntimeAdmission(request, request?.launchKind ?? 'build', () => spawnDetached(argv, spawnOptions));
+  if (child?.outcome === 'runtime-refused') return child;
   const pid = Number(child?.pid);
   if (!Number.isInteger(pid) || pid <= 0) {
     // SAME indeterminate shape as an unparseable `claude --bg` confirmation: something may be running and its

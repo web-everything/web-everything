@@ -2221,7 +2221,7 @@ export async function cliSpawnHoldLand(entry) {
   if (entry.commit) argv.push(`--commit=${entry.commit}`);
   if (entry.reason) argv.push(`--reason=${entry.reason}`);
   const logPath = deliveryDispatchLogPath(`hold-route-${entry.num}`, REPO_ROOT);
-  return withRuntimeAdmission(entry, 'route', () => defaultSpawnDetached(argv, { cwd: REPO_ROOT, logPath }));
+  return withRuntimeAdmission(entry, 'route', () => defaultSpawnDetached(argv, { cwd: REPO_ROOT, logPath, card: entry, kind: 'route' }));
 }
 
 /** #4465 — the real IO wiring for `runBuildDispatchTick`'s `effects.routeHeldItems`: dedup via
@@ -2616,7 +2616,7 @@ export async function cliStampPrepare(card, {
     const { defaultSpawnDetached, deliveryDispatchLogPath } = await import('../../scripts/operations/detached-dispatch.mjs');
     const result = withRuntimeAdmission(card, 'prepare-stamp', () => defaultSpawnDetached([
       join(SCRIPTS, 'operations', 'prepare-stamp-land.mjs'), `--num=${num}`,
-    ], { cwd: REPO_ROOT, logPath: deliveryDispatchLogPath(`prepare-stamp-${num}`, REPO_ROOT) }));
+    ], { cwd: REPO_ROOT, logPath: deliveryDispatchLogPath(`prepare-stamp-${num}`, REPO_ROOT), card, kind: 'prepare-stamp' }));
     if (result?.outcome === 'runtime-refused') { release(entry); return result; }
     // The shared spawner returns ChildProcess, not a dispatch verdict. Wait for actual spawn/error.
     if (typeof result?.once === 'function') {

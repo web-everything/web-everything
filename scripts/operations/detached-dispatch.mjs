@@ -36,8 +36,9 @@
  */
 
 import { routingPolicyEnv } from '../lib/dispatch-routing-policy-io.mjs';
+import { withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { mkdirSync, openSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { markWorkerEnv } from './session-role.mjs';
@@ -134,15 +135,18 @@ export function defaultIsPidAlive(pid) {
  * `settingsEnv` omitted (a caller with nothing to add, or a test) keeps this byte-identical but for the
  * sanitize — no `--settings`-shaped surprise for anything that never wires one through.
  */
-export function defaultSpawnDetached(argv, { cwd, logPath, settingsEnv = null } = {}, {
+export function defaultSpawnDetached(argv, { cwd, logPath, settingsEnv = null, card = {}, kind = card.launchKind ?? 'build' } = {}, {
   spawn = nodeSpawn,
   ensureDir = (d) => mkdirSync(d, { recursive: true }),
   openLog = (p) => openSync(p, 'a'),
+  closeLog = closeSync,
 } = {}) {
   ensureDir(dirname(logPath));
   const fd = openLog(logPath);
   const env = markWorkerEnv({ ...sanitizeSpawnEnv(process.env), ...(settingsEnv || {}), ...routingPolicyEnv() });
-  const child = spawn(process.execPath, argv, { cwd, detached: true, stdio: ['ignore', fd, fd], env });
+  const opts = { cwd, detached: true, stdio: ['ignore', fd, fd], env };
+  const child = withRuntimeAdmission(card, kind, () => spawn(process.execPath, argv, opts));
+  if (child?.outcome === 'runtime-refused') { closeLog(fd); return child; }
   if (typeof child.unref === 'function') child.unref();
   return child;
 }
@@ -159,4 +163,19 @@ export function wrapperExecutorFor(deliveryAgent) {
   const name = String(deliveryAgent ?? '').trim();
   if (!name || name === 'claude-restricted') return 'claude';
   return name;
+}
+
+/** Diagnostic card filing has no delivery identity and remains available during a runtime hold. */
+export function defaultSpawnDiagnosticDetached(argv, { cwd, logPath, settingsEnv = null } = {}, {
+  spawn = nodeSpawn, ensureDir = d => mkdirSync(d, { recursive: true }),
+  openLog = p => openSync(p, 'a'), closeLog = closeSync,
+} = {}) {
+  ensureDir(dirname(logPath));
+  const fd = openLog(logPath);
+  try {
+    const child = spawn(process.execPath, argv, { cwd, detached: true, stdio: ['ignore', fd, fd],
+      env: markWorkerEnv({ ...sanitizeSpawnEnv(process.env), ...(settingsEnv || {}), ...routingPolicyEnv() }) });
+    child.unref?.();
+    return child;
+  } finally { closeLog(fd); }
 }

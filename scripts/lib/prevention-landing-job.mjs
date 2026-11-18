@@ -26,7 +26,7 @@
  * @see we:scripts/operations/land-prevention-card.mjs for the detached job itself.
  */
 import { join } from 'node:path';
-import { defaultSpawnDetached, REPO_ROOT } from '../operations/detached-dispatch.mjs';
+import { defaultSpawnDiagnosticDetached, REPO_ROOT } from '../operations/detached-dispatch.mjs';
 import { buildGhShimSettingsEnv, isDaemonCaller } from './gh-app-shim.mjs';
 import { automationStateRoot } from './automation-home.mjs';
 
@@ -49,7 +49,7 @@ export function preventionCardLandingLogPath(sessionSlug) {
  * approval that already landed, or a review-loop round that is about to resume to `accept`), and must stay
  * fast and non-blocking: the full lane-acquire + file-item + verify + open-pr sequence is the same multi-minute
  * arc a delivery agent runs. So this function's ONLY synchronous work is spawning that sequence as its own
- * detached, unref'd process (`defaultSpawnDetached`) and returning; the spawned job (`land-prevention-card.mjs`)
+ * detached, unref'd process (`defaultSpawnDiagnosticDetached`) and returning; the spawned job (`land-prevention-card.mjs`)
  * does the real acquire/file-item/verify/open-pr/release work on its own time.
  *
  * `num`/`rel` are ALWAYS `null` in the return value — the card's real id is not known until the spawned job
@@ -73,7 +73,7 @@ export function preventionCardLandingLogPath(sessionSlug) {
  *   session?:string}}
  */
 export function spawnPreventionLandingJob(input, {
-  spawnDetached = defaultSpawnDetached,
+  spawnDetached = defaultSpawnDiagnosticDetached,
   logPathFor = preventionCardLandingLogPath,
   runScript = LAND_PREVENTION_CARD_SCRIPT,
   root = REPO_ROOT,

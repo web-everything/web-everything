@@ -46,6 +46,8 @@ export const RUNTIME_ADMISSION_SPAWN_SCAN = Object.freeze([
   'scripts/conveyor/tick-core.mjs',
   'scripts/conveyor/infra-blocked.mjs',
   'scripts/operations/ci-heal-pr-dispatch.mjs',
+  'scripts/operations/detached-dispatch.mjs',
+  { directory: 'scripts/operations/dispatch-providers', files: /\.mjs$/ },
   { directory: 'scripts/operations', files: /^dispatch-lane[^/]*\.mjs$/ },
   { directory: 'scripts/conveyor', files: /^build-dispatch-[^/]*\.mjs$/ },
 ]);

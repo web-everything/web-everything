@@ -1,3 +1,5 @@
+import { deliverItemDetachedProvider } from '../../operations/dispatch-providers/build.mjs';
+import { defaultSpawnDetached, defaultSpawnDiagnosticDetached } from '../../operations/detached-dispatch.mjs';
 import { routeDispatchProvider, defaultClaudeProvider, spawnAgentToCompletion, reserveBuildLane } from '../../operations/dispatch-lane-io.mjs';
 import { cliRetryInfraBlocked, cliEffects } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
 import { resumeOpen, infraRecoveryCard, parseInfraStore } from '../../conveyor/infra-blocked.mjs';
@@ -231,4 +233,48 @@ it.each([[], 'bad settings', Promise.resolve({})].map(settings => [settings]))('
   expect(withRuntimeAdmission({ num: 12 }, 'build', effect, { readSettings: () => settings }))
     .toMatchObject({ outcome: 'runtime-refused', reason: 'runtime-malformed' });
   expect(effect).not.toHaveBeenCalled();
+});
+
+it.each(['lead', 'member'])('mechanical marker read revoking the %s prevents the spawn', async revoked => {
+  let settings = only(['12', '13']);
+  const spawnDetached = vi.fn(() => ({ pid: 7 }));
+  await withRuntimeAdmissionTick(() => settings, async () => {
+    const result = deliverItemDetachedProvider({ num: '12', groupMembers: ['13'], lane: 1, sessionSlug: 'test' }, {
+      readDeliveryAgentMarker: () => { settings = only(revoked === 'lead' ? ['13'] : ['12']); return null; },
+      spawnDetached, logPathFor: () => 'fixture.log',
+    });
+    expect(result).toMatchObject({ outcome: 'runtime-refused' });
+    expect(spawnDetached).not.toHaveBeenCalled();
+    settings = only(['12', '13']);
+    expect(deliverItemDetachedProvider({ num: '12', groupMembers: ['13'], lane: 1, sessionSlug: 'test' }, {
+      readDeliveryAgentMarker: () => null, spawnDetached, logPathFor: () => 'fixture.log',
+    })).toBe('pid:7');
+    expect(spawnDetached).toHaveBeenCalledTimes(1);
+    return {};
+  });
+});
+it('detached primitive rechecks admission after opening its log', async () => {
+  let settings = only(['12', '13']);
+  const spawn = vi.fn(() => ({ pid: 7 }));
+  await withRuntimeAdmissionTick(() => settings, async () => {
+    const result = defaultSpawnDetached([], { logPath: 'fixture.log', card: { num: '12', groupMembers: ['13'] } }, {
+      ensureDir: () => {}, openLog: () => { settings = only(['12']); return 1; }, closeLog: () => {}, spawn,
+    });
+    expect(result).toMatchObject({ outcome: 'runtime-refused' });
+    expect(spawn).not.toHaveBeenCalled();
+    return {};
+  });
+});
+
+it('diagnostic card filing still spawns under an empty runtime allowlist', async () => {
+  const spawn = vi.fn(() => ({ pid: 7, unref() {} }));
+  const closeLog = vi.fn();
+  await withRuntimeAdmissionTick(() => only([]), async () => {
+    expect(defaultSpawnDiagnosticDetached([], { logPath: 'fixture.log' }, {
+      ensureDir: () => {}, openLog: () => 123, closeLog, spawn,
+    }).pid).toBe(7);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(closeLog).toHaveBeenCalledWith(123);
+    return {};
+  });
 });

@@ -444,6 +444,40 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     expect(readSettings).toHaveBeenCalledTimes(2);
   });
 
+  it.each([[0, 'default'], [1, 'default'], [0, 'injected'], [1, 'injected']])('final refusal rolls back the pending marker and preserves %s attempts (%s); the next tick recovers', async (attempts, mode) => {
+    const num = '4131';
+    const row = buildRow({ num, handle: 'pid:74142' });
+    if (attempts) markBuildDispatchResume({ num, pid: 999, runId: row.runId, rowKey: row.entry.key, attempts, lockRoot: resumeRoot });
+    let settings = { mode: 'lift' };
+    const spawn = vi.fn(() => 777);
+    const markResume = vi.fn(o => {
+      const result = markBuildDispatchResume({ ...o, lockRoot: resumeRoot });
+      if (o.pid === null) settings = { mode: 'only', only: true, ids: [] };
+      return result;
+    });
+    const options = {
+      listClaims: () => [{ pid: 1, meta: { kind: 'build', num } }], isPidAlive: () => false,
+      findRow: () => row, readResumeMarker: () => readBuildDispatchResume({ num, lockRoot: resumeRoot }),
+      resolveResumability: () => ({ resumable: true }), readSettings: () => settings, markResume,
+      releaseResumeMarker: ({ num }) => releaseBuildDispatchResume({ num, lockRoot: resumeRoot }),
+      spawnResume: mode === 'default' ? undefined : spawn,
+    };
+    expect(await adoptFixtureClaims(options)).toEqual([expect.objectContaining({ action: 'runtime-refused' })]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(markResume.mock.calls.filter(([o]) => o.pid === null)).toHaveLength(1);
+    const restored = readBuildDispatchResume({ num, lockRoot: resumeRoot });
+    if (attempts) expect(restored.meta).toMatchObject({ attempts, pid: 999 });
+    else expect(restored).toBeNull();
+    expect(classifyClaimLiveness({ row, resumeMarker: restored, isPidAlive: () => false }).status).toBe('dead');
+    settings = { mode: 'lift' };
+    const recovered = await adoptFixtureClaims({ ...options, spawnResume: spawn,
+      markResume: o => markBuildDispatchResume({ ...o, lockRoot: resumeRoot }),
+    });
+    expect(recovered).toEqual([expect.objectContaining({ action: 'resume', pid: 777 })]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(readBuildDispatchResume({ num, lockRoot: resumeRoot }).meta.attempts).toBe(attempts + 1);
+  });
+
   it('never records a null spawn as a successful resume or leaves a pending marker', async () => {
     const markResume = vi.fn(o => markBuildDispatchResume({ ...o, lockRoot: resumeRoot }));
     const result = await adoptFixtureClaims({

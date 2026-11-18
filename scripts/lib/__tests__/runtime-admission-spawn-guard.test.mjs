@@ -91,6 +91,7 @@ function scan(source) {
 }
 // Reviewed exceptions are keyed by file + function, never by argv or line number.
 const reviewedReads = new Map([
+  ['scripts/operations/detached-dispatch.mjs#defaultSpawnDiagnosticDetached', 'Files diagnostic cards only; never delivery work.'],
   ['scripts/conveyor/infra-blocked.mjs#originSlugOf', 'Reads the origin URL.'],
   ['scripts/conveyor/infra-blocked.mjs#readResumeGit', 'Fetches and reads the already-published ref; never publishes or starts delivery.'],
   ['skills-src/conveyor/build-dispatch-daemon.mjs#cliPlanTick', 'Reads the tick plan; never executes its proposed work.'],

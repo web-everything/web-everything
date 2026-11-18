@@ -481,7 +481,9 @@ export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = nul
   ];
   beforeSpawn();
   const logPath = logPathFor(sessionSlug);
-  const child = withRuntimeAdmission({ num, bornAs, groupMembers }, 'resume', () => spawnDetached(argv, { cwd: REPO_ROOT, logPath }), { readSettings });
+  const card = { num, bornAs, groupMembers };
+  const spawnOptions = { cwd: REPO_ROOT, logPath, card, kind: 'resume' };
+  const child = withRuntimeAdmission(card, 'resume', () => spawnDetached(argv, spawnOptions), { readSettings });
   if (child?.outcome === 'runtime-refused') { child.runtimeRefused.forEach(onRefused); return null; }
   const pid = Number(child?.pid);
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -620,10 +622,18 @@ export async function adoptOrphanedBuildClaims({
         }).every(Boolean);
         if (!allMembersAdmitted) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused group', runtimeRefused }); continue; }
         const binding = { runId: row.runId, rowKey: row.entry?.key, attempts: attempts + 1 };
-        const beforeSpawn = () => markResume({ num, pid: null, ...binding });
+        let pendingWritten = false;
+        const beforeSpawn = () => { markResume({ num, pid: null, ...binding }); pendingWritten = true; };
+        const rollbackResume = () => {
+          if (!pendingWritten) return;
+          releaseResumeMarker({ num });
+          // Restore the previous dead attempt count; a refusal consumes no attempt.
+          if (liveness.marker) markResume({ ...liveness.marker.meta, num,
+            nowIso: liveness.marker.meta.resumedAt });
+        };
         let pid;
         try {
-          // The real helper admits freshly BEFORE persisting the pending attempt.
+          // The pending write precedes the final spawn check and must be undone on refusal.
           if (spawnResume) beforeSpawn();
           const request = {
             num, lane: payload.lane, scope: payload.scope, sessionSlug: payload.sessionSlug,
@@ -632,7 +642,7 @@ export async function adoptOrphanedBuildClaims({
           };
           pid = spawnResume ? withRuntimeAdmission(request, 'resume', () => spawnResume(request), { readSettings })
             : withRuntimeAdmission(request, 'resume', () => spawnResumeDelivery(request, { readSettings, beforeSpawn, onRefused: refusal => runtimeRefused.push(refusal) }), { readSettings });
-          if (pid?.outcome === 'runtime-refused' || (pid === null && !spawnResume)) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn', ...(runtimeRefused.length ? { runtimeRefused } : {}) }); continue; }
+          if (pid?.outcome === 'runtime-refused' || (pid === null && !spawnResume)) { rollbackResume(); results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn', ...(runtimeRefused.length ? { runtimeRefused } : {}) }); continue; }
           if (!Number.isInteger(pid) || pid <= 0) throw new Error(`resume spawn for #${num} reported no pid`);
         } catch (e) {
           // Known NOT running — record it so the next pass counts this attempt dead at once, not after a TTL.

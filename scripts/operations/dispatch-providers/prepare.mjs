@@ -1,3 +1,4 @@
+import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/dispatch-providers/prepare.mjs
  * @description `#3641` — THE `prepare` LAUNCH KIND'S DISPATCH PROVIDER. One implementation of the same `#3579`
@@ -77,7 +78,9 @@ export function prepareScopeDetachedProvider(request, {
   // #landing-freeze-2779 — forward the request's already-computed gh-App-shim env (fresh-cache PATH override,
   // never a static token) into the wrapper's OWN process env — see `detached-dispatch.mjs#defaultSpawnDetached`'s
   // own docblock for the full incident and mechanism this closes.
-  const child = spawnDetached(argv, { cwd: request?.cwd ?? REPO_ROOT, logPath: logPathFor(sessionSlug), settingsEnv: request?.settingsEnv });
+  const spawnOptions = { cwd: request?.cwd ?? REPO_ROOT, logPath: logPathFor(sessionSlug), settingsEnv: request?.settingsEnv, card: request };
+  const child = withRuntimeAdmission(request, request?.launchKind ?? 'build', () => spawnDetached(argv, spawnOptions));
+  if (child?.outcome === 'runtime-refused') return child;
   const pid = Number(child?.pid);
   if (!Number.isInteger(pid) || pid <= 0) {
     // SAME indeterminate shape as an unparseable `claude --bg` confirmation: something may be running and its
