@@ -77,3 +77,12 @@ it('review gate refuses newer REST success without workflow identity', () => {
   const passed = { ...success('test'), startedAt: '2026-10-28T02:00:00Z', id: 99 };
   for (const rows of [[failed, passed], [passed, failed]]) expect(gate([...rows, success('daemon-soak')]).allowed).toBe(false);
 });
+
+it.each([2, undefined])('review gate retains CodeQL failure for a different or missing workflow id (%s)', workflow_id => {
+  const failed = { ...success('CodeQL'), workflowName: 'CI', workflow_id: 1, conclusion: 'failure', startedAt: '2026-10-28T01:00:00Z' };
+  const passed = { ...failed, workflow_id, conclusion: 'success', startedAt: '2026-10-28T02:00:00Z' };
+  for (const checks of [[failed, passed], [passed, failed]]) {
+    expect(reviewCiGate({ headSha, requiredChecks: ['CodeQL'], checks }))
+      .toMatchObject({ allowed: false, affected: [{ name: 'CodeQL', reason: 'failure' }] });
+  }
+});

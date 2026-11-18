@@ -802,3 +802,25 @@ it('workflow-less later success keeps the original failure red', () => {
   for (const rollup of [[failed, passed], [passed, failed]]) expect(requiredCheckStates({ rollup, requiredChecks: ['test'] }))
     .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
 });
+
+it.each([2, undefined])('ci-heal retains same-name CodeQL failure across different or missing workflow identity (%s)', workflow_id => {
+  const failed = { name: 'CodeQL', workflowName: 'CI', workflow_id: 1, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const passed = { ...failed, workflow_id, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
+  for (const rollup of [[failed, passed], [passed, failed]]) {
+    const args = { rollup, requiredChecks: ['CodeQL'] };
+    expect(requiredCheckStates(args).red).toEqual(['CodeQL']);
+    expect(ciGreenForEscalation(args)).toBe(false);
+    expect(verdictRecheck.gateOnlyRedStates(args).gateOnlyRed).toBe(false);
+  }
+});
+it.each(['SKIPPED', 'NEUTRAL', 'CANCELLED', 'STALE'])('ci-heal retains failure after a latest %s attempt', conclusion => {
+  const failed = { name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const fresh = { ...failed, conclusion, startedAt: '2026-10-28T02:00:00Z' };
+  for (const rollup of [[failed, fresh], [fresh, failed]]) {
+    const args = { rollup, requiredChecks: ['test'] };
+    expect(requiredCheckStates(args)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+    expect(ciGreenForEscalation(args)).toBe(false);
+    expect(unsettledRequiredChecks(args).red).toEqual(['test']);
+    expect(contradictingChecks({ ...input, ...args })).toEqual(['test']);
+  }
+});

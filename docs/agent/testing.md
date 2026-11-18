@@ -4452,3 +4452,9 @@ Fixtures representing independent producers must identify their workflows.
 A merge-gate review-hold annotation cannot outrank ordinary CI failure or pending
 evidence when attempt order is ambiguous. Run the resolver and affected gate tests
 through heavy admission.
+
+Workflow identity (workflow id first, then resource path/URL/path) takes precedence
+over display names; check/run ids never identify a workflow. Name-only evidence
+matching identified rows makes the partition ambiguous and retains its worst state.
+A latest attempt consisting only of skipped, neutral, cancelled or stale results
+cannot clear an earlier failure. A later successful rerun can clear it.

@@ -103,6 +103,8 @@ export function latestRollupAttempts(rollup) {
 
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
+  // Resolve workflow identities before summarizing names. A skipped/neutral
+  // latest attempt cannot replace earlier red evidence with proof of a rerun.
   const checks = resolveCheckRows((Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck),
     row => row.name === 'merge-gate' && row.mergeGateReviewHold
       ? 'green' : classifyCheck({ ...row, required: true }));

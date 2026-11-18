@@ -182,3 +182,14 @@ it('CodeQL failure survives newer REST success without workflow identity', () =>
   const passed = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z', id: 99 };
   for (const rows of [[failed, passed], [passed, failed]]) expect(failedCodeQLCheck({ statusCheckRollup: rows })).toBe(failed);
 });
+
+it.each([2, undefined])('CodeQL failure survives same-name workflow with different or missing identity (%s)', workflow_id => {
+  const failed = { name: 'CodeQL', workflowName: 'CI', workflow_id: 1, conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const passed = { ...failed, workflow_id, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
+  for (const rows of [[failed, passed], [passed, failed]]) expect(failedCodeQLCheck({ statusCheckRollup: rows })).toBe(failed);
+});
+it.each(['SKIPPED', 'NEUTRAL', 'CANCELLED', 'STALE'])('CodeQL failure survives later %s attempt', conclusion => {
+  const failed = { name: 'CodeQL', workflowName: 'CI', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const fresh = { ...failed, conclusion, startedAt: '2026-10-28T02:00:00Z' };
+  for (const rows of [[failed, fresh], [fresh, failed]]) expect(failedCodeQLCheck({ statusCheckRollup: rows })).toBe(failed);
+});

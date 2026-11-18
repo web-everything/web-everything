@@ -5,6 +5,52 @@ const failed = { workflowName: 'CI', name: 'test', status: 'completed', conclusi
 const passed = { ...failed, conclusion: 'success', startedAt: '2026-10-28T02:00:00Z' };
 
 describe('fail-closed workflow/check attempt resolver', () => {
+  it.each([
+    id => ({ workflow: { databaseId: id, name: 'CI' } }),
+    id => ({ workflow: { id, name: 'CI' } }),
+    id => ({ workflow_id: id }),
+    id => ({ workflowRun: { id: 999, workflow: { id, name: 'CI' } } }),
+    id => ({ checkSuite: { workflowRun: { id: 999, workflow: { id, name: 'CI' } } } }),
+    ...['resourcePath', 'url', 'path'].map(key => id => ({ workflow: { [key]: String(id), name: 'CI' } })),
+  ])('partitions same-name workflows by identity and permits reruns only within it (%#)', identity => {
+    const red = { ...failed, ...identity(1) };
+    const green = { ...passed, ...identity(2) };
+    for (const rows of [[red, green], [green, red]]) {
+      expect(resolveCheckRows(rows)).toHaveLength(2);
+      expect(resolveCheckRows(rows)).toContain(red);
+    }
+    expect(resolveCheckRows([red, { ...passed, ...identity(1) }])).toEqual([{ ...passed, ...identity(1) }]);
+  });
+  it('prefers database identity over matching workflow paths and display names', () => {
+    expect(resolveCheckRows([1, 2].map((id, i) => ({ ...(i ? passed : failed), workflow: { databaseId: id, id: 'shared', path: 'shared' } })))).toHaveLength(2);
+  });
+  it('uses identity across display-name changes and ignores workflow-run ids', () => {
+    const red = { ...failed, workflowRun: { id: 1, workflow: { id: 7 } } };
+    const green = { ...passed, workflowName: 'renamed', workflowRun: { id: 2, workflow: { id: 7 } } };
+    expect(resolveCheckRows([red, green])).toEqual([green]);
+  });
+  it('name-only evidence bridges same-name identities ambiguously in every insertion position', () => {
+    const red = { ...failed, workflow_id: 1 };
+    const green = { ...passed, workflow_id: 2 };
+    const nameOnly = { ...passed };
+    for (const rows of [[red, green, nameOnly], [nameOnly, green, red], [green, nameOnly, red]]) {
+      expect(resolveCheckRows(rows)).toEqual([red]);
+    }
+    for (const rows of [[red, nameOnly], [nameOnly, red], [failed, green], [green, failed]]) {
+      expect(resolveCheckRows(rows)).toEqual([rows.find(row => row.conclusion === 'failure')]);
+    }
+  });
+  it.each(['SKIPPED', 'NEUTRAL', 'CANCELLED', 'STALE'])('a latest %s cannot erase earlier failure', conclusion => {
+    const fresh = { ...passed, conclusion };
+    for (const rows of [[failed, fresh], [fresh, failed]]) expect(resolveCheckRows(rows)).toEqual([failed]);
+    expect(resolveCheckRows([fresh])).toEqual([fresh]);
+    expect(resolveCheckRows([failed, fresh, { ...passed, startedAt: '2026-10-28T03:00:00Z' }]))
+      .toEqual([{ ...passed, startedAt: '2026-10-28T03:00:00Z' }]);
+  });
+  it('keeps failure when all tied latest attempts are non-proving', () => {
+    expect(resolveCheckRows([failed, { ...passed, conclusion: 'skipped' }, { ...passed, conclusion: 'neutral' }])).toEqual([failed]);
+    expect(resolveCheckRows([failed, passed, { ...passed, conclusion: 'neutral' }])).toEqual([passed]);
+  });
   it.each(['startedAt', 'started_at'])('orders attempts by %s regardless of ids and input order', field => {
     const old = Object.freeze({ ...failed, startedAt: undefined, [field]: failed.startedAt, id: 999 });
     const fresh = Object.freeze({ ...passed, startedAt: undefined, [field]: passed.startedAt, id: 1 });
