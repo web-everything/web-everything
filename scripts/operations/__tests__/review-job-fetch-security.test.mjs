@@ -742,13 +742,35 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository iden
       expect(f.apiCalls).toEqual([]);
     });
 
+  // GitHub's own ports name the same repository (as drain-api-reads' origin parser accepts them).
+  it.each(['ssh://git@github.com:22/', 'https://github.com:443/', 'ssh://git@ssh.github.com:443/',
+    'ssh://git@ssh.github.com/', 'ssh://git@ssh.github.com:22/', 'https://x-access-token@github.com/'])(
+    'accepts a GitHub default-port or credentialed origin form without an API call (%s)', prefix => {
+      const f = fixture({ origin: `${prefix}${canonical}.git` });
+      expect(f.run()).toEqual({ head });
+      expect(f.apiCalls).toEqual([]);
+      expect(f.calls.some(([, args]) => args.includes('fetch'))).toBe(true);
+    });
+
   it.each(['git://github.com/chalbert/web-everything.git', 'https://evil.example/chalbert/web-everything.git',
-    'git@github.com:chalbert/web-everything?query.git', 'git@github.com:chalbert/web-everything/extra.git'])(
+    'git@github.com:chalbert/web-everything?query.git', 'git@github.com:chalbert/web-everything/extra.git',
+    'ssh://git@github.com:2222/chalbert/web-everything.git', 'https://github.com:8443/chalbert/web-everything.git',
+    'ssh://git@ssh.github.com:2222/chalbert/web-everything.git', 'ssh://other@github.com:22/chalbert/web-everything.git',
+    'ssh://git@github.com:443/chalbert/web-everything.git', 'https://github.com:22/chalbert/web-everything.git',
+    'https://github.com.evil.example/chalbert/web-everything.git', 'https://a@b@github.com/chalbert/web-everything.git',
+    'git@github.com:../user.git', 'git@github.com:./web-everything.git', 'git@github.com:chalbert/...git'])(
     'refuses unsupported URLs or malformed origin slugs without API calls (%s)', origin => {
       const f = fixture({ origin });
       expect(() => f.run()).toThrow(identityError);
       expect(f.apiCalls).toEqual([]);
       expect(f.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    });
+
+  it.each(['../user', './web-everything', 'web-everything/..', 'web-everything/...'])(
+    'refuses a dot-segment review repository before any command (%s)', repo => {
+      const f = fixture();
+      expect(() => f.run(repo)).toThrow('invalid review repository');
+      expect(f.calls).toEqual([]);
     });
 
   it('caches both ids by lowercase slug across jobs and entry points in the same IO instance', () => {

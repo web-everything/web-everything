@@ -309,9 +309,12 @@ export function execReadRaw(file, args, options = {}) {
   return execFileSyncThrottled(file, args, { ...options, maxBuffer: options.maxBuffer ?? READ_MAX_BUFFER });
 }
 
+/** An `owner/name` GitHub slug. A `.` or `..` segment is no GitHub name and would walk a `gh api repos/<slug>` path. */
+const isGithubSlug = slug => /^[\w.-]+\/[\w.-]+$/.test(slug ?? '') && !slug.split('/').some(part => /^\.+$/.test(part));
+
 /** Fetch outside the lane's config boundary, then hand only verified objects to the lane. */
 function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, exec, readConfig, spawnPack, log, repoIds }) {
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid review repository; inspect repo argument before retrying');
+  if (!isGithubSlug(repo)) throw Error('invalid review repository; inspect repo argument before retrying');
   const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
   const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
   try {
@@ -338,9 +341,11 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
       throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
     }
     const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
-    const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
+    // Only GitHub's own ports name github.com: 22 for ssh, 443 for https, 22 or 443 for ssh.github.com (as
+    // drain-api-reads' origin parser does). The origin is identity evidence only: the fetch below uses a fixed URL.
+    const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/|ssh:\/\/git@ssh\.github\.com(?::22|:443)?\/|https:\/\/(?:[^@/]+@)?github\.com(?::443)?\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
     const identityError = 'review lane origin repository mismatch or unreadable; inspect lane before retrying';
-    if (!/^[\w.-]+\/[\w.-]+$/.test(originRepo ?? '')) throw Error(identityError);
+    if (!isGithubSlug(originRepo)) throw Error(identityError);
     if (originRepo.toLowerCase() !== repo.toLowerCase()) {
       const resolveId = slug => {
         const key = slug.toLowerCase();
@@ -539,7 +544,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { head };
     },
     prepareLane: ({ pr, repo, lanePath }) => {
-      if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid review repository; inspect repo argument before retrying');
+      if (!isGithubSlug(repo)) throw Error('invalid review repository; inspect repo argument before retrying');
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
