@@ -632,6 +632,14 @@ describe('head-bound escalation notes', () => {
   const red = [{ status: 'COMPLETED', conclusion: 'FAILURE' }];
   const note = (extra = {}) => c('web-everything', '2026-10-21T06:00:00Z', buildNoteComment({
     kind: 'owed-ci-rerun-spent', prNumber: 5485, head: HEAD, failingRequiredChecks: ['test', 'lint', 'build'], text: 'reruns spent', ...extra }));
+  it.each(['green checks', 'new head'])
+  ('a later CI note recovered by %s preserves an earlier unanswered same-head dispute', recovery => {
+    const dispute = c('web-everything', '2026-10-21T05:00:00Z',
+      `🔔 conveyor — needs your decision\n\nneeds your decision: disagree about a ruling\n<!-- conveyor-note-head: ${HEAD} -->`);
+    const recovered = note(recovery === 'new head' ? { head: 'b'.repeat(40) } : {});
+    expect(needsDecisionOpen([dispute, recovered], { liveHead: HEAD, statusCheckRollup: green }))
+      .toMatchObject({ at: Date.parse(dispute.createdAt), dispute: true });
+  });
   it('producer embeds the head marker', () => {
     expect(note().body).toContain(`<!-- conveyor-note-head: ${HEAD} -->`);
   });

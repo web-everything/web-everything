@@ -406,6 +406,25 @@ describe('stored-review not-owed rule (R730)', () => {
 
 
 describe('live red-team alert suppression', () => {
+  it.each(['failure', 'pending', 'unreadable', 'clear'])
+  ('a success check suppresses the alert only with validated publication evidence: %s', state => {
+    const status = { id: 1, context: `red-team/publication #${pr}`, state };
+    const gh = vi.fn(args => {
+      if (state === 'unreadable') throw Error('offline');
+      return JSON.stringify(args[1].includes('/statuses?') ? [status]
+        : { total_count: state === 'clear' ? 0 : 1, statuses: state === 'clear' ? [] : [status] });
+    });
+    const readLive = createLiveRedTeamReader({
+      provider: { readPrState: () => ({ headRefOid: head }) }, readComments: () => [],
+      readCheckFact: () => ({ ok: true }), gh,
+    });
+    expect(readLive({ repo, pr, head })).toEqual({ clear: state === 'clear' });
+    const f = fixture();
+    f.io.readLiveRedTeam = readLive;
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(state === 'clear' ? 0 : 1);
+  });
+
   it.each([
     ['confirmed finding', '1. [**confirmed**] (correctness, high) `src/example.js:1` — breaks the result'],
     ['malformed result', '1. [confirmed] malformed finding'],
@@ -427,7 +446,8 @@ describe('live red-team alert suppression', () => {
       labels: [] })) };
     f.io.readLiveRedTeam = createLiveRedTeamReader({ provider,
       readComments: () => kind === 'completed result' ? [{ body: clearResult(head), author: { login: 'web-everything' } }] : [],
-      readCheckFact: () => ({ ok: kind === 'check' }) });
+      readCheckFact: () => ({ ok: kind === 'check' }),
+      readPublicationHoldFact: () => ({ ok: true }) });
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
     expect(f.markers()).toHaveLength(1);

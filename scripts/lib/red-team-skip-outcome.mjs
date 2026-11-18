@@ -10,7 +10,7 @@ import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
 import { redTeamOwedFor } from './review-red-team-policy.mjs';
 import { isPublishableRedTeamResult, redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
-import { readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
+import { readRedTeamCheckFact, readRedTeamPublicationHoldFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
 /** Thrown values can have unreadable messages or unstringifiable JSON shapes. */
@@ -87,7 +87,9 @@ export function createLiveRedTeamReader({ provider, readComments, env = process.
   readCheckFact = args => {
     const app = resolveWeAppId({ env });
     return app.ok ? readRedTeamCheckFact({ ...args, appId: app.appId, gh }) : app;
-  } }) {
+  },
+  readPublicationHoldFact = args => readRedTeamPublicationHoldFact({ ...args, gh }),
+}) {
   return ({ repo, pr, head }) => {
     const live = provider.readPrState(repo, pr);
     if (!isRealHead(live?.headRefOid)) throw Error('live PR head unreadable');
@@ -95,7 +97,9 @@ export function createLiveRedTeamReader({ provider, readComments, env = process.
     if (live.headRefOid.toLowerCase() !== head.toLowerCase()) return { clear: true };
     const result = redTeamForHead(readComments({ repo, pr }), pr, head);
     if (result) return { clear: result.findings?.length === 0 && isPublishableRedTeamResult(result) };
-    return { clear: readCheckFact({ repo, pr, headSha: head })?.ok === true };
+    const key = { repo, pr, headSha: head };
+    // A successful check can still be covered by a failed or unfinished publication.
+    return { clear: readCheckFact(key)?.ok === true && readPublicationHoldFact(key)?.ok === true };
   };
 }
 
