@@ -111,6 +111,8 @@ import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
+import { latestChangesVerdict } from '../review-set-label.mjs';
+import { gateOutcomesForHead } from '../lib/red-team-gate.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
@@ -1459,6 +1461,7 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
   // stale-hold-resume — `review-referral-hold.mjs#decideReferralHoldAutoResolve` read every live-head finding as ruled.
   let auto = pr.referralHoldAutoResolve && pr.referralHoldAutoResolve.head === pr.headRefOid ? pr.referralHoldAutoResolve : null;
   if (auto?.outcome === 'resume') {
+    if (sendBackAfterFixAttempt(pr)) return false;
     // All card / not-real: no ruling is owed, so the pause is over and the PR moves to its next step. On a
     // `review:human` PR whose live head already has its advisory, that step is the human /review, never another panel
     // (the same-head guard still stands) and never an accept: refuse as the nothing-owed `already-reviewed-head`, which
@@ -1486,6 +1489,41 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
     ...(auto ? { referralHoldAutoResolve: auto } : {}),
   });
   return true;
+}
+
+/** A newer repair request survives a clean referral ruling on an unchanged head. Use the sanctioned
+ * verdict/gate readers and the existing durable attempt markers; unknown chronology grants no release. */
+function sendBackAfterFixAttempt(pr) {
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const trusted = comments.filter(isTrustedMarkerAuthor);
+  const attempts = trusted.filter(c => [FIX_BEGIN_MARKER, FIX_END_MARKER, STAND_DOWN_MARKER,
+    REARM_COMMENT_MARKER, ADVISORY_FIX_COMMENT_MARKER, CONFLICT_FIX_COMMENT_MARKER]
+    .some(marker => String(c?.body ?? '').trimStart().startsWith(marker)));
+  const times = attempts.map(c => Date.parse(c.createdAt ?? c.created_at));
+  if (times.some(at => !Number.isFinite(at))) return false;
+  // Preserve the existing operator request's review-order and one-shot consumption proof. An automated
+  // copy with no fixer episode cannot create a new repair obligation on an already-reviewed head.
+  if (!attempts.length) return Boolean(operatorSendBackAfterReview(pr));
+  const lastAt = Math.max(-Infinity, ...times);
+  const lastIndex = Math.max(-1, ...attempts.map(c => comments.indexOf(c)));
+  const verdict = latestChangesVerdict(trusted);
+  const requests = trusted.filter(c => {
+    const outcomes = gateOutcomesForHead([c], pr.number, pr.headRefOid);
+    return (c === verdict && (!isOperatorAuthored(c) || Boolean(operatorSendBackAfterReview(pr)))) || outcomes.has('sent-back')
+      || (labelNames(pr.labels).includes('red-team:blocked') && outcomes.has('operator-block'));
+  });
+  if (requests.some(c => {
+    const heads = reviewedHeadsOf(c);
+    return (!heads.length || heads.some(head => sameHeadSha(head, pr.headRefOid)))
+      && comments.indexOf(c) > lastIndex && Date.parse(c.createdAt ?? c.created_at) > lastAt;
+  })) return true;
+  const labels = labelNames(pr.labels);
+  return (Array.isArray(pr.labelEvents) ? pr.labelEvents : []).some(e => {
+    const label = typeof e?.label === 'string' ? e.label : e?.label?.name;
+    return labels.includes(label) && ['review:changes', 'status:sent-back-review', 'status:sent-back-red-team'].includes(label)
+      && (e.event === 'labeled' || e.event === undefined)
+      && Date.parse(e.created_at ?? e.at ?? e.createdAt) > lastAt;
+  });
 }
 
 /** Every review path respects a trusted human clearance of the exact, normalized head. */
@@ -2251,6 +2289,11 @@ export function planReconcile({
     const hold = pr?.referralHold;
     if (auto?.outcome !== 'resume' || !hold || auto.head !== pr.headRefOid || hold.kind !== 'same-head'
       || hold.head !== pr.headRefOid || hold.noVerdict) return pr;
+    // Ruled referrals say nothing about a later orchestrator/red-team send-back. Release the pause to the
+    // ordinary fixer (and its existing caps), without producing a human-review refusal or a re-arm label write.
+    if (sendBackAfterFixAttempt(pr)) {
+      return { ...pr, referralHold: null, referralHoldAutoResolve: { ...auto, next: 'fix' } };
+    }
     const human = labelNames(pr.labels).includes(REVIEW_LABELS.human);
     if (human && advisoryHeadState(pr).advisoryIsCurrent) return pr;
     // Every attempt since the wake counts, finished or not (a review that dies before `advise` is an attempt too). A
@@ -2802,7 +2845,9 @@ export function planReconcile({
     const phase = classifyPr({
       // The planner accepts strings and GraphQL label objects; the board classifier
       // accepts objects only. Never let a live send-back disappear behind an older accept.
-      state: pr?.state, labels: labelNames(pr?.labels).map(name => ({ name })), mergeStateStatus: pr?.mergeStateStatus,
+      state: pr?.state, labels: [...labelNames(pr?.labels),
+        ...(pr.referralHoldAutoResolve?.next === 'fix' && pr.referralHoldAutoResolve.head === pr.headRefOid
+          && pr.referralHoldAutoResolve.outcome === 'resume' ? [REVIEW_LABELS.changes] : [])].map(name => ({ name })), mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
     }, requiredChecks);
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);

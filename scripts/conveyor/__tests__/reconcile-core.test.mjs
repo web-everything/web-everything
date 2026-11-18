@@ -102,6 +102,69 @@ const pr1563 = (over = {}) => ({
   ...over,
 });
 
+describe('same-head referral resume preserves a newer send-back', () => {
+  const head = 'b'.repeat(40);
+  const comment = (body, createdAt) => ({ author: AUTOMATION, body, createdAt });
+  const attempt = comment(buildFixEndComment({ who: 'fix-6945', headSha: head }), '2026-11-18T05:00:00Z');
+  const advisory = comment(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** accept\n\nNet basis: \`${'a'.repeat(40)}..${head}\``, '2026-11-18T05:10:00Z');
+  const sendBack = comment(`🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\nFix the missing export.\n\nNet basis: \`${'a'.repeat(40)}..${head}\``, '2026-11-18T05:22:00Z');
+  const run = (labels, comments, extra = {}) => planReconcile({ prs: [pr1563({ number: 6945, headRefOid: head,
+    labels: lbl('review:human', ...labels), comments,
+    referralHold: { kind: 'same-head', head, count: 1, attemptsSinceWake: 1, why: 'all findings ruled' },
+    referralHoldAutoResolve: { outcome: 'resume', head, why: 'all findings ruled' },
+    ...extra,
+  })], agents: [], now: Date.parse('2026-11-18T06:00:00Z') });
+
+  it.each([{ labels: ['status:sent-back-review'] }, { labels: ['status:sent-back-review', 'review:changes'] }])(
+    '#6945: orchestrator send-back after the last fixer attempt dispatches a fix ($labels)', ({ labels }) => {
+      const result = run(labels, [attempt, advisory, sendBack]);
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+      expect(result.refusals).toEqual([]);
+      expect(result.notes).not.toContainEqual(expect.objectContaining({ parkToHuman: true }));
+    });
+
+  it.each(['sent-back', 'operator-block'])('#6989: red-team %s after the last fixer attempt dispatches a fix', outcome => {
+    const block = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, '2026-11-18T05:43:00Z');
+    const result = run(['status:sent-back-red-team', 'red-team:blocked'], [attempt, advisory, block], { number: 6989 });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+    expect(result.refusals).toEqual([]);
+  });
+
+  it('without a send-back after the last fixer attempt still refuses already-reviewed-head', () => {
+    const result = run([], [sendBack, { ...attempt, createdAt: '2026-11-18T05:30:00Z' }, advisory]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it('a trusted send-back comment alone preserves the fixer obligation', () => {
+    expect(run([], [attempt, advisory, sendBack]).dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+  });
+
+  it('a later send-back label event preserves the fixer obligation', () => {
+    const result = run(['status:sent-back-review'], [attempt, advisory], {
+      labelEvents: [{ event: 'labeled', label: { name: 'status:sent-back-review' }, created_at: sendBack.createdAt }],
+    });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+  });
+
+  it.each([
+    { name: 'untrusted send-back', request: { ...sendBack, author: { login: 'outsider' } } },
+    { name: 'unreadable send-back time', request: { ...sendBack, createdAt: 'unknown' } },
+    { name: 'another head', request: { ...sendBack,
+      body: `🔁 review — changes requested\n\nRecorded by agent via ${REVIEW_PR_CHANNEL}.\n\nFix the missing export.\n\n---\n\nNet basis: \`${'a'.repeat(40)}..${'c'.repeat(40)}\` — 1 net changed file(s) vs current main\n\n${REVIEW_PR_FOOTER}` } },
+  ])('$name keeps the current-advisory refusal', ({ request }) => {
+    const result = run(['status:sent-back-review'], [attempt, advisory, request]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it('an unreadable fixer attempt time cannot prove a later send-back', () => {
+    const result = run([], [{ ...attempt, createdAt: 'unknown' }, advisory, sendBack]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+});
+
 describe('live send-back supersedes stale accepted phase and verdict', () => {
   const oldHead = 'a'.repeat(40), head = 'b'.repeat(40);
   const accepted = { author: AUTOMATION, createdAt: '2026-08-26T15:00:00Z', body: buildReviewedShaMarker(oldHead) };
