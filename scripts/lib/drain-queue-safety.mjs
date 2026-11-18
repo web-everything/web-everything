@@ -23,13 +23,13 @@ const MQ_INFRA_MAX_JOBS = 10;
 const MQ_SUMMARY_TAIL_BYTES = 64 * 1024;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 
-// Every gate row the merge-gate prints for one PR. A pending-freeze verdict is main-caused only when the log is
+// Every gate row the merge-gate prints for one PR. A freeze verdict is main-caused only when the log is
 // structurally complete: header, all of these rows once, the freeze row as the sole blocking row, final HOLD line.
 const MQ_GATE_ROWS = ['required-check-read', 'candidate-label', 'producer-certified', 'default-base', 'required-check-green',
   'codeql', 'mergeable', 'landable-state', 'non-empty-body', 'red-team', 'review-hold-labels', 'review-acceptance',
   'manifest-baseline', 'test-gaming', 'head-pin', 'freshness', 'red-main-freeze', 'duplicate-id-on-main', 'couple-whole',
   'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'];
-function pendingFreezeLogComplete(log, pr) {
+function freezeLogComplete(log, pr, blockingStatus) {
   const lines = log.split('\n').map(line => line.replace(/\r$/, ''));
   const headers = lines.flatMap((line, i) => new RegExp(`^\\S+\\s+#${Number(pr)}: HOLD\\s*$`).test(line) ? [i] : []);
   if (headers.length !== 1) return false;
@@ -43,7 +43,7 @@ function pendingFreezeLogComplete(log, pr) {
   }
   if (seen.size !== MQ_GATE_ROWS.length || MQ_GATE_ROWS.some(name => !seen.has(name))) return false;
   const blocking = [...seen].filter(([, status]) => status === 'hold' || status === 'fail-closed');
-  return blocking.length === 1 && blocking[0][0] === 'red-main-freeze' && blocking[0][1] === 'fail-closed';
+  return blocking.length === 1 && blocking[0][0] === 'red-main-freeze' && blocking[0][1] === blockingStatus;
 }
 const MQ_INFRA_SCAN_BYTES = 64 * 1024;
 const MQ_INFRA_LINE_CHARS = 512;
@@ -829,8 +829,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           freezeProven = holds.length === 1
             && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
-          if (freezePending && !pendingFreezeLogComplete(log, pr)) { freezeProven = freezePending = false; blocked = true; }
-          if (freezePending) {
+          if (freezeProven && !freezeLogComplete(log, pr, freezePending ? 'fail-closed' : 'hold')) { freezeProven = freezePending = false; blocked = true; }
+          if (freezeProven) {
             // Bind the log to the expected merge_group run: workflow "Merge gate", job merge-gate, the merge-group commit.
             budget--;
             const job = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}`], {
@@ -845,7 +845,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
                 encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
               return run?.id === job.run_id && run.path === '.github/workflows/merge-gate.yml' && run.event === 'merge_group' && mqOid(run.head_sha) === oid;
             })()) { freezeProven = freezePending = false; blocked = true; }
-            // The freeze row blames an unreadable MAIN CI verdict; an active (or unreadable) shared freeze always blocks.
+            // An active (or unreadable) shared freeze always blocks either freeze retry path.
             else {
               const shared = readFreeze?.();
               if (!shared || shared.error || shared.frozen !== false) { freezeProven = freezePending = false; blocked = true; }
@@ -856,7 +856,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
           }
         }
-      } catch { blocked = true; /* unreadable gate log: the hold stays */ }
+      } catch { freezeProven = freezePending = false; blocked = true; /* unreadable freeze evidence: the hold stays */ }
     }
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;

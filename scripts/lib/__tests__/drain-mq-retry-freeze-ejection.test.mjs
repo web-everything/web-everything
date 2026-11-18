@@ -19,9 +19,9 @@ const GATE_ROWS = ['required-check-read', 'candidate-label', 'producer-certified
   'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'];
 const TS = '2026-11-16T02:19:19.9Z';
 const PENDING_ROW = `${TS}   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending`;
-const fullLog = ({ pr: n = pr, rows = {}, drop = [], extra = [], header = true, final = true } = {}) => [
+const fullLog = ({ pr: n = pr, rows = {}, drop = [], extra = [], header = true, final = true, hold = false } = {}) => [
   header && `${TS} #${n}: HOLD`,
-  ...GATE_ROWS.filter(n => !drop.includes(n)).map(n => rows[n] ?? (n === 'red-main-freeze' ? PENDING_ROW : `${TS}   pass              ${n.padEnd(22)} ok`)),
+  ...GATE_ROWS.filter(n => !drop.includes(n)).map(n => rows[n] ?? (n === 'red-main-freeze' ? (hold ? FREEZE : PENDING_ROW) : `${TS}   pass              ${n.padEnd(22)} ok`)),
   ...extra, final && `${TS} merge-gate: HOLD — held: #${n}`].filter(Boolean).join('\n');
 const FREEZE = '2026-11-11T21:02:22Z   hold              red-main-freeze        main is RED (freeze: main CI red since ac12ebdb5)';
 let gateLog = FREEZE;
@@ -73,13 +73,13 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   afterEach(() => vi.useRealTimers());
 
   it('retries when the merge-gate failed with the red-main-freeze hold and every other failure is cancelled', () => {
-    const f = fixture([gate(), ...[1, 2, 3].map(i => shard(i))]);
+    const f = fixture([gate(fullLog({ hold: true })), ...[1, 2, 3].map(i => shard(i))]);
     expect(f.guard().hold).toBe(false);
     expect(f.retried()).toBe(true);
   });
 
   it('retries a freeze ejection with more than 10 cancelled shards (no log reads)', () => {
-    const f = fixture([gate(), ...Array.from({ length: 14 }, (_, i) => shard(i + 1))]);
+    const f = fixture([gate(fullLog({ hold: true })), ...Array.from({ length: 14 }, (_, i) => shard(i + 1))]);
     expect(f.guard().hold).toBe(false);
   });
 
@@ -89,8 +89,55 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   });
 
   it('retries a freeze ejection even when main looked green at removal', () => {
-    const f = fixture([gate(), ...[1, 2].map(i => shard(i))], greenAtRemoval);
+    const f = fixture([gate(fullLog({ hold: true })), ...[1, 2].map(i => shard(i))], greenAtRemoval);
     expect(f.guard().hold).toBe(false);
+  });
+
+  it('holds an ordinary lone freeze hold row with an incomplete gate log', () => {
+    const f = fixture([gate(FREEZE)]);
+    expect(f.guard().hold).toBe(true);
+    expect(f.retried()).toBe(false);
+  });
+
+  it.each([
+    { id: 51 }, { name: 'other-job' }, { workflow_name: 'CI' }, { head_sha: 'd'.repeat(40) },
+    { status: 'in_progress' }, { conclusion: 'success' }, { run_id: 2 },
+  ])('holds an ordinary freeze with mismatched job identity: %j', bad => {
+    jobMeta = { ...goodJob(), ...bad };
+    expect(fixture([gate(fullLog({ hold: true }))]).guard().hold).toBe(true);
+  });
+
+  it.each([
+    { id: 2 }, { path: '.github/workflows/ci.yml' }, { event: 'push' }, { head_sha: 'd'.repeat(40) },
+  ])('holds an ordinary freeze with mismatched run identity: %j', bad => {
+    runMeta = { ...goodRun(), ...bad };
+    expect(fixture([gate(fullLog({ hold: true }))]).guard().hold).toBe(true);
+  });
+
+  it('holds an ordinary freeze while the shared freeze is active', () => {
+    freezeState = { frozen: true, kind: 'manual', reason: 'operator' };
+    expect(fixture([gate(fullLog({ hold: true }))]).guard().hold).toBe(true);
+  });
+
+  it.each([{ error: 'branch unreadable' }, null, {}])('holds an ordinary freeze when shared freeze evidence is unreadable: %j', state => {
+    freezeState = state;
+    expect(fixture([gate(fullLog({ hold: true }))]).guard().hold).toBe(true);
+  });
+
+  it('holds an ordinary freeze when the shared freeze read throws', () => {
+    freezeState = { get frozen() { throw new Error('freeze unreadable'); } };
+    expect(fixture([gate(fullLog({ hold: true }))]).guard().hold).toBe(true);
+  });
+
+  it('holds an ordinary freeze when run metadata is unreadable', () => {
+    runMeta = null;
+    expect(fixture([gate(fullLog({ hold: true }))]).guard().hold).toBe(true);
+  });
+
+  it('retries an ordinary freeze with a complete log, matching identity and clear shared freeze (control)', () => {
+    const f = fixture([gate(fullLog({ hold: true }))], greenAtRemoval);
+    expect(f.guard().hold).toBe(false);
+    expect(f.retried()).toBe(true);
   });
 
   it('still holds a real failing shard next to the freeze hold', () => {
