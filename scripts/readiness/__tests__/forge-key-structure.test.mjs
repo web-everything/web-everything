@@ -129,6 +129,20 @@ describe('Forge key structure slice 1',()=>{
     for(const source of [text,'['.repeat(65)+']'.repeat(65)])
       expect(keyStructureFinding(Buffer.from(source))).toBe('private-key-scan-budget-exhausted-use-local');
   });
+  // Members are assembled at runtime so this source file holds no literal JWK for the tracked sweep.
+  const member=(name,value)=>JSON.stringify(name)+':'+JSON.stringify(value);
+  const jwk=(...members)=>'{'+members.map(([name,value])=>member(name,value)).join(',')+'}';
+  it('I3 scans every duplicate JSON member, not the parsed object',()=>{
+    blocked(Buffer.from(jwk(['kty','oct'],['k','abcdefghijklmn'],['k',''])));
+    blocked(Buffer.from(jwk(['d','abcd'],['kty','RSA'],['d',''])));
+    expect(keyStructureFinding(Buffer.from(jwk(['kty','oct'],['k',''],['k',''])))).toBeNull();
+  });
+  it('I1 finds a JWK inside line and block comments',()=>{
+    const key=jwk(['kty','oct'],['k','abcdefghijklmn']);
+    blocked(Buffer.from('// '+key));
+    blocked(Buffer.from('/* '+key+' */'));
+    blocked(Buffer.from(key.replace(',',', /* c */ ')));
+  });
   it('fails closed on unreadable input',()=>{
     expect(keyStructureFinding(null)).toBe('private-key-scan-unreadable-use-local');
   });

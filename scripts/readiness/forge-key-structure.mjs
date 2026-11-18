@@ -53,12 +53,30 @@ function derFinding(bytes,tick) {
   return false;
 }
 
+// Scan every top-level member occurrence (duplicates included); a parsed object keeps only the last one.
 function jwkFinding(bytes) {
-  let object;
-  try {object=JSON.parse(bytes.toString('utf8'));} catch {return false;}
-  if(!object||Array.isArray(object)||typeof object.kty!=='string')return false;
-  const present=name=>typeof object[name]==='string'&&object[name].length>0;
-  return (object.kty==='oct'&&present('k'))||['d','p','q','dp','dq','qi'].some(present);
+  const text=bytes.toString('utf8');
+  if(!text.trimStart().startsWith('{'))return false;
+  let depth=0,key=null,pending=null,kty=null,oct=false,priv=false;
+  const decoded=token=>{try {return JSON.parse(token);} catch {return '';}};
+  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]:,]/g)) {
+    const token=match[0];
+    if(token[0]==='/')continue;
+    if(token==='{'||token==='[')depth++;
+    else if(token==='}'||token===']')depth--;
+    else if(depth!==1)continue;
+    else if(token===':') {key=pending;pending=null;}
+    else if(token===',') {key=pending=null;}
+    else if(key===null)pending=decoded(token);
+    else {
+      const value=decoded(token);
+      if(key==='kty')kty=value;
+      else if(value.length>0&&key==='k')oct=true;
+      else if(value.length>0&&['d','p','q','dp','dq','qi'].includes(key))priv=true;
+      key=null;
+    }
+  }
+  return (kty==='oct'&&oct)||(typeof kty==='string'&&priv);
 }
 
 // All representations (including mixed base64 alphabets) converge here, before detection.
@@ -69,7 +87,8 @@ function canonicalize(bytes,emit,tick) {
   for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]\ufffd]/g)) {
     tick();
     const token=match[0];
-    if(token[0]==='"') {
+    if(token[0]==='/')emit(Buffer.from(token.replace(/^\/\/|^\/\*|\*\/$/g,'')));
+    else if(token[0]==='"') {
       if(token.includes('\\')) {
         try {emit(Buffer.from(JSON.parse(token)));} catch(error) {if(error===EXHAUSTED)throw error;}
       }
