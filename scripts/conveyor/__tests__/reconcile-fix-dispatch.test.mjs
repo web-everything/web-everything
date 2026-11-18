@@ -1,3 +1,4 @@
+import { planReconcile } from '../reconcile-core.mjs';
 import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
@@ -2515,6 +2516,29 @@ describe('Claude red-team repair round publication', () => {
     acquireClaim: () => ({ ok: true }), releaseClaim: vi.fn(), readFixClaim: () => null,
     ensureSessionCwd: p => p, grantConflictHelper: () => {}, isolateSession: () => ({}),
     resolveSettingsEnv: () => ({}), postNotice: () => {}, mintSessionId: () => 'sid' });
+
+  it.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])(
+    'carries configured cap 1 from reconcile through planning and refuses a second Claude charge (%s)', headRefName => {
+      const { comments } = thread();
+      const pr = { number: 7031, state: 'OPEN', headRefName, headRefOid: head, isDraft: false,
+        labels: ['review:accepted', 'red-team:blocked'], comments, commentsComplete: true,
+        mergeStateStatus: 'CLEAN', statusCheckRollup: [], files: ['scripts/example.mjs'] };
+      const rows = planReconcile({ prs: [pr], agents: [], roundCap: 1, now: Date.now() }).dispatch;
+      const { planned: fixes, refusals } = planFixesFromReconcile(rows, findItemStub, () => []);
+      expect(refusals).toEqual([]);
+      expect(fixes).toHaveLength(1);
+      expect(fixes[0].roundCap).toBe(1);
+      // Another writer consumes the budget after planning, before this launch's fresh-thread check.
+      const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+      expect(publishRedTeamFixDispatch({ repo: 'we', planned: fixes[0] }, { readComments: () => comments, exec })).toBe(true);
+      const spawnAgent = vi.fn();
+      const io = { ...options(), spawnAgent,
+        publishRedTeamRound: request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec }) };
+      expect(() => dispatchFix({ ...fixes[0], lane: 9, attempts: 1 }, io)).toThrow('cap exhausted');
+      expect(spawnAgent).not.toHaveBeenCalled();
+      expect(exec).toHaveBeenCalledOnce();
+      expect(countRedTeamFixComments(comments)).toBe(1);
+    });
 
   it('routes red-team repairs through fresh counted dispatch instead of either resume path', () => {
     expect(tryResumeFix(planned)).toEqual({ resumed: false, resumeAttempt: null });

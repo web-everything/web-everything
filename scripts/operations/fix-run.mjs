@@ -2,7 +2,7 @@
 import { sharedRoundAttempts } from '../conveyor/reconcile-core.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { redTeamSentBackFindings } from '../conveyor/dispatch-eligibility-facts.mjs';
-import { publishRedTeamFixLaunch, lockRedTeamFixCharge } from '../conveyor/red-team-fix-round-count.mjs';
+import { publishRedTeamFixLaunch, lockRedTeamFixCharge, hasRedTeamFixLaunch } from '../conveyor/red-team-fix-round-count.mjs';
 import { randomUUID } from 'node:crypto';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
@@ -758,9 +758,12 @@ export async function runFixCli(argv = [], {
         if (!charged) throw new LauncherError('launch already spent; a new dispatch is required');
       } finally { release(); }
     };
+    const comments = await readComments(pr, { repo: launch.repo });
+    if (hasRedTeamFixLaunch(comments, launch.launchId)) {
+      throw new LauncherError('launch already spent; a new dispatch is required');
+    }
     if (launch.repairKind === 'ci-heal') {
       if (hasRedTeamSentBackLabels(prHead)) {
-        const comments = await readComments(pr, { repo: launch.repo });
         redTeamRepair = redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
         if (redTeamRepair) await chargeRedTeamLaunch();
       }
@@ -768,7 +771,6 @@ export async function runFixCli(argv = [], {
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
       prContext = renderCiHealContext(inputs);
     } else {
-      const comments = await readComments(pr, { repo: launch.repo });
       redTeamRepair = hasRedTeamSentBackLabels(prHead)
         && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
       if (redTeamRepair) await chargeRedTeamLaunch();

@@ -538,6 +538,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
 /** Card xrbu1bp — the planner's spent-round count and the PR's base ref, carried onto a planned fix. */
 function roundFields(entry) {
   return {
+    ...(entry.roundCap !== undefined ? { roundCap: entry.roundCap } : {}),
     ...(Number.isFinite(Number(entry.attempts)) && entry.attempts != null ? { attempts: Number(entry.attempts) } : {}),
     ...(Number.isFinite(Number(entry.cap)) && entry.cap != null ? { cap: Number(entry.cap) } : {}),
     ...(entry.baseRefName ? { baseRefName: entry.baseRefName } : {}),

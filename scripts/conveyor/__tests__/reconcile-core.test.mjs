@@ -51,7 +51,7 @@ import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
-import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER, publishRedTeamFixLaunch, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
 import {
   ADVISORY_FIX_COMMENT_MARKER, buildAdvisoryFixComment, isLatestAdvisoryFindingAddressed, countCompletedAdvisoryEpisodes,
 } from '../advisory-fix-mark.mjs';
@@ -616,6 +616,26 @@ describe('case 3 — refusal 2: a PR with nothing to fix never gets a fixer (#32
     expect(plan.dispatch).toHaveLength(1);
     expect(plan.dispatch[0].kind).toBe('review');
     expect(plan.dispatch[0].prNumber).toBe(1576);
+  });
+
+  it.each(['receipt', 'hand-back', 'both'])('red-team %s bookkeeping alone refuses no-findings', kind => {
+    const head = 'a'.repeat(40);
+    const gate = { author: AUTOMATION, body: renderRedTeamComment({ pr: 1563, rev: head,
+      provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'Gate break', category: 'edge-case', impactIfUnfixed: 'broken',
+        file: 'scripts/example.mjs', line: 1, confirmedByRecheck: true }] }) };
+    const receipts = [];
+    const gateComments = [gate, { author: AUTOMATION,
+      body: redTeamGateMarker(1563, head, 'sent-back', liveResultGateState([gate], 1563, head).resultId) }];
+    publishRedTeamFixLaunch({ comments: gateComments, pr: 1563, head, attemptId: 'spent-launch', chargedRounds: 0,
+      publish: body => receipts.push({ author: AUTOMATION, body }) });
+    const handBack = { author: AUTOMATION, body: buildRedTeamRearmComment({ actor: 'fix agent',
+      decision: { rearmFrom: 'review:accepted', keepsHuman: false } }) };
+    const comments = kind === 'receipt' ? receipts : kind === 'hand-back' ? [handBack] : [...receipts, handBack];
+    expect(countFindings(comments)).toBe(0);
+    const plan = planReconcile({ prs: [pr1563({ comments })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings', findings: 0 }));
   });
 
   it('a BOUNCED PR with zero findings gets NOTHING — the sharper half of the same refusal', () => {

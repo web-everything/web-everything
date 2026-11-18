@@ -44,6 +44,11 @@ function receiptLaunchId(comment) {
   return /^Red-team repair dispatched: head=\S+ result=\S+ attempt=([\w-]{1,128})$/m.exec(comment.body)?.[1] ?? null;
 }
 
+/** Trusted receipts spend a launch independently of the current head, labels or repair kind. */
+export function hasRedTeamFixLaunch(comments, attemptId) {
+  return comments.some(c => receiptLaunchId(c) === String(attemptId));
+}
+
 /** Durable spent rounds, pairing dispatch receipts with their later hand-back, never charging both.
  * Marker-only historical receipts and orphan hand-backs retain their charge. Duplicate launch IDs
  * are one round even if the head/result changed. Failed launches need no hand-back to count.
@@ -75,7 +80,7 @@ export function publishRedTeamFixLaunch({ comments, pr, head, attemptId, publish
     throw new Error('red-team repair dispatch evidence unreadable; retry with a fresh reconciliation or ask an operator');
   }
   const body = `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${head} result=${result.resultId} attempt=${attemptId}`;
-  if (comments.some(c => receiptLaunchId(c) === String(attemptId))) return false;
+  if (hasRedTeamFixLaunch(comments, attemptId)) return false;
   if (!Number.isSafeInteger(chargedRounds) || chargedRounds < 0 || !Number.isSafeInteger(cap) || cap < 0) {
     throw new Error('red-team repair round bound unreadable; reconcile again or ask an operator');
   }

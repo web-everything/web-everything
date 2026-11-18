@@ -9,11 +9,11 @@ import { fileURLToPath } from 'node:url';
 import { createFixBorrowGate, recordRoutedOutcome, consecutiveUnproductiveOnHead, chooseFixExecutor } from '../../lib/fix-slot-borrow.mjs';
 import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { openOperatorSendBacks } from '../../lib/operator-send-backs.mjs';
-import { dispatchFix, writePrivateBorrowedPrompt, withPlannedContext } from '../../conveyor/reconcile-fix-dispatch.mjs';
+import { planFixesFromReconcile, dispatchFix, writePrivateBorrowedPrompt, withPlannedContext } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
 import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
-import { lockRedTeamFixCharge, RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../../conveyor/red-team-fix-round-count.mjs';
+import { publishRedTeamFixLaunch, lockRedTeamFixCharge, RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../../conveyor/red-team-fix-round-count.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
@@ -198,7 +198,70 @@ describe('runFixCli', () => {
     expect(m.spawn).not.toHaveBeenCalled();
     expect(m.calls.some(c => c.includes('acquire') || c.includes('push') || c.includes('comment'))).toBe(false);
   });
-  it.each(['red-team', 'advisory'])('real provider replays the same red-team plan four times with one charge and executor launch, and refuses at the live shared cap (%s)', async budget => {
+  it.each(['fix', 'ci-heal'])('refuses %s before execution when the spent-launch thread cannot be read', async repairKind => {
+    const m = mk(['a'.repeat(40)]);
+    const writeErr = vi.fn(), readCiHeal = vi.fn();
+    const result = await runFixCli([...argv, `--repair-kind=${repairKind}`, '--launch-id=possibly-spent'], {
+      ...m.io, writeErr, readCiHeal, readComments: async () => { throw Error('complete thread unavailable'); },
+    });
+    expect(result.code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('complete thread unavailable'));
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(readCiHeal).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('acquire') || c.includes('comment') || c.includes('push'))).toBe(false);
+  });
+
+  it('an untrusted copy of a production receipt cannot spend an ordinary launch ID', async () => {
+    const pr = acceptedRedTeamPr();
+    const receipts = [];
+    publishRedTeamFixLaunch({ comments: pr.comments, pr: 7, head: pr.headRefOid, attemptId: 'copied-launch',
+      chargedRounds: 0, publish: body => receipts.push({ author: { login: 'outsider' }, body }) });
+    pr.labels = [{ name: 'review:changes' }];
+    pr.comments = [...receipts, { body: '🔁 review — changes requested\nAn actual finding' }];
+    const m = mk([pr.headRefOid, pr.headRefOid]);
+    const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
+    expect((await runFixCli([...argv, '--launch-id=copied-launch'], {
+      ...m.io, run, readComments: async () => pr.comments,
+    })).code).toBe(0);
+    expect(m.spawn).toHaveBeenCalledOnce();
+  });
+
+  it('carries cap 1 from reconcile through borrowed dispatch and the real provider, refusing an exhausted live thread', async () => {
+    const pr = { ...acceptedRedTeamPr(), state: 'OPEN', headRefName: 'lane/7-x', isDraft: false,
+      mergeStateStatus: 'CLEAN', statusCheckRollup: [], files: ['scripts/example.mjs'] };
+    const rows = planReconcile({ prs: [pr], agents: [], now: Date.now(), roundCap: 1 }).dispatch;
+    const { planned, refusals } = planFixesFromReconcile(rows,
+      () => ({ num: '7', scope: ['we:scripts/example.mjs'] }), () => []);
+    expect(refusals).toEqual([]);
+    expect(planned).toHaveLength(1);
+    // Consume the only round after planning; the launcher must enforce the carried cap on a fresh read.
+    publishRedTeamFixLaunch({ comments: pr.comments, pr: 7, head: pr.headRefOid, attemptId: 'other-launch',
+      chargedRounds: 0, cap: 1, publish: body => pr.comments.push({ author: { login: 'web-everything' }, body }) });
+    const m = mk([pr.headRefOid, pr.headRefOid]);
+    const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
+    const writeErr = vi.fn();
+    let launched;
+    dispatchFix({ ...planned[0], lane: 2 }, {
+      root: '/repo', repo: 'we', borrowed: { executor: 'codex', reason: 'borrowed-build-slot' },
+      readFixClaim: () => null, acquireClaim: () => ({ ok: true }), releaseClaim: () => {},
+      postNotice: () => {}, readBrief: () => 'brief {{PR_NUM}} {{LANE_REF}}',
+      writeBorrowedPrompt: () => '/brief.md', checkoutExists: () => true, readPackageJson: () => ({ scripts: {} }),
+      spawnBorrowed: request => fixDetachedProvider(request, {
+        readDeliveryAgentMarker: () => null, logPathFor: () => '/logs/fix-7',
+        spawnDetached: args => {
+          launched = runFixCli(args.slice(1), { ...m.io, run, writeErr, readComments: async () => pr.comments });
+          return { pid: 99 };
+        },
+      }),
+    });
+    expect((await launched).code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('cap exhausted'));
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('acquire') || c.includes('comment') || c.includes('push'))).toBe(false);
+    expect(countRedTeamFixComments(pr.comments)).toBe(1);
+  });
+
+  it.each(['red-team', 'advisory'])('real provider refuses deterministic launch replay after review:changes with one charge and executor launch, and enforces the live cap (%s)', async budget => {
     const pr = acceptedRedTeamPr();
     const head = pr.headRefOid;
     const m = mk([head, head]);
@@ -223,11 +286,16 @@ describe('runFixCli', () => {
     for (let replay = 0; replay < 4; replay++) {
       fixDetachedProvider({ ...request }, providerIo);
       expect((await runs.at(-1)).code).toBe(1);
+      if (replay === 0) {
+        pr.labels = [{ name: 'review:changes' }];
+        pr.comments.push({ body: '🔁 review — changes requested\nAnother ordinary finding' });
+      }
     }
     expect(new Set(ids).size).toBe(1);
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
     expect(m.spawn).toHaveBeenCalledTimes(1);
     expect(m.calls.filter(c => c.includes('comment'))).toHaveLength(1);
+    pr.labels = acceptedRedTeamPr().labels;
     // Fill the shared budget with legacy rounds, then submit a different unspent planned ID.
     pr.comments.push(...Array.from({ length: 2 }, () => ({ author: { login: 'web-everything' }, body: budget === 'advisory' ? ADVISORY_NOTE_MARKER : RED_TEAM_FIX_COMMENT_MARKER })));
     const writeErr = vi.fn();
@@ -313,7 +381,7 @@ describe('runFixCli', () => {
     expect(m.calls.some(c => c.includes('push') || c.includes('comment'))).toBe(false);
     expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('retry with a fresh reconciliation or ask an operator'));
   });
-  it.each(['failed', 'no-change', 'executor fallback'])('charges a %s repair once, refuses replay, and runs a fresh launch', async kind => {
+  it.each(['failed', 'no-change', 'executor fallback'])('charges a %s repair once, refuses explicit launch replay after review:changes in both modes, and runs a fresh launch', async kind => {
     const head = 'a'.repeat(40);
     const m = mk([head, head, head]); // Initial head plus unchanged heads for both executed launches.
     const pr = acceptedRedTeamPr();
@@ -339,6 +407,9 @@ describe('runFixCli', () => {
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
     expect(m.calls.some(c => c.includes('push'))).toBe(false);
     if (kind === 'executor fallback') expect(spawnCodex).toHaveBeenCalledTimes(2);
+    // Labels and repair kind can change; the trusted receipt still spends this explicit launch ID.
+    pr.labels = [{ name: 'review:changes' }];
+    pr.comments.push({ body: '🔁 review — changes requested\nAnother ordinary finding' });
     // A failed or no-change launch is spent: replay must refuse before any execution.
     m.spawn.mockImplementation(async () => {});
     m.spawn.mockClear();
@@ -355,6 +426,7 @@ describe('runFixCli', () => {
     expect(m.spawn).not.toHaveBeenCalled();
     expect(spawnCodex).not.toHaveBeenCalled();
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
+    pr.labels = acceptedRedTeamPr().labels;
     // A new dispatch on the same head and gate result still consumes a new round.
     expect((await runFixCli([...argv, '--launch-id=new-launch'], io)).code).toBe(0);
     expect(m.spawn).toHaveBeenCalledTimes(1);
@@ -893,7 +965,7 @@ describe('runFixCli', () => {
     const readCiHeal = vi.fn(() => ({ title: 'CI red', body: 'B', checks: [{ name: 'unit', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/42' }],
       jobs: [{ name: 'unit', log: '2026-10-13T13:19:27.2719622Z FAIL  scripts/conveyor/soak/__tests__/shard-files.test.mjs > coverage\nAssertionError: expected 0.796875 to be greater than 0.8' }] }));
     expect((await runFixCli([...argv, '--repair-kind=ci-heal'], { ...m.io, readComments, readCiHeal, appendLoopRow })).code).toBe(0);
-    expect(readComments).not.toHaveBeenCalled();
+    expect(readComments).toHaveBeenCalledOnce(); // All modes check trusted spent-launch receipts.
     const prompt = m.spawn.mock.calls[0][0].prompt;
     for (const text of ['## CI FAILURE CONTEXT (fetched by the launcher)', 'scripts/conveyor/soak/__tests__/shard-files.test.mjs', 'AssertionError: expected 0.796875 to be greater than 0.8']) expect(prompt).toContain(text);
     expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', head: 'aaa', outcome: 'no-change', infra: false }));

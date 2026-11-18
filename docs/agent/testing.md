@@ -4603,3 +4603,10 @@ Both receipt writers serialize fresh complete-thread reads, shared-round countin
 under the same per-repository/PR charge lock in the shared coordination root. A busy or unreadable
 lock refuses admission; after a crashed writer an operator must inspect the full thread and remove
 the abandoned lock before retrying. Never reclaim a charge lock merely because time elapsed.
+
+The reconcile-to-fix planning projection must preserve `roundCap` on both item-backed and
+PR-diff rows. Cap-1 tests exercise both receipt writers after a competing writer consumes
+the live budget. Spent-launch checks read trusted receipts before selecting repair mode,
+even after labels change to `review:changes`; CI-heal therefore also reads the thread.
+Receipt and hand-back producers are tested as bookkeeping-only threads through the
+planner's existing `no-findings` refusal.

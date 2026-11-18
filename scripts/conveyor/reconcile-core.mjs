@@ -134,7 +134,7 @@ import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operatio
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
-import { countRedTeamFixComments } from './red-team-fix-round-count.mjs';
+import { countRedTeamFixComments, RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
@@ -396,6 +396,7 @@ export const BOOKKEEPING_MARKERS = Object.freeze([
   // #xkmu3gv — the two new completed-round markers. Neither is a reviewer speaking, so neither may ever count as
   // a finding (`countFindings`) or the pass would read its OWN handback comment as fresh work to fix.
   CONFLICT_FIX_COMMENT_MARKER, ADVISORY_FIX_COMMENT_MARKER,
+  RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER,
   // we:backlog/heal-wait-for-rerun — a ci-heal escalation is this loop's OWN bookkeeping too: a PR whose head
   // has since moved past a ci-red phase but still carries an old escalation comment in its history must not
   // have that comment misread as a fresh reviewer finding.
