@@ -209,6 +209,8 @@ console.log(result);`;
   it.each([
     ['101', true],
     ['202', false],
+    // A legacy parent publishes no label; its only pool was the shared one, so 202 still needs its own slot.
+    [undefined, true],
   ])('a nested call whose outer was admitted to pool %s is throttled: %s (inner resolves installation 202, which is full)', (outerBucket, throttled) => {
     delivery.readDeliveryIdentity.mockReturnValue({ roles: {
       reviewer: { appId: '1', installations: { example: '202' } },
@@ -219,7 +221,7 @@ console.log(result);`;
     const execute = vi.fn(ok);
     const extra = { cap: 20, caller: 'custom-read', shimRouted: true,
       resolveSlotBucket: input => resolveGhSlotBucket({ ...input, readFresh: path => ({ installationId: path.includes('.202.') ? '202' : '101' }) }) };
-    const env = { GH_CALLER: 'review-pr.mjs', WE_GH_THROTTLE_OUTER_INV: 'outer-inv', WE_GH_THROTTLE_OUTER_BUCKET: outerBucket };
+    const env = { GH_CALLER: 'review-pr.mjs', WE_GH_THROTTLE_OUTER_INV: 'outer-inv', ...(outerBucket === undefined ? {} : { WE_GH_THROTTLE_OUTER_BUCKET: outerBucket }) };
     const result = invoke('cli', env, execute, extra);
     if (throttled) { expect(result).toMatchObject({ status: 1, throttled: true }); expect(execute).not.toHaveBeenCalled(); }
     else expect(execute).toHaveBeenCalled();
@@ -255,6 +257,27 @@ console.log(result);`;
     const full = spawnSync(process.execPath, [shim, ...args], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
     expect(full.status).not.toBe(0);
     expect(readGhSlotHolders({ lockRoot: root, cap: 1, includeInstallations: false })).toHaveLength(1);
+  });
+  it('forwards the owner-map installation for a legacy cache without an installation id (same pool as the resolver)', () => {
+    expect(acquire(null, 'shared-holder').ok).toBe(true);
+    const cachePath = defaultCachePath();
+    writeFileSync(cachePath, JSON.stringify({ v: 2, token: 'ghs_fixture_legacy', expiresAt: new Date(Date.now() + 3600000).toISOString() }));
+    const executable = join(root, 'fixture-executable');
+    writeFileSync(executable, `#!${process.execPath}\nconsole.log('executed');\n`);
+    chmodSync(executable, 0o755);
+    const shim = join(root, 'shim.cjs');
+    const priorControl = process.env.WE_CONTROL_CLONE;
+    process.env.WE_CONTROL_CLONE = fileURLToPath(new NodeURL('../../..', import.meta.url));
+    try {
+      writeFileSync(shim, renderGhShimScript({ realGhPath: executable, cachePath, roleTable: {}, callerRoles: {} }));
+    } finally { if (priorControl === undefined) delete process.env.WE_CONTROL_CLONE; else process.env.WE_CONTROL_CLONE = priorControl; }
+    const env = { PATH: process.env.PATH, HOME: root, ...baseEnv(),
+      WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}', WE_GH_THROTTLE_LOCK_ROOT: root,
+      WE_GH_THROTTLE_CAP: '20', WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1', WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS: '0' };
+    expect(resolveGhSlotBucket({ identity: 'default', args, env }).bucket).toBe('101');
+    const actual = execFileSync(process.execPath, [shim, ...args], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+    expect(actual.trim()).toBe('executed');
+    expect(rows('calls.jsonl').find(r => r.outcome === 'call')).toMatchObject({ id: 'app-installation-101' });
   });
   it('fails closed on absent caches and unknown owners', () => {
     expect(resolveGhSlotBucket({ identity: 'default', args, readFresh: () => null }).bucket).toBeNull();

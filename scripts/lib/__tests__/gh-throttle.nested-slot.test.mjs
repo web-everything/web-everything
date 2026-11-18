@@ -56,6 +56,21 @@ describe('nested gh call (shim under a runGhSync that already holds a slot)', ()
     expect(logLines(lockRoot).some((e) => e.outcome === 'slot_timeout')).toBe(false);
     expect(logLines(lockRoot).find((e) => e.outcome === 'call')?.outer).toBe('outer-inv-1');
   });
+  // A parent on pre-PR code publishes the outer id but no bucket label; its one pool IS the shared pool directory.
+  it('a legacy parent (outer id, no bucket label) still rides its shared slot on a FULL pool', () => {
+    const lockRoot = tmp();
+    fillPool(lockRoot, 2);
+    const sleep = vi.fn();
+    const spawn = vi.fn(ok);
+    const r = runGhCliPassthrough(['pr', 'list'], {
+      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-legacy' }, now: tickingClock(), sleep, acquireTimeoutMs: 120_000, warn: vi.fn() },
+      spawn,
+    });
+    expect(r.status).toBe(0);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(logLines(lockRoot).some((e) => e.outcome === 'slot_timeout')).toBe(false);
+  });
 });
 
 describe('un-nested gh call on a full pool', () => {
