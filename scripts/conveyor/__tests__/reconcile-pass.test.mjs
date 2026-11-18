@@ -625,7 +625,8 @@ it('runReconcilePass threads enrichBaseRef\'s output through to planReconcile (#
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
     enrichBaseRef,
   });
-  expect(enrichBaseRef).toHaveBeenCalledWith([{ ...stackedPr, rosterSource: 'live' }], { defaultBranch: 'main' });
+  expect(enrichBaseRef).toHaveBeenCalledWith([{ ...stackedPr, rosterSource: 'live', rowsComplete: false,
+    rollupIncomplete: true }], { defaultBranch: 'main' });
 });
 
 // #4263 (PR #2787 review, live incident 2026-09-27) — a `waiting-on-system-fix` ci-heal escalation refuses
@@ -703,7 +704,8 @@ it('runReconcilePass threads enrichSystemFix\'s output through to planReconcile 
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
     enrichBaseRef: (prs) => prs, enrichSystemFix,
   });
-  expect(enrichSystemFix).toHaveBeenCalledWith([{ ...escalatedPr, rosterSource: 'live' }], { repo: null });
+  expect(enrichSystemFix).toHaveBeenCalledWith([{ ...escalatedPr, rosterSource: 'live', rowsComplete: false,
+    rollupIncomplete: true }], { repo: null });
 });
 
 it('defaultFetchRef fetches refs/pull/<n>/head behind --end-of-options into an explicit destination — never the branch name (PR #2769 security review)', async () => {
@@ -1373,8 +1375,9 @@ it.each(['check-runs', 'statuses'])('a failed second %s page leaves production e
   });
   const rows = defaultReadChecks({ repo: 'web-everything/web-everything', sha: XX_HEAD }, { exec });
   expect(rows).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: false, readError: 'HTTP 502 page two' });
-  const plan = runReconcilePass({ ...xxOptions(), readChecks: () => rows });
-  expect(plan.enrichedPrs[0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
+  const enrichMainRed = vi.fn(prs => ({ prs, mainRedWindows: [] }));
+  const plan = runReconcilePass({ ...xxOptions(), readChecks: () => rows, enrichMainRed });
+  expect(enrichMainRed.mock.calls[0][0][0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
   expect(plan.dispatch).toEqual([]);
   expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed',
     why: expect.stringContaining('HTTP 502 page two') }));
@@ -1387,9 +1390,12 @@ it('production pagination overflow fails closed and tells the operator to invest
   expect(exec).toHaveBeenCalledTimes(128);
   expect(rows).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: false,
     readError: expect.stringContaining('operator must investigate oversized evidence') });
-  const plan = runReconcilePass({ ...xxOptions(), readChecks: () => rows });
-  expect(plan.enrichedPrs[0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
+  const enrichMainRed = vi.fn(prs => ({ prs, mainRedWindows: [] }));
+  const plan = runReconcilePass({ ...xxOptions(), readChecks: () => rows, enrichMainRed });
+  expect(enrichMainRed.mock.calls[0][0][0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
   expect(plan.dispatch).toEqual([]);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed',
+    why: expect.stringContaining('operator must investigate oversized evidence') }));
 });
 
 it.each(['check-runs', 'statuses', 'job'])('production reader refuses a foreign head in %s', async feed => {
@@ -2283,14 +2289,18 @@ it.each(['live', 'cache', 'declared', 'fallback', undefined])(
   });
 
 it.each([
-  ['foreign read head', { rowsHead: 'b'.repeat(40), rowsComplete: true }, 'foreign-head'],
+  ['foreign read head', { rowsHead: 'b'.repeat(40), rowsComplete: true }, 'foreign-head,rows-incomplete'],
   ['missing completeness', { rowsHead: XX_HEAD, rowsComplete: undefined }, 'rows-incomplete'],
 ])('never infers review evidence from a green snapshot with %s', async (_, evidence, reason) => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const pr = { ...xxPr(), ...evidence, isDraft: false, labels: [{ name: 'review:pending' }],
     statusCheckRollup: xxRuns().map(row => ({ ...row, conclusion: 'success' })) };
+  // Hydration invalidates completeness for a foreign head; the gate reports both refusal reasons.
+  const enrichMainRed = vi.fn(prs => ({ prs, mainRedWindows: [] }));
   const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [pr],
-    env: { WE_REVIEW_START_AFTER: 'ci-green' } });
+    enrichMainRed, env: { WE_REVIEW_START_AFTER: 'ci-green' } });
+  expect(enrichMainRed.mock.calls[0][0][0]).toMatchObject({ rowsHead: evidence.rowsHead,
+    rowsComplete: false, rollupIncomplete: true });
   expect(plan.dispatch).toEqual([]);
   expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
     ci: expect.objectContaining({ reason }) }));
