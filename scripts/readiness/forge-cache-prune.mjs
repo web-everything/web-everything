@@ -261,9 +261,15 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
             && Object.getPrototypeOf(record.siblingShas) === Object.prototype
             && Object.keys(record.siblingShas).length > 0
             && Object.values(record.siblingShas).every(sha => typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha)));
-        const siblings = invalidSiblingShas ? undefined : manifestKnown ? !!record.manifest.siblings
-          : typeof record.siblings === 'boolean' ? record.siblings
-            : suffix === 'receipt' ? record.siblingShas !== undefined : undefined;
+        // Explicit signals must agree before any digest can narrow lock protection.
+        // An omitted receipt siblingShas is only the fallback, not a contrary signal.
+        const siblingSignals = [];
+        if (manifestKnown) siblingSignals.push(!!record.manifest.siblings);
+        if (typeof record.siblings === 'boolean') siblingSignals.push(record.siblings);
+        if (suffix === 'receipt' && record.siblingShas !== undefined && !invalidSiblingShas) siblingSignals.push(true);
+        const conflictingSiblings = siblingSignals.some(signal => signal !== siblingSignals[0]);
+        const siblings = invalidSiblingShas || conflictingSiblings ? undefined
+          : siblingSignals.length ? siblingSignals[0] : suffix === 'receipt' ? false : undefined;
         const digest = siblings === undefined ? undefined : (siblings ? record.manifestDigest : record.inputDigest);
         const profileKnown = typeof digest === 'string' && HEX.test(digest);
         // Keep refusing corrupt digests, even though the known lock is protected.

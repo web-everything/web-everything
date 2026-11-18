@@ -672,6 +672,43 @@ describe('live reservation compatibility', () => {
 });
 
 describe('readLiveEvidence', () => {
+  const siblingSelectionCases = [
+    {scenario: 'receipt siblings:false conflicts with valid siblingShas',
+      evidence: {siblings: false, siblingShas: {frontierui: 'd'.repeat(40)}}, conflict: true},
+    {scenario: 'manifest.siblings:true conflicts with record.siblings:false',
+      evidence: {manifest: {siblings: true}, siblings: false}, conflict: true},
+    {scenario: 'manifest without siblings conflicts with record.siblings:true',
+      evidence: {manifest: {}, siblings: true}, conflict: true},
+    {scenario: 'manifest without siblings conflicts with valid siblingShas',
+      evidence: {manifest: {}, siblingShas: {frontierui: 'd'.repeat(40)}}, conflict: true},
+    {scenario: 'agreeing false manifest and record signals select inputDigest',
+      evidence: {manifest: {}, siblings: false}, digest: 'b'},
+    {scenario: 'agreeing true manifest and record signals select manifestDigest',
+      evidence: {manifest: {siblings: true}, siblings: true}, digest: 'c'},
+    {scenario: 'agreeing true record and siblingShas signals select manifestDigest',
+      evidence: {siblings: true, siblingShas: {frontierui: 'd'.repeat(40)}}, digest: 'c'},
+    {scenario: 'all three agreeing true signals select manifestDigest',
+      evidence: {manifest: {siblings: true}, siblings: true, siblingShas: {frontierui: 'd'.repeat(40)}}, digest: 'c'},
+  ];
+  it.each(siblingSelectionCases.flatMap(testCase => [false, true].map(leaked => ({...testCase, leaked}))))
+  ('$scenario (leaked=$leaked)', async ({evidence, conflict = false, digest, leaked}) => {
+    const run = await reserve();
+    const receiptPath = join(receipts, `${run}.receipt`);
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), ...evidence});
+    await fs.utimes(join(receipts, 'worker-active', 'reservation.json'),
+      (now - (leaked ? 3 * HOUR : 1000)) / 1000, (now - (leaked ? 3 * HOUR : 1000)) / 1000);
+    await fs.utimes(receiptPath, (now - 500) / 1000, (now - 500) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(conflict ? [lock] : []));
+    expect(live.profiles).toEqual(new Set(conflict || leaked ? [] : [`${lock}/dev-v5-${hex(digest)}`]));
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    const keep = conflict ? profiles : leaked ? [] : profiles.filter(e => e.name === `dev-v5-${hex(digest)}`);
+    expectDecision(plan(profiles, {live}), profiles.filter(e => !keep.includes(e)), keep);
+  });
+
   it.each([
     {scenario: 'null siblingShas', siblingShas: null},
     {scenario: 'string siblingShas', siblingShas: 'd'.repeat(40)},
