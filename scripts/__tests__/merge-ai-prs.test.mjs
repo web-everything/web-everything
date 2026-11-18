@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +18,125 @@ import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
+
+describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
+  const clean = { decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND', mergeable: 'MERGEABLE', hasManifest: false,
+    certifyLabel: true, aiGenerated: false, testGreen: true };
+
+  it('is true for behind + clean + certified + green, including AI certification', () => {
+    expect(isBehindButClean(clean)).toBe(true);
+    expect(isBehindButClean({ ...clean, certifyLabel: false, aiGenerated: true })).toBe(true);
+  });
+
+  it.each([
+    ['CONFLICTING', { mergeable: 'CONFLICTING' }],
+    ['DIRTY', { state: 'DIRTY' }],
+    ['hasManifest', { hasManifest: true }],
+    ['uncertified', { certifyLabel: false, aiGenerated: false }],
+    ['not testGreen', { testGreen: false }],
+    ['already merge', { decision: 'merge' }],
+    ['off default base', { offDefaultBase: true }],
+    ['unknown mergeability', { mergeable: 'UNKNOWN' }],
+    ['unknown state', { state: 'UNKNOWN' }],
+    ['invalid manifest evidence', { hasManifest: null }],
+    ['another blocker reason', { reason: unlandableStateReason('BEHIND') + '; reviewDecision=CHANGES_REQUESTED' }],
+    ['codeql blocked', { codeqlBlocked: true }],
+    ['review held', { reviewHeld: true }],
+    ['required check read error', { requiredCheckReadError: true }],
+    ['invalid green evidence', { testGreen: 'true' }],
+    ['invalid certification evidence', { certifyLabel: 'true' }],
+  ])('is false for %s', (_name, patch) => {
+    expect(isBehindButClean({ ...clean, ...patch })).toBe(false);
+  });
+
+  it.each(['decision', 'state', 'mergeable', 'hasManifest', 'certifyLabel', 'testGreen'])('fails closed with missing %s', key => {
+    const incomplete = { ...clean };
+    delete incomplete[key];
+    expect(isBehindButClean(incomplete)).toBe(false);
+  });
+
+  it('fails closed with missing verdict fields', () => {
+    for (const v of [undefined, null, {}]) expect(isBehindButClean(v)).toBe(false);
+  });
+});
+
+describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
+  const clean = { repo: 'fixture/repo', decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND',
+    mergeable: 'MERGEABLE', hasManifest: false, certifyLabel: true, testGreen: true, headSha: 'reviewed-head' };
+  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, reclassified = true, patch = {} } = {}) => {
+    const verdict = { ...clean, ...patch };
+    const before = { ...verdict };
+    const rebaseDropManifest = vi.fn(() => ({ action: 'skip', reason: 'fixture rebase probe' }));
+    const mergeStrategy = { queueOwnsFreshness: vi.fn(() => ownsFreshness) };
+    const operation = routeRebaseBeforeEnqueue(verdict, {
+      setting, mergeStrategy, manifestFree: () => manifestFree, reclassifiesMerge: () => reclassified, rebase: rebaseDropManifest,
+    });
+    const args = { laneRef: 'lane/fixture', base: 'origin/main' };
+    const result = operation?.(args);
+    return { verdict, before, operation, rebaseDropManifest, mergeStrategy, args, result };
+  };
+
+  it('conflict-only retains a clean BEHIND verdict for the queue without calling rebaseDropManifest', () => {
+    const { verdict, operation, rebaseDropManifest, mergeStrategy } = route();
+    expect(verdict).toEqual({ ...clean, decision: 'merge', rebaseDrop: 'skipped-behind-clean',
+      reason: 'behind main but clean; merge queue tests PR + main - enqueued on its existing head' });
+    expect(operation).toBe(null);
+    expect(rebaseDropManifest).not.toHaveBeenCalled();
+    expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledOnce();
+    expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledWith(clean.repo);
+  });
+
+  it.each([
+    ['always still calls rebaseDropManifest for a queue-owned clean BEHIND PR', { setting: 'always' }],
+    ['direct-merge repo still calls rebaseDropManifest under conflict-only', { ownsFreshness: false }],
+    ['unknown freshness ownership still calls rebaseDropManifest', { ownsFreshness: null }],
+    ['CONFLICTING still calls rebaseDropManifest', { patch: { mergeable: 'CONFLICTING' } }],
+    ['DIRTY still calls rebaseDropManifest', { patch: { state: 'DIRTY' } }],
+    ['manifest PR still calls rebaseDropManifest', { patch: { hasManifest: true } }],
+    ['unproven manifest-free head still calls rebaseDropManifest', { manifestFree: false }],
+    ['a guard that classifyPr still fails (body/review hold) still calls rebaseDropManifest', { reclassified: false }],
+    ['missing manifest evidence still calls rebaseDropManifest', { patch: { hasManifest: undefined } }],
+  ])('%s', (_name, options) => {
+    const { verdict, before, operation, rebaseDropManifest, args, result } = route(options);
+    expect(verdict).toEqual(before);
+    expect(verdict.decision).toBe('skip');
+    expect(operation).toBe(rebaseDropManifest);
+    expect(rebaseDropManifest).toHaveBeenCalledOnce();
+    expect(rebaseDropManifest).toHaveBeenCalledWith(args);
+    expect(result).toEqual({ action: 'skip', reason: 'fixture rebase probe' });
+  });
+});
+
+describe('resolveRebaseBeforeEnqueue — setting and provenance', () => {
+  it('defaults to conflict-only from the standard', () => {
+    expect(resolveRebaseBeforeEnqueue({})).toEqual({ value: 'conflict-only', source: 'standard' });
+  });
+
+  it.each(['conflict-only', 'always'])('environment override selects %s over settings', value => {
+    expect(resolveRebaseBeforeEnqueue({ WE_DRAIN_REBASE_BEFORE_ENQUEUE: value }, {
+      platform: { rebaseBeforeEnqueue: 'always' }, tool: { rebaseBeforeEnqueue: 'always' },
+    })).toEqual({ value, source: 'env' });
+  });
+
+  it('resolves platform then tool settings before environment', () => {
+    const platform = { rebaseBeforeEnqueue: 'always' };
+    expect(resolveRebaseBeforeEnqueue({}, { platform })).toEqual({ value: 'always', source: 'platform' });
+    expect(resolveRebaseBeforeEnqueue({}, { platform, tool: { rebaseBeforeEnqueue: 'conflict-only' } }))
+      .toEqual({ value: 'conflict-only', source: 'tool' });
+  });
+
+  it.each(['invalid', '', null, false, 1, 'always\n', 'x'.repeat(10000)])('invalid environment value %# fails closed to always with visible provenance', value => {
+    expect(resolveRebaseBeforeEnqueue({ WE_DRAIN_REBASE_BEFORE_ENQUEUE: value }))
+      .toEqual({ value: 'always', source: 'env (invalid; fail closed to always)' });
+  });
+
+  it.each(['platform', 'tool'])('invalid %s setting, including object values, fails closed to always', source => {
+    for (const value of ['invalid', null, {}, { nested: 'conflict-only' }, ['conflict-only']]) {
+      expect(resolveRebaseBeforeEnqueue({}, { [source]: { rebaseBeforeEnqueue: value } }))
+        .toEqual({ value: 'always', source: `${source} (invalid; fail closed to always)` });
+    }
+  });
+});
 
 describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
   const reason = 'branch is BEHIND main — rebase needed';
@@ -328,4 +447,33 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
   const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
+});
+
+describe('headTreeLacksManifestFile — authoritative manifest-path probe', () => {
+  const sha = 'a'.repeat(40);
+  const mk = (lsTree, show, root = '') => (args) => {
+    if (args[0] === 'cat-file') return '';
+    if (args[0] === 'ls-tree' && args.includes('--name-only')) return root;
+    if (args[0] === 'ls-tree') { if (lsTree instanceof Error) throw lsTree; return lsTree; }
+    if (args[0] === 'show') { if (show instanceof Error) throw show; return show; }
+    return '';
+  };
+  const call = (git) => headTreeLacksManifestFile({ headRef: 'lane/x', headSha: sha, prNumber: 1, git });
+  it('true only when the head tree lists no manifest path', () => { expect(call(mk('', ''))).toBe(true); });
+  it('false when a root fix-evidence scratch file exists (rebaseDropManifest would strip it)', () => {
+    expect(call(mk('', '', 'package.json\n.fix-abc-evidence.md'))).toBe(false);
+  });
+  it('true when the root holds only ordinary files', () => { expect(call(mk('', '', 'package.json\nREADME.md'))).toBe(true); });
+  it('false for a malformed manifest file (parses to null but the path exists)', () => {
+    expect(call(mk('100644 blob abc\t.lane-manifest.json', '{not json'))).toBe(false);
+  });
+  it('false for a manifest without item', () => {
+    expect(call(mk('100644 blob abc\t.lane-manifest.json', '{}'))).toBe(false);
+  });
+  it('false (fail closed) when git cannot read the head', () => {
+    expect(call(mk(new Error('boom'), ''))).toBe(false);
+  });
+  it('false without a full head sha', () => {
+    expect(headTreeLacksManifestFile({ headRef: 'lane/x', headSha: 'abc', prNumber: 1, git: mk('', '') })).toBe(false);
+  });
 });

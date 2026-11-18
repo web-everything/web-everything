@@ -6,6 +6,7 @@ import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, crea
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
+import { isDrainTransientPath } from './lib/transient-paths.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, refreshApprovedHeadChecked, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -1385,6 +1386,56 @@ export function isRebaseDropCandidate(v) {
   const state = String(v.state || '').toUpperCase();
   const mergeable = String(v.mergeable || '').toUpperCase();
   return mergeable === 'CONFLICTING' || state === 'BEHIND' || state === 'DIRTY';
+}
+
+/** Pure: only complete, clean evidence permits retaining a BEHIND head for the merge queue. */
+export function isBehindButClean(v) {
+  // BEHIND must be the SOLE blocker: the verdict reason is exactly the plain BEHIND reason (no queueBlocker suffix,
+  // no CodeQL / read-error / review-hold / fix-claim reason, which replace it) and no blocker flag is set.
+  return isRebaseDropCandidate(v) && v.state === 'BEHIND' && v.mergeable === 'MERGEABLE'
+    && v.reason === unlandableStateReason('BEHIND')
+    && !v.codeqlBlocked && !v.reviewHeld && !v.requiredCheckReadError && !v.prestagePendingCi && !v.offDefaultBase
+    && v.hasManifest === false && v.testGreen === true && (v.certifyLabel === true || v.aiGenerated === true);
+}
+
+/**
+ * Authoritative head-tree probe: true ONLY when git proves the head tree has no `.lane-manifest.json` path at all.
+ * `v.hasManifest === false` is not enough (malformed/item-less manifests parse to null), so any read problem or any
+ * listed path fails closed (false => the existing rebase/strip path runs). `git` is injected (args => stdout).
+ */
+export function headTreeLacksManifestFile({ headRef, headSha, prNumber, git }) {
+  try {
+    const read = readLegacyLocalManifestAt({ headRef, headSha, prNumber, git });
+    if (read.unreadable || !read.definitive || read.manifest != null) return false;
+    if (String(git(['ls-tree', '--end-of-options', headSha, '--', '.lane-manifest.json']) ?? '').trim() !== '') return false;
+    // rebaseDropManifest also strips root fix-evidence scratch files; keep that backstop by requiring none exist.
+    const root = String(git(['ls-tree', '--name-only', '--end-of-options', headSha]) ?? '').split('\n').filter(Boolean);
+    return !root.some(name => isDrainTransientPath(name));
+  } catch { return false; }
+}
+
+/** Return the rebase operation unless the queue can preserve this proven manifest-free head. */
+export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFree, reclassifiesMerge, rebase = rebaseDropManifest }) {
+  if (setting === 'conflict-only' && mergeStrategy.queueOwnsFreshness(v.repo) === true
+    && isBehindButClean(v) && manifestFree() === true && reclassifiesMerge() === true) {
+    v.decision = 'merge';
+    v.reason = 'behind main but clean; merge queue tests PR + main - enqueued on its existing head';
+    v.rebaseDrop = 'skipped-behind-clean';
+    return null;
+  }
+  return rebase;
+}
+
+/** Pure: injected settings layers keep IO outside the resolver; invalid values retain the legacy rebase path. */
+export function resolveRebaseBeforeEnqueue(env = {}, { platform, tool } = {}) {
+  const checked = value => value === undefined || ['conflict-only', 'always'].includes(value) ? value : 'invalid';
+  const r = resolveCascade({
+    standard: 'conflict-only', platform: checked(platform?.rebaseBeforeEnqueue), tool: checked(tool?.rebaseBeforeEnqueue),
+    envValues: { '': checked(env?.WE_DRAIN_REBASE_BEFORE_ENQUEUE) },
+  });
+  const value = r.value, source = r.sources[''];
+  return ['conflict-only', 'always'].includes(value) ? { value, source }
+    : { value: 'always', source: `${source} (invalid; fail closed to always)` };
 }
 
 /**
@@ -5524,6 +5575,10 @@ async function runCli() {
   };
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
+  const rebaseBeforeEnqueue = resolveRebaseBeforeEnqueue(process.env, {
+    platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
+  });
+  if (!AS_JSON) process.stderr.write(`  rebase-before-enqueue: ${rebaseBeforeEnqueue.value} (${rebaseBeforeEnqueue.source})\n`);
   const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false, onUnreadable = null } = {}) => {
     // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
@@ -6032,6 +6087,24 @@ async function runCli() {
         }
         continue;
       }
+      const behindCleanDir = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
+      const rebase = routeRebaseBeforeEnqueue(v, { setting: rebaseBeforeEnqueue.value, mergeStrategy,
+        // Re-run every classifyPr guard (body, review hold, claims, checks) with BEHIND treated as queue-landable,
+        // exactly as the approved-head path does; BEHIND alone must be the only thing that was blocking.
+        reclassifiesMerge: () => {
+          const live = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
+          return !!live && classifyPr(retainApprovedHumanQueueHead(live, { hold: true, queueOwnsFreshness: true }), { requiredCheck: REQUIRED,
+            defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge';
+        },
+        manifestFree: () => !!behindCleanDir && headTreeLacksManifestFile({
+          headRef: v.headRef, headSha: v.listedHeadSha || v.headSha, prNumber: v.num,
+          git: (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: behindCleanDir }),
+        }),
+      });
+      if (!rebase) {
+        if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} ${v.reason}\n`);
+        continue;
+      }
 
       // #2684 — is this a cross-locus couple's WE half that was overlap-stacked on its impl tip? For such a half
       // the rebase-drop OUTCOME below already IS the couple CI-concurrency guard realized in git state — no
@@ -6063,7 +6136,7 @@ async function runCli() {
         if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} would rebase-drop manifest (state ${v.state}/${v.mergeable})${cloneDir ? ` via ${cloneDir}` : ''} then merge\n`);
         continue;
       }
-      let r = rebaseDropManifest({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
+      let r = rebase({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
       // #2371 — a REAL (non-manifest) conflict is the manifest resolver's own skip boundary; retry it with the
       // wider content resolver, which ONLY auto-resolves if every conflicting hunk is non-overlapping. Its own
       // skip (a genuine overlapping/unsafe hunk) is left exactly as before — surfaced for `/finish`.
