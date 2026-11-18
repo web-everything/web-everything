@@ -918,6 +918,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
     gates,
     asked: String(num ?? ''),
     num: resolvedNum,
+    ...(raw.item?.bornAs ? { bornAs: raw.item.bornAs } : {}),
     // WHICH AGENT this call is about, on every exit — a non-dispatch that says "not cleared" is a different
     // fact depending on whether a build or a prepare was asked for, and the run record has to say which.
     launchKind,
@@ -1479,6 +1480,7 @@ export function dispatchLaneOperation({ readTick } = {}) {
           idempotent: false,
           payload: {
             num: read.num,
+            ...(read.bornAs ? { bornAs: read.bornAs } : {}),
             groupMembers: read.groupMembers,
             launchKind: read.launchKind,
             lane: read.lane,

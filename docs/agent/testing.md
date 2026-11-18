@@ -2394,6 +2394,16 @@ or the admitted `npm run test:unit -- <file>` / `npm run check:standards` script
 If `run` exits 75 (host busy or queue full), do not loop: re-run it once with `run --wait-ms=540000 -- …`,
 which keeps re-trying admission itself (load gate and slot queue, holding its queue place) and still exits 75
 when the budget runs out. `heavyAdmission.runWaitMs` sets a default budget through the settings cascade.
+
+Runtime admission's spawn inventory checks the dispatch-lane `provider` boundary, where the
+card identity is still available before mechanical/agent routing. Its generic raw exec helpers
+also run read-only planner calls and trust retries; they are not separate conveyor admission
+sites. Keep the provider bypass regression when changing this inventory. Direct daemon exec
+launches remain inventoried. Prepare grouping must report excluded held candidates as well
+as exclude them from the selected group; exercise this with older planner output.
+Draft recovery must restore its prior persisted state if fresh runtime admission refuses
+after the pending-attempt write. The named regression in `build-red-draft-recovery.test.mjs`
+tightens admission during reservation and checks the rollback, no dispatch, and lease release.
 `WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.

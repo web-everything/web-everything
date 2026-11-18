@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', scope: 'files',
+    why: 'every conveyor work launch must pass the fresh runtime admission boundary',
+    matches: f => /^scripts\/conveyor\/(?:build-dispatch-.*|tick-core)\.mjs$/.test(f)
+      || ['skills-src/conveyor/build-dispatch-daemon.mjs', 'scripts/operations/dispatch-lane-io.mjs'].includes(f),
+    inputs: ['scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', 'scripts/lib/runtime-admission.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs',
     scope: 'files',
     why: 'inventories health-watch and stale-state command/helper calls so new destructive lane actions require guard coverage',

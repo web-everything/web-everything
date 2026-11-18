@@ -1,3 +1,4 @@
+import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
@@ -1564,7 +1565,7 @@ export function createDispatchSinks({
   // file + `--settings` env, the `claude --bg` spawn env, the worker-wrapper env), instead of this process's own.
   // A read-only dispatcher (health-watch is `observer`) passes `{ ...process.env, WE_GITHUB_APP_ROLE: 'worker' }`
   // for a session that must write; process.env itself is never touched. `null` keeps every path byte-identical.
-  spawnEnv = null,
+  spawnEnv = null, readRuntimeSettings,
 } = {}) {
   return {
     // #4349 — `ctx` (`{key, runId, ...}`, from `effect-executor.mjs#applyPendingEffects`'s per-sink call) was
@@ -1612,6 +1613,8 @@ export function createDispatchSinks({
       let wrappedPid = null;
       let handle;
       try {
+        const admission = assertRuntimeAdmitted(payload, payload?.launchKind ?? 'build', { readSettings: readRuntimeSettings });
+        if (!admission.admitted) throw notApplied(admission.reason);
         handle = await provider({
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).

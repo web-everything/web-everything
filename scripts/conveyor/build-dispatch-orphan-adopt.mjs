@@ -80,6 +80,7 @@ import { readBuildDelivery } from './build-delivery-evidence.mjs';
 import { recordBuildFailure, clearBuildFailure, dispatchAttemptKey, claimAttemptKeys } from './build-dispatch-failures.mjs';
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
+import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
 // Through the REGISTRY, never `dispatch-providers/build.mjs` directly: `detached-dispatch.mjs` imports the
 // registry, which imports `build.mjs` — entering that cycle at `build.mjs` (or at `detached-dispatch.mjs` first)
@@ -465,6 +466,7 @@ export function settleOrphanRow({ runId, key, outcome = 'orphan-released' }, sto
  *  finished). `runId`/`effectKey` name the ORIGINAL dispatch row, so the resumed wrapper settles that row on
  *  exit instead of leaving it in-flight forever (PR #2921 review). Returns the spawned pid. */
 export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = null, effectKey = null, groupMembers = [] }, { spawnDetached = defaultSpawnDetached, logPathFor = deliveryDispatchLogPath } = {}) {
+  if (!assertRuntimeAdmitted({ num }, 'resume').admitted) return null;
   const argv = [
     String(dispatchProviderEntry('build').runScript),
     `--num=${num}`, `--lane=${lane}`, `--session=${sessionSlug}`, `--scope=${String(scope ?? '')}`, '--resume',
@@ -518,7 +520,7 @@ export async function adoptOrphanedBuildClaims({
   releaseResumeMarker = ({ num }) => releaseBuildDispatchResume({ num }),
   settleRow = (o) => settleOrphanRow(o),
   placeHold = ({ num, reason }) => placeBuildDispatchHold({ num, reason }),
-  spawnResume = (o) => spawnResumeDelivery(o),
+  spawnResume = (o) => spawnResumeDelivery(o), readSettings,
   markResume = (o) => markBuildDispatchResume(o),
   // xykwe0h — real-outcome evidence (a PR on the card's branch, or a resolved card) and session liveness.
   readDelivery = (num) => readBuildDelivery(num),
@@ -590,6 +592,8 @@ export async function adoptOrphanedBuildClaims({
       if (decision.action === 'leave') {
         results.push({ num, action: 'leave', reason: decision.reason });
       } else if (decision.action === 'resume') {
+        const admission = assertRuntimeAdmitted({ num, bornAs: payload.bornAs }, 'resume', { readSettings });
+        if (!admission.admitted) { results.push({ num, action: 'runtime-refused', reason: admission.reason }); continue; }
         const binding = { runId: row.runId, rowKey: row.entry?.key, attempts: attempts + 1 };
         markResume({ num, pid: null, ...binding });
         let pid;

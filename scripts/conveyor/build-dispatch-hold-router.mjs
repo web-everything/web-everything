@@ -43,6 +43,7 @@ import { randomUUID } from 'node:crypto';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { reserve, releaseLockDir, readLockEntry } from '../readiness/file-locks.mjs';
 import { normNum } from './queue-store.mjs';
+import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
 import { DEFAULT_BUILD_DISPATCH_HOLD_MINUTES } from './build-dispatch-claim.mjs';
 
 // ── pure ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -221,11 +222,13 @@ export function listHoldFindings({ file = holdFindingsFile() } = {}) {
  */
 export async function routeHeldItems({
   plan, reserveRoute = reserveHoldRoute, releaseRoute = releaseHoldRoute, spawnLand = () => ({ spawned: false }),
-  recordFinding = appendHoldFinding,
+  recordFinding = appendHoldFinding, readSettings,
 } = {}) {
   const outcomes = [];
   for (const entry of Array.isArray(plan) ? plan : []) {
     if (!entry?.num) continue;
+    const admission = assertRuntimeAdmitted(entry, 'route', { readSettings });
+    if (!admission.admitted) { outcomes.push({ num: entry.num, route: entry.route, action: 'runtime-refused', reason: admission.reason }); continue; }
     // EVERY route dedups against a still-live lease first (#4465 review round 2 — route 'other' had NO dedup
     // at all: the same held item is re-planned every tick for the whole hold TTL, so a bare
     // `recordFinding` here would append one duplicate ledger entry per tick — ~120 of them over a 240-minute

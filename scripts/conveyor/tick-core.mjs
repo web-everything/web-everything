@@ -150,7 +150,7 @@
 import { planningRead, PLANNING_SNAPSHOT_ENV } from '../lib/planning-snapshot.mjs';
 import { childFailure } from '../lib/child-failure.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
-import { filterRuntimeCandidates as filterCandidates } from '../lib/build-queue.mjs';
+import { decideRuntimeAdmission, readBuildPrioritySettings } from '../lib/build-queue.mjs';
 import { normNum } from './queue-store.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -1279,7 +1279,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     .map(([num, timestamps]) => [num, recentPrepareRefusals(timestamps, refusalNow)])
     .filter(([, timestamps]) => timestamps.length > 0));
   const { queue = [], unshaped = [], needsSlice = [], decisions = [], lanes = [], prs = [], health = {}, infraBlocked = [] } = state;
-  const filterRuntimeCandidates = (rows, settings) => filterCandidates(rows, settings, queue);
+  const selectBeforeAssignment = (rows, settings) => rows.filter(row => decideRuntimeAdmission({ ...queue.find(c => normNum(c.num) === normNum(row.num)), ...row }, 'prepare', settings).admitted);
   // #3567 — the `needs-investigation` holds, read straight off THIS TICK's dispatch plan (not off `state`, the
   // way `unshaped`/`decisions` are): an investigation has no separate state-derivation step (no `prepared`
   // flag to persist), so a freshly-clearable SPAWN candidate is simply "held `needs-investigation` this tick"
@@ -1355,7 +1355,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   const prepareGuardNums = new Set(prepare.live.map(g => normNum(g.num)));
   const runtimeFilteredBuild = new Set(), runtimeFilteredPrepare = new Set();
   const runtimeCandidates = (rows, removed) => {
-    const kept = filterRuntimeCandidates(rows, config.buildPriority);
+    const kept = selectBeforeAssignment(rows, config.buildPriority);
     const nums = new Set(kept.map(r => normNum(r.num)));
     for (const row of rows) if (!nums.has(normNum(row.num))) removed.add(normNum(row.num));
     return kept;
@@ -1367,10 +1367,10 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   const refusalSkippedNums = new Set(refusalNotes.map(note => normNum(note.num)));
   const eligiblePrepareCandidates = prepareCandidates.filter(h => !refusalSkippedNums.has(normNum(h.num)));
   const prepareWindow = prepareAheadNums({
-    queue: filterRuntimeCandidates(queue, config.buildPriority), launch: filterRuntimeCandidates(plan.launch ?? [], config.buildPriority),
+    queue: selectBeforeAssignment(queue, config.buildPriority), launch: selectBeforeAssignment(plan.launch ?? [], config.buildPriority),
     held: prepareAutoSize && Array.isArray(plan.held)
-      ? filterRuntimeCandidates(plan.held, config.buildPriority).map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
-      : filterRuntimeCandidates(plan.held ?? [], config.buildPriority),
+      ? selectBeforeAssignment(plan.held, config.buildPriority).map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
+      : selectBeforeAssignment(plan.held ?? [], config.buildPriority),
     window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
     skip: [...prepareHeld, ...refusalSkippedNums],
   });
@@ -2332,6 +2332,7 @@ async function main(argv) {
 
   // epic #3383 — dispatchPausedKinds carries the manual-pause marker's KIND SCOPE through verbatim (`null` =
   // blanket pause); dropping it here would silently re-widen a scoped pause back to holding all six kinds.
+  config.buildPriority = readBuildPrioritySettings();
   const out = planTick({ state, plan, freeLanes, bookkeeping, signals, prRearmCounts, prCiHealCounts, prCiHealRefunds, admission, liveAgentSessions, config, now: Date.now(), lastOperatorTurn, dispatchPaused, dispatchPausedKinds, dispatchPausedReason, loadAdmission, queueAdmission, itemSizes });
   // Always expose the observed phase costs, including in the builder log; the pure decision is unchanged.
   out.decisions.timings = timings;

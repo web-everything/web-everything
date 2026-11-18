@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recoverBuilderDrafts, runBuildDispatchTick, cliRecoverBuilderDrafts } from '../build-dispatch-daemon.mjs';
 import { MAX_RESUME_ATTEMPTS } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
+import { withRuntimeAdmission } from '../../../scripts/lib/runtime-admission.mjs';
 
 const nowMs = Date.parse('2026-09-30T12:00:00Z');
 const candidate = {
@@ -90,6 +91,30 @@ describe('abandoned builder draft recovery', () => {
     await f.run();
     expect(f.effects.escalate).toHaveBeenCalledTimes(2);
     expect(f.effects.dispatch).not.toHaveBeenCalled();
+  });
+  it('restores recovery state when runtime admission tightens between reservation and dispatch', async () => {
+    const prior = { attempts: 0, handle: 'pid:previous' };
+    const f = fixture(prior);
+    let settings = { mode: 'lift', ids: [] };
+    const readSettings = vi.fn(() => settings);
+    f.effects.reserve.mockImplementation(() => {
+      settings = { mode: 'only', only: true, ids: [] };
+      return { ok: true };
+    });
+    const result = await withRuntimeAdmission(readSettings, () => f.run());
+    expect(readSettings).toHaveBeenCalledTimes(2);
+    expect(f.effects.reserve).toHaveBeenCalledWith(candidate);
+    expect(f.effects.writeState.mock.calls).toEqual([
+      [candidate.pr, { attempts: 1, pending: true, pendingAt: nowMs }],
+      [candidate.pr, prior],
+    ]);
+    expect(f.effects.readState()).toEqual(prior);
+    expect(f.effects.dispatch).not.toHaveBeenCalled();
+    expect(f.effects.escalate).not.toHaveBeenCalled();
+    expect(f.effects.release).toHaveBeenCalledOnce();
+    expect(f.effects.release).toHaveBeenCalledWith(candidate);
+    expect(result).toHaveLength(0);
+    expect(result.runtimeRefused).toEqual([{ num: candidate.num, kind: 'draft-recovery', reason: 'runtime-only' }]);
   });
   it('runs recovery before candidate holds and previews it without mutations', async () => {
     const effects = {

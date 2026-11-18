@@ -554,17 +554,25 @@ function clamp01(v) { return Math.max(0, Math.min(1, v)); }
 function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 function item_dateKey(it) { return String(it.dateOpened ?? ''); }
 
-/** Filter direct priority aliases; `candidates` supplies metadata for num-only plan rows. Unrestricted rows retain identity. */
-export function filterRuntimeCandidates(rows, settings = {}, candidates = rows) {
-  if (!settings.only && !settings.held) return rows;
-  if (settings.held) return [];
+/** Pure admission: only direct card identity or a validated durable hash can authorize work. */
+export function decideRuntimeAdmission(card, kind, settings = {}) {
+  if (!settings || settings.held) return { admitted: false, reason: 'runtime-malformed' };
+  if (!settings.only && settings.mode !== 'only') return { admitted: true, reason: 'runtime-unrestricted' };
+  if (!Array.isArray(settings.ids)) return { admitted: false, reason: 'runtime-malformed' };
   const allowed = new Set(settings.ids.map(normalizePriorityNum));
+  const alias = typeof card?.bornAs === 'string' && card.bornAs.startsWith('x')
+    && BUILD_PRIORITY_ID.test(card.bornAs) ? card.bornAs : null;
+  const stem = typeof card?.id === 'string' ? card.id.split('-')[0] : '';
+  const idAlias = /^x[0-9a-z]{6,}$/.test(stem) ? stem : null;
+  const admitted = (card?.num != null && allowed.has(normalizePriorityNum(card.num)))
+    || (alias !== null && allowed.has(normalizePriorityNum(alias)))
+    || (idAlias !== null && allowed.has(idAlias));
+  return { admitted, reason: admitted ? 'runtime-listed' : 'runtime-only' };
+}
+
+/** Pre-assignment selection; plan rows recover direct identity from the candidate metadata. */
+export function filterRuntimeCandidates(rows, settings = {}, candidates = rows) {
+  if (!settings.only && settings.mode !== 'only' && !settings.held) return rows;
   const byNum = new Map(candidates.map(r => [normalizePriorityNum(r.num), r]));
-  // Plan/hold rows carry only num; recover their direct aliases, never ancestor membership.
-  return rows.filter(r => {
-    const item = { ...byNum.get(normalizePriorityNum(r.num)), ...r };
-    // Only durable hash aliases authorize membership; numeric bornAs must not impersonate another card.
-    if (typeof item.bornAs !== 'string' || !item.bornAs.startsWith('x') || !BUILD_PRIORITY_ID.test(item.bornAs)) item.bornAs = null;
-    return buildPriorityAliases(item).some(alias => allowed.has(normalizePriorityNum(alias)));
-  });
+  return rows.filter(r => decideRuntimeAdmission({ ...byNum.get(normalizePriorityNum(r.num)), ...r }, 'build', settings).admitted);
 }

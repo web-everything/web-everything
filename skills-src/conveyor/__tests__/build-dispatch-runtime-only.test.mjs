@@ -248,3 +248,28 @@ it.each([only([]), { ...only(['xabcdef0']), held: true }])('dispatch assignment 
   expect(plan.launch).toEqual([]);
   expect(plan.held).toEqual([{ num: '8001', reason: 'runtime-only' }]);
 });
+
+
+it('fresh spawn admission protects an older daemon plan and hold-routing effect', async () => {
+  const effects = effectsFor(planTick(input()));
+  effects.readRuntimeSettings = () => only(['8001', '7202']);
+  effects.listHolds = () => [{ num: '9001', reason: 'spec already done on main: commit abcdef012' }];
+  effects.routeHeldItems = vi.fn(() => []);
+  const tick = await runBuildDispatchTick({ live: true, effects, policy });
+  expect(nums(tick.dispatched)).toEqual(['8001']);
+  expect(effects.dispatch.mock.calls.every(([row]) => ['8001', '7202'].includes(row.num))).toBe(true);
+  expect(effects.routeHeldItems).toHaveBeenCalledWith([]);
+  expect(tick.runtimeRefused).toEqual(expect.arrayContaining([
+    { num: '8002', kind: 'build', reason: 'runtime-only' },
+    { num: '9001', kind: 'route', reason: 'runtime-only' },
+  ]));
+});
+it('CLI planning with fresh runtime settings retains a runtime-only guard but proposes no prepare-scope', () => {
+  const data = input(only([]));
+  data.state.unshaped = [{ num: '9001' }];
+  data.plan = { launch: [], held: [{ num: '9001', reason: 'runtime-only' }] };
+  data.bookkeeping = { tick: 1, prepareGuards: [{ num: '9001', kind: 'prepare', lane: 1, spawnedTick: 1 }] };
+  const out = planTick(data);
+  expect(out.decisions.spawnPrepareScope).toEqual([]);
+  expect(out.nextState.prepareGuards.map(r => r.num)).toContain('9001');
+});

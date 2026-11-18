@@ -35,7 +35,8 @@ import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/bui
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
-import { readBuildPrioritySettings, filterRuntimeCandidates as filterCandidates } from '../../scripts/lib/build-queue.mjs';
+import { readBuildPrioritySettings, decideRuntimeAdmission } from '../../scripts/lib/build-queue.mjs';
+import { assertRuntimeAdmitted, withRuntimeAdmission, setRuntimeAdmissionCards } from '../../scripts/lib/runtime-admission.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
@@ -315,7 +316,7 @@ export function deriveDispatchedByBuilder(runStoreRows = [], settledRows = []) {
  */
 export async function runBuildDispatchTick(options) {
   const timer = options.timer ?? createPhaseTimer();
-  try { return await runTimedBuildDispatchTick({ ...options, timer }); }
+  try { return await withRuntimeAdmission(options.effects?.readRuntimeSettings, () => runTimedBuildDispatchTick({ ...options, timer })); }
   catch (error) { error.timings = timer.snapshot(); throw error; }
 }
 
@@ -350,7 +351,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   effects = timer.wrap(effects);
   const filteredBuild = new Set(), filteredPrepare = new Set();
   const runtimeCandidates = (rows, removed) => {
-    const kept = filterRuntimeCandidates(rows, buildPriority);
+    const kept = selectBeforeAssignment(rows, buildPriority);
     const nums = new Set(kept.map(r => normNum(r.num)));
     for (const row of rows) if (!nums.has(normNum(row.num))) removed.add(normNum(row.num));
     return kept;
@@ -607,7 +608,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
   const d = out?.decisions || {};
   const admission = d.admission || {};
-  const filterRuntimeCandidates = (rows, settings) => filterCandidates(rows, settings, admission.queue ?? []);
+  setRuntimeAdmissionCards(admission.queue ?? []);
+  const selectBeforeAssignment = (rows, settings) => rows.filter(row => decideRuntimeAdmission({ ...(admission.queue ?? []).find(c => normNum(c.num) === normNum(row.num)), ...row }, 'build', settings).admitted);
   const scopeByNum = new Map((admission.queue || []).map((r) => [normNum(r.num), Array.isArray(r.scope) ? r.scope : []]));
   const clearedNums = new Set((admission.cleared || []).map((r) => normNum(r.num)));
   const rawOpenPrs = await effects.fetchOpenPrs();
@@ -687,7 +689,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const withheld = holdRouting.filter((h) => !allowed.includes(h))
       .map((h) => ({ num: h.num, route: h.route, action: 'withheld-frozen', reason: freeze.reasons.join('; ') }));
     try {
-      const routed = await effects.routeHeldItems(allowed);
+      const routed = await effects.routeHeldItems(allowed.filter(card => assertRuntimeAdmitted(card, 'route').admitted));
       holdRoutingResult = [...(Array.isArray(routed) ? routed : []), ...withheld];
     }
     catch (e) { holdRoutingResult = { error: String(e?.message || e).split('\n')[0] }; }
@@ -1011,6 +1013,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         }
         if (groupMembers.length && groupMembers.length + 1 < groupingSettings.groupMin) releaseMembers();
         let res;
+        if (!assertRuntimeAdmitted(pick, 'build').admitted) { releaseMembers(); effects.releaseClaim({ num: pick.num }); continue; }
+        if (groupMembers.some(num => !assertRuntimeAdmitted({ num }, 'build').admitted)) { releaseMembers(); effects.releaseClaim({ num: pick.num }); continue; }
         try { res = await effects.dispatch({ num: pick.num, ...(groupMembers.length ? { groupMembers: [...groupMembers] } : {}), bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
         if (res?.pending) startedThisTick += 1;
         if (res?.dispatching) {
@@ -1401,8 +1405,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const lightRevalidateCandidate = num => preparePolicy.lightRevalidate !== false && (admission.held ?? [])
     .some(h => normNum(h.num) === normNum(num) && h.reason === 'prepare-stale'
       && h.detail?.startsWith('scope changed since '));
-  const windowNums = prepareAheadNums({ queue: filterRuntimeCandidates(admission.queue ?? [], buildPriority), launch: filterRuntimeCandidates(admission.planned ?? admission.launch ?? [], buildPriority),
-    held: filterRuntimeCandidates(admission.held ?? [], buildPriority).map(h => h.reason === 'no-size' && preparePolicy.autoSize ? { ...h, reason: 'needs-prepare' } : h),
+  const windowNums = prepareAheadNums({ queue: selectBeforeAssignment(admission.queue ?? [], buildPriority), launch: selectBeforeAssignment(admission.planned ?? admission.launch ?? [], buildPriority),
+    held: selectBeforeAssignment(admission.held ?? [], buildPriority).map(h => h.reason === 'no-size' && preparePolicy.autoSize ? { ...h, reason: 'needs-prepare' } : h),
     // With the window off, every queued card is eligible for batching. The shared helper uses
     // non-finite windows as its "no filter" sentinel, so give it the complete queue's size here.
     window: effectivePrepareAheadWindow ?? admission.queue?.length ?? 0, skip: bookkeeping.prepareHeldNums ?? [] });
@@ -1499,6 +1503,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
             if (memberClaim.ok) groupMembers.push(member);
           } catch (e) { await failPrepare(member, 'claim', String(e?.message || e)); }
         }
+        if (!assertRuntimeAdmitted({ num, bornAs: cardBornAs }, 'prepare-item').admitted) {
+          effects.releasePrepareClaim({ num });
+          for (const member of groupMembers) effects.releasePrepareClaim({ num: member });
+          continue;
+        }
+        if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'prepare-item').admitted)) { releasePrepareMembers(); effects.releasePrepareClaim({ num }); continue; }
         let res;
         try { res = await effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', lightRevalidate: lightRevalidateCandidate(num), prepareFallback: fallback, batchExternalCap: policy.maxConcurrentExternalBuilds, tick: out, tickBookkeeping, tickAt }); }
         catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
@@ -1962,6 +1972,8 @@ function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepare
 }
 
 export function cliDispatch(args, { exec = execFileSync } = {}) {
+  const admission = assertRuntimeAdmitted(args, args.launchKind ?? 'build');
+  if (!admission.admitted) return { dispatching: false, reason: admission.reason };
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   const base = launchBase();
   try {
@@ -1994,6 +2006,8 @@ function launchBase() {
  * not yet confirmed" — never a failure.
  */
 export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot(), readBase = launchBase } = {}) {
+  const admission = assertRuntimeAdmitted(args, args.launchKind ?? 'build');
+  if (!admission.admitted) return { dispatching: false, reason: admission.reason };
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
@@ -2145,6 +2159,8 @@ export function cliRetryInfraBlocked({
  * dispatch logs so a stuck landing is discoverable the same way a stuck build dispatch already is.
  */
 export async function cliSpawnHoldLand(entry) {
+  const admission = assertRuntimeAdmitted(entry, 'route');
+  if (!admission.admitted) return { spawned: false, reason: admission.reason };
   const { defaultSpawnDetached, deliveryDispatchLogPath } = await import('../../scripts/operations/detached-dispatch.mjs');
   const argv = [
     join(SCRIPTS, 'operations', 'build-dispatch-hold-route-land.mjs'),
@@ -2540,6 +2556,8 @@ export async function cliStampPrepare({ num }, {
   }
   if (!reserve(entry).ok) return { pending: true };
   try {
+    const admission = assertRuntimeAdmitted({ num }, 'prepare-stamp');
+    if (!admission.admitted) { release(entry); return { spawned: false, reason: admission.reason }; }
     markStarting(num);
     const { defaultSpawnDetached, deliveryDispatchLogPath } = await import('../../scripts/operations/detached-dispatch.mjs');
     const result = defaultSpawnDetached([
@@ -2589,6 +2607,7 @@ export async function recoverBuilderDrafts({
         : decideOrphanAction({ resumable: true, attempts: state.attempts, allowResume });
       if (decision.action === 'leave') continue;
       if (dryRun) { results.push({ pr: c.pr, num: c.num, action: decision.action, planned: true }); continue; }
+      if (decision.action === 'resume' && !assertRuntimeAdmitted(c, 'draft-recovery').admitted) continue;
       if (!effects.reserve(c).ok) continue;
       try {
         if (decision.action === 'exhausted') {
@@ -2600,6 +2619,10 @@ export async function recoverBuilderDrafts({
         } else {
           const pending = { attempts: state.attempts + 1, pending: true, pendingAt: nowMs };
           effects.writeState(c.pr, pending);
+          if (!assertRuntimeAdmitted(c, 'draft-recovery').admitted) {
+            effects.writeState(c.pr, state); // no attempt was launched
+            continue;
+          }
           const out = await effects.dispatch(c);
           if (out?.held) {
             effects.writeState(c.pr, state); // no attempt was launched
@@ -2705,6 +2728,8 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     reserve: c => (io.reserve ?? reserveHoldRoute)(route(c)),
     release: c => (io.release ?? releaseHoldRoute)(route(c)),
     dispatch: async c => {
+      const admission = assertRuntimeAdmitted(c, 'draft-recovery');
+      if (!admission.admitted) return { held: true, reason: admission.reason };
       const lane = (lanes ??= (io.freeLanes ?? freeLaneNumbers)()).shift();
       if (!lane) return { held: true, reason: 'no-lane' };
       // The builder invokes the existing PR repair primitive directly. Its brief acquires the PR's
@@ -2762,6 +2787,7 @@ export function cliEffects() {
     listPrepareReleases: () => readPrepareReleases(join(SCRIPTS, 'conveyor', 'prepare-failure-releases.json'), REPO_ROOT),
     recordPrepareFailure: async input => recordPrepareFailure(input, { fileCard: async card => {
       const { spawnPreventionLandingJob } = await import('../../scripts/lib/prevention-landing-job.mjs');
+      if (!assertRuntimeAdmitted(card, 'route').admitted) return { spawned: false };
       return spawnPreventionLandingJob(card, { sessionPrefix: 'prepare-prevention' });
     } }),
     listProbationPrepares: () => {
@@ -3155,7 +3181,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, costAdmission: r.costAdmission ? { line: r.costAdmission.line, tally: r.costAdmission.tally } : null, launchSettlement: r.launchSettlement, launchPolicy: r.launchPolicy, sameTickHolds: r.sameTickHolds, capacity: tickCapacity(r) })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, runtimeRefused: r.runtimeRefused, loadHolds: r.loadHolds, costAdmission: r.costAdmission ? { line: r.costAdmission.line, tally: r.costAdmission.tally } : null, launchSettlement: r.launchSettlement, launchPolicy: r.launchPolicy, sameTickHolds: r.sameTickHolds, capacity: tickCapacity(r) })}\n`);
       if (r.costAdmission?.line) console.error(`build-dispatch-daemon: ${r.costAdmission.line}`);
     },
     onTickError: (e, _tick, loop) => {
