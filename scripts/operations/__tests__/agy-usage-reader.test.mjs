@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { collectAgyUsage, descendantPids, parseAgyUsage, readAgyUsageSettings, runAgyUsageReader } from '../agy-usage-reader.mjs';
+import { collectAgyUsage, descendantPids, readCheckedAgyUsage, parseAgyUsage, readAgyUsageSettings, runAgyUsageReader } from '../agy-usage-reader.mjs';
 
 const NOW = Date.parse('2026-11-18T12:00:00Z');
 const SCREEN = `GEMINI MODELS
@@ -16,7 +16,32 @@ Refreshes in 4h 59m
 const settings = { minIntervalMinutes: 15, timeoutMs: 45000 };
 afterEach(() => vi.useRealTimers());
 
+describe('strict settings read', () => {
+  it('fails on tainted or duplicated settings instead of using defaults', () => {
+    expect(() => readCheckedAgyUsage(() => ({ value: {}, taint: [{ source: 'agy-usage.json', reason: 'invalid JSON' }] }))).toThrow('unreadable');
+    expect(readCheckedAgyUsage(() => ({ value: { timeoutMs: 1 }, taint: [{ source: 'settings/other.json', reason: 'dotted key' }] }))).toEqual({ agyUsage: { timeoutMs: 1 } });
+  });
+});
+
 describe('Gemini usage parser', () => {
+  it('takes the last full frame after a screen clear, not the first', () => {
+    const stale = SCREEN.replace('100.00%', '40.00%');
+    expect(parseAgyUsage(`${stale}\x1b[2J\x1b[H${SCREEN}`, NOW).seven_day.used_percentage).toBe(0);
+  });
+  it('falls back to the previous full frame when a later repaint is partial', () => {
+    expect(parseAgyUsage(`${SCREEN}\x1b[2JGEMINI MODELS\nWeekly Limit Remaining\n`, NOW).seven_day.used_percentage).toBe(0);
+  });
+  it('rejects a screen that never completes after a clear', () => {
+    expect(() => parseAgyUsage('\x1b[2JGEMINI MODELS\nWeekly Limit Remaining\n', NOW)).toThrow();
+  });
+  it('stops the Gemini group at a mixed-case next model group', () => {
+    const mixed = SCREEN.replace('Five Hour Limit Remaining', 'Claude Models\nFive Hour Limit Remaining');
+    expect(() => parseAgyUsage(mixed, NOW)).toThrow();
+  });
+  it('uses the last GEMINI MODELS block within one frame', () => {
+    const stale = SCREEN.replace('100.00%', '40.00%');
+    expect(parseAgyUsage(`${stale}\n${SCREEN}`, NOW).seven_day.used_percentage).toBe(0);
+  });
   it('parses the fixture, strips ANSI and converts remaining percentages and relative resets', () => {
     expect(parseAgyUsage(`\x1b[32m${SCREEN}\x1b[0m`, NOW)).toEqual({
       at: '2026-11-18T12:00:00.000Z', session: null, spend_limit: null,

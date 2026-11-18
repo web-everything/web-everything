@@ -6,7 +6,17 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { readSettings } from '../lib/settings-files.mjs';
+import { readSettingsChecked } from '../lib/settings-files.mjs';
+
+/** Strict read: unreadable, malformed or duplicated settings fail the reader instead of silently using defaults. */
+export const readCheckedAgyUsage = (check = readSettingsChecked) => {
+  const result = check({ namespace: 'agyUsage' });
+  // Taint from unrelated settings files must not block this reader; its own file and any duplicate of its leaves must.
+  const taint = result.taint.filter(t => /agy-usage|agyUsage/.test(`${t.source} ${t.reason}`));
+  const { value } = result;
+  if (taint.length) throw new Error(`agyUsage settings unreadable or duplicated: ${taint.map(t => `${t.source} ${t.reason}`).join('; ').slice(0, 300)}`);
+  return { agyUsage: value };
+};
 
 /** Exact PIDs of every descendant of `root` (script moves agy into its own session, so the group kill misses it). */
 export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8', timeout: 3000 })) {
@@ -20,7 +30,7 @@ export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'p
   return out.reverse();
 }
 
-export function readAgyUsageSettings({ env = process.env, read = readSettings, platform, log = console.error } = {}) {
+export function readAgyUsageSettings({ env = process.env, read = readCheckedAgyUsage, platform, log = console.error } = {}) {
   const number = key => env[key] === undefined ? undefined : Number(env[key]);
   return cascadePolicy('agyUsage', read()?.agyUsage, {
     standard: { minIntervalMinutes: 15, timeoutMs: 45000 }, platform, env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log,
@@ -30,10 +40,22 @@ export function readAgyUsageSettings({ env = process.env, read = readSettings, p
   }).value;
 }
 
-/** Pure: require both Gemini windows; incomplete or unknown screens never become quota evidence. */
+// Screen clears and alternate-screen switches end a frame; only content after the last one is current.
+const FRAME_BREAK = /\x1b\[[0-3]?J|\x1bc|\x1b\[\?1049[hl]/;
+
+/** Pure: parse the LAST complete frame (a later partial repaint falls back to the previous full frame). */
 export function parseAgyUsage(screen, now = Date.now()) {
+  let failure = new Error('Incomplete Gemini usage screen');
+  for (const frame of String(screen).split(new RegExp(FRAME_BREAK, 'g')).reverse()) {
+    try { return parseAgyFrame(frame, now); } catch (error) { failure = error; }
+  }
+  throw failure;
+}
+
+function parseAgyFrame(screen, now) {
   const text = stripVTControlCharacters(screen).replace(/\r/g, '');
-  const group = text.split(/GEMINI MODELS/i)[1]?.split(/\n\s*[A-Z][A-Z ]+ MODELS/)[0];
+  const group = text.split(/GEMINI MODELS/i).at(-1)?.split(/\n\s*[A-Z][A-Z ]+ MODELS/i)[0];
+  if (text.split(/GEMINI MODELS/i).length < 2) throw new Error('Incomplete Gemini usage screen');
   if (!group || !Number.isFinite(now)) throw new Error('Incomplete Gemini usage screen');
   const window = label => {
     const match = group.match(new RegExp(`${label} Limit Remaining\\s+[^\\d%\\n+-]*?(\\d+(?:\\.\\d+)?)%\\s+Refreshes in[ \\t]+(?:(\\d+)h[ \\t]*)?(?:(\\d+)m)?[ \\t]*(?=\\n)`, 'i'));
