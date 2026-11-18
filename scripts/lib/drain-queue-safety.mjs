@@ -159,9 +159,17 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
       else return hold(reason || 'unknown removal reason');
     }
   }
-  if (failedChecksRemovals > 2)
+  const cancelledRegroup = retryEvidence?.infra === 'cancelled-regroup';
+  const cancelledMax = retryEvidence?.mqCancelledRetryMax ?? 2;
+  const cancelledRetry = cancelledRegroup && retryEvidence.mergeState === 'CLEAN'
+    && Number.isSafeInteger(cancelledMax) && cancelledMax > 0;
+  if (cancelledRegroup && (!Number.isSafeInteger(cancelledMax) || cancelledMax <= 0))
+    return hold('invalid cancellation retry bound; operator must inspect history and enqueue manually');
+  if (cancelledRegroup && reenqueuedAfterFailure >= cancelledMax)
+    return hold(`failed_checks (cancelled/regroup retries already spent: ${reenqueuedAfterFailure}/${cancelledMax}); operator must inspect history and enqueue manually`);
+  if (!cancelledRegroup && failedChecksRemovals > 2)
     return hold(`failed_checks (${failedChecksRemovals} removals on this head); operator must inspect history and enqueue manually`);
-  if (failedChecksRemovals > 0 && reenqueuedAfterFailure >= 2)
+  if (!cancelledRegroup && failedChecksRemovals > 0 && reenqueuedAfterFailure >= 2)
     return hold('failed_checks (the two infrastructure retries were already spent); operator must inspect history and enqueue manually');
   // Every failing test is in the active red-main quarantine: a known flake, not a head failure.
   const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
@@ -170,7 +178,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
-  if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
+  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -185,7 +193,8 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
   const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
   return { hold: false, line: failedChecksRemovals > 0
-    ? hold((quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
+    ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
+      : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
       : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
@@ -725,6 +734,7 @@ function readMqRetryEvidence(options) {
     : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: uncachedExec }) };
   const baseOptions = { ...options, exec, now };
   const base = readMqBaseRetryEvidence(baseOptions);
+  if (base?.infra === 'cancelled-regroup') return live(base);
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
     || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return live(base);
   // The exact-test reader alone may read ONE job log: the failed shard's, for vitest's final summary block (a bounded tail).
@@ -748,10 +758,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
       && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
-    if (timeline.error || timeline.hasPreviousPage !== false || removals.length < 1 || removals.length > 2
+    if (timeline.error || timeline.hasPreviousPage !== false || removals.length < 1
       || removals.some(event => mqRemovalReason(event) !== 'failed_checks')) return null;
-    if (timeline.nodes.filter(event => event?.__typename === 'AddedToMergeQueueEvent'
-      && timeline.nodes.indexOf(event) > timeline.nodes.indexOf(removals[0])).length >= 2) return null;
     const removal = removals.at(-1);
     const oid = mqOid(removal.beforeCommit?.oid);
     const timestamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
@@ -782,7 +790,24 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       }
       throw new Error('truncated retry evidence; operator must inspect full history');
     };
-    const attempts = inspectMqReruns({ checks: readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs'), repo, commit: oid, removedAt });
+    const rawChecks = readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs');
+    const cancelled = check => ['cancelled', 'startup_failure'].includes(check.conclusion);
+    const passingCheck = check => ['success', 'neutral', 'skipped'].includes(check.conclusion);
+    const rawFailed = rawChecks.filter(check => !passingCheck(check));
+    if (rawChecks.every(check => check.status === 'completed') && rawFailed.some(cancelled)
+      && rawFailed.every(check => cancelled(check) || check.conclusion === 'failure'
+        && retryPolicy.mqAggregateJobs.includes(localJob(check.name)))) {
+      const names = checks => checks.map(check => String(check.name ?? 'unnamed')
+        .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' '));
+      return { infra: 'cancelled-regroup', mqCancelledRetryMax: retryPolicy.mqCancelledRetryMax,
+        cancelledNames: names(rawFailed.filter(cancelled)),
+        derivedNames: names(rawFailed.filter(check => !cancelled(check))),
+        mergeState: readMqMergeState({ repo, pr, head, exec }) };
+    }
+    // Other evidence kinds retain their historical removal and re-enqueue limits.
+    if (removals.length > 2 || timeline.nodes.filter(event => event?.__typename === 'AddedToMergeQueueEvent'
+      && timeline.nodes.indexOf(event) > timeline.nodes.indexOf(removals[0])).length >= 2) return null;
+    const attempts = inspectMqReruns({ checks: rawChecks, repo, commit: oid, removedAt });
     const checks = attempts.checks;
     const infraConclusions = new Set(['cancelled', 'timed_out', 'startup_failure']);
     const passing = new Set(['success', 'neutral', 'skipped']);
@@ -1103,10 +1128,12 @@ function mqRetryDeclineReason(evidence, holdLine) {
   return evidence?.flakeReason ? `${base}; flake evidence: ${evidence.flakeReason}` : base;
 }
 function mqRetryDeclineReasonBase(evidence, holdLine) {
+  if (evidence?.infra === 'cancelled-regroup' && /already spent/.test(holdLine ?? ''))
+    return 'cancelled/regroup retry bound reached; operator must inspect history and enqueue manually';
   if (/removals on this head|already spent/.test(holdLine ?? '')) return 'retry bound reached (this head already had its single retry)';
   if (!evidence) return 'retry evidence unreadable or incomplete';
   if (evidence.logReason) return evidence.logReason;
-  if (evidence.infra === 'quarantined')
+  if (['quarantined', 'cancelled-regroup'].includes(evidence.infra))
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
   if (!['infra', 'main-red', 'flaky-test', 'exact-test'].includes(evidence.infra))
@@ -1182,9 +1209,9 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   }
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqInfraSignatures: MQ_INFRA_SIGNATURES, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
-    valid: { mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { mqAggregateJobs, mqInfraSignatures, queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqInfraSignatures: MQ_INFRA_SIGNATURES, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
+    valid: { mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v > 0, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { mqAggregateJobs, mqInfraSignatures, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
   // Retired: this switch let the drain enqueue an owed head with NO red-team result once the deadline passed. It is no

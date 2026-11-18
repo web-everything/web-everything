@@ -883,7 +883,7 @@ describe('merge-queue same-head failure admission', () => {
       test(f);
     }
 
-    it.each(['cancelled', 'timed_out', 'startup_failure'])('guard logs retry 1/2 for infrastructure check conclusion %s', conclusion => fixture(f => {
+    it.each(['timed_out'])('guard logs retry 1/2 for infrastructure check conclusion %s', conclusion => fixture(f => {
       f.checks[0].conclusion = conclusion;
       expect(f.guard().hold).toBe(false);
       expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
@@ -893,6 +893,79 @@ describe('merge-queue same-head failure admission', () => {
         arg.includes(`/commits/${removed().beforeCommit.oid}/check-runs`)))).toBe(true);
       expect(f.exec.mock.calls.some(([, args]) => args.includes('mergeStateStatus,headRefOid'))).toBe(true);
     }));
+    const regroupChecks = (conclusion = 'cancelled') => [
+      { id: 21, name: 'CI / integration', status: 'completed', conclusion },
+      { id: 22, name: 'CI / test', status: 'completed', conclusion: 'failure' },
+      { id: 23, name: 'merge-gate', status: 'completed', conclusion: 'success' },
+      { id: 24, name: 'soak', status: 'completed', conclusion: 'success' },
+    ];
+    it.each(['cancelled', 'startup_failure'])(
+      'cancelled/regroup retries %s plus a derived aggregate without main, logs or reruns', conclusion => fixture(f => {
+        f.checks = regroupChecks(conclusion);
+        f.mainError = true;
+        const result = f.guard();
+        expect(result.hold).toBe(false);
+        expect(result.line).toContain('mq-same-head-retry:');
+        expect(result.line).toContain('failed_checks cancelled/regroup retry 1/2 (no failed required job; cancelled: CI / integration; aggregate derived: CI / test; PR CLEAN)');
+        expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
+          && !args.some(arg => arg.includes('/actions/') || arg.includes('/logs')))).toBe(true);
+        expect(f.mainReads).toBeUndefined();
+      }));
+    it('cancelled-only evidence also retries without main CI', () => fixture(f => {
+      f.checks = [regroupChecks()[0]];
+      f.mainError = true;
+      expect(f.guard().line).toContain('aggregate derived: none; PR CLEAN');
+    }));
+    it('second cancelled/regroup retry is allowed at N=2; third holds even after manual withdrawal', () => {
+      for (const spent of [1, 2]) fixture(f => {
+        f.checks = regroupChecks();
+        f.events = [removed(), added, removed()];
+        if (spent === 2) f.events.push(added, removed('manual'));
+        const result = f.guard();
+        expect(result.hold).toBe(spent === 2);
+        if (spent === 1) expect(result.line).toContain('cancelled/regroup retry 2/2');
+        else expect(result.line).toMatch(/already spent: 2\/2.*operator must inspect/);
+        expect(f.mainReads).toBeUndefined();
+      });
+    });
+    it('cancelled/regroup bypasses the removal caps below a configured N and holds at N', () => {
+      const previous = process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX;
+      process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX = '3';
+      try {
+        for (const spent of [2, 3]) fixture(f => {
+          f.checks = regroupChecks();
+          f.events = [removed(), added, removed(), added, removed()];
+          if (spent === 3) f.events.push(added, removed());
+          const result = f.guard();
+          expect(result.hold).toBe(spent === 3);
+          expect(result.line).toContain(spent === 2 ? 'cancelled/regroup retry 3/3' : 'already spent: 3/3');
+          expect(f.mainReads).toBeUndefined();
+        });
+      } finally {
+        if (previous === undefined) delete process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX;
+        else process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX = previous;
+      }
+    });
+    it.each(['real failure', 'timed_out', 'unconfigured aggregate', 'aggregate timed_out',
+      'incomplete', 'unreadable', 'truncated', 'not CLEAN', 'unreadable PR state'])(
+      'cancelled/regroup holds with %s evidence', kind => fixture(f => {
+        f.checks = regroupChecks();
+        if (kind === 'real failure') f.checks.push({ id: 25, name: 'test-shard (1)', status: 'completed', conclusion: 'failure' });
+        if (kind === 'timed_out') f.checks[0].conclusion = 'timed_out';
+        if (kind === 'unconfigured aggregate') f.checks[1].name = 'other';
+        if (kind === 'aggregate timed_out') f.checks[1].conclusion = 'timed_out';
+        if (kind === 'incomplete') f.checks[3].status = 'in_progress';
+        if (kind === 'unreadable') f.checkError = true;
+        if (kind === 'truncated') f.checkTotal = 1000;
+        if (kind === 'not CLEAN' || kind === 'unreadable PR state') f.events = [removed(), added, removed()];
+        if (kind === 'not CLEAN') f.live.mergeStateStatus = 'BEHIND';
+        if (kind === 'unreadable PR state') f.live = null;
+        expect(f.guard().hold).toBe(true);
+        if (kind === 'not CLEAN' || kind === 'unreadable PR state') {
+          expect(f.log.mock.calls[1][0]).toMatch(/PR is not CLEAN/);
+          expect(f.mainReads).toBeUndefined();
+        }
+      }));
     it.each([['title', 'Runner disconnected'], ['summary', 'Lost communication with worker'],
       ['summary', 'SELF-HOSTED RUNNER went away']])('guard treats runner loss in output.%s as infrastructure (%s)', (field, text) => fixture(f => {
       f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { [field]: text } };
@@ -1601,6 +1674,33 @@ describe('durable head-bound red-team admission', () => {
 });
 
 describe('drain policy cascade', () => {
+  it('defaults mqCancelledRetryMax to two and logs standard provenance', () => {
+    const log = vi.fn();
+    const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log });
+    expect(r).toMatchObject({ value: { mqCancelledRetryMax: 2 }, sources: { mqCancelledRetryMax: 'standard' } });
+    expect(log.mock.calls.flat().join('')).toContain('mqCancelledRetryMax=2 (standard)');
+  });
+  it.each([
+    ['platform', {}, {}, { mqCancelledRetryMax: 5 }, 5],
+    ['tool', {}, { mqCancelledRetryMax: 4 }, { mqCancelledRetryMax: 5 }, 4],
+    ['env', { WE_DRAIN_MQ_CANCELLED_RETRY_MAX: '3' }, { mqCancelledRetryMax: 4 }, { mqCancelledRetryMax: 5 }, 3],
+  ])('resolves mqCancelledRetryMax from %s and logs provenance', (source, env, tool, platform, value) => {
+    const log = vi.fn();
+    expect(readDrainQueueSafety({ env, tool, platform, log })).toMatchObject({
+      value: { mqCancelledRetryMax: value }, sources: { mqCancelledRetryMax: source },
+    });
+    expect(log.mock.calls.flat().join('')).toContain(`mqCancelledRetryMax=${value} (${source})`);
+  });
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, 'typo', true, null])(
+    'invalid mqCancelledRetryMax %s falls back to the next valid layer', value => {
+      const r = readDrainQueueSafety({ env: {}, tool: { mqCancelledRetryMax: value }, platform: {} });
+      expect(r).toMatchObject({ value: { mqCancelledRetryMax: 2 }, sources: { mqCancelledRetryMax: 'standard' } });
+      expect(r.invalid.join('')).toContain('mqCancelledRetryMax');
+      expect(readDrainQueueSafety({ env: { WE_DRAIN_MQ_CANCELLED_RETRY_MAX: String(value) },
+        tool: { mqCancelledRetryMax: 4 }, platform: {} })).toMatchObject({
+        value: { mqCancelledRetryMax: 4 }, sources: { mqCancelledRetryMax: 'tool' },
+      });
+    });
   it('defaults queueRebuildMax to three and logs standard provenance', () => {
     const lines = [];
     const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log: l => lines.push(l) });
