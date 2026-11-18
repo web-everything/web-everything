@@ -398,7 +398,7 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
   });
 
   it('throws when the enforced shape did not land, naming the stop reason it saw instead', () => {
-    const noShape = { is_error: false, stop_reason: 'end_turn', result: 'here are my thoughts' };
+    const noShape = { is_error: false, session_id: SID, stop_reason: 'end_turn', result: 'here are my thoughts' };
     expect(() => parseJudgeOutcome(JSON.stringify(noShape))).toThrow(/structured_output/);
     expect(() => parseJudgeOutcome(JSON.stringify(noShape))).toThrow(/end_turn/);
   });
@@ -709,7 +709,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
       sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
     expect(error).toBeInstanceOf(Error);
-    expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+    if (source === 'stdout') expect(error.message).toMatch(/malformed JSON object line/);
+    else expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
     expect(error.telemetry ?? {}).not.toHaveProperty('failureKind');
     expect(error).not.toHaveProperty('quota');
     expect(error).not.toHaveProperty('holdRow');
@@ -1609,8 +1610,8 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   it.each([
     ['malformed-only output', malformedLine, /malformed JSON object line.*content redacted/],
     ['explicit CLI error event', JSON.stringify(genericFailure), /JSON error event/],
-    ['missing structured_output', JSON.stringify({ type: 'result', subtype: 'success' }), /expected an object/],
-    ['invalid schema', JSON.stringify({ structured_output: {} }), /schema violation/],
+    ['missing structured_output', JSON.stringify({ type: 'result', subtype: 'success', session_id: SID }), /expected an object/],
+    ['invalid schema', JSON.stringify({ session_id: SID, structured_output: {} }), /schema violation/],
   ].flatMap(([name, stdout, reason]) => [0, 1].map(code => [name, code, stdout, reason])))
   ('treats %s at exit %s as terminal even when the next verdict would be valid', async (_name, code, stdout, reason) => {
     const { fn, calls } = scriptedSpawn([
@@ -1728,7 +1729,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     ['empty object with permissive schema', {}, { type: 'object' }, /nonempty object/],
     ['missing output', undefined, SHAPE, /expected an object/],
   ])('rejects %s as no verdict with a schema violation and no raw output', async (_name, value, shape, violation) => {
-    const stdout = JSON.stringify({ structured_output: value, result: 'private-juror-content' });
+    const stdout = JSON.stringify({ session_id: SID, structured_output: value, result: 'private-juror-content' });
     const { fn, calls } = scriptedSpawn([{ stdout, code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
     const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn })
       .catch(e => e);
@@ -1933,10 +1934,10 @@ describe('resolveUnparseableRetries — the retry count is a cascade setting wit
   });
 });
 
-describe('parseJudgeOutcome — a stray line around the result object does not lose the answer', () => {
-  it('reads the last line that is a JSON result object when the whole stdout is not one document', () => {
+describe('parseJudgeOutcome — every non-blank line must be a JSON object', () => {
+  it('rejects a warning line even when followed by a valid result object', () => {
     const answer = JSON.stringify({ is_error: false, stop_reason: 'tool_use', session_id: 's', structured_output: { verdict: 'accept', findings: [] } });
-    expect(parseJudgeOutcome(`some warning printed to stdout\n${answer}\n`).value).toEqual({ verdict: 'accept', findings: [] });
+    expect(() => parseJudgeOutcome(`some warning printed to stdout\n${answer}\n`)).toThrow(/malformed JSON object line/);
   });
   it('still throws the unparseable error, marked as such, when no line is a result object', () => {
     let err;

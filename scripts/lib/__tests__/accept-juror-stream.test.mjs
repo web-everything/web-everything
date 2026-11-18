@@ -24,6 +24,12 @@ const probes = [
   ['blocking rejection then acceptance', lines({ ...ok, structured_output: { verdict: 'reject' } }, ok), {}, /exactly one/],
   ['schema-invalid then valid', lines({ ...ok, structured_output: { verdict: 123 } }, ok), {}, /exactly one/],
   ['another UUID', lines({ ...ok, session_id: 'bbbbbbbb-bbbb-8ccc-9ddd-eeeeeeeeeeee' }), {}, /session_id mismatch/],
+  ['missing session_id', lines({ type: 'result', structured_output: ok.structured_output }), {}, /session_id missing/],
+  ['legacy without session', lines({ structured_output: ok.structured_output }), {}, /session_id missing/],
+  ...['[]', '[{"type":"error"}', '"log"', '123', 'true', 'null', 'plain log'].flatMap(line =>
+    ['before', 'after'].map(position => [`${line} ${position} success`, position === 'before' ? lines(line, ok) : lines(ok, line), {}, /malformed JSON|invalid JSON event/])),
+  ...['[]', '"log"', '123', 'true', 'null', '[{"type":"error"}'].map(line =>
+    [`non-object or truncated document ${line}`, line, {}, /malformed JSON|invalid JSON event/]),
   ['malformed then success', lines('{broken', ok), {}, /malformed JSON/],
   ['truncated error then success', lines('{"type":"error","message":"SECRET_TOKEN', ok), {}, /malformed JSON/],
   ['8MiB with earlier failure', lines(generic, 'x'.repeat(8 * 1024 * 1024), ok), {}, /exceeds 8MiB.*inspect the full run manually/],
@@ -46,13 +52,17 @@ const probes = [
 describe('acceptJurorStream audit probes', () => {
   it.each(probes)('fails closed: %s', (_name, stream, options, expected) => {
     expect(() => run(stream, options)).toThrow(expected);
+    if (expected instanceof RegExp && /malformed JSON|invalid JSON event|session_id/.test(expected.source)) {
+      try { run(stream, options); } catch (error) {
+        expect(error.verdictIntegrity).toBe(true);
+      }
+    }
   });
   it.each([
     ['JSON document', JSON.stringify(ok, null, 2)],
     ['JSON lines with benign trailers', lines({ type: 'system' }, ok, { type: 'system' }, { type: 'rate_limit_event' })],
     ['legacy document', lines({ session_id: sessionId, structured_output: ok.structured_output })],
-    ['legacy without session', lines({ structured_output: ok.structured_output })],
-    ['plain log ignored', lines('plain log', ok)],
+    ['blank lines ignored', `\n \n${lines(ok)}\n\t\n`],
   ])('accepts %s', (_name, stream) => expect(run(stream).value).toEqual(ok.structured_output));
   it('keeps quota hold metadata deterministically', () => {
     let error;

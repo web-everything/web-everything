@@ -714,7 +714,7 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
   catch {
     events = [];
     for (const line of stdout.split(/\r?\n/)) {
-      if (!line.trimStart().startsWith('{')) continue;
+      if (!line.trim()) continue;
       try { events.push(JSON.parse(line)); }
       catch { malformed = true; }
     }
@@ -726,7 +726,7 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
   let results = 0;
   for (const event of events) {
     if (!event || typeof event !== 'object' || Array.isArray(event)) {
-      failure ??= fail('judge-spawn: invalid JSON event; no verdict.');
+      failure ??= fail('judge-spawn: invalid JSON event: expected a JSON object (content redacted); no verdict.');
       continue;
     }
     const isResult = event.type === 'result' || (event.type === undefined
@@ -767,12 +767,16 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
   if (Buffer.byteLength(stdout) > 8 * 1024 * 1024) {
     throw fail('judge-spawn: stdout exceeds 8MiB; inspect the full run manually; no verdict.');
   }
-  if (malformed) throw fail('judge-spawn: the juror did not emit parseable JSON: malformed JSON object line on stdout (content redacted); no verdict.');
+  // Preserve the lost/plain-stdout retry only when there is no JSON evidence at all.
+  // A truncated object or array is evidence too, even if no line parsed successfully.
+  if (malformed && (events.length || /^\s*[\[{]/m.test(stdout))) {
+    throw fail('judge-spawn: the juror did not emit parseable JSON: malformed JSON object line on stdout (content redacted); no verdict.');
+  }
   if (failure) throw failure;
   if (!events.length) throw Object.assign(new Error('judge-spawn: the juror did not emit parseable JSON on stdout.\n'
     + `stdout[0..600]: ${stdout.slice(0, 600)}\nstderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`), { unparseableStdout: true });
   if (results !== 1) throw fail('judge-spawn: expected exactly one result event; no verdict.');
-  if ('session_id' in result && result.session_id !== sessionId) throw fail('judge-spawn: result session_id mismatch; no verdict.');
+  if (!Object.hasOwn(result, 'session_id') || result.session_id !== sessionId) throw fail('judge-spawn: result session_id missing or session_id mismatch; no verdict.');
   let validate;
   try { validate = compileJurorSchema(schema); }
   catch (error) { throw fail(`judge-spawn: schema compilation failed (${error instanceof JurorSchemaError ? error.message : 'details redacted'}); correct the schema before retrying; no verdict.`); }
@@ -786,7 +790,7 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     throw fail(violation ? `structured_output schema violation at ${violation.schemaPath}: ${violation.message}`
       : 'structured_output schema violation: expected a nonempty object');
   }
-  return { value, sessionId: result.session_id ?? sessionId, costUsd: typeof result.total_cost_usd === 'number' ? result.total_cost_usd : 0,
+  return { value, sessionId: result.session_id, costUsd: typeof result.total_cost_usd === 'number' ? result.total_cost_usd : 0,
     durationMs: typeof result.duration_ms === 'number' ? result.duration_ms : 0,
     numTurns: typeof result.num_turns === 'number' ? result.num_turns : 0,
     stopReason: result.stop_reason ?? '', usage: result.usage ?? {} };
