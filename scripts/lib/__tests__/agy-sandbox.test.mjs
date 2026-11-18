@@ -19,10 +19,19 @@ function fixture() {
   const stateDir = join(homeDir, '.gemini/antigravity-cli');
   const workspaceOps = join(homeDir, 'workspace/.operations');
   for (const p of [cloneDir, privateTempDir, laneDir, join(privateHomeDir, '.gemini/antigravity-cli'), join(stateDir, 'log'), join(stateDir, 'bin'), join(stateDir, 'builtin'), ...sandboxSecretPaths(homeDir), workspaceOps]) mkdirSync(p, { recursive: true });
-  return { root, homeDir, cloneDir, privateTempDir, privateHomeDir, laneDir, workspaceOps, osTempBase: realpathSync(tmpdir()) };
+  return { transcriptDir: join(root, 'transcript'), root, homeDir, cloneDir, privateTempDir, privateHomeDir, laneDir, workspaceOps, osTempBase: realpathSync(tmpdir()) };
 }
 
 describe('pure sandbox profile', () => {
+  it.each(['cloneDir', 'privateTempDir', 'privateHomeDir', 'workspaceOps'])
+  ('refuses a transcript directory in %s with operator fallback', key => {
+    const f = fixture();
+    for (const transcriptDir of [f[key], join(f[key], 'transcript')])
+      expect(() => buildSandboxProfile({ ...f, transcriptDir })).toThrow(/transcript directory.*operator review/);
+  });
+  it('refuses missing transcript containment evidence', () => {
+    expect(() => buildSandboxProfile({ ...fixture(), transcriptDir: undefined })).toThrow('unsafe sandbox path');
+  });
   it('denies writes by default, grants clone/private state/device writes, and keeps network allowed', () => {
     const f = fixture();
     const profile = buildSandboxProfile(f);
@@ -118,7 +127,7 @@ describe('pure sandbox profile', () => {
   });
   it.each(['"', '\\', '\n', '\r', '\0', '\x7f', '\x85'])('refuses unsafe SBPL path character %j', char => {
     const f = fixture();
-    for (const key of ['cloneDir', 'homeDir', 'workspaceOps', 'privateTempDir', 'privateHomeDir', 'laneDir', 'osTempBase', 'extraDeniedPaths', 'deniedPaths']) {
+    for (const key of ['cloneDir', 'homeDir', 'workspaceOps', 'privateTempDir', 'privateHomeDir', 'laneDir', 'osTempBase', 'transcriptDir', 'extraDeniedPaths', 'deniedPaths']) {
       const p = join(f.root, `unsafe${char}path`);
       expect(() => buildSandboxProfile({ ...f, [key]: key.endsWith('Dirs') || key.endsWith('Paths') ? [p] : p }))
         .toThrow('unsafe sandbox path');

@@ -76,17 +76,21 @@ export function preparePrivateAgyHome(homeDir, privateHomeDir, cloneDir) {
 
 /** Pure SBPL builder. Inputs are canonical absolute paths resolved by the launcher.
  * deniedPaths lets the launcher resolve secret symlinks; extraDeniedPaths supports isolated probes. */
-export function buildSandboxProfile({ cloneDir, privateTempDir, laneDir, homeDir, privateHomeDir, workspaceOps, osTempBase,
+export function buildSandboxProfile({ transcriptDir, cloneDir, privateTempDir, laneDir, homeDir, privateHomeDir, workspaceOps, osTempBase,
   agyBinDir, homebrewPrefix, workspaceDir = join(homeDir, 'workspace'), deniedPaths = sandboxSecretPaths(homeDir), extraDeniedPaths = [] }) {
   const privateState = join(privateHomeDir, '.gemini');
   const writable = [cloneDir, privateTempDir, privateState];
   safePath(osTempBase);
+  safePath(transcriptDir);
   const readDenied = ['/Users', '/Volumes', '/private/tmp', '/tmp',
     inside(osTempBase, '/private/var/folders') ? '/private/var/folders' : osTempBase, homeDir];
   const binaryRoots = [agyBinDir, homebrewPrefix].filter(Boolean);
   const readable = [cloneDir, privateTempDir, privateHomeDir, ...binaryRoots];
   readDenied.forEach(safePath);
   [homeDir, workspaceDir, workspaceOps, laneDir, ...writable, ...readable, ...(agyBinDir ? [agyBinDir] : []), ...deniedPaths, ...extraDeniedPaths].forEach(safePath);
+  if ([...writable, privateHomeDir, workspaceDir, join(homeDir, 'workspace'), laneDir]
+    .some(p => inside(transcriptDir, p) || inside(p, transcriptDir)))
+    throw new Error('transcript directory overlaps sandbox writable roots/home/workspace/lane; use another provider or request operator review');
   if (binaryRoots.some(bin => [workspaceDir, join(homeDir, 'workspace')].some(p => inside(bin, p) || inside(p, bin))))
     throw new Error('agy binary overlaps workspace; use another provider or request operator review');
   if (binaryRoots.some(p => inside(p, join(homeDir, '.gemini')) || inside(join(homeDir, '.gemini'), p)))

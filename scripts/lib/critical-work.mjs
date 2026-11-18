@@ -69,6 +69,11 @@ const CRITICAL_PATH_PREFIXES = Object.freeze({
     'scripts/lib/github-app-', 'scripts/lib/forge-land-provider.mjs', 'scripts/operations/land-advance',
     'scripts/operations/pr-land-reasons.mjs', 'scripts/lib/ai-pr-authorship.mjs', 'scripts/lib/marker-authorship.mjs',
     'scripts/lib/verdict-totality.mjs', 'scripts/lib/trust-chain-tier.mjs', 'scripts/conveyor/hiccup-approve.mjs',
+    // Untrusted diff producer: its confinement, admission, settings and regression harness are gate code.
+    'scripts/lib/agy-confined-', 'scripts/lib/agy-sandbox.mjs', 'scripts/lib/agy-fix-admission.mjs',
+    'scripts/operations/agy-fix-provider.mjs', 'scripts/settings/agy-build.json',
+    'scripts/lib/__tests__/agy-confined-', 'scripts/lib/__tests__/agy-sandbox.test.mjs',
+    'scripts/lib/__tests__/agy-fix-admission.test.mjs',
     '.githooks/',
   ]),
   irreversible: Object.freeze([

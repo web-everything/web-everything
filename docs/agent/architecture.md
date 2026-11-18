@@ -70,3 +70,9 @@ for (const injector of element.injectors()) console.log(injector.providers); // 
 const r = registry.parse('expr'); console.log(r.success, r.expressions, r.remaining); // parser
 ```
 Subclass `CustomAttribute` and log in `connectedCallback`/`disconnectedCallback` to trace lifecycle.
+
+## Confined agy transcript ownership
+
+Keep build transcripts in a fresh launcher-owned 0700 temp directory outside every sandbox write grant,
+private HOME, clone, lane and workspace. The profile builder refuses overlaps; the launcher uses exclusive
+no-follow creation and retains the regular-file fd for writes. Audit before deleting the directory.

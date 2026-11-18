@@ -2,7 +2,7 @@
  * The launcher alone applies admitted hunks; agy's git operations remain forbidden. */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { accessSync, constants, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
@@ -87,14 +87,14 @@ export async function defaultSpawnAgy(options) {
     const privateHomeDir = profileDir;
     preparePrivateAgyHome(homeDir, privateHomeDir, realpathSync(options.dir));
     const privateTempDir = mkdtempSync(join(profileDir, 'tmp-'));
-    const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir, privateTempDir, privateHomeDir, osTempBase: temp,
+    const profile = buildSandboxProfile({ transcriptDir: realpathSync(dirname(options.logFile)), cloneDir: realpathSync(options.dir), homeDir, privateTempDir, privateHomeDir, osTempBase: temp,
       laneDir: realpathSync(options.laneDir), workspaceDir, agyBinDir: dirname(cli),
       homebrewPrefix: cli.match(/^(.*)\/(?:Cellar|Caskroom)\//)?.[1],
       workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
       deniedPaths: sandboxSecretPaths(homeDir).map(canonicalPath) });
     const profileFile = join(profileDir, 'profile.sb');
     writeFileSync(profileFile, profile, { mode: 0o600, flag: 'wx' });
-    return await runAgyDirectExec({ ...options, cli, readHold: readAgyHold, saveHold: saveAgyHold, spawnFn: (bin, args, opts) => {
+    return await runAgyDirectExec({ ...options, exclusiveLog: true, cli, readHold: readAgyHold, saveHold: saveAgyHold, spawnFn: (bin, args, opts) => {
       const [, ...argv] = sandboxedSpawnArgv(profileFile, [bin, ...args]);
       return spawn('/usr/bin/sandbox-exec', argv, { ...opts,
         env: buildSandboxEnv(process.env, privateTempDir, privateHomeDir) });
@@ -151,7 +151,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     spawnAgy = defaultSpawnAgy, mkTempDir = mkdtempSync,
     platform = process.platform, sandboxExists = existsSync,
     removeDir = p => rmSync(p, { recursive: true, force: true }), log = console.error } = deps;
-  let clone;
+  let clone, transcriptDir;
   const result = (status, reasons = [], extra = {}) => ({ status, applied: [],
     reasons: reasons.map(r => scrubPaths(r, [clone, laneDir, MODULE_REPO_ROOT, tmpdir()])
       .replace(/[\x00-\x1f\x7f]/g, ' ')), ...extra });
@@ -208,8 +208,10 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
       GIT_DIR: join(clone, '.git'), GIT_COMMON_DIR: join(clone, '.git'), GIT_WORK_TREE: clone,
       GIT_ALTERNATE_OBJECT_DIRECTORIES: '',
     } });
-    // Stored inside the disposable clone, outside the tracked diff. Never accept a caller-selected log path.
-    const transcriptFile = join(clone, '.git', 'agy-build.jsonl');
+    // Launcher-owned sibling of the clone and sandbox HOME/temp; never grant worker writes here.
+    transcriptDir = realpathSync(mkdtempSync(join(tmpdir(), 'we-agy-transcript-')));
+    chmodSync(transcriptDir, 0o700);
+    const transcriptFile = join(transcriptDir, 'agy-build.jsonl');
     let outcome, spawnError;
     try {
       outcome = await spawnAgy({ dir: clone, laneDir, model, effort, logFile: transcriptFile, stream: false,
@@ -225,8 +227,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     let events;
     try {
       const transcript = readFile(transcriptFile);
-      // The native file tools can reach the log too. Compare with the launcher's captured stream
-      // so editing/replacing the on-disk evidence cannot erase a tool call.
+      // Require the on-disk evidence to match the launcher's captured stream.
       if (typeof outcome?.stdout !== 'string' || transcript !== outcome.stdout) throw new Error('transcript differs from captured stream');
       events = auditTranscript(transcript, clone);
     }
@@ -272,6 +273,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
   } catch {
     return result('voided', ['confinement or atomic apply evidence failed; use another fix provider or request human review']);
   } finally {
-    if (clone) removeDir(clone);
+    try { if (clone) removeDir(clone); }
+    finally { if (transcriptDir) rmSync(transcriptDir, { recursive: true, force: true }); }
   }
 }

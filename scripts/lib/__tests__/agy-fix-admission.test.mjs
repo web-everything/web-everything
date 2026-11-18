@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
+import { criticalWorkVerdict } from '../critical-work.mjs';
 import { deriveAgyFixAdmission } from '../agy-fix-admission.mjs';
 
 const admit = item => deriveAgyFixAdmission(item, { scope: item.scope });
@@ -73,4 +74,21 @@ describe('repair scope admission', () => {
     expect(admit({ taskKind: 'doc-fix', size: 1, scope }))
       .toEqual({ kind: 'doc-fix', size: 1, scope });
   });
+});
+
+it.each([
+  'scripts/lib/agy-confined-build.mjs', 'scripts/lib/agy-sandbox.mjs',
+  'scripts/lib/agy-fix-admission.mjs', 'scripts/operations/agy-fix-provider.mjs',
+  'scripts/settings/agy-build.json', 'scripts/lib/agy-confined-future.mjs',
+  'scripts/lib/__tests__/agy-confined-build.test.mjs',
+  'scripts/lib/__tests__/agy-confined-launcher.test.mjs',
+  'scripts/lib/__tests__/agy-confined-future.test.mjs',
+  'scripts/lib/__tests__/agy-sandbox.test.mjs', 'scripts/lib/__tests__/agy-fix-admission.test.mjs',
+])('shared verdict marks confinement path %s critical and refuses size-1 admission', path => {
+  expect(criticalWorkVerdict({ filesTouched: [path] }).critical).toBe(true);
+  expect(admit({ taskKind: 'fix', size: 1, scope: [path] })).toBeNull();
+});
+it('shared verdict keeps ordinary documentation non-critical and admissible', () => {
+  expect(criticalWorkVerdict({ filesTouched: ['docs/guide.md'] }).critical).toBe(false);
+  expect(admit({ size: 1, scope: ['docs/guide.md'] })).not.toBeNull();
 });

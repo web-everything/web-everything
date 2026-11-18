@@ -442,3 +442,25 @@ describe('escape evidence', () => {
     expect((await f.run(undefined, { forgedTranscript: JSON.stringify(finish) })).status).toBe('voided');
   });
 });
+
+it('audits launcher-owned private transcript outside clone and removes it after applying', async () => {
+  const f = fixture();
+  let transcriptDir;
+  const result = await f.run((clone, args) => {
+    transcriptDir = dirname(args.logFile);
+    expect(transcriptDir.startsWith(`${clone}/`)).toBe(false);
+    expect(transcriptDir.startsWith(`${f.lane}/`)).toBe(false);
+    expect(lstatSync(transcriptDir).mode & 0o777).toBe(0o700);
+    writeFileSync(join(clone, 'docs/a.md'), 'after\n');
+  });
+  expect(result).toMatchObject({ status: 'ok', applied: ['docs/a.md'] });
+  expect(readFileSync(join(f.lane, 'docs/a.md'), 'utf8')).toBe('after\n');
+  expect(existsSync(transcriptDir)).toBe(false);
+});
+it('removes launcher transcript directory after rejected transcript audit', async () => {
+  const f = fixture();
+  let transcriptDir;
+  expect(await f.run((_clone, args) => { transcriptDir = dirname(args.logFile); },
+    { forgedTranscript: '{}' })).toMatchObject({ status: 'voided' });
+  expect(existsSync(transcriptDir)).toBe(false);
+});
