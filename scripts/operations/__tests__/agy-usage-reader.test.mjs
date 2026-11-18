@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { collectAgyUsage, parseAgyUsage, readAgyUsageSettings, runAgyUsageReader } from '../agy-usage-reader.mjs';
+import { collectAgyUsage, descendantPids, parseAgyUsage, readAgyUsageSettings, runAgyUsageReader } from '../agy-usage-reader.mjs';
 
 const NOW = Date.parse('2026-11-18T12:00:00Z');
 const SCREEN = `GEMINI MODELS
@@ -55,7 +55,7 @@ function processFixture(options = {}) {
   const writes = [];
   child.stdin.on('data', data => writes.push(data.toString()));
   const spawnFn = vi.fn(() => child), kill = vi.fn();
-  const promise = collectAgyUsage({ home: '/trusted-home', now: () => NOW, spawnFn, kill, ...options });
+  const promise = collectAgyUsage({ home: '/trusted-home', now: () => NOW, spawnFn, kill, descendants: () => [], ...options });
   return { child, writes, spawnFn, kill, promise };
 }
 
@@ -80,6 +80,16 @@ describe('PTY collection', () => {
     await assertion;
     expect(h.kill).toHaveBeenCalledTimes(1);
     expect(h.kill).toHaveBeenCalledWith(-1234, "SIGKILL");
+  });
+  it('kills the pty grandchild by exact PID before the wrapper group', async () => {
+    const h = processFixture({ descendants: () => [1236, 1235] });
+    const assertion = expect(h.promise).rejects.toThrow('timed out');
+    await vi.advanceTimersByTimeAsync(45000);
+    await assertion;
+    expect(h.kill.mock.calls).toEqual([[1236, 'SIGKILL'], [1235, 'SIGKILL'], [-1234, 'SIGKILL']]);
+  });
+  it('lists descendants leaf first from ps output', () => {
+    expect(descendantPids(10, () => '10 1\n11 10\n12 11\n13 99\n')).toEqual([12, 11]);
   });
   it('bounds oversized output with an operator-visible manual retry fallback', async () => {
     const h = processFixture({ maxBytes: 8 });

@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { homedir } from 'node:os';
@@ -7,6 +7,20 @@ import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+
+/** Exact PIDs of every descendant of `root` (script moves agy into its own session, so the group kill misses it). */
+export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })) {
+  const children = new Map();
+  try {
+    for (const line of list().split('\n')) {
+      const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+      if (Number.isInteger(pid) && Number.isInteger(ppid)) children.set(ppid, [...(children.get(ppid) ?? []), pid]);
+    }
+  } catch { return []; }
+  const out = [], queue = [root];
+  while (queue.length) for (const pid of children.get(queue.shift()) ?? []) { out.push(pid); queue.push(pid); }
+  return out.reverse();
+}
 
 export function readAgyUsageSettings({ env = process.env, read = readSettings, platform, log = console.error } = {}) {
   const number = key => env[key] === undefined ? undefined : Number(env[key]);
@@ -38,7 +52,7 @@ export function parseAgyUsage(screen, now = Date.now()) {
 /** Run only the PTY wrapper; all process I/O is injectable and bounded. No agy settings are written. */
 export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn = spawn,
   kill = process.kill.bind(process), now = Date.now, startupMs = 3000, stepMs = 300,
-  maxBytes = 1024 * 1024 } = {}) {
+  maxBytes = 1024 * 1024, descendants = descendantPids } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnFn('sh', ['-c', 'cat | script -q /dev/null agy'], { cwd: home, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let screen = '', bytes = 0, requested = false, stopping = false, settled = false;
@@ -49,7 +63,8 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       settled = true;
       timers.forEach(clearTimeout);
       if (Number.isInteger(child.pid) && child.pid > 0) {
-        // Own process group (detached): negative exact PID kills sh, cat, script and agy together.
+        // Exact PIDs only: descendants first (agy lives in script's own session), then the wrapper and its group.
+        for (const pid of descendants(child.pid)) { try { kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
         try { kill(-child.pid, 'SIGKILL'); } catch { /* child may already have exited */ }
       }
       error ? reject(error) : resolve(value);
