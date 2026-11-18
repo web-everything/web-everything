@@ -1,4 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { readPlannerRow, readPlannerRows } from './red-team-planner-row.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
@@ -477,11 +478,12 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
  *   a kept `red-team:pending`. Every other stored verdict flows through the evidence and owed-ness checks unchanged,
  *   so a verdict added to the enum needs no branch here.
  */
-export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
+export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [], rawPrs, requiredChecks, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
-  return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
+  return readPlannerRows({ repo, plan, refusals, rawPrs, requiredChecks })
+    .filter(row => row.refusal.kind === 'already-reviewed-head').map(({ refusal }) => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
@@ -917,7 +919,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   try {
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
-    const refusals = plan?.refusals ?? [];
+    const refusals = readPlannerRows({ repo, plan, rawPrs }).map(row => row.refusal);
     // Reconcile rows omit formal reviews. Read recovery candidates, including unaccepted not-owed heads,
     // once per PR, without mutating the daemon's shared snapshot. Failed/oversized
     // reads stay unknown: the planner requires operator inspection before clearing.
@@ -927,9 +929,11 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const reviewsByPr = new Map();
     const planningPrs = (rawPrs ?? []).map(rawPr => {
       const pr = Number(rawPr?.number), head = rawPr?.headRefOid;
+      const { refusal } = readPlannerRow({ repo, pr, plan,
+        refusals: refusals.filter(r => r?.kind === 'already-reviewed-head'
+          && (r.headSha == null || r.headSha === head)), rawPrs });
       if (!resolved.enabled || Array.isArray(rawPr?.reviews) || !isRealHead(head)
-        || !refusals.some(r => r?.kind === 'already-reviewed-head' && Number(r.prNumber) === pr
-          && (r.headSha == null || r.headSha === head))
+        || !refusal || !(refusal.headSha == null || refusal.headSha === head)
         || !Array.isArray(rawPr.comments) || redTeamForHead(rawPr.comments, pr, head)
         || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
           // review:pending is the parked run's own retained label: a ruled referral-blocked review resumes through
@@ -944,7 +948,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       reviewsByPr.set(pr, reviews);
       return { ...rawPr, reviews };
     });
-    const planningOptions = { repo, refusals, rawPrs: planningPrs,
+    const planningOptions = { repo, plan, refusals, rawPrs: planningPrs,
       readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
@@ -986,7 +990,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         throw Error('evidence changed before settlement');
       }
       const rawPr = { ...live, number: row.prNumber, comments, reviews };
-      const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
+      const { refusal } = readPlannerRow({ repo, pr: row.prNumber, plan, rawPrs: [rawPr],
+        refusals: refusals.filter(r => r.kind === 'already-reviewed-head') });
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });
       if (fresh?.why === 'review-unfinished' && fresh.escalate) {

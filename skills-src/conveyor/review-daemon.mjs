@@ -96,6 +96,7 @@ import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
 import { sampleHost } from '../../scripts/lib/host-sample.mjs';
 import { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
+import { readPlannerRows } from '../../scripts/lib/red-team-planner-row.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
@@ -212,7 +213,8 @@ export const OPERATOR_HOLD_KINDS = Object.freeze(['cap-exhausted', 'stood-down',
  */
 export function operatorHoldsFromPlan(plan) {
   const seen = new Map();
-  for (const row of Array.isArray(plan?.refusals) ? plan.refusals : []) {
+  for (const { refusal: row } of readPlannerRows({
+    plan, refusals: Array.isArray(plan?.refusals) ? plan.refusals : [] })) {
     const prNumber = Number(row?.prNumber);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue;
     for (const refusal of [row, row?.reviewRefusal]) {
@@ -297,7 +299,7 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     const names = (pr?.labels ?? []).map(labelName);
     // A `review:pending` PR already has its once-per-episode notice; a `review:human` PR without one has nothing.
     const alwaysExplained = names.includes(ALWAYS_EXPLAINED_LABEL) && !names.includes('review:pending');
-    if (!alwaysExplained && plan?.refusals?.some(r => r.prNumber === n
+    if (!alwaysExplained && readPlannerRows({ plan }).some(({ refusal: r }) => r.prNumber === n
       && (r.kind === 'review-referrals-pending' || r.reviewRefusal?.kind === 'review-referrals-pending')
       && (r.referralHold ?? r.reviewRefusal?.referralHold)?.kind !== 'same-head')) continue;
     const held = (pr?.labels ?? []).map(labelName).filter((l) => EXPLAINED_HOLD_LABELS.includes(l));
@@ -307,7 +309,7 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     for (const d of (plan?.dispatch ?? [])) {
       if (Number(d?.prNumber) === n && d.kind !== 'review') reasons.push(`owed a ${d.kind}, not a review — ${d.why ?? ''}`.trim());
     }
-    for (const r of (plan?.refusals ?? [])) {
+    for (const { refusal: r } of readPlannerRows({ plan })) {
       if (Number(r?.prNumber) !== n) continue;
       const bind = r.cwd || r.pid != null ? ` [cwd=${r.cwd ?? '?'} pid=${r.pid ?? 'absent'}]` : '';
       reasons.push(`${r.kind}: ${r.why ?? ''}${bind}`);
@@ -678,7 +680,7 @@ export function runReviewTick({
   let occupiedLanes = 0;
   const dispatched = [];
   const failed = [];
-  for (const row of plan.refusals ?? []) {
+  for (const { refusal: row } of readPlannerRows({ repo, plan, rawPrs })) {
     const hold = row.referralHold ?? row.reviewRefusal?.referralHold;
     if (!hold) continue;
     try {
@@ -693,7 +695,7 @@ export function runReviewTick({
   // and routes the PR to a fixer to rebase. No review is dispatched for it meanwhile (the plan refused it).
   const scopeBloatRefreshed = [];
   if (typeof refreshScopeBloat === 'function') {
-    for (const row of plan.refusals ?? []) {
+    for (const { refusal: row } of readPlannerRows({ repo, plan, rawPrs })) {
       if (row.kind !== 'scope-bloat' || !row.scopeBloat?.stale || row.scopeBloat.refresh || !row.headRefName || !row.headRefOid) continue;
       // A refresh that THROWS is normalized into a failed result and goes down the same path as one that returns: it is
       // remembered in this process AND gets the durable per-head marker, because the fix daemon (another process) reads
@@ -732,7 +734,7 @@ export function runReviewTick({
       // guard. For red-team recovery they are also already reviewed; the recovery planner still
       // requires an accepting, head-bound payload and checks comments, status and cooldown.
       // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
-      const recoveryRefusals = (plan.refusals ?? []).map(row =>
+      const recoveryRefusals = readPlannerRows({ repo, plan, rawPrs }).map(({ refusal: row }) =>
         row.kind === 'nothing-owed' && row.phase === 'queued'
           ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
           : row);
