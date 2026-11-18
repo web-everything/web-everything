@@ -203,27 +203,21 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
   } catch { return unchanged; }
 }
 
-// Exact producer diagnostic only: an unreadable workflow comparison is still a real failure.
-const workflowMismatch = "running workflow (\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml) at [0-9a-f]{9} differs from [A-Za-z0-9._/-]+'s — a PR may not change the gate that judges it";
 function parseWorkflowProtection(job, log, prNumber) {
   const lines = String(log).split(/\r?\n/).map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''));
-  const diagnostics = lines.filter(l => l.startsWith('merge-gate: workflow self-check'));
-  const diagnostic = new RegExp(`^merge-gate: workflow self-check — FAIL: (${workflowMismatch})$`).exec(diagnostics[0] ?? '');
   const table = parsePrResultTable(log, prNumber);
-  const tableWorkflowHold = !table.error && table.results.some(r => r.id === 'review-acceptance'
-    && r.status === 'hold' && /^human-only: the diff at [0-9a-f]{9} touches \.github\/(?:workflows|actions)\//.test(r.reason));
-  if ((!diagnostic || diagnostics.length !== 1) && !tableWorkflowHold) return null;
-  // Workflow protection excuses only its own failure. Check the whole job, including
-  // diagnostics before the table that parsePrResultTable does not inspect.
+  if (table.error || table.ok) return null;
+  // Only the table proves a workflow-touching diff hold. A self-check failure
+  // is a job-level failure, even when the PR table otherwise passes.
   const mergeGateLines = lines.filter(l => l.startsWith('merge-gate:'));
-  const summaries = lines.filter(l => /^merge-gate: (?:PASS|HOLD)/.test(l));
-  const footer = `merge-gate: HOLD — workflow self-check failed — fail closed: ${diagnostic?.[1]}; `;
-  if (tableWorkflowHold
-    ? mergeGateLines.length !== 1 || mergeGateLines[0] !== 'merge-gate: HOLD — held'
-    : mergeGateLines.length !== 2 || summaries.length !== 1
-      || !['held', 'all pass'].some(end => summaries[0] === footer + end)) {
+  const summaries = mergeGateLines.filter(l => !/^merge-gate: workflow self-check — ok: .+$/.test(l));
+  if (mergeGateLines.length - summaries.length > 1 || summaries.length !== 1
+    || summaries[0] !== 'merge-gate: HOLD — held') {
     return { error: 'unknown or ambiguous workflow-protection merge-gate diagnostic' };
   }
+  const tableWorkflowHold = table.results.some(r => r.id === 'review-acceptance'
+    && r.status === 'hold' && /^human-only: the diff at [0-9a-f]{9} touches \.github\/(?:workflows|actions)\//.test(r.reason));
+  if (!tableWorkflowHold) return null;
   // The evaluator must be the sole failed step in the gate's own completed job.
   const steps = job.steps;
   if (job.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure'
@@ -232,12 +226,7 @@ function parseWorkflowProtection(job, log, prNumber) {
   const failed = steps.filter(s => s.conclusion === 'failure');
   if (failed.length !== 1 || failed[0].name !== "Evaluate the drain's merge gates"
     || steps.filter(s => s.name === failed[0].name).length !== 1) return { error: 'workflow-protection evaluator is not the sole failed step' };
-  if (tableWorkflowHold) return { ...table, workflowEditProtection: true };
-  const normalized = lines.filter(l => l !== diagnostics[0]).map(l => l === summaries[0]
-    ? `merge-gate: ${l.endsWith('; held') ? 'HOLD — held' : 'PASS — all pass'}` : l).join('\n');
-  const parsed = parsePrResultTable(normalized, prNumber);
-  if (parsed.error) return null;
-  return { ...parsed, ok: false, workflowEditProtection: true };
+  return { ...table, workflowEditProtection: true };
 }
 
 const jobCache = new Map();

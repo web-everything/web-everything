@@ -636,7 +636,7 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
     })[0], runGh };
   }
   it('uses the real workflow-edit producer reason in the fixture', () => {
-    const hold = workflowEditFact({ pinnedHead: { sha: HEAD }, gatePaths: { files: ['.github/workflows/merge-gate.yml'] } });
+    const hold = workflowEditFact({ pinnedHead: { sha: HEAD }, gatePaths: { files: ['.github/workflows/ci.yml'] } });
     expect(workflowEvidence().log).toContain(`  hold  review-acceptance  ${hold.reason}`);
   });
   it('annotates a workflow-edit hold from the failed evaluator without clearing merge-gate', () => {
@@ -645,26 +645,33 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
       mergeGateReviewHold: { holds: expect.arrayContaining(['workflow-edit-protection']), jobId: 123 } });
     expect(runGh.mock.calls[0][0]).toEqual(['api', 'repos/owner/repo/actions/jobs/123']);
   });
-  it('also annotates the workflow table hold when the running workflow matches main', () => {
+  it('also annotates the table hold without a self-check diagnostic', () => {
     const { out } = probe(e => { e.log = e.log.split('\n').filter(l => !l.startsWith('merge-gate:')).concat('merge-gate: HOLD — held').join('\n'); });
     expect(out.statusCheckRollup[0].mergeGateReviewHold).toBeTruthy();
   });
-  it.each(['diagnostic HOLD', 'diagnostic PASS', 'table'])('keeps %s red without review ownership on an extra no-verdict diagnostic', path => {
-    for (const position of ['before', 'after']) {
-      const { out } = probe(e => {
-        if (path === 'table') {
-          e.log = e.log.split('\n').filter(l => !l.startsWith('merge-gate:'))
-            .concat('merge-gate: HOLD — held').join('\n');
-        } else if (path === 'diagnostic PASS') {
-          e.log = e.log.replace('#7106: HOLD', '#7106: PASS')
-            .replace(/  hold  review-acceptance  [^\n]+/, '  pass  review-acceptance  accepted')
-            .replace('; held', '; all pass');
-        }
-        const extra = 'merge-gate: no verdict — failing closed';
-        e.log = position === 'before' ? `${extra}\n${e.log}` : `${e.log}\n${extra}`;
-      });
-      expect(out.statusCheckRollup, `${path}: ${position}`).toEqual([workflowRow]);
-    }
+  function selfCheckFailure(e, verdict = 'HOLD') {
+    const mismatch = `running workflow .github/workflows/ci.yml at ${HEAD.slice(0, 9)} differs from main's — a PR may not change the gate that judges it`;
+    e.log = e.log.replace(/merge-gate: workflow self-check — ok: [^\n]+/,
+      `merge-gate: workflow self-check — FAIL: ${mismatch}`)
+      .replace('merge-gate: HOLD — held',
+        `merge-gate: HOLD — workflow self-check failed — fail closed: ${mismatch}; ${verdict === 'PASS' ? 'all pass' : 'held'}`);
+    if (verdict === 'PASS') e.log = e.log.replace('#7106: HOLD', '#7106: PASS')
+      .replace(/  hold  review-acceptance  [^\n]+/, '  pass  review-acceptance  accepted');
+  }
+  it.each(['HOLD', 'PASS'])('keeps self-check FAIL with a %s table red without review ownership', verdict => {
+    expect(probe(e => selfCheckFailure(e, verdict)).out.statusCheckRollup).toEqual([workflowRow]);
+  });
+  it('keeps self-check FAIL red when only src/example.js changed', () => {
+    expect(probe(e => {
+      selfCheckFailure(e);
+      e.log = e.log.replace(/  hold  review-acceptance  [^\n]+/, '  hold  review-acceptance  awaiting review');
+    }).out.statusCheckRollup).toEqual([workflowRow]);
+  });
+  it.each(['before', 'after'])('keeps the table hold red on an extra no-verdict diagnostic %s the log', position => {
+    expect(probe(e => {
+      const extra = 'merge-gate: no verdict — failing closed';
+      e.log = position === 'before' ? `${extra}\n${e.log}` : `${e.log}\n${extra}`;
+    }).out.statusCheckRollup).toEqual([workflowRow]);
   });
   it.each([
     ['wrong head', e => { e.job.head_sha = 'b'.repeat(40); }],
@@ -674,18 +681,12 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
     ['other failing step', e => { e.job.steps[0].conclusion = 'failure'; }],
     ['wrong failed step', e => { e.job.steps[1].name = 'Install'; }],
     ['real CI failure', e => { e.log = e.log.replace('pass  codeql  ok', 'hold  codeql  CodeQL failed'); }],
-    ['unreadable workflow comparison', e => { e.log = e.log.replaceAll(/running workflow [^\n;]+/g, 'running workflow could not be compared with main'); }],
+    ['unreadable workflow comparison', e => { e.log = e.log.replace(/merge-gate: workflow self-check — ok: [^\n]+/, 'merge-gate: workflow self-check — FAIL: running workflow could not be compared with main'); }],
     ['truncated table', e => { e.log = e.log.replace(/  pass  codeql  ok\n/, ''); }],
     ['extra footer', e => { e.log += '\nmerge-gate: HOLD — held'; }],
+    ['duplicate self-check', e => { e.log = `${e.log.split('\n')[0]}\n${e.log}`; }],
   ])('keeps %s red without review ownership', (_name, mutate) => {
     expect(probe(mutate).out.statusCheckRollup).toEqual([workflowRow]);
-  });
-  it('classifies workflow self-protection even when all PR table gates passed', () => {
-    const { out } = probe(e => { e.log = e.log.replace('#7106: HOLD', '#7106: PASS')
-      .replace(/  hold  review-acceptance  [^\n]+/, '  pass  review-acceptance  accepted')
-      .replace('; held', '; all pass'); });
-    expect(out.statusCheckRollup[0]).toMatchObject({ conclusion: 'FAILURE',
-      mergeGateReviewHold: { holds: ['workflow-edit-protection'], jobId: 123 } });
   });
   it('keeps a table-only workflow hold red when another job step failed', () => {
     expect(probe(e => { e.log = e.log.split('\n').filter(l => !l.startsWith('merge-gate:'))
