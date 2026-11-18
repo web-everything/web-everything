@@ -43,6 +43,9 @@ const POLICY_TIER_HOMES = Object.freeze(new Set(
 // Confinement entrypoints, their direct local imports, and the AgY spawn/juror chain.
 // Deeper generic infrastructure is intentionally not critical merely by transitive import.
 const CONFINEMENT_MODULES = Object.freeze([
+  // The repair-dispatch caller chain that applies the confinement and routes fixes (audit: its tests hold the enforcement assertions).
+  'scripts/operations/fix-run.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs', 'scripts/conveyor/fix-executor-routing.mjs',
+  'scripts/lib/fix-slot-borrow.mjs', 'scripts/lib/fix-executor-chain.mjs', 'scripts/operations/dispatch-providers/fix.mjs',
   'scripts/lib/agy-confined-build.mjs',
   'scripts/lib/agy-sandbox.mjs',
   'scripts/lib/agy-fix-admission.mjs',

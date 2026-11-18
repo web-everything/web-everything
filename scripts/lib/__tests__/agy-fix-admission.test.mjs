@@ -127,3 +127,11 @@ describe('tests of critical subjects and fixtures are not admissible (audit: gat
     expect(isAdmissibleTargetPath('docs/guide.md')).toBe(true);
   });
 });
+
+describe('the repair-dispatch chain tests that hold enforcement assertions are not admissible', () => {
+  it.each([
+    'scripts/operations/__tests__/fix-run.test.mjs',
+    'scripts/conveyor/__tests__/fix-executor-routing.test.mjs',
+    'scripts/lib/__tests__/fix-executor-chain.test.mjs',
+  ])('refuses %s', path => { expect(isAdmissibleTargetPath(path)).toBe(false); });
+});
