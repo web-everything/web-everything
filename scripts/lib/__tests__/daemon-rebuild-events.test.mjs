@@ -78,6 +78,14 @@ describe('rebuildClone coordination events', () => {
     expectEvent('rebuild-adopted', { sha });
   });
 
+  it('preserves the typed partial-adoption alert alongside the adoption event', async () => {
+    const partial = { kind: 'ready-candidate-adopted-partial', detail: { target: sha, pending: ['lane/pending'] } };
+    const result = { moved: true, adopted: true, reason: 'ready-adopted', head: sha };
+    prepareRebuild.mockReturnValue({ terminal: true, result, alerts: [partial] });
+    expect(await rebuildClone(options)).toEqual({ ...result, alerts: [partial] });
+    expectEvent('rebuild-adopted', { sha });
+  });
+
   it('emits overlay-adopted from the rebuild path when a pending overlay sha is in the clone HEAD', async () => {
     const { execFileSync } = await import('node:child_process');
     const { recordPendingAdoption } = await import('../overlay-adoption.mjs');
@@ -261,7 +269,7 @@ describe('rebuildClone coordination events', () => {
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
       'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',
       'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
-      'index-locked', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
+      'index-locked', 'invalid-probation', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',
