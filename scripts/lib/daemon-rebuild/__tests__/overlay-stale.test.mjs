@@ -62,7 +62,6 @@ describe('post-plan stale detector', () => {
     tick(); tick(); tick();
     expect(emit).toHaveBeenCalledTimes(1);
     tick({ openPrHeads: [{ headRefName: ref, headRefOid: sha('e'), isCrossRepository: false }] });
-    tick(); tick();
     expect(emit).toHaveBeenCalledTimes(1);
   });
   it('re-registration at the same tip changes the attention identity', () => {
@@ -83,6 +82,13 @@ describe('post-plan stale detector', () => {
     git.mockImplementation(args => args[0] === 'merge-tree' ? { status: 0, stdout: tree } : args[0] === 'rev-parse' ? { status: 0, stdout: tip } : { status: args[1] === '--is-ancestor' ? 1 : 0, stdout: mainSha });
     tick({ overlays: [overlay, other] });
     expect(emit.mock.calls.filter(([r]) => r.ref === ref)).toHaveLength(0);
+  });
+  it('a cancelled undelivered notice can fire again when the same conflict returns', () => {
+    emit.mockImplementationOnce(() => { throw new Error('feed down'); });
+    tick(); tick(); tick();
+    tick({ openPrHeads: [{ headRefName: ref, headRefOid: sha('e'), isCrossRepository: false }] });
+    tick(); tick(); tick();
+    expect(emit).toHaveBeenCalledTimes(2);
   });
   it('a failed publish is retried next tick and then marked delivered', () => {
     emit.mockImplementationOnce(() => { throw new Error('feed down'); });

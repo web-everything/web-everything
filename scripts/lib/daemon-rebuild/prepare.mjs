@@ -135,11 +135,13 @@ export async function prepareRebuild({
   const writeState = () => writeRebuildState(root, state, stEnv);
   // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
   // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.
-  let dropPending = false;
-  try { dropPending = readPendingDrops(root, env).length > 0; } catch (error) {
-    dropPending = true;
-    alert('drop-pending-unsettled', { error: String(error.message) });
-  }
+  // Re-read at each mutation point (not one early snapshot): a retirement can start during recovery or planning.
+  const dropPendingNow = () => {
+    try { return readPendingDrops(root, env).length > 0; } catch (error) {
+      alert('drop-pending-unsettled', { error: String(error.message) });
+      return true;
+    }
+  };
 
   const finishVerifiedSwaps = async () => {
     try {
@@ -386,7 +388,7 @@ export async function prepareRebuild({
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
-  if (dropPending && plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove'))) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
+  if (plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   if (!readyOnly) {
     try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git }); }
     catch (error) { alert('overlay-stale-unknown', { error: String(error.message) }); }
@@ -498,6 +500,7 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
+  if ((plan.finalSha !== prevHead || plan.decisions.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {

@@ -122,7 +122,7 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
     for (const [why, notice] of Object.entries(record.pending ?? {})) {
       // Recheck tip, registration and pin: an obsolete notice is dropped, never delivered.
       if (state.current[notice.ref] !== key || skipped.has(notice.ref) || !live.has(notice.ref)
-        || rows.find(r => r.ref === notice.ref)?.reason !== why) { delete record.pending[why]; continue; }
+        || rows.find(r => r.ref === notice.ref)?.reason !== why) { delete record.pending[why]; delete record.seen?.[why]; continue; }
       try { emit(notice); delete record.pending[why]; } catch { /* retried next tick */ }
     }
   }
