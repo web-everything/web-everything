@@ -4583,8 +4583,10 @@ head, and show process start at/after adoption with a later completed tick. Call
 must obtain boot evidence from that daemon's process record, not from a sibling or
 from the wrapper's first tick time. `evaluateProbation` passes only with all owed
 records, or immediately for a known empty owed set. Non-owed evidence is a no-op.
-A recorded proof returns a fresh, deeply frozen copy that shares nothing with its input,
-so mutating restored (for example JSON-parsed) state cannot discharge another daemon.
+Each function reads its input once into a deeply frozen plain copy (enumerable keys only)
+and validates and decides from that copy. A recorded proof returns that fresh copy, so
+mutating restored (for example JSON-parsed) state, a getter or a hidden key cannot
+discharge another daemon. A no-op still returns the caller's own input object.
 Legacy single-record state cannot promote; it requires operator recovery.
 
 The probation tests adapt the WIP adoption clock/heads and invalid-tick cases. The

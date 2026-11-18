@@ -162,6 +162,55 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     expect(evaluateProbation(next, now)).toEqual({ action: 'pass' });
   });
 
+  it('a non-enumerable record the validator never saw cannot discharge an owed daemon', async () => {
+    const { freezeProbation, recordProof, evaluateProbation, validateProbation } = await core();
+    const s = JSON.parse(JSON.stringify(recordProof(freezeProbation(options), 'worker', proof(101), now)));
+    Object.defineProperty(s.records, 'review', { value: 'junk', enumerable: false });
+    expect(validateProbation(s, now)).toBeNull();
+    expect(evaluateProbation(s, now)).toEqual({ action: 'pending', owed: ['review'] });
+    const next = recordProof(s, 'review', proof(202, 'review'), now);
+    expect(evaluateProbation(next, now)).toEqual({ action: 'pass' });
+    expect(Object.keys(next.records)).toEqual(['worker', 'review']);
+  });
+
+  it('an owed getter that changes between reads cannot narrow what is decided or returned', async () => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const shifty = () => {
+      const s = JSON.parse(JSON.stringify(freezeProbation(options)));
+      let reads = 0;
+      Object.defineProperty(s, 'owed', { enumerable: true, get: () => (++reads === 1 ? ['worker', 'review'] : ['worker']) });
+      return s;
+    };
+    expect(evaluateProbation(shifty(), now)).toEqual({ action: 'pending', owed: ['worker', 'review'] });
+    const next = recordProof(shifty(), 'worker', proof(101), now);
+    expect(next.owed).toEqual(['worker', 'review']);
+    expect(evaluateProbation(next, now)).toEqual({ action: 'pending', owed: ['review'] });
+    const empty = shifty();
+    let reads = 0;
+    Object.defineProperty(empty, 'owed', { enumerable: true, get: () => (++reads === 1 ? ['worker', 'review'] : []) });
+    expect(evaluateProbation(empty, now)).toEqual({ action: 'pending', owed: ['worker', 'review'] });
+    const throwing = shifty();
+    Object.defineProperty(throwing, 'owed', { enumerable: true, get: () => { throw new Error('unreadable'); } });
+    expect(evaluateProbation(throwing, now)).toMatchObject({ action: 'pending', reason: expect.stringMatching(/^invalid-probation: state-fields/) });
+    expect(recordProof(throwing, 'worker', proof(101), now)).toBe(throwing);
+  });
+
+  it('a roster that changes between reads cannot drop a daemon from the owed set', async () => {
+    const { freezeProbation } = await core();
+    let reads = 0;
+    const roster = new Proxy([{ id: 'worker' }, { id: 'review' }], {
+      get(target, key, receiver) { if (key === 'length' && ++reads > 1) return 1; return Reflect.get(target, key, receiver); },
+    });
+    expect(freezeProbation({ ...options, registered: roster }).owed).toEqual(['worker', 'review']);
+    const renamed = [{ id: 'worker' }];
+    const p = freezeProbation({ ...options, registered: renamed, readClosure(daemon, sha) {
+      try { daemon.id = 'ghost'; } catch { /* frozen copy */ }
+      return closure(sha);
+    } });
+    expect(p.owed).toEqual(['worker']);
+    expect(renamed[0].id).toBe('worker');
+  });
+
   it.each(['pid', 'head', 'before-adoption', 'before-boot', 'future', 'unapproved-head', 'missing-start', 'wrong-daemon', 'wrong-boot-daemon'])(
     'rejects invalid previous tick evidence: %s', async kind => {
       const { freezeProbation, recordProof, evaluateProbation } = await core();

@@ -6,6 +6,8 @@ const nameOK = value => typeof value === 'string' && value.trim().length > 0;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const dateMs = value => typeof value === 'string' ? Date.parse(value) : NaN;
 const rosterError = () => new Error('Probation refused: operator must recover the clone roster/adoption evidence');
+// Reads `length` once, then each index once (array iteration re-reads `length` every step).
+const readArray = (a, map = v => v) => { const n = a.length; return Array.from({ length: n }, (_, i) => map(a[i])); };
 const exactKeys = (value, keys) => object(value) && Object.keys(value).length === keys.length
   && keys.every(key => Object.hasOwn(value, key));
 
@@ -32,6 +34,34 @@ function closureDiffers(daemon, from, to, readClosure) {
  * daemon and the adopted head, and a unique pid per daemon.
  */
 export function validateProbation(p, now) {
+  return checkSnapshot(snapshot(p), now);
+}
+
+/** A fresh, deeply frozen plain copy of `p`, reading each input property exactly once and keeping only
+ * enumerable own keys. Every transition validates and decides from this copy, never from `p` again, so
+ * getters, Proxies, non-enumerable keys or later mutation of `p` cannot make what was checked differ
+ * from what is decided or returned. Unreadable input becomes null (fails `state-fields`).
+ */
+function snapshot(p) {
+  const frozenCopy = e => (object(e) ? Object.freeze({ ...e }) : e);
+  const record = r => {
+    if (!object(r)) return r;
+    const c = { ...r };
+    for (const k of ['boot', 'tick']) if (Object.hasOwn(c, k)) c[k] = frozenCopy(c[k]);
+    return Object.freeze(c);
+  };
+  try {
+    if (!object(p)) return p;
+    const s = { ...p };
+    if (Object.hasOwn(s, 'owed') && Array.isArray(s.owed)) s.owed = Object.freeze(readArray(s.owed));
+    if (Object.hasOwn(s, 'records') && object(s.records)) {
+      s.records = Object.freeze(Object.fromEntries(Object.entries(s.records).map(([id, r]) => [id, record(r)])));
+    }
+    return Object.freeze(s);
+  } catch { return null; }
+}
+
+function checkSnapshot(p, now) {
   if (!Number.isFinite(now)) return 'now-not-finite';
   if (!exactKeys(p, ['version', 'adoptionId', 'sha', 'provenGood', 'adoptedAt', 'owed', 'records'])) return 'state-fields';
   if (p.version !== 2) return 'version';
@@ -72,9 +102,15 @@ export function validateProbation(p, now) {
  * Unreadable closures owe proof; unreadable/ambiguous rosters refuse adoption, never imply an empty set.
  */
 export function freezeProbation({ adoptionId, sha, provenGood, adoptedAt, registered, readClosure } = {}) {
-  if (!Array.isArray(registered) || Array.from(registered).some(d => !object(d) || !nameOK(d.id))
-    || new Set(Array.from(registered).map(d => d.id)).size !== registered.length) throw rosterError();
-  const owed = Array.from(registered).filter(d => closureDiffers(d, provenGood ?? null, sha, readClosure)).map(d => d.id);
+  // Read the roster exactly once into frozen copies: a getter or Proxy roster cannot pass the checks
+  // and then shrink, and readClosure cannot rename a daemon between the diff and the owed id.
+  let roster = null;
+  try {
+    if (Array.isArray(registered)) roster = readArray(registered, d => (object(d) ? Object.freeze({ ...d }) : d));
+  } catch { roster = null; }
+  if (!roster || roster.some(d => !object(d) || !nameOK(d.id))
+    || new Set(roster.map(d => d.id)).size !== roster.length) throw rosterError();
+  const owed = roster.filter(d => closureDiffers(d, provenGood ?? null, sha, readClosure)).map(d => d.id);
   const state = Object.freeze({ version: 2, adoptionId, sha, provenGood: provenGood ?? null, adoptedAt,
     owed: Object.freeze(owed), records: Object.freeze({}) });
   if (validateProbation(state, dateMs(adoptedAt)) !== null) throw rosterError();
@@ -85,27 +121,19 @@ export function freezeProbation({ adoptionId, sha, provenGood, adoptedAt, regist
  * Invalid or non-owed evidence is an identity-preserving no-op. Never consume or narrow `owed`.
  */
 export function recordProof(probation, daemonId, evidence, now) {
-  if (validateProbation(probation, now) !== null || !probation.owed.includes(daemonId)) return probation;
-  const next = snapshot({ ...probation, records: { ...probation.records,
+  const base = snapshot(probation);
+  if (checkSnapshot(base, now) !== null || !base.owed.includes(daemonId)) return probation;
+  // A successful transition returns a fresh deep-frozen state sharing nothing with its input.
+  const next = snapshot({ ...base, records: { ...base.records,
     [daemonId]: { boot: evidence?.boot, tick: evidence?.tick } } });
-  return validateProbation(next, now) === null ? next : probation;
-}
-
-/** A fresh, deeply frozen copy: the returned state shares no array or object with its input,
- * so a caller mutating restored (e.g. JSON-parsed) state can never change a state it was given.
- * Validation runs on the copy, so what was checked is exactly what is returned.
- */
-function snapshot(p) {
-  const copy = e => (object(e) ? Object.freeze({ ...e }) : e);
-  const records = object(p.records) ? p.records : {};
-  return Object.freeze({ ...p, owed: Object.freeze(Array.from(p.owed)), records: Object.freeze(Object.fromEntries(
-    Object.entries(records).map(([id, r]) => [id, object(r) ? Object.freeze({ boot: copy(r.boot), tick: copy(r.tick) }) : r]))) });
+  return checkSnapshot(next, now) === null ? next : probation;
 }
 
 /** Promotion is a caller-owned effect, authorized only by `pass`. Legacy/malformed state cannot pass. */
 export function evaluateProbation(probation, now) {
-  const violation = validateProbation(probation, now);
+  const s = snapshot(probation);
+  const violation = checkSnapshot(s, now);
   if (violation !== null) return { action: 'pending', reason: `invalid-probation: ${violation}; operator recovery required` };
-  const owed = probation.owed.filter(id => !Object.hasOwn(probation.records, id));
-  return owed.length ? { action: 'pending', owed } : { action: 'pass' };
+  const owed = s.owed.filter(id => !Object.hasOwn(s.records, id));
+  return owed.length ? { action: 'pending', owed: [...owed] } : { action: 'pass' };
 }
