@@ -1,5 +1,3 @@
-import { shapePrs } from '../../readiness/conveyor-state.mjs';
-import { planFixSpawns, readTickCommentFloors } from '../tick-core.mjs';
 import { buildRedTeamRearmComment } from '../rearm-review.mjs';
 import { decideSetLabel } from '../../review-set-label.mjs';
 /**
@@ -105,22 +103,6 @@ describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
       comments: [result, { author: AUTOMATION, body: `${redTeamGateMarker(7031, head, 'sent-back', id)}\nSent back confirmed break #1.` }] };
   };
   const plan = (pr, extra = {}) => planReconcile({ prs: [pr], agents: [], now: NOW, ...extra });
-
-  it('production gh pr list row without mode defers a repair after restart with an unreadable floor', () => {
-    const pr = makePr();
-    expect(pr).not.toHaveProperty('mode');
-    const prs = shapePrs([pr]);
-    expect(prs[0]).not.toHaveProperty('mode');
-    expect(prs[0]).toMatchObject({ prNumber: 7031, state: 'OPEN' });
-    const floors = readTickCommentFloors({ prs,
-      readCompleteComments: () => { throw Error('unreadable'); },
-      readComments: () => { throw Error('wrong reader'); } });
-    const options = { prs, launchedNums: [7031], fixAttempts: {}, retryCap: 3, availableLanes: [5] };
-    const blocked = planFixSpawns({ ...options, ...floors });
-    expect(blocked).toMatchObject({ spawns: [], newGuards: [], consumedLanes: [], fixAttempts: {} });
-    expect(blocked.notes[0].kind).toBe('fix-floor-unavailable');
-    expect(planFixSpawns({ ...options, prRearmCounts: { 7031: 0 } }).spawns).toHaveLength(1);
-  });
 
   it('dispatches a fix for the trusted named send-back on the accepted current head', () => {
     const out = plan(makePr());

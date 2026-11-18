@@ -13,14 +13,13 @@
  *   • WATCHER ARMING (one per conveyor-launched open PR), IDLE-STOP, the exit-code router, and the whole
  *     {@link planTick} composition — including the free-lane exclusion shared across builds and prepares.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   retireBuildGuards,
   filterLaunches,
   retirePrepareGuards,
   planPrepareSpawns,
   planFixSpawns,
-  readTickCommentFloors,
   retireFixGuards,
   clearTerminalFixAttempts,
   planCiHealSpawns,
@@ -48,10 +47,6 @@ import {
   lanePoolListArgsForRepo,
   reuseFailedLanePoolRead,
 } from '../tick-core.mjs';
-import { readCompletePrComments } from '../pr-comments-complete.mjs';
-import { countFixRoundComments, REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER } from '../rearm-round-count.mjs';
-import { RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
-import { shapePrs } from '../../readiness/conveyor-state.mjs';
 import { buildCiHealComment, CI_HEAL_ROUND_CAP } from '../ci-heal-mark.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
@@ -444,6 +439,18 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
     expect(r.fixAttempts).toEqual({}); // unchanged — nothing bumped merely by being planned
   });
 
+  it('never launches a red-team-sent-back repair (dispatch-provider path only) and logs the refusal', () => {
+    const blocked = { num: 40, prNumber: 99, state: 'OPEN', labels: ['review:accepted', 'red-team:blocked', 'ready-to-merge'] };
+    const r = planFixSpawns({ prs: [blocked], launchedNums: [40], availableLanes: [5], tick: 0 });
+    expect(r.spawns).toEqual([]);
+    expect(r.newGuards).toEqual([]);
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'fix-dispatch-provider-only', pr: 99 }));
+    const explicit = planFixSpawns({ prs: [{ ...changesPr(98, 41), mode: 'red-team-sent-back' }], launchedNums: [41], availableLanes: [5], tick: 0 });
+    expect(explicit.spawns).toEqual([]);
+    expect(explicit.notes).toContainEqual(expect.objectContaining({ kind: 'fix-dispatch-provider-only', pr: 98 }));
+    expect(planFixSpawns({ prs: [changesPr(97, 42)], launchedNums: [42], availableLanes: [5], tick: 0 }).spawns).toHaveLength(1);
+  });
+
   it('does NOT fix a review:changes PR the conveyor did not launch', () => {
     const r = planFixSpawns({ prs: [changesPr(99, 40)], launchedNums: [], availableLanes: [5], tick: 0 });
     expect(r.spawns).toEqual([]);
@@ -474,123 +481,6 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
     });
     expect(r.spawns).toEqual([]); // cap binds → no re-fix from zero
     expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', pr: 99, attempts: DEFAULT_FIX_RETRY_CAP });
-  });
-
-  it.each(['failed', 'handed back', 'legacy hand-back'])('three spent red-team rounds (%s) restore floor 3 and exhaust cap 3 after restart', kind => {
-    const trusted = body => ({ author: { login: 'web-everything' }, body });
-    const comments = Array.from({ length: 3 }, (_, i) => [
-      ...(kind === 'legacy hand-back' ? [] : [trusted(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${'a'.repeat(40)} result=result-${i} attempt=launch-${i}`)]),
-      ...(kind === 'failed' ? [] : [trusted(RED_TEAM_REARM_COMMENT_MARKER)]),
-    ]).flat();
-    const floor = countFixRoundComments(comments);
-    expect(floor).toBe(3);
-    expect(countRedTeamFixComments(comments)).toBe(3);
-    const r = planFixSpawns({
-      prs: [changesPr(99, 40)], launchedNums: [40], fixAttempts: {},
-      prRearmCounts: { 99: floor }, retryCap: 3, availableLanes: [5], tick: 0,
-    });
-    expect(r.spawns).toEqual([]);
-    expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', pr: 99, attempts: 3 });
-  });
-
-  describe('red-team-sent-back complete durable floor admission', () => {
-    // Production gh pr list row, projected by the real state shaper; no planned mode.
-    const [pr] = shapePrs([{ number: 99, headRefName: 'lane/40-repair', state: 'OPEN',
-      labels: [{ name: 'review:changes' }] }]);
-    const plan = floors => planFixSpawns({ prs: [pr], launchedNums: [40], fixAttempts: {},
-      ...floors, retryCap: 3, availableLanes: [5], tick: 0 });
-    const read = gh => readTickCommentFloors({ prs: [pr],
-      readComments: () => { throw Error('must use complete reader'); },
-      readCompleteComments: p => readCompletePrComments(p.prNumber, { repo: 'owner/repo', gh }),
-    });
-    const countProof = totalCount => ({ data: { repository: { pullRequest: { comments: { totalCount } } } } });
-    const comment = i => ({ node_id: `IC_${i}`, user: { login: 'web-everything' }, body: RED_TEAM_FIX_COMMENT_MARKER });
-
-    it('comment-read failure after restart defers without a spawn, guard, lane or attempt; next tick retries', () => {
-      const floors = read(() => { throw Error('comment read failed'); });
-      expect(floors.prRearmCounts).toEqual({ 99: null });
-      const r = plan(floors);
-      expect(r).toMatchObject({ spawns: [], newGuards: [], consumedLanes: [], fixAttempts: {} });
-      expect(r.notes).toEqual([expect.objectContaining({ kind: 'fix-floor-unavailable', pr: 99,
-        text: expect.stringContaining('retry next tick') })]);
-      expect(plan(read(args => args[1] === 'graphql' ? countProof(0) : [])).spawns).toHaveLength(1);
-    });
-
-    it('incomplete pagination at the ten-page cap defers instead of counting the prefix', () => {
-      let calls = 0;
-      const floors = read(() => Array.from({ length: 100 }, (_, i) => comment(calls++ * 100 + i)));
-      expect(calls).toBe(1000);
-      expect(floors.prRearmCounts).toEqual({ 99: null });
-      expect(plan(floors).notes[0].kind).toBe('fix-floor-unavailable');
-      expect(plan(floors).spawns).toEqual([]);
-    });
-
-    it('a short REST read with a mismatching total count defers', () => {
-      const floors = read(args => args[1] === 'graphql' ? countProof(3) : []);
-      expect(floors.prRearmCounts).toEqual({ 99: null });
-      expect(plan(floors).spawns).toEqual([]);
-    });
-
-    it.each([undefined, null, -1, NaN, '0'])('unset or invalid floor %s defers', floor => {
-      const r = plan({ prRearmCounts: { 99: floor } });
-      expect(r.spawns).toEqual([]);
-      expect(r.notes[0].kind).toBe('fix-floor-unavailable');
-    });
-
-    it.each([0, 2, 3])('successful complete read with %i spent rounds enforces cap 3', spent => {
-      const floors = read(args => args[1] === 'graphql' ? countProof(spent) : Array.from({ length: spent }, (_, i) => comment(i)));
-      expect(floors.prRearmCounts).toEqual({ 99: spent });
-      const r = plan(floors);
-      expect(r.spawns).toEqual(spent < 3 ? [{ pr: 99, num: '40', lane: 5 }] : []);
-      if (spent === 3) expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', attempts: 3 });
-    });
-
-    it.each([RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER])('review:changes after a red-team %s restores the complete history without a mode field', marker => {
-      expect(pr).not.toHaveProperty('mode');
-      const floors = read(args => args[1] === 'graphql' ? countProof(3)
-        : Array.from({ length: 3 }, (_, i) => ({ ...comment(i), body: marker })));
-      expect(floors.prRearmCounts).toEqual({ 99: 3 });
-      expect(plan(floors).notes[0]).toMatchObject({ kind: 'fix-exhausted', attempts: 3 });
-      expect(plan(floors).spawns).toEqual([]);
-    });
-
-    it('review:changes with receipts only beyond the first 100 comments exhausts the durable cap after restart', () => {
-      const comments = Array.from({ length: 103 }, (_, i) => ({ ...comment(i),
-        body: i < 100 ? 'Ordinary conversation' : RED_TEAM_FIX_COMMENT_MARKER }));
-      const floors = read(args => args[1] === 'graphql' ? countProof(103)
-        : comments.slice(args.some(a => a.endsWith('&page=2')) ? 100 : 0, args.some(a => a.endsWith('&page=2')) ? 200 : 100));
-      expect(floors.prRearmCounts).toEqual({ 99: 3 });
-      expect(plan(floors)).toMatchObject({ spawns: [], notes: [expect.objectContaining({ kind: 'fix-exhausted', attempts: 3 })] });
-    });
-
-    it('red-team:blocked without review:changes or mode also requires a complete floor', () => {
-      const blocked = { ...pr, labels: ['review:accepted', 'red-team:blocked'] };
-      const readCompleteComments = vi.fn(() => { throw Error('unreadable'); });
-      const floors = readTickCommentFloors({ prs: [blocked], readCompleteComments });
-      expect(readCompleteComments).toHaveBeenCalledWith(blocked);
-      expect(planFixSpawns({ prs: [blocked], launchedNums: [40], ...floors, availableLanes: [5] }))
-        .toMatchObject({ spawns: [], notes: [expect.objectContaining({ kind: 'fix-floor-unavailable' })] });
-    });
-
-    it('ordinary review:changes also defers an unreadable thread because hidden red-team history cannot be ruled out', () => {
-      const floors = read(() => { throw Error('unreadable'); });
-      expect(floors.prRearmCounts).toEqual({ 99: null });
-      expect(plan(floors).spawns).toEqual([]);
-    });
-  });
-
-  it('shares marker trust and launch deduplication while retaining ordinary rounds and failed launches', () => {
-    const c = body => ({ author: { login: 'web-everything' }, body });
-    const receipt = result => c(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${'a'.repeat(40)} result=${result} attempt=same-launch`);
-    const comments = [c(REARM_COMMENT_MARKER), receipt('old'), c(RED_TEAM_REARM_COMMENT_MARKER), receipt('new'), c(RED_TEAM_REARM_COMMENT_MARKER),
-      c(RED_TEAM_FIX_COMMENT_MARKER),
-      c(`${REARM_COMMENT_MARKER}\n${SAME_HEAD_WAKE_TRAILER}`),
-      { author: { login: 'outsider' }, body: RED_TEAM_FIX_COMMENT_MARKER },
-      { body: RED_TEAM_REARM_COMMENT_MARKER }, c(`> ${RED_TEAM_REARM_COMMENT_MARKER}`),
-      c(`${RED_TEAM_REARM_COMMENT_MARKER} suffix`)];
-    expect(countRedTeamFixComments(comments)).toBe(2);
-    expect(countFixRoundComments(comments)).toBe(3);
-    expect(countFixRoundComments(null)).toBe(0);
   });
 
   it('a spawn below the max(in-session, durable) cap still spawns, but still does not bump (bump moved to claim-time)', () => {
