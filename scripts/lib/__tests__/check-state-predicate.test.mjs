@@ -630,6 +630,19 @@ describe('required check evidence contract (PR1 acceptance)', () => {
     expect(resolve([contradictory])).toMatchObject({ state: 'unknown',
       perName: { test: { state: 'unknown', reasons: ['malformed'] } } });
   });
+  it.each(['BOGUS', 'neutral', 'failure', '', null, undefined, 42])('explicit state %j alongside success fails closed', state => {
+    const malformed = row('test', 'success', { state });
+    for (const rows of [[malformed], ...orders([row(), malformed])]) {
+      expect(resolve(rows)).toMatchObject({ state: 'unknown',
+        perName: { test: { state: 'unknown', reasons: ['malformed'] } } });
+    }
+  });
+  it('success passes with an absent state or a consistent case-insensitive state', () => {
+    for (const extra of [{}, { state: 'success' }, { state: 'SuCcEsS' }]) {
+      expect(resolve([row('test', 'success', extra)]))
+        .toMatchObject({ state: 'pass', perName: { test: { state: 'pass', reasons: [] } } });
+    }
+  });
   it.each([
     { status: 'in_progress', conclusion: 'success' },
     { status: 'completed', conclusion: 'success', state: 'failure' },

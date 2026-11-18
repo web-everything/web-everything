@@ -144,6 +144,8 @@ const evidenceJob = row => {
 
 // Completed is a lifecycle marker, not an outcome. Compare only explicit
 // outcome categories, before legacy mapping or hold excusal rewrites evidence.
+// A present state has its own closed vocabulary, independent of conclusions.
+const knownEvidenceStates = new Set(['success', 'failure', 'error', 'pending', 'expected']);
 const contradictoryEvidence = row => {
   const outcomes = [row?.status, row?.conclusion, row?.state].map(normalize).map(value => {
     if (value === 'error') return 'red';
@@ -190,7 +192,8 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       else if (['pending', 'expected'].includes(legacy)) status = 'pending';
     }
     let state = 'unknown';
-    if (contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
+    if ((row != null && Object.hasOwn(row, 'state') && !knownEvidenceStates.has(normalize(row.state)))
+      || contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
       || (row?.conclusion != null && !Object.hasOwn(CHECK_STATE_TABLE.completed, normalize(row.conclusion)))
       || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');
     else if (status !== 'completed') { state = 'pending'; why.push('pending'); }
