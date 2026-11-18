@@ -27,6 +27,7 @@ export function evaluateAudit(ledgerText, options = {}) {
   }
   const liveFp = suppliedFp;
   const genesis = lines.findLastIndex(e => e.record?.kind === 'genesis');
+  const firstGenesis = lines.findIndex(e => e.record?.kind === 'genesis');
   if (genesis < 0 && !hwmPresent) {
     if (lines.some(e => e.record?.kind !== 'genesis' && chained(e.record))) return fail('chain-break');
     const records = Array.isArray(ledgerText) ? ledgerText : lines.map(e => e.record).filter(Boolean);
@@ -61,11 +62,13 @@ export function evaluateAudit(ledgerText, options = {}) {
     if (!carriesAcross(fp, fp)) { try { fp = options.resolveFingerprint?.(r.base, r.head); } catch { fp = null; } }
     const accepted = r.verdict === 'WEAKENED' && r.questionHash == null || r.questionHash === questionHash || isAcceptedQuestionHash(r.questionHash, {
       priorQuestionHashes, now, at: typeof r.at === 'string' && Number.isFinite(Date.parse(r.at)) ? r.at : undefined });
-    return { ...e, r, legacy, fp, accepted, order: legacy ? e.index - genesis : r.seq,
+    return { ...e, r, legacy, fp, accepted, sealed: legacy && e.index > firstGenesis, order: legacy ? e.index - genesis : r.seq,
       trusted: legacy || !!e.trusted };
   });
   const related = e => lower(e.r.head) === lower(head) || carriesAcross(e.fp, liveFp);
-  const passes = entries.filter(e => e.accepted && e.trusted && validSha(e.r.head) && validSha(e.r.base)
+  // Records sealed under a later reseal can still block, but their passes are never trusted again.
+  const ownAny = entries.some(e => e.accepted && lower(e.r.head) === lower(head) && (e.r.verdict === 'WEAKENED' || e.r.verdict === 'NOT WEAKENED'));
+  const passes = entries.filter(e => e.accepted && e.trusted && !e.sealed && validSha(e.r.head) && validSha(e.r.base)
     && e.r.base !== e.r.head && e.r.verdict === 'NOT WEAKENED' && carriesAcross(e.fp, e.fp)
     && typeof e.r.at === 'string' && Number.isFinite(Date.parse(e.r.at)) && Date.parse(e.r.at) <= now + 300000
     && legacyFindAudit([e.r], { head: e.r.head, base: e.r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === e.r);
@@ -86,7 +89,7 @@ export function evaluateAudit(ledgerText, options = {}) {
   }
   const authorized = entries.filter(e => e.r.verdict === 'WEAKENED' && validSha(e.r.head) && validSha(e.r.base)
     && e.r.base !== e.r.head && carriesAcross(e.fp, e.fp) && waived(e));
-  const pass = [...passes, ...authorized].filter(e => related(e) && e.r.questionHash === questionHash
+  const pass = [...passes, ...authorized].filter(e => related(e) && (!ownAny || lower(e.r.head) === lower(head)) && e.r.questionHash === questionHash
     && (base === undefined || lower(e.r.base) === lower(base)) && covered(e.r.base)).sort((a, b) => b.order - a.order)[0];
   return pass ? { ok: true, record: pass.r } : fail(broken ? 'chain-break' : 'no-record');
 }

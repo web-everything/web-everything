@@ -108,6 +108,17 @@ describe('R1047 attack table', () => {
     const waivers = [{ sha: HEAD, findings: weak().findings }];
     expect(evaluateAudit(text, { ...options, hwm, waivers }).ok).toBe(false);
   });
+  it('a reseal does not promote an unchained pass to trusted legacy evidence', () => {
+    const first = ledger([weak()]);
+    const stale = JSON.stringify(pass({ at: '2026-11-17T11:30:00Z' }));
+    const lines = [...first.lines, stale, JSON.stringify(buildGenesis(Buffer.from(`${first.lines.join('\n')}\n${stale}\n`), { reseal: true }))];
+    const hwm = { seq: 0, lineHash: sha256Line(lines.at(-1)) };
+    expect(evaluateAudit(lines.join('\n') + '\n', { ...options, hwm }).ok).toBe(false);
+  });
+  it('live-head verdicts take precedence over a covered carried pass', () => {
+    const l = ledger([pass({ head: OTHER, base: 'e'.repeat(40) }), pass()]);
+    expect(evaluate(l, { covers: base => base === 'e'.repeat(40) }).ok).toBe(false);
+  });
   it('a waiver without auditId covers only legacy', () => {
     const waivers = [{ sha: HEAD, findings: weak().findings }];
     const legacy = ledger([pass()], JSON.stringify(weak({ base: OTHER })) + '\n');
