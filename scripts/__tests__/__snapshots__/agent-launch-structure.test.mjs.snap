@@ -225,7 +225,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/check-standards.mjs",
-    "sha256": "f57b763a8fdc978bbe2fca03e8e06c6145c2ef0828ac4ebb8e767ad882ceebdf",
+    "sha256": "d615ac8c38281e03ec42d28faa1b40203a6f443698701142d86b8f5d5adcdd2c",
   },
   {
     "count": 1,
@@ -680,7 +680,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/conveyor/fix-scope-policy.mjs",
-    "sha256": "cc71d13cc5d68a33c9e1fa0634703a007da3bd2b76d112e176218ebeae50031b",
+    "sha256": "faa2e172df75c7c57ec9f8cc003b9ea272926af1ef7445cba2aceea1fdad2c97",
   },
   {
     "count": 1,
@@ -1425,7 +1425,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/conveyor/open-pr-fetch.mjs",
-    "sha256": "e99436a9717516a017af50d1cfd0f843267e42688809e96131c72bc6ef5bf2c8",
+    "sha256": "8d467a48c2c494917584b7e0de8f858455886915e2bdcc5b8cc63a2f74e290d0",
   },
   {
     "count": 1,
@@ -1715,7 +1715,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/conveyor/reconcile-fix-dispatch.mjs",
-    "sha256": "f354466864baa06bab4d46a2cf0e296dafc30908462f834b712263b77fe38d05",
+    "sha256": "7ee063544868a204f28ffdea3437b2206bd25d46f0dee5c12ea87582079d05b6",
   },
   {
     "count": 1,
@@ -2394,6 +2394,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   },
   {
     "count": 1,
+    "file": "scripts/conveyor/soak/breaks/fix-scope-overlap-prose-serializes.mjs",
+    "sha256": "129e9fada57978fa2d62510bfdf37087cd172ecebe74f680f3a54e4836b87fee",
+  },
+  {
+    "count": 1,
     "file": "scripts/conveyor/soak/breaks/fix-scope-stale-claim-head.mjs",
     "sha256": "3b5d1667294e0c18068580b809bdf08200f1451aa8f8c67b3cc79f61d7ea69a7",
   },
@@ -2934,6 +2939,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   },
   {
     "count": 1,
+    "file": "scripts/conveyor/soak/breaks/probation-accessor-snapshot.mjs",
+    "sha256": "06d1fe732b730056d02a5cc378c7cd53b26e29c12ac4c17e86c034125b495282",
+  },
+  {
+    "count": 1,
     "file": "scripts/conveyor/soak/breaks/probe-worker-termination-blocks-timeout.mjs",
     "sha256": "90b08f09a21e0403d330cd6917d370e830d1294c246c6a4d1de95e13fa76e40e",
   },
@@ -2960,7 +2970,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/conveyor/soak/breaks/queue-split-across-checkouts.mjs",
-    "sha256": "1b6c4b5e907081dfc6edd2ecbdd84932c27a9a4f37208c454f72b470316198b2",
+    "sha256": "cf88de92875fc4b87fa037b13d86cbcb46552524126e37b233bb3bfa9934fb13",
   },
   {
     "count": 1,
@@ -3124,6 +3134,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   },
   {
     "count": 1,
+    "file": "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.mjs",
+    "sha256": "03e05a9e79745b7d08accdc4ad66347c05ec49ba644ed1af0e2907b57fc19489",
+  },
+  {
+    "count": 1,
     "file": "scripts/conveyor/soak/breaks/red-team-renamed-host-dead-owner-never-reaped.mjs",
     "sha256": "4edbe022fa627b6e10902be9467b4da66b142e68a328bc881cc8f07d536eb9df",
   },
@@ -3189,6 +3204,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   },
   {
     "count": 1,
+    "file": "scripts/conveyor/soak/breaks/review-daemon-budget-lists-real-processes.mjs",
+    "sha256": "4162335876d8a64e260696887e561c73442805152275310f4412373fd340fc2f",
+  },
+  {
+    "count": 1,
     "file": "scripts/conveyor/soak/breaks/review-dispatch-stalls-on-unrelated-clone-lag.mjs",
     "sha256": "3fafad069823e399091c337c9db069e4ddc4847b512b70e79a1068d5f4b64b90",
   },
@@ -3246,6 +3266,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/conveyor/soak/breaks/review-recovery-single-lane-starved.mjs",
     "sha256": "c07d01c3f11c2da471ff392e48f8a0900165c4017ea4d983d4272a7bed262153",
+  },
+  {
+    "count": 1,
+    "file": "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.mjs",
+    "sha256": "e43579e7efec1cde8b84b904d9690d63a62a64b64a74fc3fa4d73aaec2ca222a",
   },
   {
     "count": 1,
@@ -3570,7 +3595,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/conveyor/soak/invariants.mjs",
-    "sha256": "e8a163370c3f3c80b0fd873b74e1eff6ba378ea509672b5f878dc5ee668feb56",
+    "sha256": "571ad502ec48b969c6a4763a4134a7b0aaf53319ef48168bf16c9234f680a4ab",
   },
   {
     "count": 1,
@@ -3610,7 +3635,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/conveyor/soak/soak.mjs",
-    "sha256": "1f352fb61f37d5dcca43b407b46632466fcfe7875b995d9874af6bc14fafc9f3",
+    "sha256": "1cd55aeaa55d01559a37869a34607b452e5d2bb50bf0d0f2c5fcc983c88db035",
   },
   {
     "count": 1,
@@ -3940,7 +3965,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/guard-bash.mjs",
-    "sha256": "4545b5007c4e4232719e17de51eafd403ee680d249304555aef53f626165647d",
+    "sha256": "142f68cd6b8c01edd27a395b807dcb10ceff21573f524dd1c937809f6a0a3663",
   },
   {
     "count": 1,
@@ -4140,7 +4165,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/antigravity-judge-spawn.mjs",
-    "sha256": "0b3385e2cd9eac271e50386bb43921e3244630602deb6e8d6b7da90ca1f69e3d",
+    "sha256": "f630208808f27dfb291168d460f6f6caafabbab157f843cf883868c939001b21",
   },
   {
     "count": 1,
@@ -4179,18 +4204,23 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   },
   {
     "count": 1,
+    "file": "scripts/lib/audit-finding-key.mjs",
+    "sha256": "d147b3f7956e555390195a05949376aa89cc285befee008e290817f48a12d3d8",
+  },
+  {
+    "count": 1,
     "file": "scripts/lib/audit-path.mjs",
     "sha256": "55a528e103cc807c4ec13eb24c75716b826e2ae4fd0776f51743c4fed15b15d9",
   },
   {
     "count": 1,
     "file": "scripts/lib/audit-settings.mjs",
-    "sha256": "76f4a7fcda82eab9dcf382b29c2eb20f4a1b2d44ae1645eb4510e6520d7f67a1",
+    "sha256": "fdd06ae48edc3c6a49f3cceadf14acc34a31b7f83a8dfe4aea054059b5574879",
   },
   {
     "count": 1,
     "file": "scripts/lib/author-stamp-restore.mjs",
-    "sha256": "27346ead972227226d882c991e51069dbceb8c82d6cdcd8d601929e3938bab8e",
+    "sha256": "77c321b6e84740a1b30e0df8eb8c8e291575c760215c1f0af714c633e21403a5",
   },
   {
     "count": 1,
@@ -4340,7 +4370,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/check-state-predicate.mjs",
-    "sha256": "6f17aa2a322d3c0d250528be0f64708c33d43eeed274d58fcf06cc72f73633e2",
+    "sha256": "13969f93935172873737985060c644a4eb1a94eeb61e9dc1de7577c9c7495172",
   },
   {
     "count": 1,
@@ -4465,7 +4495,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/constellation-repos.mjs",
-    "sha256": "40f2e98900cb513f0330639ec921a9d38b1de8a0a570aa3f4fb0dc215b8dbeaa",
+    "sha256": "e23d186ab8594da15e9425d7db63b8de7023a163eda175b61d0deda80191a06e",
   },
   {
     "count": 1,
@@ -4545,7 +4575,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/daemon-clone-lock.mjs",
-    "sha256": "03d08f96c8fd35f1256ecb23d076f9778f1e72fc35350d7fd03fef303b58676e",
+    "sha256": "2d6ef9daa4517659b7859162910321cba151fbafe3d02250fb4e1d08d790c323",
   },
   {
     "count": 1,
@@ -4635,7 +4665,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/daemon-rebuild/adopt.mjs",
-    "sha256": "b7f9f16603ba95f4ad17790813e0d0df69548a8ad1be0b8ddc3db56e2e17b058",
+    "sha256": "2eb88282a469e6b7b9f544f668b519ed1fb30f83b0b8b894e7b37681a9d314b0",
   },
   {
     "count": 1,
@@ -4700,12 +4730,17 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/daemon-rebuild/prepare.mjs",
-    "sha256": "994155630e55943bef11d2a0abc64a0a121c1e64664a9dbfb20943ce86c89726",
+    "sha256": "371d136cb63a2a62988e66ec46b8eb018dbb48436ca27a78ab99e6b49126cb69",
   },
   {
     "count": 1,
     "file": "scripts/lib/daemon-rebuild/preview.mjs",
     "sha256": "a8d6c709b2088512009c833dba41c18b7203ce866885c49676f609219d607222",
+  },
+  {
+    "count": 1,
+    "file": "scripts/lib/daemon-rebuild/probation.mjs",
+    "sha256": "0cd62b96d638b885590bfcf39bae12d2685a462538cebcdda40b383c90a80908",
   },
   {
     "count": 1,
@@ -4960,7 +4995,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/dispatch-routing-policy.mjs",
-    "sha256": "406a4d621c6d0bad3828a658f83ec411e631cd17db431e698705e9a6e86b047c",
+    "sha256": "c85a04a88eb3bf1deac93fe8e964454a61b76ef7259c32643bfb9e03bdea908a",
   },
   {
     "count": 1,
@@ -5085,7 +5120,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/drain-queue-safety.mjs",
-    "sha256": "4776ced2254f0465e6f82fd4d13e5cfbab91112bbc2afefa5ef542057682b791",
+    "sha256": "9a5bee13cb2327bce329823d151dd6112f987112a00a82bad6c595ffdf15eb7a",
   },
   {
     "count": 1,
@@ -5130,7 +5165,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/fast-drain-scope.mjs",
-    "sha256": "fcbd298140d2e19c81cee4b38ab3d6576d5717780fa90bd0dbd66d04c3fd7ddc",
+    "sha256": "61fc14cbcc08867ef91ad0e9734db677414e81cf390bb71db51b5cf7ad66570e",
   },
   {
     "count": 1,
@@ -5555,7 +5590,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/lane-git-hardening.mjs",
-    "sha256": "1a4563abf09abe308fd735627caba1518d4765437d7bb7e333fb69044953163c",
+    "sha256": "6651cafd1204f2f1d7f882325b2875cb7ef479539a30b9b1694875ff34efcc48",
   },
   {
     "count": 1,
@@ -6045,7 +6080,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/pr-list-paged.mjs",
-    "sha256": "b6e0915db239f5a1da008705dc136d10517428f58a9fea232e3d1d146721aa35",
+    "sha256": "ba86241cbbe3ef1cd643388c5dfce568140c3d184fc9bd456758d218b3a5cc36",
   },
   {
     "count": 1,
@@ -6186,6 +6221,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/lib/priority-order.mjs",
     "sha256": "85d1d67b046495e5b7b20292ed4c59ae4af3ab1886564a7de8e638fc4b8c650a",
+  },
+  {
+    "count": 1,
+    "file": "scripts/lib/privacy-terms.mjs",
+    "sha256": "3eb9e32fc22943a0a86ebd128edd08721339bc2442514b70801d18130afcf3f5",
   },
   {
     "count": 1,
@@ -6355,7 +6395,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/red-team-dispatch-queue.mjs",
-    "sha256": "dc13f6a07223174b14ac418a1d06d29e7cc81deb031c0efe49f5779c4b8a0d75",
+    "sha256": "aa328ba99611ad18dc89967f53bef337dab3c257544a1a734f93f340de37d4e8",
   },
   {
     "count": 1,
@@ -6445,7 +6485,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/remote-fallback-log.mjs",
-    "sha256": "69cec4b07db1e9a2500d70e6c072122bdf022fc22bfc7b85528ca1a819e8122f",
+    "sha256": "f5e3d3c91490ca668cca6f9b873af5902e04f0022611946b492a3e24255997fe",
   },
   {
     "count": 1,
@@ -6465,7 +6505,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/repo-profile.mjs",
-    "sha256": "90e66cfa99ddfcd1ea6087a4c457c963eee9c2b48e1a6d493bb1554178f4635f",
+    "sha256": "52628e9d970a22f91e10523c797efec1d32dec11f410ddb076cfab29ae90c547",
   },
   {
     "count": 1,
@@ -7055,7 +7095,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/verify-lane-gate.mjs",
-    "sha256": "f4ad1b88cd0dbae3faa322f802e132669bfaf677770935cd926c574f19d8617e",
+    "sha256": "c5862f1b14ec9ccdf0dfa7c98ea853694e09e2cbab89a984dad90822b90794a9",
   },
   {
     "count": 1,
@@ -7145,7 +7185,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/merge-ai-prs.mjs",
-    "sha256": "d0dde99fac7fee286cddde254c1fc6cd0c8d511c85daa0427fb4e3c5b70ac2c5",
+    "sha256": "fd5122021f4bdc60da2b0a00e4f212e9402e3a4a453697193164337f661a602f",
   },
   {
     "count": 1,
@@ -7246,6 +7286,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/operations/ai-routing.mjs",
     "sha256": "d2ab6966d9eac7a94477620f5a0b13e7b854e1911660949521bb9dce6b83d288",
+  },
+  {
+    "count": 1,
+    "file": "scripts/operations/audit-base-repro.mjs",
+    "sha256": "c9b650835c8f1e249ac4420129f9d02a04ff310afb7c9b3b628d272865438159",
   },
   {
     "count": 1,
@@ -7445,7 +7490,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/operations/coroner-extract.mjs",
-    "sha256": "b0ca14a69a81b1238dba65c2118f8cb813bbefed799807baaa5872b68225b056",
+    "sha256": "17a84064d264a5d98718c7957fe2a2bdbfa7b26a0e561af263488dbf3108d0fe",
   },
   {
     "count": 1,
@@ -7530,7 +7575,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/operations/deliver-item-wrapper.mjs",
-    "sha256": "b0e09928c314b2ce4cdc0d23a0058001af7a1498fb4ae9d71d6fc21c8cb5827f",
+    "sha256": "ef95a75bd9b85b71d52795f7c259ab74b133a21bf9211a2cc541e64fa452bbb3",
   },
   {
     "count": 1,
@@ -8330,12 +8375,17 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/operations/review-dispatch.mjs",
-    "sha256": "97ae51829c3eed7484782f1f03d6cf0e7e89c6f2513919db4ace6f19ed7c3bb4",
+    "sha256": "904e38d9b7a6c6e61de70240c2a014ae134cb791b9517219bee6aeeced4c4a69",
   },
   {
     "count": 1,
     "file": "scripts/operations/review-extra-seats.mjs",
     "sha256": "5c04f3aa29ba4c5ab96b35dbdb61cc2f17c32790df529fab5754ef166cce557d",
+  },
+  {
+    "count": 1,
+    "file": "scripts/operations/review-job-end-diagnosis.mjs",
+    "sha256": "7e8ea89a385a631c591d5f74a2758af2d3a4ca8a04f475c85e109b8cfef88754",
   },
   {
     "count": 1,
@@ -8345,12 +8395,12 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/operations/review-job-store.mjs",
-    "sha256": "114497f10bbfc9d3323a100747f3b031ea804f6e19041bc01d886d37b0ea54b9",
+    "sha256": "a78cbc91c2126759385fabe41d6070deecd0867b3a6499590cd048a590f7642b",
   },
   {
     "count": 1,
     "file": "scripts/operations/review-job.mjs",
-    "sha256": "b77eb72ecea920d8f422d544ea2b039aaaafacdd555afcf4872d1314eda6d475",
+    "sha256": "efc377ed2f44fa064fcdf403d0ddea8fc01916d53c60347cf9e48894aa3e175d",
   },
   {
     "count": 1,
@@ -8810,7 +8860,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/readiness/file-locks.mjs",
-    "sha256": "86655bc90960c08eca8cfa785cfe42a6c679be9e27cbb39160a4594925e8225f",
+    "sha256": "2b5901bb5aaa27f36850df2acad9466040c8c66b686f3701c2b00d2927e529d5",
   },
   {
     "count": 1,
@@ -8830,7 +8880,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/readiness/forge-exec-bases.mjs",
-    "sha256": "569ebaf14b927432d111834f79d4ecacd6e8a62219242bc5d576e201d9aef087",
+    "sha256": "df35479c8bbb684fde852224280a567a9b8a9dbbca519dc033a52210c0b4a69a",
   },
   {
     "count": 1,
@@ -8845,7 +8895,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/readiness/forge-exec-run.mjs",
-    "sha256": "a31b787987b90bd53ea3e1bda7f8d72c38160fdb881cdd4fe70728f0bde8f53a",
+    "sha256": "a4d57e0a881a4be896207790595ff011a78d5aeb28136c74dbb073c2d51028ca",
   },
   {
     "count": 1,
@@ -8865,12 +8915,12 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/readiness/forge-run-finish.mjs",
-    "sha256": "4d0392e7f4c74ed8411616f42abfc6ceea86227d78c95afaeda579f03f8c1647",
+    "sha256": "a42b98b4ecc39f1668131bdf2cf599b2b29654764afbb80958278af6468a38ec",
   },
   {
     "count": 1,
     "file": "scripts/readiness/forge-slot-markers.mjs",
-    "sha256": "4be6344b124678eb6ca4d888d2576579845b5b784132c1b68dd47d69ccec5264",
+    "sha256": "6b7e8bc4ed327da0bbe7914e64f669b5ce5fc6bd5e57da0db50dd8def03fd4a9",
   },
   {
     "count": 1,
@@ -8995,7 +9045,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/readiness/remote-exec.mjs",
-    "sha256": "bcda25e449405d6d0a877f239337188c2816a7efe45631497d081fb5b389142a",
+    "sha256": "53615833fa8736d193d77ae7acff56fdc3e280070a5d8ab51b4bfd5b58677be1",
   },
   {
     "count": 1,
@@ -9011,6 +9061,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/readiness/reservations.mjs",
     "sha256": "67784457ca1f8fe1a812ced528b7d4b07eae6d5899128737b68b3353fe216fd6",
+  },
+  {
+    "count": 1,
+    "file": "scripts/readiness/resource-request.mjs",
+    "sha256": "c7049943f9409d0f8aa5b8ab4395e89dec3e6824a7489adb47eb30287a6a9c80",
   },
   {
     "count": 1,
@@ -9275,7 +9330,7 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "skills-src/conveyor/review-daemon.mjs",
-    "sha256": "c5a52bf1e9520a097b028dcdf93d48db9c86b6115b9d731695330abd88530813",
+    "sha256": "e7a73df91a5995c6336aef2c60ed3ba8e0fd44ed15fa7e344d0fcdd008a5a971",
   },
   {
     "count": 1,

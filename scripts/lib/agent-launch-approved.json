@@ -1863,5 +1863,16 @@
   "scripts/lib/raised-by.mjs",
   "scripts/lib/daemon-rebuild/smoke-classify/index.mjs",
   "scripts/lib/model-settings.mjs",
-  "scripts/lib/node-heap-cap.mjs"
+  "scripts/lib/node-heap-cap.mjs",
+  "scripts/conveyor/soak/breaks/fix-scope-overlap-prose-serializes.mjs",
+  "scripts/conveyor/soak/breaks/probation-accessor-snapshot.mjs",
+  "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.mjs",
+  "scripts/conveyor/soak/breaks/review-daemon-budget-lists-real-processes.mjs",
+  "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.mjs",
+  "scripts/lib/audit-finding-key.mjs",
+  "scripts/lib/daemon-rebuild/probation.mjs",
+  "scripts/lib/privacy-terms.mjs",
+  "scripts/operations/audit-base-repro.mjs",
+  "scripts/operations/review-job-end-diagnosis.mjs",
+  "scripts/readiness/resource-request.mjs"
 ]

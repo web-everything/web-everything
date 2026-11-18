@@ -4889,3 +4889,27 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+## Codex boolean-option resume replay (PR #7022)
+
+Replay the real `launchAgent` export with an injected counting primitive and a synchronous
+`launchGuard` returning true. Use mode `codex-exec-resume`, descriptor `resumeId: 'other-id'`,
+command `codex`, and this exact argv:
+
+```json
+["exec","--ignore-rules","resume","12345678-1234-4234-8234-123456789abc"]
+```
+
+The historical source at `7fdb2bdfa6` calls the primitive once (`launched`). The repaired
+source refuses with `EAGENTLAUNCHREFUSED`, reason `resumeId must equal the native resume id
+in argv`, and zero primitive calls. A descriptor matching the UUID calls the primitive once.
+Moving `--ignore-rules` after `resume` gives the same matching/mismatching results.
+`["exec","resume","--model"]` refuses parsing with zero primitive calls.
+
+`scripts/__tests__/agent-launch.test.mjs` pins both option placements with matching and
+mismatching descriptors and malformed argv through the real boundary. Only allowlisted
+value options consume a following word; `--ignore-rules` is boolean. A resume mode must
+have parsed native evidence equal to its descriptor, including through shell wrappers.
+Use a historical blob import for before-proof when Git writes are prohibited; preserve
+the historical implementation and resolve only its relative dependency import. Never
+disable a current guard to manufacture a failure. No actual agent process is needed.

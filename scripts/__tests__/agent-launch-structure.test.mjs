@@ -534,6 +534,19 @@ describe('single agent launch boundary', () => {
       'scripts/lib/daemon-rebuild/smoke-classify/index.mjs',
       'scripts/lib/model-settings.mjs',
       'scripts/lib/node-heap-cap.mjs',
+      // Main 0539048b16: reviewed merged modules, including soak probes with injected IO.
+      // Keep this explicit membership separate from their complete-module fingerprints.
+      'scripts/conveyor/soak/breaks/fix-scope-overlap-prose-serializes.mjs',
+      'scripts/conveyor/soak/breaks/probation-accessor-snapshot.mjs',
+      'scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.mjs',
+      'scripts/conveyor/soak/breaks/review-daemon-budget-lists-real-processes.mjs',
+      'scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.mjs',
+      'scripts/lib/audit-finding-key.mjs',
+      'scripts/lib/daemon-rebuild/probation.mjs',
+      'scripts/lib/privacy-terms.mjs',
+      'scripts/operations/audit-base-repro.mjs',
+      'scripts/operations/review-job-end-diagnosis.mjs',
+      'scripts/readiness/resource-request.mjs',
     ];
     expect(AGENT_LAUNCH_ALLOWLIST).toHaveLength(1857 + reviewedExistingCallers.length);
     expect(new Set(AGENT_LAUNCH_ALLOWLIST).size).toBe(AGENT_LAUNCH_ALLOWLIST.length);
