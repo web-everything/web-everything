@@ -25,7 +25,14 @@ export function boundMergeGateReviewHold(row, { headSha, labels } = {}) {
     && Number.isSafeInteger(jobId) && jobId > 0
     && [row.mergeGateHoldExcused, row.mergeGateReviewHold].some(annotation => {
       // Only a plain failure is excusable: a cancelled/timed-out run needs a rerun, never a hold excuse.
-      if (String(annotation?.originalConclusion ?? row.conclusion).toLowerCase() !== 'failure') return false;
+      // A review-hold annotation never rewrites the row, so the row's own conclusion is the truth; only the
+      // compatibility excusal rewrites it to success and records the original.
+      if (!annotation) return false;
+      const excusal = annotation === row.mergeGateHoldExcused;
+      // The compatibility excusal leaves the row success (rewritten) or failure; any other conclusion is a different outcome.
+      if (excusal && !['success', 'failure'].includes(String(row.conclusion).toLowerCase())) return false;
+      const actual = excusal ? (annotation.originalConclusion ?? row.conclusion) : row.conclusion;
+      if (String(actual).toLowerCase() !== 'failure') return false;
       if (annotation?.jobId !== jobId || typeof annotation.headSha !== 'string'
         || annotation.headSha.toLowerCase() !== headSha.toLowerCase()
         || !Array.isArray(annotation.holdIds) || !annotation.holdIds.length) return false;
