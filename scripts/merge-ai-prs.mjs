@@ -5302,7 +5302,7 @@ async function runCli() {
   // `--only` sweep filtered out of the candidate set is still visible for the couple gate's health read.
   // #4108 (converge round 1 v3, simplicity lens) — no default: the sole call site (below) always passes
   // `liveListingsByRepo` explicitly.
-  const collectContext = (liveByRepo) => collectOpenPrContext({
+  const collectContext = (liveByRepo, readLiveRowsByRepo) => collectOpenPrContext({
     contextRepos: CONTEXT_REPOS,
     reconcileRan: true,
     // #999/xq985wu F3 — `--limit OPEN_PR_LIST_LIMIT` (raised off the old silent 100). This listing is the SOLE
@@ -5314,6 +5314,9 @@ async function runCli() {
       // that is in `CONTEXT_REPOS` but not `REPOS` (a narrowed `--repos`/`--this-repo` sweep's extra
       // constellation-context repos — rare, a no-op on the common full sweep) needs its own live open set.
       if (liveByRepo.has(repo)) return liveByRepo.get(repo);
+      // Round rows are candidate evidence only. Re-list pages live, reusing the hydrated
+      // heavy-field cache/shared host seed only after matching the live head and updatedAt.
+      if (readLiveRowsByRepo.has(repo)) return readLiveRowsByRepo.get(repo)();
       // xsbyo56 — `body` added so the #2832 held-reconcile branch (below) can read back the PR's own
       // `## Escalation reason` block (`buildHeldReviewHoldReason`/`parseEscalationReason`) and name the
       // specific file(s) that forced a review:human/pending/changes hold, not just the label.
@@ -5735,9 +5738,13 @@ async function runCli() {
         return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       };
       const rows = roundPath && slug
-        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget,
-          defaultBranch: () => defaultBranchByRepo.get(repo) ?? null,
-          listLive: async () => { const rows = await listLive(); await resolveDefaultBranch(repo); return rows; } })
+        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: true,
+          defaultBranch: async () => {
+            await __t.timeAsync('listing.defaultBranch', () => resolveDefaultBranch(repo));
+            return defaultBranchByRepo.get(repo) ?? null;
+          },
+          reuseDefaultBranch: name => { if (typeof name === 'string' && name.trim()) defaultBranchByRepo.set(repo, name); },
+          listLive })
         : await listLive();
       const listedRows = Array.isArray(rows) ? rows : [];
       const truncated = Array.isArray(rows) && isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT);
@@ -5791,6 +5798,7 @@ async function runCli() {
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
   const liveListingsByRepo = buildLiveListingsByRepo(listings);
+  const readLiveRowsByRepo = new Map(listings.filter(l => l.listing === 'snapshot').map(l => [l.repo, l.readLiveRows]));
   // #2421 — the shared open-PR listing + manifest reads + cross-repo item-openness set the reconcile below
   // needs, computed ONCE for this pass (RECONCILE-gated — same cost profile as the reconcile it feeds: free on
   // a bare, unlabelled sweep). #4108 — reuses `liveListingsByRepo` above instead of re-listing every repo in
@@ -5810,7 +5818,7 @@ async function runCli() {
       });
       await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts();
     },
-    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
+    collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo, readLiveRowsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
   // Round snapshots are candidate evidence only. Reuse the live context listing when available; a bare
