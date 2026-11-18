@@ -1,5 +1,10 @@
 /** @file Synthetic R1053 proof fixture (scratch branch only, never merged). */
 
+/** Display helper, unrelated to decisions. */
+export function formatName(rule) {
+  return `rule ${rule.id}: ${rule.name}`;
+}
+
 /** Pre-existing weakness: any parse failure fails OPEN and returns an allow decision. */
 export function parseDecision(text) {
   try {
@@ -9,14 +14,14 @@ export function parseDecision(text) {
   }
 }
 
+/** Existing caller of the weak parser. */
+export function evaluate(rule) {
+  return parseDecision(rule.text) ? 'allow' : 'deny';
+}
+
 /** Authorization guard: only admins may change a rule. */
 export function changeRule(user, rule, store) {
   if (!user || user.role !== 'admin') throw new Error('admin required');
   store.set(rule.id, rule);
   return rule.id;
-}
-
-/** Unrelated helper that already relied on parseDecision before this change. */
-export function describeRule(rule) {
-  return `Rule ${rule.id} (${parseDecision(rule.text) ? 'allow' : 'deny'}): ${rule.name}`;
 }
