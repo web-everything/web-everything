@@ -72,6 +72,71 @@ describe('R986 report-only probation persistence', () => {
       const sha = git(['commit-tree', git(['write-tree']), '-m', 'unresolved require']);
       expect(m.readClosure(root, registered[1], sha)).toEqual({ complete: false });
     });
+  it.each([
+    'import /* comment */ "./dep.mjs";',
+    'import // comment\n "./dep.mjs";',
+    "export { default } from /*c*/ './dep.mjs';",
+    "import /*c*/ ( /*c*/ './dep.mjs' /*c*/ );",
+    "import( // comment\n './dep.mjs' // comment\n );",
+  ])('commented import includes its dependency and owes proof: %s', async source => {
+    const m = await load();
+    writeFileSync(join(root, 'x.mjs'), source);
+    writeFileSync(join(root, 'dep.mjs'), 'export default 1;');
+    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'comment before']);
+    writeFileSync(join(root, 'dep.mjs'), 'export default 2;');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'comment after']);
+    expect(m.readClosure(root, registered[0], head)).toEqual({ complete: true, files: {
+      'x.mjs': git(['rev-parse', head + ':x.mjs']), 'dep.mjs': git(['rev-parse', head + ':dep.mjs']),
+    } });
+    expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
+      .toMatchObject({ action: 'pending', owed: ['X'] });
+    writeFileSync(join(root, 'x.mjs'), source.replaceAll('./dep.mjs', '../outside.mjs'));
+    writeFileSync(join(dir, 'outside.mjs'), 'export default 1;');
+    git(['add', '.']); const outside = git(['commit-tree', git(['write-tree']), '-m', 'outside import']);
+    expect(m.readClosure(root, registered[0], outside)).toEqual({ complete: false });
+  });
+  it('regex character-class slashes preserve the following import and owe proof for its changed dependency', async () => {
+    const m = await load();
+    writeFileSync(join(root, 'x.mjs'), "const re = /[//]/; import './dep.mjs';");
+    writeFileSync(join(root, 'dep.mjs'), 'export default 1;');
+    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'regex before']);
+    writeFileSync(join(root, 'dep.mjs'), 'export default 2;');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'regex after']);
+    expect(m.readClosure(root, registered[0], head)).toEqual({ complete: true, files: {
+      'x.mjs': git(['rev-parse', head + ':x.mjs']), 'dep.mjs': git(['rev-parse', head + ':dep.mjs']),
+    } });
+    expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
+      .toMatchObject({ action: 'pending', owed: ['X'] });
+  });
+  it('unreadable comment syntax refuses a complete closure', async () => {
+    const m = await load();
+    writeFileSync(join(root, 'x.mjs'), "/* unterminated comment hiding import './dep.mjs';");
+    git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'unreadable syntax']);
+    expect(m.readClosure(root, registered[0], sha)).toEqual({ complete: false });
+  });
+  it.each(['preserved', 'reverted'])('successive freezes retain unproven X debt when its files are %s', async mode => {
+    const m = await load(), observer = m.createProbationObserver(opts);
+    expect(await observer.adopt(previous(), adopted())).toMatchObject({ action: 'pending', owed: ['X'] });
+    const first = adopted();
+    if (mode === 'reverted') writeFileSync(join(root, 'dep.mjs'), 'export default 1;');
+    writeFileSync(join(root, 'unrelated.txt'), 'second adoption');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', head, '-m', 'second']);
+    expect(await observer.adopt(first, { head, at: iso(at + 1) }))
+      .toMatchObject({ action: 'pending', owed: ['X'] });
+    const record = JSON.parse(readFileSync(m.probationPath(root, env), 'utf8'));
+    expect(record.provenGood).toBe(good);
+    expect(record.records).toEqual({});
+  });
+  it('persistent lock contention exhausts five attempts and requests operator recovery without changing bytes', async () => {
+    const m = await load(), observer = m.createProbationObserver(opts);
+    await observer.adopt(previous(), adopted());
+    const file = m.probationPath(root, env), before = readFileSync(file, 'utf8');
+    await withWriteLock(root, async () => {
+      expect(await observer.proof(processRecord('X', 101))).toMatchObject({ status: 'invalid', action: 'pending',
+        reason: expect.stringMatching(/concurrent-mover.*5 attempts.*operator recovery required/) });
+      expect(readFileSync(file, 'utf8')).toBe(before);
+    }, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'persistent-blocker' });
+  });
   it('snapshots runtime JSON names across directories so a changed config owes proof', async () => {
     const m = await load();
     writeFileSync(join(root, 'y.mjs'), "export const config = 'runtime.json';");
@@ -177,14 +242,22 @@ describe('R986 report-only probation persistence', () => {
     await held;
     const first = a.proof(processRecord('X', 101)), second = b.proof(processRecord('Y', 202));
     expect(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).toEqual({});
-    release(); await blocker; const results = await Promise.all([first, second]);
-    // Existing lock primitive, used as-is (R1050 owns its gaps): contenders may be REFUSED (concurrent-mover),
-    // never both-applied-out-of-order. A refused proof is reported invalid/pending and the record stays valid.
-    for (const r of results) expect(['pending', 'pass']).toContain(r.action);
+    const samples = [];
+    const sample = () => {
+      try { samples.push(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8'))); }
+      catch (e) { samples.push({ error: e.message }); }
+    };
+    const timer = setInterval(sample, 1);
+    let results;
+    try { release(); await blocker; results = await Promise.all([first, second]); }
+    finally { clearInterval(timer); sample(); }
+    expect(samples.length).toBeGreaterThan(0);
+    for (const snapshot of samples) {
+      expect(snapshot.error).toBeUndefined();
+      expect((await import('../probation.mjs')).validateProbation(snapshot, at + 3)).toBeNull();
+    }
+    for (const r of results) expect(r.status).toBe('valid');
     const onDisk = () => Object.keys(JSON.parse(readFileSync(m.probationPath(root, env), 'utf8')).records).sort();
-    expect(onDisk().every(id => ['X', 'Y'].includes(id))).toBe(true);
-    // Retrying each daemon's proof sequentially converges; no proof is ever invented by the race.
-    await a.proof(processRecord('X', 101)); await b.proof(processRecord('Y', 202));
     expect(await a.status()).toMatchObject({ action: 'pass' });
     expect(onDisk()).toEqual(['X', 'Y']);
   });
