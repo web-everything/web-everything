@@ -23,8 +23,8 @@ import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
  *   - `candidate`: the same sha (`exact`); a different sha whose TREE is identical — overlay-list churn that does
  *     not change a single file (`same-tree`, adopts the current plan's commit); or an older build the plan has
  *     since moved past (`superseded`, adopts the verified build — still newer than HEAD; the newer plan is smoked
- *     on a later tick), but only while every overlay it carries is still registered or has landed on main, so an
- *     overlay the operator removed is never brought back.
+ *     on a later tick), but only while each carried tip is still wanted. A removed ref is refused even when
+ *     another overlay contains its tip. Newly wanted overlays and descendant tips are rebuilt on the next tick.
  *   - `fallback-main-moved`: a passed fallback whose failing inputs moved ONLY because main advanced — every
  *     suspect that is still registered is still at the sha that failed (`overlayTip`) — is adopted anyway and
  *     still drops the suspects, exactly as its own finalize would have.
@@ -33,7 +33,7 @@ import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
  * this module could have minted from the current main history and the registered overlay refs
  * ({@link readyBuildVerified}). Refuses by default.
  * @param {{ready:object|null, plan:object, prevHead:string, treeOf:(sha:string)=>string|null,
- *   stillWanted:(ref:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
+ *   stillWanted:(ref:string,sha?:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
  *   overlayTip?:(ref:string)=>string|null, registered?:(ref:string)=>boolean, allowFallback?:boolean,
  *   rejected?:object|null, nowMs:number, maxAgeMs:number, forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
  *   `registered`: still on the overlay list after this tick's own edits (defaults to `stillWanted`); `allowFallback: false`
@@ -85,10 +85,10 @@ export function matchReadyCandidate({
     // Literal reasons (no template): the reason-classification test reads them statically.
     if (watch !== 'ok') return { adopt: null, reason: watch === 'unreadable' ? 'forced-watch-unreadable' : watch === 'owed' ? 'forced-watch-owed' : 'forced-watch-missing' };
   }
-  const carriesOnlyWanted = (ready.adopt.applied || []).every((a) => stillWanted(a.ref));
+  const applied = ready.adopt.applied || [];
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
-    if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+    if (!applied.every((a) => stillWanted(a.ref))) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
     const revokedFallback = revokedAudit(ready.adopt);
     if (revokedFallback.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedFallback };
@@ -102,13 +102,18 @@ export function matchReadyCandidate({
       ? { adopt: null, reason: 'fallback-inputs-moved' }
       : { adopt: ready.adopt, dropRefs, failed: ready.failed || '', match: 'fallback-main-moved' };
   }
+  // Each recorded tip must itself remain wanted. Successor ancestry cannot authorize a removed ref:
+  // the successor's current descendant may have retracted content present in this candidate.
+  const carriesOnlyWanted = applied.every((a) => a.sha && stillWanted(a.ref, a.sha));
   if (plan.finalSha === ready.adopt.finalSha) {
+    if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const revokedExact = revokedAudit(ready.adopt);
     if (revokedExact.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedExact };
     return { adopt: ready.adopt, dropRefs: [], match: 'exact' };
   }
   const planTree = treeOf(plan.finalSha);
   if (planTree && ready.tree && planTree === ready.tree) {
+    if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const adopt = {
       finalSha: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied,
     };
@@ -116,8 +121,8 @@ export function matchReadyCandidate({
     if (revokedSameTree.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSameTree };
     return { adopt, dropRefs: [], match: 'same-tree' };
   }
-  if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
+  if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
   const revokedSuperseded = revokedAudit(ready.adopt);
   if (revokedSuperseded.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSuperseded };
   // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.

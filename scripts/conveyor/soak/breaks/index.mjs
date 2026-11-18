@@ -43,6 +43,7 @@
  * `stall-sweep-pages-files-past-100.mjs` uses the same automatic registration.
  * `red-team-gate-send-back-failed-never-retried.mjs` uses the same automatic registration.
  * `ready-candidate-diagnostic-event-masks-drop.mjs` uses the same automatic registration.
+ * `ready-candidate-adopted-across-overlay-churn.mjs` uses the same automatic registration.
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.
  * `live-changes-stale-accepted-phase.mjs` uses the same automatic registration.
  * `same-head-hold-clean-head-never-resolves.mjs` uses the same automatic registration.

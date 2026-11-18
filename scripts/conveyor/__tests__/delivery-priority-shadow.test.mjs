@@ -40,9 +40,14 @@ describe('actualScopeWaiters — only PRs actually waiting behind this one', () 
 describe('replay: the live 12-PR fix pass of 2026-10-09 03:04Z', () => {
   it('spreads the classes: only the admitted head that others wait on is P1, the rest P3 (was 12 x P1)', () => {
     const now = Date.parse(PASS_0304.now);
-    const scope = filterFixesByInFlightScope(PASS_0304.planned, [], [], { now, maxWaitMinutes: 60 });
+    // R1048 exempts backlog prose: replay the same overlap graph with code paths.
+    const planned = PASS_0304.planned.map((entry) => ({
+      ...entry,
+      overlapScope: entry.overlapScope.map((path) => path.replace(/^we:backlog\/(.*)\.md$/, 'we:scripts/replay-overlap/$1.mjs')),
+    }));
+    const scope = filterFixesByInFlightScope(planned, [], [], { now, maxWaitMinutes: 60 });
     const { ranked } = shadowFixPassPriority({
-      planned: PASS_0304.planned, ranks: scope.ranks, refusals: scope.refusals,
+      planned, ranks: scope.ranks, refusals: scope.refusals,
       settings: resolvePrioritySettings({ mode: 'shadow', agingHours: 8, maxLiveP0: 2, unblockWeightMinutes: 60 }), now,
     });
     expect(ranked).toHaveLength(12);
