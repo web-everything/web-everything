@@ -104,6 +104,21 @@ describe('urgent verifier', () => {
 });
 
 describe('real adapter contract with injected filesystem and subprocesses', () => {
+  it('strips CI markers from every subprocess so host admission cannot be bypassed', () => {
+    const markers = ['CI', 'GITHUB_ACTIONS', 'CONTINUOUS_INTEGRATION', 'GITLAB_CI',
+      'BUILDKITE', 'CIRCLECI', 'TRAVIS', 'JENKINS_URL', 'TEAMCITY_VERSION', 'TF_BUILD', 'BUILD_NUMBER'];
+    const env = { PATH: '/bin', HOME: '/home/test', ...Object.fromEntries(markers.map(k => [k, 'true'])) };
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    const deps = createUrgentDeps({ env, spawnSync });
+    deps.standards(); deps.shard({ shard: '1/1' });
+    expect(spawnSync).toHaveBeenCalledTimes(2);
+    for (const [, args, options] of spawnSync.mock.calls) {
+      expect(args[0]).toBe('scripts/readiness/heavy-admission.mjs');
+      expect(options.env).toEqual({ PATH: '/bin', HOME: '/home/test' });
+      for (const marker of markers) expect(options.env).not.toHaveProperty(marker);
+    }
+    expect(env.CI).toBe('true');
+  });
   it('reads the current ten CI groups, runs every shard through admission and appends privately', async () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
     const plan = ciUnitPlan(workflow);
@@ -166,6 +181,33 @@ describe('CI gate mirroring fails closed', () => {
     });
   });
   const real = yaml.safeLoad(workflow);
+  it.each(['test-shard', 'standards', 'coverage-merge', 'host-paths', 'integration'])(
+    'refuses extra previously allowlisted commands in %s even with matching context', job => {
+      for (const run of ['npm run build:tools', 'npm ci --ignore-scripts', 'npm ci',
+        'sh scripts/ci/fetch-main-history.sh', 'npm ci\nnpm run build:tools']) {
+        const changed = yaml.safeLoad(workflow);
+        changed.jobs[job].steps.push({ run,
+          'working-directory': run.includes('\n') ? 'frontierui' : 'web-everything',
+          ...(job === 'test-shard' ? { if: "${{ needs.changes.outputs.light != 'true' }}" }
+            : job === 'integration' ? { if: "${{ steps.gate.outputs.run == 'true' }}" } : {}),
+        });
+        expect(() => ciGatePlan(yaml.safeDump(changed)), run).toThrow('unreadable-ci-gates');
+      }
+    });
+  const checkoutSteps = Object.entries(real.jobs)
+    .filter(([job]) => ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'standards'].includes(job))
+    .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => step.uses === 'actions/checkout@v4' ? [[job, index, step.with?.path === 'frontierui']] : []));
+  it.each(checkoutSteps)('pins checkout source and directory for %s step %i (FUI=%s)', (job, index, fui) => {
+    for (const [key, value] of [['ref', 'other-branch'], ['ref', null], ['path', 'unexpected'],
+      ['repository', fui ? 'other/frontierui' : 'frontier-ui/frontierui'],
+      ...(fui ? [['repository', undefined]] : [])]) {
+      const changed = yaml.safeLoad(workflow), checkout = changed.jobs[job].steps[index];
+      checkout.with = { ...checkout.with, [key]: value };
+      if (value === undefined) delete checkout.with[key];
+      expect(() => ciGatePlan(yaml.safeDump(changed)), key).toThrow('unreadable-ci-gates');
+    }
+  });
+
   const runSteps = Object.entries(real.jobs).filter(([job]) => ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'].includes(job))
     .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => typeof step.run === 'string' ? [[job, index, step.name]] : []));
   it.each(runSteps)('refuses changed execution context for %s step %i (%s)', (job, index) => {

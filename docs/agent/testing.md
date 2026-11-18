@@ -4644,11 +4644,14 @@ The urgent sweep reads all check-runs (maximum 100, exact count and unique IDs r
 green only after every run completes and all required runs succeed. Pending unrelated runs keep the
 load eligible for later failure detection. Legacy green settlements without `checksComplete: true`
 are rechecked; incomplete or oversized evidence escalates to NEEDS-YOU for manual inspection.
+An explicit completed failure for the exact SHA unloads first even when the remaining evidence is malformed, incomplete or oversized.
 
 Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
 
 The urgent gate mirror pins every `run` text in `test-shard`, `coverage-merge`, `host-paths`,
-`integration`, `test`, `standards` and `changes`, with an explicit setup-command allowlist outside `test`/`changes`. When CI adds
+`integration`, `test`, `standards` and `changes`, with job-specific setup commands and exact occurrence counts.
+Extra validations require a local runner update, including otherwise familiar setup commands.
+Checkout sources and paths are pinned: WE uses the event checkout without a ref/repository override; FUI uses `frontier-ui/frontierui` without a ref override. When CI adds
 validation, update the mirror before issuing local receipts; unknown run steps refuse with
 `unreadable-ci-gates`. Keep the real-workflow acceptance and per-job unknown-step regressions
 in `urgent-verify.test.mjs`.
@@ -4658,7 +4661,7 @@ Urgent verification derives the required CI job closure from `test.needs`, inclu
 dependencies; unknown jobs or changed install commands require a mirror update or passing CI.
 It verifies the clean FUI sibling against its fetched default branch, then admits FUI install/build
 and checkout install before suites. Signed receipts include `fuiSha` and both install steps; older
-receipts require fresh verification. Child environments are allowlisted and the signing key is read
+receipts require fresh verification. Child environments are allowlisted with CI markers explicitly removed so host admission cannot be bypassed, and the signing key is read
 only after the suite pipeline stops. `urgent-sweep` is one bounded pass (32 loads, 100 checks per SHA);
 the orchestrator schedules it. Its durable settlement ledger prevents repeat handling and stores a
 `sweep-cursor` before each batch so pending or unreadable loads cannot starve later entries.

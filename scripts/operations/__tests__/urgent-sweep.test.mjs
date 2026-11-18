@@ -172,6 +172,30 @@ describe('urgent CI sweep', () => {
     expect(await f.run()).toMatchObject({ ok: false, fallback: expect.stringContaining('manually') });
     expect(f.d.escalate).toHaveBeenCalled(); expect(f.d.remove).not.toHaveBeenCalled(); expect(f.settlements()).toEqual([]);
   });
+  it.each([
+    ['oversized', { total_count: 101, check_runs: [check('test', 'failure')] }],
+    ['incomplete', { total_count: 2, check_runs: [check('test', 'failure')] }],
+    ['missing count', { check_runs: [check('test', 'failure')] }],
+    ['malformed row', { total_count: 2, check_runs: [null, check('smoke', 'failure', { app: undefined, id: undefined })] }],
+    ['duplicate IDs', { total_count: 2, check_runs: [check('test', 'success', { id: 1 }), check('test', 'failure', { id: 1 })] }],
+  ])('unloads before escalating %s evidence containing an explicit exact-SHA failure', async (_, data) => {
+    const f = fixture(); f.d.checks.mockReturnValue(data);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded' })]);
+    expect(f.settlements()).toEqual([expect.objectContaining({ status: 'settled-unloaded' })]);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
+    expect(f.d.remove.mock.invocationCallOrder[0]).toBeLessThan(f.d.escalate.mock.invocationCallOrder[0]);
+    expect(f.d.required).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['foreign SHA', check('test', 'failure', { head_sha: 'c'.repeat(40) })],
+    ['unfinished failure', check('test', 'failure', { status: 'in_progress' })],
+  ])('keeps incomplete evidence with %s unsettled', async (_, row) => {
+    const f = fixture(); f.d.checks.mockReturnValue({ total_count: 2, check_runs: [row] });
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(f.d.remove).not.toHaveBeenCalled(); expect(f.settlements()).toEqual([]);
+  });
   it.each(['required', 'checks'])('escalates an unreadable %s reader', async step => {
     const f = fixture(); f.d[step].mockImplementation(() => { throw new Error('unreadable'); });
     expect((await f.run()).ok).toBe(false); expect(f.d.escalate).toHaveBeenCalled(); expect(f.settlements()).toEqual([]);

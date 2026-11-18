@@ -45,8 +45,11 @@ export function ciUnitPlan(workflow) {
 // Pin complete run texts, including shard-selection helpers and dependency receipts.
 // Do not derive this allowlist from the workflow at runtime: new validation must update the mirror.
 const runText = run => run.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#')).join('\n');
-const setupRuns = ['sh scripts/ci/fetch-main-history.sh', 'npm ci', 'npm ci --ignore-scripts',
-  'npm run build:tools', 'npm ci\nnpm run build:tools'];
+const setupRuns = ['sh scripts/ci/fetch-main-history.sh', 'npm ci', 'npm ci\nnpm run build:tools'];
+const jobSetupRuns = {
+  standards: setupRuns, 'test-shard': setupRuns, integration: setupRuns,
+  'coverage-merge': ['npm ci'],
+};
 const mirroredRuns = {
   changes: ["FRESH_MAIN_SHA=\"\"\nif [ \"$EVENT_NAME\" = \"merge_group\" ]; then\n  BASE_SHA=\"$MG_BASE_SHA\"\nfi\nif [ \"$BASE_REF\" = \"main\" ]; then\n  if sh scripts/ci/fetch-main-history.sh; then\n    FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=\"\"\n  else\n    echo \"ci-card-only: main fetch failed; full suite\" >&2\n  fi\nfi\nnode scripts/ci-card-only.mjs --event=\"$EVENT_NAME\" --base=\"$BASE_SHA\" --base-ref=\"$BASE_REF\" --fresh-main-sha=\"$FRESH_MAIN_SHA\" --head=HEAD >> \"$GITHUB_OUTPUT\""],
   'test-shard': [
@@ -188,11 +191,26 @@ export function ciGatePlan(workflow) {
   for (const job of requiredJobs) {
     const mirrored = mirroredRuns[job];
     const steps = jobs?.[job]?.steps;
-    const allowed = new Set([...(job === 'test' || job === 'changes' ? [] : setupRuns), ...mirrored].map(runText));
+    const expectedRuns = [...(jobSetupRuns[job] ?? []), ...mirrored].map(runText);
+    const allowed = new Set(expectedRuns);
     if (!Array.isArray(steps) || steps.some(s => !s || typeof s !== 'object' || ('run' in s &&
       (typeof s.run !== 'string' || !allowed.has(runText(s.run)))))
       || steps.some(s => 'uses' in s && !mirroredActions.has(s.uses)))
       throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run or uses steps`);
+    // Every accepted command must belong to the local mirror, exactly once.
+    const actualRuns = steps.filter(s => 'run' in s).map(s => runText(s.run));
+    if (actualRuns.length !== expectedRuns.length || expectedRuns.some(text => actualRuns.filter(run => run === text).length !== 1))
+      throw new Error(`unreadable-ci-gates: ${job} command layout; update the urgent verification mirror`);
+    const sibling = ['standards', 'test-shard', 'integration'].includes(job);
+    const checkouts = steps.filter(s => s.uses === 'actions/checkout@v4');
+    const expectedCheckouts = sibling ? 2 : job === 'test' ? 0 : 1;
+    if (checkouts.length !== expectedCheckouts || checkouts.some((checkout, index) => {
+      const options = checkout.with ?? {};
+      const fui = sibling && index === 1;
+      const path = fui ? 'frontierui' : sibling || job === 'coverage-merge' ? 'web-everything' : undefined;
+      return Object.hasOwn(options, 'ref') || options.path !== path
+        || (fui ? options.repository !== 'frontier-ui/frontierui' : Object.hasOwn(options, 'repository'));
+    })) throw new Error(`unreadable-ci-gates: ${job} checkout layout; update the urgent verification mirror`);
     if (jobs[job].defaults?.run !== undefined || jobs[job].env !== undefined || jobs[job].container !== undefined
       || jobs[job]['continue-on-error'] !== undefined)
       throw new Error(`unreadable-ci-gates: ${job} execution context; update the urgent verification mirror`);

@@ -102,15 +102,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           continue;
         }
         const data = await deps.checks(r);
-        if (!Number.isInteger(data?.total_count)
-          || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
-          || data.check_runs.length !== data.total_count || new Set(data.check_runs.map(c => c?.id)).size !== data.total_count
-          || data.check_runs.some(c => !Number.isSafeInteger(c?.id)
-            || c.head_sha !== r.sha || typeof c.name !== 'string' || !Number.isSafeInteger(c.app?.id)
-            || !['queued', 'in_progress', 'completed'].includes(c.status)
-            || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
-          throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
-        if (data.check_runs.some(c => failedCheck(c, r.sha))) {
+        if (Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha))) {
           const removal = await deps.remove(r);
           if (!removal || removal.refused || (removal.removed !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };
@@ -119,6 +111,14 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           await deps.settle({ ...event, status: 'settled-unloaded' });
           results.push({ id, status: 'settled-unloaded' });
         } else {
+          if (!Number.isInteger(data?.total_count)
+            || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
+            || data.check_runs.length !== data.total_count || new Set(data.check_runs.map(c => c?.id)).size !== data.total_count
+            || data.check_runs.some(c => !Number.isSafeInteger(c?.id)
+              || c.head_sha !== r.sha || typeof c.name !== 'string' || !Number.isSafeInteger(c.app?.id)
+              || !['queued', 'in_progress', 'completed'].includes(c.status)
+              || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
+            throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
           const required = await deps.required(r);
           if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
           const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
