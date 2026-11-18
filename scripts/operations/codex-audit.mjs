@@ -96,7 +96,7 @@ async function proveFindings(findings, base, head, deps) {
     for (const name of ['reproOnBase', 'readBaseFile', 'readHeadFile', 'diffText', 'numstatText', 'baseRecheckMax', 'fileCard']) {
       if (typeof deps[name] !== 'function') throw new Error('missing proof dependency');
     }
-    const answers = parseReproAnswer(await deps.reproOnBase(REPRO_QUESTION(findings), findings, base), findings.length);
+    const answers = parseReproAnswer(await deps.reproOnBase(`${REPRO_QUESTION(findings)}\nCompare with head ${head}: read git diff ${base}...${head} and answer WORSENED if it adds a reaching path, removes a guard, or makes the weakness easier to trigger.\n`, findings, base), findings.length);
     const detailed = findings.map((text, i) => {
       const loc = parseFindingLocation(text);
       const sourceText = loc ? deps.readHeadFile(loc.file, head) : undefined;

@@ -570,6 +570,11 @@ describe('R1053 prove mode', () => {
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(() => true) });
     return f;
   }
+  it('the repro prompt names the head and the diff range', async () => {
+    const f = proof();
+    await main(ARGS, f.deps);
+    expect(f.deps.reproOnBase.mock.calls[0][0]).toMatch(/Compare with head [0-9a-f]{40}: read git diff [0-9a-f]{40}\.\.\.[0-9a-f]{40}/);
+  });
   it('a1 clears X while only Y changes and confirms exactly one card before recording', async () => {
     const f = proof();
     expect(await main(ARGS, f.deps)).toBe(0);
