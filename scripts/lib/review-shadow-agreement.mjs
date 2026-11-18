@@ -91,6 +91,20 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
   };
 }
 
+// Validate raw evidence before the display normalizer can coerce or drop malformed findings.
+// The reducer has no exported answer validator; require the canonical summary shape locally.
+function validShadowAnswer(answer) {
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const text = value => typeof value === 'string' && value.trim().length > 0;
+  return object(answer) && text(answer.summary) && Array.isArray(answer.findings)
+    && Array.from(answer.findings).every(finding => object(finding) && text(finding.summary)
+      && ['file', 'path', 'category', 'failure_scenario', 'disposition', 'impactIfUnfixed'].every(
+        key => finding[key] == null || typeof finding[key] === 'string')
+      && (finding.line == null || (Number.isSafeInteger(finding.line) && finding.line > 0)));
+}
+
+export const REQUIRED_PROMOTION_LENSES = Object.freeze(['correctness', 'security']);
+
 /**
  * The durable row for one shadow seat run. PURE. Carries counts and identities, never finding text.
  * @param {object} o
@@ -102,6 +116,8 @@ export function buildShadowRow({ at, repo, pr, head, lens, runId, model, agyRun,
     at, repo: repo ?? null, pr: pr ?? null, head: head ?? null, lens, runId: runId ?? null,
     provider: 'agy', model, servedModel: agyRun.servedModel ?? null,
     status: agyRun.status,
+    claudeValid: validShadowAnswer(claudeAnswer),
+    agyValid: validShadowAnswer(agyAnswer),
     ...(agyRun.reasons?.length ? { reasons: agyRun.reasons.slice(0, 5).map((r) => String(r).slice(0, 300)) } : {}),
     agySessionId: agyRun.sessionId ?? null,
     claudeSessionId: agyRun.claudeSessionId ?? null,
@@ -193,13 +209,18 @@ export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
     const key = `${row.repo}#${row.pr}`;
     // Any failed, voided, skipped, uncompared or unserved Carbon trial on the PR disqualifies it: incomplete evidence.
     const complete = typeof row.servedModel === 'string' && row.servedModel.toLowerCase().includes('carbon')
+      && row.claudeValid === true && row.agyValid === true
       && row.status === 'ok' && Boolean(row.overlap) && !Object.hasOwn(row, 'fellBackTo');
     // Carbon must match every Claude finding and add none of its own (no Claude-only, no Carbon-only findings).
     const findingsAgree = complete && (row.overlap.claudeOnly ?? row.overlap.claudeCount) === 0
       && (row.overlap.agyOnly ?? row.overlap.agyCount) === 0;
-    prs.set(key, (prs.get(key) ?? true) && complete && row.verdictAgree === true && findingsAgree);
+    const evidence = prs.get(key) ?? { agrees: true, lenses: new Set() };
+    evidence.agrees &&= complete && row.verdictAgree === true && findingsAgree;
+    evidence.lenses.add(row.lens);
+    prs.set(key, evidence);
   }
-  const agreeingPrs = [...prs.values()].filter(Boolean).length;
+  const agreeingPrs = [...prs.values()].filter(evidence => evidence.agrees
+    && REQUIRED_PROMOTION_LENSES.every(lens => evidence.lenses.has(lens))).length;
   return { agreeingPrs, comparedPrs: prs.size, threshold, reached: agreeingPrs >= threshold };
 }
 

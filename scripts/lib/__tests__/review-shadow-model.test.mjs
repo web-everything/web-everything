@@ -105,6 +105,17 @@ describe('Carbon promotion settings and advisory guards', () => {
     expect(carbon.value.findings).toEqual(claudeAnswer.findings);
     expect(carbon.rows[0]).toMatchObject({ model: carbonModel, servedModel: carbonModel, status: 'ok', verdictAgree: true });
   });
+  it.each(['claude', 'skip'])('skips counted Carbon at cap zero with onEscape=%s and never uses its answer', async onEscape => {
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
+    const result = await run([ok], { mode: 'agy', model: 'gemini-4-carbon-high', onEscape });
+    expect(result.models).toEqual([]);
+    expect(result.rows).toEqual([]);
+    expect(result.value.seatProvider).toMatchObject(onEscape === 'claude'
+      ? { provider: 'claude', fellBackFrom: { status: 'skipped', reasons: ['gemini seat cap 0'] } }
+      : { provider: 'agy', status: 'skipped', reasons: ['gemini seat cap 0'] });
+    expect(result.value.summary).toBe(onEscape === 'claude' ? claudeAnswer.summary : 'skipped: agy seat skipped: gemini seat cap 0');
+    expect(result.value.findings).toEqual(onEscape === 'claude' ? claudeAnswer.findings : []);
+  });
   it('keeps the Claude answer when Carbon disagrees in shadow', async () => {
     const result = await run([{ ...ok, value: { findings: [] } }], { model: 'gemini-4-carbon-high' });
     expect(result.value.findings).toEqual(claudeAnswer.findings);
@@ -207,6 +218,34 @@ describe('shadow rows', () => {
     expect(trial).toMatchObject({ attempts: 1, ok: expected.compared, failed: expected.failed,
       voided: expected.voided, quota: { held: expected.held }, skipped: expected.skipped,
       agreement: { compared: expected.compared }, trial: { reviews: expected.compared } });
+  });
+  it.each([
+    { summary: '', findings: [] },
+    { summary: '   ', findings: [] },
+    { summary: 42, findings: [] },
+    { summary: 'reviewed', findings: {} },
+    { summary: 'reviewed' },
+    { summary: 'reviewed', findings: [null] },
+    { summary: 'reviewed', findings: [[]] },
+    { summary: 'reviewed', findings: [{}] },
+    { summary: 'reviewed', findings: [{ summary: 42 }] },
+    { summary: 'reviewed', findings: [{ summary: 'defect', file: 42 }] },
+    { summary: 'reviewed', findings: [{ summary: 'defect', line: -1 }] },
+  ])('malformed raw answer %j is invalid promotion evidence on either side', malformed => {
+    const valid = { summary: 'reviewed', findings: [] };
+    const makeRow = (claude, agy, lens) => buildShadowRow({
+      repo: 'o/r', pr: 1, lens, model: 'gemini-4-carbon-high',
+      agyRun: { ...ok, servedModel: 'gemini-4-carbon-high' }, claudeAnswer: claude, agyAnswer: agy,
+      comparison: compareShadowAnswers({ claude, agy }),
+    });
+    for (const side of ['claude', 'agy']) {
+      const rows = ['correctness', 'security'].map(lens => makeRow(side === 'claude' ? malformed : valid, side === 'agy' ? malformed : valid, lens));
+      expect(rows[0]).toMatchObject({ claudeValid: side !== 'claude', agyValid: side !== 'agy' });
+      expect(summarizeCarbonPromotion(rows).agreeingPrs).toBe(0);
+    }
+    const validRows = ['correctness', 'security'].map(lens => makeRow(valid, valid, lens));
+    expect(validRows[0]).toMatchObject({ claudeValid: true, agyValid: true });
+    expect(summarizeCarbonPromotion(validRows).agreeingPrs).toBe(1);
   });
   it('stores only bounded anchors and counts with one-to-one matches', () => {
     const agyAnswer = { findings: Array.from({ length: 35 }, () => ({ ...finding, claim: 'secret', message: 'secret' })) };
@@ -388,14 +427,16 @@ it('persists served-model evidence through the shadow runner for promotion count
   const servedModel = 'gemini-4-carbon-high';
   const result = await run([{ ...ok, servedModel }], { model: servedModel });
   expect(result.rows[0].servedModel).toBe(servedModel);
-  expect(summarizeCarbonPromotion(result.rows).agreeingPrs).toBe(1);
+  const security = await run([{ ...ok, servedModel }], { model: servedModel, seat: 'security' });
+  expect(result.rows[0]).toMatchObject({ claudeValid: true, agyValid: true });
+  expect(summarizeCarbonPromotion([...result.rows, ...security.rows]).agreeingPrs).toBe(1);
   const legacy = await run([ok], { model: servedModel });
   expect(legacy.rows[0].servedModel).toBeNull();
   expect(summarizeCarbonPromotion(legacy.rows)).toMatchObject({ agreeingPrs: 0, comparedPrs: 1 });
 });
 
 it('promotion evidence rejects a PR where Carbon misses a Claude finding', () => {
-  const row = (pr, overlap) => ({ repo: 'r', pr, status: 'ok', servedModel: 'gemini-4-carbon-high', verdictAgree: true, overlap });
+  const row = (pr, overlap) => ({ repo: 'r', pr, lens: 'correctness', claudeValid: true, agyValid: true, status: 'ok', servedModel: 'gemini-4-carbon-high', verdictAgree: true, overlap });
   const rows = [row(1, { matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 }), row(2, { matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 }), row(3, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), row(4, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), { repo: 'r', pr: 4, status: 'failed', model: 'gemini-4-carbon-high', servedModel: null }];
-  expect(summarizeCarbonPromotion(rows, { threshold: 10 })).toMatchObject({ agreeingPrs: 1, comparedPrs: 4, reached: false });
+  expect(summarizeCarbonPromotion(rows.flatMap(row => [row, { ...row, lens: 'security' }]), { threshold: 10 })).toMatchObject({ agreeingPrs: 1, comparedPrs: 4, reached: false });
 });

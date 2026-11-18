@@ -227,11 +227,20 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
 
 describe('the agreement report (#76a identity, #76b sameAs through the PR table)', () => {
   const carbonRow = (extra = {}) => ({ repo: 'o/r', pr: 1, model: 'gemini-4-carbon-high', servedModel: 'gemini-4-carbon-high',
-    status: 'ok', overlap: { jaccard: 1, matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }, verdictAgree: true, lens: 'correctness', ...extra });
+    claudeValid: true, agyValid: true, status: 'ok', overlap: { jaccard: 1, matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }, verdictAgree: true, lens: 'correctness', ...extra });
+  const carbonPr = (extra = {}) => [carbonRow(extra), carbonRow({ ...extra, lens: 'security' })];
+  it('ten PRs with correctness alone cannot reach promotion', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => carbonRow({ pr: i + 1 }));
+    expect(summarizeCarbonPromotion(rows)).toEqual({ agreeingPrs: 0, comparedPrs: 10, threshold: 10, reached: false });
+    expect(summarizeCarbonPromotion(rows.flatMap(row => carbonPr({ pr: row.pr })))).toMatchObject({ agreeingPrs: 10, reached: true });
+  });
+  it('a disagreeing additional Carbon lens poisons a complete mandatory panel', () => {
+    expect(summarizeCarbonPromotion([...carbonPr(), carbonRow({ lens: 'advisory', verdictAgree: false })]).agreeingPrs).toBe(0);
+  });
   it('counts each PR once across heads, runs and lenses, requiring every compared Carbon verdict to agree', () => {
     const rows = [carbonRow(), carbonRow({ lens: 'security' }), carbonRow({ head: 'next', runId: 'next' }),
       carbonRow({ pr: 2 }), carbonRow({ pr: 2, verdictAgree: false }),
-      carbonRow({ repo: 'other/repo' }), carbonRow({ pr: 3, verdictAgree: 'true' })];
+      ...carbonPr({ repo: 'other/repo' }), carbonRow({ pr: 3, verdictAgree: 'true' })];
     const before = structuredClone(rows);
     expect(summarizeCarbonPromotion(rows, { threshold: 2 })).toEqual({ agreeingPrs: 2, comparedPrs: 4, threshold: 2, reached: true });
     expect(summarizeCarbonPromotion(rows, { threshold: 3 }).reached).toBe(false);
@@ -241,9 +250,15 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     const ignored = [null, carbonRow({ model: 'gemini-4-argon-high', servedModel: 'gemini-4-argon-high' }),
       carbonRow({ repo: null }), carbonRow({ pr: null })];
     expect(summarizeCarbonPromotion(ignored)).toEqual({ agreeingPrs: 0, comparedPrs: 0, threshold: 10, reached: false });
-    expect(summarizeCarbonPromotion([carbonRow(), ...ignored.map(row => row && { ...row, verdictAgree: false })]).agreeingPrs).toBe(1);
+    expect(summarizeCarbonPromotion([...carbonPr(), ...ignored.map(row => row && { ...row, verdictAgree: false })]).agreeingPrs).toBe(1);
   });
   it.each([
+    { claudeValid: undefined },
+    { agyValid: undefined },
+    { claudeValid: false },
+    { agyValid: false },
+    { claudeValid: 'true' },
+    { agyValid: 'true' },
     { status: 'failed', servedModel: null },
     { status: 'voided' },
     { status: 'skipped' },
@@ -256,9 +271,9 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     const poisoned = carbonRow(extra);
     const summary = { agreeingPrs: 0, comparedPrs: 1, threshold: 10, reached: false };
     expect(summarizeCarbonPromotion([poisoned])).toEqual(summary);
-    expect(summarizeCarbonPromotion([carbonRow(), poisoned])).toEqual(summary);
-    expect(summarizeCarbonPromotion([poisoned, carbonRow()])).toEqual(summary);
-    expect(summarizeCarbonPromotion([carbonRow(), poisoned, carbonRow({ pr: 2 })]))
+    expect(summarizeCarbonPromotion([...carbonPr(), poisoned])).toEqual(summary);
+    expect(summarizeCarbonPromotion([poisoned, ...carbonPr()])).toEqual(summary);
+    expect(summarizeCarbonPromotion([...carbonPr(), poisoned, ...carbonPr({ pr: 2 })]))
       .toEqual({ ...summary, agreeingPrs: 1, comparedPrs: 2 });
   });
   it.each([
@@ -275,8 +290,8 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     const different = carbonRow(comparison([a], [b]));
     expect(different.verdictAgree).toBe(true);
     expect(summarizeCarbonPromotion([different]).agreeingPrs).toBe(0);
-    expect(summarizeCarbonPromotion([carbonRow(comparison([a], [a]))]).agreeingPrs).toBe(1);
-    expect(summarizeCarbonPromotion([carbonRow(comparison([], []))]).agreeingPrs).toBe(1);
+    expect(summarizeCarbonPromotion(carbonPr(comparison([a], [a]))).agreeingPrs).toBe(1);
+    expect(summarizeCarbonPromotion(carbonPr(comparison([], []))).agreeingPrs).toBe(1);
     expect(summarizeCarbonPromotion([carbonRow({ overlap: {} })]).agreeingPrs).toBe(0);
     expect(summarizeCarbonPromotion([carbonRow(), different]).agreeingPrs).toBe(0);
   });
@@ -289,7 +304,7 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     }
   });
   it('renders reached and not reached with manual promotion and includes the empty report', () => {
-    const rows = [carbonRow()];
+    const rows = carbonPr();
     const message = 'Carbon vs Claude: 1 of 1 PRs agree; promotion threshold 1 agreeing PRs: reached (promotion is manual; the orchestrator flips it)';
     expect(renderShadowReport(summarizeShadowAgreement(rows), summarizeCarbonPromotion(rows, { threshold: 1 }))).toContain(message);
     expect(renderShadowReport([], summarizeCarbonPromotion([]))).toContain(
@@ -299,7 +314,7 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     const root = mkdtempSync(join(tmpdir(), 'carbon-report-'));
     try {
       mkdirSync(join(root, '.conveyor'));
-      writeFileSync(join(root, '.conveyor', 'agy-shadow-agreement.jsonl'), `${JSON.stringify(carbonRow())}\n`);
+      writeFileSync(join(root, '.conveyor', 'agy-shadow-agreement.jsonl'), carbonPr().map(row => JSON.stringify(row)).join('\n') + '\n');
       const env = { ...process.env, CONVEYOR_STATE_ROOT: root, WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: '10', WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES: 'codex' };
       const script = 'scripts/lib/review-shadow-agreement.mjs';
       const options = { env, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
@@ -309,7 +324,7 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
       expect(result.stderr).toContain('promotionReplaces=codex (env)');
       const json = JSON.parse(result.stdout);
       expect(json.carbonPromotion).toEqual({ agreeingPrs: 1, comparedPrs: 1, threshold: 10, reached: false, promotionReplaces: 'codex' });
-      expect(json.seats[0].compared).toBe(1);
+      expect(json.seats.map(seat => seat.compared)).toEqual([1, 1]);
       const text = execFileSync(process.execPath, [script, '--report'], options);
       expect(text).toContain('Carbon vs Claude: 1 of 1 PRs agree; promotion threshold 10 agreeing PRs: not reached');
       for (const builder of ['claude', 'codex', 'agy']) expect(text).toContain(`Post-promotion cross-vendor panel for ${builder} builder:`);
