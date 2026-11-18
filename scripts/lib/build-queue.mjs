@@ -551,3 +551,10 @@ function numOr(v, fallback) { return typeof v === 'number' && !Number.isNaN(v) ?
 function clamp01(v) { return Math.max(0, Math.min(1, v)); }
 function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 function item_dateKey(it) { return String(it.dateOpened ?? ''); }
+
+/** Filter candidate rows with the runtime allowlist; unrestricted rows retain identity. */
+export function filterRuntimeCandidates(rows, settings = {}) {
+  if (!settings.only && !settings.held) return rows;
+  const allowed = new Set(filterIdsToRuntimeOnly(rows.map(r => String(r.num).replace(/^#/, '')), settings));
+  return rows.filter(r => allowed.has(String(r.num).replace(/^#/, '')));
+}

@@ -4580,3 +4580,14 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+### Builder runtime-only candidate admission
+
+`build-dispatch-runtime-only.test.mjs` drives the daemon with the real pure tick core and
+also with older planner output. Pass the once-per-tick `buildPriority` snapshot through
+`config.buildPriority`: filter new build/prepare candidates before cost admission, but keep
+the original queues for retiring existing guards. Filter the prepare group pool too: members
+are new work even when their lead is allowed. The runtime top ID reserves one additional
+prepare slot/window position only when newly eligible; an in-flight or absent top ID cannot
+lend that slot to another card. Malformed runtime evidence holds new work and logs the
+operator fallback (repair or remove the runtime file). Lift/no-file output stays unchanged.

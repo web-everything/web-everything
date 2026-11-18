@@ -35,7 +35,7 @@ import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/bui
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
-import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
+import { readBuildPrioritySettings, filterRuntimeCandidates, extraPrepareSlot } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
@@ -346,8 +346,16 @@ export function releaseOwnPrepareHolds({ nums, holds, release }) {
 // The one hold the prepare failure ledger places (`failPrepare`); `prepare-stamp-pending` belongs to stamp recovery.
 const LEDGER_HOLD_REASON = 'prepare-unstamped';
 
-async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, routingPolicy, effects, timer = createPhaseTimer() }) {
+async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, routingPolicy, buildPriority, effects, timer = createPhaseTimer() }) {
   effects = timer.wrap(effects);
+  const filteredBuild = new Set(), filteredPrepare = new Set();
+  const runtimeCandidates = (rows, removed) => {
+    const kept = filterRuntimeCandidates(rows, buildPriority);
+    const nums = new Set(kept.map(r => normNum(r.num)));
+    for (const row of rows) if (!nums.has(normNum(row.num))) removed.add(normNum(row.num));
+    return kept;
+  };
+  const extraPrepareId = extraPrepareSlot(buildPriority ?? {});
   const groupingSettings = readBuildGroupingSettings();
   console.error(formatBuildGroupingLine(groupingSettings));
   // Item 95 — held transient prepare failures whose backoff elapsed become dispatchable again BEFORE holds are read.
@@ -546,6 +554,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ?? (policy.prepareAheadWindow !== BUILD_DISPATCH_POLICY.prepareAheadWindow))
     ? policy.prepareAheadWindow : (preparePolicy.aheadCount ?? policy.prepareAheadWindow);
   const planConfig = planConfigFrom({ ...policy, prepareAheadWindow: effectivePrepareAheadWindow });
+  if (buildPriority?.only || buildPriority?.held) planConfig.buildPriority = buildPriority;
   let out = await effects.planTick(tickBookkeeping, { config: planConfig });
   const planningSkips = [];
   // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
@@ -785,7 +794,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // #4349 — a held item (a recent non-PR terminal-outcome cooldown) is dropped from candidates entirely, same
   // as if the tick core had never surfaced it — this is the actual fix for the re-dispatch loop the
   // settle/release above would otherwise tighten rather than close.
-  const candidates = spawn
+  const candidates = runtimeCandidates(spawn, filteredBuild)
     .filter((s) => !protectedMembers.has(normNum(s.num)))
     .filter((s) => !heldNums.has(normNum(s.num)))
     .filter((s) => !prepareRows.some(r => normNum(r.num) === normNum(s.num) && !completedPrepares.has(normNum(s.num))))
@@ -946,7 +955,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   };
   // A LIGHT launch under the rule ON: its own budget / cap / CPU floor; the heavy host gate is not consulted.
   const lightGateFor = (kind, num, lightInFlight) => {
-    const d = admitLaunch({ kind, settings: costSettings, facts: { ...readFacts(), lightInFlight } });
+    const d = admitLaunch({ kind, settings: kind === 'prepare-item' && normNum(num) === extraPrepareId
+      ? { ...costSettings, lightMaxConcurrent: costSettings.lightMaxConcurrent + 1 } : costSettings, facts: { ...readFacts(), lightInFlight } });
     costDecisions.push({ num: normNum(num), kind, ...d });
     if (!d.admit) {
       loadHolds.push({ num: normNum(num), kind, reason: d.reason, why: d.why });
@@ -1038,7 +1048,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
-  const prepareSpawns = (d.spawnPrepareItems ?? d.itemPrepareSpawns ?? []).filter(p => !planningSkips.some(r => r.num === normNum(p.num)));
+  const prepareSpawns = runtimeCandidates(d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [], filteredPrepare).filter(p => !planningSkips.some(r => r.num === normNum(p.num)));
   const settledPrepares = new Map();
   for (const row of allSettledPrepares) {
     if (failureRecords.some(f => f.num === row.num && f.attempt === row.source && f.retry)
@@ -1061,6 +1071,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { runner, runnerSource, batchSize: preparePolicy.batchSize ?? 6, aheadCount: effectivePrepareAheadWindow, sources: preparePolicy.sources, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  for (const num of d.runtimeOnly?.filteredBuild ?? []) filteredBuild.add(normNum(num));
+  for (const num of d.runtimeOnly?.filteredPrepare ?? []) filteredPrepare.add(normNum(num));
+  if (buildPriority?.only || buildPriority?.held) prepare.filteredByRuntimeOnly = [...filteredPrepare];
   prepare.skippedInPlanning = planningSkips;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
@@ -1379,7 +1392,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
     && !sameTickClash(num, scopeByNum.get(normNum(num)));
-  const needsPrepare = new Set((admission.held ?? [])
+  const runtimePrepareHeld = runtimeCandidates((admission.held ?? []).filter(h => ['needs-prepare', 'prepare-stale', ...(preparePolicy.autoSize ? ['no-size'] : [])].includes(h.reason)), filteredPrepare);
+  if (buildPriority?.only || buildPriority?.held) prepare.filteredByRuntimeOnly = [...filteredPrepare];
+  const needsPrepare = new Set(runtimePrepareHeld
     .filter(h => ['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
   const otherPrepareHolds = new Set((admission.held ?? [])
     .filter(h => !['needs-prepare', 'prepare-stale', ...(preparePolicy.autoSize ? ['no-size'] : [])].includes(h.reason)).map(h => normNum(h.num)));
@@ -1387,14 +1402,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const lightRevalidateCandidate = num => preparePolicy.lightRevalidate !== false && (admission.held ?? [])
     .some(h => normNum(h.num) === normNum(num) && h.reason === 'prepare-stale'
       && h.detail?.startsWith('scope changed since '));
-  const windowNums = prepareAheadNums({ queue: admission.queue, launch: admission.planned ?? admission.launch,
-    held: (admission.held ?? []).map(h => h.reason === 'no-size' && preparePolicy.autoSize ? { ...h, reason: 'needs-prepare' } : h),
+  const windowNums = prepareAheadNums({ queue: filterRuntimeCandidates(admission.queue ?? [], buildPriority), launch: filterRuntimeCandidates(admission.planned ?? admission.launch ?? [], buildPriority),
+    held: filterRuntimeCandidates(admission.held ?? [], buildPriority).map(h => h.reason === 'no-size' && preparePolicy.autoSize ? { ...h, reason: 'needs-prepare' } : h),
     // With the window off, every queued card is eligible for batching. The shared helper uses
     // non-finite windows as its "no filter" sentinel, so give it the complete queue's size here.
-    window: effectivePrepareAheadWindow ?? admission.queue?.length ?? 0, skip: bookkeeping.prepareHeldNums ?? [] });
+    window: effectivePrepareAheadWindow ?? admission.queue?.length ?? 0, skip: [...(bookkeeping.prepareHeldNums ?? []), ...(prepareSpawns.some(p => normNum(p.num) === extraPrepareId) ? [extraPrepareId] : [])] });
+  if (prepareSpawns.some(p => normNum(p.num) === extraPrepareId)) windowNums?.add(extraPrepareId);
   const windowOrder = new Map([...(windowNums ?? [])].map((num, i) => [num, i]));
   prepareSpawns.sort((a, b) => (windowOrder.get(normNum(a.num)) ?? Infinity) - (windowOrder.get(normNum(b.num)) ?? Infinity));
-  const preparePool = [...(windowNums ?? [])].map(num => groupRowsByNum.get(num))
+  const preparePool = [...(windowNums ?? [])].filter(num => num !== extraPrepareId).map(num => groupRowsByNum.get(num))
     .filter(r => r && (needsPrepare.has(normNum(r.num)) || (preparePolicy.autoSize && (admission.held ?? []).some(h => normNum(h.num) === normNum(r.num) && h.reason === 'no-size')))
       && !otherPrepareHolds.has(normNum(r.num)) && !lightRevalidateCandidate(r.num)
       && !groupDropped.has(normNum(r.num)) && prepareAvailable(r.num));
@@ -1423,17 +1439,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     prepareGroupPlan = planPrepareGroups();
   }
   prepare.groups = prepareGroupPlan.groups;
+  let extraPrepareUsed = false;
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
       const num = normNum(pick.num);
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
       if (prepareGroupPlan.absorbed.has(num) || prepareMembers.has(num)
         || finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || refusalHeldNums.has(num)
-        || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
+        || prepareBusy.has(num) || (num === extraPrepareId ? prepareBusy.size >= prepareCap + 1 : prepareBusy.size - Number(extraPrepareUsed) >= prepareCap)) continue;
       const group = prepareGroupPlan.groups.find(g => normNum(g.lead) === num);
       let groupMembers = [];
       prepare.planned.push({ ...pick, num, ...(group ? { groupMembers: group.members } : {}) });
-      if (!live) { prepareBusy.add(num); continue; }
+      if (!live) { prepareBusy.add(num); if (num === extraPrepareId) extraPrepareUsed = true; continue; }
       if (launchSlotBusy()) continue;
       const clash = sameTickClash(num, scopeByNum.get(num));
       if (clash) { sameTickHolds.push({ num, kind: 'prepare', why: clash }); continue; }
@@ -1445,7 +1462,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       };
       try {
         if (!(await cloneGate('prepare', num))) continue;
-        if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
+        if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size - Number(extraPrepareUsed)) : loadGateFor('prepare', num)).admit) continue;
         // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
         // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
         // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
@@ -1491,6 +1508,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         prepareClaimed = false;
         if (res?.dispatching) {
           prepareBusy.add(num);
+          if (num === extraPrepareId) extraPrepareUsed = true;
           launchedThisTick.push({ num, kind: 'prepare', scope: scopeByNum.get(num) ?? [] });
           for (const member of groupMembers) {
             prepareMembers.add(member);
@@ -1529,6 +1547,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   return {
     live,
+    ...((buildPriority?.only || buildPriority?.held) ? { runtimeOnly: { filteredBuild: [...filteredBuild], filteredPrepare: [...filteredPrepare] } } : {}),
     timings: { ...timer.snapshot(), tickCore: d.timings ?? {} },
     statusLine: d.statusLine || '',
     tickCore: { building: externalBuilding, spawnBuilds: spawn, held: admission.held || [], planned: admission.planned || [], queue: admission.queue || [], suppressedBuilds: d.suppressedBuilds || [] },
@@ -3067,9 +3086,10 @@ export function buildPriorityLog(buildPriority, result, previousKey) {
   // Descendants rank by their listed epic, so name actual launches as well as the configured ids.
   const launches = [...(result.dispatched ?? []).map(d => `build #${normNum(d.num)}`),
     ...(result.prepare?.launched ?? []).map(p => `prepare #${normNum(p.num)}`)];
-  if (!buildPriority.ids.length || (key === previousKey && !launches.length)) return { key, line: null };
+  const restricted = buildPriority.only || buildPriority.held;
+  if ((!restricted && !buildPriority.ids.length) || (key === previousKey && !launches.length && !restricted)) return { key, line: null };
   const head = buildPriority.ids.slice(0, 5).join(',') + (buildPriority.ids.length > 5 ? ',…' : '');
-  return { key, line: `build-dispatch-daemon: build.priority (${buildPriority.source}): ${buildPriority.ids.length} ids [${head}]${launches.length ? ` · this tick: ${launches.join(', ')}` : ''}` };
+  return { key, line: `build-dispatch-daemon: build.priority (${buildPriority.source}): ${buildPriority.ids.length} ids [${head}]${launches.length ? ` · this tick: ${launches.join(', ')}` : ''}${restricted ? ` · runtime-only: filteredBuild=${result.runtimeOnly?.filteredBuild.length ?? 0} filteredPrepare=${result.prepare?.filteredByRuntimeOnly?.length ?? 0}` : ''}${buildPriority.runtime?.warning ? ` · ${buildPriority.runtime.warning}` : ''}` };
 }
 
 async function live(flags) {
@@ -3107,7 +3127,7 @@ async function live(flags) {
       effects.listSettledBuilds = () => settledRows;
       const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item', records }));
       effects.listPrepareInFlight = () => prepareRows;
-      const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
+      const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, buildPriority, effects, timer });
       bookkeeping = r.nextBookkeeping;
       const priorityLog = buildPriorityLog(buildPriority, r, lastBuildPriority);
       if (priorityLog.line !== null) console.error(priorityLog.line);
