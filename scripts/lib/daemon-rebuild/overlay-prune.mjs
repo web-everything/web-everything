@@ -113,13 +113,16 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
     }
   }
   state.rows = rows;
+  const live = new Set(overlays.map(o => o.ref));
+  for (const ref of Object.keys(state.current)) if (!live.has(ref)) delete state.current[ref];
   const file = sidecar(root, env), tmp = `${file}.${process.pid}.tmp`;
   mkdirSync(dirname(file), { recursive: true });
   // Clear a pending notice only after delivery succeeds: a failed publish retries next tick (never lost).
   for (const [key, record] of Object.entries(state.records)) {
     for (const [why, notice] of Object.entries(record.pending ?? {})) {
       // Recheck tip, registration and pin: an obsolete notice is dropped, never delivered.
-      if (state.current[notice.ref] !== key || skipped.has(notice.ref)) { delete record.pending[why]; continue; }
+      if (state.current[notice.ref] !== key || skipped.has(notice.ref) || !live.has(notice.ref)
+        || rows.find(r => r.ref === notice.ref)?.reason !== why) { delete record.pending[why]; continue; }
       try { emit(notice); delete record.pending[why]; } catch { /* retried next tick */ }
     }
   }

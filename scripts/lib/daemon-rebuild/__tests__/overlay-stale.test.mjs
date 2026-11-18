@@ -48,7 +48,6 @@ describe('post-plan stale detector', () => {
   });
   it('a transient unknown does not suppress the later conflict alert', () => {
     tick({ remoteTips: {} });
-    expect(emit).toHaveBeenCalledTimes(0 + emit.mock.calls.length);
     const before = emit.mock.calls.length;
     tick(); tick(); tick();
     expect(emit.mock.calls.slice(before).some(([row]) => row.reason === 'conflict')).toBe(true);
@@ -73,6 +72,17 @@ describe('post-plan stale detector', () => {
     tick({ emit: r => rows.push(r) }); tick({ emit: r => rows.push(r) }); tick({ emit: r => rows.push(r) });
     expect(rows).toHaveLength(2);
     expect(rows[0].registration).not.toBe(rows[1].registration);
+  });
+  it('a retried notice is dropped once its registration is removed or the overlay is clean', () => {
+    emit.mockImplementationOnce(() => { throw new Error('feed down'); });
+    tick(); tick(); tick();
+    const other = { ref: 'lane/other', pr: 0, addedAt: 'x' };
+    tick({ overlays: [other] });
+    expect(emit.mock.calls.filter(([r]) => r.ref === ref)).toHaveLength(1);
+    emit.mockClear();
+    git.mockImplementation(args => args[0] === 'merge-tree' ? { status: 0, stdout: tree } : args[0] === 'rev-parse' ? { status: 0, stdout: tip } : { status: args[1] === '--is-ancestor' ? 1 : 0, stdout: mainSha });
+    tick({ overlays: [overlay, other] });
+    expect(emit.mock.calls.filter(([r]) => r.ref === ref)).toHaveLength(0);
   });
   it('a failed publish is retried next tick and then marked delivered', () => {
     emit.mockImplementationOnce(() => { throw new Error('feed down'); });
@@ -220,6 +230,13 @@ it.each(['pending', 'unreadable'])('F1 %s drop intent refuses a build that chang
   const result = await prepareRebuild({ root, env, run: gitRun, now: () => 0, prBaseChain: () => [] });
   expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'drop-pending-unsettled' } });
   expect(plan).toHaveBeenCalledTimes(1);
+});
+
+it('a pending drop intent also refuses an unchanged-HEAD plan that would remove a registration', async () => {
+  stubPrepare(); writePending('pending');
+  vi.spyOn(planner, 'planRebuild').mockResolvedValue({ ok: true, finalSha: headSha, mainSha, applied: [], decisions: [{ ref, action: 'remove', reason: 'pr-closed' }], alerts: [] });
+  const result = await prepareRebuild({ root, env, run: gitRun, now: () => 0, prBaseChain: () => [] });
+  expect(result.result.reason).toBe('drop-pending-unsettled');
 });
 
 it('a pending drop intent still lets unverified-build recovery run (it never drops registrations)', async () => {

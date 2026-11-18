@@ -386,7 +386,7 @@ export async function prepareRebuild({
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
-  if (dropPending && plan.ok && plan.finalSha !== prevHead) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
+  if (dropPending && plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove'))) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   if (!readyOnly) {
     try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git }); }
     catch (error) { alert('overlay-stale-unknown', { error: String(error.message) }); }
