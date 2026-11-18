@@ -107,10 +107,10 @@ export function createLiveRedTeamReader({ provider, readComments, env = process.
     const live = provider.readPrState(repo, pr);
     if (!isRealHead(live?.headRefOid)) throw Error('live PR head unreadable');
     if (!isRealHead(head)) return { clear: false };
-    if (live.headRefOid.toLowerCase() !== head.toLowerCase()) return { clear: true };
     // An open red-team label gate (pending/blocked) keeps the escalation alive.
     if (!Array.isArray(live.labels) || live.labels.some(label => ['red-team:pending', 'red-team:blocked']
       .includes(typeof label === 'string' ? label : label?.name))) return { clear: false };
+    if (live.headRefOid.toLowerCase() !== head.toLowerCase()) return { clear: true };
     const result = redTeamForHead(readComments({ repo, pr }), pr, head);
     // A recorded, publishable zero-finding result is required; a check alone never clears (a deleted result comment must not hide it).
     if (!result || !(result.findings?.length === 0 && isPublishableRedTeamResult(result))) return { clear: false };

@@ -406,6 +406,26 @@ describe('stored-review not-owed rule (R730)', () => {
 
 
 describe('live red-team alert suppression', () => {
+  it.each([
+    ['blocked label', ['red-team:blocked'], false, true],
+    ['pending label', [{ name: 'red-team:pending' }], false, true],
+    ['unreadable labels', undefined, false, true],
+    ['no label', [], true, true],
+    ['failing validators but no label', [], true, false],
+  ])('a moved head with %s clears only without an open label gate', (_kind, labels, clear, validatorsOk) => {
+    const readComments = vi.fn(() => []);
+    const readCheckFact = vi.fn(() => ({ ok: validatorsOk }));
+    const readPublicationHoldFact = vi.fn(() => ({ ok: validatorsOk }));
+    const readLive = createLiveRedTeamReader({
+      provider: { readPrState: () => ({ headRefOid: 'b'.repeat(40), labels }) },
+      readComments, readCheckFact, readPublicationHoldFact,
+    });
+    expect(readLive({ repo, pr, head })).toEqual({ clear });
+    expect(readComments).not.toHaveBeenCalled();
+    expect(readCheckFact).not.toHaveBeenCalled();
+    expect(readPublicationHoldFact).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('bypasses memo and stale snapshot env for every live read (hold=%s)', held => {
     const env = { WE_GH_READ_MEMO_DIR: 'tick-memo', WE_PR_SNAPSHOT_STALE_OK_MS: '60000',
       WE_APP_ID: '123', GH_TOKEN: 'fixture-token' };

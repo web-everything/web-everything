@@ -631,6 +631,15 @@ describe('head-bound escalation notes', () => {
   const green = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { context: 'lint', state: 'SUCCESS' }];
   const note = (extra = {}) => c('web-everything', '2026-10-21T06:00:00Z', buildNoteComment({
     kind: 'owed-ci-rerun-spent', prNumber: 5485, head: HEAD, text: 'reruns spent', ...extra }));
+  it('keeps a same-head marker note open despite a far-future commit timestamp', () => {
+    expect(needsDecisionOpen([note()], { liveHead: HEAD, headCommittedAt: '2099-01-01T00:00:00Z' }))
+      .toMatchObject({ at: Date.parse('2026-10-21T06:00:00Z') });
+  });
+  it('closes a legacy note without a head marker after a later commit timestamp', () => {
+    expect(needsDecisionOpen([note({ head: undefined })], {
+      liveHead: HEAD, headCommittedAt: '2099-01-01T00:00:00Z',
+    })).toBeNull();
+  });
   it('a newer head-resolved note preserves an earlier unanswered same-head dispute', () => {
     const dispute = c('web-everything', '2026-10-21T05:00:00Z',
       `🔔 conveyor — needs your decision\n\nneeds your decision: disagree about a ruling\n<!-- conveyor-note-head: ${HEAD} -->`);

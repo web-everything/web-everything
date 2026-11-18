@@ -139,11 +139,12 @@ export function needsDecisionOpen(comments, { headCommittedAt = null, liveHead =
     if (NO_ASK_NOTE_KINDS.includes(kind)) continue;
     const note = e;
     if (note.at === null) return null;
-    if (pushed !== null && pushed > note.at) continue;
-    for (const e of list) if (e.at !== null && e.at > note.at && isOperatorAuthored(e.c)) return null;
     const body = bodyOf(note.c);
     const lastLine = body.split('\n').filter(line => line.trim()).at(-1) ?? '';
     const noteHead = /^<!-- conveyor-note-head: ([a-f0-9]{40}) -->$/i.exec(lastLine.trim())?.[1];
+    // Head-bound notes use SHA evidence; commit timestamps may be in the future.
+    if (!noteHead && pushed !== null && pushed > note.at) continue;
+    for (const e of list) if (e.at !== null && e.at > note.at && isOperatorAuthored(e.c)) return null;
     if (noteHead && typeof liveHead === 'string' && /^[a-f0-9]{40}$/i.test(liveHead)
       && noteHead.toLowerCase() !== liveHead.toLowerCase()) continue;
     return { at: note.at, dispute: /disagree about a ruling|operator ruled .* came back/i.test(body),
