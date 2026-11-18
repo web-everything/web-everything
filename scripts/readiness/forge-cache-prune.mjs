@@ -229,7 +229,8 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       const final = records.find(r => r.suffix === 'receipt');
       const finalReceipt = final?.record;
       const leaked = writerGuard === 1 && finalReceipt?.v === 1 && finalReceipt.run === run
-        && typeof finalReceipt.phase === 'string' && Number.isInteger(finalReceipt.code)
+        && typeof finalReceipt.phase === 'string' && finalReceipt.phase.trim() !== '' && finalReceipt.phase.length <= 64
+        && Number.isInteger(finalReceipt.code) && finalReceipt.code >= 0 && finalReceipt.code <= 255
         && final.mtimeMs <= now && records.every(r => r.mtimeMs <= final.mtimeMs)
         && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS;
       if (lock === undefined && !leaked) throw new Error('Invalid reserved lock evidence');

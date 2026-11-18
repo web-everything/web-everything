@@ -149,7 +149,7 @@ describe('leaked reservation lifetime', () => {
 describe('leaked reservation proof guards', () => {
   it.each([
     {phase: undefined}, {code: undefined}, {v: undefined},
-    {phase: 1}, {code: 0.5}, {v: 2},
+    {phase: 1}, {code: 0.5}, {v: 2}, {phase: ''}, {phase: '  '}, {code: -1}, {code: 256},
   ])('keeps protection with an incomplete final receipt: %j', async incomplete => {
     const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
     await json(join(receipts, `${run}.running`), record(false));
