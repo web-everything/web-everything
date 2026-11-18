@@ -943,7 +943,8 @@ export async function judgeSpawn({
       let settled = false;
       const killGroup = () => {
         if (Number.isInteger(child.pid) && child.pid > 0) {
-          try { process.kill(-child.pid, 'SIGKILL'); return; } catch { /* fallback below */ }
+          try { process.kill(-child.pid, 'SIGKILL'); return; }
+          catch (error) { if (error.code === 'ESRCH') return; /* fallback below */ }
         }
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
       };
@@ -959,6 +960,9 @@ export async function judgeSpawn({
       });
       process.on('exit', killGroup);
       const cleanup = () => {
+        // Descendants can outlive a successful juror without holding its pipes open.
+        // Keep the cancellation hooks armed until the whole group has been signalled.
+        killGroup();
         if (timer) clearTimeout(timer);
         if (grace) clearTimeout(grace);
         signals.forEach((sig, i) => process.removeListener(sig, handlers[i]));

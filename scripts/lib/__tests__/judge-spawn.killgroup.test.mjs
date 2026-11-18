@@ -6,6 +6,8 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createServer } from 'node:net';
+import { Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { judgeSpawn, JudgeTimeoutError } from '../judge-spawn.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 
@@ -23,6 +25,31 @@ it.each(['close', 'error'])('removes per-spawn process listeners after %s, inclu
     } }).catch(() => {});
     expect(events.map(name => process.listenerCount(name))).toEqual(before);
   }
+});
+
+it.each(['close', 'error'])('kills the group before removing caller hooks on %s settlement', async (event) => {
+  const events = ['SIGTERM', 'SIGINT', 'SIGHUP', 'exit'];
+  const before = events.map(name => process.listenerCount(name));
+  const child = new EventEmitter();
+  child.pid = 987654321;
+  const observed = [];
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+    observed.push(events.map(name => process.listenerCount(name)));
+    throw Object.assign(new Error('group already gone'), { code: 'ESRCH' });
+  });
+  child.kill = vi.fn();
+  try {
+    await judgeSpawn({ ...request, spawnFn: () => {
+      queueMicrotask(() => event === 'error'
+        ? child.emit('error', new Error('failed spawn')) : child.emit('close', 0, null));
+      return child;
+    } }).catch(() => {});
+    expect(kill).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledWith(-child.pid, 'SIGKILL');
+    expect(observed).toEqual([before.map(n => n + 1)]);
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(events.map(name => process.listenerCount(name))).toEqual(before);
+  } finally { kill.mockRestore(); }
 });
 
 // A socket inherited by both descendants proves termination without confusing zombies with live work.
@@ -95,6 +122,153 @@ it('falls back to child.kill when the process group cannot be signalled', async 
 });
 
 describe.skipIf(process.platform === 'win32')('real juror process group cleanup', () => {
+  it('preserves exact large stdout and stderr with slow readers before killing the supervisor group', async () => {
+    const source = `const stdout=JSON.stringify({structured_output:{value:'result-'.repeat(600000)}});
+      const stderr='diagnostic-'.repeat(400000)+'diagnostic-end';
+      Promise.all([[process.stdout,stdout],[process.stderr,stderr]].map(([stream,text])=>
+        new Promise(resolve=>stream.write(text,resolve)))).then(()=>process.exit(0));`;
+    const supervisor = spawn(process.execPath, [
+      resolve('scripts/lib/judge-spawn-supervisor.mjs'),
+      String(process.pid), String(Date.now() + 15000), process.execPath, '-e', source,
+    ], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const buffers = { stdout: [], stderr: [] };
+    const pending = new Set();
+    let timer;
+    try {
+      const exited = once(supervisor, 'close');
+      const reads = ['stdout', 'stderr'].map(name => pipeline(supervisor[name], new Writable({
+        highWaterMark: 1,
+        write(chunk, encoding, callback) {
+          buffers[name].push(chunk);
+          // Force sustained backpressure rather than simply delaying the first read.
+          const delay = setTimeout(() => { pending.delete(delay); callback(); }, 5);
+          pending.add(delay);
+        },
+      })));
+      const [status] = await Promise.race([
+        Promise.all([exited, ...reads]),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('supervisor output failed to drain within test bound')), 12000);
+        }),
+      ]);
+      expect(status).toEqual([null, 'SIGKILL']);
+      expect(Buffer.concat(buffers.stdout).toString()).toBe(JSON.stringify({
+        structured_output: { value: 'result-'.repeat(600000) },
+      }));
+      expect(Buffer.concat(buffers.stderr).toString()).toBe('diagnostic-'.repeat(400000) + 'diagnostic-end');
+    } finally {
+      clearTimeout(timer);
+      for (const delay of pending) clearTimeout(delay);
+      try { process.kill(-supervisor.pid, 'SIGKILL'); } catch {}
+      supervisor.stdout.destroy();
+      supervisor.stderr.destroy();
+    }
+  }, 20000);
+
+  it.each(['production supervisor', 'direct spawn'])('reaps a successful juror\'s grandchild with ignored stdio within 5 seconds (%s)', async (mode) => {
+    const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'judge-success-'));
+    const cli = join(dir, 'fake-cli');
+    const pidFile = join(dir, 'grandchild.pid');
+    const server = createServer();
+    let connection;
+    let closed;
+    let timer;
+    let group;
+    try {
+      server.on('connection', socket => {
+        connection = socket;
+        closed = once(socket, 'close');
+        socket.on('data', () => {});
+      });
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const grandchild = keepAliveScript({
+        anchorPid: process.pid, maxLifetimeMs: 30000,
+        postlude: `require('node:net').connect(${server.address().port},'127.0.0.1',function(){
+          this.write('ready'); process.send('ready'); process.disconnect();
+        });`,
+      });
+      const result = JSON.stringify({ is_error: false, stop_reason: 'tool_use',
+        session_id: 'successful-juror', structured_output: { verdict: 'accept' } });
+      writeFileSync(cli, `#!${process.execPath}\n` +
+        `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:['ignore','ignore','ignore','ipc']});\n` +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(child.pid));\n` +
+        `child.once('message',()=>process.stdout.write(${JSON.stringify(result)},()=>process.exit(0)));\n`,
+      { mode: 0o755 });
+      const outcome = await judgeSpawn({ ...request, cli, timeoutMs: 15000,
+        spawnFn: (command, argv, options) => {
+          // Match the production supervisor launch without Vitest's import.meta.url rewrite.
+          const child = mode === 'direct spawn' ? spawn(command, argv, options)
+            : spawn(process.execPath, [resolve('scripts/lib/judge-spawn-supervisor.mjs'),
+              String(process.pid), String(Date.now() + 15000), command, ...argv], options);
+          group = child.pid;
+          return child;
+        },
+      });
+      expect(outcome.value).toEqual({ verdict: 'accept' });
+      expect(outcome.timedOut).toBe(false);
+      expect(connection).toBeDefined();
+      await Promise.race([
+        closed,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('grandchild survived successful settlement for 5 seconds')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      if (group) { try { process.kill(-group, 'SIGKILL'); } catch {} }
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch {}
+      connection?.destroy();
+      server.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 25000);
+
+  it.each(['stdout', 'stderr'])('enforces the supervisor deadline after juror exit with inherited %s and caller timeout disabled', async (stream) => {
+    const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'judge-exited-'));
+    const cli = join(dir, 'fake-cli');
+    const pidFile = join(dir, 'grandchild.pid');
+    let supervisor;
+    let exited;
+    let closed;
+    let timer;
+    let output = '';
+    const hardDeadline = Date.now() + 1200;
+    try {
+      const grandchild = keepAliveScript({
+        anchorPid: process.pid, maxLifetimeMs: 30000,
+        postlude: `process.${stream}.write('grandchild-ready');`,
+      });
+      writeFileSync(cli, `#!${process.execPath}\n` +
+        `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:['ignore',${stream === 'stdout' ? "'inherit','ignore'" : "'ignore','inherit'"}]});\n` +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(child.pid));\n` +
+        'process.exit(7);\n', { mode: 0o755 });
+      // Exercise judgeSpawn with no caller timer; shorten only the supervisor's
+      // production hard deadline so the real-process regression remains fast.
+      const outcome = judgeSpawn({ ...request, cli, timeoutMs: 0, spawnFn: (command, argv, options) => {
+        supervisor = spawn(process.execPath, [resolve('scripts/lib/judge-spawn-supervisor.mjs'),
+          String(process.pid), String(hardDeadline), command, ...argv], options);
+        exited = once(supervisor, 'exit');
+        closed = once(supervisor[stream], 'close');
+        supervisor[stream].on('data', data => { output += data; });
+        return supervisor;
+      } }).catch(error => error);
+      const bound = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('inherited pipe survived the supervisor deadline')), 3000);
+      });
+      await Promise.race([Promise.all([outcome, closed, exited]).then(([, , status]) => {
+        expect(status).toEqual([null, 'SIGKILL']);
+        expect(output).toContain('grandchild-ready');
+        expect(Date.now()).toBeLessThan(hardDeadline + 1500);
+      }), bound]);
+    } finally {
+      clearTimeout(timer);
+      if (supervisor?.pid) { try { process.kill(-supervisor.pid, 'SIGKILL'); } catch {} }
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch {}
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 5000);
+
   it.each(['deadline', 'normal close'])('supervisor exits on %s without leaving a keepalive behind', async (mode) => {
     const script = mode === 'deadline'
       ? keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 30000 }) : 'process.exit(7)';
@@ -108,7 +282,7 @@ describe.skipIf(process.platform === 'win32')('real juror process group cleanup'
         once(supervisor, 'close'),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('supervisor survived')), 3000); }),
       ]);
-      expect(result).toEqual(mode === 'deadline' ? [null, 'SIGKILL'] : [7, null]);
+      expect(result).toEqual([null, 'SIGKILL']);
     } finally {
       clearTimeout(timer);
       try { process.kill(-supervisor.pid, 'SIGKILL'); } catch {}

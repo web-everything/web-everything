@@ -4536,3 +4536,16 @@ every 2000 ms and enforces the spawn deadline plus grace, so caller SIGKILL cann
 leave an unbounded juror. A disabled caller timeout retains the default hard
 supervisor lifetime. Injected `spawnFn` implementations retain direct CLI argv
 for unit fixtures; real caller-death probes must use the production spawn path.
+The supervisor owns and forwards the juror's stdout/stderr pipes: its `close`
+handler drains both destination streams before killing the whole group, including
+itself, with the watchdogs still armed. Source closure alone does not prove that
+forwarded writes have drained. The large-output slow-reader regression checks
+stdout and stderr byte for byte under sustained backpressure.
+Direct-child `exit` (or `close` with inherited stdio) cannot prove those pipes are
+closed. Named stdout/stderr regressions keep the caller timeout disabled and
+shorten only the supervisor deadline, then assert group SIGKILL and pipe closure.
+Every caller settlement kills the group before removing signal/exit hooks, including
+successful close and spawn errors; ESRCH means the group is already gone. The
+successful-juror regressions exercise both direct spawn and the production supervisor
+with a grandchild whose standard streams are ignored. Socket closure proves it stops
+within five seconds of resolution without confusing zombie PIDs with live processes.
