@@ -4609,10 +4609,10 @@ self-sync test uses the WIP injected rebuild/lock/closure fixture as a core cons
 it does not establish production probation integration. `probation-io.mjs` now observes the legacy prepare/finalize adoption paths inside
 their existing `withWriteLock` holds. It freezes launchd labels (stable daemon IDs),
 entry paths and SHA-specific tree/entry snapshots in a per-clone `.probation.json`
-under `stateDir`. The previous smoke-adopted head supplies the legacy comparison
-baseline; this observer never promotes it. Failed closure reads conservatively owe
-proof. Roster failure produces an invalid record and requires operator recovery of
-registrations. Every persisted read is
+under `stateDir`. The prior record supplies the last proven SHA: its `sha` after pass, otherwise
+its `provenGood`; only the first freeze uses the previous adopted head. Failed closure reads conservatively owe
+proof. Observation failures attempt an explicit `{invalid:true, adoptionId, reason}` marker
+with validated `priorRecord` evidence for the next freeze; recover the roster before retrying. Every persisted read is
 validated; missing, unreadable and malformed records report invalid, never empty.
 Self-sync submits only its own immutable PID/start/boot-head and completed tick
 head after releasing its read lock; ambiguous process identity earns no proof.
@@ -4626,7 +4626,12 @@ in the state directory, with a PID holder and a default 2000ms timeout (override
 then take the probation lock; probation never acquires the clone lock or clears
 writer-priority claims. Observer status/adopt/proof take only the probation lock.
 Lock timeout or failure reports invalid/pending with operator recovery required,
-leaving record bytes untouched; inspect the holder and recover before retrying.
+adoption attempts an invalid marker even on lock timeout. Inspect the holder and
+recover before retrying. Status/proof lock failures leave bytes untouched.
+The optional `currentAdoption: () => adoptionId|null` uses `${head}:${at}`.
+Self-sync wires it to the clone rebuild state on every status/proof read. A mismatch
+reports invalid/pending with `stale-adoption: record is for an older adoption`,
+and proof cannot mutate the stale record, even if writing the failure marker failed.
 Every LaunchAgents `*.plist` must be readable and parseable, including filenames
 outside discovery's filter; otherwise the roster is incomplete and requires
 operator recovery of registrations.
@@ -4646,5 +4651,7 @@ an operator must inspect Git evidence if it cannot be collected. The IO tests
 exercise repository-wide changes, identical trees, immutable snapshots, invalid
 SHAs, missing/non-regular entries and external symlink targets changing while
 the tracked tree stays identical. Adoption may create a record only when none
-exists or the existing record validates. Invalid/unreadable records (including dangling symlinks)
-remain untouched and require operator recovery; they never reset the debt baseline.
+exists, the existing record validates, or a failed-observation marker retains validated
+prior evidence. Without retained evidence a failed marker forces a null baseline,
+owing every daemon proof. Other invalid/unreadable records require operator recovery
+and an attempted invalid marker; they never seed a baseline from an unobserved head.

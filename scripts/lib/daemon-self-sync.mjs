@@ -961,7 +961,10 @@ export function withSelfSync(effects, {
   const bootAt = now();
   // Own process record: boot identity is immutable; completed tick HEAD is captured under the read lock.
   const probationObserver = realIo && !vctx && !resolvedPocBranch ? createProbationObserver({ root, env, log,
-    lockOpts: { waitMs: 0 } }) : null;
+    currentAdoption: () => {
+      const adopted = readState(root, env)?.adopted;
+      return adopted?.head && adopted?.at ? `${adopted.head}:${adopted.at}` : null;
+    }, lockOpts: { waitMs: 0 } }) : null;
   let probationDaemonId = null;
   if (probationObserver) {
     try { probationDaemonId = ownDaemonId(root, entries?.[0], { env }); }

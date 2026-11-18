@@ -58,7 +58,7 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 function seedPass() {
-  const record = freezeProbation({ adoptionId: 'fixture', sha: HEAD, provenGood: GOOD,
+  const record = freezeProbation({ adoptionId: `${initial.adopted.head}:${initial.adopted.at}`, sha: HEAD, provenGood: GOOD,
     adoptedAt: new Date(now - 1000).toISOString(), registered: [{ id: 'X' }],
     readClosure: () => ({ complete: true, files: { 'x.mjs': GOOD } }) });
   writeFileSync(probationPath(root, env), JSON.stringify(record));
@@ -66,8 +66,9 @@ function seedPass() {
 const lockOpts = () => ({ lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, waitMs: 0 });
 
 describe('R986 production caller probation results remain telemetry only', () => {
-  it.each(['pass', 'invalid persistence', 'probation lock refusal', 'clone writer held'])('self-sync preserves tick result and lifecycle state on %s', async mode => {
+  it.each(['pass', 'stale adoption', 'invalid persistence', 'probation lock refusal', 'clone writer held'])('self-sync preserves tick result and lifecycle state on %s', async mode => {
     seedPass();
+    if (mode === 'stale adoption') writeRebuildState(root, { ...initial, adopted }, env);
     if (mode === 'invalid persistence') writeFileSync(probationPath(root, env), '{}');
     const before = stateBytes(), protectedBefore = protectedBytes();
     const tickResult = { processed: 3, cursor: 'keep' };
@@ -99,6 +100,7 @@ describe('R986 production caller probation results remain telemetry only', () =>
       expect(own).toMatchObject({ daemonId: 'X', pid: process.pid, bootHead: HEAD, tickHead: HEAD });
       expect(result).toMatchObject(['pass', 'clone writer held'].includes(mode) ? { status: 'valid', action: 'pass' } : { status: 'invalid', action: 'pending' });
       if (mode === 'probation lock refusal') expect(result.reason).toContain('timed out');
+      if (mode === 'stale adoption') expect(result.reason).toContain('stale-adoption');
       expect(stateBytes()).toEqual(before);
       expect(protectedBytes()).toEqual(protectedBefore);
     } finally { releaseWrite(root, { ...lockOpts(), owner: 'other-writer' }); }

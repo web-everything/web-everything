@@ -36,6 +36,46 @@ const previous = () => ({ head: good, at: iso(at - 100) });
 const adopted = () => ({ head, at: iso(at) });
 
 describe('R986 report-only probation persistence', () => {
+  it.each(['roster failure', 'lock timeout', 'surviving stale pass'])('A proven, B %s, C with B tree retains debt from A', async mode => {
+    const m = await load();
+    let current = `${head}:${iso(at)}`;
+    const observer = m.createProbationObserver({ ...opts, currentAdoption: () => current,
+      lockOpts: { timeoutMs: 20, pollMs: 2 } });
+    await observer.adopt(previous(), adopted());
+    await observer.proof(processRecord('X', 101));
+    expect(await observer.proof(processRecord('Y', 202))).toMatchObject({ action: 'pass' });
+    const a = adopted();
+    writeFileSync(join(root, 'workers/dep.mjs'), 'export default 3;');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-p', a.head, '-m', 'B']);
+    const b = { head, at: iso(at + 1) };
+    current = `${head}:${b.at}`;
+    const file = m.probationPath(root, env), oldPass = readFileSync(m.probationPath(root, env), 'utf8');
+    if (mode === 'lock timeout') writeFileSync(`${file}.lock`, `${process.pid}\n`);
+    const failed = mode === 'lock timeout' ? m.observeAdoption({ ...opts, lockOpts: { timeoutMs: 20, pollMs: 2 } }, a, b)
+      : await m.createProbationObserver({ ...opts, registered: [{ id: '' }] }).adopt(a, b);
+    expect(failed).toMatchObject({ status: 'invalid', action: 'pending' });
+    if (mode === 'lock timeout') rmSync(`${file}.lock`);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ invalid: true, adoptionId: current });
+    // Model a failed marker write leaving the old passing bytes behind.
+    if (mode === 'surviving stale pass') writeFileSync(file, oldPass);
+    expect(await observer.status()).toMatchObject({ action: 'pending' });
+    head = git(['commit-tree', git(['rev-parse', `${b.head}^{tree}`]), '-p', b.head, '-m', 'C']);
+    const c = { head, at: iso(at + 2) }; current = `${head}:${c.at}`;
+    expect(await observer.adopt(b, c)).toMatchObject({ action: 'pending', owed: ['X', 'Y'] });
+    expect(JSON.parse(readFileSync(file, 'utf8')).provenGood).toBe(a.head);
+  });
+  it('stale adoption status and proof stay pending without recording evidence', async () => {
+    const m = await load(), observer = m.createProbationObserver(opts);
+    await observer.adopt(previous(), adopted());
+    await observer.proof(processRecord('X', 101));
+    await observer.proof(processRecord('Y', 202));
+    const file = m.probationPath(root, env), before = readFileSync(file, 'utf8');
+    const stale = m.createProbationObserver({ ...opts, currentAdoption: () => `${head}:${iso(at + 1)}` });
+    for (const result of [await stale.status(), await stale.proof(processRecord('X', 303))])
+      expect(result).toMatchObject({ status: 'invalid', action: 'pending',
+        reason: expect.stringContaining('stale-adoption: record is for an older adoption') });
+    expect(readFileSync(file, 'utf8')).toBe(before);
+  });
   it('unions every canonical clone alias group so all registered daemons owe proof', async () => {
     const m = await load();
     const alias = join(dir, 'alias'); symlinkSync(root, alias, 'dir');
@@ -141,7 +181,7 @@ describe('R986 report-only probation persistence', () => {
     expect(record.provenGood).toBe(good);
     expect(record.records).toEqual({});
   });
-  it.each(['status', 'adopt', 'proof'])('held probation lock times out %s without changing record bytes', async method => {
+  it.each(['status', 'proof'])('held probation lock times out %s without changing record bytes', async method => {
     const m = await load(), observer = m.createProbationObserver({ ...opts, lockOpts: { timeoutMs: 20, pollMs: 2 } });
     await observer.adopt(previous(), adopted());
     const file = m.probationPath(root, env), before = readFileSync(file, 'utf8');
@@ -235,7 +275,7 @@ describe('R986 report-only probation persistence', () => {
     expect(await observer.adopt(adopted(), adopted())).toMatchObject({ action: 'pass' });
   });
   it.each(['empty object', 'truncated JSON', 'directory', 'wrong version', 'dangling symlink'])(
-    'adoption preserves invalid persisted %s and requires operator recovery', async mode => {
+    'adoption marks invalid persisted %s and requires operator recovery', async mode => {
       const m = await load(), observer = m.createProbationObserver(opts);
       await observer.adopt(previous(), adopted());
       const file = m.probationPath(root, env);
@@ -258,8 +298,8 @@ describe('R986 report-only probation persistence', () => {
       expect(closureReads).toBe(0);
       expect(await observer.status()).toMatchObject({ status: 'invalid', action: 'pending' });
       if (mode === 'directory') expect(lstatSync(file).isDirectory()).toBe(true);
-      else if (mode === 'dangling symlink') expect(lstatSync(file).isSymbolicLink()).toBe(true);
-      else expect(readFileSync(file, 'utf8')).toBe(bytes);
+      else expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ invalid: true,
+        adoptionId: `${next.head}:${next.at}`, reason: expect.stringContaining('probation freeze failed') });
     });
   it('missing, unreadable and invalid files report invalid, never pass or empty', async () => {
     const m = await load(), observer = m.createProbationObserver(opts);

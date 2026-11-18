@@ -80,6 +80,11 @@ function readRecord(root, env, now) {
     lstatSync(probationPath(root, env));
     present = true;
     const record = JSON.parse(readFileSync(probationPath(root, env), 'utf8'));
+    if (record?.invalid === true) {
+      const prior = record.priorRecord;
+      return { error: record.reason || 'failed adoption observation', failedObservation: true,
+        record: prior && !validateProbation(prior, now) ? prior : undefined };
+    }
     const error = validateProbation(record, now);
     return error ? { error } : { record };
   } catch (e) { return { error: 'probation unreadable', absent: !present && e.code === 'ENOENT' }; }
@@ -90,6 +95,17 @@ function writeRecord(root, env, record) {
   writeFileSync(tmp, JSON.stringify(record) + '\n');
   renameSync(tmp, file);
 }
+function failedObservation(options, adopted, reason) {
+  const { root, env = process.env, now = Date.now } = options;
+  // Preserve only validated evidence, including debt, across a failed observation.
+  try {
+    const prior = readRecord(root, env, now());
+    writeRecord(root, env, { invalid: true, adoptionId: `${adopted?.head}:${adopted?.at}`,
+      reason, priorRecord: prior.record ?? null });
+  } catch { /* Current-adoption checks still refuse any surviving stale record. */ }
+  return invalid(reason);
+}
+
 function report(record, now) {
   const result = evaluateProbation(record, now);
   return { status: 'valid', ...result, reason: result.reason || (result.action === 'pass' ? 'all owed proofs recorded' : 'owed daemon proof pending') };
@@ -102,29 +118,31 @@ export function withProbationLock(root, env, fn, { timeoutMs = 2000, pollMs } = 
   return withFileLock(`${path}.lock`, fn, { timeoutMs, pollMs, holderText: `${process.pid}\n` });
 }
 
-/** Caller holds the clone lock: lock order is clone then probation. Lock failure leaves the record untouched. */
+/** Caller holds the clone lock: lock order is clone then probation. Lock failure attempts an invalid marker. */
 export function observeAdoption(options, previous, adopted) {
   const { root, env = process.env, lockOpts, log = console } = options;
   try { return withProbationLock(root, env, () => observeAdoptionRecord(options, previous, adopted), lockOpts); }
   catch (e) {
-    const result = invalid(e.message);
+    const result = failedObservation(options, adopted, e.message);
     log?.error?.(`daemon-probation: ${JSON.stringify(result)}`);
     return result;
   }
 }
 
-function observeAdoptionRecord({ root, env = process.env, now = Date.now, log = console,
-  registered, readClosure: closure = (d, sha) => readClosure(root, d, sha) }, previous, adopted) {
+function observeAdoptionRecord(options, previous, adopted) {
+  const { root, env = process.env, now = Date.now, log = console,
+    registered, readClosure: closure = (d, sha) => readClosure(root, d, sha) } = options;
   try {
     if (!adopted?.head || (previous?.head === adopted.head && previous?.at === adopted.at)) return;
     const adoptionId = `${adopted.head}:${adopted.at}`;
     const prior = readRecord(root, env, now()); // Even a superseded record is validated before use.
-    if (prior.error && !prior.absent) return invalid(prior.error);
-    if (prior.record?.adoptionId === adoptionId) return report(prior.record, now());
+    if (prior.error && !prior.absent && !prior.failedObservation) throw new Error(prior.error);
+    if (!prior.error && prior.record?.adoptionId === adoptionId) return report(prior.record, now());
     const outstanding = prior.record && evaluateProbation(prior.record, now());
     const pending = outstanding?.action === 'pending';
     const frozen = freezeProbation({ adoptionId, sha: adopted.head,
-      provenGood: pending ? prior.record.provenGood : previous?.head ?? null,
+      provenGood: prior.record ? (pending ? prior.record.provenGood : prior.record.sha)
+        : prior.failedObservation ? null : previous?.head ?? null,
       adoptedAt: adopted.at, registered: registered ?? registeredDaemons(root, { env }), readClosure: closure });
     // Old proofs name the old SHA: carry only the debt, never its evidence.
     const record = { ...frozen, owed: [...new Set([...frozen.owed, ...(pending ? outstanding.owed : [])])] };
@@ -133,8 +151,7 @@ function observeAdoptionRecord({ root, env = process.env, now = Date.now, log = 
     log?.error?.(`daemon-probation: ${JSON.stringify(result)}`);
     return result;
   } catch (e) {
-    try { writeRecord(root, env, null); } catch { /* An unreadable file remains invalid. */ }
-    const result = invalid(`probation freeze failed: ${e.message}`);
+    const result = failedObservation(options, adopted, `probation freeze failed: ${e.message}`);
     log?.error?.(`daemon-probation: ${JSON.stringify(result)}`);
     return result;
   }
@@ -142,7 +159,7 @@ function observeAdoptionRecord({ root, env = process.env, now = Date.now, log = 
 
 /** Public reads/mutations serialize on the probation record. Results are telemetry only. */
 export function createProbationObserver(options) {
-  const { root, env = process.env, now = Date.now, log = console, lockOpts = {} } = options;
+  const { root, env = process.env, now = Date.now, log = console, lockOpts = {}, currentAdoption } = options;
   const locked = async fn => {
     try {
       const value = withProbationLock(root, env, fn, lockOpts);
@@ -150,12 +167,22 @@ export function createProbationObserver(options) {
       return value;
     } catch (e) { const value = invalid(e.message); log?.error?.(`daemon-probation: ${JSON.stringify(value)}`); return value; }
   };
-  const status = () => { const p = readRecord(root, env, now()); return p.error ? invalid(p.error) : report(p.record, now()); };
+  const readCurrent = () => {
+    const p = readRecord(root, env, now());
+    if (!p.error && currentAdoption && p.record.adoptionId !== currentAdoption())
+      return { error: 'stale-adoption: record is for an older adoption' };
+    return p;
+  };
+  const status = () => { const p = readCurrent(); return p.error ? invalid(p.error) : report(p.record, now()); };
   return {
     status: () => locked(status),
-    adopt: (previous, adopted) => locked(() => observeAdoptionRecord(options, previous, adopted) ?? status()),
+    adopt: async (previous, adopted) => {
+      // observeAdoption also marks failures to acquire the probation lock.
+      const result = observeAdoption(options, previous, adopted);
+      return result ?? locked(status);
+    },
     proof: own => locked(() => {
-      const p = readRecord(root, env, now());
+      const p = readCurrent();
       if (p.error) return invalid(p.error);
       const { daemonId, pid, bootHead, tickHead, startedAt, lastTickDoneAt } = own;
       const next = recordProof(p.record, daemonId, {
