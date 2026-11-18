@@ -1040,7 +1040,7 @@ describe('the label sink', () => {
   });
 });
 
-// The recorded basis used to name `origin/<branch>` — a ref that moves. The `reviewed-sha` marker covers the
+// The recorded basis used to name `refs/remotes/origin/<branch>` — a ref that moves. The `reviewed-sha` marker covers the
 // merge gate; it does not make the "Net basis" line reproducible, which is what this pins.
 describe('the rev is pinned to a commit', () => {
   const SHA = 'd7ad4774849fe32af2a317510a43b7ca1375e6b3';
@@ -1048,15 +1048,15 @@ describe('the rev is pinned to a commit', () => {
   it('resolves the candidate ref to its full commit SHA, guarding a dash-leading refname', () => {
     const calls = [];
     const exec = (cmd, args) => { calls.push([cmd, ...args]); return `${SHA}\n`; };
-    expect(revParseCommit(exec, 'origin/lane/3058-seed-encoding')).toBe(SHA);
-    expect(calls[0]).toEqual(['git', 'rev-parse', '--verify', '--end-of-options', 'origin/lane/3058-seed-encoding^{commit}']);
+    expect(revParseCommit(exec, 'refs/remotes/origin/lane/3058-seed-encoding')).toBe(SHA);
+    expect(calls[0]).toEqual(['git', 'rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/lane/3058-seed-encoding^{commit}']);
   });
 
   it('returns null — never a half-pin — when the rev will not resolve, and never throws', () => {
-    expect(revParseCommit(() => { throw new Error('fatal: Needed a single revision'); }, 'origin/gone')).toBe(null);
-    expect(revParseCommit(() => 'd7ad477\n', 'origin/x')).toBe(null); // an abbreviation is not a pin
-    expect(revParseCommit(() => '', 'origin/x')).toBe(null);
-    expect(revParseCommit(null, 'origin/x')).toBe(null);
+    expect(revParseCommit(() => { throw new Error('fatal: Needed a single revision'); }, 'refs/remotes/origin/gone')).toBe(null);
+    expect(revParseCommit(() => 'd7ad477\n', 'refs/remotes/origin/x')).toBe(null); // an abbreviation is not a pin
+    expect(revParseCommit(() => '', 'refs/remotes/origin/x')).toBe(null);
+    expect(revParseCommit(null, 'refs/remotes/origin/x')).toBe(null);
     expect(revParseCommit(() => SHA, '')).toBe(null);
   });
 });
@@ -3608,7 +3608,10 @@ describe('#5135 fix range read wiring', () => {
     }) });
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
-    expect(calls.filter(args => args[0] === 'rev-parse')).toEqual([['rev-parse', '--verify', '--end-of-options', 'origin/lane/x^{commit}']]);
+    expect(calls.filter(args => args[0] === 'rev-parse')).toEqual([
+      ['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/main^{commit}'],
+      ['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/lane/x^{commit}'],
+    ]);
     expect(calls).toContainEqual(hardenedGitDiffCommand(['diff', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]).args);
   });
 });

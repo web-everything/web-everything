@@ -801,7 +801,7 @@ export function pushFailedDetail(message, { SRC, REF, REMOTE }) {
   if (!/non-fast-forward|\[rejected\]|fetch first/i.test(full)) return detail;
   return detail + ` — the lane HEAD is not the tip of ${REF} — re-acquire a fresh lane with `
     + '`node we:scripts/lane-pool.mjs acquire --base=<tip>`'
-    + ` (use --base=${REF} for the pushed tip), or fetch and rebase onto ${REMOTE}/${REF}, then re-run`;
+    + ` (use --base=${REF} for the pushed tip), or fetch and rebase onto refs/remotes/${REMOTE}/${REF}, then re-run`;
 }
 
 // Allow importing the pure helpers without running the CLI (the test file imports this module).
@@ -924,7 +924,8 @@ async function runCli() {
 
   // 1. Resolve the SOURCE commit to publish (the lane clone's HEAD, or an explicit --sha). No local
   //    branch is created (that's guarded) — the lane model pushes `<source>:lane/<n>` straight to origin.
-  const refSha = tryGit(['rev-parse', SRC]);
+  const sourceRef = SRC === 'HEAD' || /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(SRC) ? SRC : `refs/heads/${SRC}`;
+  const refSha = tryGit(['rev-parse', '--verify', '--end-of-options', `${sourceRef}^{commit}`]);
   // E3 (#3929) — record the producer's own hold in the verdict ledger, ALONGSIDE the label (strictly additive).
   // Fail-soft by construction: `recordParkVerdict` never throws, a miss is reported on stderr only, and nothing
   // here is read by any park / label / land decision. Written BEFORE the label call, like the drain's park.
@@ -954,9 +955,9 @@ async function runCli() {
   let readyOnOpen = false;
   try {
     // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
-    const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
+    const guardConfigPaths = JSON.parse(gitC(['show', `refs/remotes/${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
     let changedFiles = [];
-    try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* fail closed: stays a draft */ }
+    try { changedFiles = String(gitC(['diff', '--name-only', `refs/remotes/${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* fail closed: stays a draft */ }
     readyOnOpen = decideReadyOnOpen({ body: CREATE_BODY, changedFiles, guardConfigPaths }).ready;
   } catch { /* fail closed: stays a draft */ }
   const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '', readyOnOpen });
@@ -971,7 +972,7 @@ async function runCli() {
     if (!soakPrecheckEnabled()) return { ok: true, skipped: 'disabled' };
     let files;
     try {
-      files = parseNameStatus(gitC(['diff', '--name-status', '-M', `${REMOTE}/${BASE}...${refSha}`]));
+      files = parseNameStatus(gitC(['diff', '--name-status', '-M', `refs/remotes/${REMOTE}/${BASE}...${refSha}`]));
     } catch (e) {
       process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
       return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
@@ -985,7 +986,7 @@ async function runCli() {
     emit({
       repo: REPO, merged: false, reason: 'dry-run', ref: REF, base: BASE, method: METHOD,
       plan: [
-        `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
+        `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `refs/remotes/${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
         `soak precheck (if no PR exists yet): ${soak.ok ? soak.skipped || soak.reason : `REFUSE: ${soak.message}`}`,
         `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
         prCreateBodyGuard(BODY).ok ? `gh ${createArgs.join(' ')}` : `REFUSE (if no PR exists yet): ${prCreateBodyGuard(BODY).reason}  # #2332 fail-fast — an existing PR for this head is exempt`,
@@ -1006,7 +1007,7 @@ async function runCli() {
           ? `node scripts/merge-ai-prs.mjs --only=<pr> --label=${LABEL || 'ready-to-merge'} --this-repo   # #2290 single-couple FAST DRAIN (the drain lands it — pr-land never merges)`
           : PLAN.mode === 'park' ? '(--park: STOP — the PR is HELD review:*; a human clears it via /review, then the drain lands it)'
           : '(label-on-green: STOP after labelling — the standalone drain lands it; no direct merge here)',
-        FALLBACK_GIT ? `fallback on failure (BREAK-GLASS only, WE_MERGE_BREAK_GLASS=1): git merge --no-ff ${REMOTE}/${REF} + push ${REMOTE} ${BASE}` : null,
+        FALLBACK_GIT ? `fallback on failure (BREAK-GLASS only, WE_MERGE_BREAK_GLASS=1): git merge --no-ff refs/remotes/${REMOTE}/${REF} + push ${REMOTE} ${BASE}` : null,
       ].filter(Boolean),
       detail: `would open+label ${SRC} (${refSha.slice(0, 8)}) as a self-approved PR from ${REF}${PLAN.triggerDrain ? ' and trigger a single-couple drain' : ''} — the drain lands it onto ${BASE}`,
     }, 0);
@@ -1075,7 +1076,7 @@ async function runCli() {
   // 1c. #2331 — PRODUCER locus-prefix re-check. The #2170 pre-PR review can edit an item body AFTER the
   //     author's write-time gate ran (and via a route the PostToolUse hook does not see), leaking a bare
   //     code-path ref (#883) that only CI would catch — going red AFTER the PR is open. Re-lint THIS lane's
-  //     OWN committed corpus changes (${REMOTE}/${BASE}..SRC) before publishing, so the producer fails fast,
+  //     OWN committed corpus changes (refs/remotes/${REMOTE}/${BASE}..SRC) before publishing, so the producer fails fast,
   //     never CI. A real leak (linter exit 2) is a hard stop; any other failure (git/node infra) is
   //     best-effort — CI still backstops it — never a false block.
   //
@@ -1087,7 +1088,7 @@ async function runCli() {
   //     gates) — but no longer INVISIBLE: a completed sweep now says so on stderr, so "no line" means "did
   //     not run" instead of being indistinguishable from a pass, and the skip line names the swept root.
   const LOCUS_LINT = resolve(fileURLToPath(new URL('./lint-locus-prefix.mjs', import.meta.url)));
-  const LOCUS_RANGE = `${REMOTE}/${BASE}..${refSha}`;
+  const LOCUS_RANGE = `refs/remotes/${REMOTE}/${BASE}..${refSha}`;
   try {
     execFileSync('node', [LOCUS_LINT, ...buildLocusLintArgs({ root: REPO, range: LOCUS_RANGE })], { cwd: REPO, stdio: ['ignore', 'inherit', 'inherit'] });
     if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · locus-prefix range sweep ran and is clean (${LOCUS_RANGE})\n`);
@@ -1172,7 +1173,7 @@ async function runCli() {
     {
       const repoKeyForLimit = repoKeyForSlug(originSlugOf(REPO)) || 'we';
       let changedFilesForLimit = [];
-      try { changedFilesForLimit = gitC(['diff', '--name-only', '--no-renames', `${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* --no-renames: both sides of a rename, as `isCardOnlyDiff` requires; best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
+      try { changedFilesForLimit = gitC(['diff', '--name-only', '--no-renames', `refs/remotes/${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* --no-renames: both sides of a rename, as `isCardOnlyDiff` requires; best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
       const { count: openCount, limit, excludeCardOnly, cardOnly: cardOnlyExcluded, accepted: acceptedExcluded, stacked: stackedExcluded } = countOpenPrsForRepo(repoKeyForLimit);
       const limitDecision = decideOpenPr({
         repoKey: repoKeyForLimit, limit, openCount, cardOnlyExcluded, acceptedExcluded, stackedExcluded, excludeCardOnly, changedFiles: changedFilesForLimit, branch: REF,
@@ -1560,10 +1561,10 @@ async function runCli() {
       // #2290 — assert this route may write to main BEFORE touching git (blocked unless break-glass, and a
       // break-glass use emits the loud audit line). Capture the pre-merge base sha for the heal's onto-ref.
       assertMayMerge({ caller: 'pr-land', pr: null, repo: REPO });
-      const preMergeBaseSha = tryGit(['rev-parse', `${REMOTE}/${BASE}`]) || null;
+      const preMergeBaseSha = tryGit(['rev-parse', '--verify', '--end-of-options', `refs/remotes/${REMOTE}/${BASE}^{commit}`]) || null;
       tryGit(['fetch', REMOTE, `${REF}`, '--quiet']);
       gitC(['checkout', BASE]);
-      gitC(['merge', '--no-ff', `${REMOTE}/${REF}`, '-m', `merge ${REF} (pr-land git fallback)`]);
+      gitC(['merge', '--no-ff', `refs/remotes/${REMOTE}/${REF}`, '-m', `merge ${REF} (pr-land git fallback)`]);
       // JIT numbering (#2288 / #xzxc92d): the fallback-git merge is a LAND path too — the last one #2288 left
       // un-numbered. Number every provisional hash file the merge just brought onto BASE BEFORE the push, so
       // no hash strands on main (this is the exact route that stranded #xzxc92d itself). Shares lane-drain's
@@ -1622,8 +1623,8 @@ async function runCli() {
     if (isPostLandTreeDirty(tryGit(['status', '--porcelain', '--untracked-files=no']))) return { skipped: true, warning: `skipped id-collision heal — the checkout at ${REPO} has TRACKED local changes (won't reset a dirty working tree); if the gate flags "ids must be unique", run scripts/backlog-renumber-collisions.mjs on ${BASE} by hand` };
     try {
       gitC(['fetch', REMOTE, BASE, '--quiet']);
-      gitC(['checkout', '--detach', `${REMOTE}/${BASE}`]);
-    } catch (e) { return { warning: `skipped id-collision heal — could not sync to ${REMOTE}/${BASE} (${firstLine(e)})` }; }
+      gitC(['checkout', '--detach', `refs/remotes/${REMOTE}/${BASE}`]);
+    } catch (e) { return { warning: `skipped id-collision heal — could not sync to refs/remotes/${REMOTE}/${BASE} (${firstLine(e)})` }; }
     let plan;
     try {
       const out = execFileSync('node', buildRenumberHealArgs({ ontoRef }), { cwd: REPO, encoding: 'utf8' });
@@ -1678,8 +1679,8 @@ async function runCli() {
     if (isPostLandTreeDirty(tryGit(['status', '--porcelain', '--untracked-files=no']))) return { done: [], failed: [], skipped: true, warning: `skipped derived-artifact regen — the checkout at ${REPO} has TRACKED local changes; run npm run gen:inventory && npm run gen:reference-index on ${BASE} by hand` };
     try {
       gitC(['fetch', REMOTE, BASE, '--quiet']);
-      gitC(['checkout', '--detach', `${REMOTE}/${BASE}`]);
-    } catch (e) { return { done: [], failed: [], warning: `skipped derived-artifact regen — could not sync to ${REMOTE}/${BASE} (${firstLine(e)})` }; }
+      gitC(['checkout', '--detach', `refs/remotes/${REMOTE}/${BASE}`]);
+    } catch (e) { return { done: [], failed: [], warning: `skipped derived-artifact regen — could not sync to refs/remotes/${REMOTE}/${BASE} (${firstLine(e)})` }; }
     const done = [];
     const failed = [];
     for (const [cmd, ...args] of buildRegenArgs()) {

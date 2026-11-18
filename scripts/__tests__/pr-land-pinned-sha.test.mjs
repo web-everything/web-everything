@@ -93,6 +93,16 @@ describe('pr-land pinned SHA evidence', () => {
   });
 
 
+  it.each(['missing', 'mutable'])('a shared basis with a %s base pin cannot grant clearance', kind => {
+    const basis = resolveNetDiffBasis({ exec, rev: head, pinRev: true });
+    expect(basis).toMatchObject({ ok: true, baseRef: base, baseSha: base });
+    if (kind === 'missing') delete basis.baseSha;
+    else basis.baseRef = 'origin/main';
+    for (const read of [computeNetDiffText, computeNetDiffPaths, computeNetDiffChangedFiles]) {
+      expect(read({ exec, rev: head, basis, pinRev: true })).toMatchObject({ scored: false, reason: 'basis-mismatch' });
+    }
+  });
+
   it('mixed-case SHA readers bind canonical full identities to the requested commit', () => {
     const mixed = head.toUpperCase();
     const sig = computeNetDiffSignals({ exec, rev: mixed });
@@ -101,10 +111,13 @@ describe('pr-land pinned SHA evidence', () => {
     expect(readDrainNetDiffSignals({ exec, headSha: mixed })).toMatchObject({ scored: true, revSha: head });
   });
 
-  it.each(['abbreviated', 'origin display'])('pinned %s revs resolve before every scoring read', kind => {
+  it.each(['abbreviated', 'origin display'])('ambiguous %s revs stay unscored unless they name an explicit branch', kind => {
     const rev = kind === 'abbreviated' ? head.slice(0, 12) : 'origin/lane/head';
     git('update-ref', 'refs/remotes/origin/lane/head', head);
-    const sig = computeNetDiffSignals({ exec, rev, pinRev: true });
+    const ambiguous = computeNetDiffSignals({ exec, rev, pinRev: true });
+    expect(ambiguous.scored).toBe(false);
+    expect(() => requireScoredNetDiff(ambiguous, head)).toThrow(/unscored/);
+    const sig = computeNetDiffSignals({ exec, rev: 'lane/head', pinRev: true });
     expect(requireScoredNetDiff(sig, head)).toBe(sig);
     expect(sig.changedFiles).toEqual(['guard.test.mjs']);
     expect(sig.netDiffText.rev).toBe(head);

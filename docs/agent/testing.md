@@ -4647,3 +4647,10 @@ provide raw blob records matching the rendered sections. Real-git CLI fixtures s
 the checkout through the subprocess `cwd` seam: hardened reads intentionally strip
 `GIT_DIR`. SHA spelling is canonicalized before identity comparisons; abbreviated
 fetch-parked heads bind to the verified full fetched identity, never a display ref.
+
+Pinned net-diff bases resolve once, after fetch, from `refs/remotes/<remote>/<base>^{commit}`
+with `rev-parse --verify --end-of-options`. Reuse that SHA for every scoring read;
+branch candidates probe qualified remote then local branch refs, never tags. Real-Git
+regressions in `review-pr-io-pinned-head.test.mjs` cover local branch/tag shadows named
+`origin/main`, a missing tracking base, tag-only heads, and a base moving after pinning.
+Unresolvable bases remain unscored: repair the checkout/read and rerun or request human review.

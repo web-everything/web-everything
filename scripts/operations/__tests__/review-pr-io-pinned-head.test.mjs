@@ -69,6 +69,63 @@ describe('review read pins real Git evidence before merge-base', () => {
     expect(result.diff.text).not.toContain('card only');
   };
 
+  it.each(['branch', 'tag', 'both'])('ignores %s shadow of the fetched base and scores the real change', shadow => {
+    if (shadow !== 'tag') git('update-ref', 'refs/heads/origin/main', executable);
+    if (shadow !== 'branch') git('update-ref', 'refs/tags/origin/main', executable);
+    // Reproduce the vulnerable DWIM basis with real Git: the raw and rendered
+    // diffs both agree on empty evidence for the wrong base.
+    expect(git('rev-parse', '--verify', '--end-of-options', 'origin/main^{commit}')).toBe(executable);
+    expect(git('diff', '--name-only', 'origin/main', executable)).toBe('');
+    const calls = [];
+    const exec = (cmd, args, opts) => {
+      calls.push(args);
+      if (args[0] === 'fetch') {
+        // Exercise the ordering contract: fetch replaces a previously wrong base.
+        git('update-ref', 'refs/remotes/origin/main', base);
+        return '';
+      }
+      return execFileSync(cmd, args, { ...opts, cwd: root });
+    };
+    git('update-ref', 'refs/remotes/origin/main', executable);
+    const basis = resolveNetDiffBasis({ exec, rev: executable, pinRev: true });
+    expect(basis).toMatchObject({ ok: true, baseRef: base, baseSha: base, diffBase: base, candidate: executable });
+    expect(calls[0][0]).toBe('fetch');
+    expect(calls[1]).toEqual(['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/main^{commit}']);
+    const result = computeNetDiffText({ exec, rev: executable, basis, pinRev: true });
+    expect(result).toMatchObject({ scored: true, base, revSha: executable });
+    expect(result.text).toContain('security relevant');
+  });
+
+  it('fails closed when the qualified base is missing despite a matching shadow tag', () => {
+    git('update-ref', '-d', 'refs/remotes/origin/main');
+    git('update-ref', 'refs/tags/origin/main', executable);
+    const { result } = read();
+    expect(result.diff).toMatchObject({ scored: false, text: '', reason: 'ref-unresolved' });
+    expect(result.net.scored).toBe(false);
+  });
+
+  it.each([false, true])('tags never satisfy a branch candidate (pinRev=%s)', pinRev => {
+    git('update-ref', '-d', 'refs/remotes/origin/lane/security');
+    git('update-ref', 'refs/tags/origin/lane/security', card);
+    git('update-ref', 'refs/tags/lane/security', card);
+    const exec = (cmd, args, opts) => {
+      if (args[0] === 'fetch') throw new Error('offline fixture');
+      return execFileSync(cmd, args, { ...opts, cwd: root });
+    };
+    expect(computeNetDiffText({ exec, rev: 'lane/security', pinRev })).toMatchObject({ scored: false, reason: 'ref-unresolved' });
+    git('update-ref', 'refs/heads/lane/security', executable);
+    const result = computeNetDiffText({ exec, rev: 'lane/security', pinRev });
+    expect(result.scored).toBe(true);
+    expect(result.text).toContain('security relevant');
+  });
+
+  it('reuses the pinned base when the tracking ref moves before merge-base', () => {
+    const { result } = read(args => {
+      if (args[0] === 'merge-base') git('update-ref', 'refs/remotes/origin/main', executable);
+    });
+    expectExecutable(result);
+  });
+
   it('refuses paired scoring when binary paths need human review', () => {
     git('checkout', '--quiet', '--detach', executable);
     writeFileSync(join(root, 'payload'), Buffer.from([0, 255, 1]));
@@ -92,10 +149,10 @@ describe('review read pins real Git evidence before merge-base', () => {
     expect(git('rev-parse', 'origin/lane/security')).toBe(card);
     expectExecutable(result);
     expect(calls.filter(a => a[0] === 'merge-base')).toEqual([
-      ['merge-base', '--end-of-options', 'origin/main', executable],
+      ['merge-base', '--end-of-options', base, executable],
     ]);
     for (const args of calls.filter(a => a.includes('diff'))) expect(args.join(' ')).not.toContain('origin/lane/security');
-    expect(calls.filter(a => a[0] === 'rev-parse')).toHaveLength(1);
+    expect(calls.filter(a => a[0] === 'rev-parse')).toHaveLength(2);
   });
 
   it('pins the standalone text helper before merge-base and never repins after the race', () => {
@@ -109,7 +166,7 @@ describe('review read pins real Git evidence before merge-base', () => {
     const result = computeNetDiffText({ exec, rev: 'lane/security', pinRev: true });
     expect(result).toMatchObject({ scored: true, revSha: executable, rev: executable, base });
     expect(result.text).toContain('security relevant');
-    expect(pins).toBe(1);
+    expect(pins).toBe(2);
   });
 
   it('ignores a real replace object that hides the executable tree', () => {

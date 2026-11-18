@@ -178,7 +178,7 @@ const verdictRecord = ({ rows = [['correctness', 'mandatory', 'accept'], ['secur
   body: ['✅ review — accepted', '', 'Recorded by operator via the declared `review-pr` operation (#3035).', '',
     panelTable(rows), '',
     single ? '**Lens:** `correctness` — a SINGLE-LENS run. One `judge` step, one juror, one lens.' : '',
-    basis ? `Net basis: \`${BASE_SHA}..${head}\` (rev \`origin/lane/x\` at review time)` : ''].join('\n') });
+    basis ? `Net basis: \`${BASE_SHA}..${head}\` (rev \`refs/remotes/origin/lane/x\` at review time)` : ''].join('\n') });
 const cleanPr = { comments: [verdictRecord()] };
 
 describe('#3308 — reviewRecordKind / recordedReviewRecords', () => {
@@ -416,7 +416,7 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
 
   it('PR #4631 round 7: a diff that was not read at the head SHA is a read miss, never coverage', () => {
     const view = acceptanceView();
-    const netDiff = () => ({ scored: true, text: REVIEWED_DIFF, rev: 'origin/lane/3432' });
+    const netDiff = () => ({ scored: true, text: REVIEWED_DIFF, rev: 'refs/remotes/origin/lane/3432' });
     const evidence = readDrainAcceptance({ ...acceptanceOptions(view), netDiff });
     expect(evidence.headDiff).toBe(null);
     expect(evidence.headReadFailed).toBe(true);
@@ -503,9 +503,9 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
 
   it("a merge-base basis reports `basisKind:'merge-base'` and `basisNarrowed:true`", () => {
     const { exec } = fakeExec({
-      'git merge-base origin/main origin/lane/x': { stdout: 'forkpoint\n' },
-      'git diff --numstat forkpoint origin/lane/x': { stdout: '3\t1\tREADME.md\n' },
-      'git diff forkpoint origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n' },
+      'git merge-base refs/remotes/origin/main refs/remotes/origin/lane/x': { stdout: 'forkpoint\n' },
+      'git diff --numstat forkpoint refs/remotes/origin/lane/x': { stdout: '3\t1\tREADME.md\n' },
+      'git diff forkpoint refs/remotes/origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.scored).toBe(true);
@@ -515,10 +515,10 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
 
   it("an ancestry basis reports `basisKind:'ancestry'` and is still NARROWED — it is the PR's own file set", () => {
     const { exec } = fakeExec({
-      'git merge-base origin/main origin/lane/x': { throw: 'no common ancestors' },
-      'git diff --numstat origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
-      'git log --numstat --diff-merges=first-parent --pretty=format: origin/main..origin/lane/x --': { stdout: '2\t0\tbacklog/a.md\n' },
-      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
+      'git merge-base refs/remotes/origin/main refs/remotes/origin/lane/x': { throw: 'no common ancestors' },
+      'git diff --numstat refs/remotes/origin/main refs/remotes/origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
+      'git log --numstat --diff-merges=first-parent --pretty=format: refs/remotes/origin/main..refs/remotes/origin/lane/x --': { stdout: '2\t0\tbacklog/a.md\n' },
+      'git diff refs/remotes/origin/main refs/remotes/origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.basisKind).toBe('ancestry');
@@ -528,9 +528,9 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
 
   it("a base-tip basis reports `basisNarrowed:false` — the signal the producer threads into the human gate", () => {
     const { exec } = fakeExec({
-      'git merge-base origin/main origin/lane/x': { throw: 'no common ancestors' },
-      'git diff --numstat origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
-      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
+      'git merge-base refs/remotes/origin/main refs/remotes/origin/lane/x': { throw: 'no common ancestors' },
+      'git diff --numstat refs/remotes/origin/main refs/remotes/origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
+      'git diff refs/remotes/origin/main refs/remotes/origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.basisKind).toBe('base-tip');

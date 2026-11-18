@@ -3968,7 +3968,7 @@ function isStrictAncestor(exec, ancestor, descendant) {
  * then per candidate narrows the LEFT side of the diff to the #2404 provable fork point
  * (`merge-base(<remote>/<base>, candidate)`) and probes candidate resolution with a cheap `git diff --numstat`
  * (which doubles as the human-gate basis). Returns the resolved `{ baseRef, diffBase, candidate, humanBasis }`
- * for the FIRST candidate (`<remote>/<rev>` first, then bare `rev` — the #2373-review-r2 order) that resolves,
+ * for the FIRST candidate (`refs/remotes/<remote>/<rev>` first, then `refs/heads/<rev>` — the #2373-review-r2 order) that resolves,
  * or `{ ok:false, reason }` when it can't produce one (the caller degrades to the safe over-scoring / `gh pr diff`
  * fallback). NEVER checks out the PR branch (#2336): it only fetches tracking refs and diffs two trees in place.
  * Pure aside from the injected `exec`.
@@ -3988,7 +3988,7 @@ function isStrictAncestor(exec, ancestor, descendant) {
  * `reason: 'ref-unresolved'` — the legitimately-absent-ref case, unfixable and correctly falls back.
  * @param {{exec:Function, remote?:string, base?:string, rev:string, fetchExtraRefs?:string[]}} opts
  *   `exec(cmd, args, opts)` — inject `execFileSync`-shaped exec so this stays unit-testable with a fake.
- * @returns {{ok:true, baseRef:string, diffBase:string, candidate:string, humanBasis:{changedFiles:string[],diffLines:number}, requestedFor:{remote:string,base:string,rev:string}}|{ok:false, reason:'exec-contract'|'ref-unresolved', requestedFor:{remote:string,base:string,rev:string|null}}}
+ * @returns {{ok:true, baseRef:string, baseSha?:string, diffBase:string, candidate:string, humanBasis:{changedFiles:string[],diffLines:number}, requestedFor:{remote:string,base:string,rev:string}}|{ok:false, reason:'exec-contract'|'ref-unresolved', requestedFor:{remote:string,base:string,rev:string|null}}}
  */
 /**
  * #2890-review-r2 finding 1 — does this already-resolved basis answer the question THIS call is asking?
@@ -4080,7 +4080,8 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
   // own `'ref-unresolved'` either (that reads as "this branch is gone", which is a different fact).
   const requestedFor = { remote, base, rev: rev || null };
   if (typeof exec !== 'function' || !rev) return { ok: false, reason: 'ref-unresolved', requestedFor };
-  const baseRef = `${remote}/${base}`;
+  let baseRef = `refs/remotes/${remote}/${base}`;
+  let baseSha;
   try {
     // ALWAYS force-update the base tracking-ref (#2373 opportunistic-fetch fix): the cumulative human-gate basis
     // below is `<remote>/<base>…head`, which a stacked `baseRev` must never be able to shrink (#2390-review-fix).
@@ -4094,8 +4095,20 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
     if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
     /* a real fetch failure degrades to whatever is locally cached — the diff attempts below still run */
   }
+  if (pinRev) {
+    try {
+      // Resolve only the force-updated tracking ref, once. DWIM names can be
+      // shadowed by local branches/tags and raw blob verification cannot detect it.
+      baseSha = String(hardenedGitRead(exec, ['rev-parse', '--verify', '--end-of-options', `${baseRef}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(baseSha)) return { ok: false, reason: 'ref-unresolved', requestedFor };
+      baseRef = baseSha;
+    } catch (err) {
+      return { ok: false, reason: isExecContractError(err) ? 'exec-contract' : 'ref-unresolved', requestedFor };
+    }
+  }
   const candidates = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) ? [rev.toLowerCase()]
-    : [`${remote}/${rev}`, rev];
+    : [`refs/remotes/${remote}/${rev}`, `refs/heads/${rev}`];
   for (let candidate of candidates) {
     // Pin BEFORE merge-base or any scoring probe. Once a candidate resolves, never
     // retry a mutable name if subsequent evidence fails.
@@ -4167,7 +4180,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       catch (err) { if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor }; }
       if (ancestry) { humanBasis = ancestry; basisKind = 'ancestry'; }
     }
-    return { ok: true, baseRef, diffBase, candidate, humanBasis, basisKind, basisNarrowed: basisKind !== 'base-tip', requestedFor, ...(pinRev ? { revSha: candidate } : {}) };
+    return { ok: true, baseRef, diffBase, candidate, humanBasis, basisKind, basisNarrowed: basisKind !== 'base-tip', requestedFor, ...(pinRev ? { revSha: candidate, baseSha } : {}) };
   }
   return { ok: false, reason: 'ref-unresolved', requestedFor };
 }
@@ -4184,7 +4197,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
   // #2890-review-fix finding 3 — reuse a basis the caller already resolved for this same ref (see
   // `resolveNetDiffBasis`); absent one, resolve our own exactly as before.
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
-  if (pinRev && basis.ok && (!basis.revSha || basis.candidate !== basis.revSha || (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) return { ...empty, reason: 'basis-mismatch' };
+  if (pinRev && basis.ok && (!basis.revSha || basis.candidate !== basis.revSha || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(basis.baseSha ?? '') || basis.baseRef !== basis.baseSha || (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) return { ...empty, reason: 'basis-mismatch' };
   // #2952 — additive: `reason` distinguishes a fixable caller-side `exec`-contract violation ('exec-contract')
   // from a legitimately absent ref ('ref-unresolved'). Existing consumers that read only `scored` are untouched.
   if (!basis.ok) return { ...empty, reason: basis.reason };
@@ -4241,7 +4254,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
   if (!basis.ok) return { ...unscored, reason: basis.reason }; // caller falls back to `gh pr diff`
   let { diffBase, candidate } = basis;
-  if (pinRev && (!basis.revSha || basis.candidate !== basis.revSha ||
+  if (pinRev && (!basis.revSha || basis.candidate !== basis.revSha || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(basis.baseSha ?? '') || basis.baseRef !== basis.baseSha ||
       (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) {
     return { ...unscored, reason: 'basis-mismatch' };
   }
@@ -4398,7 +4411,7 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
   if (typeof exec !== 'function' || !rev) return unscored;
   if (sharedBasis && !basisAnswersRequest(sharedBasis, { remote, base, rev })) return { ...unscored, reason: 'basis-mismatch' };
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
-  if (pinRev && basis.ok && (!basis.revSha || basis.candidate !== basis.revSha || (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) return { ...unscored, reason: 'basis-mismatch' };
+  if (pinRev && basis.ok && (!basis.revSha || basis.candidate !== basis.revSha || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(basis.baseSha ?? '') || basis.baseRef !== basis.baseSha || (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) return { ...unscored, reason: 'basis-mismatch' };
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {

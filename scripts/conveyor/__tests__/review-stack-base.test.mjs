@@ -605,10 +605,21 @@ describe('the synthetic stack base on a real git graph', () => {
       expect(text).toContain('+T1');
       expect(text).toContain('+T8');
       expect(text).toContain('-s8');
-      expect(text).not.toContain('b1');         // the bottom's change (bottom.txt) is inherited, not the top's
-      expect(text).not.toContain('B1');         // ... including the bottom's edit inside the shared file
-      expect(text).not.toContain('o1');         // ... and main's own advance since the top forked
-      expect(text).not.toContain('b2');
+      expect(text).not.toMatch(/^[ +\-]b1$/m);         // the bottom's change (bottom.txt) is inherited, not the top's
+      expect(text).not.toMatch(/^[ +\-]B1$/m);         // ... including the bottom's edit inside the shared file
+      expect(text).not.toMatch(/^[ +\-]o1$/m);         // ... and main's own advance since the top forked
+      expect(text).not.toMatch(/^[ +\-]b2$/m);
+    } finally { g.cleanup(); }
+  });
+
+  it('a local main tag cannot shadow the stack base branch', () => {
+    const { g, b1, b2, top } = build();
+    try {
+      g.run(['update-ref', 'refs/tags/main', top]);
+      const sets = readOffMainSets([top, b2], { run: g.run, base: 'main' });
+      expect(containedCommit(sets, b2, top)).toBe(b1);
+      const tree = stackBaseTree({ contained: b1, topHead: top, run: g.run, base: 'main' });
+      expect(stackNetFiles({ tree, topHead: top, run: g.run }).sort()).toEqual(['shared.txt', 'top.txt']);
     } finally { g.cleanup(); }
   });
 

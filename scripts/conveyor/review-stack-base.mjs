@@ -307,8 +307,14 @@ const gitRun = (root) => (args, opts = {}) => String(execFileSync('git', ['-C', 
   encoding: 'utf8', timeout: 60e3, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], ...opts,
 }));
 
+// Branch bases may be supplied by local graph callers. Never let a tag satisfy
+// those branch names; production's default is already a qualified tracking ref.
+const branchBaseRef = base => SHA.test(base) || base.startsWith('refs/') ? base
+  : base.startsWith('origin/') ? `refs/remotes/${base}` : `refs/heads/${base}`;
+
 /** Read {@link OffMainSets} for the given heads. A head whose read fails is left out (its answers become unknown). */
-export function readOffMainSets(heads, { root = ROOT, run = gitRun(root), base = 'origin/main' } = {}) {
+export function readOffMainSets(heads, { root = ROOT, run = gitRun(root), base = 'refs/remotes/origin/main' } = {}) {
+  base = branchBaseRef(base);
   const sets = new Map();
   for (const head of new Set(heads)) {
     if (!SHA.test(String(head ?? ''))) continue;
@@ -325,7 +331,8 @@ export function readOffMainSets(heads, { root = ROOT, run = gitRun(root), base =
  * The synthetic base tree for a stacked top: merge the bottom commit it contains into its merge-base with main.
  * `null` on a conflict or any failure (fail open: the caller keeps the main basis).
  */
-export function stackBaseTree({ contained, topHead, root = ROOT, run = gitRun(root), base = 'origin/main' }) {
+export function stackBaseTree({ contained, topHead, root = ROOT, run = gitRun(root), base = 'refs/remotes/origin/main' }) {
+  base = branchBaseRef(base);
   try {
     const mainBase = run(['merge-base', '--end-of-options', base, topHead]).split('\n')[0].trim();
     if (!SHA.test(mainBase)) return null;
@@ -384,12 +391,13 @@ export const fingerprintOf = (text) => normalizeDiffFingerprint(String(text ?? '
  * marker (an integer, checked here again before it reaches a ref name). A merged bottom's branch is usually deleted,
  * so its commits are fetched through GitHub's own `refs/pull/<n>/head`.
  */
-export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root), base = 'origin/main',
+export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root), base = 'refs/remotes/origin/main',
   readBottom = (n) => {
     const j = JSON.parse(String(execFileSync('gh', ['pr', 'view', String(n), '--repo', repo, '--json', 'state,headRefOid,mergeCommit'],
       { cwd: root, encoding: 'utf8', timeout: 60e3, maxBuffer: 4 * 1024 * 1024 })));
     return { state: j?.state, headRefOid: j?.headRefOid, mergeOid: j?.mergeCommit?.oid };
   } } = {}) {
+  base = branchBaseRef(base);
   try {
     const n = marker?.bottom;
     if (!Number.isInteger(n) || n <= 0) return { ok: false, why: 'the marker names no valid bottom PR' };

@@ -1071,7 +1071,7 @@ describe('applyLabelWithRetry — a park label is retried before it is reported 
 describe('R502 ready-on-open allowlist wiring', () => {
   it('reads the guard-config allowlist from the base branch, never the PR checkout', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src).toMatch(/gitC\(\['show', `\$\{REMOTE\}\/\$\{BASE\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
+    expect(src).toMatch(/gitC\(\['show', `refs\/remotes\/\$\{REMOTE\}\/\$\{BASE\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
     expect(src).not.toMatch(/readSettings\(\)\.prLandReady/);
   });
 });
