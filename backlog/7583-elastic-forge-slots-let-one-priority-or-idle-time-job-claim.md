@@ -6,7 +6,10 @@ status: open
 scope: ["we:docs/agent/platform-decisions.md"]
 scopeRationale: "The named executable checks are delivered by 7615 after policy completion; this card delivers only the statute amendment and its card update."
 dateOpened: "2026-11-01"
+preparedDate: "2026-11-17"
+preparedAgainstSha: "7491c6ecda714ea2590065f2a2e3c166b306d9bc"
 tags: []
+relatedReport: reports/2026-11-17-elastic-forge-slots-policy-prep.md
 ---
 
 
@@ -19,15 +22,26 @@ R331 (2026-11-01 11:22 ET) "Ok idle first": v1 is idle-time growth only. R350 (2
 - Forge has 32 CPUs and 62G RAM; each of 8 slots is capped at 800% CPU and 12G, under a parent cap of 2800% CPU and 56G. 8 slots already exceed the parent, so slots are a fairness lane and the parent is the real cap.
 - Known occurrences: Kubernetes burstable QoS, GitHub Actions larger runners, Bazel `--local_cpu_resources`, make `-jN` job tokens (borrow only while others idle).
 
-No real fork survives. The call to ratify is the five rulings below plus the statute amendments.
+## Digest
+
+**Recommended default: ratify as is (already R354), land statute amendments 0-7 (6 and 7 added in prep after the skeptic pass; A1's "0-5" reads 0-7) with the seven clarification rulings below, and send the code drift to 7615.** Prep research: [report](/reports/2026-11-17-elastic-forge-slots-policy-prep.md).
+
+## Why there is no `## Fork N`
+
+Standing test, every concern: (1) idle-only growth, (2) 3-slot ceiling, (3) off until proven, (4) fail closed, (5) elastic before smaller slots. Each has a named broken alternative already ruled out by the operator (R324, R331, R350, R354), or is a config value (`maxSlots`, `idleFreeSlots`) under `#config-extends-platform-default`, not a fork. The one new tension, the shipped code defaulting elastic to on, is the broken branch of "off until proven", so it is a build correction, not a choice. Prior art (Kubernetes burstable QoS, GitHub larger runners, Bazel local resources, make jobserver) all borrow only when idle, with a ceiling and no preemption: the same shape.
+
+## Prep finding: shipped code differs from the ratified policy (owner: 7615)
+
+`we:scripts/readiness/heavy-admission.mjs` already carries R324 mechanics. Differences from this card: the key is `remote.elasticSlots.enabled` (not `remote.elastic.enabled`), its standard default is `true` (line 252, so A3 would fail today), the idle test is "zero active runs" (not 4 of 8 free), and `resolveRemoteSlotUnits` still lets a priority caller lift the gate. These belong to 7615 (rename or alias, default `false`, idle test, priority off). They do not change the statute text.
 
 ## Rulings to ratify (none is a fork)
 
 - **Idle-only growth.** A job may take more than 1 slot only when Forge is idle, meaning at least `idleFreeSlots` (4 of the 8) slots are free and the Forge runner confirms parent CPU and memory headroom for the request (the Mac cannot see Forge load). Priority claiming is off and deferred to a later slice; no caller-spellable signal raises a grant.
 - **At most 3 slots per job** (`maxSlots` = 3, from the parent CPU and memory ceilings).
-- **Off until proven.** `remote.elastic.enabled` is `false` until a live before/after proof is attached; then the operator sets it true (a platform-preferences change) citing that proof.
+- **Off until proven.** `remote.elasticSlots.enabled` is `false` until a live before/after proof is attached; then the operator sets it true (a platform-preferences change) citing that proof.
 - **Fail closed to 1 slot.** Any doubt grants exactly 1 slot, today's behaviour. An optimisation failure never denies a run.
-- **Ordering.** Elastic lands first; shrinking to about 16 smaller slots is a later card that depends on this one.
+
+Dependency note (sequencing, not a ruling): elastic lands first; shrinking to about 16 smaller slots is a later card that depends on this one.
 
 Mechanics (grant function, polling, starvation bound, timeout, grant contract, runner slice and clamp, lease and marker reaping, settings and env layers, proof steps) are NOT decided here: see build story 7615.
 
@@ -46,10 +60,12 @@ Statute `#heavy-command-admission-queue` in we:docs/agent/platform-decisions.md 
 0. Scope (add a sentence after the four clauses): "Elastic slots apply to the `remote.*` (Forge) path only; the local pool is unchanged."
 1. Clause 1: replace "v1 ships as a plain named SET, not weighted" with "v1 ships as a plain named SET; every heavy command weighs one token, except that on an idle Forge a job may weigh up to `maxSlots` tokens."
 2. Clause 2: replace "queues on a capacity semaphore" with "queues on a counting semaphore (one token per slot; a job acquires N tokens at once)".
-3. Clause 4: after "env/config-overridable per machine" add "for the local pool; the Forge (`remote.*`) leaves, including `maxConcurrent` and `remote.elastic.*`, are standard-then-platform-preferences only, as they already are", and "the cap counts one job as up to `maxSlots` tokens".
+3. Clause 4: after "env/config-overridable per machine" add "for the local pool; the Forge (`remote.*`) leaves, including `maxConcurrent` and `remote.elasticSlots.*`, resolve standard-then-platform-preferences and stay platform-only (this is the TARGET rule, stricter than today: a checkout or tool-layer setting, including under a private `LANE_POOL_ROOT`, never overrides a platform-preferences `remote.elasticSlots.enabled: false`, so an operator disablement and the proof-before-enablement restriction cannot be bypassed; there is no env override; KNOWN CODE DRIFT, a fix required in build story #7615 before elastic slots turn on: today a private `LANE_POOL_ROOT` lets a tool-layer `enabled:true` beat a platform `enabled:false`, which the audit reproduced with a three-slot grant)", and "the cap counts one job as up to `maxSlots` tokens".
 4. Re-entrance paragraph: after "gives its child `WE_HEAVY_ADMISSION_HELD=1`" add "carrying the granted slot count N", so a nested wrapper neither re-acquires nor double-counts.
 5. Reaper sentence: add "a multi-slot `waiting` marker is one owner holding N tokens; reaping it releases all N".
-Unchanged: clause 3 (waiting-for-capacity tick). Consistent with, not amended: "a running holder is never preempted" (code comment at we:scripts/readiness/heavy-admission.mjs:135).
+6. Clause 1 heading: "v1 equal-cost" becomes "v1 equal-cost except idle-Forge elastic", so it no longer contradicts amendment 1.
+7. New sentence in clause 2 (starvation guard): "A live P0 (red-main repair) waiter blocks any new multi-slot grant; a running holder is never preempted." The no-preemption half is today only a code comment (we:scripts/readiness/heavy-admission.mjs:135), so the statute now states it.
+Unchanged: clause 3 (waiting-for-capacity tick).
 
 ## Non-goals
 
@@ -82,3 +98,18 @@ Six second-screen flags were recorded at ratification. This card resolves the st
 4. Amendment 3's unverifiable "as they already are".
 5. Amend the re-entrance "one slot, not two" note.
 6. Waiting-marker token semantics: the statute records one owner holding N tokens and reaping all N; the build implements and tests that rule.
+
+## Prepared resolution of the six clarifications (plus one)
+
+1. **Values:** confirmed. `maxSlots` 3 equals parent 2800% / slot 800% (the shipped `autoSlotUnits` 3). Idle means at least `idleFreeSlots` 4 of 8 free plus Forge headroom.
+2. **Amendment 0 anchor:** a new paragraph directly after clause 4, before the `Lineage` line: "Elastic slots apply to the `remote.*` (Forge) path only; the local pool is unchanged."
+3. **Amendment 3 second insertion:** clause 4's sentence "The admission cap is a fixed number" gains "; the cap counts one job as up to `maxSlots` tokens".
+4. **"As they already are":** the unqualified claim was too broad. Verified in `we:scripts/readiness/heavy-admission.mjs`: the tool layer is ignored only on a shared pool (line ~390) and `ADMISSION_ENV` (lines ~305-310) has no `remote.*` override. Amendment 3 is reworded above to say exactly that; "as they already are" is dropped.
+5. **Re-entrance note:** "takes one slot, not two" becomes "takes the granted slot count once, never a second grant".
+6. **Waiting marker:** one owner holding N tokens; reaping releases all N. 7615 implements and tests it.
+7. **Setting name (drafting correction):** the statute names the shipped key `remote.elasticSlots.enabled`; `remote.elastic.enabled` in this card was shorthand.
+
+Clarifications 2 and 3 are drafting placement, not rulings.
+
+Skeptic: SURVIVES-WITH-AMENDMENT - "ratify as is" beat the no-fork attack; folded in: `remote.elasticSlots.*` key everywhere (rename recorded in clarification 7, a ratification correction), amendment 3 layer claim corrected (shared-pool only, no env override), new amendment 6 (clause 1 heading) and 7 (a P0 waiter blocks multi-slot grants; no-preemption stated in the statute). Anchors at lines ~5998 and ~6127 only compose, no collision.
+Screen: flagged(prio, impl) -> fixed: sequencing demoted from ruling to a dependency note; ruling 3 key renamed; clarification 4 no longer enumerates code exceptions; 2, 3 and 7 relabelled as drafting. Remaining detail in "Idle-only growth" (who measures headroom) is left to 7615.
