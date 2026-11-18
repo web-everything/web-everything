@@ -21,7 +21,7 @@ export default {
   id: 'check-evidence-hold-excused-by-name-or-stale-run',
   title: 'a merge-gate hold or check was excused by name or by an unbound/stale run, letting a PR advance',
   card: 'check-evidence-contract stack #7084 (PR2c)',
-  fixedBy: { sha: '4738c850bf', where: 'lane/check-evidence-contract-pr2c', paths: [MODULE] },
+  fixedBy: { sha: 'e944247ee0', where: 'lane/check-evidence-contract-pr2c', paths: [MODULE] },
   // Decided by behaviour (a child process runs the capability probe against this tree), never by marker strings.
   // The probe only proves the bound-hold resolver exists and accepts a valid hold; every invariant under test is
   // judged in run(), so a regression of one stays a required failure instead of flipping this to expected-fail.
@@ -64,6 +64,7 @@ export default {
       check(!advances(result), `${name}: merge-gate still advances (state=${result.perName['merge-gate']?.state}, overall=${result.state})`);
       log?.(`${name}: merge-gate=${result.perName['merge-gate']?.state}, overall=${result.state}\n`);
     }
+    check(mod.boundMergeGateReviewHold(gateRow({ status: 'in_progress' }), { headSha: HEAD, labels: [] }) === false, 'in-progress run reporting a conclusion still carries a bound hold');
     check(mod.boundMergeGateReviewHold(gateRow(), { headSha: HEAD, labels: ['ready-to-merge'] }) === false, 'ready-to-merge label still excuses a hold');
     return { violations };
   },
