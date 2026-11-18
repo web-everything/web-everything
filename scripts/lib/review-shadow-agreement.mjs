@@ -191,7 +191,9 @@ export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
     if (typeof row?.servedModel !== 'string' || !row.servedModel.toLowerCase().includes('carbon') || row.status !== 'ok'
       || !row.overlap || Object.hasOwn(row, 'fellBackTo') || row.repo == null || row.pr == null) continue;
     const key = `${row.repo}#${row.pr}`;
-    const findingsAgree = row.overlap.matched > 0 || (row.overlap.claudeCount === 0 && row.overlap.agyCount === 0);
+    // Carbon must find every Claude finding (none Claude-only); extra Carbon-only findings do not disqualify it.
+    const findingsAgree = (row.overlap.claudeOnly ?? row.overlap.claudeCount) === 0
+      && (row.overlap.matched > 0 || (row.overlap.claudeCount === 0 && row.overlap.agyCount === 0));
     prs.set(key, (prs.get(key) ?? true) && row.verdictAgree === true && findingsAgree);
   }
   const agreeingPrs = [...prs.values()].filter(Boolean).length;

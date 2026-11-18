@@ -363,3 +363,9 @@ it('persists served-model evidence through the shadow runner for promotion count
   expect(legacy.rows[0].servedModel).toBeNull();
   expect(summarizeCarbonPromotion(legacy.rows).comparedPrs).toBe(0);
 });
+
+it('promotion evidence rejects a PR where Carbon misses a Claude finding', () => {
+  const row = (pr, overlap) => ({ repo: 'r', pr, status: 'ok', servedModel: 'gemini-4-carbon-high', verdictAgree: true, overlap });
+  const rows = [row(1, { matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 }), row(2, { matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 })];
+  expect(summarizeCarbonPromotion(rows, { threshold: 10 })).toMatchObject({ agreeingPrs: 1, comparedPrs: 2, reached: false });
+});
