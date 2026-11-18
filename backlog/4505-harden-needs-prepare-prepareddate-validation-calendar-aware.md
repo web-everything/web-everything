@@ -5,8 +5,8 @@ status: open
 scope: ["we:scripts/readiness/dispatch-plan.mjs", "we:scripts/backlog.mjs", "we:scripts/readiness/engine.mjs", "we:scripts/lib/prepared-date.mjs", "we:scripts/readiness/__tests__/dispatch-plan.test.mjs", "we:scripts/__tests__/backlog-prepare-stamp-status.test.mjs", "we:scripts/readiness/__tests__/engine.test.mjs", "we:scripts/lib/__tests__/prepared-date.test.mjs"]
 estimatedLoc: 240
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-16"
-preparedAgainstSha: "578083a15a2d401dab86a9a48f5c7fd3522e508c"
+preparedDate: "2026-11-17"
+preparedAgainstSha: "45534e48c50d6314690e581d285a284e62fd127f"
 tags: []
 ---
 
@@ -21,6 +21,8 @@ Make prepared-date validity consistent across dispatch admission, readiness sele
 - Corrected scope: retain those three sources; add a pure helper and four matching test files. Include the existing age consumer so a newly accepted Date cannot bypass maxAgeDays. Existing tests live at we:scripts/readiness/__tests__/dispatch-plan.test.mjs:790, we:scripts/readiness/__tests__/dispatch-plan.test.mjs:1403, we:scripts/__tests__/backlog-prepare-stamp-status.test.mjs:32, and we:scripts/readiness/__tests__/engine.test.mjs:16. The engine fixture builder currently drops preparedDate at we:scripts/readiness/__tests__/engine.test.mjs:41-53; carry it through explicitly.
 - The production shell loads we:src/_data/backlog.js at we:scripts/readiness/dispatch-plan.mjs:976 and forwards the date at we:scripts/readiness/dispatch-plan.mjs:857. The loader uses gray-matter at we:src/_data/backlog.js:26. A Date-valued loader result has not been probed here; do not claim an observed production incident. The writer's quoted output remains compatible.
 - Estimate was absent; set estimatedLoc to 240: helper 35 + dispatcher 25 + engine 10 + writer 5 + helper tests 55 + dispatch tests 50 + engine tests 35 + writer tests 25. These are estimated changed lines, grounded in the touch points above; no size or dependency change is needed.
+
+- Re-prepare 2026-11-17: scope drift since 578083a1 (a336d5eb36, PR #7002) re-checked. Premise unchanged: no `we:scripts/lib/prepared-date.mjs` exists; the shape-only gate is still at we:scripts/readiness/dispatch-plan.mjs:604, the age predicate at we:scripts/readiness/dispatch-plan.mjs:697-698, engine truthiness at we:scripts/readiness/engine.mjs:146 and we:scripts/readiness/engine.mjs:190, and the writer's unvalidated stamp at we:scripts/backlog.mjs:622. Design, MVP, Acceptance A1–A6 unchanged and still valid; only the stamp is refreshed.
 
 ## Design
 
