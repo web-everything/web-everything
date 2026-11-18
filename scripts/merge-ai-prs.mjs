@@ -186,6 +186,16 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { backfillOpenReviewRuns } from './lib/review-run-index.mjs';
+/** Optional discovery hints must never reject the drain's open-PR context. */
+export function backfillDrainReviewRuns(context, {
+  backfill = backfillOpenReviewRuns, resolveDir = resolveRunsDir, localSlug,
+} = {}) {
+  try { backfill(context, { runsDir: resolveDir(), localSlug }); }
+  catch { /* The unchanged bounded evidence scan remains authoritative. */ }
+  return context;
+}
+import { resolveRunsDir } from './operations/run-store.mjs';
 import { resolveCardNumbering } from './lib/policy-cascade.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
@@ -5353,7 +5363,7 @@ async function runCli() {
     },
     onListingFailed: (repo) => { process.stderr.write(`  ⚠️  FAILED open-PR listing for ${repoTag(repo) || 'cwd'}: gh pr list threw — the couple gate treats the open-PR context as INCOMPLETE this pass (fail closed; #xc7p3q9 B2).\n`); },
     onListingTruncated: (repo, n) => { if (!AS_JSON) process.stderr.write(`  ⚠️  DEGRADED open-PR listing for ${repoTag(repo) || 'cwd'}: ${n} PRs hit the --limit ${OPEN_PR_LIST_LIMIT} cap — the page MAY be truncated (oldest, longest-held blockers dropped first). The cross-item merge order derived from this listing is NOT trustworthy for the early-land decision this pass (#999/xq985wu F3).\n`); },
-  });
+  }).then(context => backfillDrainReviewRuns(context, { localSlug }));
 
   // #2421 — POST-CI TOTAL CI-LIFECYCLE LABEL RECONCILE, generalizing #2216's green-only `reconcileGreenLabels`
   // per the #2281 ruling. Every open, PRODUCER-OWNED (AI-generated) PR is brought to the state
