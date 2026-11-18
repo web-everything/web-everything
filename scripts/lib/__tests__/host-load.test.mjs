@@ -98,6 +98,17 @@ describe('parseDarwinMemoryPressureLevel', () => {
 });
 
 describe('readHostMemoryReading Darwin pressure probe', () => {
+  it('normal memory-pressure counts free plus inactive pages via parseDarwinReclaimableMemoryMb', () => {
+    const vm = [
+      'Mach Virtual Memory Statistics: (page size of 16384 bytes)',
+      'Pages free: 65536.', 'Pages inactive: 131072.',
+      'Pages speculative: 0.', 'Pages purgeable: 0.',
+    ].join('\n');
+    expect(hostLoad.parseDarwinReclaimableMemoryMb(vm, swapUsage)).toBe(3072);
+    expect(hostLoad.readHostMemoryReading(probes({ vm }))).toEqual({
+      mb: 3072, source: 'memory-pressure', level: 'normal',
+    });
+  });
   it.each([
     ['1\n', 'normal', reclaimableMb],
     ['2\n', 'warn', 0],
