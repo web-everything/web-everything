@@ -112,7 +112,8 @@ export function createLiveRedTeamReader({ provider, readComments, env = process.
     if (!Array.isArray(live.labels) || live.labels.some(label => ['red-team:pending', 'red-team:blocked']
       .includes(typeof label === 'string' ? label : label?.name))) return { clear: false };
     const result = redTeamForHead(readComments({ repo, pr }), pr, head);
-    if (result && !(result.findings?.length === 0 && isPublishableRedTeamResult(result))) return { clear: false };
+    // A recorded, publishable zero-finding result is required; a check alone never clears (a deleted result comment must not hide it).
+    if (!result || !(result.findings?.length === 0 && isPublishableRedTeamResult(result))) return { clear: false };
     const key = { repo, pr, headSha: head };
     // Comments and successful checks can still be covered by a newer run or publication hold.
     try {

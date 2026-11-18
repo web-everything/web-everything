@@ -413,8 +413,8 @@ describe('live red-team alert suppression', () => {
     vi.stubEnv('WE_PR_SNAPSHOT_STALE_OK_MS', env.WE_PR_SNAPSHOT_STALE_OK_MS);
     const gh = vi.fn(args => {
       if (args[0] === 'pr') return JSON.stringify({ headRefOid: head, labels: [] });
-      if (args.includes('--paginate')) return '';
-      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 0 } } } } });
+      if (args.includes('--paginate')) return `${clearResult(head).replaceAll('\n', '\\n')}\t2026-01-01T00:00:00Z\tweb-everything\tIC_clear\thttps://github.com/${repo}/pull/${pr}#issuecomment-1`;
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
       if (args[1].includes('/check-runs?')) return JSON.stringify({ total_count: 1, check_runs: [{
         id: 10, name: 'red-team', head_sha: head, external_id: `${repo}#${pr}`,
         app: { id: 123 }, status: 'completed', conclusion: 'success',
@@ -448,7 +448,8 @@ describe('live red-team alert suppression', () => {
         : { total_count: state === 'clear' ? 0 : 1, statuses: state === 'clear' ? [] : [status] });
     });
     const readLive = createLiveRedTeamReader({
-      provider: { readPrState: () => ({ headRefOid: head, labels: [] }) }, readComments: () => [],
+      provider: { readPrState: () => ({ headRefOid: head, labels: [] }) },
+      readComments: () => [{ body: clearResult(head), author: { login: 'web-everything' } }],
       readCheckFact: () => ({ ok: true }), gh,
     });
     expect(readLive({ repo, pr, head })).toEqual({ clear: state === 'clear' });
@@ -456,6 +457,16 @@ describe('live red-team alert suppression', () => {
     f.io.readLiveRedTeam = readLive;
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(state === 'clear' ? 0 : 1);
+  });
+
+  it('a success check without a result comment does not clear', () => {
+    const readLive = createLiveRedTeamReader({
+      provider: { readPrState: () => ({ headRefOid: head, labels: [] }) },
+      readComments: () => [],
+      readCheckFact: () => ({ ok: true }),
+      readPublicationHoldFact: () => ({ ok: true }),
+    });
+    expect(readLive({ repo, pr, head })).toEqual({ clear: false });
   });
 
   it.each([
@@ -509,7 +520,7 @@ describe('live red-team alert suppression', () => {
     const provider = { readPrState: vi.fn(() => ({ headRefOid: kind === 'stale head' ? 'b'.repeat(40) : head,
       labels: [] })) };
     f.io.readLiveRedTeam = createLiveRedTeamReader({ provider,
-      readComments: () => kind === 'completed result' ? [{ body: clearResult(head), author: { login: 'web-everything' } }] : [],
+      readComments: () => [{ body: clearResult(head), author: { login: 'web-everything' } }],
       readCheckFact: () => ({ ok: kind === 'check' || kind === 'completed result' }),
       readPublicationHoldFact: () => ({ ok: true }) });
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
