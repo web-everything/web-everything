@@ -78,7 +78,7 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null }) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
+  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
 }
 
 const ZERO = '0001-01-01T00:00:00Z';
@@ -221,13 +221,68 @@ export function resolveCheckAppsByCommit({ repo, rows, exec, execOpts = {}, env 
   return rows;
 }
 
-/** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
+/** Connection metadata is required; flattened gh rows cannot prove completeness. */
+export function rollupEvidence(commit) {
+  const c = commit?.statusCheckRollup?.contexts;
+  return { rowsHead: typeof commit?.oid === 'string' && SHA_RE.test(commit.oid) ? commit.oid : null,
+    rowsComplete: c?.pageInfo?.hasNextPage === false && Number.isInteger(c?.totalCount) && c.totalCount >= 0
+      && Array.isArray(c?.nodes) && c.nodes.length === c.totalCount
+      && c.nodes.every(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)) };
+}
+
+/** Legacy lists omit metadata. Bound reads to ten batches of twenty heads.
+ * Unknown evidence holds review until the next tick or an operator repairs the read.
+ */
+export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
+  for (const pr of rows) Object.assign(pr, { rowsComplete: false, rowsHead: null });
+  const heads = [...new Set(rows.map(pr => pr.headRefOid).filter(sha => typeof sha === 'string' && SHA_RE.test(sha)))].slice(0, 200);
+  for (let offset = 0; offset < heads.length; offset += 20) {
+    const batch = heads.slice(offset, offset + 20);
+    const objects = batch.map((sha, i) => `h${i}:object(oid:"${sha}"){...on Commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}`).join(' ');
+    try {
+      const out = JSON.parse(String(exec('gh', ['api', 'graphql', '-F', `owner=${repo?.split('/')[0] || '{owner}'}`,
+        '-F', `name=${repo?.split('/')[1] || '{repo}'}`, '-f',
+        `query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${objects}}}`], execOptions(execOpts))));
+      if (out?.errors?.length) continue;
+      batch.forEach((sha, i) => {
+        const commit = out?.data?.repository?.[`h${i}`];
+        if (commit?.oid !== sha) return;
+        for (const pr of rows.filter(pr => pr.headRefOid === sha)) {
+          Object.assign(pr, rollupEvidence(commit));
+          const nodes = commit?.statusCheckRollup?.contexts?.nodes;
+          if (pr.rowsComplete === true) pr.statusCheckRollup = nodes.map(mapCtx);
+          else if (Array.isArray(nodes)) {
+            // A partial read cannot retire old evidence, but must retain every
+            // newly observed blocker for consumers that do not read rowsComplete.
+            const blockers = nodes.map(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)
+              ? mapCtx(n) : { status: 'UNKNOWN' }).filter(row => {
+              const name = row.name ?? row.context;
+              const success = row.__typename === 'CheckRun'
+                ? String(row.status).toLowerCase() === 'completed' && String(row.conclusion).toLowerCase() === 'success'
+                : String(row.state).toLowerCase() === 'success';
+              return !(typeof name === 'string' && name.trim() && success);
+            });
+            if (blockers.length) {
+              pr.statusCheckRollup ??= [];
+              pr.statusCheckRollup.push(...blockers);
+            }
+          }
+        }
+      });
+    } catch { /* unknown: retain fail-closed evidence */ }
+  }
+  return rows;
+}
+
+/** PURE: gh-shaped labels and rollup rows. Malformed nodes become nameless unknown
+ * evidence: strict resolution stays unknown and legacy summaries reject the read.
+ */
 export function mapGraphqlPr(n) {
-  return { number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
+  return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
     headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
-    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(mapCtx) };
+    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename) ? mapCtx(n) : { status: 'UNKNOWN' }) };
 }
 
 /** PURE: reject GraphQL errors even when accompanied by partial data. */

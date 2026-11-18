@@ -9,7 +9,7 @@ import {
   fetchOpenPrsRest, restPullToBuildDispatchShape, BUILD_DISPATCH_PR_FIELDS,
 } from '../open-pr-fetch.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
-import { resolveCheckAppsByCommit } from '../../lib/pr-list-paged.mjs';
+import { resolveCheckAppsByCommit, mapGraphqlPr } from '../../lib/pr-list-paged.mjs';
 import { normalizeOpenPrs } from '../build-dispatch-policy.mjs';
 import { defaultListOpenPrs } from '../duplicate-pr-watch.mjs';
 import { defaultListParkedPrs as listConflicts } from '../parked-pr-conflict-watch.mjs';
@@ -58,7 +58,7 @@ describe('shared open-PR discovery', () => {
   it.each([null, 'owner/repo'])('uses runGhSync by default with the full query (repo %s)', (repo) => {
     const prs = [{ number: 123, comments: [{ body: 'retained' }], files: [{ path: 'a.mjs' }] }];
     runGhSync.mockReset().mockReturnValue(JSON.stringify(prs));
-    expect(defaultFetchOpenPrs({ repo })).toEqual(prs);
+    expect(defaultFetchOpenPrs({ repo })).toEqual(prs.map(pr => ({ ...pr, rowsComplete: false, rowsHead: null })));
     expect(runGhSync).toHaveBeenCalledTimes(1);
     expect(runGhSync).toHaveBeenCalledWith(
       ['pr', 'list', '--state', 'open', '--limit', '200', '--json', OPEN_PR_LIST_FIELDS, ...(repo ? ['--repo', repo] : [])],
@@ -76,6 +76,7 @@ describe('shared open-PR discovery', () => {
     const row = (rollup, sha = SHA, number = 1) => ({ number, headRefOid: sha, statusCheckRollup: rollup.map((c) => ({ ...c })) });
     const mkExec = (rows, apiRuns, calls, total) => (args) => {
       if (args[0] !== 'api') return JSON.stringify(rows);
+      if (args[1] === 'graphql') return '{}';
       calls.push(args[1]);
       if (apiRuns instanceof Error) throw apiRuns;
       const runs = apiRuns.map((r) => ({ status: 'in_progress', ...r }));
@@ -149,6 +150,7 @@ describe('shared open-PR discovery', () => {
             const out = defaultFetchOpenPrs({ repo: 'progress/runner', readComments: () => [],
               exec: args => {
                 if (args[0] !== 'api') return JSON.stringify(rows);
+                if (args[1] === 'graphql') return '{}';
                 calls++;
                 return JSON.stringify({ total_count: 1, check_runs: [{ name: 'red-team',
                   status: 'in_progress', app: { id: 5037855, slug: 'web-everything' } }] });
@@ -276,4 +278,70 @@ describe('snapshot reader', () => {
   it('returns an empty list for unreadable files', () => {
     expect(readPrsFromFile('unused', { readFile: () => { throw new Error('ENOENT'); } })).toEqual([]);
   });
+});
+
+
+describe('rollup connection completeness at the fetch boundary', () => {
+  const head = 'a'.repeat(40);
+  const nodes = [{ __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+  it.each([
+    ['complete', { pageInfo: { hasNextPage: false }, totalCount: 1, nodes }, true],
+    ['paged', { pageInfo: { hasNextPage: true }, totalCount: 1, nodes }, false],
+    ['count mismatch', { pageInfo: { hasNextPage: false }, totalCount: 2, nodes }, false],
+    ['missing pageInfo', { totalCount: 1, nodes }, false],
+    ['invalid count', { pageInfo: { hasNextPage: false }, totalCount: '1', nodes }, false],
+    ['missing nodes', { pageInfo: { hasNextPage: false }, totalCount: 0 }, false],
+    ['malformed row', { pageInfo: { hasNextPage: false }, totalCount: 1, nodes: [null] }, false],
+    ['empty complete', { pageInfo: { hasNextPage: false }, totalCount: 0, nodes: [] }, true],
+  ])('%s metadata is proved strictly on both read paths', (_name, contexts, complete) => {
+    const commit = { oid: head, statusCheckRollup: { contexts } };
+    expect(mapGraphqlPr({ headRefOid: head, commits: { nodes: [{ commit }] } }))
+      .toMatchObject({ rowsHead: head, rowsComplete: complete });
+    const exec = vi.fn(args => args[0] === 'pr'
+      ? JSON.stringify([{ number: 1, headRefOid: head, statusCheckRollup: [] }])
+      : JSON.stringify({ data: { repository: { h0: commit } } }));
+    expect(defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] })[0])
+      .toMatchObject({ rowsHead: head, rowsComplete: complete });
+    expect(exec.mock.calls[1][0].join(' ')).toContain('contexts(first:100){pageInfo{hasNextPage} totalCount nodes{');
+    expect(exec.mock.calls[1][0].join(' ')).toContain('Commit{oid statusCheckRollup');
+  });
+});
+
+
+it('caps legacy rollup hydration at 200 heads and leaves overflow unknown for a later tick/operator', () => {
+  const rows = Array.from({ length: 201 }, (_, i) => ({ number: i + 1,
+    headRefOid: (i + 1).toString(16).padStart(40, '0'), statusCheckRollup: [] }));
+  const exec = vi.fn(args => args[0] === 'pr' ? JSON.stringify(rows) : '{}');
+  const out = defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] });
+  expect(exec.mock.calls.filter(([args]) => args[1] === 'graphql')).toHaveLength(10);
+  expect(out[200]).toMatchObject({ rowsComplete: false, rowsHead: null });
+});
+
+it.each([null, 'wrong-head', 'read-error', 'graphql-error'])('legacy rollup read fails closed for %s', failure => {
+  const head = 'a'.repeat(40);
+  const exec = args => {
+    if (args[0] === 'pr') return JSON.stringify([{ number: 1, headRefOid: head, statusCheckRollup: [] }]);
+    if (failure === 'read-error') throw new Error('unreadable');
+    return JSON.stringify(failure === 'graphql-error' ? { errors: [{ message: 'partial' }] }
+      : { data: { repository: { h0: failure === null ? null : { oid: 'b'.repeat(40),
+        statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 0, nodes: [] } } } } } });
+  };
+  expect(defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] })[0])
+    .toMatchObject({ rowsComplete: false, rowsHead: null });
+});
+
+
+it('malformed refresh beside success preserves an existing legacy failure at the fetch boundary', () => {
+  const head = 'a'.repeat(40);
+  const oldRows = [{ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' }];
+  const commit = { oid: head, statusCheckRollup: { contexts: { totalCount: 2,
+    pageInfo: { hasNextPage: false }, nodes: [
+      { __typename: 'CheckRun', name: 'merge-gate', status: 'COMPLETED', conclusion: 'SUCCESS' }, null,
+    ] } } };
+  const exec = vi.fn(args => args[0] === 'pr'
+    ? JSON.stringify([{ number: 1, headRefOid: head, statusCheckRollup: oldRows }])
+    : JSON.stringify({ data: { repository: { h0: commit } } }));
+  expect(defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] })[0])
+    .toMatchObject({ rowsHead: head, rowsComplete: false,
+      statusCheckRollup: [...oldRows, { status: 'UNKNOWN' }] });
 });
