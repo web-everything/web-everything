@@ -6,17 +6,10 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { readSettingsChecked } from '../lib/settings-files.mjs';
 
-/** Strict read: unreadable, malformed or duplicated settings fail the reader instead of silently using defaults. */
-export const readCheckedAgyUsage = (check = readSettingsChecked) => {
-  const result = check({ namespace: 'agyUsage' });
-  // Taint from unrelated settings files must not block this reader; its own file and any duplicate of its leaves must.
-  const taint = result.taint.filter(t => /agy-usage|agyUsage/.test(`${t.source} ${t.reason}`));
-  const { value } = result;
-  if (taint.length) throw new Error(`agyUsage settings unreadable or duplicated: ${taint.map(t => `${t.source} ${t.reason}`).join('; ').slice(0, 300)}`);
-  return { agyUsage: value };
-};
+// Deliberately no settings file: the shared settings reader is lenient about unreadable files, so the two
+// tunables (interval, timeout) come from environment overrides over the standard defaults only.
+const noSettingsFile = () => ({});
 
 /** Exact PIDs of every descendant of `root` (script moves agy into its own session, so the group kill misses it). */
 export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8', timeout: 3000 })) {
@@ -30,7 +23,7 @@ export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'p
   return out.reverse();
 }
 
-export function readAgyUsageSettings({ env = process.env, read = readCheckedAgyUsage, platform, log = console.error } = {}) {
+export function readAgyUsageSettings({ env = process.env, read = noSettingsFile, platform, log = console.error } = {}) {
   const number = key => env[key] === undefined ? undefined : Number(env[key]);
   return cascadePolicy('agyUsage', read()?.agyUsage, {
     standard: { minIntervalMinutes: 15, timeoutMs: 45000 }, platform, env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log,
@@ -47,7 +40,10 @@ const FRAME_BREAK = /\x1b\[[0-3]?J|\x1bc|\x1b\[\?1049[hl]/;
 export function parseAgyUsage(screen, now = Date.now()) {
   let failure = new Error('Incomplete Gemini usage screen');
   for (const frame of String(screen).split(new RegExp(FRAME_BREAK, 'g')).reverse()) {
-    try { return parseAgyFrame(frame, now); } catch (error) { failure = error; }
+    try { return parseAgyFrame(frame, now); } catch (error) {
+      if (error.invalid) throw error; // a newer complete-but-invalid frame must never fall back to older evidence
+      failure = error;
+    }
   }
   throw failure;
 }
@@ -62,7 +58,7 @@ function parseAgyFrame(screen, now) {
     if (!match || (!match[2] && !match[3])) throw new Error(`Missing ${label} usage or refresh time`);
     const remaining = Number(match[1]);
     const seconds = Number(match[2] || 0) * 3600 + Number(match[3] || 0) * 60;
-    if (remaining > 100 || !Number.isSafeInteger(seconds)) throw new Error('Invalid usage bounds');
+    if (remaining > 100 || !Number.isSafeInteger(seconds)) throw Object.assign(new Error('Invalid usage bounds'), { invalid: true });
     return { used_percentage: Number((100 - remaining).toFixed(6)), resets_at: Math.floor(now / 1000) + seconds };
   };
   return { at: new Date(now).toISOString(), session: null, five_hour: window('Five Hour'),

@@ -1,4 +1,0 @@
-{
-  "$comment": "agyUsage resolves standard → platform → tool → environment, logging sources. WE_AGY_USAGE_MIN_INTERVAL_MINUTES and WE_AGY_USAGE_TIMEOUT_MS override these defaults. Failed collection preserves the last snapshot; retry manually after checking agy startup or increasing timeoutMs.",
-  "agyUsage": { "minIntervalMinutes": 15, "timeoutMs": 45000 }
-}
