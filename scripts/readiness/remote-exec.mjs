@@ -1395,7 +1395,10 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     const noTierLines = /^Diff branch coverage \(base ([^\s()]+)\): no changed tier lines; nothing to attribute\.$/.exec(plain);
     if (noTierLines) {
       try {
-        benign = scanDiffBranchCoverage(cwd, {base:noTierLines[1]}).status === 'no-scope';
+        // The reported base must be the requested one (default HEAD), never trusted from output.
+        const requestedBase = env.DIFF_COVERAGE_BASE ?? 'HEAD';
+        const sameBase = noTierLines[1] === requestedBase || noTierLines[1] === executionEnv.DIFF_COVERAGE_BASE;
+        benign = sameBase && scanDiffBranchCoverage(cwd, {base:requestedBase}).status === 'no-scope';
       } catch { /* incomplete local evidence requires fallback */ }
     }
     if (plain.startsWith(prefix) && argv.includes('--local') && standardsFiles.length) {
