@@ -361,7 +361,7 @@ it.each([38, 5, 'throws'])('CLI queue uses the shared CPU sample (%s) and preser
   const budget = capacity.budget;
   try {
     cliReviewTickOpts({ log: { error: vi.fn() } }).redTeamOnSkip({
-      repo: 'fixture/cpu-floor', plan: { refusals: [] }, rawPrs: [], capacity,
+      repo: 'web-everything/web-everything', plan: { refusals: [] }, rawPrs: [], capacity,
     });
     expect(hostSample.sampleHost).toHaveBeenCalledOnce();
     expect(recovery.mock.calls[0][0].capacity).toBe(capacity);

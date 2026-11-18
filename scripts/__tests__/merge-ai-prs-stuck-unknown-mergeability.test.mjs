@@ -415,9 +415,9 @@ describe('persistent UNKNOWN real drain wiring', () => {
   }), 180_000);
 
   it.each([false, true])('prunes departed marks and alerts on a complete fetch (still open=%s)', unready => withCli(({ run, seed, marks, repo }) => {
-    seed([{ repo, num: 42, since: Date.now() - 80 * MINUTE }, { repo: 'fixture/other', num: 42, since: Date.now() }]);
+    seed([{ repo, num: 42, since: Date.now() - 80 * MINUTE }, { repo: 'frontier-ui/frontierui', num: 42, since: Date.now() }]);
     const out = run({ numbers: unready ? [42] : [], unready });
-    expect(marks()).toEqual([{ repo: 'fixture/other', num: 42, since: expect.any(Number) }]);
+    expect(marks()).toEqual([{ repo: 'frontier-ui/frontierui', num: 42, since: expect.any(Number) }]);
     expect(out.result.alerts ?? []).not.toContainEqual(expect.objectContaining({ repo, num: 42 }));
     expect(out.stderr).not.toContain('"kind":"stuck-unknown-mergeability"');
   }), 90_000);

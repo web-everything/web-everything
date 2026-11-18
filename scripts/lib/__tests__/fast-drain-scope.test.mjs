@@ -230,7 +230,7 @@ describe('mergeLiveTargetIntoRows', () => {
 });
 
 describe('snapshot fast drain CLI dependency context', () => {
-  const repo = 'fixture/repo';
+  const repo = 'web-everything/web-everything';
   const pr = (number, item, blockedBy = []) => ({
     number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: `sha${number}`,
     updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', isDraft: false,
@@ -251,15 +251,15 @@ describe('snapshot fast drain CLI dependency context', () => {
       mkdirSync(bin);
       mkdirSync(snapshots);
       mkdirSync(join(dir, 'backlog'));
-      writeFileSync(join(snapshots, 'fixture__repo.json'), JSON.stringify({ v: 1, repo,
+      writeFileSync(join(snapshots, 'web-everything__web-everything.json'), JSON.stringify({ v: 1, repo,
         fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: snapshot.length, prs: snapshot }));
-      for (const name of ['frontierui', 'plateau-app']) {
-        writeFileSync(join(snapshots, `fixture__${name}.json`), JSON.stringify({ v: 1, repo: `fixture/${name}`,
+      for (const sibling of ['frontier-ui/frontierui', 'plateauapp/plateau-app']) {
+        writeFileSync(join(snapshots, `${sibling.replace('/', '__')}.json`), JSON.stringify({ v: 1, repo: sibling,
           fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: 0, prs: [] }));
       }
       writeFileSync(join(dir, 'fixture.json'), JSON.stringify({ live, target, failPage, extraLive }));
       writeFileSync(join(dir, 'calls.jsonl'), '');
-      writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/repo.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/web-everything/web-everything.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
       writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
@@ -269,7 +269,7 @@ const output = value => { fs.writeSync(1, JSON.stringify(value)); process.exit(0
 if (a[0] === 'repo' && a[1] === 'view') { fs.writeSync(1, 'main'); process.exit(0); }
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   if (f.failPage === true || f.failPage === process.env.GH_REPO) { fs.writeSync(2, 'fixture listing unreadable'); process.exit(1); }
-  const rows = process.env.GH_REPO === 'fixture/repo' ? f.live : (f.extraLive[process.env.GH_REPO] || []);
+  const rows = process.env.GH_REPO === 'web-everything/web-everything' ? f.live : (f.extraLive[process.env.GH_REPO] || []);
   output({data:{repository:{pullRequests:{totalCount:rows.length,
     pageInfo:{hasNextPage:false,endCursor:null},nodes:rows.map(p => ({...p, labels:{nodes:p.labels},
       commits:{nodes:[{commit:{statusCheckRollup:{contexts:{nodes:p.statusCheckRollup.map(c => ({...c,__typename:'CheckRun'}))}}}}]}}))}}}});
@@ -280,7 +280,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
   if (fields.includes('state')) output(f.target);
   if (fields.includes('commits')) output({commits:[]});
   const repoIdx = a.indexOf('--repo');
-  const rows = repoIdx < 0 || a[repoIdx + 1] === 'fixture/repo' ? f.live : (f.extraLive[a[repoIdx + 1]] || []);
+  const rows = repoIdx < 0 || a[repoIdx + 1] === 'web-everything/web-everything' ? f.live : (f.extraLive[a[repoIdx + 1]] || []);
   output(rows.find(p => p.number === Number(a[2])) || {});
 }
 output({});
@@ -357,7 +357,7 @@ output({});
   it('also discovers a new blocker in a context-only repository', () => {
     const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
     const a = { ...pr(8, 'xaaaaaa'), labels: [] };
-    const r = run({ snapshot: [b], live: [b], extraLive: { 'fixture/frontierui': [a] } });
+    const r = run({ snapshot: [b], live: [b], extraLive: { 'frontier-ui/frontierui': [a] } });
     expect(r.status, r.stderr).toBe(0);
     expect(r.payload.deferred).toEqual(expect.arrayContaining([
       expect.objectContaining({ num: 7, waitOn: expect.arrayContaining(['xaaaaaa']) }),
@@ -366,8 +366,8 @@ output({});
 
   it('defers B when a context-only repository is unreadable', () => {
     const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
-    const r = run({ snapshot: [b], live: [b], failPage: 'fixture/frontierui',
-      extraLive: { 'fixture/frontierui': [pr(8, 'xaaaaaa')] } });
+    const r = run({ snapshot: [b], live: [b], failPage: 'frontier-ui/frontierui',
+      extraLive: { 'frontier-ui/frontierui': [pr(8, 'xaaaaaa')] } });
     expect(r.status, r.stderr).toBe(0);
     expect(r.payload.deferred).toEqual(expect.arrayContaining([
       expect.objectContaining({ num: 7, waitOn: expect.arrayContaining(['xaaaaaa']) }),
