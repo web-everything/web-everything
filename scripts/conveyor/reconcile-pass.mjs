@@ -86,7 +86,7 @@ import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
-import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
+import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, enrichPrRollupEvidence, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { isGhThrottled } from '../lib/gh-deferred.mjs';
 import { withListRetry } from '../lib/gh-list-retry.mjs';
@@ -473,6 +473,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const parsed = parseListOutput(out, { repo });
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
     if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
+    enrichPrRollupEvidence({ repo, rows: parsed, exec });
     // `gh pr list` rollups carry no posting app; the planner's external-check exemption needs it (#6926). An unreadable
     // `gh api` answer leaves the app empty (fail closed).
     return resolveCheckAppsByCommit({ repo, rows: parsed, exec });

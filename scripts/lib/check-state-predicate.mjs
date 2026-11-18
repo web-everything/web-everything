@@ -152,6 +152,9 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
   const classified = [...rows].map(row => {
     const name = evidenceName(row), why = [];
     let status = normalize(row?.status), conclusion = normalize(row?.conclusion), legacyError = false;
+    // Compatibility excusal rewrites conclusions for legacy consumers. Strict
+    // admission rechecks the original failure and binds any hold to this row.
+    if (name === 'merge-gate' && row?.mergeGateHoldExcused) conclusion = 'failure';
     if (row?.status === undefined && row?.__typename !== 'CheckRun' && typeof row?.state === 'string') {
       const legacy = normalize(row.state); legacyError = legacy === 'error';
       if (['success', 'failure', 'error'].includes(legacy)) { status = 'completed'; conclusion = legacy; }
@@ -171,7 +174,7 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
     }
     if (state === 'fail' && name === 'review-gate') state = 'held';
     if (state === 'fail' && name === 'merge-gate') {
-      const candidates = [row.mergeGateReviewHold, ...(Array.isArray(holds) ? holds : [])];
+      const candidates = [row.mergeGateReviewHold, row.mergeGateHoldExcused, ...(Array.isArray(holds) ? holds : [])];
       if (candidates.some(hold => evidenceJob(row) && evidenceInteger(hold?.jobId) === evidenceInteger(evidenceJob(row))
         && sha(hold?.headSha) === sha(head) && Array.isArray(hold?.holdIds) && hold.holdIds.length
         && [...hold.holdIds].every(id => HUMAN_REVIEW_HOLD_GATES.includes(id)))) state = 'held';

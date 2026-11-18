@@ -382,8 +382,11 @@ describe('requiredCheckStates shared predicate regressions', () => {
         const evidence = { ...input, requiredChecks: ['test'], rollup: [
           ...pair, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
         ] };
-        expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
-        expect(contradictingChecks(evidence)).toEqual(['test']);
+        const unknown = kind === 'StatusContext' && conclusion === 'STARTUP_FAILURE';
+        expect(requiredCheckStates(evidence)).toEqual(unknown
+          ? { red: [], pending: [], missing: ['test', 'check-evidence'], green: [] }
+          : { red: ['test'], pending: [], missing: [], green: [] });
+        expect(contradictingChecks(evidence)).toEqual(unknown ? [] : ['test']);
         expect(ciGreenForEscalation(evidence)).toBe(false);
         expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
         const pr = { headRefOid: input.headSha, statusCheckRollup: evidence.rollup };
@@ -392,7 +395,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
           readPr: async () => pr, readRequired: async () => ({ checks: ['test'] }) };
         expect(await checkNeedsHumanEscalable({ ...options, outcome: 'needs-human' })).toEqual({ refusal: null });
         expect(await checkNotCiBreakRecordable({ ...options, outcome: 'not-a-ci-break' }))
-          .toEqual({ refusal: expect.stringContaining('red: test') });
+          .toEqual({ refusal: expect.stringContaining(unknown ? 'test' : 'red: test') });
       }
     }
   });
@@ -425,8 +428,12 @@ describe('requiredCheckStates shared predicate regressions', () => {
             ...pair, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
           ] };
           const expected = { red: [], pending: [], missing: [], green: [] };
-          const expectedBucket = kind === 'StatusContext' && bucket === 'pending' ? 'red' : bucket;
+          const unknown = kind === 'StatusContext'
+            ? !['SUCCESS', 'FAILURE', 'ERROR'].includes(dated) || !['SUCCESS', 'FAILURE', 'ERROR'].includes(undated)
+            : !['SUCCESS', 'FAILURE', 'NEUTRAL', 'SKIPPED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'CANCELLED', 'STALE'].includes(undated);
+          const expectedBucket = unknown ? 'missing' : bucket;
           expected[expectedBucket] = ['test'];
+          if (expectedBucket === 'missing') expected.missing.push('check-evidence');
           expect(requiredCheckStates(evidence), `${kind} ${dated}/${undated} ${JSON.stringify(timestamps)}`)
             .toEqual(expected);
           expect(contradictingChecks(evidence)).toEqual(expected.red);
@@ -544,10 +551,10 @@ describe('requiredCheckStates shared predicate regressions', () => {
     },
   );
 
-  it('an unknown completed conclusion fails closed red with its original-case name', () => {
+  it('an unknown completed conclusion remains unproven with its original-case name', () => {
     expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
       { name: 'Test', status: 'COMPLETED', conclusion: 'FUTURE_UNKNOWN_CONCLUSION' },
-    ] })).toEqual({ red: ['Test'], pending: [], missing: [], green: [] });
+    ] })).toEqual({ red: [], pending: [], missing: ['Test', 'check-evidence'], green: [] });
   });
 
   it.each([
@@ -629,7 +636,10 @@ describe('required check verdict recheck', () => {
     expect([...result.pending, ...result.missing]).toEqual(expect.arrayContaining(['test', 'daemon-soak']));
     expect(result.red).toEqual([]);
   });
-  it('unknown required set fails closed for escalation', () => expect(contradictingChecks({ ...input, requiredChecks: [] })).toEqual(['check-evidence']));
+  it('unknown required set blocks admission without contradicting a verdict', () => {
+    expect(contradictingChecks({ ...input, requiredChecks: [] })).toEqual([]);
+    expect(ciGreenForEscalation({ ...input, requiredChecks: [] })).toBe(false);
+  });
   it('legacy StatusContext failures count', () => {
     expect(contradictingChecks({ ...input, rollup: [{ __typename: 'StatusContext', context: 'test', state: 'FAILURE' }] })).toEqual(['test']);
   });
@@ -730,7 +740,7 @@ describe('R272 fail-closed evidence across every row', () => {
     ['in-progress alongside success', { status: 'IN_PROGRESS' }, 'pending'],
     ['queued alongside success', { status: 'QUEUED' }, 'pending'],
     ['cancelled alongside success', { status: 'COMPLETED', conclusion: 'CANCELLED' }, 'pending'],
-    ['undated unknown alongside success', {}, 'red'],
+    ['undated unknown alongside success', {}, 'missing'],
   ])('%s respects every source type and input order', (_label, evidence, bucket) => {
     for (const kind of ['CheckRun', 'untagged', 'StatusContext']) {
       const blocker = kind === 'StatusContext'
@@ -740,10 +750,11 @@ describe('R272 fail-closed evidence across every row', () => {
         run_id: 999, run_attempt: 999, id: 999, completedAt: '2099-01-01T00:00:00Z' };
       for (const rollup of [[success, blocker], [blocker, success]]) {
         const expected = { red: [], pending: [], missing: [], green: [] };
-        // Legacy contexts have no IN_PROGRESS/QUEUED/CANCELLED state: unknown values stay red.
+        // Legacy contexts have no IN_PROGRESS/QUEUED/CANCELLED state: those values remain unproven.
         const expectedBucket = kind === 'StatusContext' && (['IN_PROGRESS', 'QUEUED'].includes(evidence.status) || evidence.conclusion === 'CANCELLED')
-          ? 'red' : bucket;
+          ? 'missing' : bucket;
         expected[expectedBucket] = ['test'];
+        if (expectedBucket === 'missing') expected.missing.push('check-evidence');
         expect(requiredCheckStates({ rowsComplete: true, headSha: fixture.headRefOid, rollup, requiredChecks: ['test'] })).toEqual(expected);
         expect(ciGreenForEscalation({ rowsComplete: true, headSha: fixture.headRefOid, rollup, requiredChecks: ['test'] })).toBe(bucket === 'green');
       }
@@ -825,11 +836,20 @@ describe('CI-heal completeness evidence', () => {
       escalation: input.escalation, rollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     for (const extra of [{}, { rowsComplete: false }]) {
       expect(ciGreenForEscalation({ ...evidence, ...extra })).toBe(false);
-      expect(requiredCheckStates({ ...evidence, ...extra }).red).toEqual(['check-evidence']);
-      expect(contradictingChecks({ ...evidence, ...extra })).toEqual(['check-evidence']);
+      expect(requiredCheckStates({ ...evidence, ...extra }).red).toEqual([]);
+      expect(requiredCheckStates({ ...evidence, ...extra }).missing).toContain('check-evidence');
+      expect(contradictingChecks({ ...evidence, ...extra })).toEqual([]);
       expect(verdictRecheck.gateOnlyRedStates({ ...evidence, ...extra }).gateOnlyRed).toBe(false);
     }
     expect(ciGreenForEscalation({ ...evidence, rowsComplete: true })).toBe(true);
     expect(contradictingChecks({ ...evidence, rowsComplete: true })).toEqual([]);
   });
+});
+
+it('incomplete evidence alone never contradicts a recorded verdict or reports observed red', () => {
+  const evidence = { ...input, rowsComplete: false, rollup: green };
+  expect(contradictingChecks(evidence)).toEqual([]);
+  expect(requiredCheckStates(evidence).red).toEqual([]);
+  expect(ciGreenForEscalation(evidence)).toBe(false);
+  expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
 });

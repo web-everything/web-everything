@@ -186,8 +186,8 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       return unchanged;
     }
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
-      mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
-    return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
+      mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, holdIds: classification.holds.map(r => r.id), headSha, jobId } };
+    return { rows: rows.map(r => r === row ? replacement : r), excused: true };
   } catch { return unchanged; }
 }
 

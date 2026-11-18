@@ -176,6 +176,7 @@ function registeredStartGate({ headSha, checks, requiredChecks, rowsComplete }) 
 /** Start permission only. Merge/ready decisions must continue using their strict CI gates. */
 export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete = false, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   const strict = () => reviewCiGate({ headSha, checks, requiredChecks, rowsComplete });
+  if (rowsComplete !== true) return strict();
   // Rollback preserves the original strict CI-green result, including its reason and affected rows.
   if (policy.startEarly === 'off' && !policy.startBeforeCi && policy.startAfter === 'ci-green') return strict();
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;

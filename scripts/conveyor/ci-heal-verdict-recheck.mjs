@@ -74,8 +74,7 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 export function ciGreenForEscalation(options) {
   const { requiredChecks } = options;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
-  const { red, pending, missing } = requiredCheckStates(options);
-  return !red.length && !pending.length && !missing.length;
+  return ['pass', 'held'].includes(checkEvidence(options).state);
 }
 
 export const sameSha = (a, b) => {
@@ -112,18 +111,18 @@ export function requiredCheckStates(options) {
     if (r.state === 'held') continue;
     // Gates outside the roster contribute failures, but their pending state is review work.
     if (gateNames.includes(name) && !options.requiredChecks?.includes(name) && r.state === 'pending') continue;
-    out[r.state === 'pass' ? 'green' : r.reasons.includes('missing') ? 'missing'
+    out[r.state === 'pass' ? 'green' : r.state === 'unknown' || r.reasons.includes('missing') ? 'missing'
       : r.state === 'pending' ? 'pending' : 'red'].push(name);
   }
-  if (result.state === 'unknown' && !Object.keys(result.perName).length) out.red.push(...(options.requiredChecks?.length ? options.requiredChecks : ['check-evidence']));
-  if (result.state === 'unknown' && !out.red.length) out.red.push('check-evidence');
+  // Unknown evidence blocks admission without inventing a failed check.
+  if (result.state === 'unknown') out.missing.push('check-evidence');
   return out;
 }
 
 /** Only a fully resolved review hold prevents CI-heal escalation. */
 export function gateOnlyRedStates(options) {
   const result = checkEvidence(options);
-  const red = Object.entries(result.perName).filter(([, r]) => ['held', 'fail', 'unknown'].includes(r.state)).map(([name]) => name);
+  const red = Object.entries(result.perName).filter(([, r]) => ['held', 'fail'].includes(r.state)).map(([name]) => name);
   return { gateOnlyRed: result.state === 'held', red, waitingOnReview: result.state === 'held' };
 }
 
@@ -134,7 +133,10 @@ export function gateOnlyRedStates(options) {
  */
 export function contradictingChecks({ escalation, headSha, rollup, requiredChecks, rowsComplete = false }) {
   if (escalation?.outcome !== 'not-a-ci-break' || !sameSha(escalation.headSha, headSha)) return [];
-  return requiredCheckStates({ rollup, requiredChecks, headSha, rowsComplete }).red;
+  const result = checkEvidence({ rollup, requiredChecks, headSha, rowsComplete });
+  // An incomplete snapshot can still contain an observed failure, but absence
+  // of proof (including malformed or foreign-head rows) never voids a verdict.
+  return Object.entries(result.perName).filter(([, r]) => r.state === 'fail').map(([name]) => name);
 }
 
 /** {@link contradictingChecks} as a yes/no. PURE. */

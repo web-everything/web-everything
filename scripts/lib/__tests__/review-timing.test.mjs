@@ -381,7 +381,7 @@ it('logs each timing setting with its effective source, including enabled defaul
 
 describe('verified early review', () => {
   it.each(['fast-checks', 'ci-green'])('starts with an exact-head verification under %s', startAfter => {
-    const args = { headSha: head, checks: [], requiredChecks: ['test'], verifyGreen: true,
+    const args = { rowsComplete: true, headSha: head, checks: [], requiredChecks: ['test'], verifyGreen: true,
       policy: { ...review, startAfter, startBeforeCi: true } };
     expect(reviewStartGate(args)).toMatchObject({ allowed: true, reason: 'verify-marker' });
     for (const verifyGreen of [false, undefined, 'true'])
@@ -546,4 +546,12 @@ describe('strict review timing completeness', () => {
     expect(reviewStartGate({ ...evidence, rowsComplete: false })).toMatchObject({ allowed: false, reason: 'rows-incomplete' });
     expect(reviewStartGate({ ...evidence, rowsComplete: true }).allowed).toBe(true);
   });
+});
+
+it('verification-marker admission refuses incomplete rows', () => {
+  for (const completeness of [{}, { rowsComplete: false }]) {
+    expect(reviewStartGate({ headSha: head, checks: [check('test')], requiredChecks: ['test'],
+      verifyGreen: true, policy: { ...review, startBeforeCi: true }, ...completeness }))
+      .toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
+  }
 });
