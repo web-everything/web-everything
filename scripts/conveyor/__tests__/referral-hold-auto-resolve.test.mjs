@@ -213,6 +213,55 @@ describe('send-back: a block ruling on the live head owes a fix, never a ruling'
   });
 });
 
+describe('complete long threads with ruled referral-kind holds', () => {
+  const fx = FX[5775];
+  const record = liveRecord(fx);
+  const hold = { kind: 'referral', head: fx.headRefOid };
+  const thread = result => [...fx.comments,
+    operatorRuling(fx, { key: record.referrals[0].key, runId: record.runId, result, at: '2026-10-21T17:20:00.000Z' }),
+    ...Array.from({ length: GH_LIST_COMMENT_CAP }, () => ({ body: 'Thread padding.', author: { login: 'untrusted-contributor' } }))];
+
+  it.each([
+    ['not-real', true, 'resume'],
+    ['block', true, 'send-back'],
+    ['not-real', undefined, 'stay'],
+    ['not-real', false, 'stay'],
+    ['not-real', 'true', 'stay'],
+  ])('%s ruling with commentsComplete=%s yields %s', (result, commentsComplete, outcome) => {
+    const comments = thread(result);
+    expect(comments.length).toBeGreaterThanOrEqual(GH_LIST_COMMENT_CAP);
+    const out = decide({ ...asPr(fx, comments), commentsComplete }, hold);
+    expect(out).toMatchObject({ outcome });
+    if (outcome === 'stay') expect(out.why).toMatch(/may be truncated; read the full thread/);
+    else expect(out.counts).toEqual({ [result]: 1 });
+  });
+
+  it.each([
+    ['full array', () => thread('not-real'), true],
+    ['non-array read', () => null, false],
+    ['failed read', () => { throw new Error('unreadable thread'); }, false],
+  ])('enrichment of a capped snapshot marks completeness only for a %s', (_name, read, complete) => {
+    const full = complete ? read() : null;
+    const snapshot = thread('not-real').slice(0, GH_LIST_COMMENT_CAP);
+    const readComments = vi.fn(complete ? () => full : read);
+    const [pr] = enrichPrsWithReferralHolds([asPr(fx, snapshot)], {
+      repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {}, readComments,
+    });
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledWith({ repo, number: fx.number });
+    if (complete) {
+      expect(pr.comments).toBe(full);
+      expect(pr.comments.length).toBeGreaterThanOrEqual(GH_LIST_COMMENT_CAP);
+      expect(pr.commentsComplete).toBe(true);
+      expect(decide(pr, hold)).toMatchObject({ outcome: 'resume', counts: { 'not-real': 1 } });
+    } else {
+      expect(pr.comments).toBe(snapshot);
+      expect(pr.commentsComplete).not.toBe(true);
+      expect(decide(pr, hold)).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/may be truncated/) });
+    }
+  });
+});
+
 describe('send-back prose is rendered as HTML text', () => {
   it.each([
     ['ordinary prose', '  Fix\n this\t finding.  ', 'Fix this finding.'],
@@ -255,8 +304,8 @@ describe('same-head holds with no referral finding (#7012)', () => {
   it.each([
     ['missing comments', undefined, {}, /thread is unreadable/],
     ['non-array comments', {}, {}, /thread is unreadable/],
-    ['comments at the list cap', Array.from({ length: GH_LIST_COMMENT_CAP }, () => advisory), {}, /may be truncated/],
-    ['comments above the list cap', Array.from({ length: GH_LIST_COMMENT_CAP + 1 }, () => advisory), {}, /may be truncated/],
+    ['comments at the list cap', Array.from({ length: GH_LIST_COMMENT_CAP }, () => advisory), {}, /may be truncated/, { commentsComplete: false }, 'thread-truncated'],
+    ['comments above the list cap', Array.from({ length: GH_LIST_COMMENT_CAP + 1 }, () => advisory), {}, /may be truncated/, { commentsComplete: false }],
     ['malformed referral', [...comments, { ...advisory, body: '<!-- mandatory-referrals-v1: broken -->' }], {}, /malformed/],
     ['pending referral', [...comments, recordComment({ rulings: [], carried: [], superseded: [] })], {}, /no readable ruling/],
     ['referral-kind hold without records', comments, { kind: 'referral' }, /no referral record names/],
@@ -268,6 +317,8 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold with a newer malformed advisory note', [advisory, { ...advisory, createdAt: '2999-01-01T00:00:00Z', body: advisory.body.replace(/^Net basis:.*$/im, '') }], {}, /no clean advisory accept/],
     ['same-head hold with a second malformed outcome line', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`123\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a duplicate accept outcome line', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`accept\`` }], {}, /no clean advisory accept/],
+    ['one completed review with two attempts since wake stays paused', comments, { count: 1, attemptsSinceWake: 2 }, /no clean advisory accept/],
+    ['two completed reviews with one attempt since wake stays paused', comments, { count: 2, attemptsSinceWake: 1 }, /no clean advisory accept/],
     ['same-head hold after two review attempts', comments, { count: 2, attemptsSinceWake: 2 }, /no clean advisory accept/],
     ['same-head hold whose review started after the advisory', comments, { reviewStartedAt: Date.parse('2999-01-01T00:00:00Z') }, /no clean advisory accept/],
     ['same-head hold that does not say when its review started', comments, { reviewStartedAt: null }, /no clean advisory accept/],
@@ -277,18 +328,20 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold with a quoted advisory inside another comment', [{ ...advisory, body: `quoted example, not a review:\n\n${advisory.body}` }], {}, /no clean advisory accept/],
     ['same-head hold whose advisory note carries a fenced example', [{ ...advisory, body: `${advisory.body}\n\`\`\`\n**Advisory outcome:** \`accept\`\n\`\`\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a short-prefix advisory head', [{ ...advisory, body: advisory.body.replace(/(Net basis: `[a-f0-9]+\.\.)[a-f0-9]+`/i, '$1' + fx.headRefOid.slice(0, 1) + '`') }], {}, /no clean advisory accept/],
+    ['same-head hold with a different full advisory head', [{ ...advisory, body: advisory.body.replace(fx.headRefOid, 'a'.repeat(40)) }], {}, /no clean advisory accept/],
+    ['same-head hold with an untrusted advisory author', [{ ...advisory, author: { login: 'untrusted-contributor' }, authorAssociation: 'NONE' }], {}, /no clean advisory accept/],
     ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
     ['no verdict', comments, { noVerdict: {} }, /no verdict ever landed/],
     ['ledger cause', comments, { cause: 'ledger-unreadable' }, /ledger cannot answer/],
     ['hold on another head', comments, { head: 'a'.repeat(40) }, /not on the live head/],
-  ])('%s stays review-referrals-pending', (_name, thread, change, reason, prChange = {}) => {
+  ])('%s stays paused', (_name, thread, change, reason, prChange = {}, refusal = 'review-referrals-pending') => {
     const pr = held();
-    // Bypass the planner's earlier unmarked-page refusal to exercise the referral guard even on a marked full read.
-    const out = resolved({ ...pr, ...prChange, comments: thread, commentsComplete: true, referralHold: { ...pr.referralHold, ...change } });
+    // Mark full reads except the cap rows, which also pin the planner's earlier unmarked-page refusal.
+    const out = resolved({ ...pr, comments: thread, commentsComplete: true, ...prChange, referralHold: { ...pr.referralHold, ...change } });
     expect(out.referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(reason) });
     const p = plan(out);
     expect(p.dispatch).toEqual([]);
-    expect(p.refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
+    expect(p.refusals.map(r => r.kind)).toEqual([refusal]);
   });
 
   it('a PR that is not review:human is not released by a no-finding advisory', () => {

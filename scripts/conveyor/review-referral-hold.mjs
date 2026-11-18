@@ -628,7 +628,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   if (hold.noVerdict) return stay('no verdict ever landed on this head; the no-verdict retries own the pause');
   if (hold.cause) return stay(`the verdict ledger cannot answer for this PR (${hold.cause})`);
   if (!Array.isArray(pr.comments)) return stay('the comment thread is unreadable; read the full thread before resuming');
-  if (pr.comments.length >= GH_LIST_COMMENT_CAP) return stay('the comment thread may be truncated; read the full thread before resuming');
+  if (pr.comments.length >= GH_LIST_COMMENT_CAP && pr.commentsComplete !== true) return stay('the comment thread may be truncated; read the full thread before resuming');
   // Zero findings is proof only when the head's finished review left its advisory: that is the evidence the review ran
   // and raised nothing. Without it (a lost write-back) the pause stays; onClean is honoured like any clean resume.
   const noFinding = why => {
@@ -763,7 +763,7 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
       && runs.some(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)) {
       try {
         const full = readComments({ repo, number: pr.number });
-        if (Array.isArray(full)) pr = { ...pr, comments: full };
+        if (Array.isArray(full)) pr = { ...pr, comments: full, commentsComplete: true };
       }
       catch { /* Keep the list snapshot when the full thread is unavailable. */ }
     }
