@@ -125,12 +125,12 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
   it.each([true, false])('check-run refuses a newer pending round after initial success (fresh pending label=%s)', withLabel => {
     const appId = 5037855;
     const runs = [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: `${LOCAL}#5283`, app: { id: appId }, status: 'completed', conclusion: 'success' }];
-    const readRedTeamEvidence = vi.fn(() => ({ ...idleEvidence(), scheduled: true, inFlight: liveReads >= 2 }));
+    const readRedTeamEvidence = vi.fn(() => ({ ...idleEvidence(), seats: [completedSeat(HEAD)], scheduled: true, inFlight: liveReads >= 2 }));
     const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }));
     let liveReads = 0;
     const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
       env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run' },
-      strategyExtra: { readRedTeamEvidence, readRedTeamCheck },
+      strategyExtra: { readRedTeamEvidence, readRedTeamCheck }, liveComments: [completedComment(5283, HEAD)],
       onView: { readLive: () => {
         if (++liveReads === 2) {
           expect(readRedTeamCheck.mock.results[0].value.ok).toBe(true);
@@ -256,8 +256,8 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     let fact = { ok: false, reason: 'no red-team check run on head' }, requests = 0;
     const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' };
     const make = initial => harness({ strategy: 'github-merge-queue', env, now: () => clock.t, initial,
-      labels: ['ready-to-merge', 'review:accepted'], requestRedTeam: () => { requests++; },
-      strategyExtra: { readRedTeamCheck: () => fact } });
+      labels: ['ready-to-merge', 'review:accepted'], liveComments: [completedComment(5283, HEAD)],
+      requestRedTeam: () => { requests++; }, strategyExtra: { readRedTeamCheck: () => fact } });
     let h = make();
     expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
     clock.t += 30_000;
@@ -283,8 +283,8 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     let fact = { ok: false, reason: 'no red-team check run on head' }, requests = 0;
     const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' };
     const make = initial => harness({ strategy: 'github-merge-queue', env, now: () => clock.t, initial,
-      labels: ['ready-to-merge', 'review:accepted'], requestRedTeam: () => { requests++; },
-      strategyExtra: { readRedTeamCheck: () => fact } });
+      labels: ['ready-to-merge', 'review:accepted'], liveComments: [completedComment(5283, HEAD)],
+      requestRedTeam: () => { requests++; }, strategyExtra: { readRedTeamCheck: () => fact } });
     let h = make();
     h.s.enqueue({ num: 5283 }, HEAD);
     clock.t += 60_001;
@@ -311,10 +311,23 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     const h = checkRunHarness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
       liveComments: [], evidence: { ...idleEvidence(), inFlight: work === 'inFlight', queued: work === 'queued',
         scheduled: true, loopPayload: { findings: { read: reviewedRead(HEAD) } } } });
-    const active = work !== 'idle';
-    expect(h.s.prestage({ num: 5283 }, HEAD).allowed).toBe(!active);
-    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }).enqueued).toBe(!active);
-    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(!active);
+    expect(h.s.prestage({ num: 5283 }, HEAD).allowed).toBe(false);
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }).enqueued).toBe(false);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it('idle owed pass behind an older successful check requests recovery once across restarts and stays held', () => {
+    let clock = 0, requests = 0;
+    const make = initial => checkRunHarness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      liveComments: [], evidence: { ...idleEvidence(), scheduled: true, loopPayload: { findings: { read: reviewedRead(HEAD) } } },
+      now: () => clock, initial, requestRedTeam: () => { requests++; return { requested: true }; } });
+    let h = make();
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    clock = 46 * 60_000;
+    h = make(h.state());
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    h = make(h.state());
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    expect(requests).toBe(1);
   });
   it.each(['revoked before admission', 'revoked before enqueue', 'still valid'])(
     'check-run revalidates a cached success against a security deferral: %s', phase => {
@@ -375,7 +388,7 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
       const env = { WE_UNDER_TEST: '1', WE_SHARED_RUNS_DIR: join(root, 'runs') };
       let reads = 0;
       const h = checkRunHarness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'],
-        onView: { readLive: () => {
+        liveComments: [completedComment(5283, HEAD)], onView: { readLive: () => {
           if (++reads === 2) recordRedTeamStatus({ repo: LOCAL, pr: 5283, status: 'running',
             loopPayload: { findings: { read: reviewedRead(HEAD) } } }, {
             env, gh: () => '', log: () => {}, postCheckRun: () => ({ ok: false, reason: 'outage' }),
@@ -417,7 +430,7 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
       expect(attempts.map(check => check.status)).toEqual(['in_progress', 'in_progress', 'in_progress', 'completed']);
       // GitHub still has the old success; the durable publication hold closes this gap.
       expect(evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
-      const makeDrain = () => checkRunHarness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'] });
+      const makeDrain = () => checkRunHarness({ strategy: 'github-merge-queue', env, liveComments: clean, labels: ['ready-to-merge', 'review:accepted'] });
       const first = makeDrain();
       expect(first.s.prestage({ num: 5283 }, HEAD)).toMatchObject({ allowed: false });
       expect(first.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending',
@@ -1590,23 +1603,23 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(enqueuedAny(h)).toBe(false);
   });
 
-  it.each([undefined, 'red-team:pending'])('only the explicit operator env override enqueues without a result with label %s, logged with who and the source', status => {
+  it.each([undefined, 'red-team:pending'])('a named operator deadline override cannot admit blocking owed debt with label %s', status => {
     const { h, notes } = pastDeadline({ labels: [...ACCEPTED, ...(status ? [status] : [])], env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' } });
-    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
-    expect(h.logs.join('')).toContain(`OPERATOR OVERRIDE: enqueuing ${LOCAL}#5283 on ${HEAD} with NO red-team result after 45 min (redTeam.deadlineAction=merge-without-result, env, by chalbert)`);
-    expect(notes).toHaveLength(0);
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+    expect(notes).toHaveLength(1);
   });
 
   const OVERRIDE_ENV = { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' };
-  it.each(['red-team:pending', 'red-team:blocked'])('deadline override waives only pending on the fresh read: %s', status => {
+  it.each(['red-team:pending', 'red-team:blocked'])('deadline override remains held before any fresh-label bypass: %s', status => {
     // pastDeadline makes one held attempt, then the overdue attempt reads live state twice.
     const readLive = vi.fn().mockReturnValueOnce({ headRefOid: HEAD, labels: ACCEPTED })
       .mockReturnValueOnce({ headRefOid: HEAD, labels: ACCEPTED })
       .mockReturnValue({ headRefOid: HEAD, labels: [...ACCEPTED, status] });
     const { h } = pastDeadline({ env: OVERRIDE_ENV, onView: { readLive } });
-    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(status === 'red-team:pending');
-    expect(readLive).toHaveBeenCalledTimes(3);
-    expect(enqueuedAny(h)).toBe(status === 'red-team:pending');
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    expect(readLive).toHaveBeenCalledTimes(2);
+    expect(enqueuedAny(h)).toBe(false);
   });
   // Admission gates must cover every fall-through path and every live red-team label state.
   const admissionCases = ['clear', 'pending', 'deadline-hold', 'override', 'ruling'].flatMap(path =>
@@ -1626,7 +1639,7 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
         headSha: HEAD, firstPendingAt: overdue ? 0 : 44 * 60_000, retryAt: 0, checkedAt: 0,
         reason: 'post-accept red team has no recorded result on the live head',
       } } } });
-    const allowed = status !== 'red-team:blocked' && (result || path === 'override');
+    const allowed = status !== 'red-team:blocked' && result;
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments }).enqueued).toBe(allowed);
     expect(enqueuedAny(h)).toBe(allowed);
     if (allowed) expect(h.state().redTeamPending['cwd#5283']).toBeUndefined();

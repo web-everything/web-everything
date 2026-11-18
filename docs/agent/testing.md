@@ -4616,9 +4616,12 @@ hold labels. Structural mutations restore setting/env guards and early check-run
 returns, proving every successful admission route still reaches the evidence decision.
 
 
-Operator amendment: `redTeamHold` materializes `pass-owed` with `blocking: true` whenever
-same-head work is running or queued. Only explicit `inFlight: false` and `queued: false`
-permit a non-blocking pass-owed hold; unknown flags remain blocking. `pending-publish`
-stays non-blocking. Check-run preparation and enqueue must hold an earlier successful
-same-head check when newer work is active. Mutations remove each live-debt guard and
-bypass typed hold construction; consumers route only on the resulting kind/blocking.
+Operator amendment: the fixed `RED_TEAM_HOLDS` table makes `pass-owed` always
+blocking, including explicit idle scheduling flags. Only `pending-publish` is
+non-blocking. An older successful same-head check cannot pay current execution
+debt. Mutations flip the table values and bypass its lookup. Consumers route only
+on kind/blocking. Recovery distinguishes idle `pass-owed` from unreadable evidence:
+legacy deadline handling and check-run admission can request one pass per head,
+with the attempt persisted before dispatch, while continuing to hold admission.
+A green check ends that wait only once live evidence clears; a deadline override
+cannot waive blocking debt.

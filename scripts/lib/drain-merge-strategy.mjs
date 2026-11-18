@@ -42,7 +42,7 @@ import { labelSignature } from './drain-prestage.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamAdmissionHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
-import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
+import { readRedTeamDeadlineAction } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -282,28 +282,16 @@ export function createDrainMergeStrategy({
     ? readRedTeamPublicationHold({ repo: slugOf(c.repo), pr: c.num, head, env }) : null;
   let appIdMemo = null;
   const redTeamAppId = () => (appIdMemo ??= resolveWeAppId({ env, log: line => log.write(`  ${line}\n`) }));
-  const checkRunAdmission = (c, head, before) => {
+  const checkRunAdmission = (c, head, before, owedHold = null) => {
     const unpublished = publicationHold(c, head);
     const checkGh = (args, options) => exec('gh', args, options);
     // The drain's env never carries WE_APP_ID: the id is the `redTeamGate.appId` setting (#6535, ruling R907/R905),
     // resolved once per strategy with its source logged. An unresolved id passes `undefined` on, so the read keeps its
     // existing fail-closed reason.
-    const fact = readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), pr: c.num, headSha: head })
+    const fact = owedHold ? { ok: false, reason: owedHold.message } : readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), pr: c.num, headSha: head })
       : readRedTeamCheckFact({ repo: slugOf(c.repo), pr: c.num, headSha: head, appId: redTeamAppId().appId, gh: checkGh });
     const key = keyOf(c.repo, c.num);
-    if (fact?.ok === true && !unpublished) {
-      // A passing check ends the wait, as the legacy redTeamPending path does on admission, so a later round on the
-      // same head starts a fresh wait instead of inheriting this one's clock. The once-per-head request spend
-      // (attemptedHeads) is kept: ending a wait never refunds a request.
-      const wait = before.redTeamCheckRecovery?.[key];
-      if (wait && (wait.firstPendingAt != null || wait.headSha != null || wait.attemptedAt != null)) {
-        const attemptedHeads = { ...wait.attemptedHeads, ...(wait.attemptedAt != null && wait.headSha ? { [wait.headSha]: wait.attemptedAt } : {}) };
-        if (Object.keys(attemptedHeads).length) before.redTeamCheckRecovery[key] = { attemptedHeads };
-        else delete before.redTeamCheckRecovery[key];
-        writeState(statePath, before);
-      }
-      return null;
-    }
+    if (fact?.ok === true && !unpublished) return null;
     const reason = unpublished || fact?.reason || 'red-team check unreadable';
     before.redTeamCheckRecovery ??= {};
     let wait = before.redTeamCheckRecovery[key];
@@ -311,7 +299,7 @@ export function createDrainMergeStrategy({
       attemptedHeads: { ...wait?.attemptedHeads, ...(wait?.attemptedAt != null ? { [wait.headSha]: wait.attemptedAt } : {}) } };
     // Anchored: an external_id mismatch ("no red-team check run on head for X#N: …") or a truncated history
     // ("… incomplete at 100-run bound …") is not fixed by a new round, so it never spends the once-per-head request.
-    const recoverable = unpublished || /^(no red-team check run on head|red-team check run in progress or incomplete)$/.test(reason);
+    const recoverable = owedHold?.kind === 'pass-owed' || unpublished || /^(no red-team check run on head|red-team check run in progress or incomplete)$/.test(reason);
     if (recoverable && now() - wait.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000
       && wait.attemptedAt == null && wait.attemptedHeads?.[head] == null && typeof requestRedTeam === 'function') {
       wait.attemptedAt = now();
@@ -341,8 +329,8 @@ export function createDrainMergeStrategy({
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
   const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
   // A successful check is a snapshot: live rulings and comments can restore a break hold on the same head.
-  // Check-run mode needs this disposition decision at each admission boundary, without legacy waits or label sync.
-  const checkRunDispositionHold = (c, head, live) => {
+  // Check-run mode needs this evidence decision at each boundary, with durable recovery for idle owed work.
+  const checkRunDispositionHold = (c, head, live, before) => {
     let reason;
     try {
       let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head, env });
@@ -353,8 +341,24 @@ export function createDrainMergeStrategy({
       const standingRuling = grantScopeFor(c, head, comments);
       evidence = settleUnknownEvidenceByComment(evidence, comments, c.num, head, live.reviews);
       const hold = redTeamAdmissionHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
-      // The check owns pending/wait states; confirmed breaks and unknown evidence still fail closed.
-      if (!hold || !hold.blocking) return null;
+      // A green snapshot ends recovery only after the live evidence decision clears.
+      if (!hold || !hold.blocking) {
+        const key = keyOf(c.repo, c.num);
+        // A passing check ends the wait, as the legacy redTeamPending path does on admission, so a later round on the
+        // same head starts a fresh wait instead of inheriting this one's clock. The once-per-head request spend
+        // (attemptedHeads) is kept: ending a wait never refunds a request.
+        const wait = before.redTeamCheckRecovery?.[key];
+        if (wait && (wait.firstPendingAt != null || wait.headSha != null || wait.attemptedAt != null)) {
+          const attemptedHeads = { ...wait.attemptedHeads, ...(wait.attemptedAt != null && wait.headSha ? { [wait.headSha]: wait.attemptedAt } : {}) };
+          if (Object.keys(attemptedHeads).length) before.redTeamCheckRecovery[key] = { attemptedHeads };
+          else delete before.redTeamCheckRecovery[key];
+          writeState(statePath, before);
+        }
+        return null;
+      }
+      // Idle execution debt must still dispatch recovery behind an older green check.
+      if (hold.kind === 'pass-owed' && evidence.inFlight === false && evidence.queued === false && evidence.recorded === false)
+        return checkRunAdmission(c, head, before, hold);
       reason = hold.message;
     } catch {
       reason = 'red-team evidence unreadable; hold and inspect run evidence and complete comments';
@@ -464,11 +468,10 @@ export function createDrainMergeStrategy({
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
       if (checkRunOnly) {
-        const hold = checkRunAdmission(c, headSha, before) || checkRunDispositionHold(c, headSha, live);
+        const hold = checkRunAdmission(c, headSha, before) || checkRunDispositionHold(c, headSha, live, before);
         if (hold) return hold;
       }
       let admissionLabels = queueLabels(live.labels);
-      let deadlineOverride = false;
       // Head-bound file preparation is reusable; authorization evidence is always live.
       if (!checkRunOnly) {
         let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
@@ -544,9 +547,9 @@ export function createDrainMergeStrategy({
           const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
           const source = deadline.sources?.deadlineAction ?? 'standard';
           // Unknown run evidence (`ok:false`, e.g. a capped scan) is never "missing": a run may exist past the cap, so
-          // it neither re-requests nor reaches the operator override; it holds below with its reason named.
-          const unknown = hold.blocking;
-          const missing = !unknown && !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          // it never re-requests and holds below with its reason named.
+          const unknown = hold.kind !== 'pass-owed' && hold.blocking;
+          const missing = hold.kind === 'pass-owed' && evidence.inFlight === false && evidence.queued === false && evidence.recorded === false;
           if (missing && deadlineAction === 'requeue-then-hold') {
             // The one re-request for this head gets its own full wait before the operator is asked.
             if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
@@ -569,37 +572,29 @@ export function createDrainMergeStrategy({
               }
             }
           }
-          if (missing && deadlineAction === RED_TEAM_DEADLINE_OVERRIDE && deadline.operatorOverride?.by) {
-            // The only path to merge-without-result: the operator's own env, named, logged on every use.
-            deadlineOverride = true;
-            log.write(`  ⚠ OPERATOR OVERRIDE: enqueuing ${slugOf(c.repo)}#${c.num} on ${headSha} with NO red-team result after ${maxMin} min (redTeam.deadlineAction=${RED_TEAM_DEADLINE_OVERRIDE}, env, by ${deadline.operatorOverride.by})\n`);
-          } else {
-            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
-              : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
-              : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
-              : unknown ? `run evidence unknown (${evidence.reason ?? hold.kind})` : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
-            const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
-            if (wait.deadlineHeldAt == null) {
-              wait.deadlineHeldAt = now();
-              log.write(`  merge-queue: HOLD ${slugOf(c.repo)}#${c.num} on ${headSha}: ${heldReason}; redTeamPendingMaxMin=${maxMin} (${safety.sources?.redTeamPendingMaxMin ?? 'standard'}), redTeam.deadlineAction=${deadlineAction} (${source}); never enqueued without a result\n`);
-            }
-            if (wait.notifiedAt == null && publishNote) {
-              try {
-                publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha, kind: 'red-team-deadline-held', reason: heldReason,
-                  pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });
-                wait.notifiedAt = now();
-              } catch (e) { log.write(`  ⚠ red-team deadline note for #${c.num} not published (${firstLine(e)}) — PR stays held; retried at the next recheck\n`); }
-            }
-            writeState(statePath, before);
-            return { ...outcome, deadlineHeld: true, reason: heldReason };
+          const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
+            : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
+            : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
+            : unknown ? `run evidence unknown (${evidence.reason ?? hold.kind})` : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
+          const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
+          if (wait.deadlineHeldAt == null) {
+            wait.deadlineHeldAt = now();
+            log.write(`  merge-queue: HOLD ${slugOf(c.repo)}#${c.num} on ${headSha}: ${heldReason}; redTeamPendingMaxMin=${maxMin} (${safety.sources?.redTeamPendingMaxMin ?? 'standard'}), redTeam.deadlineAction=${deadlineAction} (${source}); never enqueued without a result\n`);
           }
+          if (wait.notifiedAt == null && publishNote) {
+            try {
+              publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha, kind: 'red-team-deadline-held', reason: heldReason,
+                pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });
+              wait.notifiedAt = now();
+            } catch (e) { log.write(`  ⚠ red-team deadline note for #${c.num} not published (${firstLine(e)}) — PR stays held; retried at the next recheck\n`); }
+          }
+          writeState(statePath, before);
+          return { ...outcome, deadlineHeld: true, reason: heldReason };
         }
       }
       // Let pending evidence reach its retry/deadline path above. A live hold label still refuses admission
-      // when no pass is owed or the wait setting is off; it never becomes a dequeue reason on its own.
-      // The named deadline override waives only pending, never a blocked label or a confirmed break.
-      const labelHold = checkRunOnly ? null : redTeamLabelHoldReason(deadlineOverride
-        ? admissionLabels.filter(label => label !== 'red-team:pending') : admissionLabels);
+      // when no pass is owed; it never becomes a dequeue reason on its own.
+      const labelHold = checkRunOnly ? null : redTeamLabelHoldReason(admissionLabels);
       if (labelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: labelHold };
       if (before.redTeamPending?.[key]) {
         delete before.redTeamPending[key];
@@ -624,8 +619,7 @@ export function createDrainMergeStrategy({
       }
       const freshHeld = sendBackReason(fresh.labels);
       const freshLabels = queueLabels(fresh.labels);
-      const freshLabelHold = redTeamLabelHoldReason(deadlineOverride
-        ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
+      const freshLabelHold = redTeamLabelHoldReason(freshLabels);
       if (freshHeld) {
         removeSentBack(c.repo, c.num, fresh.labels);
         // Blocked labels still get send-back cleanup, with the admission hold's pending outcome.
@@ -663,7 +657,7 @@ export function createDrainMergeStrategy({
       if (checkRunOnly) {
         // One fresh check read closes the gap since the initial success observation.
         // Recheck the publication marker and live disposition before the enqueue mutation.
-        const hold = checkRunAdmission(c, headSha, before) || checkRunDispositionHold(c, headSha, fresh);
+        const hold = checkRunAdmission(c, headSha, before) || checkRunDispositionHold(c, headSha, fresh, before);
         if (hold) return hold;
       }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
