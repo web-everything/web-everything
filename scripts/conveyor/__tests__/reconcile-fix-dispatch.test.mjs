@@ -2552,6 +2552,33 @@ describe('Claude red-team repair round publication', () => {
     expect(countRedTeamFixComments(comments)).toBe(2);
     expect(comments.at(-1).body).toContain(RED_TEAM_FIX_COMMENT_MARKER);
   });
+  it.each([false, true])('a newer gate result cannot replay a spent launch ID; a new ID charges and launches (head moved=%s)', moved => {
+    const { comments, result } = thread();
+    const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+    const spawnAgent = vi.fn(() => '');
+    const io = { ...options(), spawnAgent,
+      publishRedTeamRound: request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec }) };
+    dispatchFix(planned, io);
+    const newer = thread().comments;
+    const nextHead = moved ? 'b'.repeat(40) : head;
+    const nextPlan = { ...planned, headRefOid: nextHead, redTeamSentBack: { ...planned.redTeamSentBack, head: nextHead } };
+    newer[0].body = newer[0].body.replaceAll(head, nextHead).replace('Gate break', 'New gate break');
+    const newResult = liveResultGateState([newer[0]], planned.pr, nextHead).resultId;
+    expect(newResult).not.toBe(result);
+    comments.push(newer[0], { author: { login: 'web-everything' },
+      body: redTeamGateMarker(planned.pr, nextHead, 'sent-back', newResult) });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => dispatchFix(nextPlan, io)).toThrow('launch already spent; new dispatch required');
+    } finally { log.mockRestore(); }
+    expect(spawnAgent).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledOnce();
+    dispatchFix({ ...nextPlan, attempts: 1 }, io);
+    expect(spawnAgent).toHaveBeenCalledTimes(2);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(countRedTeamFixComments(comments)).toBe(2);
+    expect(comments.at(-1).body).toContain(`result=${newResult} attempt=2`);
+  });
   it.each(['unread', 'missing gate', 'write failure'])('refuses to launch Claude when marker publication has %s', fault => {
     const { comments } = thread();
     const spawnAgent = vi.fn();

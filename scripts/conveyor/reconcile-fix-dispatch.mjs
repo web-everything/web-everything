@@ -1414,7 +1414,7 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
   return file;
 }
 
-/** Count Claude repairs before launch; retries of the same head/result/attempt are idempotent. */
+/** Count Claude repairs before launch; a spent launch ID stays spent across heads and gate results. */
 export function publishRedTeamFixDispatch({ repo, planned }, {
   readComments = () => readCompletePrComments(planned.pr, { repo: ghRepoSlug(repo) }),
   exec = execFileSyncThrottled,

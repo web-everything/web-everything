@@ -1,4 +1,5 @@
 /** Shared re-arm classification for the ordinary counter, enrichment threshold and real-fix windows. */
+import { countRedTeamFixComments } from './red-team-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 // Durable protocol strings: preserve existing PR comment history when changing their readers.
@@ -11,4 +12,10 @@ export function isFixRoundRearmComment(comment) {
   const body = typeof comment === 'string' ? comment : comment?.body;
   return typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER)
     && !body.trimEnd().endsWith(SAME_HEAD_WAKE_TRAILER);
+}
+
+/** Shared restart-surviving fix floor: ordinary re-arms plus spent red-team rounds. */
+export function countFixRoundComments(comments) {
+  if (!Array.isArray(comments)) return 0;
+  return comments.filter(isFixRoundRearmComment).length + countRedTeamFixComments(comments);
 }

@@ -47,6 +47,8 @@ import {
   lanePoolListArgsForRepo,
   reuseFailedLanePoolRead,
 } from '../tick-core.mjs';
+import { countFixRoundComments, REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER } from '../rearm-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
 import { buildCiHealComment, CI_HEAL_ROUND_CAP } from '../ci-heal-mark.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
@@ -469,6 +471,37 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
     });
     expect(r.spawns).toEqual([]); // cap binds → no re-fix from zero
     expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', pr: 99, attempts: DEFAULT_FIX_RETRY_CAP });
+  });
+
+  it.each(['failed', 'handed back', 'legacy hand-back'])('three spent red-team rounds (%s) restore floor 3 and exhaust cap 3 after restart', kind => {
+    const trusted = body => ({ author: { login: 'web-everything' }, body });
+    const comments = Array.from({ length: 3 }, (_, i) => [
+      ...(kind === 'legacy hand-back' ? [] : [trusted(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${'a'.repeat(40)} result=result-${i} attempt=launch-${i}`)]),
+      ...(kind === 'failed' ? [] : [trusted(RED_TEAM_REARM_COMMENT_MARKER)]),
+    ]).flat();
+    const floor = countFixRoundComments(comments);
+    expect(floor).toBe(3);
+    expect(countRedTeamFixComments(comments)).toBe(3);
+    const r = planFixSpawns({
+      prs: [changesPr(99, 40)], launchedNums: [40], fixAttempts: {},
+      prRearmCounts: { 99: floor }, retryCap: 3, availableLanes: [5], tick: 0,
+    });
+    expect(r.spawns).toEqual([]);
+    expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', pr: 99, attempts: 3 });
+  });
+
+  it('shares marker trust and launch deduplication while retaining ordinary rounds and failed launches', () => {
+    const c = body => ({ author: { login: 'web-everything' }, body });
+    const receipt = result => c(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${'a'.repeat(40)} result=${result} attempt=same-launch`);
+    const comments = [c(REARM_COMMENT_MARKER), receipt('old'), c(RED_TEAM_REARM_COMMENT_MARKER), receipt('new'), c(RED_TEAM_REARM_COMMENT_MARKER),
+      c(RED_TEAM_FIX_COMMENT_MARKER),
+      c(`${REARM_COMMENT_MARKER}\n${SAME_HEAD_WAKE_TRAILER}`),
+      { author: { login: 'outsider' }, body: RED_TEAM_FIX_COMMENT_MARKER },
+      { body: RED_TEAM_REARM_COMMENT_MARKER }, c(`> ${RED_TEAM_REARM_COMMENT_MARKER}`),
+      c(`${RED_TEAM_REARM_COMMENT_MARKER} suffix`)];
+    expect(countRedTeamFixComments(comments)).toBe(2);
+    expect(countFixRoundComments(comments)).toBe(3);
+    expect(countFixRoundComments(null)).toBe(0);
   });
 
   it('a spawn below the max(in-session, durable) cap still spawns, but still does not bump (bump moved to claim-time)', () => {

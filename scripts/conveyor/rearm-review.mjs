@@ -26,7 +26,7 @@ import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels, neutralizeCommentMarkers } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
-import { RED_TEAM_FIX_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
 import { redTeamFact } from './dispatch-eligibility-facts.mjs';
 import { latestRedTeamResultPosition } from '../lib/red-team-gate.mjs';
 import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -315,7 +315,7 @@ export function buildRearmComment({ actor, decision }) {
 
 // Red-team repairs spend their round at dispatch, including failed/no-change runs. Their hand-back
 // must still wake review, but must not emit an ordinary counted re-arm marker.
-export const RED_TEAM_REARM_COMMENT_MARKER = '<!-- conveyor-red-team-fix-rearmed -->';
+export { RED_TEAM_REARM_COMMENT_MARKER };
 export function buildRedTeamRearmComment(input) {
   return buildRearmComment(input).replace(REARM_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER);
 }
