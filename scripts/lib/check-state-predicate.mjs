@@ -176,7 +176,7 @@ const evidenceIdentity = row => {
  * Every required name needs its own evidence; historical implication options are ignored.
  * rowsComplete is true only after exhausting pages or explicitly fetching every required name.
  */
-export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [] } = {}) {
+export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [], reviewGateOwnedByReview = false } = {}) {
   const perName = Object.create(null), reasons = [];
   const validNames = names => Array.isArray(names) && [...names].every(n => typeof n === 'string' && n.trim());
   if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || !requiredNames.length) reasons.push('roster-unavailable');
@@ -219,7 +219,9 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
     const boundHold = hold => rowHead !== null && sha(hold?.headSha) === rowHead
       && Array.isArray(hold?.holdIds) && hold.holdIds.length
       && humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only;
-    if (failedByName) {
+    // Review-start timing (not admission) owns the review-gate by contract: it is red until a review exists.
+    if (reviewGateOwnedByReview === true && name === 'review-gate' && failedByName) state = 'held';
+    else if (failedByName) {
       const candidates = [row.mergeGateReviewHold, row.mergeGateHoldExcused, ...(Array.isArray(holds) ? holds : [])];
       if (job !== null && candidates.some(hold => evidenceInteger(hold?.jobId) === job && boundHold(hold))) state = 'held';
     }
