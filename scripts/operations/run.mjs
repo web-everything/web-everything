@@ -44,7 +44,7 @@ import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-s
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry, op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { createGenesisRunner } from './audit-ledger-genesis.mjs';
+import { createGenesisRunner, createResealRunner } from './audit-ledger-genesis.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
@@ -632,6 +632,22 @@ export const OPERATIONS = Object.freeze({
       } }),
     }),
     sinks: { 'audit-ledger-genesis.run': createGenesisRunner() },
+    finish: ({ run, code, lines }) => run?.verdict ? { code, lines: [JSON.stringify(run.verdict)] } : { code, lines },
+  }),
+  'audit-ledger-reseal': () => ({
+    declaration: op('audit-ledger-reseal', {
+      input: { actor: { type: 'string' }, reason: { type: 'string' }, apply: { type: 'boolean', required: false, default: false } },
+      verdictFrom: 'assess',
+      reseal: effect({ reads: ['input.actor', 'input.reason', 'input.apply'], effects: ({ input }) => [{
+        type: 'audit-ledger-reseal.run', payload: input, idempotent: false,
+      }] }),
+      assess: compute({ reads: ['findings.reseal'], fn: ({ findings }) => {
+        const entry = findings.reseal?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('audit-ledger-reseal: reseal did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'audit-ledger-reseal.run': createResealRunner() },
     finish: ({ run, code, lines }) => run?.verdict ? { code, lines: [JSON.stringify(run.verdict)] } : { code, lines },
   }),
   'codex-audit': () => ({

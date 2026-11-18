@@ -19,10 +19,10 @@ function linesOf(raw) {
 }
 
 /** Returns null when already migrated. Hashes original bytes, including trailing newlines. */
-export function buildGenesis(rawBytes) {
+export function buildGenesis(rawBytes, reseal) {
   const raw = Buffer.from(rawBytes), lines = linesOf(raw);
-  if (lines.some(line => parse(line)?.kind === 'genesis')) return null;
-  return { kind: 'genesis', seq: 0, id: newId(), legacyCount: lines.length,
+  if (!reseal && lines.some(line => parse(line)?.kind === 'genesis')) return null;
+  return { ...reseal, kind: 'genesis', seq: 0, id: newId(), legacyCount: lines.length,
     legacyDigest: sha256Line(raw), prev: lines.length ? sha256Line(lines.at(-1)) : null,
     at: new Date().toISOString() };
 }
@@ -46,19 +46,35 @@ function reclaimStale(lock, fs, now) {
 }
 
 const hwmPath = path => join(dirname(path), 'audits.hwm.json');
-/** Refuses a ledger that was truncated or rewritten below the recorded high-water mark. */
-function assertHighWater(path, lines, parsed, fs) {
+const isChained = entry => Number.isSafeInteger(entry?.seq) && typeof entry.id === 'string' && (typeof entry.prev === 'string' || entry.kind === 'genesis');
+const tamper = message => Object.assign(new Error(message), { code: 'LEDGER_TAMPER' });
+/**
+ * Refuses only real tampering: rewritten legacy bytes or chained records, a rollback below the
+ * high-water mark, or a missing sidecar after genesis. Unchained post-genesis lines (stale writers)
+ * are skipped for linking. Returns the index of the last chained line, or -1 before genesis.
+ */
+function assertHighWater(path, raw, lines, parsed, fs) {
+  const g = parsed.findLastIndex(entry => entry?.kind === 'genesis');
   let hwm;
   try { hwm = JSON.parse(fs.readFileSync(hwmPath(path), 'utf8')); }
   catch (error) {
-    if (error.code === 'ENOENT') return;
-    throw new Error('Audit ledger high-water mark unreadable; repair before appending.');
+    if (error.code === 'ENOENT' && g === -1) return -1;
+    throw tamper(error.code === 'ENOENT' ? 'Audit ledger high-water mark missing after genesis; run audit-ledger-reseal after review.'
+      : 'Audit ledger high-water mark unreadable; run audit-ledger-reseal after review.');
   }
-  const at = parsed.findIndex(entry => entry?.seq === hwm?.seq && Number.isSafeInteger(hwm.seq));
-  const last = parsed.findLast(entry => Number.isSafeInteger(entry?.seq));
-  if (at === -1 || !last || last.seq < hwm.seq || sha256Line(lines[at]) !== hwm.lineHash) {
-    throw new Error(`Audit ledger rollback detected (high-water seq ${hwm?.seq}); refusing to append.`);
+  const broken = () => { throw tamper(`Audit ledger chain broken, rollback detected (high-water seq ${hwm?.seq}); refusing to append.`); };
+  if (g === -1) broken();
+  // Every legacy byte before genesis and every chained link since must still match.
+  if (sha256Line(raw.subarray(0, lines[g].byteOffset - raw.byteOffset)) !== parsed[g].legacyDigest) broken();
+  let last = g;
+  for (let i = g + 1; i < lines.length; i++) {
+    if (!isChained(parsed[i])) continue;
+    if (parsed[i].seq !== parsed[last].seq + 1 || parsed[i].prev !== sha256Line(lines[last])) broken();
+    last = i;
   }
+  const at = parsed.findIndex((entry, i) => i >= g && isChained(entry) && entry.seq === hwm?.seq);
+  if (at === -1 || parsed[last].seq < hwm.seq || sha256Line(lines[at]) !== hwm.lineHash) broken();
+  return last;
 }
 function writeHighWater(path, record, line, fs) {
   const tmp = `${hwmPath(path)}.${process.pid}.tmp`, fd = fs.openSync(tmp, 'w', 0o600);
@@ -96,15 +112,14 @@ export async function appendChained(path, record, { fs = realFs, sleep = setTime
     fs.writeFileSync(owner, String(process.pid));
     const raw = readLedger(path, fs), lines = linesOf(raw), parsed = lines.map(parse);
     const separator = raw.length && raw.at(-1) !== 10 ? '\n' : '';
-    assertHighWater(path, lines, parsed, fs);
-    const genesis = parsed.findIndex(entry => entry?.kind === 'genesis');
+    const lastIdx = record.reseal ? -1 : assertHighWater(path, raw, lines, parsed, fs);
     if (record.kind === 'genesis') {
-      record = buildGenesis(separator ? Buffer.concat([raw, Buffer.from(separator)]) : raw);
+      record = buildGenesis(separator ? Buffer.concat([raw, Buffer.from(separator)]) : raw, record.reseal && record);
       if (!record) return null;
-    } else if (genesis !== -1) {
-      const last = parsed.slice(genesis).findLast(entry => Number.isSafeInteger(entry?.seq) && entry.seq >= 0);
-      if (!last || last.seq === Number.MAX_SAFE_INTEGER) throw new Error('Invalid audit sequence; repair the ledger before retrying.');
-      record = { ...record, id: newId(), seq: last.seq + 1, prev: sha256Line(lines.at(-1)) };
+    } else if (lastIdx !== -1) {
+      const last = parsed[lastIdx];
+      if (last.seq === Number.MAX_SAFE_INTEGER) throw new Error('Invalid audit sequence; repair the ledger before retrying.');
+      record = { ...record, id: newId(), seq: last.seq + 1, prev: sha256Line(lines[lastIdx]) };
     } else {
       record = { ...record };
       delete record.id; delete record.seq; delete record.prev;
@@ -116,6 +131,13 @@ export async function appendChained(path, record, { fs = realFs, sleep = setTime
     } finally { fs.closeSync(fd); }
     if (Number.isSafeInteger(record.seq)) writeHighWater(path, record, Buffer.from(JSON.stringify(record)), fs);
     return record;
+  } catch (error) {
+    // Nothing is silently lost: the record the writer meant to append goes to a side file.
+    if (error.code === 'LEDGER_TAMPER') {
+      fs.appendFileSync(join(dirname(path), 'audits.quarantine.jsonl'),
+        `${JSON.stringify({ ...record, quarantinedAt: new Date().toISOString(), quarantineReason: error.message })}\n`, { mode: 0o600 });
+    }
+    throw error;
   } finally {
     try {
       try { fs.closeSync(owner); } finally { fs.unlinkSync(lock); }

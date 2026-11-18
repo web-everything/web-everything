@@ -49,6 +49,26 @@ describe('audit ledger chain', () => {
     fs.writeFileSync(path, `${lines.join('\n')}\n`);
     await expect(appendChained(path, { verdict: 'NOT WEAKENED' })).rejects.toThrow(/rollback/);
   });
+  it('refuses when an earlier record or a legacy byte was rewritten', async () => {
+    fs.writeFileSync(path, '{"legacy":1}\n');
+    await genesis();
+    await appendChained(path, { verdict: 'WEAKENED' });
+    await appendChained(path, { verdict: 'WEAKENED' });
+    const good = fs.readFileSync(path, 'utf8');
+    const lines = good.trim().split('\n');
+    lines[2] = JSON.stringify({ ...JSON.parse(lines[2]), verdict: 'NOT WEAKENED' });
+    fs.writeFileSync(path, `${lines.join('\n')}\n`);
+    await expect(appendChained(path, { verdict: 'x' })).rejects.toThrow(/rollback/);
+    fs.writeFileSync(path, good.replace('"legacy":1', '"legacy":2'));
+    await expect(appendChained(path, { verdict: 'x' })).rejects.toThrow(/rollback/);
+  });
+  it('refuses when the high-water file is deleted after genesis', async () => {
+    await genesis();
+    await appendChained(path, { verdict: 'WEAKENED' });
+    fs.rmSync(join(root, 'audits.hwm.json'));
+    fs.writeFileSync(path, fs.readFileSync(path, 'utf8').split('\n')[0] + '\n');
+    await expect(appendChained(path, { verdict: 'x' })).rejects.toThrow(/missing after genesis/);
+  });
   it('hashes all original legacy bytes and the last nonempty raw line', async () => {
     const raw = Buffer.from(' {"old":1}\r\n\nnot-json\n\n');
     fs.writeFileSync(path, raw);
@@ -72,14 +92,27 @@ describe('audit ledger chain', () => {
     const lines = fs.readFileSync(path, 'utf8').trimEnd().split('\n');
     expect(JSON.parse(lines[2])).toMatchObject({ seq: 1, prev: hash(lines[1]) });
   });
-  it.each(['broken', '{"legacy":true}'])('continues post-genesis sequence after chain-less line %s', async legacy => {
+  it.each(['broken', '{"legacy":true}', '{"verdict":"NOT WEAKENED","seq":7}'])('skips a stale-writer line %s between chained lines without wedging', async stale => {
     fs.writeFileSync(path, '{"seq":900}\n');
     await genesis();
     await appendChained(path, { verdict: 'WEAKENED' });
-    fs.appendFileSync(path, `${legacy}\n\n`);
+    fs.appendFileSync(path, `${stale}\n\n`);
     await appendChained(path, { verdict: 'WEAKENED' });
-    const last = fs.readFileSync(path, 'utf8').trimEnd().split('\n').at(-1);
-    expect(JSON.parse(last)).toMatchObject({ seq: 2, prev: hash(legacy) });
+    const lines = fs.readFileSync(path, 'utf8').trimEnd().split('\n');
+    expect(JSON.parse(lines.at(-1))).toMatchObject({ seq: 2, prev: hash(lines[2]) });
+    await appendChained(path, { verdict: 'WEAKENED' });
+  });
+  it('quarantines the record and reseal recovers after tampering', async () => {
+    await genesis();
+    await appendChained(path, { verdict: 'WEAKENED' });
+    fs.writeFileSync(path, fs.readFileSync(path, 'utf8').split('\n')[0] + '\n');
+    const error = await appendChained(path, { verdict: 'WEAKENED', n: 1 }).catch(e => e);
+    expect(error.code).toBe('LEDGER_TAMPER');
+    const quarantined = fs.readFileSync(join(root, 'audits.quarantine.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(quarantined[0]).toMatchObject({ verdict: 'WEAKENED', n: 1, quarantineReason: expect.stringContaining('rollback') });
+    const sealed = await appendChained(path, { kind: 'genesis', reseal: true, actor: 'orchestrator', reason: 'test' });
+    expect(sealed).toMatchObject({ kind: 'genesis', seq: 0, actor: 'orchestrator', reason: 'test' });
+    expect(await appendChained(path, { verdict: 'WEAKENED' })).toMatchObject({ seq: 1 });
   });
   it('serializes parallel calls with contiguous seq, unique ids and correct prev hashes', async () => {
     await genesis();
@@ -117,10 +150,10 @@ describe('audit ledger chain', () => {
     expect(fs.existsSync(`${path}.lock.reap`)).toBe(false);
     await appendChained(path, {});
   });
-  it('refuses sequence overflow with a repair diagnostic and releases the lock', async () => {
+  it('ignores an unchained maximum-seq line and releases the lock', async () => {
     await genesis();
     fs.appendFileSync(path, `${JSON.stringify({ seq: Number.MAX_SAFE_INTEGER })}\n`);
-    await expect(appendChained(path, {})).rejects.toThrow('repair the ledger before retrying');
+    expect(await appendChained(path, {})).toMatchObject({ seq: 1 });
     expect(fs.existsSync(`${path}.lock`)).toBe(false);
   });
   it('reclaims an abandoned stale lock', async () => {

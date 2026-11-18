@@ -124,8 +124,10 @@ export async function main(argv, deps) {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
         questionHash: QUESTION_HASH, verdict: recordedVerdict, findings, fingerprint,
         ...(fingerprintError !== undefined ? { fingerprintError } : {}) });
-    } catch {
-      deps.stderr('Audit record write failed; repair the record path and retry.\n');
+    } catch (error) {
+      deps.stderr(error?.code === 'LEDGER_TAMPER'
+        ? `AUDIT LEDGER TAMPERING: ${error.message} The record was quarantined in audits.quarantine.jsonl.\n`
+        : 'Audit record write failed; repair the record path and retry.\n');
       return 3;
     }
     deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[recordedVerdict, ...findings].join('\n')}\n`);
