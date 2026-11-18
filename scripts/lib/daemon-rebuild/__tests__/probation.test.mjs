@@ -21,6 +21,113 @@ const proof = (pid = 101, daemonId = 'worker') => ({
 const now = ADOPTED_AT + 2;
 
 describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
+  it.each(['evaluate', 'record', 'evaluate records first', 'record records first'])(
+    'records getter cannot pop owed during %s', async transition => {
+      const { freezeProbation, recordProof, evaluateProbation } = await core();
+      const restored = JSON.parse(JSON.stringify(freezeProbation(options)));
+      const input = transition.endsWith('records first') ? { records: undefined, ...restored } : restored;
+      let reads = 0;
+      Object.defineProperty(input, 'records', { enumerable: true, get() {
+        reads++;
+        input.owed.pop();
+        return { worker: proof() };
+      } });
+      const result = transition.startsWith('evaluate') ? evaluateProbation(input, now)
+        : evaluateProbation(recordProof(input, 'worker', proof(), now), now);
+      expect(result).toEqual({ action: 'pending', owed: ['review'] });
+      expect(reads).toBe(1);
+    },
+  );
+
+  it('an adoption callback getter cannot shrink the roster even when it is the first key', async () => {
+    const { freezeProbation, evaluateProbation } = await core();
+    const roster = [{ id: 'worker' }, { id: 'review' }];
+    const input = { readClosure: undefined, ...options, registered: roster };
+    Object.defineProperty(input, 'readClosure', { enumerable: true, get() {
+      roster.pop();
+      return options.readClosure;
+    } });
+    expect(evaluateProbation(freezeProbation(input), now))
+      .toEqual({ action: 'pending', owed: ['worker', 'review'] });
+  });
+
+  it.each(['boot', 'tick', 'nested boot', 'nested tick'])(
+    'throwing evidence getter is an identity-preserving no-op: %s', async site => {
+      const { freezeProbation, recordProof } = await core();
+      const input = freezeProbation(options);
+      const evidence = proof();
+      const nested = site.startsWith('nested ');
+      const key = site.replace('nested ', '');
+      Object.defineProperty(nested ? evidence[key] : evidence, nested ? 'pid' : key,
+        { enumerable: true, get() { throw new Error('unreadable evidence'); } });
+      expect(recordProof(input, 'worker', evidence, now)).toBe(input);
+    },
+  );
+
+  it.each(['adoptionId', 'registered', 'readClosure'])(
+    'unreadable adoption input returns the original input: %s', async key => {
+      const { freezeProbation } = await core();
+      const input = { ...options };
+      Object.defineProperty(input, key, { enumerable: true, get() { throw new Error('unreadable'); } });
+      expect(freezeProbation(input)).toBe(input);
+    },
+  );
+
+  it.each(['cycle', 'function'])(
+    'uncopyable evidence fails closed without silently stripping fields: %s', async kind => {
+      const { freezeProbation, recordProof } = await core();
+      const input = freezeProbation(options);
+      const evidence = proof();
+      evidence.boot.extra = kind === 'cycle' ? evidence : () => {};
+      expect(recordProof(input, 'worker', evidence, now)).toBe(input);
+    },
+  );
+
+  it.each(['complete', 'files', 'blob'])(
+    'unreadable closure data always leaves the daemon owed: %s', async site => {
+      const { freezeProbation, evaluateProbation } = await core();
+      const value = closure(GOOD);
+      Object.defineProperty(site === 'blob' ? value.files : value,
+        site === 'blob' ? 'worker.mjs' : site,
+        { enumerable: true, get() { throw new Error('unreadable closure'); } });
+      const input = freezeProbation({ ...options, registered: [{ id: 'worker' }], readClosure: () => value });
+      expect(evaluateProbation(input, now)).toEqual({ action: 'pending', owed: ['worker'] });
+    },
+  );
+
+  it('sanitization never executes a serialization hook to hide invalid state fields', async () => {
+    const { freezeProbation, validateProbation, recordProof, evaluateProbation } = await core();
+    const plain = JSON.parse(JSON.stringify(freezeProbation(options)));
+    let calls = 0;
+    const input = { ...plain, toJSON() { calls++; return { ...plain, owed: [], records: {} }; } };
+    expect(validateProbation(input, now)).toBe('state-fields');
+    expect(recordProof(input, 'worker', proof(), now)).toBe(input);
+    expect(evaluateProbation(input, now).action).toBe('pending');
+    expect(calls).toBe(0);
+  });
+
+  it('aliased evidence is copied once even when a getter changes on subsequent reads', async () => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const input = JSON.parse(JSON.stringify(freezeProbation(options)));
+    const evidence = proof();
+    let reads = 0;
+    Object.defineProperty(evidence.boot, 'pid', { enumerable: true, get: () => ++reads === 1 ? 101 : 999 });
+    input.records.worker = evidence;
+    const next = recordProof(input, 'worker', evidence, now);
+    expect(next).not.toBe(input);
+    expect(reads).toBe(1);
+    expect(evaluateProbation(next, now)).toEqual({ action: 'pending', owed: ['review'] });
+  });
+
+  it('oversized input fails closed with operator recovery and identity-preserving no-ops', async () => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const optionsTooLarge = { ...options, registered: new Array(100_001) };
+    expect(freezeProbation(optionsTooLarge)).toBe(optionsTooLarge);
+    const state = { ...freezeProbation(options), owed: new Array(100_001) };
+    expect(recordProof(state, 'worker', proof(), now)).toBe(state);
+    expect(evaluateProbation(state, now)).toEqual({ action: 'pending', reason: expect.stringMatching(/operator recovery required/) });
+  });
+
   describe.each(['shared wrapper', 'shared files', 'independent results'])('%s closure reads', reuse => {
     it.each(['blob', 'membership', 'incomplete', 'empty', 'invalid blob', 'unchanged'])(
       'preserves the proven-good evidence before the adopted read: %s', async variant => {

@@ -4590,8 +4590,20 @@ head, and show process start at/after adoption with a later completed tick. Call
 must obtain boot evidence from that daemon's process record, not from a sibling or
 from the wrapper's first tick time. `evaluateProbation` passes only with all owed
 records, or immediately for a known empty owed set. Non-owed evidence is a no-op.
-Each function reads its input once into a deeply frozen plain copy (enumerable keys only)
-and validates and decides from that copy. A recorded proof returns that fresh copy, so
+Each entry uses the same sanitizing boundary to recursively capture enumerable data
+properties before invoking accessors, including when `records` precedes `owed` in key
+order; validation and decisions use only that frozen plain copy.
+The boundary catches read/copy errors, rejects cycles and functions (except the separately
+captured injected closure reader), memoizes aliases, and does not execute `toJSON`.
+Copying is limited to 100,000 properties/array slots per entry, including getter-produced
+objects. Oversized input follows the same closed path; recover a bounded roster or state
+before retrying, and treat an identity return from adoption as a refused adoption.
+It preserves invalid values such as `undefined` and `NaN` for the validator rather than
+silently dropping unknown fields or coercing values through JSON serialization.
+Unreadable adoption options return the original options; readable but invalid rosters
+still throw the operator recovery error. Unreadable proof/state input is a no-op for
+`recordProof`; validation reports invalid state and evaluation stays pending.
+A recorded proof returns a fresh frozen copy, so
 mutating restored (for example JSON-parsed) state, a getter or a hidden key cannot
 discharge another daemon. A no-op still returns the caller's own input object.
 Legacy single-record state cannot promote; it requires operator recovery.
@@ -4602,6 +4614,13 @@ it does not establish production probation integration. Remaining wiring: enumer
 clone registrations, read both import closures by SHA, persist adoption and daemon
 boot/tick records under a shared mutation lock, and advance proven-good only on pass.
 No rollback, boot counting or probation deadline policy ships in this I1 core.
+
+`scripts/conveyor/soak/breaks/probation-accessor-snapshot.mjs` replays the operator's
+shared-files-map, records-getter-popping-owed and throwing-boot probes against the real
+core. Its soak wrapper is automatically registered by the breaks directory discovery.
+The shared-map and nested-getter cases are non-regression pins; the records getter and
+top-level boot getter reproduce the failure at `41aaa588c39397fc7ad7eca7f63e9bf5fa041483`.
+These pure-core probes do not establish live daemon integration or merge compatibility.
 ## Review job exit evidence
 
 Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
