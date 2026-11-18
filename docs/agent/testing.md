@@ -4449,3 +4449,7 @@ review-owned merge-gate holds. Preserve the classification from that enriched sn
 `plannerRows`; use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining
 top-level ownership and the folded `reviewRefusal` separately. The planner-row unit and
 production suites pin refusal parity and propagation through normal and read-only passes.
+Reuse requires a known matching repo, PR, head and canonical required-set hash; legacy or
+mismatched rows are recomputed. Normal passes carry `plannerRequiredChecks` for validation.
+Derive red-only eligibility from the same head-aware CI classification: wrong-head,
+missing-head and unknown-required-set evidence must remain closed.

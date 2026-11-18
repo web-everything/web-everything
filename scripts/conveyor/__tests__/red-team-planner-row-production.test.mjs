@@ -29,6 +29,7 @@ const source = () => ({ number: pr, headRefOid: head, headRefName: 'lane/5762-ex
 it.each([false, true])('carries the normal reconciler classification to daemon and external readers (readOnly=%s)', readOnly => {
   const raw = source();
   const plan = runReconcilePass({ ...options(raw), readOnly });
+  expect(plan.plannerRequiredChecks).toEqual(['test', 'review-gate', 'merge-gate']);
   const row = readPlannerRow({ repo: 'web-everything/web-everything', pr, plan, rawPrs: [raw] });
   expect(row.absent).toBe(false);
   expect(row.refusal).toBe(plan.refusals.find(r => r.prNumber === pr));

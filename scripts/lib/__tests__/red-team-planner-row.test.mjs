@@ -95,12 +95,67 @@ describe('readPlannerRow', () => {
 
   it('uses the producer classification with an adapted refusal instead of re-deriving it from the raw daemon snapshot', () => {
     const original = refusal('nothing-owed', { phase: 'queued' });
-    const saved = readPlannerRow({ pr, refusals: [original], rawPrs: [rawPr([check('review-gate')])], requiredChecks: ['review-gate'] });
+    const requiredChecks = ['review-gate'];
+    const saved = readPlannerRow({ repo, pr, refusals: [original], rawPrs: [rawPr([check('review-gate')])], requiredChecks });
     const adapted = { ...original, kind: 'already-reviewed-head' };
-    const result = readPlannerRow({ repo, pr, plan: { refusals: [adapted], plannerRows: [saved] }, rawPrs: [rawPr()] });
+    const result = readPlannerRow({ repo, pr, plan: { refusals: [adapted], plannerRows: [saved] }, rawPrs: [rawPr()], requiredChecks });
     expect(result.refusal).toBe(adapted);
     expect(result.reviewOwnedChecks).toBe(saved.reviewOwnedChecks);
     expect(result.reviewOwnedChecks.reviewOwned).toEqual(['review-gate']);
+  });
+
+  it.each(['failure', 'success'])('rejects %s checks entirely from another head for CI and red-only evidence', conclusion => {
+    const checks = [check('test', 'success'), check('review-gate', conclusion)]
+      .map(row => ({ ...row, head_sha: 'b'.repeat(40) }));
+    const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')],
+      rawPrs: [rawPr(checks)], requiredChecks: ['test', 'review-gate'] });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [
+      { name: 'test', reason: 'wrong-head' }, { name: 'review-gate', reason: 'wrong-head' },
+    ] });
+  });
+
+  it.each([
+    ['same head and required set', {}, true],
+    ['reordered and duplicated required set', { requiredChecks: ['review-gate', 'test', 'test'] }, true],
+    ['head B with no checks', { rawPrs: [{ ...rawPr(), headRefOid: 'b'.repeat(40) }] }, false],
+    ['changed required set', { requiredChecks: ['test', 'review-gate', 'integration'] }, false],
+    ['different repo', { repo: 'other/repo' }, false],
+    ['different PR', { pr: pr + 1, rawPrs: [{ ...rawPr(), number: pr + 1 }],
+      refusals: [refusal('review-ci', { prNumber: pr + 1 })] }, false],
+    ['missing repo', { repo: undefined }, false],
+    ['missing head', { rawPrs: [{ ...rawPr(), headRefOid: undefined }] }, false],
+    ['missing required set', { requiredChecks: null }, false],
+    ['empty required set', { requiredChecks: [] }, false],
+    ['malformed required set', { requiredChecks: ['test', ''] }, false],
+  ])('reuses saved classification only for a known matching key: %s', (_, changed, reuse) => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test', 'review-gate'] };
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success'), check('review-gate', 'success')])] });
+    expect(saved.reviewOwnedChecks.ci.allowed).toBe(true);
+    const result = readPlannerRow({ ...input, rawPrs: [rawPr()], plan: { plannerRows: [saved] }, ...changed });
+    expect(result.reviewOwnedChecks === saved.reviewOwnedChecks).toBe(reuse);
+    expect(result.reviewOwnedChecks.ci.allowed).toBe(reuse);
+    if (!reuse) expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('recomputes legacy saved rows with no classification key', () => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test'] };
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success')])] });
+    delete saved.classificationKey;
+    const result = readPlannerRow({ ...input, rawPrs: [rawPr()], plan: { plannerRows: [saved] } });
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'missing' }] });
+  });
+
+  it.each([
+    ['missing head', { headRefOid: undefined }, ['review-gate'], 'missing-head'],
+    ['missing required set', {}, null, 'unknown-required-set'],
+    ['empty required set', {}, [], 'unknown-required-set'],
+  ])('fails closed on red-only evidence with %s', (_, changed, requiredChecks, reason) => {
+    const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')],
+      rawPrs: [{ ...rawPr([check('review-gate')]), ...changed }], requiredChecks });
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, reason });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
   });
 
   it('preserves refusal order and multiple refusals for the same PR', () => {
