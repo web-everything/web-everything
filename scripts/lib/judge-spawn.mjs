@@ -1007,11 +1007,19 @@ export async function judgeSpawn({
 
     const thisAttemptMs = Date.now() - startedAt;
     wallMs += thisAttemptMs;
+    // Process status is terminal regardless of whether stdout can be parsed. Parse only to
+    // preserve higher-priority quota/budget evidence before applying this failure.
+    const processFailure = timedOut
+      ? new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr })
+      : code !== 0 || signal != null
+        ? Object.assign(new Error(`juror process failed (exit ${code ?? 'none'}, signal ${signal ?? 'none'})`), {
+          unparseableStdout: true, verdictIntegrity: true, processFailed: true,
+        })
+        : null;
     let outcome;
     try {
-      // Preserve explicit CLI failures (including quota and budget errors).
       outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
-      if (timedOut) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
+      if (processFailure) throw processFailure;
       const valid = validate(outcome.value);
       if (!valid || Object.keys(outcome.value).length === 0) {
         const violation = validate.errors?.[0];
@@ -1022,17 +1030,10 @@ export async function judgeSpawn({
         error.verdictIntegrity = true;
         throw error;
       }
-      if (code !== 0 || signal != null) {
-        const error = new Error(`juror process failed (exit ${code ?? 'none'}, signal ${signal ?? 'none'})`);
-        error.unparseableStdout = true;
-        error.verdictIntegrity = true;
-        error.processFailed = true;
-        throw error;
-      }
     } catch (error) {
       // Spending limits outrank the wall-clock bound; both outrank generic failures.
       if (error instanceof JudgeBudgetError || error.quota === true) throw error;
-      if (timedOut) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
+      if (processFailure) error = processFailure;
       if (error.unparseableStdout !== true) throw error;
       const reason = error.verdictIntegrity ? error.message : null;
       failedAttempts.push({
