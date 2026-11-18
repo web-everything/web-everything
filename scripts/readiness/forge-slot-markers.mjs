@@ -27,8 +27,11 @@ const HELD_NAME = /^slot-(\d+)\.unconfirmed(?:\.held-[0-9a-f]{16})?$/;
  */
 export function markerContent({owner, pid, nowMs, host, run, caller, lane, pr}) {
   const tagCaller = normalizeCaller(caller);
-  return JSON.stringify({v: 1, note: 'remote termination unconfirmed', host, owner, pid, at: nowMs,
-    ...(run ? {run} : {}), ...(tagCaller ? {caller: tagCaller} : {}),
+  // The core fields get the reader's own checks too: an omitted field is tolerated, a malformed one would make the marker unreadable.
+  return JSON.stringify({v: 1, note: 'remote termination unconfirmed',
+    ...(typeof host === 'string' ? {host} : {}), ...(typeof owner === 'string' ? {owner} : {}),
+    ...(Number.isInteger(pid) ? {pid} : {}), ...(Number.isFinite(nowMs) ? {at: nowMs} : {}),
+    ...(typeof run === 'string' && RUN.test(run) ? {run} : {}), ...(tagCaller ? {caller: tagCaller} : {}),
     ...(validLane(lane) ? {lane} : {}), ...(validPr(pr) ? {pr} : {})}) + '\n';
 }
 
@@ -442,7 +445,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
                     await Promise.race([Promise.resolve().then(() => finishRun({run: entry.run, nonce: entry.nonce})),
                       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('finish timeout')), FINISH_TIMEOUT_MS); })]);
                     finishedRuns.add(finishKey); trim(finishedRuns);
-                    try { unlinkSync(finishStamp(entry.run)); } catch { /* none */ }
+                    // The stamp stays until the marker is released: another process's lagging sample may still list the run.
                   } catch {
                     if (!finishFailuresLogged.has(entry.run)) {
                       finishFailuresLogged.add(entry.run); trim(finishFailuresLogged);

@@ -173,6 +173,19 @@ describe('R1017 marker traceability', () => {
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
     expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
   });
+  it.each([
+    [{run: 'bogus'}, 'run'], [{run: RUN_A + '\n'}, 'run'], [{host: null}, 'host'], [{owner: 7}, 'owner'],
+    [{pid: 1.5}, 'pid'], [{nowMs: Number.NaN}, 'at'],
+  ])('the writer omits a core field the reader would reject instead of writing an unreadable marker: %j', async (bad, field) => {
+    const root = setup({}), file = join(root, 'slot-0.unconfirmed');
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...bad}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).not.toHaveProperty(field);
+    if (field === 'run') { // a dropped run leaves a readable run-less marker, released by the idle-Forge path
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
+      expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+    }
+  });
   it.each([0, 1])('releases a dead owner on idle Forge alike for caller.ppid %s (0 = parent outside the PID namespace)', async ppid => {
     const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
     const caller = {kind: 'files', session: 'fix-7024', ppid, cmd: 'npm'};

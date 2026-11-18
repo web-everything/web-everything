@@ -132,6 +132,13 @@ describe('R1017 finish settled active runs for dead owners', () => {
     const stamp = JSON.parse(readFileSync(join(f.root, `.finish-${RUN_DEAD}`), 'utf8'));
     expect(stamp).toEqual({at: NOW});
   });
+  it('keeps the finish stamp through a successful finish and removes it only with the released marker', async () => {
+    const f = fixture();
+    expect(await f.reaper.step(f.sample())).toEqual(['slot-0.unconfirmed']);
+    expect(f.finishRun).toHaveBeenCalledTimes(1);
+    expect(existsSync(f.file)).toBe(false);
+    expect(existsSync(join(f.root, `.finish-${RUN_DEAD}`))).toBe(false);
+  });
   it('ignores a future-dated or malformed finish stamp instead of suppressing the retry for good', async () => {
     for (const text of [JSON.stringify({at: NOW + 3_600_000}), 'garbage']) {
       const f = fixture({finishRun: vi.fn().mockRejectedValue(new Error('transport failed'))});
