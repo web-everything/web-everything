@@ -2870,6 +2870,7 @@ head with them. Test an initially empty repository label catalog and a same-head
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
 UNKNOWN listings before collecting head-bound context and also revalidates before
 merging, waiting for the configured delay at most three times per read stage.
+Before listing re-polls, a bounded REST GET trigger requests mergeability computation for up to ten unknown or empty candidates without changing their facts or classification.
 Hermetic drain CLI fixtures with synthetic UNKNOWN reads pin
 `WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC=0` while retaining the retry count and
 merge/hold assertions. Several read stages can otherwise exhaust a child-process
