@@ -4615,28 +4615,9 @@ a live target replacing a stale cached target with a different head and red chec
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
 
-## Owed CI rerun recovery
+## Owed CI rerun execution
 
 The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
-Keep `owed-ci-rerun-executor.test.mjs` and `owed-ci-rerun-recovery.test.mjs` in the scoped gate
-with the timeout dispatcher and review daemon suites. Cover oldest-first limits, non-fatal effects,
-and daemon completion waiting. Expiry schedules a reconciliation-only planner row, including when the retry cap is spent;
-it never clears the heal hold. Release pending state only after a bound observation proves the
-same target job completed at exactly the reserved run and job attempt. Reconciliation-only rows
-never request a run; the next plan selects
-a retry or heal from the observed state. Direct retries may reselect once under the per-head lock.
-Keep the expired-reservation/failed-observation regression asserting zero heal dispatches. Missing timestamps and unreadable state remain held.
-Pin historical young-reservation fixtures to their original clock, and test the spent-budget heal path.
-
-Owed-rerun recovery must retain live or unknown same-host, same-namespace requester identities past expiry,
-including while another executor awaits the API. Only proven-dead local owners may release
-after the stale threshold; missing/different namespace markers (including legacy/remote
-owners) stay pending regardless of age. Release also requires a bound, completed observation
-at exactly the reserved run and job attempt. Older attempts and in-progress observations retain
-the hold; a strictly newer run attempt confirms the pending request. Expired ambiguous requests
-become `rejected` without `released: true`
-and spend retry budget; only reservations known never to have sent a request are free releases.
-Test cap-to-heal without an extra rerun. Record Linux PID namespaces or a non-Linux boot marker;
-unreadable markers are unknown, never proof of local death. Pin dead-owner fixtures explicitly;
-never infer death from age.
-The mechanical executor uses the shared main-staleness guard and returns refused rows on refusal.
+Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
+daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
+refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".

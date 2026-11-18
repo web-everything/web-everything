@@ -8,6 +8,15 @@ const rows = Array.from({ length: 13 }, (_, i) => ({ kind: 'ci-timeout-rerun', p
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 describe('owed rerun executor', () => {
+  it('refuses every rerun when main freshness is unknown (offline), never throwing', async () => {
+    const dispatchRetry = vi.fn();
+    const out = await executeOwedCiReruns({ rows: rows.slice(0, 2), repo, dispatchRetry, checkStaleness: () => ({ offline: true }) });
+    expect(dispatchRetry).not.toHaveBeenCalled();
+    expect(out.requested).toEqual([]);
+    expect(out.refused).toHaveLength(2);
+    expect(out.refused[0].reason).toMatch(/freshness unknown/);
+  });
+
   it('executes ten oldest PRs sequentially and leaves oversized input owed next tick', async () => {
     let active = 0;
     const calls = [];

@@ -731,8 +731,8 @@ describe('xng7q1p retry reservation and restart soak', () => {
     const e = evidence(); await reservePending(dir, e);
     await flushTimeoutFollowups({ dir, repo: e.repo, now: () => t0,
       effects: { observe: (...args) => ({ ...observe(...args), open: false }) } });
-    expect(readTimeoutHold({ ...e, dir, now: t0 })).toEqual({ status: 'refused', reason: 'retry-outcome-pending' });
-    expect(readTimeoutBudget({ ...e, dir, now: t0 })).toEqual({ confirmed: 0, rejected: 0, pending: true, pendingSince: expect.any(String) });
+    expect(readTimeoutHold({ ...e, dir })).toEqual({ status: 'refused', reason: 'retry-outcome-pending' });
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 0, rejected: 0, pending: true, pendingSince: expect.any(String) });
   }));
   it('confirms the last closed-PR observation and still retries owed filing after retirement', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
@@ -846,16 +846,13 @@ describe('xng7q1p retry reservation and restart soak', () => {
     })));
     expect(readFileSync(join(dir, 'deliveries'), 'utf8')).toBe('request\n');
   }), 30_000);
-  it('explicit rejected requests spend retry budget and block further requests at cap', async () => harness(async (dir) => {
+  it('explicit rejected requests spend no successful budget and never heal', async () => harness(async (dir) => {
     const e = evidence(); let reject = true;
-    const request = vi.fn(() => ({ status: reject ? 'rejected' : 'confirmed' }));
-    const opts = { dir, repo: e.repo, effects: { observe, request } };
+    const opts = { dir, repo: e.repo, effects: { observe, request: () => ({ status: reject ? 'rejected' : 'confirmed' }) } };
     expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ reason: 'retry-api-rejected' });
     reject = false;
     expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ status: 'requested' });
-    expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ reason: 'timeout-retries-exhausted' });
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 1, rejected: 1, pending: false });
+    expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ reason: 'waiting-for-new-attempt' });
   }));
   it('owed filing retries independently after CI passes and never reallocates its card identity', async () => harness(async (dir) => {
     const e = evidence(); const ids = []; let reject = true;

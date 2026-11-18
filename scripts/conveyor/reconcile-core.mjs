@@ -3071,18 +3071,6 @@ export function planReconcile({
       continue;
     }
 
-    // Expiry schedules reconciliation even when the retry cap is spent. Keep the heal hold until
-    // the executor has bound an observation; this row cannot request another run. An unobserved
-    // expired request is counted as spent, so the next plan can reach the cap and fall through to heal.
-    const pendingRetry = [pr.owedCiRerunRetry, pr.timeoutRetry].find(retry => retry?.eligible
-      && retry.head === pr.headRefOid && retry.pr === prNumber);
-    if (pr.timeoutRetryBudget?.pending && pr.timeoutRetryBudget.pendingStale && !pr.timeoutRetryBudget.reason && pendingRetry) {
-      dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun',
-        timeoutRetry: { ...pendingRetry, reconcilePendingOnly: true },
-        why: 'expired CI rerun reservation needs a bound observation before rerun or heal can proceed' });
-      continue;
-    }
-
     // ── CODEQL-HELD PR (card x8cnbii) — LIVE 2026-10-08, PR #4370: ready-to-merge + review:accepted (phase `queued`)
     // with every REQUIRED check green, but the drain refuses to land it because its non-required `CodeQL` check
     // failed (`drainBlocksOnCodeQL`). Phase `queued` answers `nothing-owed`, so the drain skipped it every pass and
@@ -3432,10 +3420,9 @@ export function planReconcile({
       // xng7q1p: same-head mechanical retries never consume or rewrite heal markers.
       // All main-red, escalation and live-owner guards above retain precedence.
       // An infra-cancelled re-run is bounded by ALL attempts (confirmed + rejected/refused), so a re-run the API keeps
-      // rejecting falls through to ci-heal instead of being re-planned forever. Expired ambiguous requests
-      // also spend budget, including ordinary timeouts: they may already have been sent.
+      // rejecting falls through to ci-heal instead of being re-planned forever; ordinary timeouts keep confirmed-only.
       // (No observed budget stays `undefined`, which never authorizes a re-run.)
-      const retrySpent = retryBudget?.confirmed !== undefined
+      const retrySpent = pr.timeoutRetry?.infraCancelled && retryBudget?.confirmed !== undefined
         ? retryBudget.confirmed + (retryBudget.rejected ?? 0) : retryBudget?.confirmed;
       if (retrySpent < (pr.timeoutRetry?.infraCancelled ? (pr.timeoutRetry.cap ?? 6) : 2) && pr.timeoutRetry?.eligible && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
         dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', timeoutRetry: pr.timeoutRetry,

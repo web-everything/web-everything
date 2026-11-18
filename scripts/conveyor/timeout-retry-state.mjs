@@ -2,43 +2,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { hostname } from 'node:os';
-import childProcess from 'node:child_process';
-import { pidIdentity, pidNamespace } from '../lib/pid-alive.mjs';
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { ghThrottleLockRoot } from '../lib/gh-throttle.mjs';
-
-/** PID tables are comparable only within the same namespace (or boot on non-Linux hosts). */
-export function timeoutRequesterNamespace({ platform = process.platform, readNamespace = pidNamespace, exec = childProcess.execFileSync } = {}) {
-  try {
-    if (platform === 'linux') return readNamespace() || null;
-    const boot = String(exec('sysctl', ['-n', 'kern.boottime'], {
-      encoding: 'utf8', timeout: 5_000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'pipe'],
-    })).match(/^\{\s*sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)\s*\}/);
-    return boot ? `boot:${boot[1]}:${boot[2]}` : null;
-  } catch { return null; }
-}
-
-/** Eligibility for observation-based release, never proof that a request was not sent.
- * Only proven-dead same-host, same-namespace owners are eligible; all unknown owners remain held.
- */
-export function timeoutPendingIsStale(pending, now = Date.now(), env = process.env, ownerProbe = {}) {
-  const raw = Number(env.WE_TIMEOUT_RERUN_PENDING_STALE_MS);
-  const policy = cascadePolicy('timeoutRerun', undefined, {
-    env, standard: { pendingStaleMs: 20 * 60_000 },
-    envValues: { pendingStaleMs: Number.isFinite(raw) && raw > 0 ? raw : undefined },
-    valid: { pendingStaleMs: v => Number.isFinite(v) && v > 0 },
-  });
-  const at = Date.parse(pending?.reservedAt);
-  if (!Number.isFinite(at) || now - at <= policy.value.pendingStaleMs) return false;
-  const owner = pending.requester;
-  const { host = hostname(), namespace = timeoutRequesterNamespace(), identity = pidIdentity } = ownerProbe;
-  if (!owner || owner.hostname !== host || !namespace || owner.namespace !== namespace
-      || !Number.isInteger(owner.pid) || owner.pid <= 0) {
-    return false;
-  }
-  return identity(owner.pid, { expectStart: owner.runnerStart, startedBy: at }).alive === false;
-}
 
 export const timeoutStateDir = () => join(ghThrottleLockRoot(), 'ci-timeout-reruns');
 export const timeoutKey = ({ repo, pr, head }) => createHash('sha256')
@@ -55,20 +19,17 @@ export function readTimeoutStates(evidence, dir = timeoutStateDir()) {
   });
 }
 
-export function readTimeoutBudget({ dir, now = Date.now(), ownerProbe, ...evidence }) {
+export function readTimeoutBudget({ dir, ...evidence }) {
   try {
     dir ??= timeoutStateDir(); // resolved inside the guard: an unreadable lock root is "unreadable state", never a throw
     const requests = readTimeoutStates(evidence, dir).flatMap((state) => state.requests);
     // `rejected` = requests GitHub refused (4xx) or whose job was no longer failed at the evidenced attempt. They spend
-    // no confirmed budget, but the planner counts them against the re-run cap so a persistently rejected re-run
+    // no confirmed budget, but the planner counts them against the infra re-run cap so a persistently rejected re-run
     // reaches ci-heal instead of being re-planned forever. An early `released` reservation (a failed observation or a
-    // stale head: nothing was ever sent) is transient and is NOT counted. Expired ambiguous requests are spent.
-    const pending = requests.filter(r => r.status === 'pending');
+    // stale head: nothing was ever sent) is transient and is NOT counted.
     return { confirmed: requests.filter((r) => r.status === 'confirmed').length,
       rejected: requests.filter((r) => r.status === 'rejected' && !r.released).length,
-      // Expiry schedules observation; it never proves an ambiguous request safe to heal.
-      pending: pending.length > 0,
-      ...(pending.length && pending.every(r => timeoutPendingIsStale(r, now, process.env, ownerProbe)) ? { pendingStale: true } : {}),
+      pending: requests.some((r) => r.status === 'pending'),
       // When the oldest still-pending request was reserved: lets the planner tell a rerun that is simply in
       // flight (hold, no human) from one that has been unresolved too long (escalate).
       ...(requests.some((r) => r.status === 'pending')

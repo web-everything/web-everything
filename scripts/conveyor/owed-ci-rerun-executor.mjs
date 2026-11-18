@@ -1,6 +1,6 @@
 /** Fast mechanical executor: no fixer slots or fix-pass budget. */
 import { dispatchTimeoutRetry } from '../operations/ci-heal-pr-dispatch.mjs';
-import { assertMainNotStale } from '../lib/main-staleness.mjs';
+import { assertMainNotStale, checkMainStaleness, gitRun } from '../lib/main-staleness.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
@@ -25,7 +25,15 @@ export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dis
       .sort((a, b) => Number(a.prNumber) - Number(b.prNumber));
     result.skippedOverCap = Math.max(0, owed.length - cap);
     if (result.skippedOverCap) safeLog(`owed-ci-rerun: ${result.skippedOverCap} over cap ${cap}; still owed next review tick`);
-    try { if (owed.length) assertMainNotStale(root, checkStaleness); }
+    // Unknown freshness (fetch failed) is NOT fresh here: the shared guard is fail-open on `offline`, a rerun is not.
+    const probe = checkStaleness ?? (r => checkMainStaleness({ base: 'main', autoFf: process.env.WE_DAEMON_MANAGED_CLONE !== '1',
+      cleanOnly: true, run: args => gitRun(args, { cwd: r }) }));
+    const strictCheck = r => {
+      const st = probe(r);
+      if (st?.offline) throw new Error('main freshness unknown (offline); owed rerun deferred');
+      return st;
+    };
+    try { if (owed.length) assertMainNotStale(root, strictCheck); }
     catch (error) {
       result.refused = owed.map(row => ({ pr: row.prNumber, reason: String(error?.message ?? error) }));
       result.skippedOverCap = 0;

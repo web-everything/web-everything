@@ -44,11 +44,10 @@ import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 
 import { readFileSync, mkdirSync, readdirSync, existsSync, openSync, fstatSync, readSync, closeSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir, hostname } from 'node:os';
-import { pidIdentityStamp } from '../lib/pid-alive.mjs';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { timeoutPendingIsStale, timeoutRequesterNamespace, timeoutStateDir, timeoutKey, readTimeoutStates, readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
+import { timeoutStateDir, timeoutKey, readTimeoutStates, readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -496,11 +495,11 @@ export async function runReconcileCiHealDispatch({
       const rounds = entry.timeoutRetry?.infraCancelled ? Math.max(1, entry.timeoutRetry.jobs?.length ?? 1) : 1;
       for (let i = 0; i < rounds; i++) {
         const result = await retryTimeout(entry.timeoutRetry, { root, repo: CONSTELLATION_REPOS[repoKey].slug });
-        timeoutResults.push({ ...result, why: result.reason ?? result.why ?? 'unknown timeout retry result', kind: 'ci-timeout-rerun', pr: entry.prNumber });
+        timeoutResults.push({ ...result, kind: 'ci-timeout-rerun', pr: entry.prNumber, ...(result.why == null && result.reason != null ? { why: result.reason } : {}) });
         if (result.status !== 'requested') break;
       }
     } catch (error) {
-      timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message, why: error.message ?? String(error) });
+      timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message, why: error.message });
     }
   }
   let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
@@ -580,7 +579,7 @@ export async function runReconcileCiHealDispatch({
       if (unsettled) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-unsettled', why: unsettled.error ?? 'owned wrapper still running' }); continue; }
       if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
       const hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
-      if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold, why: hold.reason ?? hold.why ?? 'retry-outcome-pending' }); continue; }
+      if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold, why: hold.why ?? hold.reason }); continue; }
       if (salvageEnabled()) {
         let recovered = null;
         try { recovered = await salvage({ entry, root, repoKey, profile }); } catch { /* Fall through to dispatch. */ }
@@ -871,8 +870,8 @@ export function timeoutGithubEffects({ exec = execFileSyncThrottled } = {}) {
 function confirmedTimeouts(state) { return state.requests.filter((r) => r.status === 'confirmed').length; }
 
 /** An ambiguous request must not become an agent heal just because this tick's evidence read failed. */
-export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir(), now = Date.now() }) {
-  const budget = readTimeoutBudget({ repo, pr, head, dir, now });
+export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
+  const budget = readTimeoutBudget({ repo, pr, head, dir });
   return budget.pending ? { status: 'refused', reason: budget.reason ?? 'retry-outcome-pending' } : null;
 }
 
@@ -972,7 +971,7 @@ export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = time
  * budget. It reconciles only on an observed newer run attempt for the SAME repository and head.
  */
 export async function dispatchTimeoutRetry(evidence, {
-  root = REPO_ROOT, repo, dir = timeoutStateDir(), effects = timeoutGithubEffects(), fileFollowup, now = Date.now, ownerProbe,
+  root = REPO_ROOT, repo, dir = timeoutStateDir(), effects = timeoutGithubEffects(), fileFollowup, now = Date.now,
 } = {}) {
   const refuse = (reason, extra = {}) => ({ status: 'refused', reason, ...extra });
   if (!evidence?.eligible || evidence.repo !== repo || !evidence.head || !evidence.signature
@@ -985,88 +984,69 @@ export async function dispatchTimeoutRetry(evidence, {
     return { version: 1, evidence, card: legacy.find((state) => state.card)?.card,
       requests: legacy.flatMap((state) => state.requests).map((request, id) => ({ ...request, id })) };
   };
-  const attempt = async (allowRelease) => {
-    let reservation;
-    const selected = timeoutTransaction(path, initial, (state) => {
-      const pending = state.requests.find((r) => r.status === 'pending');
-      if (pending) return { pending: structuredClone(pending) };
-      if (evidence.reconcilePendingOnly) return { waiting: true };
-      const spent = state.requests.filter(r => r.status === 'confirmed' || (r.status === 'rejected' && !r.released)).length;
-      if (spent >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
-      const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
-        && r.target.run === j.run && r.target.job === j.job && r.target.attempt === j.attempt));
-      if (!target) return { waiting: true };
-      reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', requester: { pid: process.pid, hostname: hostname(),
-        namespace: timeoutRequesterNamespace(), runnerStart: pidIdentityStamp(process.pid).runnerStart }, reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
-      state.requests.push(reservation);
-      return { target };
-    });
-    if (selected.exhausted) {
-      await fileTimeoutFollowup(path, { root, fileFollowup });
-      return refuse('timeout-retries-exhausted', { card: JSON.parse(readFileSync(path, 'utf8')).card?.payload.num });
-    }
-    if (selected.waiting) return refuse('waiting-for-new-attempt');
-    const target = selected.pending?.target ?? selected.target;
-    // A reservation THIS call created has had no request sent yet, so an early refusal must release it:
-    // left `pending` it would read as an ambiguous in-flight request and wedge every later tick on
-    // `retry-outcome-pending`. A reservation inherited from an earlier call (`selected.pending`) may have
-    // been sent, so only the observed stale-reservation path below can release it.
-    const releaseFresh = () => {
-      if (reservation) timeoutTransaction(path, initial, (state) => {
-        const request = state.requests[reservation.id];
-        // `released` marks an early release (observation failed / stale head): no request was ever sent, so it is not an
-        // attempt the infra re-run cap should count (`readTimeoutBudget` skips it) — a flaky GitHub read must not burn the cap.
-        if (request?.status === 'pending') { request.status = 'rejected'; request.released = true; }
-      });
-    };
-    let observed;
-    try { observed = await effects.observe(evidence, target); }
-    catch (error) { releaseFresh(); return refuse(`retry-observation-unknown:${error.message}`); }
-    const bound = observed.repo === repo && observed.head === evidence.head && observed.runHead === evidence.head
-      && observed.run === target.run && observed.jobRun === target.run && observed.job === target.job;
-    if (!bound || !observed.open) { releaseFresh(); return refuse('stale-head-or-job'); }
-    if (selected.pending) {
-      if (!Number.isInteger(observed.attempt) || !Number.isInteger(target.attempt)) return refuse('retry-observation-unknown:invalid-attempt');
-      if (observed.attempt <= target.attempt) {
-        if (observed.attempt !== target.attempt || observed.jobAttempt !== target.attempt || observed.status !== 'completed'
-            || !allowRelease || !timeoutPendingIsStale(selected.pending, now(), process.env, ownerProbe)) return refuse('retry-outcome-pending');
-        timeoutTransaction(path, initial, (state) => {
-          const pending = state.requests[selected.pending.id];
-          if (pending?.status === 'pending' && pending.reservedAt === selected.pending.reservedAt) {
-            pending.status = 'rejected'; delete pending.released;
-            pending.outcome = 'ambiguous request expired unobserved; counted as spent';
-          }
-        });
-        if (evidence.reconcilePendingOnly) return refuse('retry-reconciled-wait-for-evidence');
-        return attempt(false); // Re-select under the same per-head lock, at most once.
-      }
-      timeoutTransaction(path, initial, (state) => {
-        const pending = state.requests[selected.pending.id];
-        if (pending.status === 'pending') {
-          pending.status = 'confirmed'; pending.outcome = `observed run attempt ${observed.attempt}; request attribution uncertain`;
-        }
-      });
-      await fileTimeoutFollowup(path, { root, fileFollowup });
-      return refuse('retry-reconciled-wait-for-evidence');
-    }
-    if (observed.attempt !== target.attempt || observed.jobAttempt !== target.attempt
-        || observed.status !== 'completed'
-        || (evidence.infraCancelled ? ['success', 'skipped', 'neutral'].includes(observed.conclusion) : observed.conclusion !== 'failure')) {
-      timeoutTransaction(path, initial, (state) => { state.requests[reservation.id].status = 'rejected'; });
-      return refuse('job-no-longer-failed-at-evidenced-attempt');
-    }
-    let outcome;
-    try { outcome = await effects.request(evidence, target); }
-    catch (error) { outcome = { status: 'ambiguous', reason: error.message }; }
-    timeoutTransaction(path, initial, (state) => {
+  let reservation;
+  const selected = timeoutTransaction(path, initial, (state) => {
+    if (confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
+    const pending = state.requests.find((r) => r.status === 'pending');
+    if (pending) return { pending: structuredClone(pending) };
+    const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
+      && r.target.run === j.run && r.target.job === j.job && r.target.attempt === j.attempt));
+    if (!target) return { waiting: true };
+    reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
+    state.requests.push(reservation);
+    return { target };
+  });
+  if (selected.exhausted) {
+    await fileTimeoutFollowup(path, { root, fileFollowup });
+    return refuse('timeout-retries-exhausted', { card: JSON.parse(readFileSync(path, 'utf8')).card?.payload.num });
+  }
+  if (selected.waiting) return refuse('waiting-for-new-attempt');
+  const target = selected.pending?.target ?? selected.target;
+  // A reservation THIS call created has had no request sent yet, so an early refusal must release it:
+  // left `pending` it would read as an ambiguous in-flight request and wedge every later tick on
+  // `retry-outcome-pending`. A reservation inherited from an earlier call (`selected.pending`) may have
+  // been sent, so it is never released here.
+  const releaseFresh = () => {
+    if (reservation) timeoutTransaction(path, initial, (state) => {
       const request = state.requests[reservation.id];
-      // A concurrent observer may have confirmed the pending request already; never demote it.
-      if (request.status !== 'confirmed') request.status = ['confirmed', 'rejected'].includes(outcome?.status) ? outcome.status : 'pending';
-      request.outcome = outcome?.status === 'confirmed' ? 'API accepted; retry result not yet observed' : (outcome?.reason ?? 'API outcome unknown');
+      // `released` marks an early release (observation failed / stale head): no request was ever sent, so it is not an
+      // attempt the infra re-run cap should count (`readTimeoutBudget` skips it) — a flaky GitHub read must not burn the cap.
+      if (request?.status === 'pending') { request.status = 'rejected'; request.released = true; }
+    });
+  };
+  let observed;
+  try { observed = await effects.observe(evidence, target); }
+  catch (error) { releaseFresh(); return refuse(`retry-observation-unknown:${error.message}`); }
+  const bound = observed.repo === repo && observed.head === evidence.head && observed.runHead === evidence.head
+    && observed.run === target.run && observed.jobRun === target.run && observed.job === target.job;
+  if (!bound || !observed.open) { releaseFresh(); return refuse('stale-head-or-job'); }
+  if (selected.pending) {
+    if (observed.attempt <= target.attempt) return refuse('retry-outcome-pending');
+    timeoutTransaction(path, initial, (state) => {
+      const pending = state.requests[selected.pending.id];
+      if (pending.status === 'pending') {
+        pending.status = 'confirmed'; pending.outcome = `observed run attempt ${observed.attempt}; request attribution uncertain`;
+      }
     });
     await fileTimeoutFollowup(path, { root, fileFollowup });
-    return outcome?.status === 'confirmed' ? { status: 'requested', head: evidence.head, run: target.run, job: target.job, attempt: target.attempt }
-      : refuse(outcome?.status === 'rejected' ? 'retry-api-rejected' : 'retry-outcome-pending');
-  };
-  return attempt(true);
+    return refuse('retry-reconciled-wait-for-evidence');
+  }
+  if (observed.attempt !== target.attempt || observed.jobAttempt !== target.attempt
+      || observed.status !== 'completed'
+      || (evidence.infraCancelled ? ['success', 'skipped', 'neutral'].includes(observed.conclusion) : observed.conclusion !== 'failure')) {
+    timeoutTransaction(path, initial, (state) => { state.requests[reservation.id].status = 'rejected'; });
+    return refuse('job-no-longer-failed-at-evidenced-attempt');
+  }
+  let outcome;
+  try { outcome = await effects.request(evidence, target); }
+  catch (error) { outcome = { status: 'ambiguous', reason: error.message }; }
+  timeoutTransaction(path, initial, (state) => {
+    const request = state.requests[reservation.id];
+    // A concurrent observer may have confirmed the pending request already; never demote it.
+    if (request.status !== 'confirmed') request.status = ['confirmed', 'rejected'].includes(outcome?.status) ? outcome.status : 'pending';
+    request.outcome = outcome?.status === 'confirmed' ? 'API accepted; retry result not yet observed' : (outcome?.reason ?? 'API outcome unknown');
+  });
+  await fileTimeoutFollowup(path, { root, fileFollowup });
+  return outcome?.status === 'confirmed' ? { status: 'requested', head: evidence.head, run: target.run, job: target.job, attempt: target.attempt }
+    : refuse(outcome?.status === 'rejected' ? 'retry-api-rejected' : 'retry-outcome-pending');
 }
