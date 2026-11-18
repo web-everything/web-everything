@@ -123,8 +123,53 @@ describe('Forge key structure slice 1',()=>{
     expect(credentialBufferFinding(bytes)).toBe('private-key-scan-budget-exhausted-use-local');
   });
   it('fails closed on candidate-count exhaustion',()=>{
-    const text=Array.from({length:16400},(_,index)=>'value'+String(index).padStart(8,'0')).join(' ');
+    // Ordinary prose is terminal after decoding; use distinct escaped text layers to
+    // exhaust the queue of views that actually need further canonicalization.
+    const text=Array.from({length:16400},(_,index)=>JSON.stringify('value'+String(index).padStart(8,'0'))
+      .replace('v','\\u0076')).join('\n');
     expect(keyStructureFinding(Buffer.from(text))).toBe('private-key-scan-budget-exhausted-use-local');
+  });
+  it('keeps many ordinary encoded-looking words clean without exhausting candidates',()=>{
+    const text=Array.from({length:16400},(_,index)=>'value'+String(index).padStart(8,'0')).join(' ');
+    expect(keyStructureFinding(Buffer.from(text))).toBeNull();
+  });
+  it('detects minimal structures before pruning terminal decoded views',()=>{
+    const version=1;
+    const minimal=Buffer.from([48,6,2,1,version,4,1,7]);
+    for(const encode of Object.values(views))blocked(Buffer.from(encode(minimal)));
+    blocked(Buffer.from(minimal.toString('base64url')));
+    const text=JSON.stringify({kty:'oct',k:'a'});
+    for(const body of [Buffer.from(text),Buffer.from(text,'utf16le'),Buffer.from(text,'utf16le').swap16()]) {
+      blocked(body);
+      blocked(Buffer.from(body.toString('base64')));
+      // Decoded binary may surround another encoded representation.
+      blocked(Buffer.from(Buffer.concat([Buffer.from([255]),body,Buffer.from([255])]).toString('hex')));
+    }
+  });
+  it('preserves nested UTF-16 text after non-ASCII prefixes and Unicode whitespace',()=>{
+    const text=JSON.stringify({kty:'oct',k:'a'});
+    const wrapped=Buffer.from(text).toString('base64').split('').join('\u2003');
+    for(const innerBE of [false,true])for(const outerBE of [false,true])for(const source of [text,wrapped]) {
+      const inner=Buffer.from(source,'utf16le');
+      if(innerBE)inner.swap16();
+      const outer=Buffer.from(inner.toString('latin1'),'utf16le');
+      if(outerBE)outer.swap16();
+      blocked(outer);
+      const prefix=Buffer.from('\u0800'.repeat(100),'utf16le');
+      if(outerBE)prefix.swap16();
+      blocked(Buffer.concat([prefix,outer]));
+    }
+  });
+  it.each(['LE','BE'])('blocks embedded UTF-16%s after odd and even binary prefixes',endian=>{
+    const text=JSON.stringify({kty:'oct',k:'a'});
+    const body=Buffer.from(text,'utf16le');
+    if(endian==='BE')body.swap16();
+    for(const prefixLength of [0,1,2,3])for(const suffixLength of [0,1]) {
+      const bytes=Buffer.concat([Buffer.alloc(prefixLength,255),body,Buffer.alloc(suffixLength,255)]);
+      blocked(bytes);
+      blocked(Buffer.from(bytes.toString('hex')));
+      blocked(Buffer.from(bytes.toString('base64')));
+    }
   });
   it('fails closed on decoding depth and JSON nesting exhaustion',()=>{
     let text=JSON.stringify({kty:'oct',k:'a'});
