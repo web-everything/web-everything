@@ -12,7 +12,7 @@ const SLOW_ROUND_MS = 4_000;
 
 async function roundStarts({ pinRoundClock }) {
   const starts = [];
-  await runSoak({
+  const report = await runSoak({
     name: `round-clock-${pinRoundClock ? 'pinned' : 'fixed-advance'}`, rounds: 2, daemons: ['review'], mainEvery: 0, churnEvery: 0,
     fleet: false, pinRoundClock, log: () => {},
     perRound: async (w, round) => {
@@ -20,6 +20,10 @@ async function roundStarts({ pinRoundClock }) {
       if (round === 0) await new Promise((resolve) => setTimeout(resolve, SLOW_ROUND_MS)); // a slow host
     },
   });
+  // The run itself must have completed cleanly: a crash, timeout or invariant failure in round 1 may not pass.
+  expect(report.fatal).toBeNull();
+  expect(report.ticks.length).toBe(2);
+  expect(report.violations).toEqual([]);
   return starts;
 }
 

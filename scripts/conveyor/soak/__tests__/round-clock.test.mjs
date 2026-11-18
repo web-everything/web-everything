@@ -52,6 +52,18 @@ describe('round clock', () => {
     expect(() => advanceMsForRound(-1)).toThrow(TypeError);
   });
 
+  it('reports an overrun instead of silently running on a host too slow to pin', () => {
+    const wall = { t: 0 };
+    const advances = [];
+    const pin = createRoundClock({ advance: (ms) => advances.push(ms) }, () => wall.t);
+    pin.begin();
+    wall.t += ROUND_VIRTUAL_MS + 5_000;
+    expect(pin.endRound()).toEqual({ overrunMs: 5_000 });
+    wall.t += 1_000;
+    expect(pin.endRound()).toEqual({ overrunMs: 0 });
+    expect(advances).toEqual([0, ROUND_VIRTUAL_MS - 1_000]);
+  });
+
   it('requires begin() before endRound()', () => {
     expect(() => createRoundClock({ advance() {} }).endRound()).toThrow(/before begin/);
   });

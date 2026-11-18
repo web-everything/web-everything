@@ -32,7 +32,7 @@ import { runScenario, scenario } from '../__tests__/sim/scenario.mjs';
 import { cloneFacts, checkTick, explainNoDispatch, formatTickLine, DEFAULT_BOUNDS, OWED_KIND_DAEMON, sessionMatches } from './invariants.mjs';
 import { seededRandom, stepBehaviours } from './behaviours.mjs';
 import { openChurnPr, seedDefaultFleet } from './fleet.mjs';
-import { createRoundClock } from './round-clock.mjs';
+import { createRoundClock, ROUND_VIRTUAL_MS } from './round-clock.mjs';
 
 /** In-process daemon kind → its module in the clone (for the daemon's OWN `hasStaleMainRefusal`). */
 const DAEMON_MODULES = Object.freeze({
@@ -194,8 +194,14 @@ export async function runSoak({
       if (stepped.length) {
         say(`r${String(round).padStart(2, '0')} sessions   ${stepped.map((s) => `${s.session}:${s.kind}${s.error ? `(failed: ${s.error})` : ''}`).join(' ')}`);
       }
-      if (roundClock) roundClock.endRound();
-      else w.clock.advance('3m');
+      if (roundClock) {
+        const { overrunMs } = roundClock.endRound();
+        if (overrunMs > 0) {
+          // The round took longer in real time than its virtual budget, so the clock could not be pinned: this run is
+          // not reproducible. Fail closed rather than let a too-slow host pass or fail on timing luck.
+          violations.push({ round, daemon: null, tick: null, invariant: 'round-clock', detail: `round ${round} took ${overrunMs} ms of real time more than its ${ROUND_VIRTUAL_MS} ms virtual budget; the soak cannot pin the clock on this host` });
+        }
+      } else w.clock.advance('3m');
     });
   }
 

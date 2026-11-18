@@ -34,6 +34,8 @@ export function advanceMsForRound(realElapsedMs, roundMs = ROUND_VIRTUAL_MS) {
 /**
  * The per-soak round clock. `begin()` marks the start of round 0; `endRound()` advances the sim clock so the round
  * occupied exactly {@link ROUND_VIRTUAL_MS} of virtual time and starts timing the next one.
+ * An overrun (the round's real time already exceeded the budget) cannot be pinned, so `endRound()` REPORTS it: the
+ * soak turns it into a violation instead of quietly running on a host too slow to reproduce.
  * @param {{advance: (ms:number) => unknown}} clock - the world's sim clock handle.
  * @param {() => number} [now] - wall clock (injectable for tests).
  */
@@ -41,10 +43,13 @@ export function createRoundClock(clock, now = Date.now) {
   let roundStartedAt = null;
   return {
     begin() { roundStartedAt = now(); },
+    /** @returns {{overrunMs:number}} how far the round's real time exceeded its virtual budget (0 = pinned). */
     endRound() {
       if (roundStartedAt === null) throw new Error('round-clock: endRound() before begin()');
-      clock.advance(advanceMsForRound(now() - roundStartedAt));
+      const realElapsedMs = now() - roundStartedAt;
+      clock.advance(advanceMsForRound(realElapsedMs));
       roundStartedAt = now();
+      return { overrunMs: Math.max(0, realElapsedMs - ROUND_VIRTUAL_MS) };
     },
   };
 }
