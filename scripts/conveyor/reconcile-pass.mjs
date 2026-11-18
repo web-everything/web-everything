@@ -1,5 +1,7 @@
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
+import { isDrainTransientPath } from '../lib/transient-paths.mjs';
+import { gitMergeTreeParsed } from './parked-pr-conflict-watch.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { pidIdentity, holderStartedBy } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -1383,6 +1385,31 @@ export function enrichPrsWithBaseRefFacts(prs, { resolveRef = defaultResolveMain
   });
 }
 
+export const CONFLICT_DISPOSITION_MAX_PER_PASS = 20;
+/** Bound git probes; unprobed rows retain the ordinary dispatch budget (no exemption). */
+export function enrichPrsWithConflictDisposition(prs, { compute = gitMergeTreeParsed,
+  defaultBranch = 'main', mainSha = defaultResolveMainSha(defaultBranch), max = CONFLICT_DISPOSITION_MAX_PER_PASS } = {}) {
+  let remaining = Number.isInteger(max) && max > 0 ? max : 0;
+  return prs.map(pr => {
+    // Supplied/stale evidence is never trusted: only a probe made this pass may set the field.
+    const stripped = Object.hasOwn(pr, 'conflictDisposition') ? { ...pr, conflictDisposition: null } : pr;
+    if (!remaining || (pr.state != null && pr.state !== 'OPEN') || pr.baseRefName !== defaultBranch
+      || !(pr.mergeable === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY' || hasLabel(pr.labels, 'merge-status:conflicting'))) return stripped;
+    remaining--;
+    let conflictDisposition = null;
+    try {
+      const parsed = compute({ pr, includeRefEvidence: true });
+      if (isSha(mainSha) && isSha(pr.headRefOid) && parsed?.fetchSucceeded === true
+        && parsed.headSha === pr.headRefOid && parsed.baseSha === mainSha) {
+        if (parsed.clean === true) conflictDisposition = 'clean';
+        else if (parsed.clean === false && parsed.exitCode === 1 && parsed.unrecognizedConflictLines === 0 && parsed.conflictPaths?.length > 0
+          && parsed.conflictPaths.every(path => isDrainTransientPath(path))) conflictDisposition = 'manifest-only';
+      }
+    } catch { /* Unknown evidence never earns a mechanical exemption. */ }
+    return { ...pr, conflictDisposition };
+  });
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#defaultReadSystemFixState — #4263: one `gh pr view` read of the fix PR
  * a `waiting-on-system-fix` ci-heal escalation named, classified through the SAME terminal-state reader
@@ -1675,6 +1702,7 @@ export function runReconcilePass({
   // #4265 — the stacked-base conflict-fix cap's own `currentSha` (see {@link enrichPrsWithBaseRefFacts}'s own
   // docblock). Injectable exactly like every other enrich step above, so a test supplies a fixture with no git.
   enrichBaseRef = enrichPrsWithBaseRefFacts,
+  enrichConflictDisposition = enrichPrsWithConflictDisposition,
   // #4263 — re-arms a `waiting-on-system-fix` ci-heal escalation once its named fix PR lands (see
   // {@link enrichPrsWithSystemFixFacts}'s own docblock). Injectable exactly like every other enrich step above.
   enrichSystemFix = enrichPrsWithSystemFixFacts,
@@ -1754,6 +1782,7 @@ export function runReconcilePass({
   enrichMainRed = timedStep('enrich-main-red', enrichMainRed);
   enrichAlreadyLanded = timedStep('enrich-already-landed', enrichAlreadyLanded);
   enrichBaseRef = timedStep('enrich-base-ref', enrichBaseRef);
+  enrichConflictDisposition = timedStep('enrich-conflict-disposition', enrichConflictDisposition);
   enrichSystemFix = timedStep('enrich-system-fix', enrichSystemFix);
   enrichEscalationBase = timedStep('enrich-escalation-base', enrichEscalationBase);
   enrichFixClaims = timedStep('enrich-fix-claims', enrichFixClaims);
@@ -1811,10 +1840,20 @@ export function runReconcilePass({
   const alreadyLandedPrs = enrichAlreadyLanded(redPrs, { repo: resolvedRepo, defaultBranch, ...(readOnly ? { readOnly: true } : {}) });
   // #4265 — attach each stacked PR's own base ref's current tip, purely locally, no `gh` cost.
   const baseRefPrs = enrichBaseRef(alreadyLandedPrs, { defaultBranch });
+  let fixSettings = {};
+  try { fixSettings = loadFixSettings({ env }); } catch { /* No exemption without settings. */ }
+  const mainSha = resolveMainSha(defaultBranch);
+  const conflictCap = fixSettings?.conflictFixExemptPerPass;
+  console.error(`fix.conflictFixExemptPerPass=${conflictCap ?? 0} (source: ${fixSettings?.sources?.conflictFixExemptPerPass ?? 'unknown'})`);
+  const conflictPrs = Number.isInteger(conflictCap) && conflictCap > 0
+    ? enrichConflictDisposition(baseRefPrs, { defaultBranch, mainSha, compute: ({ pr, includeRefEvidence }) => {
+      const cwd = repoKey === 'we' ? REPO_ROOT : resolveLanePoolRepoPath(CONSTELLATION_REPOS[repoKey].slug);
+      return cwd ? gitMergeTreeParsed({ pr, cwd, includeRefEvidence, ...(readOnly ? { exec: readOnlyGitExec } : {}) }) : null;
+    } }) : baseRefPrs;
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
+  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(conflictPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
     { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env, ...(readOnly ? { readOnly: true } : {}) }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   if (repoKey === 'we') enrichOwedMainRule(prsBeforeMechanical, { repo: CONSTELLATION_REPOS[repoKey].slug, settings: resolveRefreshSettings({ env }) });
@@ -1829,7 +1868,6 @@ export function runReconcilePass({
   const rulingPrs = step('enrich-review-churn', () => enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug }));
   const listedAgents = readAgents(readOnly ? { readOnly: true } : {});
   const agents = preserveIncomplete(listedAgents, enrich(listedAgents));
-  const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
   const staleCiRerunSetting = loadStaleCiRerunSetting({ env });
@@ -1846,7 +1884,7 @@ export function runReconcilePass({
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
-    ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
+    ...fixCapSettings(() => fixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
     ...roundExtensionAnchorSetting(loadRoundExtensionAnchorSetting, env),
     ...takeoverReviewSetting(loadReviewSettings, env),

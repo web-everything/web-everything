@@ -27,7 +27,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+import { cascadePolicy, platformPreference, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 
 /** R242: an invalid switch keeps the historical steps running; an absent switch inherits. Sources are logged by the cascade. */
@@ -51,7 +51,7 @@ export const FIX_SETTINGS_DEFAULTS = Object.freeze({
   roundCapAction: 'takeover', roundHistory: 'on',
   // Card xrbu1bp — see `we:scripts/conveyor/fix-resume.mjs`.
   resumeAcrossRounds: 'on', strongerModelFromRound: 3,
-  capacityStarvationHours: 6,
+  capacityStarvationHours: 6, conflictFixExemptPerPass: 3,
 });
 export const FIX_TAKEOVER_MARKER = '<!-- conveyor-fix-takeover';
 
@@ -132,18 +132,23 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   // switch fails closed; a missing layer inherits. Explicit dispatch arguments still take precedence.
   const autoProceed = value => value === undefined ? undefined : value === true;
   const platformLayer = platform === undefined ? platformPreference('fix', { env }) : platform;
+  const conflictPlatform = platform === undefined ? readPlatformPreferences({ env }) : { prefs: { fix: platform }, errors: [] };
+  const exemptCap = value => value === undefined ? undefined : ((typeof value === 'number' || typeof value === 'string')
+    && /^(0|[1-9]\d*)$/.test(String(value)) && Number.isSafeInteger(Number(value)) && Number(value) <= 10 ? Number(value) : 0); // enforced operational maximum 10; larger or invalid disables
   const envAutoProceed = env.WE_FIX_STAND_DOWN_AUTO_PROCEED;
   // Standard → platform → tool → env. Opus is reachable only through the critical-work verdict.
   const model = cascadePolicy('fix', {
+    conflictFixExemptPerPass: exemptCap(layer === INVALID_LAYER ? null : fromFile.conflictFixExemptPerPass),
     claudeEscalationModel: fromFile.claudeEscalationModel,
     capacityStarvationHours: capacityLeaf(fromFile.capacityStarvationHours),
     standDownAutoProceed: autoProceed(layer === INVALID_LAYER ? false : fromFile.standDownAutoProceed),
   }, {
-    standard: { claudeEscalationModel: 'sonnet', standDownAutoProceed: true,
+    standard: { conflictFixExemptPerPass: FIX_SETTINGS_DEFAULTS.conflictFixExemptPerPass, claudeEscalationModel: 'sonnet', standDownAutoProceed: true,
       capacityStarvationHours: FIX_SETTINGS_DEFAULTS.capacityStarvationHours },
-    platform: { ...platformLayer, standDownAutoProceed: autoProceed(platformLayer?.standDownAutoProceed),
+    platform: { ...platformLayer, conflictFixExemptPerPass: exemptCap(conflictPlatform.errors.length ? null : conflictPlatform.prefs.fix?.conflictFixExemptPerPass), standDownAutoProceed: autoProceed(platformLayer?.standDownAutoProceed),
       capacityStarvationHours: capacityLeaf(platformLayer?.capacityStarvationHours) }, env,
     envValues: {
+      conflictFixExemptPerPass: exemptCap(env.WE_CONFLICT_FIX_EXEMPT_PER_PASS),
       claudeEscalationModel: env.WE_FIX_CLAUDE_ESCALATION_MODEL,
       capacityStarvationHours: capacityLeaf(env.WE_FIX_CAPACITY_STARVATION_HOURS),
       standDownAutoProceed: envAutoProceed === undefined ? undefined
@@ -156,6 +161,7 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   return {
     roundCapAction: action.value, roundHistory: history.value,
     resumeAcrossRounds: resume.value, strongerModelFromRound: Number(from.value),
+    conflictFixExemptPerPass: model.value.conflictFixExemptPerPass,
     capacityStarvationHours: Number(model.value.capacityStarvationHours),
     claudeEscalationModel: model.value.claudeEscalationModel,
     standDownAutoProceed: model.value.standDownAutoProceed,
@@ -165,6 +171,7 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
       // Preserve the public provenance labels used before this leaf joined the shared cascade.
       capacityStarvationHours: ({ standard: 'built-in', tool: 'settings' })[model.sources.capacityStarvationHours]
         ?? model.sources.capacityStarvationHours,
+      conflictFixExemptPerPass: model.sources.conflictFixExemptPerPass,
       claudeEscalationModel: model.sources.claudeEscalationModel,
       standDownAutoProceed: model.sources.standDownAutoProceed,
     },
