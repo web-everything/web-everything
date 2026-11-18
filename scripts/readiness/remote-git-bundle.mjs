@@ -178,12 +178,23 @@ async function loadCredentialAllowlist({ git, prerequisite }) {
   }
   return map;
 }
+/** Only findings that name key-HANDLING code or an unreadable encoding can be listed; a real token format (github-token,
+ *  aws-access-key, pem-header, ...) is never maskable, whatever the allow-list says. */
+const ALLOWLISTABLE_FINDINGS = new Set(['private-key', 'unsupported-text-encoding']);
+/** The exact blob must already be public: it appears in the prerequisite (public base) history of that path. */
+async function isPublicBlob({ git, prerequisite, label, sha }) {
+  if (!prerequisite) return false;
+  try {
+    const log = await git(['log', prerequisite, '--format=', '--raw', '--no-abbrev', '--no-renames', '--', label]);
+    return log.code === 0 && log.stdout != null && bytes(log.stdout).toString('latin1').split('\n').some(line => line.startsWith(':') && line.split(' ')[3] === sha);
+  } catch { return false; }
+}
 /** True when every finding on this blob is listed for exactly this path and content hash. */
 function allowedFindings(allowed, label, content, findings) {
   const present = findings.filter(Boolean);
   if (!allowed.size || !present.length) return false;
   const set = allowed.get(`${label}\0${createHash('sha256').update(content).digest('hex')}`);
-  if (!set || !present.every(f => set.has(f))) return false;
+  if (!set || !present.every(f => set.has(f)) || [...set].some(f => !ALLOWLISTABLE_FINDINGS.has(f))) return false;
   // The scanners report only the FIRST match, so a listed finding could hide another one behind it. Mask every
   // listed pattern out of the bytes and rescan the rest (re-encoded as UTF-8 so a listed encoding finding cannot
   // mask the remaining checks): anything left over refuses the bundle as before.
@@ -379,7 +390,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
         let policy = null;
         try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
         const hit = policy ?? finding;
-        if (hit && !allowedFindings(allowed, label, content, [policy, finding])) return { path: label, finding: hit };
+        if (hit && !(allowedFindings(allowed, label, content, [policy, finding]) && await isPublicBlob({ git, prerequisite, label, sha }))) return { path: label, finding: hit };
         const warning = credentialContentWarning(path, content);
         if (warning) warnings.push({ path: label, finding: warning });
       }
