@@ -323,9 +323,9 @@ export function buildRedTeamRearmComment(input) {
 /** A red-team hand-back may omit the ordinary charge only after a counted dispatch for the latest gate result.
  * The receipt names the pre-repair head; --expect-head pins the pushed head separately in the shared writer.
  */
-export function redTeamRearmRefusal({ comments, pr }) {
+export function redTeamRearmRefusal({ comments, pr, head }) {
   const refused = 'red-team dispatch evidence missing, stale or unreadable — retry with fresh reconciliation or ask an operator';
-  if (!Array.isArray(comments)) return refused;
+  if (!Array.isArray(comments) || typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head)) return refused;
   const resultAt = latestRedTeamResultPosition(comments, pr);
   if (resultAt < 0) return refused;
   for (let i = comments.length - 1; i > resultAt; i--) {
@@ -339,7 +339,8 @@ export function redTeamRearmRefusal({ comments, pr }) {
       text.slice(RED_TEAM_FIX_COMMENT_MARKER.length).trim());
     if (!receipt || text.split('\n')[0] !== RED_TEAM_FIX_COMMENT_MARKER) return refused;
     const fact = redTeamFact(comments.slice(resultAt), pr, receipt[1])?.value;
-    return fact?.state === 'send-back' && fact.resultId === receipt[2] ? null : refused;
+    if (fact?.state !== 'send-back' || fact.resultId !== receipt[2]) return refused;
+    return head === receipt[1] ? 'no change made — fix still owed (head unchanged since red-team dispatch)' : null;
   }
   return refused;
 }
@@ -374,29 +375,44 @@ if (IS_CLI) {
   }
   const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
-  if (prArg && !isConflictRound && !argOf('only-if')) {
+  const isRedTeamRound = roundArg === 'red-team';
+  if (prArg && !isConflictRound && (isRedTeamRound || !argOf('only-if'))) {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
     let verdict = { empty: false };
+    let redTeamRefusal = isRedTeamRound
+      ? 'red-team dispatch evidence missing, stale or unreadable — retry with fresh reconciliation or ask an operator' : null;
     try {
       const repoFlag = repoVal ? [`--repo=${repoVal}`] : [];
       const head = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
       // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
       const apiRepo = repoVal || ':owner/:repo';
       const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
-      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
-    } catch { /* fail open: never block a real push on a read error */ }
+      if (isRedTeamRound) {
+        redTeamRefusal = head !== argOf('expect-head').toLowerCase()
+          ? 'live head differs from --expect-head'
+          : redTeamRearmRefusal({ comments: pages.flat(), pr: Number(prArg), head });
+        if (redTeamRefusal?.startsWith('no change made')) verdict = { empty: true, since: head };
+      } else {
+        verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
+      }
+    } catch { /* Ordinary repairs fail open; red-team repairs retain the evidence refusal. */ }
     if (verdict.empty) {
       try {
         readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
           { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
       } catch { /* the note is best-effort; the refusal below is not */ }
-      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: redTeamRefusal || 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
+      process.exit(1);
+    }
+    if (redTeamRefusal) {
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: redTeamRefusal }));
       process.exit(1);
     }
   }
   runReviewLabelCli({
     fixedTo: 'rearm',
-    rearmEvidenceGuard: roundArg === 'red-team' ? redTeamRearmRefusal : null,
+    rearmEvidenceGuard: isRedTeamRound ? input => input.head !== argOf('expect-head').toLowerCase()
+      ? 'live head differs from --expect-head' : redTeamRearmRefusal(input) : null,
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
     usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict|red-team] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',

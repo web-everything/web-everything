@@ -40,10 +40,19 @@ describe('red-team dispatch evidence', () => {
     expect(redTeamRearmRefusal({ comments, pr: 7 })).toMatch(/fresh reconciliation or ask an operator/);
   });
   it('accepts a counted receipt bound to the latest gate result on the pre-repair head', () => {
-    expect(redTeamRearmRefusal({ comments: repairThread(), pr: 7 })).toBeNull();
+    expect(redTeamRearmRefusal({ comments: repairThread(), pr: 7, head: 'a'.repeat(40) })).toBeNull();
+  });
+  it('refuses an unchanged live head at every shared-writer evidence check', () => {
+    expect(redTeamRearmRefusal({ comments: repairThread(), pr: 7, head: 'b'.repeat(40) })).toContain('no change made');
+  });
+  it.each([undefined, null, '', 'unknown'])('refuses an unreadable live head (%s)', head => {
+    expect(redTeamRearmRefusal({ comments: repairThread(), pr: 7, head })).toMatch(/fresh reconciliation or ask an operator/);
   });
   it.each([
     ['missing receipt', c => c.slice(0, 2)],
+    ['legacy receipt without head', c => [...c.slice(0, 2), { ...c[2], body: RED_TEAM_FIX_COMMENT_MARKER }]],
+    ['missing receipt head', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace(/head=\S+ /, '') }]],
+    ['unparseable receipt head', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace(/head=\S+/, 'head=unknown') }]],
     ['missing gate decision', c => [c[0], c[2]]],
     ['untrusted gate result', c => [{ ...c[0], author: { login: 'mallory' } }, ...c.slice(1)]],
     ['untrusted receipt', c => [...c.slice(0, 2), { ...c[2], author: { login: 'mallory' } }]],
@@ -56,7 +65,7 @@ describe('red-team dispatch evidence', () => {
     ['completed hand-back', c => [...c, { author: { login: 'web-everything' }, body: RED_TEAM_REARM_COMMENT_MARKER }]],
     ['new ordinary verdict', c => [...c, { author: { login: 'web-everything' }, body: '🔁 review — changes requested\n\nNew break' }]],
   ])('refuses %s with an operator-visible fallback', (_name, change) => {
-    expect(redTeamRearmRefusal({ comments: change(repairThread()), pr: 7 })).toMatch(/fresh reconciliation or ask an operator/);
+    expect(redTeamRearmRefusal({ comments: change(repairThread()), pr: 7, head: 'a'.repeat(40) })).toMatch(/fresh reconciliation or ask an operator/);
   });
 });
 
@@ -544,6 +553,46 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     expect(r.status).toBe(1);
     expect(r.wrote).toBe(false);
     expect(r.out).toContain('red-team dispatch evidence');
+  });
+
+  it.each([[false, []], [true, []], [false, ['--only-if=accepted']], [false, ['--only-if=missing']]])('refuses an unchanged red-team head without a fix-begin claim (note fails: %s, flags: %j)', (failComment, flags) => {
+    const comments = repairThread(H0);
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`, ...flags], {
+      head: H0, comments, failComment,
+      state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted', 'red-team:blocked'), comments },
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('no change made');
+    expect(bodyOf(r)).toContain(NO_CHANGE_COMMENT_MARKER);
+    expect(r.calls.some(c => c[0] === 'pr' && c[1] === 'edit')).toBe(false);
+  });
+
+  it.each([
+    ['missing receipt head', c => c.replace(/head=\S+ /, '')],
+    ['unparseable receipt head', c => c.replace(/head=\S+/, 'head=unknown')],
+    ['legacy marker-only receipt', () => RED_TEAM_FIX_COMMENT_MARKER],
+  ])('refuses %s without any write', (_name, change) => {
+    const comments = repairThread();
+    comments[2].body = change(comments[2].body);
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], {
+      head: H0, comments, state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted', 'red-team:blocked'), comments },
+    });
+    expect(r.status).toBe(1);
+    expect(r.wrote).toBe(false);
+    expect(r.out).toContain('fresh reconciliation or ask an operator');
+  });
+
+  it.each([
+    ['mismatched pin', { head: 'c'.repeat(40) }],
+    ['unreadable live head', { failView: true }],
+    ['unreadable receipt thread', { failApi: true }],
+  ])('refuses red-team %s without any write', (_name, fault) => {
+    const comments = repairThread();
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], {
+      head: H0, comments, state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted'), comments }, ...fault,
+    });
+    expect(r.status).toBe(1);
+    expect(r.wrote).toBe(false);
   });
 
   it('refuses an unpinned red-team hand-back before any forge call', () => {
