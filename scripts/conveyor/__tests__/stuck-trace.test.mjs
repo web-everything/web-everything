@@ -58,7 +58,7 @@ test('reads both direct and wrapped verdict shapes for each operation', async t 
     } });
     assert.equal(f.events[0].detail.owner, f.why.owner);
     assert.equal(f.events[0].detail.headline, f.trace.likelyBlocker);
-    assert.doesNotMatch(f.events[0].detail.note, /INCOMPLETE/);
+    assert.match(f.events[0].detail.note, /INCOMPLETE/); // unavailable review ledger
   }
 });
 
@@ -78,12 +78,86 @@ test('operation failure emits one incomplete note with unavailable fields and ne
   assert.match(f.events[0].detail.note, /owner: unavailable/);
 });
 
-test('emit failure never throws and never re-arms', async t => {
+test('failed sink retries only on a later call after ten minutes, then success never repeats', async t => {
   for (const emit of [() => false, () => { throw Error('sink'); }]) {
     const f = fixture(t);
     assert.equal((await traceStuckPr({ ...f.options, emit })).posted, false);
-    assert.equal((await traceStuckPr(f.options)).skipped, 'duplicate');
+    const receipt = () => JSON.parse(readFileSync(join(f.root, 'stuck-trace.json')))[`${repo}#17@${head}`];
+    assert.deepEqual(receipt(), { state: 'claimed', at: new Date(now).toISOString(), attempts: 1 });
+    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 600_000 })).skipped, 'duplicate');
+    assert.equal(f.calls.length, 2);
+    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 600_001, kind: 'stalled' })).posted, true);
+    assert.equal(receipt().state, 'done'); assert.equal(receipt().attempts, 2);
+    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 1800_000 })).skipped, 'duplicate');
+    assert.equal(f.calls.length, 4); assert.equal(f.events.length, 1);
   }
+});
+
+test('successful emit survives a busy receipt-finalization lock and never repeats', async t => {
+  const f = fixture(t), file = join(f.root, 'stuck-trace.json'), lock = `${file}.lock`;
+  const emit = event => {
+    f.events.push(event);
+    writeFileSync(lock, String(process.pid), { flag: 'wx' });
+    return true;
+  };
+  assert.deepEqual(await traceStuckPr({ ...f.options, emit }), { posted: true });
+  assert.equal(JSON.parse(readFileSync(file))[`${repo}#17@${head}`].state, 'claimed');
+  rmSync(lock);
+  const later = { ...f.options, now: Date.parse(now) + 600_001, kind: 'stalled' };
+  assert.equal((await traceStuckPr(later)).skipped, 'duplicate');
+  assert.equal((await traceStuckPr({ ...later, now: Date.parse(now) + 1800_000 })).skipped, 'duplicate');
+  assert.equal(f.events.length, 1); assert.equal(f.calls.length, 2);
+  // Completion is specific to the subject, not a global suppression flag.
+  assert.equal((await traceStuckPr({ ...later, pr: 18 })).posted, true);
+});
+
+test('crashed claims are reclaimed once across concurrent daemons, with three attempts maximum', async t => {
+  const f = fixture(t), file = join(f.root, 'stuck-trace.json');
+  writeFileSync(file, JSON.stringify({ [`${repo}#17@${head}`]: { state: 'claimed', at: now, attempts: 1 } }));
+  const options = { ...f.options, now: Date.parse(now) + 600_001, emit: () => false };
+  await Promise.all([traceStuckPr(options), traceStuckPr({ ...options, kind: 'stalled' })]);
+  assert.equal(f.calls.length, 2);
+  await traceStuckPr({ ...options, now: Date.parse(now) + 1200_002 });
+  assert.equal(f.calls.length, 4);
+  assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 1800_003 })).skipped, 'duplicate');
+  assert.equal(JSON.parse(readFileSync(file))[`${repo}#17@${head}`].attempts, 3);
+});
+
+test('legacy receipts remain suppressed and malformed claims fail closed', async t => {
+  for (const receipt of [{ at: now, trigger: 'stalled' }, { state: 'claimed', at: 'invalid', attempts: 1 },
+    { state: 'claimed', at: now }, { state: 'unknown', at: now, attempts: 1 }]) {
+    const f = fixture(t);
+    writeFileSync(join(f.root, 'stuck-trace.json'), JSON.stringify({ [`${repo}#17@${head}`]: receipt }));
+    assert.equal((await traceStuckPr({ ...f.options, now: Date.parse(now) + 1800_000 })).skipped, 'duplicate');
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test('why screen gaps and each pr-trace gap list independently mark notes INCOMPLETE', async t => {
+  for (const source of ['screen', 'unavailable', 'incomplete', 'none']) {
+    const f = fixture(t); f.trace.unavailable = [];
+    if (source === 'screen') f.why.screen = 'why pr 17\nowner\n  operator\ngaps\n  checks: offline\n  queue: denied';
+    else if (source !== 'none') f.trace[source] = ['checks: offline'];
+    await traceStuckPr(f.options);
+    const note = f.events[0].detail.note;
+    if (source === 'none') assert.doesNotMatch(note, /INCOMPLETE/);
+    else { assert.match(note, /INCOMPLETE/); assert.match(note, /checks: offline/); }
+    if (source === 'screen') assert.match(note, /queue: denied/);
+  }
+});
+
+test('oversized why gaps are bounded with a full-evidence fallback', async t => {
+  const f = fixture(t), gap = 'checks: ' + 'x'.repeat(5000) + 'END_OF_GAP';
+  f.why.screen = 'gaps\n  ' + gap;
+  await traceStuckPr(f.options);
+  const note = f.events[0].detail.note;
+  assert.match(note, /INCOMPLETE/); assert.match(note, /checks:/);
+  // The gap field hits clean()'s bound before the whole-note byte cap.
+  const gapLine = note.split('\n').find(line => line.startsWith('why gaps:'));
+  assert.match(gapLine, /checks:.*… \[bounded; inspect full operation JSON\]$/);
+  assert.ok(gapLine.length < gap.length);
+  assert.doesNotMatch(note, /END_OF_GAP/);
+  assert.ok(Buffer.byteLength(note) <= 3000);
 });
 
 test('only the three trace triggers are admitted', async t => {

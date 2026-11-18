@@ -1,10 +1,12 @@
 /** Layered, read-only stuck-PR evidence, once per repo/PR/head. EVENT ONLY:
  * PR comments notify watchers and retrigger comment/label daemons; the existing
  * daemon event feed is queryable and already carries ready-stuck/needs-you signals.
- * Receipts precede IO: crashes, failed operations and failed delivery never loop.
+ * Receipts precede IO: failed delivery/crashes retry after 10 minutes, at most 3 attempts.
+ * No retries within a call; successfully delivered notes never repeat.
  * Share stateDir between callers that must share receipts. Unknown heads re-arm daily.
  */
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,13 +40,25 @@ export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.
     const key = `${repo}#${pr}@${head}`;
     mkdirSync(stateDir, { recursive: true });
     const file = join(stateDir, 'stuck-trace.json');
+    const doneFile = join(stateDir, `stuck-trace-done-${createHash('sha256').update(key).digest('hex')}.json`);
     const claimed = withFileLock(`${file}.lock`, () => {
+      // A successful sink may have finalized outside the contended shared lock.
+      try {
+        if (JSON.parse(readFileSync(doneFile, 'utf8'))?.state !== 'done') throw Error('invalid completion');
+        return false;
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
       let saved = {};
       try { saved = JSON.parse(readFileSync(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
       if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw Error('invalid receipts');
-      if (Object.hasOwn(saved, key)) return false;
-      writeJsonAtomic(file, { ...saved, [key]: { at: new Date(now).toISOString(), trigger: kind } });
-      return true;
+      const previous = saved[key];
+      // Legacy receipts already suppressed delivery; retain that deduplication.
+      if (Object.hasOwn(saved, key) && (previous?.state !== 'claimed'
+        || !Number.isInteger(previous.attempts) || previous.attempts < 1 || previous.attempts >= 3
+        || !Number.isFinite(Date.parse(previous.at))
+        || new Date(now).getTime() - Date.parse(previous.at) <= 10 * 60_000)) return false;
+      const claim = { state: 'claimed', at: new Date(now).toISOString(), attempts: (previous?.attempts ?? 0) + 1 };
+      writeJsonAtomic(file, { ...saved, [key]: claim });
+      return claim;
     }, { timeoutMs: 0 });
     if (!claimed) return { posted: false, skipped: 'duplicate' };
     // Both layers share one wall-clock budget, including a misbehaving injected runner.
@@ -67,7 +81,10 @@ export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.
     const section = name => why?.sections?.find(s => s.name === name)?.lines;
     const headline = clean(trace?.likelyBlocker ?? 'unavailable root cause; inspect why/pr-trace manually');
     const owner = clean(why?.owner), waitingFor = clean(why?.waitingFor);
+    const gapsBlock = typeof why?.screen === 'string' && /(?:^|\n)gaps\r?(?:\n|$)/.test(why.screen);
+    const gaps = gapsBlock ? why.screen.split(/(?:^|\n)gaps\r?(?:\n|$)/)[1].split(/\r?\n/).filter(line => /^\s+\S/.test(line)) : [];
     const fields = [
+      ...(gapsBlock ? [['why gaps', gaps]] : []),
       ['root cause', headline], ['owner', owner], ['waitingFor', waitingFor], ['suggestedOp', why?.suggestedOp ?? 'unavailable / none suggested'],
       ['stage', section('state')], ['labels', trace?.labels], ['checks', section('checks')], ['ci (pending)', trace?.ci],
       ['holds', section('holds')], ['queue', trace?.queue ?? section('queue')], ['label conflicts', trace?.conflicts], ['looping', trace?.looping],
@@ -75,7 +92,8 @@ export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.
         `${clean(name, 80)} (${clean(trace.latestAtET?.[name], 80)}): ${clean(line, 160)}`)],
       ['unavailable evidence', trace?.unavailable], ['incomplete evidence', trace?.incomplete],
     ];
-    const status = !why || !trace ? 'INCOMPLETE trace: operation unavailable; inspect manually\n' : '';
+    const status = !why || !trace || gapsBlock || trace?.unavailable?.length || trace?.incomplete?.length
+      ? 'INCOMPLETE trace: evidence unavailable or incomplete; inspect manually\n' : '';
     const note = status + fields.map(([name, value]) => `${name}: ${clean(value, name === 'daemon logs + times' ? 700 : 130)}`).join('\n');
     const bounded = Buffer.byteLength(note) > 2900
       ? `${Buffer.from(note).subarray(0, 2800).toString('utf8')}\n[bounded; inspect full why/pr-trace JSON manually]` : note;
@@ -88,6 +106,19 @@ export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.
       ]);
       if (delivered === false) throw Error('delivery failed');
     } finally { clearTimeout(timer); }
+    try {
+      withFileLock(`${file}.lock`, () => {
+        const saved = JSON.parse(readFileSync(file, 'utf8'));
+        // Only finalize our own claim; preserve receipts written by other subjects.
+        if (saved[key]?.state === 'claimed' && saved[key].at === claimed.at && saved[key].attempts === claimed.attempts) {
+          writeJsonAtomic(file, { ...saved, [key]: { ...claimed, state: 'done' } });
+        }
+      }, { timeoutMs: 0 });
+    } catch {
+      // Delivery succeeded. Persist a subject-specific completion without the
+      // shared lock, so contention cannot make a later daemon repeat the note.
+      writeJsonAtomic(doneFile, { state: 'done' });
+    }
     return { posted: true };
   } catch { report(); return { posted: false, skipped: 'incomplete' }; }
 }
