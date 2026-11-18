@@ -552,3 +552,18 @@ describe('PR table evidence and terminal safety', () => {
     expect(rendered).toContain('x[31m');
   });
 });
+
+ describe('required review/merge holds are not CI', () => {
+  const row = (name, conclusion = 'success') => ({ name, status: 'completed', conclusion });
+  const required = ['test', 'smoke', 'daemon-soak', 'merge-gate', 'review-gate'];
+  const checks = required.map(name => row(name, name.endsWith('-gate') ? 'failure' : 'success'));
+  it('keeps CI green when both required admission gates fail without annotations', () => {
+    expect(reduceCheckState(checks, required)).toMatchObject({ state: 'green', counts: { failed: 0, total: 3 } });
+  });
+  it.each(['test', 'smoke', 'daemon-soak'])('keeps failing required %s red beside held gates', name => {
+    expect(reduceCheckState(checks.map(r => r.name === name ? row(name, 'failure') : r), required).state).toBe('red');
+  });
+  it('does not excuse missing real required evidence', () => {
+    expect(reduceCheckState(checks.filter(r => r.name !== 'smoke'), required).state).not.toBe('green');
+  });
+});

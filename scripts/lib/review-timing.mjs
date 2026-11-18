@@ -44,14 +44,9 @@ const RED = new Set(['failure', 'error', 'timed_out', 'cancelled', 'action_requi
  */
 export const NON_HEALABLE_CHECKS = Object.freeze(['review-gate', 'merge-gate', 'soak-replay-gate']);
 /**
- * A review hold, never a CI failure — even when branch protection requires the check. Same rule as the CI heal's
- * `reviewHoldRed` (#5463): `review-gate` always, `merge-gate` when its red is a review hold (`mergeGateReviewHold`,
- * attached by we:scripts/lib/merge-gate-hold-class.mjs#excuseMergeGateRows). A plain required merge-gate red is healable.
+ * Review and merge gates hold admission; neither is a CI failure a heal can repair, even when required.
  */
-export const isReviewHoldGate = row => {
-  const name = row?.name ?? row?.context;
-  return name === 'review-gate' || (name === 'merge-gate' && !!row.mergeGateReviewHold);
-};
+export const isReviewHoldGate = row => ['review-gate', 'merge-gate'].includes(row?.name ?? row?.context);
 /** The CI-heal rule (reconcile-core `splitFailingChecks`): a known required set names the healable checks. */
 const isHealable = (row, requiredChecks) => {
   const name = row.name ?? row.context;

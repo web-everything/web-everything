@@ -4664,3 +4664,11 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Review admission gates and CI truth
+
+`merge-gate` and `review-gate` are admission holds even when branch protection requires them.
+Reconcile tests must exercise unannotated gate failures alongside passing real CI, and separately
+fail `test`, `smoke`, and `daemon-soak` to retain ci-heal ownership. Keep missing, pending,
+malformed, and wrong-head real CI refusal cases. The strict `reviewCiGate` used by merge callers
+continues to require admission-gate success; review admission uses the review-hold classification.

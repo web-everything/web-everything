@@ -21,15 +21,15 @@ describe('review-hold-only red draft promotion', () => {
     results: [{ id: 'review-hold-labels', status: 'hold', reason: 'review required' }] });
 
   it.each([
-    ['annotated merge-gate and review-gate red', heldRows(), 'red', true],
-    ['review-gate red only', [check('test'), check('review-gate', 'failure'), check('merge-gate')], 'red', true],
+    ['annotated merge-gate and review-gate red', heldRows(), 'green', false],
+    ['review-gate red only', [check('test'), check('review-gate', 'failure'), check('merge-gate')], 'green', false],
     ['green', [check('test'), check('review-gate'), check('merge-gate')], 'green', false],
     ['another required failure', heldRows().map(row => row.name === 'test' ? check('test', 'failure') : row), 'red', false],
     ['another required check pending', heldRows().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row), 'pending', false],
-    ['another required check absent', heldRows().filter(row => row.name !== 'test'), 'red', false],
-    ['pending', [check('test'), check('merge-gate'), { name: 'review-gate', status: 'in_progress', conclusion: null }], 'pending', false],
+    ['another required check absent', heldRows().filter(row => row.name !== 'test'), 'unchecked', false],
+    ['pending', [check('test'), check('merge-gate'), { name: 'review-gate', status: 'in_progress', conclusion: null }], 'green', false],
     ['no evidence', [], 'unchecked', false],
-  ])('the fresh reader returns reviewHoldOnly for %s', (_, rows, state, reviewHoldOnly) => {
+  ])('the fresh reader reports CI independently of admission holds: %s', (_, rows, state, reviewHoldOnly) => {
     const out = defaultReadHeadCheckState({
       repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
       runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
@@ -40,7 +40,7 @@ describe('review-hold-only red draft promotion', () => {
     expect(out).toMatchObject({ state, reviewHoldOnly });
   });
 
-  it('the fresh reader keeps an unannotated red merge-gate ineligible when its verdict is unreadable', () => {
+  it('the fresh reader does not treat an unreadable merge verdict as a CI failure', () => {
     const out = defaultReadHeadCheckState({
       repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
       runGh: () => heldRows().map(row => JSON.stringify(row)).join('\n'),
@@ -48,7 +48,7 @@ describe('review-hold-only red draft promotion', () => {
       readPrLabels: () => ['review:pending'], readMergeGateVerdict: () => ({ error: 'unreadable' }),
       mergeGateSetting: { value: 'on' },
     });
-    expect(out).toMatchObject({ state: 'red', reviewHoldOnly: false });
+    expect(out).toMatchObject({ state: 'green', reviewHoldOnly: false });
   });
 
   it.each([
