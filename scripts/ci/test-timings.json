@@ -1712,6 +1712,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/live-changes-stale-accepted-phase.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/unchecked-draft-and-stale-accepted-status.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lane-acquire-default-wait.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/ci-rerun-ignores-external-red-team.soak.test.mjs": 2,
