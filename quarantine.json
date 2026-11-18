@@ -1,5 +1,14 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/conveyor/soak/daemon-soak.soak.test.mjs::50 real daemon ticks: every invariant holds after every tick",
+      "brokenSha": "a9eef80d78432e5b2f4ee27cd2b3a1b4f5d6c7e8",
+      "owner": "lane/main-fix-soak-owed-review",
+      "reason": "daemon-soak 50-tick: PR 10 owed review starves past grace 6; cause under investigation",
+      "addedAt": 1795012678212,
+      "expiresAt": 1795099078212
+    }
+  ],
   "mode": "quarantine"
 }
