@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { entries, blocks } from './agent-usage-report.mjs';
 import { PROJECTS_DIR, flattenToolResultText, stripControlSequences } from '../../skills-src/inspect-agent-health/agent-health.mjs';
-import { codexUsageLedgerPath } from '../lib/codex-usage-ledger.mjs';
+import { codexUsageLedgerPath, usageRepoSlug } from '../lib/codex-usage-ledger.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 
 // Lane clones and the primary checkout of this repository share one PR namespace.
@@ -14,13 +14,16 @@ const POOL_CWD = /\/workspace\/(?:\.lanes\/web-everything\/lane-\d+|webeverythin
 const POOL_DIR = /-workspace-(?:\.lanes-web-everything-lane-\d+|-lanes-web-everything-lane-\d+|webeverything)(?:-|$)/;
 const claudeZero = () => ({ input: 0, cacheCreation: 0, cacheRead: 0, output: 0, total: 0 });
 const codexZero = () => ({ input: 0, cached: 0, output: 0, reasoning: 0 });
-function add(target, source) {
+function add(target, source, preserveUnknown = false) {
+  let incomplete = false;
   for (const key of Object.keys(target)) if (key !== 'total') {
     const value = source?.[key];
     if (value != null && (!Number.isFinite(value) || value < 0)) throw new Error(`Invalid token count: ${key}`);
-    target[key] += value ?? 0;
+    if (value == null) incomplete = true;
+    target[key] = preserveUnknown && (value == null || target[key] === null) ? null : target[key] + (value ?? 0);
   }
   if ('total' in target) target.total = target.input + target.cacheCreation + target.cacheRead + target.output;
+  return incomplete;
 }
 // A slug must occupy a complete component; "fix" must not match "prefix".
 const branchMatches = (head, branch) => Boolean(branch) && new RegExp(`(?:^|[/._-])${branch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/._-])`).test(head);
@@ -29,8 +32,11 @@ export function attributeSessions({ sessions, prs, codexRows = [], repository })
   const perPr = prs.map(pr => ({ pr: pr.number, branch: pr.headRefName, sessions: 0, claude: claudeZero(), codex: null, agy: null }));
   const byNumber = new Map(perPr.map(row => [row.pr, row]));
   const unattributed = [], claude = claudeZero();
+  const repoSlug = usageRepoSlug(repository ? `https://${repository}` : null);
+  let codexUnattributedRows = 0, incompleteUsageMessages = 0;
   for (const session of sessions) {
     add(claude, session.tokens);
+    incompleteUsageMessages += session.incompleteUsageMessages ?? 0;
     // Legacy pure-core inputs are already scoped. Disk readers always attach namespaces,
     // including null for unknown scope, which must never match a repository-local identifier.
     const local = (namespaces, i) => namespaces === undefined || Boolean(repository && namespaces[i] === repository);
@@ -41,11 +47,11 @@ export function attributeSessions({ sessions, prs, codexRows = [], repository })
   }
   for (const row of codexRows) {
     const target = byNumber.get(Number(row.pr));
-    if (!target) continue;
+    if (!target || !repoSlug || usageRepoSlug(row.repo)?.toLowerCase() !== repoSlug.toLowerCase()) { codexUnattributedRows++; continue; }
     target.codex ??= codexZero();
-    add(target.codex, row.tokens);
+    add(target.codex, row.tokens, true);
   }
-  return { perPr, unattributed, totals: { claude, mergedPrs: prs.length,
+  return { perPr, unattributed, totals: { claude, mergedPrs: prs.length, codexUnattributedRows, incompleteUsageMessages,
     claudeTotalPerMergedPr: prs.length ? claude.total / prs.length : null }, note: 'agy tokens: no source' };
 }
 
@@ -93,10 +99,11 @@ export async function readSession(file, { repository = null, projectRepository =
     }
   }
   if (diagnostics.corrupt) throw new Error(`Incomplete transcript ${file}: ${diagnostics.corrupt} malformed rows; repair the file and retry`);
-  for (const usage of messages.values()) add(session.tokens, {
+  session.incompleteUsageMessages = 0;
+  for (const usage of messages.values()) if (add(session.tokens, {
     input: usage.input_tokens, cacheCreation: usage.cache_creation_input_tokens,
     cacheRead: usage.cache_read_input_tokens, output: usage.output_tokens,
-  });
+  })) session.incompleteUsageMessages++;
   // The public session shape carries the four source counters; total is derived by attribution.
   delete session.tokens.total;
   return session;
@@ -170,8 +177,9 @@ export async function readReport({ days = 7, now = Date.now(), projectsDir = PRO
 
 export function formatReport(report) {
   return ['PR      Branch                          Sessions  Claude tokens  Codex tokens',
-    ...report.perPr.map(row => `${String(row.pr).padEnd(7)} ${stripControlSequences(row.branch).padEnd(31)} ${String(row.sessions).padEnd(9)} ${String(row.claude.total).padEnd(14)} ${row.codex ? `${row.codex.input} in / ${row.codex.cached} cached / ${row.codex.output} out / ${row.codex.reasoning} reasoning` : '—'}`),
+    ...report.perPr.map(row => `${String(row.pr).padEnd(7)} ${stripControlSequences(row.branch).padEnd(31)} ${String(row.sessions).padEnd(9)} ${String(row.claude.total).padEnd(14)} ${row.codex ? `${row.codex.input ?? 'unknown'} in / ${row.codex.cached ?? 'unknown'} cached / ${row.codex.output ?? 'unknown'} out / ${row.codex.reasoning ?? 'unknown'} reasoning` : '—'}`),
     `Claude total: ${report.totals.claude.total}; merged PRs: ${report.totals.mergedPrs}; tokens/merged PR: ${report.totals.claudeTotalPerMergedPr ?? 'n/a'}`,
+    `Incomplete Claude usage messages: ${report.totals.incompleteUsageMessages}; unattributed Codex rows: ${report.totals.codexUnattributedRows}`,
     `Unattributed: ${report.unattributed.length} sessions (${report.unattributed.reduce((sum, row) => sum + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0)} tokens)`,
     report.note].join('\n');
 }

@@ -10,7 +10,7 @@ import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_
 import { ghRepoSlug, canonicalizeSlug } from './constellation-repos.mjs';
 
 /** Persist an identity, never a remote's credentials, query string, or fragment. */
-function usageRepoSlug(value) {
+export function usageRepoSlug(value) {
   if (typeof value !== 'string') return null;
   let path = value.trim();
   if (path.includes('://')) {

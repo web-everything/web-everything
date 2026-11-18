@@ -43,7 +43,7 @@ describe('whole-session attribution', () => {
       { pr: 10, branch: prs[0].headRefName, sessions: 2, claude: { ...tokens(11, 22, 33, 44), total: 110 }, codex: null, agy: null },
       { pr: 11, branch: prs[1].headRefName, sessions: 1, claude: { ...tokens(5, 6, 7, 8), total: 26 }, codex: null, agy: null },
     ]);
-    assert.deepEqual(report.totals, { claude: { ...tokens(16, 28, 40, 52), total: 136 }, mergedPrs: 2, claudeTotalPerMergedPr: 68 });
+    assert.deepEqual(report.totals, { claude: { ...tokens(16, 28, 40, 52), total: 136 }, mergedPrs: 2, codexUnattributedRows: 0, incompleteUsageMessages: 0, claudeTotalPerMergedPr: 68 });
     assert.deepEqual(report.unattributed, []);
     assert.equal(report.note, 'agy tokens: no source');
   });
@@ -56,16 +56,44 @@ describe('whole-session attribution', () => {
     assert.equal(report.perPr[0].claude.total, 110);
   });
   it('sums Codex rows beside the matching PR without changing Claude totals', () => {
-    const report = attributeSessions({ sessions, prs, codexRows: [
-      { pr: 10, tokens: { input: 100, cached: 40, output: 20, reasoning: 5 } },
-      { pr: '10', tokens: { input: 10, cached: 4, output: 2, reasoning: 1 } },
-      { pr: 11, tokens: { input: 9, output: 3 } },
+    const report = attributeSessions({ sessions, prs, repository, codexRows: [
+      { repo: 'a/b', pr: 10, tokens: { input: 100, cached: 40, output: 20, reasoning: 5 } },
+      { repo: 'a/b', pr: '10', tokens: { input: 10, cached: 4, output: 2, reasoning: 1 } },
+      { repo: 'a/b', pr: 11, tokens: { input: 9, output: 3 } },
       { pr: 999, tokens: { input: 999 } },
       { tokens: { input: 999 } },
     ] });
     assert.deepEqual(report.perPr[0].codex, { input: 110, cached: 44, output: 22, reasoning: 6 });
-    assert.deepEqual(report.perPr[1].codex, { input: 9, cached: 0, output: 3, reasoning: 0 });
+    assert.deepEqual(report.perPr[1].codex, { input: 9, cached: null, output: 3, reasoning: null });
     assert.equal(report.totals.claudeTotalPerMergedPr, 68);
+  });
+  it('does not credit foreign, missing, unknown, or unmatched Codex rows', () => {
+    const row = { pr: 10, tokens: { input: 1, cached: 2, output: 3, reasoning: 4 } };
+    const report = attributeSessions({ sessions: [], prs, repository, codexRows: [
+      { ...row, repo: 'other/repo' }, row, { ...row, repo: null }, { ...row, repo: 'unknown' },
+      { ...row, repo: 'a/b', pr: 999 }, { ...row, repo: 'https://github.com/A/B.git' },
+    ] });
+    assert.deepEqual(report.perPr[0].codex, row.tokens);
+    assert.equal(report.totals.codexUnattributedRows, 5);
+    assert.equal(attributeSessions({ sessions: [], prs, codexRows: [{ ...row, repo: 'a/b' }] }).totals.codexUnattributedRows, 1);
+    assert.match(formatReport(report), /unattributed Codex rows: 5/);
+  });
+  it('keeps null and undefined Codex counters unknown across subsequent credited rows', () => {
+    const complete = { input: 1, cached: 2, output: 3, reasoning: 4 };
+    const report = attributeSessions({ sessions: [], prs, repository, codexRows: [
+      { repo: 'a/b', pr: 10, tokens: complete },
+      { repo: 'a/b', pr: 10, tokens: { input: null, output: 0, reasoning: 0 } },
+      { repo: 'a/b', pr: 10, tokens: complete },
+      { repo: 'a/b', pr: 11 },
+    ] });
+    assert.deepEqual(report.perPr[0].codex, { input: null, cached: null, output: 6, reasoning: 8 });
+    assert.deepEqual(report.perPr[1].codex, { input: null, cached: null, output: null, reasoning: null });
+    assert.match(formatReport(report), /unknown in \/ unknown cached/);
+  });
+  it.each([-1, NaN, Infinity, -Infinity])('rejects invalid credited Codex counters: %s', value => {
+    assert.throws(() => attributeSessions({ sessions: [], prs, repository, codexRows: [
+      { repo: 'a/b', pr: 10, tokens: { input: value } },
+    ] }), /Invalid token count/);
   });
   it('uses branch order and avoids substring collisions; includes zero-session merged PRs', () => {
     const report = attributeSessions({ sessions: [{ ...sessions[0], prs: [], branches: ['river', 'lane/second'] }], prs });
@@ -90,7 +118,9 @@ describe('transcript evidence', () => {
       assistant(undefined, { output_tokens: 3 }), assistant(undefined, { output_tokens: 4 }),
       { type: 'user', message: { usage: { input_tokens: 999 } } },
     ]);
-    assert.deepEqual((await readSession(file)).tokens, tokens(11, 20, 30, 49));
+    const session = await readSession(file);
+    assert.deepEqual(session.tokens, tokens(11, 20, 30, 49));
+    assert.equal(session.incompleteUsageMessages, 3);
   });
   it('only reads qualified PR lines in assistant text/tool results, preserving textual order', async () => {
     const file = transcript('evidence', [
@@ -108,6 +138,22 @@ describe('transcript evidence', () => {
     assert.deepEqual(session.prs, [11, 10, 12, 13]);
     assert.deepEqual(session.prRepositories, [repository, repository, repository, null]);
     assert.deepEqual(session.branches, ['lane/second', 'bright-river', 'lane/third']);
+  });
+  it('counts incomplete deduped Claude messages in totals, including unattributed sessions', async () => {
+    transcript('incomplete', [
+      assistant('replaced', {}),
+      assistant('replaced', { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 }),
+      assistant('missing', { input_tokens: 2 }, [text('Created PR #10')]),
+      assistant('null', { input_tokens: null, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 }),
+    ]);
+    transcript('unattributed', [assistant('unknown', {})]);
+    const report = await readReport({ now, cwd, projectsDir: projects, env: { WE_CODEX_USAGE_LEDGER: ledger }, listMergedPrs: async () => prs });
+    assert.equal(report.totals.incompleteUsageMessages, 3);
+    assert.equal(report.perPr[0].claude.total, 2);
+    assert.match(formatReport(report), /Incomplete Claude usage messages: 3/);
+  });
+  it.each([-1, NaN, Infinity, -Infinity])('rejects invalid Claude counters: %s', value => {
+    assert.throws(() => attributeSessions({ sessions: [{ ...sessions[0], tokens: { input: value } }], prs }), /Invalid token count/);
   });
   it('rejects malformed transcript rows rather than silently understating tokens', async () => {
     const file = transcript('broken', []);
@@ -163,7 +209,8 @@ describe('windowed report and CLI', () => {
     transcript('future', [row], project, now + 86400000);
     writeFileSync(join(projects, 'ignored.jsonl'), 'invalid root-level file');
     jsonl(ledger, [
-      { at: mergedAt, pr: 10, tokens: { input: 20 } },
+      { at: mergedAt, repo: 'a/b', pr: 10, tokens: { input: 20 } },
+      { at: mergedAt, repo: 'other/repo', pr: 10, tokens: { input: 999 } },
       { at: '2026-01-01T00:00:00Z', pr: 10, tokens: { input: 999 } },
       { at: '2027-01-01T00:00:00Z', pr: 10, tokens: { input: 999 } },
     ]);
@@ -172,6 +219,9 @@ describe('windowed report and CLI', () => {
     assert.equal(report.perPr[0].sessions, 2);
     assert.equal(report.perPr[0].claude.total, 20);
     assert.equal(report.perPr[0].codex.input, 20);
+    assert.equal(report.perPr[0].codex.cached, null);
+    assert.equal(report.totals.codexUnattributedRows, 1);
+    assert.equal(report.totals.incompleteUsageMessages, 2);
     assert.equal(report.totals.mergedPrs, 2);
   });
   it('accepts an absent Codex ledger but rejects missing projects, corrupt ledger and failed PR reads', async () => {

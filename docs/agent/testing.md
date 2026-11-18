@@ -4614,3 +4614,12 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Per-PR token accounting
+
+`claude-tokens-per-pr.test.mjs` pins repository-scoped Codex ledger attribution,
+including a foreign repository with the same PR number through the file reader.
+Normalize ledger identities with `usageRepoSlug`; unscoped rows remain unattributed.
+Missing Codex counters remain null across aggregation. Claude incomplete-usage
+counts apply after message-ID deduplication and include unattributed sessions.
+Exercise absent/null counters separately from invalid negative/non-finite values.
