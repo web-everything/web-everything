@@ -32,7 +32,7 @@
  */
 
 import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/build-dispatch-policy.mjs';
-import { repeatedPrepareRefusals, prepareRefusalFallback, readFallbackPrepareRefusals, appendPrepareRefusal } from '../../scripts/conveyor/prepare-refusal-stop.mjs';
+import { repeatedPrepareRefusals } from '../../scripts/conveyor/prepare-refusal-stop.mjs';
 import { readPrepareRefusals, recordPrepareRefusal } from '../../scripts/conveyor/prepare-refusal-stop-io.mjs';
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
@@ -349,7 +349,6 @@ export function releaseOwnPrepareHolds({ nums, holds, release }) {
 const LEDGER_HOLD_REASON = 'prepare-unstamped';
 
 async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, routingPolicy, effects, timer = createPhaseTimer() }) {
-  const refusalFallback = prepareRefusalFallback(effects);
   effects = timer.wrap(effects);
   const groupingSettings = readBuildGroupingSettings();
   console.error(formatBuildGroupingLine(groupingSettings));
@@ -483,19 +482,23 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const tickNowMs = effects.now?.() ?? Date.now();
   const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   const refusalOptions = { ...preparePolicy, now: tickNowMs };
-  const skippedRepeatRefusal = repeatedPrepareRefusals([
-    ...await effects.readPrepareRefusals?.(refusalOptions) ?? [],
-    ...readFallbackPrepareRefusals(refusalFallback, refusalOptions),
-  ], refusalOptions);
+  let refusalReadError;
+  let skippedRepeatRefusal = [];
+  try { skippedRepeatRefusal = repeatedPrepareRefusals(await effects.readPrepareRefusals?.(refusalOptions) ?? [], refusalOptions); }
+  catch (error) { refusalReadError = error; }
+  const repeatRefusalNums = new Set(skippedRepeatRefusal.map(r => normNum(r.num)));
+  const skipRefusalState = (num, error) => {
+    if (repeatRefusalNums.has(num)) return;
+    const row = { num, reason: 'prepare-refusal-state-unwritable', error: childFailure(error, { singleLine: true }) };
+    skippedRepeatRefusal.push(row);
+    repeatRefusalNums.add(num);
+    console.error(`build-dispatch-daemon: ${row.reason} #${num}: ${row.error}`);
+  };
   const recordRefusal = async (num, reason) => {
     const options = { ...preparePolicy, now: effects.now?.() ?? Date.now() };
-    try { await effects.recordPrepareRefusal?.({ num, reason }, options); }
-    catch (e) {
-      refusalFallback.set(num, appendPrepareRefusal(refusalFallback.get(num) ?? [], { num, reason }, options));
-      console.error(`build-dispatch-daemon: prepare refusal persistence failed for #${num}: ${childFailure(e, { singleLine: true })}`);
-    }
+    try { await effects.recordPrepareRefusal?.({ num, reason }, options); return true; }
+    catch (error) { skipRefusalState(num, error); return false; }
   };
-  const repeatRefusalNums = new Set(skippedRepeatRefusal.map(r => normNum(r.num)));
   // An operator release or a stamp lifts a cached refusal at once.
   const freshRefusals = (Array.isArray(bookkeeping.prepareRefusals) ? bookkeeping.prepareRefusals : [])
     .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS
@@ -563,7 +566,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ?? (policy.prepareAheadWindow !== BUILD_DISPATCH_POLICY.prepareAheadWindow))
     ? policy.prepareAheadWindow : (preparePolicy.aheadCount ?? policy.prepareAheadWindow);
   const planConfig = planConfigFrom({ ...policy, prepareAheadWindow: effectivePrepareAheadWindow });
+  // Unknown history disables prepare planning; the queue still identifies cards for the tick's skip rows.
+  if (refusalReadError) planConfig.launchKinds = planConfig.launchKinds.filter(kind => kind !== 'prepare-item');
   let out = await effects.planTick(tickBookkeeping, { config: planConfig });
+  if (refusalReadError) {
+    for (const row of [...out?.decisions?.admission?.queue ?? [],
+      ...out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? []]) skipRefusalState(normNum(row.num), refusalReadError);
+    tickBookkeeping.prepareHeldNums = [...new Set([...tickBookkeeping.prepareHeldNums, ...repeatRefusalNums])];
+  }
   const planningSkips = [];
   // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
   const planningSkipDetail = new Map();
@@ -574,7 +584,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const inspectedPrepares = new Set();
   const inspectPrepareCooldown = async candidate => {
     const num = normNum(candidate.num);
-    if (typeof effects.listPreparePrs !== 'function' || inspectedPrepares.has(num) || inspectedPrepares.size >= 8) return;
+    if (repeatRefusalNums.has(num) || typeof effects.listPreparePrs !== 'function' || inspectedPrepares.has(num) || inspectedPrepares.size >= 8) return;
     inspectedPrepares.add(num);
     try {
       const bornAs = candidate.bornAs ?? out?.decisions?.admission?.queue?.find(r => normNum(r.num) === num)?.bornAs
@@ -587,7 +597,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       // Persist what the launch guard would: its PR precedence (an open prepare PR outranks the merge, so the
       // refusal probe still reads it) and reason. Claims, runs and parks stay the launch guard's own checks.
       const refusal = prepareLaunchRefusal({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
-      if (live) await recordRefusal(num, refusal.reason);
+      if (live && !await recordRefusal(num, refusal.reason)) {
+        planningSkips.push({ num, reason: 'prepare-refusal-state-unwritable' });
+        return;
+      }
       const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
       const matched = prs.find(pr => pr?.number === refusingPr) ?? merged.pr;
       // Read the scope-drift hold from the plan that offered this card: a replan with it held may drop the hold.
@@ -1388,7 +1401,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       refusal = { reason: 'prepare PR listing unavailable' };
     }
     if (!refusal) return null;
-    await recordRefusal(num, refusal.reason);
+    if (!await recordRefusal(num, refusal.reason)) {
+      prepare.planned = prepare.planned.filter(row => normNum(row.num) !== num);
+      return { reason: 'prepare-refusal-state-unwritable' };
+    }
     refusedPrepares.add(num);
     prepare.refused.push({ num, ...refusal });
     console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);
@@ -1465,7 +1481,6 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       };
       try {
         if (!(await cloneGate('prepare', num))) continue;
-        if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
         // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
         // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
         // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
@@ -1483,6 +1498,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           continue;
         }
         if (await refusePrepareLaunch(num, { pickBornAs: pick.bornAs, cardBornAs, replacesStamp })) continue;
+        if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
         const claim = effects.acquirePrepareClaim({ num, scope: scopeByNum.get(num) ?? [],
           ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
         if (!claim.ok) {
@@ -1606,7 +1622,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         ...prepare.refused.map(r => ({ num: r.num, reason: r.reason, at: new Date(tickNowMs).toISOString(),
           ...refusalDetail.get(normNum(r.num)) })),
         // A planning skip is a merged-prepare refusal decided earlier: persist it (and its scope note) the same way.
-        ...planningSkips.filter(r => !finishedPrepares.has(r.num))
+        ...planningSkips.filter(r => planningSkipDetail.has(r.num) && !finishedPrepares.has(r.num))
           .map(r => ({ num: r.num, at: new Date(tickNowMs).toISOString(), ...planningSkipDetail.get(r.num) })),
       ].slice(-200),
       prepareRecoveryPins: [...recoveryPins.values()].filter(p => !completedPrepares.has(normNum(p.num))).slice(-200),

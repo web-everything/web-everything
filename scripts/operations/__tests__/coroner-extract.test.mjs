@@ -42,7 +42,7 @@ describe('card 130 S2 outcome labels', () => {
   });
   it('separates five per-tick prepare observation failures from two launches and one result failure', () => {
     const observation = (num, reason, extra = {}) => ({ num, reason, cause: 'daemon-observation', stage: 'retirement', retry: true, ...extra });
-    const throttle = observation('41', 'gh-throttle: throttled');
+    const throttle = observation('41', 'gh-throttle: throttled pr list');
     const budget = observation('42', 'prepare PR listing call budget exhausted');
     const command = observation('43', 'Command failed: node gh-throttle.mjs pr list --limit 100');
     const failure = { num: '44', stage: 'result', reason: 'prepare-unstamped', attempt: 'run failed', recordedAt: at(2) };
@@ -55,7 +55,7 @@ describe('card 130 S2 outcome labels', () => {
     const metrics = builderMetrics(ticks, { since, until });
     expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 3, launched: 2 });
     expect(metrics.prepareObservationFailures).toEqual({ count: 5, byReason: {
-      'gh-throttle: throttled': 2,
+      'gh-throttle: throttled pr list': 2,
       'prepare PR listing call budget exhausted': 1,
       'Command failed: node gh-throttle.mjs pr list --limit N': 2,
     } });
@@ -63,9 +63,9 @@ describe('card 130 S2 outcome labels', () => {
   it('observation-only windows have zero prepare attempts and deduplicate normalized reasons within each tick', () => {
     const reason = `Command failed: node gh-throttle.mjs pr list ${'x'.repeat(100)}`;
     const failures = [
-      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing failed after 123 calls', recordedAt: at(-10), held: true },
-      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing failed after 456 calls', attempt: 'another attempt' },
-      { num: '42', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing failed after 789 calls' },
+      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 123 calls', recordedAt: at(-10), held: true },
+      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 456 calls', attempt: 'another attempt' },
+      { num: '42', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 789 calls' },
       { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} first` },
       { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} second` },
     ];
@@ -76,7 +76,7 @@ describe('card 130 S2 outcome labels', () => {
     ], { since, until });
     expect(metrics.byKind.prepare).toMatchObject({ count: 0, total: 0, launched: 0 });
     expect(metrics.prepareObservationFailures).toEqual({ count: 3, byReason: {
-      'PR listing failed after N calls': 2,
+      'PR listing call budget exhausted after N calls': 2,
       [reason.slice(0, 90)]: 1,
     } });
     expect(builderMetrics([], { since, until })).not.toHaveProperty('prepareObservationFailures');
@@ -85,8 +85,12 @@ describe('card 130 S2 outcome labels', () => {
     ['launch', 'failure recording unavailable'],
     ['launch', 'Command failed: node gh-throttle.mjs pr list'],
     ['result', 'PR listing failed'],
-    [undefined, 'gh-throttle: throttled'],
+    [undefined, 'gh-throttle: throttled pr list'],
     ['retirement', 'failure recording unavailable'],
+    ['retirement', 'gh-throttle: throttled pr view'],
+    ['retirement', 'gh-throttle: throttled'],
+    ['retirement', 'PR listing failed after 123 calls'],
+    ['retirement', 'other daemon observation pr list'],
     ['retirement', 'Command failed: node other-command.mjs'],
     ['retirement', 'Command failed: node gh-throttle.mjs pr view'],
   ])('counts daemon-observation at stage %s with reason %s as a failed attempt', (stage, reason) => {

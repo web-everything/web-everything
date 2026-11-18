@@ -1985,70 +1985,41 @@ describe('automatic item preparation', () => {
       expect(offered).toHaveLength(1);
     } finally { log.mockRestore(); }
   });
-  it.each(['throw', 'reject'])('records the refusal and preserves bookkeeping cooldown when persistence fails (%s)', async failure => {
+  it.each(['throw', 'reject', 'merged'])('skips an unwritable refusal state without planning or spending admission (%s)', async failure => {
     const effects = fixture();
-    const now = Date.parse('2026-11-18T12:00:00Z');
-    effects.now = () => now;
+    effects.now = () => Date.parse('2026-11-18T12:00:00Z');
     effects.preparePolicy = () => resolvePreparePolicy();
     effects.recordPrepareRefusal = vi.fn(() => {
-      const error = new Error('refusal store unavailable\nextra detail');
-      if (failure === 'throw') throw error;
-      return Promise.reject(error);
+      const error = new Error('disk full\nextra detail');
+      if (failure === 'reject') return Promise.reject(error);
+      throw error;
     });
-    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
-    effects.planTick = vi.fn(bk => ({ decisions: planPrepareSpawns({
-      needsPrepare: [{ num: '5028' }], prepareHeldNums: bk.prepareHeldNums,
-      availableLanes: [1], maxConcurrentItemPrepares: 1,
-    }), nextState: {} }));
-    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      const tick = await runBuildDispatchTick({ live: true, effects });
-      const refusal = { num: '5028', reason: 'open prepare PR #91 (lane/5028d-prepare-x)' };
-      expect(tick.prepare.refused).toEqual([refusal]);
-      expect(tick.nextBookkeeping.prepareRefusals).toContainEqual({ ...refusal, at: new Date(now).toISOString(),
-        pr: 91, head: 'lane/5028d-prepare-x' });
-      const errors = log.mock.calls.filter(([line]) => line.includes('prepare refusal persistence failed'));
-      expect(errors).toHaveLength(1);
-      expect(errors[0][0]).toContain('refusal store unavailable');
-      expect(errors[0][0]).not.toContain('\n');
-      const next = await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
-      expect(next.prepare.planned).toEqual([]);
-      expect(effects.recordPrepareRefusal).toHaveBeenCalledTimes(1);
-      expect(effects.dispatch).not.toHaveBeenCalled();
-    } finally { log.mockRestore(); }
-  });
-  it.each(['both', 'first', 'second'])('merges failed-write fallback with durable refusals and retries persistence (%s fails)', async fails => {
-    const path = join(lockRoot, 'fallback-refusals.json');
-    let now = Date.parse('2026-11-18T12:00:00Z');
-    const effects = fixture();
-    effects.now = () => now;
-    effects.preparePolicy = () => resolvePreparePolicy();
-    effects.readPrepareRefusals = options => readPrepareRefusals({ path, ...options });
-    effects.recordPrepareRefusal = vi.fn((row, options) => {
-      const call = effects.recordPrepareRefusal.mock.calls.length;
-      if (fails === 'both' || (fails === 'first' ? call === 1 : call === 2)) throw new Error('disk full');
-      recordPrepareRefusal(row, { path, ...options });
-    });
-    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.listPreparePrs = () => [{ number: 91, state: failure === 'merged' ? 'MERGED' : 'OPEN',
+      headRefName: 'lane/5028d-prepare-x', mergedAt: '2026-11-18T11:00:00Z' }];
     effects.planTick = bk => ({ decisions: planPrepareSpawns({
       needsPrepare: [{ num: '5028' }], prepareHeldNums: bk.prepareHeldNums,
       availableLanes: [1], maxConcurrentItemPrepares: 1,
     }), nextState: {} });
+    effects.costFacts = () => ({ cpuIdlePct: 80, memFreePct: 80, minMemFreePct: 15 });
+    const policy = { ...BUILD_DISPATCH_POLICY, costAdmission: resolveCostAdmissionSettings({ env: { WE_COST_ADMISSION: 'on' } }) };
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      for (let i = 0; i < 2; i++) {
-        expect((await runBuildDispatchTick({ live: true, effects })).prepare.refused).toHaveLength(1);
-        now += 3_600_000;
-      }
-      const tick = await runBuildDispatchTick({ live: true, effects });
+      const tick = await runBuildDispatchTick({ live: true, effects, policy });
       expect(tick.prepare.planned).toEqual([]);
-      expect(tick.prepare.skippedRepeatRefusal).toEqual([{ num: '5028', refusals: 2,
-        lastReason: 'open prepare PR #91 (lane/5028d-prepare-x)' }]);
-      expect(effects.recordPrepareRefusal).toHaveBeenCalledTimes(2);
+      expect(tick.prepare.skippedRepeatRefusal).toEqual([{ num: '5028',
+        reason: 'prepare-refusal-state-unwritable', error: expect.stringContaining('disk full') }]);
+      expect(tick.costAdmission.decisions.filter(d => d.num === '5028')).toEqual([]);
+      const errors = log.mock.calls.filter(([line]) => line.includes('prepare-refusal-state-unwritable'));
+      expect(errors).toHaveLength(1);
+      expect(errors[0][0]).toContain('#5028');
+      expect(errors[0][0]).not.toContain('\n');
       expect(effects.dispatch).not.toHaveBeenCalled();
-      now += 24 * 3_600_000;
-      expect((await runBuildDispatchTick({ live: true, effects })).prepare.refused).toHaveLength(1);
-      expect(effects.recordPrepareRefusal).toHaveBeenCalledTimes(3);
+      // No memory fallback survives: a recovered store allows the next tick to check this card again.
+      effects.recordPrepareRefusal.mockImplementation(() => {});
+      effects.listPreparePrs = () => [];
+      expect(tick.nextBookkeeping.prepareRefusals).toEqual([]);
+      const next = await runBuildDispatchTick({ live: true, effects: { ...effects }, bookkeeping: tick.nextBookkeeping });
+      expect(next.prepare.launched.map(row => row.num)).toEqual(['5028']);
     } finally { log.mockRestore(); }
   });
   it('durably counts planning-time merged-PR refusals and stops planning after two', async () => {
@@ -2079,13 +2050,35 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
   });
-  it('does not plan when durable refusal evidence is unreadable', async () => {
+  it.each(['throw', 'reject'])('skips unreadable refusal evidence with a tick row and no admission (%s)', async failure => {
     const effects = fixture();
-    effects.readPrepareRefusals = () => { throw new Error('prepare refusal history unavailable'); };
-    effects.planTick = vi.fn();
-    await expect(runBuildDispatchTick({ live: true, effects })).rejects.toThrow('prepare refusal history unavailable');
-    expect(effects.planTick).not.toHaveBeenCalled();
-    expect(effects.dispatch).not.toHaveBeenCalled();
+    effects.readPrepareRefusals = () => {
+      const error = new Error('prepare refusal history unavailable');
+      if (failure === 'reject') return Promise.reject(error);
+      throw error;
+    };
+    effects.planTick = vi.fn((bk, { config }) => {
+      expect(config.launchKinds).not.toContain('prepare-item');
+      return { decisions: { admission: { queue: [{ num: '5028' }] },
+        itemPrepareSpawns: planPrepareSpawns({ needsPrepare: [{ num: '5028' }],
+          availableLanes: [1], prepareHeldNums: bk.prepareHeldNums, dispatchPaused: !config.launchKinds.includes('prepare-item') }).itemPrepareSpawns }, nextState: {} };
+    });
+    effects.listPreparePrs = vi.fn();
+    effects.costFacts = () => ({ cpuIdlePct: 80, memFreePct: 80, minMemFreePct: 15 });
+    const policy = { ...BUILD_DISPATCH_POLICY, costAdmission: resolveCostAdmissionSettings({ env: { WE_COST_ADMISSION: 'on' } }) };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects, policy });
+      expect(tick.prepare.planned).toEqual([]);
+      expect(tick.prepare.skippedRepeatRefusal).toEqual([{ num: '5028',
+        reason: 'prepare-refusal-state-unwritable', error: expect.stringContaining('history unavailable') }]);
+      expect(tick.costAdmission.decisions).toEqual([]);
+      expect(effects.listPreparePrs).not.toHaveBeenCalled();
+      expect(effects.dispatch).not.toHaveBeenCalled();
+      expect(log.mock.calls.filter(([line]) => line.includes('prepare-refusal-state-unwritable'))).toEqual([
+        [expect.stringMatching(/#5028.*history unavailable/)],
+      ]);
+    } finally { log.mockRestore(); }
   });
   it('refuses a duplicate prepare when Codex left an OPEN letter-suffixed PR', async () => {
     const effects = fixture();

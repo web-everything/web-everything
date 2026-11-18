@@ -382,8 +382,10 @@ export function builderMetrics(ticks, window, cardNames = []) {
     const observationSeen = new Set();
     const failures = list(t.prepare?.failures).filter((f) => {
       if (!f || typeof f !== 'object') return false;
+      const observationReason = String(f.reason ?? f.evidence?.reason ?? '');
       if (f.cause !== 'daemon-observation' || f.stage !== 'retirement'
-        || !/^gh-throttle:|PR listing|^Command failed:.*\bgh-throttle\.mjs\s+pr\s+list(?:\s|$)/i.test(String(f.reason ?? f.evidence?.reason ?? ''))) return true;
+        || !(/gh-throttle\.mjs pr list|PR listing call budget/.test(observationReason)
+          || (/^gh-throttle:.*throttl/i.test(observationReason) && /pr list/.test(observationReason)))) return true;
       // No prepare launched: count each card + normalized reason once in this tick, independent of attempt metadata.
       const reason = String(f.reason ?? f.evidence?.reason ?? '').replace(/\d+/g, 'N').slice(0, 90);
       const key = `${f.num}|${reason}`;
