@@ -55,6 +55,52 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     expect(evaluateProbation({ ...p, owed: new Array(1) }, now)).toMatchObject({ action: 'pending' });
   });
 
+  describe('validateProbation: one validator, every rule fails closed', () => {
+    const base = async () => {
+      const { freezeProbation, recordProof } = await core();
+      const p = recordProof(recordProof(freezeProbation(options), 'worker', proof(101, 'worker'), now),
+        'review', proof(102, 'review'), now);
+      return JSON.parse(JSON.stringify(p));
+    };
+    const rec = (p, id = 'worker') => p.records[id];
+    const rules = [
+      ['now-not-finite', p => p, NaN],
+      ['state-fields', p => ({ ...p, extra: 1 })],
+      ['version', p => ({ ...p, version: 1 })],
+      ['adoption-id', p => ({ ...p, adoptionId: '' })],
+      ['adopted-sha', p => ({ ...p, sha: 'x' })],
+      ['proven-good', p => ({ ...p, provenGood: 'x' })],
+      ['adopted-at', p => ({ ...p, adoptedAt: iso(now + 1000) })],
+      ['owed-type', p => ({ ...p, owed: 'worker' })],
+      ['owed-names', p => ({ ...p, owed: ['worker', 5] })],
+      ['owed-duplicate', p => ({ ...p, owed: ['worker', 'worker'] })],
+      ['owed-names', p => ({ ...p, owed: new Array(2) })],
+      ['records-type', p => ({ ...p, records: [] })],
+      ['record-not-owed', p => ({ ...p, records: { ...p.records, healthy: rec(p) } })],
+      ['record-fields', p => { rec(p).extra = 1; return p; }],
+      ['boot-fields', p => { rec(p).boot.extra = 1; return p; }],
+      ['tick-fields', p => { delete rec(p).tick.head; return p; }],
+      ['record-daemon', p => { rec(p).boot.daemonId = 'review'; return p; }],
+      ['pid-type', p => { rec(p).boot.pid = '101'; return p; }],
+      ['pid-mismatch', p => { rec(p).tick.pid = 999; return p; }],
+      ['pid-shared', p => { rec(p, 'review').boot.pid = 101; rec(p, 'review').tick.pid = 101; return p; }],
+      ['record-head', p => { rec(p).tick.head = OTHER; return p; }],
+      ['time-type', p => { rec(p).boot.startedAt = 5; return p; }],
+      ['start-before-adoption', p => { rec(p).boot.startedAt = iso(ADOPTED_AT - 1); return p; }],
+      ['tick-not-after-boot', p => { rec(p).tick.lastTickDoneAt = rec(p).boot.startedAt; return p; }],
+      ['time-in-future', p => { rec(p).tick.lastTickDoneAt = iso(now + 1); return p; }],
+    ];
+    it.each(rules)('%s', async (rule, mutate, at = now) => {
+      const { validateProbation, evaluateProbation, recordProof } = await core();
+      const good = await base();
+      expect(validateProbation(good, now)).toBeNull();
+      const bad = mutate(JSON.parse(JSON.stringify(good)));
+      expect(validateProbation(bad, at)).toBe(rule);
+      expect(evaluateProbation(bad, at).action).toBe('pending');
+      expect(recordProof(bad, 'review', proof(102, 'review'), at)).toBe(bad);
+    });
+  });
+
   it('empty owed set promotes immediately with no boot or tick evidence', async () => {
     const { freezeProbation, evaluateProbation } = await core();
     const p = freezeProbation({ ...options, readClosure: () => closure(GOOD) });
@@ -136,6 +182,6 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
   it('old single-record persisted state fails closed and requires operator recovery', async () => {
     const { evaluateProbation } = await core();
     expect(evaluateProbation({ ...options, version: 1, bootPid: 101, boots: 0 }, now))
-      .toEqual({ action: 'pending', reason: 'invalid-probation: operator recovery required' });
+      .toEqual({ action: 'pending', reason: expect.stringMatching(/^invalid-probation: .*operator recovery required$/) });
   });
 });
