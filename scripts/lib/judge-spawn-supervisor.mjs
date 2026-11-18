@@ -1,10 +1,18 @@
 // Detached process-group leader: keeps the juror bounded even if its caller receives SIGKILL.
+// Requires POSIX process groups; Windows hosts are unsupported.
 import { spawn } from 'node:child_process';
 
 const [parent, deadline, cli, ...argv] = process.argv.slice(2);
 const killGroup = () => {
   try { process.kill(-process.pid, 'SIGKILL'); }
-  catch (error) { process.exit(error.code === 'ESRCH' ? 0 : 1); }
+  catch (error) {
+    if (error.code === 'ESRCH') process.exit(0);
+    else {
+      try { process.kill(child.pid, 'SIGKILL'); }
+      catch { /* best effort if the juror is already gone or inaccessible */ }
+      finally { process.exit(1); }
+    }
+  }
 };
 setTimeout(killGroup, Math.max(1, Number(deadline) - Date.now()));
 // keepalive-helper-ok: watches the caller until group SIGKILL, bounded by the hard deadline

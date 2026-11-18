@@ -8,10 +8,81 @@ import { pathToFileURL } from 'node:url';
 import { createServer } from 'node:net';
 import { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { runInNewContext } from 'node:vm';
 import { judgeSpawn, JudgeTimeoutError } from '../judge-spawn.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 
 const request = { mandate: 'review', input: 'diff', shape: { type: 'object' }, retries: 0 };
+
+describe('supervisor group-signal fallback', () => {
+  const source = readFileSync(resolve('scripts/lib/judge-spawn-supervisor.mjs'), 'utf8')
+    .replace("import { spawn } from 'node:child_process';", '');
+
+  it.each(['EPERM', 'EINVAL', undefined, 'ESRCH'])(
+    'kills the juror directly before exiting on group failure %s, except ESRCH', (code) => {
+      const child = new EventEmitter();
+      child.pid = 1234;
+      child.stdout = child.stderr = { pipe: vi.fn() };
+      const calls = [];
+      let deadline;
+      const kill = vi.fn((pid, signal) => {
+        calls.push(['kill', pid, signal]);
+        if (pid < 0) throw Object.assign(new Error('group signal failed'), { code });
+      });
+      runInNewContext(source, {
+        spawn: () => child,
+        process: {
+          argv: ['node', 'supervisor', '100', String(Date.now() + 1000), 'juror'],
+          pid: 5678, kill,
+          exit: (status) => calls.push(['exit', status]),
+        },
+        setTimeout: (callback) => { deadline = callback; },
+        setInterval: vi.fn(),
+      });
+      deadline();
+      expect(calls).toEqual(code === 'ESRCH'
+        ? [['kill', -5678, 'SIGKILL'], ['exit', 0]]
+        : [['kill', -5678, 'SIGKILL'], ['kill', child.pid, 'SIGKILL'], ['exit', 1]]);
+    });
+
+  it('exits even when the direct juror kill also fails', () => {
+    const child = new EventEmitter();
+    child.pid = 1234;
+    child.stdout = child.stderr = { pipe: vi.fn() };
+    const kill = vi.fn(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    const exit = vi.fn();
+    let deadline;
+    runInNewContext(source, {
+      spawn: () => child,
+      process: {
+        argv: ['node', 'supervisor', '100', String(Date.now() + 1000), 'juror'],
+        pid: 5678, kill, exit,
+      },
+      setTimeout: (callback) => { deadline = callback; },
+      setInterval: vi.fn(),
+    });
+    deadline();
+    expect(kill.mock.calls).toEqual([[-5678, 'SIGKILL'], [child.pid, 'SIGKILL']]);
+    expect(exit.mock.calls).toEqual([[1]]);
+  });
+});
+
+it('parent kills the child directly when group signalling fails', async () => {
+  const child = new EventEmitter();
+  child.pid = 987654321;
+  child.kill = vi.fn();
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+    throw Object.assign(new Error('group signal denied'), { code: 'EPERM' });
+  });
+  try {
+    await judgeSpawn({ ...request, spawnFn: () => {
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    } }).catch(() => {});
+    expect(kill.mock.calls).toEqual([[-child.pid, 'SIGKILL']]);
+    expect(child.kill.mock.calls).toEqual([['SIGKILL']]);
+  } finally { kill.mockRestore(); }
+});
 
 it.each(['close', 'error'])('removes per-spawn process listeners after %s, including repeated spawns', async (event) => {
   const events = ['SIGTERM', 'SIGINT', 'SIGHUP', 'exit'];

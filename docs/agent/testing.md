@@ -4546,6 +4546,9 @@ closed. Named stdout/stderr regressions keep the caller timeout disabled and
 shorten only the supervisor deadline, then assert group SIGKILL and pipe closure.
 Every caller settlement kills the group before removing signal/exit hooks, including
 successful close and spawn errors; ESRCH means the group is already gone. The
-successful-juror regressions exercise both direct spawn and the production supervisor
+supervisor falls back to a direct juror SIGKILL for other group-signal failures
+before exiting. Stubbed kill probes cover this fallback, failure of the direct
+kill, and the parent's existing direct-child fallback.
+Successful-juror regressions exercise both direct spawn and the production supervisor
 with a grandchild whose standard streams are ignored. Socket closure proves it stops
 within five seconds of resolution without confusing zombie PIDs with live processes.
