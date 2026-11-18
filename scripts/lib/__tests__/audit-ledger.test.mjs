@@ -89,6 +89,25 @@ describe('R1047 attack table', () => {
     expect(evaluate(ledger([pass(), weak()]), { waivers }).ok).toBe(true);
     expect(evaluate(ledger([pass(), weak(), weak()]), { waivers }).ok).toBe(false);
   });
+  it('a pass on another related head never clears a related-head WEAKENED; only the live head does', () => {
+    const THIRD = 'e'.repeat(40);
+    expect(evaluate(ledger([weak({ head: OTHER }), pass({ head: THIRD })])).ok).toBe(false);
+    expect(evaluate(ledger([weak({ head: OTHER }), pass({ head: THIRD }), pass()])).ok).toBe(true);
+  });
+  it('chained records without genesis cannot downgrade to legacy ordering', () => {
+    const l = ledger([weak(), pass()]);
+    const text = l.lines.slice(1).join('\n') + '\n';
+    expect(evaluateAudit(text, { ...options })).toMatchObject({ ok: false, reason: 'chain-break' });
+    expect(evaluateAudit(text, { ...options, hwm: undefined, hwmPresent: false }).ok).toBe(false);
+  });
+  it('a reseal does not make earlier chained records waivable without an auditId', () => {
+    const first = ledger([weak()]);
+    const resealed = [...first.lines, JSON.stringify({ ...buildGenesis(Buffer.from(first.text), { reseal: true }) })];
+    const text = resealed.join('\n') + '\n';
+    const hwm = { seq: 0, lineHash: sha256Line(resealed.at(-1)) };
+    const waivers = [{ sha: HEAD, findings: weak().findings }];
+    expect(evaluateAudit(text, { ...options, hwm, waivers }).ok).toBe(false);
+  });
   it('a waiver without auditId covers only legacy', () => {
     const waivers = [{ sha: HEAD, findings: weak().findings }];
     const legacy = ledger([pass()], JSON.stringify(weak({ base: OTHER })) + '\n');

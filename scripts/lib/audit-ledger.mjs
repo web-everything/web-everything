@@ -28,6 +28,7 @@ export function evaluateAudit(ledgerText, options = {}) {
   const liveFp = suppliedFp;
   const genesis = lines.findLastIndex(e => e.record?.kind === 'genesis');
   if (genesis < 0 && !hwmPresent) {
+    if (lines.some(e => e.record?.kind !== 'genesis' && chained(e.record))) return fail('chain-break');
     const records = Array.isArray(ledgerText) ? ledgerText : lines.map(e => e.record).filter(Boolean);
     return lookup ? { record: legacyFindAudit(records, { ...options, priorQuestionHashes, now }) }
       : legacyCanonicalAuditEvidence(records, head, covers, liveFp, Object.fromEntries(['ruledWeakened', 'now', 'priorQuestionHashes'].filter(k => k in options).map(k => [k, options[k]])));
@@ -70,7 +71,7 @@ export function evaluateAudit(ledgerText, options = {}) {
     && legacyFindAudit([e.r], { head: e.r.head, base: e.r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === e.r);
   const gate = options.ruledWeakened;
   const waivers = options.waivers ?? (gate?.ruledWeakened ? [{ ...gate.ruledWeakened, sha: gate.record.sha, fingerprint: gate.record.fingerprint }] : []);
-  const waived = e => e.trusted && waivers.some(w => (e.legacy ? !w.auditId || w.auditId === e.r.id : w.auditId === e.r.id)
+  const waived = e => e.trusted && waivers.some(w => (w.auditId ? w.auditId === e.r.id : e.legacy && !e.r.id)
     && validSha(w.sha) && (lower(w.sha) === lower(head) && related(e) || lower(w.sha) === lower(e.r.head) && related(e)
       || carriesAcross(w.fingerprint, liveFp) && carriesAcross(e.fp, liveFp))
     && Array.isArray(e.r.findings) && JSON.stringify(w.findings) === JSON.stringify(e.r.findings) && covered(e.r.base));
@@ -80,7 +81,7 @@ export function evaluateAudit(ledgerText, options = {}) {
     if (!own && !related(e) && !unknown) continue;
     const cleared = e.trusted && passes.some(p => p.order > e.order && (p.legacy && e.legacy || p.r.id !== e.r.id)
       && (p.r.questionHash === e.r.questionHash || p.r.questionHash === questionHash)
-      && (own ? lower(p.r.head) === lower(head) && lower(p.r.base) === lower(e.r.base) : related(p) && covered(p.r.base)));
+      && (own ? lower(p.r.head) === lower(head) && lower(p.r.base) === lower(e.r.base) : lower(p.r.head) === lower(head) && covered(p.r.base)));
     if (!cleared && !waived(e)) return { ...fail('weakened'), ...(lookup ? { record: e.r } : {}) };
   }
   const authorized = entries.filter(e => e.r.verdict === 'WEAKENED' && validSha(e.r.head) && validSha(e.r.base)
