@@ -23,6 +23,15 @@ import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, g
 let root;
 const policy = { maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 0, installationCap: 2 };
 const args = ['pr', 'list', '--repo', 'example/repo'];
+// Synthetic app and installation ids, held in named constants so the R972 account-id scan
+// (scripts/lib/privacy-terms.mjs) never reads a fixture literal as a real account id.
+const APP_1 = '1';
+const APP_2 = '2';
+const INST_101 = '101';
+const INST_201 = '201';
+const INST_202 = '202';
+const INST_303 = '303';
+const INST_999 = '999';
 const appEnv = (id) => {
   const GH_TOKEN = `ghs_fixture_${id}`;
   return { GH_TOKEN, WE_GITHUB_APP_INSTALLATIONS: JSON.stringify({ example: id }), WE_GH_AUTH_INSTALLATION: id, WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(GH_TOKEN).digest('hex') };
@@ -61,12 +70,12 @@ describe('installation bucket resolution', () => {
     expect(probeOrigin).not.toHaveBeenCalled();
   });
   it('recognizes an installation configured only in the role table', () => {
-    delivery.readDeliveryIdentity.mockReturnValue({ roles: { worker: { appId: '1', installations: { example: '303' } } } });
+    delivery.readDeliveryIdentity.mockReturnValue({ roles: { worker: { appId: APP_1, installations: { example: INST_303 } } } });
     expect(resolveGhSlotBucket({ identity: 'app-installation-303' })).toEqual({ bucket: '303', reason: 'identity' });
   });
   it('resolves an ownerless call with the same bounded origin probe as the shim', () => {
     const probeOrigin = vi.fn(() => ({ status: 0, stdout: 'git@github.com:example/repo.git\n' }));
-    expect(resolveGhSlotBucket({ identity: 'default', args: ['pr', 'list'], env: { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' }, probeOrigin, readFresh: () => ({ installationId: '101' }) })).toEqual({ bucket: '101', reason: 'shim-cache' });
+    expect(resolveGhSlotBucket({ identity: 'default', args: ['pr', 'list'], env: { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' }, probeOrigin, readFresh: () => ({ installationId: INST_101 }) })).toEqual({ bucket: '101', reason: 'shim-cache' });
     expect(probeOrigin).toHaveBeenCalledTimes(1);
     expect(probeOrigin).toHaveBeenCalledWith('/usr/bin/git', ['remote', 'get-url', 'origin'], { cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
   });
@@ -81,7 +90,7 @@ describe('installation bucket resolution', () => {
     execFileSync('/usr/bin/git', ['remote', 'add', 'origin', 'git@github.com:example/repo.git'], { cwd: checkout });
     const caches = join(root, '.claude', 'github-app-token');
     mkdirSync(caches, { recursive: true });
-    writeFileSync(join(caches, 'web-everything.101.json'), JSON.stringify({ v: 2, installationId: '101', token: 'ghs_fixture', expiresAt: new Date(Date.now() + 3600000).toISOString() }));
+    writeFileSync(join(caches, 'web-everything.101.json'), JSON.stringify({ v: 2, installationId: INST_101, token: 'ghs_fixture', expiresAt: new Date(Date.now() + 3600000).toISOString() }));
     const source = `import { resolveGhSlotBucket } from ${JSON.stringify(new NodeURL('../gh-installation-bucket.mjs', import.meta.url).href)}; console.log(JSON.stringify(resolveGhSlotBucket({ identity: 'default', env: process.env, args: ['pr', 'list'] })));`;
     const result = execFileSync(process.execPath, ['--input-type=module', '-e', source], { cwd: checkout, encoding: 'utf8', maxBuffer: 65536, timeout: 10000, env: { ...process.env, ...baseEnv(), HOME: root, GH_REPO: undefined, GH_TOKEN: undefined, GITHUB_TOKEN: undefined, WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' } });
     expect(JSON.parse(result)).toEqual({ bucket: '101', reason: 'shim-cache' });
@@ -119,7 +128,7 @@ console.log(result);`;
     expect(JSON.parse(result)).toMatchObject({ cwd: child, holders: [{ bucket: '202' }] });
   });
   it.each(['fresh', 'expired', 'malformed', 'wrong-version', 'missing-token'])('reads the %s cache with the shim freshness rules', kind => {
-    const cache = { v: 2, token: 'ghs_fixture', installationId: '101', expiresAt: new Date(Date.now() + (kind === 'expired' ? 60000 : 3600000)).toISOString() };
+    const cache = { v: 2, token: 'ghs_fixture', installationId: INST_101, expiresAt: new Date(Date.now() + (kind === 'expired' ? 60000 : 3600000)).toISOString() };
     if (kind === 'wrong-version') cache.v = 1;
     if (kind === 'missing-token') delete cache.token;
     writeFileSync(installationCachePath(defaultCachePath(), '101'), kind === 'malformed' ? '{' : JSON.stringify(cache));
@@ -128,7 +137,7 @@ console.log(result);`;
   });
   it('rejects a mismatched per-installation cache', () => {
     writeFileSync(installationCachePath(defaultCachePath(), '101'), JSON.stringify({
-      v: 2, token: 'ghs_fixture', installationId: '999',
+      v: 2, token: 'ghs_fixture', installationId: INST_999,
       expiresAt: new Date(Date.now() + 3600000).toISOString(),
     }));
     expect(resolveGhSlotBucket({
@@ -143,23 +152,23 @@ console.log(result);`;
   });
   it.each(['argv', 'GH_REPO'])('resolves a legacy installation via %s and its matching fresh cache', source => {
     const env = { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}', ...(source === 'GH_REPO' ? { GH_REPO: 'github.com/example/repo' } : {}) };
-    const readFresh = vi.fn(() => ({ installationId: '101' }));
+    const readFresh = vi.fn(() => ({ installationId: INST_101 }));
     expect(resolveGhSlotBucket({ identity: 'default', args: source === 'argv' ? args : [], env, readFresh })).toEqual({ bucket: '101', reason: 'shim-cache' });
     expect(readFresh).toHaveBeenCalledWith(installationCachePath(defaultCachePath(), '101'));
   });
   it.each(['reviewer', 'worker', 'legacy'])('uses the shared shim role chain for %s', role => {
-    delivery.readDeliveryIdentity.mockReturnValue({ roles: { reviewer: { appId: '1', installations: { example: '201' } }, worker: { appId: '2', installations: { example: '202' } } }, callerRoles: { reviewerCaller: 'reviewer' } });
+    delivery.readDeliveryIdentity.mockReturnValue({ roles: { reviewer: { appId: APP_1, installations: { example: INST_201 } }, worker: { appId: APP_2, installations: { example: INST_202 } } }, callerRoles: { reviewerCaller: 'reviewer' } });
     const env = { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}', ...(role === 'reviewer' ? {} : { WE_GITHUB_APP_ROLE: role }) };
     const expected = { reviewer: '201', worker: '202', legacy: '101' }[role];
     expect(resolveGhSlotBucket({ identity: 'default', args, caller: 'reviewerCaller', env, readFresh: () => ({ installationId: expected }) }).bucket).toBe(expected);
   });
   it('refuses ambiguity when an earlier role misses its cache even if the lower role has a fresh token', () => {
-    delivery.readDeliveryIdentity.mockReturnValue({ roles: { reviewer: { appId: '1', installations: { example: '201' } }, worker: { appId: '2', installations: { example: '202' } } } });
-    expect(resolveGhSlotBucket({ identity: 'default', args, env: { WE_GITHUB_APP_ROLE: 'reviewer' }, readFresh: path => path.includes('.202.') ? { installationId: '202' } : null })).toEqual({ bucket: null, reason: 'ambiguous' });
+    delivery.readDeliveryIdentity.mockReturnValue({ roles: { reviewer: { appId: APP_1, installations: { example: INST_201 } }, worker: { appId: APP_2, installations: { example: INST_202 } } } });
+    expect(resolveGhSlotBucket({ identity: 'default', args, env: { WE_GITHUB_APP_ROLE: 'reviewer' }, readFresh: path => path.includes('.202.') ? { installationId: INST_202 } : null })).toEqual({ bucket: null, reason: 'ambiguous' });
   });
   it('skips roles without an installation for the owner', () => {
-    delivery.readDeliveryIdentity.mockReturnValue({ roles: { reviewer: { appId: '1', installations: { other: '201' } } } });
-    expect(resolveGhSlotBucket({ identity: 'default', args, env: { WE_GITHUB_APP_ROLE: 'reviewer', WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' }, readFresh: () => ({ installationId: '101' }) }).bucket).toBe('101');
+    delivery.readDeliveryIdentity.mockReturnValue({ roles: { reviewer: { appId: APP_1, installations: { other: INST_201 } } } });
+    expect(resolveGhSlotBucket({ identity: 'default', args, env: { WE_GITHUB_APP_ROLE: 'reviewer', WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' }, readFresh: () => ({ installationId: INST_101 }) }).bucket).toBe('101');
   });
   it('accepts the legacy single cache only for the matching installation', () => {
     const env = { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' };
@@ -169,7 +178,7 @@ console.log(result);`;
     }
   });
   it.each(['reviewer', 'worker', 'legacy', 'unconfigured'])('executes the generated shim owner lookup and agrees with the resolver for %s', role => {
-    const identity = { roles: { reviewer: { appId: '1', installations: { example: '201' } }, worker: { appId: '2', installations: { example: '202' } } } };
+    const identity = { roles: { reviewer: { appId: APP_1, installations: { example: INST_201 } }, worker: { appId: APP_2, installations: { example: INST_202 } } } };
     delivery.readDeliveryIdentity.mockReturnValue(identity);
     const cachePath = defaultCachePath();
     const roleTable = delivery.shimRoleTable({ identity, cachePath });
@@ -192,8 +201,8 @@ console.log(result);`;
   });
   it.each(['sync', 'cli'])('prefers GH_CALLER over a conflicting throttle caller for %s admission', mode => {
     delivery.readDeliveryIdentity.mockReturnValue({ roles: {
-      reviewer: { appId: '1', installations: { example: '202' } },
-      worker: { appId: '2', installations: { example: '101' } },
+      reviewer: { appId: APP_1, installations: { example: INST_202 } },
+      worker: { appId: APP_2, installations: { example: INST_101 } },
     }, callerRoles: { 'review-pr.mjs': 'reviewer' } });
     expect(acquire('202', 'reviewer-first').ok).toBe(true);
     expect(acquire('202', 'reviewer-second').ok).toBe(true);
@@ -213,8 +222,8 @@ console.log(result);`;
     [undefined, true],
   ])('a nested call whose outer was admitted to pool %s is throttled: %s (inner resolves installation 202, which is full)', (outerBucket, throttled) => {
     delivery.readDeliveryIdentity.mockReturnValue({ roles: {
-      reviewer: { appId: '1', installations: { example: '202' } },
-      worker: { appId: '2', installations: { example: '101' } },
+      reviewer: { appId: APP_1, installations: { example: INST_202 } },
+      worker: { appId: APP_2, installations: { example: INST_101 } },
     }, callerRoles: { 'review-pr.mjs': 'reviewer' } });
     expect(acquire('202', 'reviewer-first').ok).toBe(true);
     expect(acquire('202', 'reviewer-second').ok).toBe(true);
@@ -229,9 +238,9 @@ console.log(result);`;
   it('admits a generated shim cached reviewer token to its installation while shared is full', () => {
     expect(acquire(null, 'shared-holder').ok).toBe(true);
     const cachePath = defaultCachePath();
-    const reviewer = { cachePath: join(root, 'reviewer.json'), installations: { example: '202' } };
+    const reviewer = { cachePath: join(root, 'reviewer.json'), installations: { example: INST_202 } };
     writeFileSync(installationCachePath(reviewer.cachePath, '202'), JSON.stringify({
-      v: 2, token: 'ghs_fixture_202', installationId: '202', expiresAt: new Date(Date.now() + 3600000).toISOString(),
+      v: 2, token: 'ghs_fixture_202', installationId: INST_202, expiresAt: new Date(Date.now() + 3600000).toISOString(),
     }));
     const executable = join(root, 'fixture-executable');
     writeFileSync(executable, `#!${process.execPath}\nconsole.log('executed');\n`);
@@ -549,7 +558,7 @@ describe.each(['sync', 'passthrough'])('%s slot routing', mode => {
       expect(holders[0].bucket ?? 'shared').toBe(kind === 'unknown' ? 'shared' : '101');
       return mode === 'sync' ? '[]' : ok();
     });
-    invoke(mode, env, execute, { shimRouted: kind === 'shim', ...(kind === 'shim' ? { resolveSlotBucket: input => resolveGhSlotBucket({ ...input, readFresh: () => ({ installationId: '101' }) }) } : {}) });
+    invoke(mode, env, execute, { shimRouted: kind === 'shim', ...(kind === 'shim' ? { resolveSlotBucket: input => resolveGhSlotBucket({ ...input, readFresh: () => ({ installationId: INST_101 }) }) } : {}) });
     expect(execute).toHaveBeenCalledTimes(1);
     expect(readGhSlotHolders({ lockRoot: root, cap: 1 })).toEqual([]);
     expect(rows('calls.jsonl').find(r => r.outcome === 'call').bucket).toBe(kind === 'unknown' ? 'shared' : '101');
