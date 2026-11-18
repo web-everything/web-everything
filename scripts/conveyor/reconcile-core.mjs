@@ -2335,6 +2335,7 @@ export function planReconcile({
     const realFixRounds = countRealFixRounds(pr);
     const openSendBacks = openOperatorSendBacks(pr);
     const base = {
+      ...(pr.timeoutRetry?.reason === 'log-unreadable' ? { ciLogEvidenceReason: 'log-unreadable' } : {}),
       ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions, roundExtensionAnchor: {

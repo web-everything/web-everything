@@ -1,4 +1,9 @@
 import { assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
+import { readCiJobLog } from '../lib/gh-ci-log.mjs';
+import { stripVTControlCharacters } from 'node:util';
+import { boundedCiLogTail, extractFailedTests } from '../lib/ci-log-evidence.mjs';
+export { extractFailedTests } from '../lib/ci-log-evidence.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 /**
  * @file scripts/conveyor/fix-context-pack.mjs
  * @description The CONTEXT PACK every fix / ci-heal brief carries (operator go 2026-10-10; study
@@ -126,7 +131,7 @@ export function extractFindings(comments = [], { labels = null, isTrusted = () =
   let changes = null;
   let advisory = null;
   (comments ?? []).forEach((c, i) => {
-    const body = String(c?.body ?? '');
+    const body = stripVTControlCharacters(String(c?.body ?? ''));
     if (!isTrusted(c)) return; // a look-alike comment from anyone else is never staged as the ask
     if (CHANGES_RE.test(body)) changes = { i, c };
     else if (ADVISORY_RE.test(body)) advisory = { i, c };
@@ -161,7 +166,7 @@ export function extractFileRefs(text, { changedPaths = [], max = 6 } = {}) {
     seen.add(key);
     out.push({ path: p, line, end });
   };
-  const s = String(text ?? '');
+  const s = stripVTControlCharacters(String(text ?? ''));
   for (const m of s.matchAll(REF_RE)) push(m[1], m[2], m[3]);
   for (const m of s.matchAll(JSON_REF_RE)) push(m[1], m[2]);
   return out.slice(0, max);
@@ -169,7 +174,7 @@ export function extractFileRefs(text, { changedPaths = [], max = 6 } = {}) {
 
 /** ±n lines around [line, end], numbered. PURE. */
 export function excerptLines(text, line, n, end = line) {
-  const lines = String(text ?? '').split('\n');
+  const lines = stripVTControlCharacters(String(text ?? '')).split('\n');
   const from = Math.max(1, line - n);
   const to = Math.min(lines.length, end + n);
   if (from > lines.length) return '';
@@ -182,7 +187,7 @@ export function excerptLines(text, line, n, end = line) {
 /** Drop whole `#`-sections whose heading line starts with one of `prefixes` (up to the next heading of the same or a
  *  higher level). PURE. @returns {{text:string, removed:string[], removedBytes:number}} */
 export function trimBriefSections(brief, prefixes = []) {
-  const lines = String(brief).split('\n');
+  const lines = stripVTControlCharacters(String(brief)).split('\n');
   const keep = [];
   const removed = [];
   let removedBytes = 0;
@@ -304,15 +309,15 @@ export function renderFixPack({ findings = [], refs = [], fileText = () => null,
  * Render the CI-HEAL context pack: the failing checks, the failing test lines and the failed-log tail, the changed
  * files. PURE. `maxBytes` is a hard cap.
  * @param {{checks:Array<{name:string, link?:string}>, failedTests:string[], logTail:string, files:Array, maxBytes:number,
- *   localTests:string, removed?:string[]}} input
+ *   filtered?:boolean, localTests:string, removed?:string[]}} input
  */
-export function renderCiPack({ checks = [], failedTests = [], logTail = '', files = [], maxBytes = 2500, localTests = 'free', removed = [] }) {
+export function renderCiPack({ checks = [], failedTests = [], logTail = '', filtered = false, files = [], maxBytes = 2500, localTests = 'free', removed = [] }) {
   if (!checks.length && !files.length) return '';
   const header = [
     '## Context pack — staged by the harness for this heal (read this first)',
     '',
-    'The failing checks, the failing tests and the end of the failed log are below — `gh pr checks` and',
-    '`gh run view --log-failed` are already done; re-run them only if this section is empty or cut short.',
+    'The failing checks and available log evidence are below — `gh pr checks` and',
+    'the job-log read via `scripts/lib/gh-ci-log.mjs` are already done; re-run them only if this section is empty or cut short.',
     ...(removed.length ? [`Brief sections not in play for this dispatch were removed: ${removed.map((r) => `"${r.replace(/^#+\s*/, '')}"`).join(', ')}.`] : []),
   ].join('\n');
   const tests = localTestsSection(localTests, 'ci-heal');
@@ -324,23 +329,21 @@ export function renderCiPack({ checks = [], failedTests = [], logTail = '', file
     parts.push(clip(block, Math.max(200, Math.floor(budget * 0.25))));
     budget -= bytes(parts.at(-1)) + 2;
   }
-  if (failedTests.length) {
-    const block = `### Failing tests\n\n${failedTests.map((t) => `- ${t}`).join('\n')}`;
+  if (filtered !== true || failedTests.length) {
+    const block = `### Failing tests\n\n${filtered === true ? failedTests.map((t) => `- ${stripVTControlCharacters(t)}`).join('\n') : 'unknown (unfiltered log)'}`;
     parts.push(clip(block, Math.max(200, Math.floor(budget * 0.3))));
     budget -= bytes(parts.at(-1)) + 2;
   }
   const filesReserve = files.length ? Math.min(600, Math.floor(budget * 0.25)) : 0;
   if (logTail && budget - filesReserve > 200) {
-    const room = budget - filesReserve;
-    const lines = String(logTail).split('\n');
-    let tail = '';
-    for (let k = lines.length - 1; k >= 0; k--) {
-      const next = `${lines[k]}\n${tail}`;
-      if (bytes(next) + 60 > room) break;
-      tail = next;
-    }
+    const title = filtered === true ? 'Failed log (last lines)' : 'Job log (unfiltered context, last lines)';
+    const overhead = bytes(`### ${title}\n\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', '')}`);
+    // Reserve the paragraph separator exactly; an extra margin can discard a
+    // final diagnostic even when the complete fenced block fits the byte cap.
+    const room = budget - filesReserve - overhead - 2;
+    const tail = room >= 100 ? boundedCiLogTail(logTail, { maxBytes: room }) : '';
     if (tail.trim()) {
-      const block = `### Failed log (last lines)\n\n\`\`\`\n${tail.trimEnd()}\n\`\`\``;
+      const block = `### ${title}\n\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', tail.trimEnd())}`;
       parts.push(block);
       budget -= bytes(block) + 2;
     }
@@ -349,17 +352,6 @@ export function renderCiPack({ checks = [], failedTests = [], logTail = '', file
   if (fl) parts.push(fl);
   if (tests) parts.push(tests);
   return clip(parts.join('\n\n'), maxBytes);
-}
-
-/** The failing test lines a vitest / node log names (FAIL rows, ×/✗ rows), de-duplicated. PURE. */
-export function extractFailedTests(log, max = 12) {
-  const out = [];
-  for (const raw of String(log ?? '').split('\n')) {
-    const l = raw.replace(/^.*?\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '').trim();
-    if (/^(FAIL|❯ .*\.test\.|×|✗|✕)\s/.test(l) && !out.includes(l)) out.push(l.slice(0, 240));
-    if (out.length >= max) break;
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -418,7 +410,7 @@ export function readFixPackInputs({ repoSlug, pr, exec, maxRefs = 4, readComment
 }
 
 /** IO: the ci-heal pack's inputs — the failing checks, the first failing job's failed log, the changed files. */
-export function readCiPackInputs({ repoSlug, pr, exec }) {
+export function readCiPackInputs({ repoSlug, pr, exec, readLog = readCiJobLog }) {
   let checks = [];
   try {
     checks = JSON.parse(String(exec('gh', ['pr', 'checks', String(pr), '--repo', repoSlug, '--json', 'name,bucket,link'], GH_OPTS)));
@@ -428,11 +420,17 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
   }
   const failing = (Array.isArray(checks) ? checks : []).filter((c) => c?.bucket === 'fail').map((c) => ({ name: c.name, link: c.link ?? '' }));
   let logTail = '';
+  let filtered = false;
   const job = failing.map((c) => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(c.link)?.[1]).find(Boolean);
   if (job) {
     try {
-      const log = String(exec('gh', ['run', 'view', '--job', job, '--log-failed', '--repo', repoSlug], GH_OPTS));
-      logTail = log.split('\n').slice(-400).map((l) => l.replace(/^[^\t]*\t[^\t]*\t(?:\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z\s?)?/, '')).join('\n');
+      const result = readLog({ repo: repoSlug, jobId: job, exec, opts: GH_OPTS });
+      if (!result.ok) throw new Error(result.reason);
+      filtered = result.filtered === true;
+      const log = stripVTControlCharacters(String(result.text));
+      logTail = boundedCiLogTail(filtered
+        ? log.split('\n').map((l) => l.replace(/^[^\t]*\t[^\t]*\t(?:\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z\s?)?/, '')).join('\n')
+        : log);
     } catch { logTail = ''; }
   }
   let files = [];
@@ -440,7 +438,7 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
     const pv = JSON.parse(String(exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'files'], GH_OPTS)));
     files = (pv.files ?? []).map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions }));
   } catch { files = []; }
-  return { checks: failing, failedTests: extractFailedTests(logTail), logTail, files };
+  return { checks: failing, failedTests: filtered ? extractFailedTests(logTail) : [], logTail, filtered, files };
 }
 
 /**
