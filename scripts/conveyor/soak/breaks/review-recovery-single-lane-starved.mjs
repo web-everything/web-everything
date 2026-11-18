@@ -10,7 +10,7 @@ export default {
   id: 'review-recovery-single-lane-starved',
   title: 'PR #7023: one free lane, no ordinary reviews — red-team-only recovery skipped for "no review capacity left" every tick',
   card: 'PR #7023 post-accept red team',
-  fixedBy: { sha: 'HEAD,f7415de704', where: 'lane/review-cap-16', paths: [SOURCE] },
+  fixedBy: { sha: 'c7bd2c8e4c,f7415de704', where: 'lane/review-cap-16', paths: [SOURCE] },
   fixPresent(root) {
     const source = readFileSync(join(root, SOURCE), 'utf8');
     return source.includes('defaultRecoveryLaneNumbers') && source.includes('recovery lane read failed');
