@@ -417,6 +417,19 @@ describe('never suppressed', () => {
   it('under test it never touches the real feed', () => {
     expect(publishStalledDigest({ items: [op(1)] }, { env: { VITEST: 'true' }, stateDir: '/nonexistent' }).skipped).toBe('under-test');
   });
+  it('injected test env with an explicit feed and no process flag isolates queue writes and skips drain', async () => {
+    vi.stubEnv('VITEST', undefined); vi.stubEnv('WE_UNDER_TEST', undefined);
+    try {
+      const ctx = setup(), drain = vi.fn();
+      const result = run(ctx, [op(1)], { env: { WE_UNDER_TEST: '1' }, drain, notify: () => ({ ok: true }) });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(result.errors).toEqual([]);
+      const queue = JSON.parse(readFileSync(join(ctx.stateDir, 'stuck-traces', 'stuck-trace-queue.json'), 'utf8'));
+      expect(queue[`${REPO}#1@${H}`].state).toBe('queued');
+      expect(existsSync(ctx.feedPath)).toBe(true);
+      expect(drain).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
 });
 
 describe('paste-ready', () => {

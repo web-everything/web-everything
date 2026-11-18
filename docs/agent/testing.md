@@ -4715,6 +4715,13 @@ hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-la
 and other incidental holds retain failure. Empty or malformed required rosters always
 return `unknown` with `roster-unavailable`, including persisted options containing the
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
+## Stuck trace isolation
+
+The stuck-trace node:test fixtures inject both operations and the event sink. Keep
+`fileURLToPath(import.meta.url)` resolution inside the default child runner: the digest
+fixtures import modules through data URLs, where eager file-path resolution fails.
+The digest and merge watcher share the watcher receipt directory; when overriding
+its state directory, pass that directory as the digest’s `traceStateDir` too.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
