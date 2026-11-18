@@ -45,7 +45,8 @@
  * `ready-candidate-diagnostic-event-masks-drop.mjs` uses the same automatic registration.
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.
  * `live-changes-stale-accepted-phase.mjs` uses the same automatic registration.
- * `same-head-send-back-after-referral-resume.mjs` uses the same automatic registration.
+ * `same-head-send-back-after-referral-resume.mjs` uses the same automatic registration;
+ * its adjacent `.soak.test.mjs` runs via `defineBreakTest` in the soak config.
  *
  * `unchecked-draft-and-stale-accepted-status.mjs` uses the same automatic registration.
  *
