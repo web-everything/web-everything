@@ -264,8 +264,10 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
         if (leaked) continue;
         if (profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
-        // Digest-bearing evidence must resolve even when a newer record is known.
-        if (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined)) {
+        // Evidence asserting a profile must resolve even when a newer record is known.
+        if (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined
+          || typeof record.siblings === 'boolean' || manifestKnown
+          || (suffix === 'receipt' && record.siblingShas !== undefined))) {
           unresolvedProfile = true;
         }
         // The newest record decides: an older known profile must not mask a later unknown one.

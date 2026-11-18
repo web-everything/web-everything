@@ -672,6 +672,23 @@ describe('live reservation compatibility', () => {
 });
 
 describe('readLiveEvidence', () => {
+  it('protects the whole lock for an older digest-free siblings running record despite a newer known prepared profile', async () => {
+    const run = await reserve();
+    const runningPath = join(receipts, `${run}.running`);
+    const preparedPath = join(receipts, `${run}.prepared`);
+    await json(runningPath, {lock, siblings: true});
+    await json(preparedPath, record(false));
+    await fs.utimes(runningPath, (now - 2000) / 1000, (now - 2000) / 1000);
+    await fs.utimes(preparedPath, (now - 1000) / 1000, (now - 1000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.profiles).toEqual(new Set([`${lock}/dev-v5-${hex('b')}`]));
+    expect(live.locks).toEqual(new Set([lock]));
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), [], profiles);
+  });
+
   it('protects the whole lock for an older manifest-only receipt despite a newer known running profile', async () => {
     const run = await reserve();
     const receiptPath = join(receipts, `${run}.receipt`);
