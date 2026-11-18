@@ -13,6 +13,15 @@ import {
 } from '../reconcile-note-comment.mjs';
 
 describe('noteEpisodeKey', () => {
+  it.each(['owed-ci-rerun-spent', 'ci-heal-exhausted', 'something-new', 'ruling-dispute'])
+  ('%s: identical text on a successor head starts a new comment episode', kind => {
+    const first = { kind, prNumber: 7, head: 'a'.repeat(40), attempts: 3, cap: 3, text: 'attempts exhausted' };
+    const second = { ...first, head: 'b'.repeat(40) };
+    expect(noteEpisodeKey(first)).not.toBe(noteEpisodeKey(second));
+    const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+    expect(planNoteComment(first, comments, { mode: 'all' }).alreadyPosted).toBe(true);
+    expect(planNoteComment(second, comments, { mode: 'all' }).alreadyPosted).toBe(false);
+  });
   it('ci-heal-exhausted: keyed on the attempt/cap pair', () => {
     expect(noteEpisodeKey({ kind: 'ci-heal-exhausted', prNumber: 2636, attempts: 2, cap: 3 })).toBe('ci-heal-exhausted:2636:2/3');
   });
@@ -79,6 +88,11 @@ describe('noteHeadline — the operator\'s own rule', () => {
 });
 
 describe('buildNoteComment', () => {
+  it('URI-encodes failing required check names in the checks marker', () => {
+    const body = buildNoteComment({ kind: 'owed-ci-rerun-spent', prNumber: 7,
+      failingRequiredChecks: ['test / unit', 'lint,build'] });
+    expect(body).toContain('<!-- conveyor-note-checks: test%20%2F%20unit,lint%2Cbuild -->');
+  });
   it('referral-hold-auto-resolved posts an informational marker without a decision header', () => {
     const body = buildNoteComment({ kind: 'referral-hold-auto-resolved', prNumber: 7, text: 'all referrals already ruled' });
     expect(body.startsWith(INFO_NOTE_COMMENT_MARKER)).toBe(true);
