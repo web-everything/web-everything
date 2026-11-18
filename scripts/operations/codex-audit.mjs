@@ -119,7 +119,12 @@ async function proveFindings(findings, base, head, deps) {
       auditPolicy: deps.auditPolicy(), readCard: deps.readCard };
     const candidates = classifyPreExisting({ ...options, cardWritten: key => /\|B[1-7]$/.test(key) ? { written: true, expedite: true, needsYou: true } : true });
     const written = new Map();
-    const date = new Date(deps.now()).toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
+    // Match the held-card grammar exactly; h23 keeps local midnight at 00:00.
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).formatToParts(new Date(deps.now())).map(({ type, value }) => [type, value]));
+    const date = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
     for (let i = 0; i < candidates.length; i++) {
       const c = candidates[i];
       if (c.blocking) continue;

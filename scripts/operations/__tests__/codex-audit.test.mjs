@@ -8,6 +8,7 @@ import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
+import { parseCards } from '../file-held-cards.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
 const settingsOverride = vi.hoisted(() => ({ text: null }));
@@ -608,6 +609,26 @@ describe('R1053 prove mode', () => {
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
     return f;
   }
+  it.each([
+    ['2026-11-18T17:00:00.000Z', '2026-11-18 12:00'],
+    ['2026-11-18T05:00:00.000Z', '2026-11-18 00:00'],
+    ['2026-11-18T00:04:59.000Z', '2026-11-17 19:04'],
+    ['2026-03-08T06:59:59.000Z', '2026-03-08 01:59'],
+    ['2026-03-08T07:00:00.000Z', '2026-03-08 03:00'],
+    ['2026-11-01T05:59:59.000Z', '2026-11-01 01:59'],
+    ['2026-11-01T06:00:00.000Z', '2026-11-01 01:00'],
+  ])('round-trips the real audit card through held-card parsing at %s', async (now, date) => {
+    const f = proof();
+    f.deps.now = () => now;
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+    const { cardLine } = f.deps.fileCard.mock.calls[0][0];
+    const text = `pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: ${finding}`;
+    expect(cardLine).toBe(`- [R1053] ${date} ET: ${text}`);
+    const cards = parseCards(cardLine);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ raw: cardLine, tag: 'R1053', date: date.slice(0, 10), text });
+  });
   it.each(['E1', 'E2'])('production policy blocks %s before filing', async cls => {
     const f = proof(reply(cls));
     f.deps.auditPolicy = () => ({ releaseStage: 'prod', requirePayBy: false, requireOnMain: true });
