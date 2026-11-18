@@ -632,7 +632,14 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   // and raised nothing. Without it (a lost write-back) the pause stays; onClean is honoured like any clean resume.
   const noFinding = why => {
     if (hold.kind !== 'same-head') return stay(why);
-    const adv = latestAdvisory(pr.comments.filter(isTrustedMarkerAuthor));
+    // parseAdvisories reads a missing outcome line as `accept`; here the outcome must be stated, so the newest advisory is
+    // taken from the trusted comments that state one. A newer advisory with no stated outcome then leaves an older accept
+    // as the latest, so also refuse when the newest advisory overall is not that stated accept.
+    const trusted = pr.comments.filter(isTrustedMarkerAuthor);
+    const stated = c => /^\*\*Advisory outcome:\*\*\s*`?accept`?(\s|$|`)/im.test(String(c?.body ?? ''));
+    const adv = latestAdvisory(trusted);
+    const newest = latestAdvisory(trusted.filter(stated));
+    if (!adv || !newest || adv.time !== newest.time || adv.head !== newest.head) return stay(`${why}, and no clean advisory accept names the full live head`);
     // Only a clean `accept` that names the live head in full proves the review ran and raised nothing; any other outcome
     // (pending-referral, none, changes, inconclusive) or a short-prefix head is unproven.
     if (!advisoryCoversHead(adv, head) || adv.outcome !== ADVISORY_OUTCOMES.ACCEPT || String(adv.head).toLowerCase() !== head.toLowerCase()) {
