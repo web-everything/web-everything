@@ -4417,11 +4417,11 @@ describe('pending label swap observation', () => {
   const run = { id: 'observe-7109', effects: [{ type: REVIEW_EFFECTS.WRITE_UP, status: 'applied',
     payload: { bodyFile: entry.payload.bodyFile, body } }] };
   const live = ['ready-to-merge', 'review:accepted', 'review-round:1', 'status:ready-to-merge', 'red-team:pending'];
-  const comment = { author: { login: 'web-everything' },
+  const comment = { id: 'IC_1', author: { login: 'web-everything' },
     body: `<!-- review-attempt: ${entry.key} -->\nRecorded by reviewer.\n\n${body.replace(/\r\n/g, '\n').trim()}\n\n<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->`, createdAt: '2026-11-18T19:16:30Z' };
   const observer = (options = {}) => {
     const readPrState = async () => ({ state: 'OPEN', body: '<!-- authored-by-actor: other-author -->', headRefOid: entry.payload.reviewedHead,
-      labels: await (options.readLabels ?? (() => live))('o/n', 7109) });
+      labels: await (options.readLabels ?? (() => live))('o/n', 7109), comments: options.stateComments ?? [comment] });
     if (options.labelProvider) options = { ...options, labelProvider: { readPrState, ...options.labelProvider } };
     const observe = createReviewPrSinks({ root, clearerId: 'observer',
       readHead: async () => entry.payload.reviewedHead, readLabels: async () => live,
@@ -4433,8 +4433,12 @@ describe('pending label swap observation', () => {
   it('observes an exact attempt marker applied on its reviewed head using the live forge readers', async () => {
     const readHead = vi.fn(() => entry.payload.reviewedHead);
     const readLabels = vi.fn(() => live.map(name => ({ name })));
-    const readComments = vi.fn(() => [comment]);
+    const readComments = vi.fn(() => {
+      expect(readLabels).toHaveBeenCalledTimes(1);
+      return [comment];
+    });
     await expect(observer({ readHead, readLabels, readComments })(entry)).resolves.toBe('applied');
+    expect(readHead).toHaveBeenCalledTimes(2);
     expect(readHead).toHaveBeenCalledWith({ repo: 'o/n', pr: 7109 });
     expect(readLabels).toHaveBeenCalledWith('o/n', 7109);
     expect(readComments).toHaveBeenCalledWith(7109, { repo: 'o/n' });
@@ -4453,7 +4457,7 @@ describe('pending label swap observation', () => {
     ['unreadable comments', null],
     ['incomplete comments result', { comments: [comment], complete: false }],
   ])('keeps matching labels unknown with %s', async (_name, comments) => {
-    await expect(observer({ readComments: () => comments })(entry)).resolves.toBeNull();
+    await expect(observer({ stateComments: comments, readComments: () => comments })(entry)).resolves.toBeNull();
   });
 
   it.each([1, 2])('requires a complete validated thread (total=%s)', async totalCount => {
@@ -4467,12 +4471,42 @@ describe('pending label swap observation', () => {
 
   it('keeps stamp-lost unknown even with a complete marked thread', async () => {
     await expect(observer({ labelProvider: { readPrState: () => ({ state: 'OPEN',
-      body: '<!-- author-stamp-lost: unrecoverable -->', headRefOid: entry.payload.reviewedHead, labels: live }) } })(entry)).resolves.toBeNull();
+      body: '<!-- author-stamp-lost: unrecoverable -->', headRefOid: entry.payload.reviewedHead, labels: live, comments: [comment] }) } })(entry)).resolves.toBeNull();
   });
 
   it('keeps a settled marked swap unknown when the mandatory-referral pipeline refuses', async () => {
-    const malformed = { author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' };
-    await expect(observer({ readComments: () => [comment, malformed] })(entry)).resolves.toBeNull();
+    const malformed = { id: 'IC_referral', author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' };
+    await expect(observer({
+      labelProvider: { readPrState: () => ({ state: 'OPEN', body: '<!-- authored-by-actor: other-author -->',
+        headRefOid: entry.payload.reviewedHead, labels: live, comments: [comment, malformed] }) },
+      readComments: () => [comment, malformed],
+    })(entry)).resolves.toBeNull();
+  });
+
+  it('keeps the audit probe unknown when state has a malformed referral absent from the old thread', async () => {
+    const malformed = { id: 'IC_referral', author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' };
+    await expect(observer({
+      labelProvider: { readPrState: () => ({ state: 'OPEN', body: '<!-- authored-by-actor: other-author -->',
+        headRefOid: entry.payload.reviewedHead, labels: live, comments: [comment, malformed] }) },
+      readComments: () => [comment],
+    })(entry)).resolves.toBeNull();
+  });
+
+  it.each([
+    ['appeared', [comment, { id: 'IC_new', body: 'New comment' }]],
+    ['disappeared', []],
+    ['replaced', [{ ...comment, id: 'IC_other' }]],
+    ['edited marker', [{ ...comment, body: `${comment.body} edited` }]],
+    ['missing id', [{ ...comment, id: undefined }]],
+    ['duplicate id', [comment, comment]],
+  ])('keeps changed thread unknown: %s', async (_name, comments) => {
+    await expect(observer({ readComments: () => comments })(entry)).resolves.toBeNull();
+  });
+
+  it('keeps head movement during observation unknown', async () => {
+    const readHead = vi.fn().mockReturnValueOnce(entry.payload.reviewedHead).mockReturnValueOnce('b'.repeat(40));
+    await expect(observer({ readHead })(entry)).resolves.toBeNull();
+    expect(readHead).toHaveBeenCalledTimes(2);
   });
 
   it.each([null, {}, { state: 'CLOSED', headRefOid: entry.payload.reviewedHead }])('keeps unreadable or inert PR state unknown: %j', async state => {

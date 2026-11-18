@@ -2078,16 +2078,22 @@ export function createReviewPrSinks({
     try {
       const head = await readHead({ repo: payload.repo, pr: payload.pr });
       if (head !== payload.reviewedHead) return null;
-      // Both reads must be complete: the attempt marker is not a substitute for current guard evidence.
-      const comments = await readComments(payload.pr, { repo: payload.repo });
-      if (!Array.isArray(comments) || !comments.filter(isTrustedMarkerAuthor).some(comment => parseReviewAttempt([comment]) === entry.key
-        && parseReviewedSha([comment]) === payload.reviewedHead)) return null;
+      // Keep the thread consistent with labels; a later complete read must prove it unchanged.
       const state = await labelProvider.readPrState(payload.repo, payload.pr);
+      const comments = await readComments(payload.pr, { repo: payload.repo });
+      if (!Array.isArray(state?.comments) || !Array.isArray(comments)
+        || state.comments.length !== comments.length) return null;
+      const byId = new Map(comments.map(comment => [comment?.id, comment]));
+      if (byId.size !== comments.length || new Set(state.comments.map(comment => comment?.id)).size !== comments.length
+        || !state.comments.every(comment => typeof comment?.id === 'string' && comment.id.trim()
+          && typeof comment.body === 'string' && byId.get(comment.id)?.body === comment.body)) return null;
+      if (!state.comments.filter(isTrustedMarkerAuthor).some(comment => parseReviewAttempt([comment]) === entry.key
+        && parseReviewedSha([comment]) === payload.reviewedHead)) return null;
       const result = reviewSetLabelPreflight({
-        state: { ...state, comments }, repo: payload.repo, pr: payload.pr,
+        state, repo: payload.repo, pr: payload.pr,
         to: payload.to, expectedHead: payload.reviewedHead, clearerId,
       });
-      if (result.settled) return 'applied';
+      if (result.settled && await readHead({ repo: payload.repo, pr: payload.pr }) === payload.reviewedHead) return 'applied';
       return null;
     } catch { return null; }
   };

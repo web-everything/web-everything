@@ -37,7 +37,7 @@ export default {
       { type: REVIEW_EFFECTS.WRITE_UP, payload: { bodyFile: payload.bodyFile, body } },
     ] }) }));
 
-    for (const state of ['same-head', 'unmarked-comment', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'later-changes', 'ruling-hold', 'pipeline-refusal', 'incomplete-thread', 'stamp-lost', 'not-applied']) {
+    for (const state of ['same-head', 'unmarked-comment', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'later-changes', 'ruling-hold', 'pipeline-refusal', 'state-referral-mismatch', 'head-moves-during-observation', 'incomplete-thread', 'stamp-lost', 'not-applied']) {
       const store = createMemoryRunStore();
       const run = advance(startRun({ op: 'observe-label', id: `observe-${state}`, registry }), { registry });
       Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: response lost',
@@ -54,15 +54,19 @@ export default {
         id: 'IC_attempt',
         author: { login: 'web-everything' }, body: `${state === 'unrelated-comment' ? 'Unrelated review.' : body}\n\n<!-- reviewed-sha: ${HEAD} -->${!['unmarked-comment', 'unrelated-comment'].includes(state) ? `\n<!-- review-attempt: ${run.effects[0].key} -->` : ''}`, createdAt: '2026-11-18T19:16:30Z',
       }, ...(state === 'pipeline-refusal' ? [{ id: 'IC_referral', author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' }] : [])];
+      let headReads = 0;
       const sinks = createReviewPrSinks({ root, runStore: store, clearerId: 'soak-observer',
         labelProvider: { readPrState: () => ({ state: 'OPEN',
           body: state === 'stamp-lost' ? '<!-- author-stamp-lost: unrecoverable -->'
-            : '<!-- authored-by-actor: other-author -->', headRefOid: HEAD, labels: readLabels() }) },
+            : '<!-- authored-by-actor: other-author -->', headRefOid: HEAD, labels: readLabels(),
+          comments: state === 'state-referral-mismatch'
+            ? [...comments, { id: 'IC_referral', author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' }]
+            : comments }) },
         readComments: (pr, options) => readCompletePrComments(pr, { ...options, gh: args =>
           args[1] === 'graphql' ? { data: { repository: { pullRequest: { comments: {
             totalCount: comments.length + (state === 'incomplete-thread' ? 1 : 0),
           } } } } } : comments }),
-        readHead: () => state === 'moved-head' ? 'b'.repeat(40) : HEAD,
+        readHead: () => state === 'moved-head' || (state === 'head-moves-during-observation' && ++headReads > 1) ? 'b'.repeat(40) : HEAD,
         readLabels,
         runNode: () => { writes++; throw new Error('sink replayed'); },
       });
