@@ -30,7 +30,7 @@ export function emptyNetDiffSkip(status, head = status?.head) {
     && provenEmptyNetDiffPayload(status.loopPayload, head);
 }
 
-/** Re-read the stored range, never a live head ref. Unknown or oversized output retains the hold. */
+/** Revalidate the stored base and range, never a live head ref. Unknown or oversized output retains the hold. */
 export function verifyEmptyNetDiff(read, head, { exec = execFileSync, cwd } = {}) {
   if (!provenEmptyNetDiff(read, head) || typeof read.netBasis.base !== 'string' || !read.netBasis.base) return false;
   try {
@@ -41,6 +41,11 @@ export function verifyEmptyNetDiff(read, head, { exec = execFileSync, cwd } = {}
     // A replacement-aware merge-base may have recorded head itself. Even a replacement-free
     // head..head diff then says nothing about the contribution; retain the hold for inspection.
     if (!/^[a-f0-9]{40}$/i.test(base) || base.toLowerCase() === head.toLowerCase()) return false;
+    // Match the review reader's PR base ref (resolveNetDiffBasis defaults to origin/main).
+    // A poisoned merge-base can also be DISTINCT from head while carrying head's tree.
+    // Never trust that stored base without re-deriving its replacement-free provenance.
+    const mergeBase = git(['merge-base', '--end-of-options', 'origin/main', head]).trim();
+    if (!/^[a-f0-9]{40}$/i.test(mergeBase) || mergeBase.toLowerCase() !== base.toLowerCase()) return false;
     return git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
       '--end-of-options', `${base}..${head}`, '--']) === '';
   } catch { return false; }

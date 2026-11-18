@@ -408,16 +408,16 @@ describe('empty net diff policy settlement', () => {
   it('publishes the terminal policy-clear reason exactly once using a config-independent emptiness probe', () => {
     const f = fixture();
     f.io.readStatus = () => ({ head, loopPayload: { findings: { read: { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
-    f.io.gitExec = vi.fn((_file, args) => args.includes('rev-parse') ? 'c'.repeat(40) : '');
+    f.io.gitExec = vi.fn((_file, args) => args.includes('rev-parse') || args.includes('merge-base') ? 'c'.repeat(40) : '');
     const skip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
     expect(classifyRedTeamSkip(skip).kind).toBe('policy');
     expect(f.settle(skip).outcome).toBe('policy-clear');
     expect(f.comments[0].body).toContain('Red team not required on this head: not-owed: empty net diff');
     expect(f.settle(skip).outcome).toBe('already');
     expect(f.io.postComment).toHaveBeenCalledTimes(1);
-    expect(f.io.gitExec.mock.calls[1][1]).toContain(`${'c'.repeat(40)}..${head}`);
-    expect(f.io.gitExec.mock.calls[1][1][0]).toBe('--no-replace-objects');
-    expect(f.io.gitExec.mock.calls[1][1]).toEqual(expect.arrayContaining([
+    expect(f.io.gitExec.mock.calls[2][1]).toContain(`${'c'.repeat(40)}..${head}`);
+    expect(f.io.gitExec.mock.calls[2][1][0]).toBe('--no-replace-objects');
+    expect(f.io.gitExec.mock.calls[2][1]).toEqual(expect.arrayContaining([
       '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
     ]));
   });
@@ -450,6 +450,7 @@ it.each(['nonempty after recording', 'probe error', 'oversized probe', 'missing 
   const bufferError = Object.assign(Error('stdout maxBuffer length exceeded'), { code: 'ENOBUFS' });
   f.io.gitExec = vi.fn()
     .mockReturnValueOnce(`${base}\n`)
+    .mockReturnValueOnce(`${base}\n`)
     .mockImplementation((_file, _args, options) => {
       if (kind === 'probe error') throw probeError;
       const output = kind === 'oversized probe' ? 'x'.repeat(1024 * 1024 + 1) : 'code.mjs\0';
@@ -462,15 +463,18 @@ it.each(['nonempty after recording', 'probe error', 'oversized probe', 'missing 
   } else {
     // Assert outside the verifier's catch so a failed mock assertion cannot prove refusal.
     const options = expect.objectContaining({ maxBuffer: 1024 * 1024 });
-    expect(f.io.gitExec).toHaveBeenCalledTimes(2);
+    expect(f.io.gitExec).toHaveBeenCalledTimes(3);
     expect(f.io.gitExec).toHaveBeenNthCalledWith(1, 'git', [
       '--no-replace-objects', 'rev-parse', '--verify', '--end-of-options', `${base}^{commit}`,
     ], options);
     expect(f.io.gitExec).toHaveBeenNthCalledWith(2, 'git', [
+      '--no-replace-objects', 'merge-base', '--end-of-options', 'origin/main', head,
+    ], options);
+    expect(f.io.gitExec).toHaveBeenNthCalledWith(3, 'git', [
       '--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
       '--ignore-submodules=none', '--name-only', '-z', '--end-of-options', `${base}..${head}`, '--',
     ], options);
-    expect(f.io.gitExec.mock.results[1]).toEqual(kind === 'nonempty after recording'
+    expect(f.io.gitExec.mock.results[2]).toEqual(kind === 'nonempty after recording'
       ? { type: 'return', value: 'code.mjs\0' }
       : { type: 'throw', value: kind === 'probe error' ? probeError : bufferError });
   }

@@ -3189,7 +3189,7 @@ describe('finished skipped empty net diff recovery', () => {
       failedSeatCount: 0, inFlight: false, queued: false };
     return { rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
       comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
-      cwd: 'subject-checkout', gitExec: vi.fn((_file, args) => args.includes('rev-parse') ? 'c'.repeat(40) : ''), readEvidence: () => evidence, readStatus: () => status };
+      cwd: 'subject-checkout', gitExec: vi.fn((_file, args) => args.includes('rev-parse') || args.includes('merge-base') ? 'c'.repeat(40) : ''), readEvidence: () => evidence, readStatus: () => status };
   };
   it.each(['malformed', 'unreadable'])('empty-diff recovery fails closed for a %s seat store', kind => {
     const dir = mkdtempSync(join(tmpdir(), 'empty-diff-seat-store-'));
@@ -3271,6 +3271,7 @@ describe('finished skipped empty net diff recovery', () => {
         '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', message);
       commit('subject base');
       const base = git(subjectCwd, 'rev-parse', 'HEAD');
+      git(subjectCwd, 'update-ref', 'refs/remotes/origin/main', base);
       commit('subject head');
       const rev = git(subjectCwd, 'rev-parse', 'HEAD');
       for (const sha of [base, rev]) expect(() => git(daemonCwd, 'cat-file', '-e', sha)).toThrow();
@@ -3326,7 +3327,7 @@ it.each(['nonempty after recording', 'probe failure'])('R979 recovery refuses %s
   Object.assign(loopPayload.findings.read, { netBasis: { base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
   const status = { head, status: 'finished', loopPayload, result: { status: 'skipped' } };
   const gitExec = vi.fn((_file, args) => {
-    if (args.includes('rev-parse')) return base;
+    if (args.includes('rev-parse') || args.includes('merge-base')) return base;
     expect(args).toContain(`${base}..${head}`);
     if (kind === 'probe failure') throw Error('unreadable');
     return 'code.mjs\0';
@@ -3337,5 +3338,7 @@ it.each(['nonempty after recording', 'probe failure'])('R979 recovery refuses %s
     readStatus: () => status, readEvidence: () => ({ status, loopPayload, recorded: false, seatRecorded: false,
       completedRecorded: false, failedSeatCount: 0, inFlight: false, queued: false }) });
   expect(result).toMatchObject({ action: 'skip', why: 'empty net diff not proven for this head; inspect stored evidence' });
-  expect(gitExec).toHaveBeenCalledTimes(2);
+  expect(gitExec).toHaveBeenCalledTimes(3);
+  expect(gitExec.mock.calls[1][1]).toEqual(['--no-replace-objects', 'merge-base', '--end-of-options', 'origin/main', head]);
+  expect(gitExec.mock.calls[2][1]).toContain('diff');
 });

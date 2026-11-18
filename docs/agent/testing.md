@@ -4444,3 +4444,16 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+### Empty-diff base provenance
+
+Empty-net-diff recovery must re-derive the merge-base of `origin/main` and the pinned
+writer head with replacement objects disabled, then require equality with the stored base
+before probing the diff. This matches the review reader's `resolveNetDiffBasis` default
+base ref. A stored base distinct from head can still carry the same tree as head; the
+`base === head` refusal alone does not establish provenance. Preserve real-Git controls
+showing both the poisoned empty range and the legitimate changed range in
+`scripts/lib/__tests__/red-team-empty-net-diff.test.mjs`. Failed, malformed, ambiguous,
+or oversized merge-base output retains the existing hold: inspect stored evidence
+and re-run the reader against the legitimate base before retrying clearance. Negative
+diff tests must return a valid matching merge-base and assert the diff call occurs.

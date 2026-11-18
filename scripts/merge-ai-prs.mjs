@@ -4102,7 +4102,8 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // newline in a would-be single revision arg, making it an invalid `git diff` argument (a "continue" to
       // the next candidate, or a `null` resolve if both candidates hit it — always the safe over-scoring
       // fallback, never wrong data, but avoidable).
-      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      // A replace ref must never choose the base stamped into an empty-diff payload.
+      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' } }) || '').split('\n')[0].trim();
       if (mb) { diffBase = mb; basisKind = 'merge-base'; }
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
@@ -4226,7 +4227,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
       // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
       if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
       diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' } }) || '').split('\n')[0].trim();
       if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
       candidate = revSha;
     } catch (err) {
