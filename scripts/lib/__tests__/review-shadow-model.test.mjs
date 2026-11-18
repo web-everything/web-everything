@@ -539,6 +539,20 @@ it('manual promotion allows Carbon with a positive Gemini cap', async () => {
   vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
   expect((await run([ok], { mode: 'agy', model: 'gemini-4-carbon-high' })).models).toEqual(['gemini-4-carbon-high']);
 });
+it.each([
+  ['garbage', false], ['true', true], [' TRUE ', true], ['false', false], [' FaLsE ', false], ['   ', false], ['', true],
+])('promotion env %j overrides tool true fail closed (%s)', (value, expected) => {
+  expect(resolveShadowPromoted({
+    env: { WE_REVIEW_SHADOW_AGY_PROMOTED: value }, platform: {}, log: () => {},
+    readFile: () => JSON.stringify({ shadowSeats: { antigravity: { promoted: true } } }),
+  })).toEqual({ value: expected, source: value === '' ? 'tool' : 'env' });
+});
+it.each(['yes', 1, null, {}, [], 'true'])('malformed tool promotion %j overrides platform true fail closed', promoted => {
+  expect(resolveShadowPromoted({
+    env: {}, platform: { shadowSeats: { antigravity: { promoted: true } } }, log: () => {},
+    readFile: () => JSON.stringify({ shadowSeats: { antigravity: { promoted } } }),
+  })).toEqual({ value: false, source: 'tool' });
+});
 it('promotion resolves standard, platform, tool and env and rejects incomplete settings', () => {
   const base = { env: {}, platform: {}, readFile: () => '{}', log: () => {} };
   expect(resolveShadowPromoted(base)).toEqual({ value: false, source: 'standard' });

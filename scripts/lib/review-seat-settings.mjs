@@ -219,13 +219,14 @@ export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTING
   readFile = (p) => readFileSync(p, 'utf8'), platform, log = (m) => console.error(m) } = {}) {
   let tool = {};
   try { tool = JSON.parse(readFile(file)); } catch { /* default refuses */ }
-  const project = value => typeof value === 'boolean' ? { promoted: value } : {};
+  // A present malformed override refuses promotion at its own layer rather than exposing a lower true.
+  const project = value => value === undefined ? {} : { promoted: value === true };
+  const envPromoted = env.WE_REVIEW_SHADOW_AGY_PROMOTED;
   const result = cascadePolicy('review.shadowSeats.antigravity', project(tool?.shadowSeats?.antigravity?.promoted), {
     standard: { promoted: false },
     platform: project((platform ?? platformPreference('review', { env }))?.shadowSeats?.antigravity?.promoted),
-    env, envValues: { promoted: env.WE_REVIEW_SHADOW_AGY_PROMOTED === undefined ? undefined
-      : env.WE_REVIEW_SHADOW_AGY_PROMOTED === 'true' ? true
-        : env.WE_REVIEW_SHADOW_AGY_PROMOTED === 'false' ? false : env.WE_REVIEW_SHADOW_AGY_PROMOTED },
+    env, envValues: { promoted: envPromoted === undefined || envPromoted === '' ? undefined
+      : typeof envPromoted === 'string' && envPromoted.trim().toLowerCase() === 'true' },
     valid: { promoted: v => typeof v === 'boolean' },
   });
   log(formatCascadeSourcesLine('review.shadowSeats.antigravity', result).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' '));

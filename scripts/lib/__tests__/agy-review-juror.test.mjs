@@ -401,6 +401,25 @@ it.each([undefined, {}, { path: '' }, { path: '   ' }, { path: 7 }, { path: null
     expect(out.status).toBe('voided');
     expect(out.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
   });
+it.each(['outside', 'missing', 'empty', 'non-string', 'changed', 'symlink', 'nested outside', 'consistent'])
+  ('read_file validates every update and the path union: %s', async kind => {
+    const fx = fixture();
+    const out = await fx.run(undefined, cwd => {
+      if (kind === 'symlink') symlinkSync(fx.shared, join(cwd, 'escape')); // only this case may touch the lane
+      const path = join(cwd, 'file.txt');
+      const parameters = {
+        outside: { AbsolutePath: '/etc/passwd' }, missing: {}, empty: { AbsolutePath: '' },
+        'non-string': { AbsolutePath: 1 }, changed: { AbsolutePath: join(cwd, 'untouched.txt') },
+        symlink: { AbsolutePath: join(cwd, 'escape', 'file.txt') },
+        'nested outside': { AbsolutePath: path, options: { path: '/etc/passwd' } },
+        consistent: { AbsolutePath: path },
+      }[kind];
+      return [tool(path, { tool_name: 'read_file', state: 'ACTIVE' }),
+        tool('', { tool_name: 'read_file', tool_info: { parameters } })];
+    });
+    expect(out.status).toBe(kind === 'consistent' ? 'ok' : 'voided');
+    if (kind !== 'consistent') expect(out.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
+  });
 it('read_file refuses a symlink escape and accepts a direct in-lane read', async () => {
   const fx = fixture();
   symlinkSync(fx.shared, join(fx.home, 'escape'));

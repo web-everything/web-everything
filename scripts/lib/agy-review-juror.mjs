@@ -245,7 +245,8 @@ export function changedCheckouts(before = {}, after = {}) {
 
 /**
  * Tool steps in an agy stream-json transcript that were NOT a read-only tool and did NOT end in an error, judged on
- * each step's LAST update (a denied call is first ACTIVE, then an error). Fail closed: a tool step with no name counts.
+ * each step's LAST status (a denied call is first ACTIVE, then an error). read_file validates every update's parameters.
+ * Fail closed: a tool step with no name counts.
  * PURE.
  */
 export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home = homedir(), sessionId } = {}) {
@@ -259,11 +260,12 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
     if (!step) continue;
     const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : (step.step_type === 'tool' ? `#${n++}` : null);
     if (key == null) continue;
-    const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, errored: false };
+    const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, updates: [], errored: false };
+    cur.updates.push(step.tool_info?.parameters);
     if (step.step_type === 'tool') {
+      if (cur.params == null) cur.params = step.tool_info?.parameters;
       cur.isTool = true;
       cur.name ??= step.tool_name ?? step.tool_info?.name;
-      cur.params ??= step.tool_info?.parameters;
     }
     if (step.status === 'TOOL_ERROR' || step.state === 'ERROR' || step.tool_info?.error != null) cur.errored = true;
     steps.set(key, cur);
@@ -288,18 +290,23 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
     if (name === 'read_file') {
-      let params = step.params;
-      if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = null; } }
-      // Carbon must name a direct path, not merely bury one in a list or nested options.
-      const paths = params && typeof params === 'object' && !Array.isArray(params)
-        ? Object.entries(params).filter(([key]) => PATH_PARAM_KEY.test(key)).map(([, value]) => value) : [];
       const laneRoots = lanes.map(canonicalPath).filter(Boolean);
-      if (!cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
-        || readsOutside(p, laneRoots, cwd))
-        || pathLeaves(params, false).some(p => readsOutside(p, laneRoots, cwd))) {
+      const seenPaths = new Set();
+      // Judge each update independently, then their union: no update may omit or change the direct path.
+      const invalid = step.updates.some(update => {
+        let params = update;
+        if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = null; } }
+        const paths = params && typeof params === 'object' && !Array.isArray(params)
+          ? Object.entries(params).filter(([key]) => PATH_PARAM_KEY.test(key)).map(([, value]) => value) : [];
+        for (const path of paths) seenPaths.add(path);
+        return !cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
+          || readsOutside(p, laneRoots, cwd))
+          || pathLeaves(params, false).some(p => readsOutside(p, laneRoots, cwd));
+      });
+      if (invalid || seenPaths.size !== 1) {
         out.push('read_file (missing or invalid in-lane path)');
-        continue;
       }
+      continue;
     }
     // A completed READ must stay inside the juror lane or this conversation's brain folder.
     // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
