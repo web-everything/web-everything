@@ -22,6 +22,7 @@ import {
   resolveRebuildAsJob, rebuildCloneAsJob, rebuildChildArgs, parseRebuildChildOutput, REBUILD_JOB_KIND, RESULT_SUFFIX,
 } from '../daemon-rebuild/rebuild-job.mjs';
 import { readRebuildStarvation, writeRebuildStarvation } from '../daemon-rebuild/lease.mjs';
+import { writeReadyCandidate } from '../daemon-rebuild/state.mjs';
 import * as rebuildLease from '../daemon-rebuild/lease.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
@@ -172,6 +173,24 @@ describe('the job records a passed build; the tick adopts it without re-smoking'
     const next = await rebuildCloneAsJob(options);
     expect(next).toMatchObject({ reason: 'rebuild-job-started', plan: { finalSha: latest } });
     expect(head(cloneDir)).toBe(target);
+  });
+
+  it('a versioned clone with a job in flight never starts an inline build from the adopt-only pass', async () => {
+    const { cloneDir, env } = makeFixture();
+    const store = createJobStore(mktemp('versioned-jobs-'));
+    enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root: cloneDir } });
+    writeReadyCandidate(cloneDir, { kind: 'candidate', prevHead: 'x', tree: 't', passedAt: new Date().toISOString(),
+      adopt: { finalSha: 'ready', applied: [] } }, env);
+    const smoke = vi.fn(async () => PASS);
+    const reattach = vi.fn(async () => ({}));
+    const adopt = () => rebuildClone({ root: cloneDir, env, runSmoke: smoke, prState: async () => null, versions: { sentinel: true },
+      lockOpts: LOCK_OPTS, adoptOnly: true, asJob: false, skipCheck: null, log: quietLog });
+    const direct = await adopt();
+    expect(direct.reason).toBe('needs-build'); // adopt-only on a versioned clone says a build is due, never builds
+    const tick = await rebuildCloneAsJob({ root: cloneDir, env, store, adopt, reattach, log: quietLog, evict: () => ({}), codeSha: 'a'.repeat(40) });
+    expect(tick.reason).toBe('rebuild-job-running');
+    expect(smoke).not.toHaveBeenCalled();
+    expect(store.list().records).toHaveLength(1);
   });
 
   it('adoptOnly with nothing ready says a build is due, smokes nothing and leaves no lease', async () => {

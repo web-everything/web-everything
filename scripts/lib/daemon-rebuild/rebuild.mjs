@@ -205,6 +205,8 @@ async function rebuildCloneInternal({
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
   if (vctx) {
+    // An adopt-only pass never builds: a versioned clone has no ready candidate to adopt, so say a build is due.
+    if (adoptOnly) return { moved: false, adopted: false, reason: 'needs-build', alerts: [] };
     // Versioned builds take no clone lease to renew while queued, but their live smoke
     // shares the same host capacity and deadline as an unversioned candidate.
     const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
