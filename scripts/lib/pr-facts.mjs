@@ -175,10 +175,8 @@ export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.c
   for (const [key, c] of Object.entries(mirror.buckets.checks)) {
     // projectPrRows joins a check to its PRs both by `prs` and by the head-sha → PRs bucket.
     const attached = [...new Set([...(c.prs || []), ...(mirror.buckets.shas[JSON.stringify([c.repo, c.sha])] || [])])];
-    const keep = attached.some((n) => {
-      const row = retained.get(n);
-      return row && (closedSeen[n] != null || c.sha === row.sha);
-    });
+    // Every sha an open PR has had keeps its checks: a head that returns to an old sha must still see its failures.
+    const keep = attached.some((n) => retained.has(n));
     const age = nowMs - Date.parse(c.at);
     if (keep || (!attached.length && age >= 0 && age < retentionMs)) checks[key] = c;
   }

@@ -313,7 +313,8 @@ describe('mirror compaction', () => {
     const next = compact(m);
     expect(lookup(next)).toEqual(lookup(m));
     expect(lookup(next).facts.checks).toHaveLength(1);
-    expect(Object.values(next.buckets.checks).map((c) => c.sha)).toEqual([HEAD]);
+    // Old heads keep their checks: a head that returns to an old sha must still see its failures.
+    expect(Object.values(next.buckets.checks).map((c) => c.sha).sort()).toEqual([HEAD, OLD].sort());
     expect(next.buckets.shas).toEqual(m.buckets.shas);
     expect(m).toEqual(before);
     expect(compact(next)).toEqual(next);
@@ -339,7 +340,7 @@ describe('mirror compaction', () => {
     m.buckets.shas[shaKey(OLD)] = [8];
     const next = compact(m);
     expect(next.buckets.shas).toEqual({ [shaKey(HEAD)]: [7] });
-    expect(Object.values(next.buckets.checks).map((c) => c.sha)).toEqual([HEAD]);
+    expect(Object.values(next.buckets.checks).map((c) => c.sha).sort()).toEqual([HEAD, OLD].sort());
     expect(lookup(next)).toEqual(lookup(m));
   });
 
@@ -404,7 +405,7 @@ describe('mirror compaction', () => {
     expect(r.mode).toBe(mode);
     expect(Object.values(r.mirror.buckets.prs).map((p) => p.number)).toEqual([8]);
     expect(r.mirror.closedSeen).toEqual({});
-    expect(Object.values(r.mirror.buckets.checks).map((c) => c.sha)).toEqual([HEAD]);
+    expect(Object.values(r.mirror.buckets.checks).map((c) => c.sha).sort()).toEqual([HEAD, OLD].sort());
   });
 
   it('does not compact failed refreshes', async () => {
