@@ -5,13 +5,13 @@ import {fileURLToPath} from 'node:url';
 import {parseTelemetry, formatTelemetry} from './forge-exec-run.mjs';
 export {parseTelemetry, formatTelemetry};
 
-export async function readForgeTelemetry({host='forge',exec=execFile}={}) {
+export async function readForgeTelemetry({host='forge',exec=execFile,signal}={}) {
   if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))throw new Error('Invalid host');
   const output=await new Promise((resolve,reject)=>{
     const child=exec('ssh',[
     '-o','BatchMode=yes','-o','ConnectTimeout=5',host,
     'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs telemetry',
-  ],{encoding:'utf8',maxBuffer:65536,timeout:8000},(error,stdout,stderr)=>{
+  ],{encoding:'utf8',maxBuffer:65536,timeout:8000,signal},(error,stdout,stderr)=>{
     if(!error)return resolve(stdout);
     // Mark only connection-level failures (ssh exit 255, timeout kill) so the health check may re-read after a ping.
     // Oversized output and remote-command failures stay unmarked and keep failing closed.
