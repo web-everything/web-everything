@@ -529,6 +529,8 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     ['later re-add despite empty registry', { later: 'added' }, false],
     ['overlay still registered', { registered: true }, false],
     ['retirement unrelated to merge', { reason: 'withdraw fix' }, false],
+    ['negated merge statement', { reason: 'PR 7055 is not merged yet' }, false],
+    ['explicit false content evidence', { evidence: { contentInMain: false, cleanMerges: true } }, false],
     ['later unknown lifecycle event', { later: 'unknown' }, false],
     ['unreadable event log', { log: 'unreadable' }, false],
     ['missing event log', { log: 'missing' }, false],
@@ -545,10 +547,10 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const retirement = {
       kind: 'auto-retired', ref, tip: sha, by: OPERATOR_LOGINS[0],
       reason: 'PR 7055 merged; registration is stale',
-      ...Object.fromEntries(Object.entries(options).filter(([key]) => ['kind', 'tip', 'reason'].includes(key))),
+      ...Object.fromEntries(Object.entries(options).filter(([key]) => ['kind', 'tip', 'reason', 'evidence'].includes(key))),
     };
     expect(retirement).not.toHaveProperty('actor');
-    expect(retirement).not.toHaveProperty('evidence');
+    if (!options.evidence) expect(retirement).not.toHaveProperty('evidence');
     appendOverlayEvent(cloneDir, retirement, { env });
     if (options.later) appendOverlayEvent(cloneDir, { kind: options.later, ref }, { env });
     if (options.registered) addOverlay(cloneDir, { ref }, { env });

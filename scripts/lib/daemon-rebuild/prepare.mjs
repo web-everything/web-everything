@@ -602,8 +602,16 @@ export async function prepareRebuild({
           // The shared reader rejects the entire log on unreadable input; any later event vetoes this proof.
           if (registeredRefs.has(ref) || overlaysBefore.some((o) => o?.ref === ref)) return false;
           const last = readOverlayEvents().findLast((event) => event?.ref === ref);
-          return !!last && ['auto-retired', 'auto-dropped'].includes(last.kind) && last.tip === sha
-            && typeof last.reason === 'string' && /merged|in-main|in main/i.test(last.reason);
+          if (!last || !['auto-retired', 'auto-dropped'].includes(last.kind) || last.tip !== sha || typeof last.reason !== 'string') return false;
+          // A positive statement only ("PR 123 ... merged ..." or in-main); negations never count.
+          const reason = last.reason;
+          if (/\b(not|never|un|isn'?t|wasn'?t|hasn'?t)[\s-]*(been\s+)?merged\b/i.test(reason)) return false;
+          if (!(/^pr-merged$/i.test(reason.trim()) || /\bPR\s*#?\d+\b[^.]*\bmerged\b/i.test(reason) || /\bin[- ]main\b/i.test(reason))) return false;
+          // Explicit negative proof vetoes; the retirement must predate the candidate's smoke (it saw the shrunken registry).
+          if (last.evidence?.contentInMain === false || last.evidence?.cleanMerges === false) return false;
+          const retiredMs = Date.parse(last.at || '');
+          const readyMs = Date.parse(ready.at ?? ready.passedAt ?? '');
+          return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs <= readyMs;
         },
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
