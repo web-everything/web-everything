@@ -53,7 +53,7 @@ export function boundMergeGateReviewHold(row, { headSha, labels } = {}) {
 
 /** Apply review-only excusal while retaining the strict resolver's provenance and conflict checks. */
 export function resolveReviewRequiredChecks({ labels, ...evidence } = {}) {
-  let held = false;
+  const boundRows = new Set();
   const rows = Array.isArray(evidence.rows) ? evidence.rows.map(row => {
     if (row?.name !== 'merge-gate') return row;
     const { mergeGateHoldExcused, mergeGateReviewHold, ...original } = row;
@@ -62,12 +62,15 @@ export function resolveReviewRequiredChecks({ labels, ...evidence } = {}) {
     if (String(original.status).toLowerCase() === 'completed'
       && String(original.conclusion).toLowerCase() === 'failure'
       && boundMergeGateReviewHold(row, { headSha: evidence.head, labels })) {
-      held = true;
-      return { ...original, conclusion: 'success' };
+      const rewritten = { ...original, conclusion: 'success' };
+      boundRows.add(rewritten);
+      return rewritten;
     }
     return original;
   }) : evidence.rows;
   const result = resolveRequiredChecks({ ...evidence, rows });
+  // Only a bound row that is still the ACTIVE merge-gate evidence holds; a superseded old failure never does.
+  const held = result.perName['merge-gate']?.rows?.some(row => boundRows.has(row)) === true;
   if (held && result.perName['merge-gate']?.state === 'pass') {
     result.perName['merge-gate'] = { ...result.perName['merge-gate'], state: 'held',
       rows: evidence.rows.filter(row => row?.name === 'merge-gate') };

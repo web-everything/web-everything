@@ -5,6 +5,7 @@ import { runDraftPromotionStep } from '../../conveyor/draft-promotion-loop.mjs';
 import { readReviewHeadAndLabels } from '../review-ci-gate-io.mjs';
 import { readReviewCiGate, exhaustiveReadChecks } from './helpers/review-checks.mjs';
 import { describe, it, expect, vi } from 'vitest';
+import { resolveReviewRequiredChecks } from '../merge-gate-hold-class.mjs';
 import { parsePrResultTable as rawParse, classifyMergeGateHold, excuseMergeGateRows, resolveMergeGateHoldSetting, readMergeGateVerdict } from '../merge-gate-hold-class.mjs';
 import { runReconcilePass } from '../../conveyor/reconcile-pass.mjs';
 import { defaultReadHeadCheckState } from '../../operations/promote-draft-pr-dispatch.mjs';
@@ -668,5 +669,21 @@ describe('review-hold annotation (card 273, #5157)', () => {
     for (const results of [[{ id: 'test-gaming', status: 'fail-closed' }], [{ id: 'test-gaming', status: 'hold' }, { id: 'red-main-freeze', status: 'hold' }]]) {
       expect(excuseMergeGateRows([row], opts({ readVerdict: () => ({ num: 4965, head_sha: sha, ok: false, results }) }))).toEqual({ rows: [row], excused: false });
     }
+  });
+});
+
+describe('review hold evidence stays bound to the active merge-gate attempt', () => {
+  const head = 'e'.repeat(40);
+  const job = n => `https://github.com/o/r/actions/runs/50/job/${n}`;
+  const hold = jobId => ({ holds: ['review-acceptance'], holdIds: ['review-acceptance'], headSha: head, jobId, originalConclusion: 'failure' });
+  const gate = (extra = {}) => ({ name: 'merge-gate', status: 'completed', head_sha: head, run_id: 50, ...extra });
+  const base = { rowsHead: head, rowsComplete: true, rosterSource: 'live', head, labels: ['review:pending'],
+    requiredNames: ['merge-gate', 'review-gate'] };
+  it('an old held failure superseded by a later success never makes a failed review-gate held', () => {
+    const old = gate({ id: 1, run_attempt: 1, conclusion: 'failure', detailsUrl: job(1), mergeGateReviewHold: hold(1) });
+    const fresh = gate({ id: 2, run_attempt: 2, conclusion: 'success', detailsUrl: job(1) });
+    const result = resolveReviewRequiredChecks({ ...base, rows: [old, fresh, { name: 'review-gate', status: 'completed', conclusion: 'failure', head_sha: head }] });
+    expect(result.perName['review-gate'].state).toBe('fail');
+    expect(result.state).toBe('fail');
   });
 });
