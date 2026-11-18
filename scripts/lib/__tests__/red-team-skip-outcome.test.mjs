@@ -415,7 +415,7 @@ describe('live red-team alert suppression', () => {
         : { total_count: state === 'clear' ? 0 : 1, statuses: state === 'clear' ? [] : [status] });
     });
     const readLive = createLiveRedTeamReader({
-      provider: { readPrState: () => ({ headRefOid: head }) }, readComments: () => [],
+      provider: { readPrState: () => ({ headRefOid: head, labels: [] }) }, readComments: () => [],
       readCheckFact: () => ({ ok: true }), gh,
     });
     expect(readLive({ repo, pr, head })).toEqual({ clear: state === 'clear' });
@@ -431,7 +431,7 @@ describe('live red-team alert suppression', () => {
   ])('a %s comment overrides a success check', (_kind, finding) => {
     const readCheckFact = vi.fn(() => ({ ok: true }));
     const readLive = createLiveRedTeamReader({
-      provider: { readPrState: () => ({ headRefOid: head }) },
+      provider: { readPrState: () => ({ headRefOid: head, labels: [] }) },
       readComments: () => [{ body: `${redTeamMarker(pr, head)}\nAdvisory only: red team · recorded verdict \`changes\`.\n${finding}`,
         author: { login: 'web-everything' } }],
       readCheckFact,
@@ -452,7 +452,7 @@ describe('live red-team alert suppression', () => {
     ['hold evidence missing', { readPublicationHoldFact: () => undefined }, false],
   ])('zero-finding comment with %s fails closed unless validated', (_kind, readers, clear) => {
     const readLive = createLiveRedTeamReader({
-      provider: { readPrState: () => ({ headRefOid: head }) },
+      provider: { readPrState: () => ({ headRefOid: head, labels: [] }) },
       readComments: () => [{ body: clearResult(head), author: { login: 'web-everything' } }],
       readCheckFact: () => ({ ok: true }),
       readPublicationHoldFact: () => ({ ok: true }),
@@ -463,6 +463,13 @@ describe('live red-team alert suppression', () => {
     f.io.readLiveRedTeam = readLive;
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(clear ? 0 : 1);
+  });
+  it.each(['red-team:pending', 'red-team:blocked'])('an open %s label keeps the skip alert', label => {
+    const readLive = createLiveRedTeamReader({
+      provider: { readPrState: () => ({ headRefOid: head, labels: [{ name: label }] }) },
+      readComments: () => [{ body: clearResult(head), author: { login: 'web-everything' } }],
+    });
+    expect(readLive({ repo, pr, head })).toEqual({ clear: false });
   });
   it.each(['completed result', 'check', 'stale head'])('settles %s without publishing or retrying', kind => {
     const f = fixture();
