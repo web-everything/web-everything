@@ -141,7 +141,7 @@ function registeredStartGate(input) {
 
 /** Start permission only. Merge/ready decisions must continue using their strict CI gates. */
 export function reviewStartGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete, rosterSource, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
-  const provenance = { rowsHead, rowsComplete, rosterSource };
+  const provenance = { rowsHead, rowsComplete, rosterSource, reviewStart: true };
   const input = { headSha, checks, requiredChecks, ...provenance };
   const strictGate = reviewCiGate(input), strict = () => strictGate;
   if (evidence(input).state === 'unknown' || strictGate.reason === 'required-review-gate-conflict') return strict();

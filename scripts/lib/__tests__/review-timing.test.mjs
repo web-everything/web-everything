@@ -276,7 +276,8 @@ describe('parallel review start and void', () => {
     ['plain merge-gate red', [check('merge-gate', 'failure')], true],
   ])('required %s: healable=%s, the same rule the CI heal uses (#5463)', (_name, rows, healable) => {
     const requiredChecks = ['test', 'review-gate', 'merge-gate'];
-    const checks = [...rows, check('test'), ...fast.map(n => check(n))];
+    const checks = [...rows, ...['review-gate', 'merge-gate'].filter(name => !rows.some(row => row.name === name)).map(name => check(name)),
+      check('test'), ...fast.map(n => check(n))];
     expect(ciRedOnHead({ headSha: head, checks, requiredChecks })).toBe(healable);
     expect(fixReadiness({ headSha: head, checks, requiredChecks }).ciFailed).toBe(healable);
     for (const startAfter of ['fast-checks', 'push'])
@@ -294,6 +295,24 @@ describe('parallel review start and void', () => {
     expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks: gates, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(false);
     // A required non-gate red still counts.
     expect(ciRedOnHead({ headSha: head, checks: [...gates, check('test', 'failure')], requiredChecks })).toBe(true);
+  });
+  it.each([
+    undefined,
+    { headSha: 'b'.repeat(40), holdIds: ['review-acceptance'], jobId: 1 },
+    { headSha: head, holdIds: ['review-acceptance'], jobId: 2 },
+    { headSha: head, holdIds: ['ci'], jobId: 1 },
+  ])('an unbound merge-gate review hold remains red and blocks start: %j', mergeGateReviewHold => {
+    const checks = [...fast.map(n => check(n)), check('merge-gate', 'failure', {
+      detailsUrl: 'https://github.com/o/r/actions/runs/7/job/1', mergeGateReviewHold,
+    })];
+    const input = { headSha: head, checks, requiredChecks: ['merge-gate'] };
+    expect(ciRedOnHead(input)).toBe(true);
+    expect(fixReadiness(input).ciFailed).toBe(true);
+    expect(reviewMustVoid({ ...input, reviewedHead: head, currentHead: head,
+      policy: { ...review, cancelOnCiRed: true } })).toBe(true);
+    for (const startAfter of ['fast-checks', 'push', 'ci-green'])
+      expect(reviewStartGate({ ...input, repo: 'we', verifyGreen: true,
+        policy: { ...review, startAfter, startBeforeCi: true } }).allowed).toBe(false);
   });
   it('the non-healable list covers the CI-truth exclusions the heal path uses', () => {
     for (const name of CI_TRUTH_EXCLUDED_CHECKS) expect(NON_HEALABLE_CHECKS).toContain(name);
@@ -553,8 +572,8 @@ describe('strict timing evidence regressions', () => {
 });
 
 
-it.each(['failure', 'in_progress'])('a required review-gate %s refuses every early review path', state => {
-  const checks = [check('test'), state === 'failure' ? check('review-gate', 'failure')
+it.each(['timed_out', 'startup_failure', 'action_required', 'cancelled', 'stale', 'neutral', 'skipped', 'in_progress'])('a required review-gate %s refuses every early review path', state => {
+  const checks = [check('test'), state !== 'in_progress' ? check('review-gate', state)
     : check('review-gate', null, { status: 'in_progress' })];
   for (const startAfter of ['ci-green', 'fast-checks', 'push']) {
     for (const startEarly of ['off', 'shadow', 'on']) {

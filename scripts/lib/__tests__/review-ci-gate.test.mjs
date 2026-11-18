@@ -34,6 +34,18 @@ describe('strict review CI prerequisite', () => {
   it('never exempts an explicitly required review-gate', () => {
     expect(reviewCiGate({ headSha, requiredChecks: ['review-gate'], checks: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })).toMatchObject({ allowed: false, reason: 'required-review-gate-conflict' });
   });
+  it('excuses held evidence only for review start, without declaring it passing', () => {
+    const input = { headSha, requiredChecks: ['review-gate', 'merge-gate'], checks: [
+      { name: 'review-gate', status: 'completed', conclusion: 'failure' },
+      { name: 'merge-gate', status: 'completed', conclusion: 'failure',
+        detailsUrl: 'https://github.com/o/r/actions/runs/7/job/1',
+        mergeGateReviewHold: { headSha, jobId: 1, holdIds: ['review-acceptance'] } },
+    ] };
+    expect(reviewCiGate(input).allowed).toBe(false);
+    expect(reviewCiGate({ ...input, reviewStart: true }).allowed).toBe(true);
+    expect(reviewCiGate({ ...input, reviewStart: true, rowsComplete: false }).allowed).toBe(false);
+    expect(reviewCiGate({ ...input, reviewStart: true, rosterSource: undefined }).allowed).toBe(false);
+  });
   it('admits successful required commit statuses', () => {
     for (const row of [{ context: 'legacy', state: 'success' }, { __typename: 'StatusContext', context: 'legacy', state: 'SUCCESS' }]) {
       expect(reviewCiGate({ headSha, requiredChecks: ['legacy'], checks: [row] }).allowed).toBe(true);
