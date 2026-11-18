@@ -190,10 +190,6 @@ describe('abandoned builder draft recovery', () => {
     { evidence: 'a whole-job log over the 1 MiB default buffer', metadata: { steps }, expectedError: '##[error]AssertionError: Done-when 2',
       log: `2026-09-30T01:00:01Z passing step ${'x'.repeat(2_200_000)}\n`
         + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary' },
-    // Past even the helper's 16 MiB bound the log is unreadable: the draft keeps the published
-    // diagnostic and is still resumed, instead of the throw aborting recovery of every draft.
-    { evidence: 'a whole-job log over the 16 MiB helper bound', metadata: { steps }, expectedError: noDetail, logUnreadable: true,
-      log: `2026-09-30T01:00:11Z failed step ##[error]${'x'.repeat(16 * 1024 * 1024)}\n` },
     { evidence: 'missing step metadata', metadata: {}, expectedError: noDetail },
     { evidence: 'published check detail', metadata: {}, summary: 'AssertionError: failed check summary', expectedError: 'AssertionError: failed check summary' },
     { evidence: 'malformed step metadata', metadata: { steps: [null, steps[1]] }, expectedError: noDetail },
@@ -205,7 +201,7 @@ describe('abandoned builder draft recovery', () => {
   ];
   // A literal-titled `it(` opener per row (not `it.each`) keeps the merge-gate's test-case counter honest: it
   // only counts string-titled openers, so an `it.each` rewrite of one case reads as a net removal.
-  for (const { evidence, metadata, summary, expectedError, log, logUnreadable } of evidenceCases) it(`keeps earlier passing-step errors out of dispatch and comments with ${evidence}`, async () => {
+  for (const { evidence, metadata, summary, expectedError, log } of evidenceCases) it(`keeps earlier passing-step errors out of dispatch and comments with ${evidence}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
       payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
@@ -260,9 +256,7 @@ describe('abandoned builder draft recovery', () => {
       expect(io.gh).toHaveBeenCalledWith(['pr', 'edit', '3033', '--repo', 'web-everything/web-everything', '--add-label', 'blocked:needs-human']);
       expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'web-everything/web-everything', '--body', expect.stringContaining(`First error: ${expectedError}`)]);
       expect(io.api).toHaveBeenCalledWith('commits/abc');
-      // Step metadata only attributes a readable log; an unreadable one keeps the published diagnostic.
-      if (logUnreadable) expect(io.api).not.toHaveBeenCalledWith('actions/jobs/456');
-      else expect(io.api).toHaveBeenCalledWith('actions/jobs/456');
+      expect(io.api).toHaveBeenCalledWith('actions/jobs/456');
       expect(io.gh).toHaveBeenCalledWith(['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/456/logs'],
         expect.objectContaining({ encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
       expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ failure: { name: 'test-shard (2)', firstError: expectedError } }));
@@ -289,5 +283,34 @@ describe('abandoned builder draft recovery', () => {
       expect(io.dispatch).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true, force: true }); }
     // The first call cold-imports the whole dispatch IO stack, which alone exceeds vitest's 5s default.
+  }, 60_000);
+
+  // Fail closed: a job log past even the helper's 16 MiB bound is unreadable, and recovery aborts instead of
+  // keeping the stale published "No error detail" and still dispatching repair.
+  it('aborts recovery when the failed job log is unreadable instead of dispatching on stale detail', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
+    const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
+      payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
+    const io = {
+      stateRoot: dir, store: { list: () => ['dispatch-lane-test'], read: () => ({ effects: [row] }) },
+      isPidAlive: () => false, listAgents: () => [],
+      api: vi.fn(path => path.startsWith('pulls/')
+        ? { draft: true, state: 'open', updated_at: new Date().toISOString(),
+          head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
+        : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+        : { check_runs: [
+          { id: 1, name: 'review-gate', conclusion: 'failure' },
+          { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
+        ] }),
+      paged: vi.fn(() => []),
+      gh: vi.fn(() => { throw Object.assign(new Error('spawnSync gh ENOBUFS'), { code: 'ENOBUFS' }); }),
+      freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
+      dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
+    };
+    const args = { rawOpenPrs: [{ repo: 'we', prs: [{ ...candidate, number: 3033, headRefName: candidate.laneRef, files: [{ path: 'scripts/a.mjs' }] }] }], allowResume: true };
+    try {
+      await expect(cliRecoverBuilderDrafts(args, io)).rejects.toThrow(/log unreadable/);
+      expect(io.dispatch).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 });
