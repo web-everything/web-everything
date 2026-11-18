@@ -28,13 +28,15 @@ const prEvent = (n) => ({ pull_request: { number: n, base: { ref: 'main' } } });
 
 const run = (o) => quarantineSkip({ env: {}, now: NOW, mode: Q, read: READ, changed: [], readEvent: () => o.event, flags: { event: 'pull_request', ref: `refs/pull/${o.pr}/merge`, 'event-path': '/e.json' }, ...o });
 
-it.each(['tagged', 'legacy', 'changed', 'main', 'fix', 'multiple'])('soak file::name exclusion: %s', (scenario) => {
+it.each(['tagged', 'legacy', 'changed', 'main', 'fix', 'multiple', 'whole-file'])('soak named cases never suppress unrelated assertions: %s', (scenario) => {
   const file = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs', job = 'soak-shard (1)';
   const read = { ok: true, list: { ...LIST, entries: [{ ...LIST.entries[0], test: `${file}::50 real daemon ticks`, ...(scenario === 'legacy' ? {} : { job }) }] } };
   if (scenario === 'multiple') read.list.entries.push({ ...read.list.entries[0], test: 'other.soak.test.mjs::case' });
+  if (scenario === 'whole-file') read.list.entries[0].test = file;
   const result = run({ read, changed: scenario === 'changed' ? [file] : [], flags: { job,
     event: scenario === 'main' ? 'push' : 'pull_request', ref: scenario === 'main' ? 'refs/heads/main' : `refs/pull/${scenario === 'fix' ? FIX_PR : 4990}/merge` } });
-  expect(result.line).toBe(scenario === 'multiple' ? `--exclude=${file} --exclude=other.soak.test.mjs` : scenario === 'tagged' ? `--exclude=${file}` : '');
+  expect(result.line).toBe(scenario === 'whole-file' ? `--exclude=${file}` : '');
+  if (['tagged', 'multiple'].includes(scenario)) expect(result.why).toContain('name-qualified');
 });
 
 describe('renderExclude — one exact Vitest exclude argument', () => {

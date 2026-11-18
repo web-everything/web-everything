@@ -638,10 +638,13 @@ export function mainQuarantineCovered({ list, signal, now, exec = execFileSyncTh
     if (run?.status !== 'completed' || !['failure', 'timed_out'].includes(run.conclusion)
       || !/^[1-9]\d*$/.test(String(run.databaseId)) || !run.headSha || run.headSha !== (signal.latestRedSha ?? signal.firstRedSha)) return false;
     const jobs = readJobs(run.databaseId);
-    if (!jobs?.complete || !Array.isArray(jobs.failed) || !jobs.failed.length) return false;
+    if (!jobs?.complete || !Array.isArray(jobs.jobs) || !Array.isArray(jobs.failed) || !jobs.failed.length) return false;
     const local = (name) => String(name).split(' / ').at(-1);
     const shards = jobs.failed.filter((j) => /^(test|soak)-shard \(\d+\)$/.test(local(j.name)));
     if (!shards.length || shards.length > 5) return false;
+    // The failed projection omits cancelled/infra jobs. Only covered failed shards may time out.
+    if (jobs.jobs.some((j) => !['success', 'skipped', 'neutral', 'failure', 'timed_out'].includes(j.conclusion)
+      || (j.conclusion === 'timed_out' && !shards.some((s) => s.id === j.id)))) return false;
     const derived = { test: 'test-shard', 'coverage-merge': 'test-shard', 'daemon-soak': 'soak-shard' };
     if (jobs.failed.some((j) => !shards.includes(j) && !shards.some((s) => local(s.name).startsWith(`${derived[local(j.name)]} (`)))) return false;
     const shas = [signal.firstRedSha, signal.latestRedSha].filter(Boolean);

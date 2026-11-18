@@ -175,21 +175,28 @@ const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
 /**
  * Failing vitest tests from one CI job's log (untrusted text). `complete` only when the run's own summary line
  * (`Test Files  N failed | …`) names exactly as many failed files as were parsed — anything else (a crash before the
- * summary, a cut-off log, a failure outside vitest) is NOT a known-failing-test case. PURE.
+ * summary, a cut-off log, a failure outside vitest) is NOT a known-failing-test case. Trailing errors/failures and
+ * a test-count mismatch also make the evidence incomplete: retain the hold for operator repair. PURE.
  * @returns {{files:string[], tests:Array<{file:string,name:string|null}>, failedFiles:number|null, complete:boolean}}
  */
 export function parseVitestFailures(logText) {
   const tests = [];
-  let failedFiles = null;
+  let failedFiles = null, failedTests = null, incomplete = false;
   for (const raw of String(logText ?? '').split('\n')) {
     const line = raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd();
+    // Assertion blocks precede the summary. Later errors/failures are additional evidence, never covered by it.
+    if (failedFiles !== null && /Error|Unhandled|##\[error\]|^\s*(?:FAIL\b|[×❯])/i.test(line)) incomplete = true;
     const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line); // `FAIL file > a > b`, or `FAIL file [ file ]` (a suite that failed to load)
     if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
+    else if (/^\s*FAIL\b/.test(line)) incomplete = true;
     const s = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
     if (s) failedFiles = Number(s[1]);
+    const t = /^\s*Tests\s+(\d+) failed\b/.exec(line);
+    if (t) failedTests = Number(t[1]);
   }
   const files = [...new Set(tests.map((t) => t.file))];
-  return { files, tests, failedFiles, complete: failedFiles !== null && failedFiles === files.length && files.length > 0 };
+  return { files, tests, failedFiles, complete: !incomplete && failedFiles !== null && failedFiles === files.length && files.length > 0
+    && (failedTests === null || failedTests === tests.filter((t) => t.name !== null).length) };
 }
 
 /** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */
@@ -383,8 +390,8 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = 
   const changed = new Set(changedFiles);
   const touched = tests.filter((t) => changed.has(testFileOf(t)));
   const rest = tests.filter((t) => !changed.has(testFileOf(t)));
-  // Soak shards consume file identities; a tagged case quarantines its scenario file. Unit exclusions stay whole-file only.
-  const { args, unsupported } = vitestExcludeArgs(/^soak-shard \(\d+\)$/.test(localJobName(job)) ? rest.map(testFileOf) : rest);
+  // Every shard uses file exclusions: named cases must run rather than suppress unrelated assertions.
+  const { args, unsupported } = vitestExcludeArgs(rest);
   const skip = args.map((a) => a.slice('--exclude='.length));
   return { skip, unsupported, why: `skipping ${skip.length} quarantined test file(s)${touched.length ? `; running ${touched.length} this PR changes` : ''}` };
 }

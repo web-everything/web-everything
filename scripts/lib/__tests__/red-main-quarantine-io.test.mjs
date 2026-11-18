@@ -110,9 +110,9 @@ describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
 
 describe('latest main quarantine coverage releases the drain only with complete evidence', () => {
   const file = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs', job = 'soak-shard (1)';
-  it.each(['all-covered', 'unit-covered', 'one-uncovered', 'unreadable-list', 'unreadable-run', 'expired', 'non-shard', 'integration', 'oversized', 'incomplete-jobs', 'unreadable-log', 'newer-run', 'legacy', 'wrong-job'])('%s proceeds only when all failures are covered; otherwise holds', (scenario) => {
+  it.each(['all-covered', 'unit-covered', 'named-case', 'one-uncovered', 'unreadable-list', 'unreadable-run', 'expired', 'non-shard', 'integration', 'oversized', 'incomplete-jobs', 'missing-full-jobs', 'unreadable-log', 'newer-run', 'legacy', 'wrong-job'])('%s proceeds only when all failures are covered; otherwise holds', (scenario) => {
     const now = Date.now(), readLog = vi.fn(() => ({ complete: true, files: [file, ...(scenario === 'one-uncovered' ? ['other.test.mjs'] : [])] }));
-    const list = addEntries(null, { tests: [`${file}::50 real daemon ticks`], brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now,
+    const list = addEntries(null, { tests: [scenario === 'named-case' ? `${file}::50 real daemon ticks` : file], brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now,
       ...(scenario === 'legacy' ? {} : { job: scenario === 'wrong-job' ? 'soak-shard (2)' : job }) }).list;
     list.mode = 'quarantine';
     if (scenario === 'expired') { list.entries[0].addedAt = now - 1; list.entries[0].expiresAt = now; }
@@ -123,10 +123,35 @@ describe('latest main quarantine coverage releases the drain only with complete 
     if (scenario === 'oversized') failed.push(...[2, 3, 4, 5, 6].map((n) => ({ id: n + 2, name: `soak-shard (${n})` })));
     const result = mainQuarantineCovered({ list: scenario === 'unreadable-list' ? null : list, signal: { latestRedSha: SHA }, now,
       exec: () => { if (scenario === 'unreadable-run') throw new Error('unreadable'); return JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: scenario === 'newer-run' ? 'other' : SHA }]); },
-      readJobs: () => ({ complete: scenario !== 'incomplete-jobs', failed }),
+      readJobs: () => ({ complete: scenario !== 'incomplete-jobs', failed,
+        ...(scenario === 'missing-full-jobs' ? {} : { jobs: failed.map((j) => ({ ...j, conclusion: 'failure' })) }) }),
       readLog: scenario === 'unreadable-log' ? () => { throw new Error('unreadable'); } : readLog });
     expect(result).toBe(['all-covered', 'unit-covered'].includes(scenario));
     if (scenario === 'oversized') expect(readLog).not.toHaveBeenCalled();
+  });
+
+  it.each(['success', 'cancelled', 'timed_out', 'startup_failure', 'action_required', null])('full job read retains the hold for an uncovered %s job', (conclusion) => {
+    const now = Date.now();
+    const list = { ...addEntries(null, { tests: [file], job, brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now }).list, mode: 'quarantine' };
+    const exec = vi.fn((_bin, args) => {
+      if (args[0] === 'run') return JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: SHA }]);
+      if (args[1].endsWith('/logs')) return ` FAIL ${file} > covered case\nAssertionError: expected true\n Test Files 1 failed\n Tests 1 failed\n`;
+      return JSON.stringify({ total_count: 3, jobs: [{ id: 1, name: job, conclusion: 'failure' },
+        { id: 2, name: 'daemon-soak', conclusion: 'failure' }, { id: 3, name: 'soak-shard (2)', conclusion }] });
+    });
+    expect(mainQuarantineCovered({ list, signal: { latestRedSha: SHA }, now, exec })).toBe(conclusion === 'success');
+  });
+
+  it.each(['', 'Error: uncovered teardown failure', 'Unhandled rejection: late', '##[error]uncovered runner failure',
+    ` FAIL ${file} > unlisted failure`, ' Tests 2 failed'])('coverage refuses trailing non-test or unlisted failure evidence: %j', (tail) => {
+    const now = Date.now();
+    const list = { ...addEntries(null, { tests: [file], job, brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now }).list, mode: 'quarantine' };
+    expect(mainQuarantineCovered({ list, signal: { latestRedSha: SHA }, now,
+      exec: (_bin, args) => args[0] === 'run'
+        ? JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: SHA }])
+        : ` FAIL ${file} > covered case\nAssertionError: expected true\n Test Files 1 failed\n Tests 1 failed\n${tail}`,
+      readJobs: () => ({ complete: true, failed: [{ id: 1, name: job }], jobs: [{ id: 1, name: job, conclusion: 'failure' }] }),
+    })).toBe(tail === '');
   });
 });
 

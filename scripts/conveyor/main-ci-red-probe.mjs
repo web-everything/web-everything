@@ -49,7 +49,8 @@ export function readChangedFiles(base, head, { exec = execFileSyncThrottled, rep
 }
 
 /**
- * Jobs of one run: `{complete, failed:[{id,name}], passed:[name]}`. A job that was only cancelled is not failing; and
+ * Jobs of one run: `{complete, jobs, failed:[{id,name}], passed:[name]}`. Keep the full list for quarantine admission.
+ * A job that was only cancelled is not failing; and
  * only a job whose conclusion is `success` is in `passed` — skipped, cancelled, neutral and not-yet-finished jobs are
  * neither (review round 1, F5: they are not evidence that anything was fixed).
  */
@@ -59,6 +60,7 @@ export function readRunJobs(runId, { exec = execFileSyncThrottled, repoSlug = DE
   const complete = Number.isInteger(page?.total_count) && page.total_count === jobs.length;
   return {
     complete,
+    jobs,
     count: jobs.length,
     failed: jobs.filter((j) => ['failure', 'timed_out'].includes(String(j.conclusion))).map((j) => ({ id: j.id, name: j.name })),
     passed: jobs.filter((j) => String(j.conclusion) === 'success').map((j) => String(j.name)),

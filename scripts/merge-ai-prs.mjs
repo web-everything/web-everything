@@ -6802,7 +6802,7 @@ async function runCli() {
         redMainHeld = true;
         let held = 0;
         // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
-        // coverage missing or unreadable ⇒ STOP; complete coverage also releases the pass-level write hold.
+        // coverage missing or unreadable ⇒ STOP. Other main writes stay held even with complete coverage.
         // A MANUAL freeze is the operator's stop-the-line: quarantine never relaxes it (stop mode for every PR).
         const mode = resolveRedMainMode();
         let quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual') && !sig.sources.includes('freeze-unreadable');
@@ -6812,7 +6812,6 @@ async function runCli() {
           const q = readQuarantine();
           qList = q.ok ? q.list : null;
           quarantine = mainQuarantineCovered({ list: qList, signal: sig, now: Date.now() });
-          redMainHeld = !quarantine;
           if (!quarantine && !AS_JSON) process.stderr.write('  red-main-hold: quarantine coverage incomplete or unreadable; held until complete evidence or operator repair\n');
           else if (!AS_JSON) process.stderr.write('  quarantine: latest main failures fully covered; drain resumes with PR overlap guards\n');
           const localPrs = [...(openPrContext?.prsByRepo instanceof Map ? openPrContext.prsByRepo : new Map())].filter(([r]) => isLocalRepo(r)).flatMap(([, prs]) => prs || []);
