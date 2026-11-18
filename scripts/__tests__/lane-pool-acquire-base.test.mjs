@@ -11,11 +11,13 @@
  *   `acquire` (no `--base`) keeps landing on `origin/<branch>`, unchanged.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
-import { spawnSync, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { sharedRepos, withGhStub, scopeTestEnv } from './fixtures/shared-git-fixture.mjs';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:net';
+import { once } from 'node:events';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -24,7 +26,7 @@ function git(args, cwd) {
 }
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: withGhStub({ ...process.env, ...extraEnv }) });
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: withGhStub({ ...process.env, ...(base ? scopeTestEnv(base) : {}), ...extraEnv }) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -354,20 +356,109 @@ describe('lane-pool acquire --scope= persists advisory predicted scope (#2560)',
     expect('predictedScope' in leaseOf(r.out.trim())).toBe(false);
   });
 
-  it('an overlapping second acquire WARNS to stderr but still succeeds (advisory, never gates)', () => {
+  it('refuses before claiming; explicit overlap is audited and release clears only its own entry', () => {
     provision(2);
-    const common = [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=basetest', '--branch=main', '--no-install'];
-    // Lane 1 declares a scope; lane 2 declares an OVERLAPPING scope (shares we:src/shared.ts).
-    const first = runPool(['acquire', ...common, '--lane=1', '--scope=we:src/shared.ts,we:src/a.ts'], { LANE_POOL_ROOT: poolRoot });
+    const common = [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=basetest', '--branch=main', '--no-install', '--session=scope-test'];
+    const env = { LANE_POOL_ROOT: poolRoot };
+    const first = runPool(['acquire', ...common, '--lane=1', '--scope=we:src/shared.ts'], env);
     expect(first.code).toBe(0);
-    const second = runPool(['acquire', ...common, '--lane=2', '--scope=we:src/shared.ts,we:src/b.ts'], { LANE_POOL_ROOT: poolRoot });
-    // The acquire STILL succeeds (advisory never gates) — lane 2 is claimed …
-    expect(second.code).toBe(0);
-    const lane2 = second.out.trim();
-    expect(leaseOf(lane2).predictedScope).toEqual(['we:src/shared.ts', 'we:src/b.ts']);
-    // … stdout stays the clean lane path (the advisory rides stderr) …
-    expect(second.out).toBe(lane2 + '\n');
-    // … and the advisory warning names the overlap on stderr.
-    expect(second.err).toMatch(/advisory \(non-blocking\).*overlaps/);
+    const registry = () => JSON.parse(readFileSync(join(base, 'agent-scopes.json'), 'utf8')).entries;
+    expect(registry()[0]).toMatchObject({ agent: 'lane-1', lane: 1, files: ['we:src/shared.ts'] });
+    expect(registry()[0].owner).toBe(leaseOf(first.out.trim()).holder);
+    expect(registry()[0].lastSeenAt).toBeTruthy();
+    const args = ['acquire', ...common, '--lane=2', '--scope=we:src/shared.ts'];
+    const refused = runPool(args, env);
+    expect(refused.code).not.toBe(0);
+    expect(refused.err).toMatch(/scope overlap:.*lane-1/);
+    expect(refused.err).toContain('--allow-overlap=<reason>');
+    expect(existsSync(join(poolRoot, 'basetest/lane-2/.git/.lane-lease'))).toBe(false);
+    expect(runPool([...args, '--allow-overlap='], env).code).not.toBe(0);
+    expect(runPool([...args, '--allow-overlap'], env).code).not.toBe(0);
+    const allowed = runPool([...args, '--allow-overlap=paired work'], env);
+    expect(allowed.code).toBe(0);
+    const audit = JSON.parse(readFileSync(join(base, 'scope-overlap-allowed.jsonl'), 'utf8'));
+    expect(audit).toMatchObject({ scope: ['we:src/shared.ts'], reason: 'paired work', session: 'scope-test',
+      overlaps: [{ file: 'we:src/shared.ts', agent: 'lane-1', lane: 1 }] });
+    expect(Number.isFinite(Date.parse(audit.ts))).toBe(true);
+    const released = runPool(['release', ...common, '--lane=2', `--session=${leaseOf(allowed.out.trim()).holder}`], env);
+    expect(released.code).toBe(0);
+    expect(registry().map(e => e.agent)).toEqual(['lane-1']);
+  });
+
+  it('concurrent overlapping acquires across pools admit exactly one without an override', async () => {
+    provision(1);
+    const otherRoot = join(base, 'other-pool');
+    const common = [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=basetest', '--branch=main', '--no-install'];
+    expect(runPool(['provision', ...common, '--count=1'], { LANE_POOL_ROOT: otherRoot }).code).toBe(0);
+    const connections = new Set();
+    let arrived = 0;
+    const server = createServer(socket => {
+      connections.add(socket);
+      socket.on('close', () => connections.delete(socket));
+      // Each reader blocks at its first PR read until BOTH acquires reach admission.
+      if (++arrived >= 2) {
+        for (const waiting of connections) waiting.end('go');
+        connections.clear();
+      }
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const reader = join(base, 'synchronized-reader.mjs');
+    writeFileSync(reader, `#!/usr/bin/env node
+import { connect } from 'node:net';
+const socket = connect(${server.address().port}, '127.0.0.1');
+socket.once('data', () => { process.stdout.write('[]'); socket.end(); });
+`, { mode: 0o755 });
+    const children = [];
+    const start = (root, session) => {
+      const child = spawn(process.execPath, [SCRIPT, 'acquire', ...common, '--lane=1', '--no-reap',
+        '--scope=we:src/concurrent.ts', `--session=${session}`], {
+        env: withGhStub({ ...process.env, ...scopeTestEnv(base), WE_FREE_SCOPE_GH_BIN: reader, LANE_POOL_ROOT: root }),
+      });
+      children.push(child);
+      let out = '', err = '';
+      child.stdout.on('data', chunk => { out += chunk; });
+      child.stderr.on('data', chunk => { err += chunk; });
+      return once(child, 'close').then(([code]) => ({ code, out, err }));
+    };
+    const deadline = setTimeout(() => { for (const child of children) child.kill('SIGKILL'); }, 20000);
+    try {
+      const results = await Promise.all([start(poolRoot, 'concurrent-a'), start(otherRoot, 'concurrent-b')]);
+      expect(arrived).toBe(4); // Both callers completed both repo reads; no network evidence was skipped.
+      expect(results.filter(result => result.code === 0)).toHaveLength(1);
+      expect(results.filter(result => result.code !== 0)).toHaveLength(1);
+      expect(results.find(result => result.code !== 0).err).toContain('scope overlap:');
+      const entries = JSON.parse(readFileSync(join(base, 'agent-scopes.json'), 'utf8')).entries;
+      expect(entries).toHaveLength(1);
+      expect(entries[0].agent).toBe('lane-1');
+      expect(existsSync(join(base, 'scope-overlap-allowed.jsonl'))).toBe(false);
+    } finally {
+      clearTimeout(deadline);
+      for (const child of children) if (child.exitCode === null) child.kill('SIGKILL');
+      for (const socket of connections) socket.destroy();
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  it('clears the pending scope reservation when acquire fails after admission', () => {
+    provision(1);
+    const common = [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=basetest', '--branch=main',
+      '--no-install', '--lane=1', '--no-reap', '--scope=we:src/failure.ts'];
+    const env = { LANE_POOL_ROOT: poolRoot };
+    const refused = runPool(['acquire', ...common, '--base=lane/missing'], env);
+    expect(refused.code).not.toBe(0);
+    expect(refused.err).toMatch(/does not resolve/);
+    expect(JSON.parse(readFileSync(join(base, 'agent-scopes.json'), 'utf8')).entries).toEqual([]);
+    expect(runPool(['acquire', ...common], env).code).toBe(0);
+  });
+
+  it('refuses corrupt evidence even with an overlap override', () => {
+    provision(1);
+    writeFileSync(join(base, 'agent-scopes.json'), '{broken');
+    const r = runPool(['acquire', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=basetest',
+      '--branch=main', '--no-install', '--lane=1', '--scope=we:src/a.ts', '--allow-overlap=inspect'], { LANE_POOL_ROOT: poolRoot });
+    expect(r.code).not.toBe(0);
+    expect(r.err).toMatch(/cannot read registry/);
+    expect(existsSync(join(poolRoot, 'basetest/lane-1/.git/.lane-lease'))).toBe(false);
   });
 });

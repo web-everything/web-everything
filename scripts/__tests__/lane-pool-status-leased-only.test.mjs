@@ -28,7 +28,7 @@
  *   leased-only call's exit code until the flag exists.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, scopeTestEnv } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -48,7 +48,7 @@ function git(args, cwd) {
 function runPool(args, extraEnv = {}) {
   // LANE_POOL_ROOT MUST be this test's private tmp dir — without it every command falls back to the real
   // default pool root (~/workspace/.lanes), colliding with the LIVE pool this very task runs under.
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_STATUS_MAX_AGE_MS: '0', ...extraEnv } });
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, ...scopeTestEnv(base), LANE_POOL_ROOT: poolRoot, WE_LANE_STATUS_MAX_AGE_MS: '0', ...extraEnv } });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 

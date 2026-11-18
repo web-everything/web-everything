@@ -31,7 +31,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs status  [--lane=N] [--json] [--leased-only] [--max-age-ms=N]     # per-lane: path / head / clean / behind origin/main / deps / lease. --lane=N probes only that provisioned lane (unknown lane: no rows). #4345: --leased-only reads only the lease marker (no git) for a lane with no LIVE lease, and runs the full git probe only for lanes that ARE leased — for a reader that only ever consumes leased rows (conveyor-state.mjs / scope-lease-collect.mjs); an unleased row's git-derived fields (head/branch/clean/behind) are simply absent. Keep plain `status` for operator use and for anything needing dirty-unleased info (lane-pool-health-watch.mjs's trim).
  *   node scripts/lane-pool.mjs list    [--json] [--acquirable [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--lane-clean-reuse-ms=N]]  # existing lane paths (for the orchestrator to dispatch into); --acquirable filters out foreign-leased / busy lanes (#2426); #xn432dz: lease-first (no git in a live-leased lane), SINGLE-FLIGHT + cached for --cache-ttl-ms (env LANE_POOL_LIST_CACHE_TTL_MS, default 30000; 0 disables) so concurrent callers share one scan, --no-cache forces a fresh one, --limit=N stops at N (never cached), and the scan fails cleanly past --scan-timeout-ms (env LANE_POOL_LIST_SCAN_TIMEOUT_MS, default 120000); xkv3p37: a cached-mode scan reuses each CLEAN lane's verdict while its cheap stat signals are unchanged, for up to --lane-clean-reuse-ms (env LANE_POOL_LIST_LANE_CLEAN_REUSE_MS, default 300000; 0 disables), and an overrun returns the lanes already proven acquirable (never cached) — it fails only when it proved none
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
- *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure (omitted ⇒ 8000ms, overridden by LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS; invalid env falls back to 8000ms; explicit --wait-ms=0 ⇒ instant-fail); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
+ *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--allow-overlap=<reason>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure (omitted ⇒ 8000ms, overridden by LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS; invalid env falls back to 8000ms; explicit --wait-ms=0 ⇒ instant-fail); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. R1055: --scope=<repo:path,...> checks PR and agent scope before acquire; known overlaps require --allow-overlap=<reason> and are audited. The predictedScope marker remains advisory. #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
  *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved] [--discard]   # #2275 hand a leased lane back to the pool (own lease, or --force); refuses unpushed commits or tracked changes unless --discard explicitly accepts their loss; #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
  *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
@@ -130,6 +130,10 @@ import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksL
 import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, touchFreeLaneList, isProvablyCleanAndPushed, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
+import { isProseScopeFile } from './lib/prose-scope-globs.mjs';
+import { checkScope } from './operations/check-scope.mjs';
+import { registerScope, releaseScope } from './operations/free-scope.mjs';
+import { defaultRegistryPath, updateRegistry, resolveFreeScopeSettings, collectFreeScope } from './operations/free-scope-io.mjs';
 import { normScope } from './readiness/scope-lease.mjs';
 import { laneGitSignature, readStatusCache, cachedGitFields, writeStatusCache, resolveStatusMaxAgeMs } from './lib/lane-status-cache.mjs';
 import { isCherryOutputAllPatchEquivalent } from './lib/git-patch-equivalence.mjs';
@@ -2458,7 +2462,58 @@ const touchFreeList = (repo, lane, free) => touchFreeLaneList({
   path: resolveFreeLaneListPath({ repoName: repo.name, poolDir: repo.poolDir }), repoName: repo.name, poolDir: repo.poolDir, lane, free,
 });
 
+// Reserve under the SAME shared registry lock used by every scope writer, across all pools.
+// PR evidence can be collected before locking; registry evidence must be read inside the transaction.
 async function cmdAcquire(repo) {
+  const declaredScope = parseScopeFlag(flags.scope);
+  const overlapReason = flags['allow-overlap'];
+  if (overlapReason !== undefined && (typeof overlapReason !== 'string' || !overlapReason.trim())) {
+    fail('--allow-overlap requires a non-empty reason');
+  }
+  if (!declaredScope.some(file => !isProseScopeFile(file))) return cmdAcquireReserved(repo);
+  const registry = defaultRegistryPath(), session = defaultSession();
+  const reservation = { agent: `lane-pending-${randomBytes(12).toString('hex')}`, owner: session };
+  let keepReservation = false;
+  const cleanup = () => {
+    if (keepReservation) return;
+    try { updateRegistry(registry, entries => releaseScope(entries, reservation.agent, reservation.owner).entries); }
+    catch (error) { log(`  warning: could not clear pending scope: ${error.message}`); }
+  };
+  // fail() exits synchronously; finally also covers thrown errors and ordinary returns.
+  process.once('exit', cleanup);
+  try {
+    const snapshot = collectFreeScope({ files: declaredScope.join(',') });
+    updateRegistry(registry, entries => {
+      const scope = checkScope({ declaredFiles: declaredScope, collect: () => ({ ...snapshot, agents: entries }) });
+      if (!scope.ok) {
+        const printable = value => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+        for (const overlap of scope.overlaps) log(`  scope overlap: ${printable(JSON.stringify(overlap))}`);
+        if (!overlapReason || scope.unreadable?.length || !scope.overlaps.length) {
+          throw new Error(`${printable(scope.reason)} — retry with readable evidence; for known overlaps use --allow-overlap=<reason>`);
+        }
+        const audit = process.env.WE_SCOPE_OVERLAP_ALLOWED_PATH
+          || join(homedir(), 'workspace/.operations/coordination/scope-overlap-allowed.jsonl');
+        mkdirSync(dirname(audit), { recursive: true });
+        appendFileSync(audit, `${JSON.stringify({ ts: new Date().toISOString(), scope: declaredScope,
+          overlaps: scope.overlaps, reason: overlapReason.trim(), session })}\n`);
+      }
+      const { staleAfterMinutes } = resolveFreeScopeSettings({ log });
+      return registerScope(entries, { ...reservation, purpose: flags.purpose || session,
+        files: declaredScope, staleAfterMinutes }, new Date().toISOString());
+    });
+    await cmdAcquireReserved(repo, reservation);
+    keepReservation = true; // A failed best-effort lane publication retains the conservative pending claim.
+  } catch (error) {
+    cleanup();
+    process.removeListener('exit', cleanup);
+    fail(`${error.message} — scope reservation refused; retry with writable coordination state`);
+  } finally {
+    cleanup();
+    process.removeListener('exit', cleanup);
+  }
+}
+
+async function cmdAcquireReserved(repo, reservation) {
   const assertExpectedHolder = (dir) => {
     if (flags['expect-holder'] === undefined) return;
     const expected = flags['expect-holder'];
@@ -2498,8 +2553,6 @@ async function cmdAcquire(repo) {
   // no land event ever fired for it) never blocks a fresh dispatch. This makes the pool ACT on the exact ghost
   // the conveyor board's health scan only FLAGS (#2616/#2700). Best-effort; `--no-reap` opts out (tests).
   reapDeadLeasesInPool(repo, nowMs, ttlMs);
-  // #2560 — the ADVISORY predicted file-scope this acquire declares (empty when no `--scope`). Persisted into the
-  // marker (via tryClaimLane) AND used for the strictly-non-blocking overlap warning below. It NEVER gates.
   const declaredScope = parseScopeFlag(flags.scope);
   const lanes = existingLanes(repo);
   // #3627 follow-up (secondary finding) — name the RESOLVED pool root in the failure: a caller whose cwd sits
@@ -2936,10 +2989,7 @@ async function cmdAcquire(repo) {
     emitAcquirePollCount(); // #xj4tewd — success path (the loop exited via `break`, not `fail`)
   }
 
-  // #2560 (§3i-A4 Fork 1) — ADVISORY, STRICTLY NON-BLOCKING scope-overlap check. Runs AFTER the atomic O_EXCL
-  // claim above (the whole-clone lease is the REAL lock): this only WARNS to stderr if the declared scope
-  // overlaps a sibling lane's predicted scope. It does NOT gate, block, delay, or change which lane won — the
-  // lane is already claimed. Wrapped so a scope-check failure can NEVER throw into the acquire path.
+  // Secondary marker-based advisory; shared scope admission ran before claiming a lane.
   if (declaredScope.length) {
     const others = existingLanes(repo)
       .filter((n) => n !== chosen)
@@ -2980,6 +3030,17 @@ async function cmdAcquire(repo) {
       fail(e && e.message ? e.message : String(e));
     }
   }
+  if (declaredScope.length) {
+    try {
+      const { staleAfterMinutes } = resolveFreeScopeSettings({ log });
+      updateRegistry(defaultRegistryPath(), entries => registerScope(reservation
+        ? releaseScope(entries, reservation.agent, reservation.owner).entries : entries, {
+        agent: `lane-${chosen}`, owner: holderSlug, purpose: flags.purpose || session,
+        files: declaredScope, staleAfterMinutes,
+      }, new Date().toISOString()).map(entry => entry.agent === `lane-${chosen}` && entry.owner === holderSlug
+        ? { ...entry, lane: chosen, ...(flags.item !== undefined ? { item: flags.item } : {}) } : entry));
+    } catch (error) { log(`  warning: could not register lane scope: ${error.message}`); }
+  }
   // #2616 — record this lane's item → lane mapping in the PRIMARY checkout's lane-ports registry (the SAME
   // registry #2139's `map` writes and conveyor-state's health-stall scan reverse-derives lane→num from). A
   // conveyor delivery agent acquires its OWN lane and claims its OWN item, so nothing else calls `map` for it —
@@ -2988,7 +3049,7 @@ async function cmdAcquire(repo) {
   // `unmapLanes(chosen)`, so the fresh entry is never immediately cleared; the pre-map `unmapLanes` drops any
   // stale item still pointing at this lane (needed on the `--no-reset` path, where the reset's unmap did not run)
   // so lane→num stays 1:1. A band-less pool records `{ lane }` (no page port) — all the health scan needs.
-  // Wrapped so a registry-write hiccup can NEVER fail the acquire (advisory, like the scope-overlap check above),
+  // Wrapped so a registry-write hiccup can NEVER fail the acquire (best effort after scope admission),
   // and the map log rides stderr so `--json`-less stdout stays the clean lane path (the `LANE=$(…)` contract).
   if (flags.item !== undefined) {
     const items = String(flags.item)
@@ -3574,6 +3635,13 @@ function boundedDetails(text) {
   return value.length <= RELEASE_DETAILS_LIMIT ? value : `${value.slice(0, RELEASE_DETAILS_LIMIT)}… (truncated)`;
 }
 
+function releaseLaneScope(n, lease) {
+  if (!lease.predictedScope?.length) return;
+  try {
+    updateRegistry(defaultRegistryPath(), entries => releaseScope(entries, `lane-${n}`, laneHolderSlug(lease)).entries);
+  } catch (error) { log(`  warning: could not release lane scope: ${error.message}`); }
+}
+
 // #2667 — cross-pool release-by-session. `release --all-pools --session=<slug>` sweeps EVERY pool under
 // POOL_ROOT and hands back every lane that `<slug>` leases — clearing a cross-locus couple's lease in the WE
 // pool AND the plateau-app pool in ONE call (the exact toil the auto-release + this selector remove). It is BY
@@ -3688,6 +3756,7 @@ async function cmdReleaseAllPools(repo) {
       });
       log(`  released ${name}/lane-${n} (was ${describeLease(lease)})`);
       lanes.push(n);
+      releaseLaneScope(n, lease);
       released++;
     }
     if (lanes.length) {
@@ -3886,6 +3955,7 @@ async function cmdRelease(repo) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
       continue;
     }
+    releaseLaneScope(n, lease);
     if (delivered) log(`  lane-${n}: contested lease released — its work is fully landed (clean tree, HEAD on upstream main), nothing to lose`);
     // The holder is done with this lane, so the parked-fixer records IT wrote are dead: left behind they refuse every
     // acquire / trim / reclaim of the lane for the whole hold window. Cleared only after the lease is confirmed
@@ -5663,7 +5733,7 @@ function cmdUnmap(repo) {
 const KNOWN_FLAGS = new Set([
   'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
-  'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
+  'repo', 'reserve', 'scope', 'allow-overlap', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms', 'list-contention-grace-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).
@@ -5778,7 +5848,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
     'usage: lane-pool.mjs <gc|heal-siblings|salvage-unpushed|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
-      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
+      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--allow-overlap=<reason>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
