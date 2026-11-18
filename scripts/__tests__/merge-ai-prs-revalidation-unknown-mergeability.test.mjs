@@ -170,6 +170,32 @@ describe('bounded listing mergeability recompute', () => {
     expect(io.sleep).not.toHaveBeenCalled();
   });
 
+  it.each([0, 3])('reports null or wrong-PR reads once after recompute and %i retries', async retries => {
+    for (const fresh of [null, pr({ number: 999 })]) {
+      const candidate = pr({ mergeable: null });
+      const nudge = vi.fn();
+      const io = await run([candidate], { read: vi.fn(async () => fresh), nudge,
+        setting: { retries, delayMs: 17 } });
+      expect(io.recompute).toHaveBeenCalledTimes(1);
+      expect(io.read).toHaveBeenCalledTimes(1 + retries);
+      expect(io.sleep).toHaveBeenCalledTimes(1 + retries);
+      expect(candidate.number).toBe(4602);
+      expect(candidate.mergeable).toBeNull();
+      expect(io.onPersistentUnknown.mock.calls).toEqual([[{ repo, num: 4602 }]]);
+      expect(nudge.mock.calls).toEqual([[{ repo, num: 4602 }]]);
+    }
+  });
+
+  it('resolves only when a valid read follows failed and wrong-PR reads', async () => {
+    const candidate = pr({ mergeable: null });
+    const read = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(pr({ number: 999 }))
+      .mockResolvedValueOnce(pr());
+    const io = await run([candidate], { read });
+    expect(read).toHaveBeenCalledTimes(3);
+    expect(candidate.mergeable).toBe('MERGEABLE');
+    expect(io.onPersistentUnknown).not.toHaveBeenCalled();
+  });
+
   it('swallows recompute failures and keeps persistent null mergeability refused and reported', async () => {
     const candidate = pr({ mergeable: null });
     const io = await run([candidate], {

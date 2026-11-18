@@ -1367,7 +1367,7 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, recompute,
     await sleep(setting.delayMs);
     const unresolved = await mapWithConcurrency(pending, concurrency, async ({ repo, pr }) => {
       const fresh = await read(repo, pr.number);
-      if (!applyFreshRead(pr, fresh)) return null;
+      if (!applyFreshRead(pr, fresh)) return { repo, pr };
       return unknown(pr) ? { repo, pr } : null;
     });
     pending = unresolved.filter(Boolean);
