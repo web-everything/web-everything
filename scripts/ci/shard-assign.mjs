@@ -96,7 +96,9 @@ export function predictedBalance(files, timings, total) {
   if (!files.length || measured < files.length) {
     throw new Error(`shard-assign: only ${measured}/${files.length} files have measured timings (every file needs one); refresh timings before trusting a balance check`);
   }
-  return balanceRatio(assignByTime(files, timings, total), timings);
+  const shards = assignByTime(files, timings, total);
+  if (shards.some((shard) => !shard.length)) throw new Error('shard-assign: the assignment leaves a shard empty, which CI rejects');
+  return balanceRatio(shards, timings);
 }
 
 export function staleRatio(files, oldTimings, newTimings, total) {

@@ -124,6 +124,11 @@ describe('shard balance metrics', () => {
     expect(predictedBalance(Object.keys(old), fresh, 2)).toBe(1);
   });
 
+  it('refuses a balance check whose assignment leaves a shard empty', () => {
+    const timings = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`t${i}`, 1]));
+    expect(() => predictedBalance(Object.keys(timings), timings, 9)).toThrow(/empty/);
+  });
+
   it('refuses a balance check with negative timings', () => {
     expect(() => predictedBalance(['a', 'b'], { a: 1, b: -1 }, 2)).toThrow(/negative/);
   });
