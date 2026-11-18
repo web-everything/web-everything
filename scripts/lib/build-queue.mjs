@@ -561,6 +561,10 @@ export function filterRuntimeCandidates(rows, settings = {}, candidates = rows) 
   const allowed = new Set(settings.ids.map(normalizePriorityNum));
   const byNum = new Map(candidates.map(r => [normalizePriorityNum(r.num), r]));
   // Plan/hold rows carry only num; recover their direct aliases, never ancestor membership.
-  return rows.filter(r => buildPriorityAliases({ ...byNum.get(normalizePriorityNum(r.num)), ...r })
-    .some(alias => allowed.has(normalizePriorityNum(alias))));
+  return rows.filter(r => {
+    const item = { ...byNum.get(normalizePriorityNum(r.num)), ...r };
+    // Only durable hash aliases authorize membership; numeric bornAs must not impersonate another card.
+    if (typeof item.bornAs !== 'string' || !item.bornAs.startsWith('x') || !BUILD_PRIORITY_ID.test(item.bornAs)) item.bornAs = null;
+    return buildPriorityAliases(item).some(alias => allowed.has(normalizePriorityNum(alias)));
+  });
 }

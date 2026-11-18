@@ -214,6 +214,34 @@ it.each(['build', 'prepare'])('durable bornAs alias survives the %s planning and
   expect(shapeQueue([row])[0]).toMatchObject({ bornAs: row.bornAs, id: row.id });
 });
 
+it.each([
+  ['build', '42', '42'],
+  ['prepare', '42', '42'],
+  ['build', '42', 42],
+  ['prepare', '42', 42],
+  ['build', '42', '#42'],
+  ['prepare', '42', '#42'],
+  ['build', 'xabcdef0', 'xabcdef1'],
+  ['prepare', 'xabcdef0', 'xabcdef1'],
+])('%s allowlist %j rejects unauthorized bornAs %j', async (kind, listed, bornAs) => {
+  const row = { ...builds[0], num: '9999', id: '9999-unlisted', bornAs };
+  const settings = only([listed]);
+  expect(dispatchPlan({ queue: [row], freeLanes: [20], buildPriority: settings }))
+    .toEqual({ launch: [], held: [{ num: '9999', reason: 'runtime-only' }] });
+  const out = planTick(input(settings, {
+    state: { queue: [row], lanes: [], prs: [] },
+    plan: kind === 'build' ? { launch: [{ num: row.num, lane: 20 }], held: [] }
+      : { launch: [], held: [{ num: row.num, reason: 'needs-prepare' }] },
+  }));
+  expect(out.decisions.spawnBuilds).toEqual([]);
+  expect(out.decisions.spawnPrepareItems).toEqual([]);
+  const effects = effectsFor(out);
+  const tick = await runBuildDispatchTick({ live: true, effects, policy, buildPriority: settings });
+  expect(tick.dispatched).toEqual([]);
+  expect(tick.prepare.launched).toEqual([]);
+  expect(effects.dispatch).not.toHaveBeenCalled();
+});
+
 it.each([only([]), { ...only(['xabcdef0']), held: true }])('dispatch assignment fails closed for runtime settings %j', buildPriority => {
   const plan = dispatchPlan({ queue: [{ num: '8001', bornAs: 'xabcdef0', scope: ['scripts/shared.mjs'] }],
     leases: [], freeLanes: [20, 21], buildPriority });

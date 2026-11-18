@@ -4628,3 +4628,4 @@ Runtime-only build-priority regressions live in `scripts/lib/__tests__/build-pri
 and `skills-src/conveyor/__tests__/build-dispatch-runtime-only.test.mjs`. Filter direct card aliases
 before dispatch lane/scope assignment; a listed ancestor lifts priority but does not grant membership.
 Keep `bornAs` and id metadata through queue projections so num-only build/prepare plans retain direct alias membership.
+Runtime-only admission validates `bornAs` with the build-priority settings validator and requires a durable hash: numeric aliases never authorize another card, and a different hash never grants membership. Cover both build and prepare paths.
