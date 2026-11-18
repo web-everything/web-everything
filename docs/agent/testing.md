@@ -4458,7 +4458,12 @@ Supersession evidence must point directly to a retained overlay or live PR head.
 also selected for pruning cannot justify removing its ancestor; without another retained
 successor, keep the ancestor. The named ancestor/successor regression covers closed, merged,
 and repeated-conflict removal, and the chain regression checks the retained evidence target.
-Confirmed closed/merged PRs can still be pruned. Corrupt counters or pending drops retain all
+Pins use the planner’s shared `pinnedStatus`: explicit, mechanism-derived, and unknown-evidence
+pins are retained. The moved `overlay-registration.mjs` guards remain mechanism-protected.
+An overlay whose current tip is carried by the running adopted head is retained for every rule
+except `pr-merged`, including dry-run output; standalone pruning also verifies the adopted head
+against HEAD. Approved `edgeResolution`/`conflictOverride` entries are retained during supersession.
+Confirmed closed/merged PRs can otherwise still be pruned. Corrupt counters or pending drops retain all
 registrations and alert for operator repair/recovery. Pruning takes the existing add-guard fence,
 refuses unsettled drop intents, and uses the rebuild's list-locked removal helper with the observed
 registration identity. `overlay-prune.test.mjs` covers these closed paths with injected IO and no network.
@@ -4469,6 +4474,8 @@ registration identity. `overlay-prune.test.mjs` covers these closed paths with i
 `overlay-prune` shares `overlay-registration.mjs` with the overlay CLI: an add-guard lock,
 a durable drop intent, and current remote tip checks before and after removal. The synchronous
 main-sync kicker uses the guard's no-wait mode and retains registrations on contention. Recover
-interrupted drops with `daemon-overlay recover-drops`; unknown or moved tips restore the snapshot.
+interrupted drops with `daemon-overlay recover-drops`; unknown or moved tips restore the full snapshot
+under the list lock, preserving resolution approvals, pin flags, stack bases, and future registration
+fields without replacing a fresh registration.
 Prune tests must retain pinned overlays and unregistered-PR carriers, and check adopted-tip alerts
 at preparation level. Keep the open-PR inventory hermetic rather than disabling pruning across fixtures.

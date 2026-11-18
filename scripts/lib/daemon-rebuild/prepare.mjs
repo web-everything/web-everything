@@ -372,7 +372,8 @@ export async function prepareRebuild({
         try { pruneStates.set(entry.pr, await prState(entry.pr)); } catch { pruneStates.set(entry.pr, null); }
       }
     }
-    pruneOverlays({ root, env, deps: { git, ...(prState ? { prState: pr => pruneStates.get(pr) } : {}), adopted: state.adopted?.head === prevHead ? state.adopted.applied : [],
+    pruneOverlays({ root, env, deps: { git, ...(prState ? { prState: pr => pruneStates.get(pr) } : {}),
+      adoptedHead: state.adopted?.head === prevHead ? prevHead : null, adopted: state.adopted?.head === prevHead ? state.adopted.applied : [],
       alertAdopted: item => alert('overlay-pruned-adopted', item), alert: message => alert('overlay-prune-failed', message) } });
     const remainingOverlays = readOverlayState(root, { env });
     if (remainingOverlays.corrupt) {

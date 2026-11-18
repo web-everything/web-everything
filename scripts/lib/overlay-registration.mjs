@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync } from 'node:fs';
-import { addOverlay, readOverlays, appendOverlayEvent, overlayFilePath } from './daemon-overlays.mjs';
+import { restoreOverlayRegistration, readOverlays, appendOverlayEvent, overlayFilePath } from './daemon-overlays.mjs';
 
 export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
   const opts = { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } };
@@ -16,12 +16,7 @@ export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
 }
 
 export function restoreRegistration(root, entry, env) {
-  if (readOverlays(root, { env }).some((o) => o?.ref === entry.ref)) return 'skipped-reregistered';
-  addOverlay(root, {
-    ref: entry.ref, pr: entry.pr ?? null, addedBy: entry.addedBy ?? null, reason: entry.reason ?? null, now: entry.addedAt,
-    ...(entry.pinned === true ? { pinned: true } : {}), stackBases: entry.stackBases, conflictOverride: entry.conflictOverride,
-  }, { env });
-  return 'restored';
+  return restoreOverlayRegistration(root, entry, { env });
 }
 
 // ── durable drop intents (R310 audit) ─────────────────────────────────────────────────────────────────────────

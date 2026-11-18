@@ -9,6 +9,9 @@ import { runGhSync } from '../gh-throttle.mjs';
 import { readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { remoteTip, withAddGuardLock, readPendingDrops, addPending, clearPending, restoreRegistration } from '../overlay-registration.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
+import { pinnedStatus } from './plan.mjs';
+import { readRebuildState } from './state.mjs';
+import { verifyRev } from './shared.mjs';
 
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '../daemon-rebuild-settings.json');
 let lastSetting;
@@ -23,8 +26,10 @@ export function resolveOverlayPrune(env = process.env, { settingsPath = SETTINGS
   return r.value;
 }
 
-export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipOf, isAncestor, conflictsWithMain, conflictCounts = {} }) {
+export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipOf, isAncestor, conflictsWithMain,
+  conflictCounts = {}, pinStatus = () => null, adoptedHead = null }) {
   const heads = openPrHeads(); // null means discovery failed: rules b/c have no proof.
+  const unregisteredHeads = heads?.filter(p => !overlays.some(o => o.ref === p.ref || (o.pr > 0 && o.pr === p.number)));
   const states = new Map([...new Set(overlays.filter(o => o.pr > 0).map(o => o.pr))].map(pr => [pr, prState(pr)]));
   const live = o => states.get(o.pr) === 'OPEN' || heads?.some(p => p.ref === o.ref || (o.pr > 0 && p.number === o.pr));
   const tips = new Map(overlays.map(o => [o.ref, tipOf(o.ref)]));
@@ -38,14 +43,22 @@ export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipO
   for (const o of overlays) {
     const state = states.get(o.pr), tip = tips.get(o.ref);
     if (o.pinned === true || !tip || live(o) || state === 'OPEN') continue;
+    const pin = pinStatus(o, tip);
+    if (pin?.pinned !== false || pin.why !== null) continue;
     // A numbered registration with unknown state cannot be retired by ancestry either.
     if (o.pr > 0 && !['CLOSED', 'MERGED'].includes(state)) continue;
+    // The running build carries this tip; let established-overlay hold/auto-rebase handle it.
+    // Only a merged PR proves that retiring it cannot discard live content.
+    if (state !== 'MERGED' && adoptedHead && isAncestor(tip, adoptedHead) !== false) continue;
     const evidence = { ref: o.ref, pr: o.pr ?? null, tip, mainSha };
     if (state === 'CLOSED' || state === 'MERGED') {
       planned.push({ ...evidence, reason: state === 'CLOSED' ? 'pr-closed' : 'pr-merged', prState: state });
       continue;
     }
     if (!heads || !tip) continue;
+    if (unregisteredHeads.some(p => p.headSha === tip || isAncestor(tip, p.headSha) === true)) continue;
+    // Resolution commits may live on an edge rather than the ordinary overlay tip.
+    if (o.edgeResolution || o.conflictOverride) continue;
     const successor = overlays.find(other => supersedes(other, o));
     if (successor) {
       planned.push({ ...evidence, reason: 'superseded', supersededBy: successor.ref,
@@ -93,6 +106,13 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
       const mainSha = deps.mainSha ?? currentTip('main');
       const tips = new Map(overlays.map(o => [o.ref, currentTip(o.ref)]));
       const tipOf = ref => tips.get(ref);
+      const adoptedState = readRebuildState(root, env).adopted;
+      const adoptedHead = Object.hasOwn(deps, 'adoptedHead') ? deps.adoptedHead
+        : adoptedState?.head && adoptedState.head === verifyRev(git, 'HEAD') ? adoptedState.head : null;
+      const isAncestor = deps.isAncestor ?? ((a, b) => {
+        const r = git(['merge-base', '--is-ancestor', a, b]);
+        return !r.error && r.status === 0 ? true : !r.error && r.status === 1 ? false : null;
+      });
       let heads = null;
       try {
         heads = deps.openPrHeads ? deps.openPrHeads() : JSON.parse(runGhSync(
@@ -125,7 +145,8 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
       }
       const planned = planOverlayPrune({ overlays, mainSha, prState: deps.prState ?? (pr => defaultPrState({ pr, root })),
         openPrHeads: () => heads, tipOf, conflictsWithMain, conflictCounts: counts,
-        isAncestor: deps.isAncestor ?? ((a, b) => { const r = git(['merge-base', '--is-ancestor', a, b]); return !r.error && r.status === 0; }) });
+        pinStatus: (entry, tip) => mainSha ? pinnedStatus(git, entry, mainSha, tip) : null,
+        adoptedHead, isAncestor });
       if (dryRun) return planned;
       const removed = [];
       for (const item of planned) {

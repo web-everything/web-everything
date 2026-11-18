@@ -3,22 +3,26 @@ import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { planOverlayPrune, pruneOverlays, resolveOverlayPrune } from '../overlay-prune.mjs';
-import { readPendingDrops, settlePendingDrops, withAddGuardLock } from '../../overlay-registration.mjs';
+import { readPendingDrops, settlePendingDrops, restoreRegistration, withAddGuardLock } from '../../overlay-registration.mjs';
+import { pinnedStatus, REBUILD_MECHANISM_PATHS } from '../plan.mjs';
+import { writeRebuildState } from '../state.mjs';
 import { kickOverlayMainSync } from '../overlay-main-sync.mjs';
-import { addOverlay, readOverlayState, overlayFilePath } from '../../daemon-overlays.mjs';
+import { addOverlay, readOverlayState, overlayFilePath, writeOverlays } from '../../daemon-overlays.mjs';
 
 const a = 'a'.repeat(40), b = 'b'.repeat(40), main = 'c'.repeat(40);
+const unpinnedGit = args => ({ status: 0, stdout: args[0] === 'diff' ? '' : main });
 const base = overrides => ({ overlays: [{ ref: 'old', pr: 0 }], mainSha: main, prState: () => null,
+  pinStatus: (entry, tip) => pinnedStatus(unpinnedGit, entry, main, tip),
   openPrHeads: () => [], tipOf: () => a, isAncestor: () => false, conflictsWithMain: () => false, ...overrides });
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 function fixture(overrides = {}) {
   const root = fs.mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'overlay-prune-')); dirs.push(root);
-  const env = { WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'no-prefs') };
+  const env = { WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'no-prefs'), WE_DAEMON_STATE_DIR: join(root, 'state') };
   const state = { overlays: [{ ref: 'old', pr: 0 }], corrupt: false };
   const events = [], removed = [];
   const deps = { resolveSetting: () => ({ enabled: true }), readOverlayState: () => state,
-    mainSha: main, openPrHeads: () => [], tipOf: () => a, isAncestor: () => false,
+    git: unpinnedGit, mainSha: main, openPrHeads: () => [], tipOf: () => a, isAncestor: () => false,
     conflictsWithMain: () => true, prState: () => null, alert: vi.fn(),
     removeOverlay: (root, ref, options) => { removed.push({ ref, options }); state.overlays = state.overlays.filter(o => o.ref !== ref); return { removed: true }; },
     appendOverlayEvent: (root, event) => events.push(event), ...overrides };
@@ -77,7 +81,8 @@ describe('overlay prune planner', () => {
       ]);
   });
   it('keeps a carrier when an unregistered open PR contains its tip, including equal tips', () => {
-    for (const headSha of [a, b]) expect(planOverlayPrune(base({ openPrHeads: () => [{ number: 8, ref: 'new', headSha }], isAncestor: () => true })))
+    for (const headSha of [a, b]) expect(planOverlayPrune(base({ openPrHeads: () => [{ number: 8, ref: 'new', headSha }], isAncestor: () => true,
+      conflictsWithMain: () => true, conflictCounts: { old: 3 } })))
       .toEqual([]);
   });
   it('keeps exactly the lower ref for identical overlay tips', () => {
@@ -242,7 +247,10 @@ it('equal-tip preference also honors OPEN state when the head list disagrees', (
 
 it.each([b, undefined])('restores a registration if the post-drop remote tip moved or is unreadable (%s), without a prune event', after => {
   const f = fixture({ prState: () => 'CLOSED' });
-  addOverlay(f.root, { ref: 'old', pr: 7 }, { env: f.env });
+  const entry = { ref: 'old', pr: 7, addedAt: '2026-11-01', addedBy: 'operator', reason: 'repair',
+    pinned: false, stackBases: ['lane/base'], edgeResolution: { sha: b, by: 'operator' },
+    conflictOverride: { by: 'operator', reason: 'approved' }, futureField: { keep: true } };
+  writeOverlays(f.root, [entry], { env: f.env });
   delete f.deps.readOverlayState; delete f.deps.removeOverlay;
   f.deps.remoteTip = vi.fn().mockReturnValueOnce(a).mockReturnValueOnce(a).mockReturnValueOnce(after);
   f.deps.afterDrop = () => {
@@ -251,7 +259,7 @@ it.each([b, undefined])('restores a registration if the post-drop remote tip mov
     expect(intent.pending[0]).toMatchObject({ ref: 'old', tip: a, kind: 'prune' });
   };
   expect(f.run()).toEqual([]);
-  expect(readOverlayState(f.root, { env: f.env }).overlays).toEqual([expect.objectContaining({ ref: 'old', pr: 7 })]);
+  expect(readOverlayState(f.root, { env: f.env }).overlays).toEqual([entry]);
   expect(f.events).toEqual([]);
   expect(fs.existsSync(`${overlayFilePath(f.root, f.env)}.drop-pending`)).toBe(false);
 });
@@ -273,8 +281,8 @@ it.each([b, undefined])('uses the current remote tip instead of a stale tracking
       if (ref.endsWith('/old') && tip === undefined) return { status: 1 };
       return { status: 0, stdout: `${ref.endsWith('/old') ? tip : a}\t${ref}\n` };
     }
-    // Stale tracking refs would falsely show old as an ancestor of carrier.
-    return { status: 0, stdout: a };
+    // Pin evidence is separate from stale tracking refs.
+    return { status: 0, stdout: args[0] === 'diff' ? '' : a };
   });
   f.deps.isAncestor = (x, y) => x === a && y === a;
   f.deps.conflictsWithMain = () => false;
@@ -342,4 +350,77 @@ it('reports adopted supersession when a registered survivor contains the adopted
   f.state.overlays.push({ ref: 'carrier', pinned: true });
   f.deps.tipOf = ref => ref === 'old' ? a : b;
   expect(f.run()).toEqual([expect.objectContaining({ ref: 'old', reason: 'superseded', wasAdopted: true, adoptedTip: a, supersedingTip: b })]);
+});
+
+
+describe('audit retention guarantees', () => {
+  it.each(['CLOSED', 'MERGED', null])('retains mechanism-derived pins for every rule (%s)', state => {
+    const f = fixture({ prState: () => state, isAncestor: () => true,
+      git: args => ({ status: 0, stdout: args[0] === 'diff' ? 'scripts/lib/overlay-registration.mjs\n' : main }) });
+    f.state.overlays = [{ ref: 'old', pr: state ? 7 : 0 }, { ref: 'carrier', pinned: true }];
+    fs.mkdirSync(join(f.root, 'overlays'), { recursive: true });
+    fs.writeFileSync(f.file, JSON.stringify({ old: 3 }));
+    expect(f.run()).toEqual([]);
+    expect(f.removed).toEqual([]); expect(f.events).toEqual([]);
+  });
+  it.each(['merge-base', 'diff'])('retains unknown pin evidence when %s fails', command => {
+    const f = fixture({ prState: () => 'CLOSED',
+      git: args => args[0] === command ? { status: 128 } : unpinnedGit(args) });
+    f.state.overlays[0].pr = 7;
+    expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
+  });
+  it('retains overlays when the planner has no pin evidence', () => {
+    expect(planOverlayPrune(base({ prState: () => 'CLOSED', overlays: [{ ref: 'old', pr: 7 }], pinStatus: undefined }))).toEqual([]);
+  });
+  it('protects the moved registration guards as rebuild mechanism', () => {
+    expect(REBUILD_MECHANISM_PATHS).toContain('scripts/lib/overlay-registration.mjs');
+    const git = vi.fn(args => ({ status: 0, stdout: args[0] === 'diff' && args.includes('scripts/lib/overlay-registration.mjs')
+      ? 'scripts/lib/overlay-registration.mjs\n' : args[0] === 'diff' ? '' : main }));
+    expect(pinnedStatus(git, { ref: 'old' }, main, a)).toEqual({ pinned: true, why: 'mechanism' });
+  });
+  it.each(['edgeResolution', 'conflictOverride'])('retains approved %s during supersession even when tips have ancestry', field => {
+    expect(planOverlayPrune(base({ overlays: [{ ref: 'old', [field]: { sha: main } }, { ref: 'carrier', pinned: true }],
+      tipOf: ref => ref === 'old' ? a : b, isAncestor: () => true,
+      conflictsWithMain: () => true, conflictCounts: { old: 3 } }))).toEqual([]);
+  });
+  it.each(['pr-closed', 'superseded', 'pr0-conflicting'])('retains a tip carried by the running adopted head for %s, including dry-run', rule => {
+    const f = fixture({ adoptedHead: main, prState: () => 'CLOSED',
+      isAncestor: (x, y) => x === a && [b, main].includes(y), tipOf: ref => ref === 'old' ? a : b });
+    f.state.overlays[0].pr = rule === 'pr-closed' ? 7 : 0;
+    if (rule === 'superseded') f.state.overlays.push({ ref: 'carrier', pinned: true });
+    fs.mkdirSync(join(f.root, 'overlays'), { recursive: true });
+    fs.writeFileSync(f.file, JSON.stringify({ old: 3 }));
+    expect(f.run({ dryRun: true })).toEqual([]);
+    expect(f.run()).toEqual([]);
+    expect(f.removed).toEqual([]); expect(f.events).toEqual([]);
+  });
+  it('retains an adopted tip on unreadable containment evidence', () => {
+    const f = fixture({ adoptedHead: main, prState: () => 'CLOSED', isAncestor: () => null });
+    f.state.overlays[0].pr = 7;
+    expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
+  });
+  it('allows pr-merged retirement even when the running adopted head contains the tip', () => {
+    const f = fixture({ adoptedHead: main, prState: () => 'MERGED', isAncestor: () => true });
+    f.state.overlays[0].pr = 7;
+    expect(f.run()).toEqual([expect.objectContaining({ reason: 'pr-merged' })]);
+  });
+  it.each([true, false])('standalone pruning reads adopted state and verifies it is running (%s)', running => {
+    const f = fixture({ prState: () => 'CLOSED', isAncestor: () => true,
+      git: args => args[0] === 'rev-parse' ? { status: 0, stdout: running ? main : b } : unpinnedGit(args) });
+    f.state.overlays[0].pr = 7;
+    writeRebuildState(f.root, { adopted: { head: main, applied: [] } }, f.env);
+    expect(f.run().length).toBe(running ? 0 : 1);
+    expect(f.removed.length).toBe(running ? 0 : 1);
+  });
+  it('full-entry restoration preserves pins and unknown fields without replacing a fresh registration', () => {
+    const f = fixture();
+    const entry = { ref: 'old', pr: 0, pinned: true, edgeResolution: { sha: b }, stackBases: ['base'],
+      conflictOverride: { by: 'operator' }, futureField: ['preserved'] };
+    withAddGuardLock(f.root, f.env, () => {
+      expect(restoreRegistration(f.root, entry, f.env)).toBe('restored');
+      expect(readOverlayState(f.root, { env: f.env }).overlays).toEqual([entry]);
+      expect(restoreRegistration(f.root, { ...entry, pr: 7 }, f.env)).toBe('skipped-reregistered');
+      expect(readOverlayState(f.root, { env: f.env }).overlays).toEqual([entry]);
+    }, { noWait: true });
+  });
 });

@@ -254,6 +254,17 @@ export function registrationIdentity(entry) {
   return identity;
 }
 
+/** Restore a drop snapshot verbatim without replacing a concurrent registration. Caller holds the add guard. */
+export function restoreOverlayRegistration(root, entry, { env = process.env } = {}) {
+  if (!isSafeBranchName(entry?.ref)) throw new TypeError('unsafe overlay restoration ref');
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env);
+    if (list.some(o => o?.ref === entry.ref)) return 'skipped-reregistered';
+    writeOverlays(root, [...list, entry], { env });
+    return 'restored';
+  });
+}
+
 export function addOverlay(root, {
   ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
 } = {}, { env = process.env, expectedOverlay } = {}) {

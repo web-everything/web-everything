@@ -2698,7 +2698,7 @@ it('prepareRebuild prunes a closed overlay while retaining a live-PR overlay', a
 });
 
 
-it('prepareRebuild alerts when pruning a conflicting overlay from the adopted build', async () => {
+it('prepareRebuild retains a conflicting overlay carried by the adopted build', async () => {
   const f = makeFixture();
   f.env.WE_OVERLAY_PRUNE = '1';
   const tip = pushBranch(f.originDir, 'lane/adopted', dir => writeFile(dir, 'README.md', 'overlay\n'));
@@ -2708,9 +2708,10 @@ it('prepareRebuild alerts when pruning a conflicting overlay from the adopted bu
   advanceMain(f.originDir, dir => writeFile(dir, 'README.md', 'main conflicts\n'));
   await rebuild(); await rebuild();
   const result = await rebuild();
-  expect(readOverlays(f.cloneDir, { env: f.env })).toEqual([]);
-  expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-pruned-adopted',
-    detail: expect.objectContaining({ ref: 'lane/adopted', tip, adoptedTip: tip, wasAdopted: true }) }));
-  const events = readFileSync(overlayFilePath(f.cloneDir, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-  expect(events).toContainEqual(expect.objectContaining({ kind: 'overlay-pruned', tip, adoptedTip: tip, wasAdopted: true }));
+  expect(readOverlays(f.cloneDir, { env: f.env })).toEqual([expect.objectContaining({ ref: 'lane/adopted' })]);
+  expect(result.reason).toBe('established-overlay-conflict');
+  expect(result.alerts.some(a => a.kind === 'overlay-pruned-adopted')).toBe(false);
+  const eventFile = overlayFilePath(f.cloneDir, f.env).replace(/\.json$/, '.events.jsonl');
+  const events = existsSync(eventFile) ? readFileSync(eventFile, 'utf8').trim().split('\n').map(JSON.parse) : [];
+  expect(events.some(e => e.kind === 'overlay-pruned' && e.tip === tip)).toBe(false);
 });
