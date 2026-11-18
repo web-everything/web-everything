@@ -1777,6 +1777,36 @@ describe('previewOverlayConflict — the overlay-conflict guard', () => {
 });
 
 describe('findUnsafeLocalState / planRebuild (pure core)', () => {
+  it.each(['mechanism', 'flag', 'unknown-base', 'unknown-diff', 'unknown-tip'])('planRebuild holds a CLOSED PR with a %s pin', async pin => {
+    const main = 'a'.repeat(40), tip = 'b'.repeat(40);
+    const git = args => {
+      if (args[0] === 'rev-parse') return { status: 0, stdout:
+        args.at(-1).includes('origin/lane/closed') ? pin === 'unknown-tip' ? '' : tip : main };
+      if (args[0] === 'merge-base') return { status: pin === 'unknown-base' ? 128 : 0, stdout: main };
+      if (args[0] === 'diff') return { status: pin === 'unknown-diff' ? 128 : 0,
+        stdout: pin === 'mechanism' ? 'scripts/lib/daemon-rebuild/plan.mjs\n' : '' };
+      return { status: 0, stdout: main };
+    };
+    const result = await planRebuild({ git, headSha: main, mainRef: 'origin/main',
+      overlays: [{ ref: 'lane/closed', pr: 7, ...(pin === 'flag' ? { pinned: true } : {}) }],
+      prState: async () => 'CLOSED', stackMode: 'independent' });
+    expect(result).toMatchObject({ ok: false, reason: 'pinned-overlay-unavailable', detail: {
+      ref: 'lane/closed', pr: 7, dropReason: 'pr-closed',
+      pinnedBy: pin.startsWith('unknown') ? 'unknown' : pin,
+      message: 'pinned overlay is gone (ref deleted or PR closed) but main does not have it — re-register or unpin it',
+    } });
+  });
+
+  it.each(['CLOSED', 'MERGED'])('planRebuild still removes a %s PR when pin protection permits it', async state => {
+    const sha = 'a'.repeat(40);
+    const result = await planRebuild({ git: args => ({ status: 0, stdout: args[0] === 'diff' ? '' : sha }),
+      headSha: sha, mainRef: 'origin/main', overlays: [{ ref: 'lane/done', pr: 7, pinned: state === 'MERGED' }],
+      prState: async () => state, stackMode: 'independent' });
+    expect(result.ok).toBe(true);
+    expect(result.decisions).toEqual([{ ref: 'lane/done', pr: 7, action: 'remove',
+      reason: state === 'MERGED' ? 'pr-merged' : 'pr-closed', sha: null }]);
+  });
+
   function gitFor(cwd) {
     return (args) => {
       const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });

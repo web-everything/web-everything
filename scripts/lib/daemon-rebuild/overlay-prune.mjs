@@ -28,16 +28,20 @@ export function resolveOverlayPrune(env = process.env, { settingsPath = SETTINGS
   return r.value;
 }
 
-export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipOf, isAncestor, conflictsWithMain,
+export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipOf, fetchedTipOf = () => null, isAncestor, conflictsWithMain,
   conflictCounts = {}, quarantinedRefs = new Set(), pinStatus = () => null, adoptedHead = null, adoptedOverlays = [] }) {
   const heads = openPrHeads(); // null means discovery failed: rules b/c have no proof.
   const unregisteredHeads = heads?.filter(p => !overlays.some(o => o.ref === p.ref || (o.pr > 0 && o.pr === p.number)));
   const states = new Map([...new Set(overlays.filter(o => o.pr > 0).map(o => o.pr))].map(pr => [pr, prState(pr)]));
   const live = o => states.get(o.pr) === 'OPEN' || heads?.some(p => p.ref === o.ref || (o.pr > 0 && p.number === o.pr));
   const tips = new Map(overlays.map(o => [o.ref, tipOf(o.ref)]));
+  const fetchedTips = new Map(overlays.map(o => [o.ref, fetchedTipOf(o.ref)]));
   const supersedes = (other, o) => {
-    const tip = tips.get(o.ref), next = tips.get(other.ref);
-    if (other.ref === o.ref || !tip || !next || conflictsWithMain(other.ref) !== false) return false;
+    // The rebuild applies fetched tracking refs. Live-only ancestry can describe
+    // content the rebuild will never apply when a branch moved after the fetch.
+    const tip = fetchedTips.get(o.ref), next = fetchedTips.get(other.ref);
+    if (other.ref === o.ref || !tip || !next || tips.get(o.ref) !== tip || tips.get(other.ref) !== next
+      || conflictsWithMain(other.ref, next) !== false) return false;
     if (tip === next) return live(other) || other.ref < o.ref;
     return probe(tip, next) === true;
   };
@@ -122,6 +126,9 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
       const mainSha = deps.mainSha ?? currentTip('main');
       const tips = new Map(overlays.map(o => [o.ref, currentTip(o.ref)]));
       const tipOf = ref => tips.get(ref);
+      const fetchedTips = new Map(overlays.map(o => [o.ref,
+        (deps.fetchedTipOf ?? (ref => verifyRev(git, `refs/remotes/origin/${ref}^{commit}`)))(o.ref)]));
+      const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
       const adoptedState = readRebuildState(root, env).adopted;
       const runningHead = verifyRev(git, 'HEAD');
       const adoptedHead = Object.hasOwn(deps, 'adoptedHead') ? deps.adoptedHead
@@ -158,14 +165,15 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
         }
       } catch (e) { heads = null; alert(e.message); }
       const conflicts = new Map();
-      const conflictsWithMain = ref => {
-        if (!conflicts.has(ref)) {
-          const tip = tipOf(ref);
-          const r = deps.conflictsWithMain ? deps.conflictsWithMain(ref) : (mainSha && tip ? git(['merge-tree', '--write-tree', mainSha, tip]) : null);
-          conflicts.set(ref, typeof r === 'boolean' ? r : r && !r.error && /^[a-f0-9]{40}$/.test(r.stdout?.split(/\r?\n/)[0])
+      const conflictsWithMain = (ref, fetchedTip) => {
+        const tip = fetchedTip ?? tipOf(ref), base = fetchedTip ? fetchedMainSha : mainSha;
+        const key = `${ref}:${base}:${tip}`;
+        if (!conflicts.has(key)) {
+          const r = deps.conflictsWithMain ? deps.conflictsWithMain(ref, tip) : (base && tip ? git(['merge-tree', '--write-tree', base, tip]) : null);
+          conflicts.set(key, typeof r === 'boolean' ? r : r && !r.error && /^[a-f0-9]{40}$/.test(r.stdout?.split(/\r?\n/)[0])
             ? r.status === 1 ? true : r.status === 0 ? false : null : null);
         }
-        return conflicts.get(ref);
+        return conflicts.get(key);
       };
       let previous = {};
       try {
@@ -204,7 +212,7 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
       const quarantineCounts = { ...counts };
       for (const q of quarantines) quarantineCounts[q.ref] = q.count;
       const planned = planOverlayPrune({ overlays, mainSha, prState: deps.prState ?? (pr => defaultPrState({ pr, root })),
-        openPrHeads: () => heads, tipOf, conflictsWithMain, conflictCounts: quarantineCounts, quarantinedRefs: new Set(quarantines.map(q => q.ref)),
+        openPrHeads: () => heads, tipOf, fetchedTipOf: ref => fetchedTips.get(ref), conflictsWithMain, conflictCounts: quarantineCounts, quarantinedRefs: new Set(quarantines.map(q => q.ref)),
         pinStatus: (entry, tip) => mainSha ? pinnedStatus(git, entry, mainSha, tip) : null,
         adoptedHead, adoptedOverlays, isAncestor });
       if (dryRun) return planned;

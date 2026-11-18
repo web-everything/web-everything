@@ -13,7 +13,8 @@ const a = 'a'.repeat(40), b = 'b'.repeat(40), main = 'c'.repeat(40);
 const unpinnedGit = args => ({ status: 0, stdout: args[0] === 'diff' ? '' : main });
 const base = overrides => ({ overlays: [{ ref: 'old', pr: 0 }], mainSha: main, prState: () => null,
   pinStatus: (entry, tip) => pinnedStatus(unpinnedGit, entry, main, tip),
-  openPrHeads: () => [], tipOf: () => a, isAncestor: () => false, conflictsWithMain: () => false, ...overrides });
+  openPrHeads: () => [], tipOf: () => a, fetchedTipOf: ref => (overrides?.tipOf ?? (() => a))(ref),
+  isAncestor: () => false, conflictsWithMain: () => false, ...overrides });
 const counterValues = file => Object.fromEntries(Object.entries(JSON.parse(fs.readFileSync(file, 'utf8'))).map(([ref, value]) => [ref, value.count]));
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -24,6 +25,7 @@ function fixture(overrides = {}) {
   const events = [], removed = [];
   const deps = { resolveSetting: () => ({ enabled: true }), readOverlayState: () => state,
     git: unpinnedGit, mainSha: main, openPrHeads: () => [], tipOf: () => a, isAncestor: () => false,
+    fetchedTipOf: ref => deps.tipOf(ref),
     conflictsWithMain: () => true, prState: () => null, alert: vi.fn(), publishAttention: vi.fn(),
     removeOverlay: (root, ref, options) => { removed.push({ ref, options }); state.overlays = state.overlays.filter(o => o.ref !== ref); return { removed: true }; },
     appendOverlayEvent: (root, event) => events.push(event), ...overrides };
@@ -357,6 +359,7 @@ it('restores the pruned tip when its registered carrier moves after removal', ()
   delete f.deps.readOverlayState; delete f.deps.removeOverlay;
   let moved = false;
   f.deps.remoteTip = ref => ref === 'old' ? a : moved ? main : b;
+  f.deps.fetchedTipOf = ref => ref === 'old' ? a : b;
   f.deps.afterDrop = () => { moved = true; };
   expect(f.run()).toEqual([]);
   expect(readOverlayState(f.root, { env: f.env }).overlays.map(o => o.ref).sort()).toEqual(['carrier', 'old']);
@@ -543,6 +546,55 @@ it('protects an older adopted tip from running-build records even without cached
 
 
 describe('quarantine recovery and clean supersession', () => {
+  it('proves supersession ancestry and clean apply using fetched tracking SHAs', () => {
+    const fetchedMain = 'd'.repeat(40);
+    const git = vi.fn(args => {
+      if (args[0] === 'rev-parse') return { status: 0, stdout: {
+        'origin/main^{commit}': fetchedMain, 'refs/remotes/origin/old^{commit}': a,
+        'refs/remotes/origin/carrier^{commit}': b,
+      }[args.at(-1)] ?? '' };
+      return unpinnedGit(args);
+    });
+    const isAncestor = vi.fn((x, y) => x === a && y === b);
+    const f = fixture({ git, tipOf: ref => ref === 'old' ? a : b, isAncestor });
+    delete f.deps.fetchedTipOf; delete f.deps.conflictsWithMain;
+    f.state.overlays.push({ ref: 'carrier', pinned: true });
+    expect(f.run()).toEqual([expect.objectContaining({ reason: 'superseded', tip: a, supersedingTip: b })]);
+    expect(isAncestor).toHaveBeenCalledWith(a, b);
+    expect(git).toHaveBeenCalledWith(['merge-tree', '--write-tree', fetchedMain, b]);
+    expect(f.removed.map(o => o.ref)).toEqual(['old']);
+  });
+
+  it.each(['old', 'carrier'])('keeps the ancestor when %s moved after fetch or its fetched tip is unknown', ref => {
+    for (const fetched of [main, null]) {
+      const f = fixture({ tipOf: name => name === 'old' ? a : b,
+        isAncestor: (x, y) => x === a && y === b, conflictsWithMain: () => false,
+        git: args => args[0] === 'rev-parse' ? { status: 0, stdout:
+          args.at(-1) === `refs/remotes/origin/${ref}^{commit}` ? fetched ?? ''
+            : args.at(-1) === 'refs/remotes/origin/old^{commit}' ? a : b } : unpinnedGit(args) });
+      delete f.deps.fetchedTipOf; // Exercise the actual tracking-ref reader.
+      f.state.overlays.push({ ref: 'carrier', pinned: true });
+      expect(f.run()).toEqual([]);
+      expect(f.removed).toEqual([]);
+      expect(f.events).toEqual([]);
+    }
+  });
+
+  it.each(['old', 'carrier'])('keeps the ancestor when the live %s tip is unknown at removal', ref => {
+    const f = fixture({ tipOf: name => name === 'old' ? a : b,
+      isAncestor: (x, y) => x === a && y === b, conflictsWithMain: () => false });
+    f.state.overlays.push({ ref: 'carrier', pinned: true });
+    const reads = new Map();
+    f.deps.remoteTip = name => {
+      const count = (reads.get(name) ?? 0) + 1; reads.set(name, count);
+      return name === ref && count > 1 ? null : name === 'old' ? a : b;
+    };
+    expect(f.run()).toEqual([]);
+    expect(f.removed).toEqual([]);
+    expect(f.events).toEqual([]);
+    expect(readPendingDrops(f.root, f.env)).toEqual([]);
+  });
+
   it.each(['clean', 'tip', 'registration'])('lifts quarantine on %s and emits once', change => {
     const f = fixture(); f.run(); f.run(); f.run();
     if (change === 'clean') f.deps.conflictsWithMain = () => false;

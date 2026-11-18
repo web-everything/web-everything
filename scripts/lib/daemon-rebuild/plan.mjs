@@ -619,7 +619,11 @@ export async function planRebuild({
     // 1. PR state — MERGED/CLOSED means the overlay is moot; never call prState for a PR-less overlay.
     const state = await stateOf(pr);
     if (state === 'MERGED' || state === 'CLOSED') {
-      if (state === 'CLOSED' && raw?.pinned === true) return refusePinned(ref, pr, null, 'pr-closed', 'flag');
+      if (state !== 'MERGED') {
+        const sha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+        const p = sha || raw?.pinned === true ? pinnedStatus(git, raw, mainSha, sha) : { pinned: true, why: 'unknown' };
+        if (p.pinned) return refusePinned(ref, pr, sha, 'pr-closed', p.why);
+      }
       decisions.push({ ref, pr, action: 'remove', reason: state === 'MERGED' ? 'pr-merged' : 'pr-closed', sha: null });
       continue;
     }
