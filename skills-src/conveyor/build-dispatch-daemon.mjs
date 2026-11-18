@@ -2174,8 +2174,9 @@ export async function cliSpawnHoldLand(entry) {
 
 /** #4465 — the real IO wiring for `runBuildDispatchTick`'s `effects.routeHeldItems`: dedup via
  *  `reserveHoldRoute`, spawn a detached landing for (a)/(b), record a finding for (c). Deliberately wires no
- *  release effect at all — see `routeHeldItems`'s own docblock (we:scripts/conveyor/build-dispatch-hold-router.mjs)
- *  for why every route leaves the build-dispatch hold (and, for (a)/(b), the dedup lease) to self-expire on
+ *  build-hold release effect — the router releases only the dedup lease on a definite non-spawn/failure.
+ *  See `routeHeldItems`'s own docblock (we:scripts/conveyor/build-dispatch-hold-router.mjs)
+ *  for why every route leaves the build-dispatch hold (and successful routes leave the dedup lease) to self-expire on
  *  its own TTL rather than being released the moment this call returns. ASYNC — `routeHeldItems` awaits
  *  `spawnLand` internally, so a rejected detached-spawn promise is captured per-item, never left as an
  *  unhandled rejection that could kill this resident daemon; `runBuildDispatchTick` already `await`s this. */

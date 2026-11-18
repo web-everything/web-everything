@@ -207,8 +207,8 @@ export function listHoldFindings({ file = holdFindingsFile() } = {}) {
  * resolved/re-scoped is harmless — a resolved item is never a build candidate regardless of hold state, and
  * a re-scoped/unshaped item is a `prepare` candidate, a code path this daemon's hold-gating never touches.
  *
- * `releaseRoute` DOES run on a DEFINITE failure — `spawnLand` throwing/rejecting (the detached process never
- * even started, e.g. a bad argv or an import failure) or `recordFinding` throwing (the ledger write itself
+ * `releaseRoute` DOES run on a DEFINITE non-spawn — `spawnLand` returning `{spawned:false}` or throwing/rejecting
+ * (the detached process never started, e.g. a bad argv or import failure) or `recordFinding` throwing (the ledger write itself
  * failed) — releasing the just-taken lease so the very NEXT tick can retry promptly, rather than waiting out
  * the whole lease TTL for an attempt that never ran at all. #4465 review round 3 (live correctness finding):
  * this is deliberately narrower than "release on any failure" — `spawnLand` succeeding only means the
@@ -218,7 +218,7 @@ export function listHoldFindings({ file = holdFindingsFile() } = {}) {
  * item's own card for the filed follow-up). A landing that starts but later fails inside the detached
  * process is therefore a KNOWN, ACCEPTED MVP gap: it is not retried inside the lease's lifetime, and the item
  * simply falls back to ordinary build dispatch once the (longer) hold TTL itself lapses.
- * @returns {{num, route, action, error?}[]} one outcome per plan entry.
+ * @returns {{num, route, action, reason?, error?}[]} one outcome per plan entry.
  */
 export async function routeHeldItems({
   plan, reserveRoute = reserveHoldRoute, releaseRoute = releaseHoldRoute, spawnLand = () => ({ spawned: false }),
@@ -249,7 +249,13 @@ export async function routeHeldItems({
     }
     // (a)/(b) — land a card edit through a lane PR.
     try {
-      await spawnLand(entry);
+      const result = await spawnLand(entry);
+      if (result?.spawned === false) {
+        try { releaseRoute({ num: entry.num, route: entry.route }); } catch { /* best-effort — the TTL still bounds it */ }
+        outcomes.push({ num: entry.num, route: entry.route, action: 'not-spawned',
+          reason: result.reason === 'runtime-only' ? 'runtime-refused' : (result.reason ?? 'not-spawned') });
+        continue;
+      }
       outcomes.push({ num: entry.num, route: entry.route, action: 'landing-spawned' });
     } catch (e) {
       try { releaseRoute({ num: entry.num, route: entry.route }); } catch { /* best-effort — the TTL still bounds it */ }
