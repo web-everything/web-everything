@@ -1,5 +1,8 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
-import { readPlannerRow, readPlannerRows } from './red-team-planner-row.mjs';
+import { readPlannerRow, readPlannerRows, nominationSafety, RED_TEAM_NOMINATION_KINDS } from './red-team-planner-row.mjs';
+import { redTeamRequestForHead, validateRedTeamRequest } from './red-team-request.mjs';
+import { loadPrOwnershipSettings } from '../conveyor/pr-ownership-settings.mjs';
+import { latestAdvisory } from './advisory-labels.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
@@ -308,7 +311,7 @@ function provenAcceptance({ comments, reviews, labels, head }) {
 /** Live holds supersede both carried and stored policy-clears. PURE.
  * Without an acceptance record nothing is "later", so any explicit hold comment stands (any author: fail closed).
  */
-function publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending = false, settlesReviewPending = false }) {
+function publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending = false, settlesReviewPending = false, preservesHuman = false }) {
   if (acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold) {
     return 'later verdict or hold supersedes acceptance';
   }
@@ -317,7 +320,9 @@ function publishableClearGuard({ labels, acceptance, comments, reviews, settlesP
   }
   if (acceptance?.reviewsUnreadable) return 'PR reviews unreadable; inspect formal reviews before policy-clear';
   if (!Array.isArray(labels)) return 'PR labels unreadable';
-  if (labels.some(label => conflictsWithPolicyClear(label, { settlesPending, settlesReviewPending }))) {
+  if (preservesHuman && labels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string')) return 'PR labels unreadable';
+  if (labels.some(label => !(preservesHuman && (typeof label === 'string' ? label : label?.name) === 'review:human')
+    && conflictsWithPolicyClear(label, { settlesPending, settlesReviewPending }))) {
     return 'conflicting label prevents policy-clear';
   }
   // A trusted marker alone is not acceptance provenance. Use numbering's whole-thread
@@ -481,14 +486,19 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
 export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [], rawPrs, requiredChecks, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
+  nominationPr, explicitRequest, readOwnership = loadPrOwnershipSettings, log = () => {},
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
-  return readPlannerRows({ repo, plan, refusals, rawPrs, requiredChecks })
-    .filter(row => row.refusal.kind === 'already-reviewed-head').map(({ refusal }) => {
+  const plannerRows = readPlannerRows({ repo, plan, refusals, rawPrs, requiredChecks });
+  return plannerRows.filter(row => nominationPr == null ? RED_TEAM_NOMINATION_KINDS.includes(row.refusal.kind)
+    : Number(row.refusal.prNumber) === Number(nominationPr)).map(plannerRow => {
+    const { refusal } = plannerRow;
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
-    const candidate = { pr, head, mode: 'normal' };
-    const row = { prNumber: pr, head, action: 'skip' };
+    const request = explicitRequest ?? redTeamRequestForHead(rawPr?.comments, { repo, pr, head });
+    const nomination = nominationPr != null || refusal.kind !== 'already-reviewed-head' || request != null;
+    const candidate = { pr, head, mode: nomination ? 'nomination' : 'normal' };
+    const row = { prNumber: pr, head, action: 'skip', ...(nomination ? { expectedHead: head, nomination: true, requested: Boolean(request) } : {}) };
     const skip = why => ({ ...row, why });
     // #6606: a verdict carry settles the head with a result but no round, so nothing else republishes its check. While
     // its outbox marker says the check is unconfirmed, a result on head is not settled: republish from live evidence,
@@ -532,11 +542,15 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
     const proposeDispatch = decision => ({ ...candidate, decision });
     function dispatchDecision(candidate) {
+      if (nomination && candidate.action && candidate.action !== 'skip') return skip(fallback);
       if (!candidate.decision) return candidate;
+      if (nomination && (!['pass', 'held'].includes(plannerRow.checkEvidence?.state)
+        || !['dispatch', ...(request ? ['review'] : [])].includes(candidate.decision.action))) return skip(fallback);
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...candidate.decision };
     }
+    const fallback = 'automatic nomination requires a finished live-head review; use red-team-enqueue --actor=<login> --reason=<text>';
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
         try {
@@ -575,28 +589,76 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
       return skip(result.reason);
     };
     function witnessDecision(candidate) {
+      if (nomination && !readWitness) return skip('red-team witness unreadable; inspect stored evidence before retrying');
       if (readWitness) {
         const w = readWitness({ repo, pr, head });
-        if (w?.ok === false) return failedRead(w);
+        if (w?.ok === false) return nomination ? skip(w.reason) : failedRead(w);
+        if (nomination && (!w || ('ok' in w && w.ok !== true) || !w.rawWriter
+          || !Object.hasOwn(w.rawWriter, 'parsed') || !Array.isArray(w.seats) || !Object.hasOwn(w, 'newest')
+          || w.rawWriter.parsed !== null && (!['queued', 'running', 'finished'].includes(w.rawWriter.parsed?.status)
+            || w.rawWriter.parsed.head !== head || w.rawWriter.parsed.repo !== repo || Number(w.rawWriter.parsed.pr) !== pr)
+          || w.unfinishedReviewException || (w.newest !== null && (!w.newest?.verdict || w.newest.pending != null
+            || w.newest.findings?.read?.netBasis?.rev !== head))))
+          return skip('red-team witness invalid; inspect stored evidence before retrying');
+        if (nomination) candidate = { ...candidate, finishedReview: w.newest !== null };
         if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
           const recovery = planRedTeamRecovery(w, { ...recoveryOptions, setting });
           return recovery.mode === 'skip' ? { ...skip(recovery.why),
             ...(recovery.escalate ? { escalate: true, escalationContext: recovery.escalationContext } : {}) }
-            : proposeDispatch({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
+            : { ...candidate, decision: { action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' } };
         }
       }
       return candidate;
     }
     function guardDecision(candidate) {
       // Recovery and failed-read decisions retain their existing bypass of the stored-review guards.
-      if (candidate.decision || candidate.action) return candidate;
-      const evidence = readEvidence({ repo, pr, head });
-      if (evidence?.ok === false) return failedRead(evidence);
+      if (candidate.action || (!nomination && candidate.decision)) return candidate;
+      let evidence = readEvidence({ repo, pr, head });
+      if (evidence?.ok === false) return nomination ? skip(evidence.reason) : failedRead(evidence);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
+      if (nomination) {
+        if (request && evidence?.loopPayload == null) {
+          const prior = latestAdvisory(rawPr.comments.filter(isTrustedMarkerAuthor))?.head;
+          if (isRealHead(prior) && prior !== head) {
+            const old = readEvidence({ repo, pr, head: prior });
+            if (old?.ok === false) return skip(old.reason);
+            evidence = { ...evidence, loopPayload: old?.loopPayload };
+          }
+        }
+        const holds = plannerRows.filter(r => Number(r.refusal.prNumber) === pr);
+        if (holds.some(r => !['pass', 'held'].includes(r.checkEvidence?.state))) return skip('required check evidence must be pass or held; inspect reconciliation');
+        const refused = holds.flatMap(r => [r.refusal, r.refusal.reviewRefusal].filter(Boolean))
+          .find(r => !RED_TEAM_NOMINATION_KINDS.includes(r.kind));
+        if (refused) return skip(`planner refusal: ${refused.kind}`);
+        if (rawPr?.isDraft !== false || rawPr.state !== 'OPEN') return skip('PR must be open and ready for review');
+        const safety = nominationSafety(plannerRow, rawPr, { repo, plan });
+        if (safety) return skip(`planner safety hold: ${safety}`);
+        if (request && (validateRedTeamRequest(request).head !== head || request.repo !== repo || request.pr !== pr)) return skip('request head or identity changed');
+        const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+        const hold = publishableClearGuard({ labels: rawPr.labels, comments: rawPr.comments, reviews,
+          acceptance: latestAcceptRecord(rawPr.comments, reviews), settlesPending: true, preservesHuman: true });
+        if (hold) return guardedSkip(hold);
+        if (!reviews || laterReviewHold(reviews)) return skip('formal review hold or unreadable reviews; inspect formal reviews');
+        const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
+        if (storedHead === head && !candidate.finishedReview) return skip(fallback);
+        if (storedHead !== head) {
+          if (!request || !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'review:human') || !isRealHead(storedHead)) return skip(fallback);
+          const resolved = readOwnership({ env })?.advisoryReviewOnHumanHandoff;
+          log(`pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=${resolved?.value} (source: ${resolved?.source})`);
+          if (resolved?.value !== 'on' || !resolved.source || resolved.source === 'unreadable' || resolved.ignored?.length)
+            return skip('advisoryReviewOnHumanHandoff off or unreadable; inspect settings before retrying');
+          if (evidence.inFlight !== false || evidence.queued || evidence.recorded !== false
+            || evidence.seatRecorded !== false || evidence.completedRecorded !== false || evidence.cleanRecorded
+            || readStatus({ repo, pr, head }) != null) return skip('live head already has review/red-team state');
+          return proposeDispatch({ action: 'review', why: 'explicit request for a fresh human-handoff advisory' });
+        }
+        if (!redTeamOwedFor(evidence?.loopPayload)) return skip('stored finished review does not owe a red team');
+      }
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return resultOnHead();
       const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
       if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
+      if (candidate.decision) return candidate;
       const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
       const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
       if (acceptance?.sha === head
@@ -771,11 +833,21 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
+      if (nomination && rawPr.comments.some(c => typeof c?.body !== 'string')) return skip('PR comments unreadable');
+      if (nomination && redTeamForHead(rawPr.comments, pr, head)) return skip('red-team result already on head');
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
       return dispatchDecision(guardDecision(witnessDecision(candidate)));
     } catch { return skip('red-team evidence unreadable; inspect stored evidence before retrying'); }
   });
+}
+
+/** The operator and automatic paths share every decision stage; missing rows grant nothing. */
+export function planRedTeamNomination({ pr, env = process.env, ...input }) {
+  return planRedTeamOnSkip({ now: Date.now(), lastDispatch: new Map(), readEvidence: readDrainRedTeamEvidence,
+    readStatus: readRedTeamStatus, readWitness: key => readRecoveryWitness({ ...key, env }),
+    setting: resolveReviewRedTeamOnSkip({ env }).value, ...input, env, nominationPr: Number(pr) })[0]
+    ?? { prNumber: Number(pr), action: 'skip', why: 'planner row absent; inspect reconciliation before retrying' };
 }
 
 const lastDispatch = new Map();
@@ -855,6 +927,7 @@ export const carriedCheckPublisher = ({ repo, env = process.env, run = runGhSync
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting,
+  readOwnership = loadPrOwnershipSettings,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviewRuns = isUnderTest() || isUnderTest(env) ? () => [] : readReviewRunEvidence,
@@ -938,10 +1011,13 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       'pr', 'view', String(pr), '--repo', repo, '--json', 'reviews',
     ], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 })).reviews);
     const reviewsByPr = new Map();
-    const planningPrs = (rawPrs ?? []).map(rawPr => {
+    const planningPrs = (rawPrs ?? []).map(snapshot => {
+      const rawPr = refusals.some(r => Number(r.prNumber) === Number(snapshot.number) && r.kind !== 'already-reviewed-head')
+        ? { ...plan?.nominationPrs?.find(p => p.number === snapshot.number && p.headRefOid === snapshot.headRefOid), ...snapshot,
+          statusCheckRollup: plan?.nominationPrs?.find(p => p.number === snapshot.number && p.headRefOid === snapshot.headRefOid)?.statusCheckRollup ?? snapshot.statusCheckRollup } : snapshot;
       const pr = Number(rawPr?.number), head = rawPr?.headRefOid;
       const { refusal } = readPlannerRow({ repo, pr, plan,
-        refusals: refusals.filter(r => r?.kind === 'already-reviewed-head'
+        refusals: refusals.filter(r => RED_TEAM_NOMINATION_KINDS.includes(r?.kind)
           && (r.headSha == null || r.headSha === head)), rawPrs });
       if (!resolved.enabled || Array.isArray(rawPr?.reviews) || !isRealHead(head)
         || !refusal || !(refusal.headSha == null || refusal.headSha === head)
@@ -949,7 +1025,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
           // review:pending is the parked run's own retained label: a ruled referral-blocked review resumes through
           // fullReviewDecision, which needs the formal reviews even when no accept or red-team label is present.
-          ['review:accepted', 'red-team:pending', 'review:pending'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
+          ['review:accepted', 'red-team:pending', 'review:pending', 'review:human'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
       if (reviewsByPr.has(pr)) return { ...rawPr, reviews: reviewsByPr.get(pr) };
       let reviews;
       try {
@@ -961,6 +1037,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     });
     const planningOptions = { repo, plan, refusals, rawPrs: planningPrs,
       readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
+      readOwnership, log: note,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
@@ -1024,8 +1101,15 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         const reserved = budget && Number.isFinite(budget.left);
         if (reserved) budget.left--;
         try {
+          if (row.nomination) {
+            const live = provider.readPrState(repo, row.prNumber);
+            if (live?.headRefOid !== row.expectedHead || live.state !== 'OPEN' || live.isDraft !== false
+              || row.requested && !redTeamRequestForHead(readComments({ repo, pr: row.prNumber }), { repo, pr: row.prNumber, head: live.headRefOid }))
+              throw new PreStartDispatchRefusalError('request or PR head changed before dispatch');
+          }
           if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
           const result = dispatch({ pr: row.prNumber, repo,
+            ...(row.expectedHead ? { expectedHead: row.expectedHead } : {}),
             ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
             ...(preferLane != null ? { preferLane } : {}) });
           if (result?.skipped || !Number.isInteger(result?.jobPid)) {

@@ -20,11 +20,11 @@ function folded(kind) {
 }
 const cases = [
   ['already-reviewed-head', refusal('already-reviewed-head'), [{ prNumber: pr, action: 'dispatch', mode: 'fresh' }]],
-  ['review-ci', refusal('review-ci', { ci: { allowed: false, reason: 'required-checks-not-successful' } }), []],
-  ['ci-heal-escalated', refusal('ci-heal-escalated', { outcome: 'needs-human' }), []],
+  ['review-ci', refusal('review-ci', { ci: { allowed: false, reason: 'required-checks-not-successful' } }), [{ prNumber: pr, action: 'skip' }]],
+  ['ci-heal-escalated', refusal('ci-heal-escalated', { outcome: 'needs-human' }), [{ prNumber: pr, action: 'skip' }]],
   ['scope-bloat', refusal('scope-bloat', { scopeBloat }), []],
-  ['folded reviewRefusal', folded('already-reviewed-head'), []],
-  ['folded scope-bloat', folded('scope-bloat'), []],
+  ['folded reviewRefusal', folded('already-reviewed-head'), [{ prNumber: pr, action: 'skip' }]],
+  ['folded scope-bloat', folded('scope-bloat'), [{ prNumber: pr, action: 'skip' }]],
   ['referral hold', refusal('review-referrals-pending', { referralHold: { why: 'waiting for referral' } }), []],
   ['absent row', null, []],
 ];
@@ -156,15 +156,15 @@ describe('readPlannerRow', () => {
   });
 });
 
-describe('normal-path parity with the pre-extraction decisions', () => {
-  it.each(cases)('%s keeps the planner decision and queue nomination unchanged', (_, row, before) => {
+describe('normal path retained; new nomination fails closed on historical fixtures', () => {
+  it.each(cases)('%s preserves normal recovery or refuses incomplete nomination evidence', (_, row, before) => {
     const rows = row ? [row] : [];
     const input = options(rows);
-    // Frozen decision projections from the existing planner fixtures, including a positive fresh dispatch.
+    // Normal dispatch stays frozen. New allow-listed candidates now queue and produce explicit skips: these old fixtures lack a strict witness.
     expect(decisions(planRedTeamOnSkip(input))).toEqual(before);
     const plan = { refusals: rows, plannerRows: readPlannerRows(input) };
     expect(decisions(planRedTeamOnSkip({ ...input, plan, refusals: undefined }))).toEqual(before);
-    if (!before.length) expect(input.readEvidence).not.toHaveBeenCalled();
+    if (before[0]?.action !== 'dispatch') expect(input.readEvidence).not.toHaveBeenCalled();
     const queue = createRedTeamDispatchQueue({ file: 'fixture/queue.json',
       readFile: () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); },
       writeFile: () => {}, rename: () => {}, unlink: () => {}, now: () => 1 });

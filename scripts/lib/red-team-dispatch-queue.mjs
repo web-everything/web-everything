@@ -1,4 +1,5 @@
 import { readPlannerRows } from './red-team-planner-row.mjs';
+import { RED_TEAM_NOMINATION_KINDS } from './red-team-planner-row.mjs';
 import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
@@ -304,7 +305,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
   const candidates = [], cardOnlyCandidates = [];
   const plannerRows = readPlannerRows({ repo, plan, rawPrs });
   for (const { refusal: row } of plannerRows) {
-    if (row.kind !== 'already-reviewed-head') continue;
+    if (!RED_TEAM_NOMINATION_KINDS.includes(row.kind)) continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
     if (!isRealHead(head)) continue;
     const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
@@ -360,10 +361,10 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>
-      row.kind === 'already-reviewed-head' && Number(row.prNumber) === entry.pr));
+      RED_TEAM_NOMINATION_KINDS.includes(row.kind) && Number(row.prNumber) === entry.pr));
     let index = 0;
     const options = { repo, plan: { ...plan, refusals: refusals.map(row =>
-      row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
+      RED_TEAM_NOMINATION_KINDS.includes(row.kind) && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
     rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
     const finish = result => {
       queue.settle(repo, result);

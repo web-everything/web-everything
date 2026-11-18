@@ -2,6 +2,8 @@ import { expect, it, vi } from 'vitest';
 import { readPlannerRow } from '../../lib/red-team-planner-row.mjs';
 import { runReconcilePass } from '../reconcile-pass.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
+import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { REVIEW_TIMING_DEFAULTS } from '../../lib/review-timing.mjs';
 
 vi.mock('node:child_process', async original => ({ ...await original(), execFileSync: vi.fn(() => '[]') }));
 vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(),
@@ -55,4 +57,28 @@ it('exposes scope-bloat folded by the normal not-a-ci-break escalation, without 
   expect(row.refusal).toMatchObject({ kind: 'ci-heal-escalated', reviewRefusal: { kind: 'scope-bloat', scopeBloat } });
   expect(row.refusal.reviewRefusal).not.toHaveProperty('ciHealNotCiBreak');
   expect(plan.dispatch).toEqual([]);
+});
+
+it.each([false, true])('an allow-listed nomination consumes hydrated bound holds without changing raw CI (readOnly=%s)', readOnly => {
+  const raw = { ...source(), labels: ['review:human'], isDraft: false, reviews: [],
+    files: [{ path: 'scripts/guard.mjs', additions: 2, deletions: 1 }],
+    statusCheckRollup: [...source().statusCheckRollup, ...REVIEW_TIMING_DEFAULTS.fastChecks.we.map(name => check(name, 'success'))] };
+  const p = runReconcilePass({ ...options(raw), readOnly, loadPrOwnership: () => ({
+    advisoryReviewOnHumanHandoff: { value: 'off', source: 'fixture' } }) });
+  const run = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } };
+  const dispatch = vi.fn(() => ({ jobPid: 42 }));
+  // This producer fixture yields review-hold-red, which is outside PR-B's allow-list. Exercise the
+  // dispatch consumer with the task's review-ci refusal, retaining the real producer's hydration/options.
+  expect(p.refusals[0].kind).toBe('review-hold-red');
+  const nominated = { ...p, refusals: [{ kind: 'review-ci', prNumber: pr, headSha: head }] };
+  const out = runRedTeamOnSkip({ repo: 'web-everything/web-everything', plan: nominated, rawPrs: [raw],
+    dispatch, now: () => 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+    readWitness: () => ({ rawWriter: { parsed: null }, seats: [], newest: run }),
+    readEvidence: () => ({ loopPayload: run, recorded: false }), readStatus: () => null,
+    capacity: { lanes: 1, remainingStarts: 1, budget: { left: 1 } } });
+  expect(readPlannerRow({ pr, plan: p, rawPrs: [raw] }).checkEvidence.state).toBe('fail');
+  expect(p.nominationPrs[0].statusCheckRollup[2]).toHaveProperty('mergeGateReviewHold');
+  expect(raw.statusCheckRollup[2]).not.toHaveProperty('mergeGateReviewHold');
+  expect(out.dispatched, JSON.stringify(out.rows)).toHaveLength(1);
+  expect(dispatch).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr, expectedHead: head, redTeamOnly: true, redTeamMode: 'fresh' });
 });

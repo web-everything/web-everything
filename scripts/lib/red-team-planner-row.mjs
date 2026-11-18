@@ -1,6 +1,31 @@
 /** A read-only view of reconciliation evidence; this module does not nominate work. */
 import { resolveRequiredChecks } from './check-state-predicate.mjs';
 import { isFailedCheckRow } from './rollup-collapse.mjs';
+import { repoKeyForSlug } from './constellation-repos.mjs';
+import { refuseUnreviewable, planReconcile } from '../conveyor/reconcile-core.mjs';
+
+/** Reach the normal planner's later holds even when an early CI refusal owns the row. */
+export function nominationSafety(row, rawPr, { repo, plan } = {}) {
+  if (row.absent || !['pass', 'held'].includes(row.checkEvidence?.state)) return 'required check evidence must be pass or held; inspect reconciliation';
+  if (!row.reviewOwnedChecks?.onlyRed) return 'non-review checks block nomination; inspect check failures';
+  let hold;
+  refuseUnreviewable({ pr: rawPr, refuse: kind => { hold = kind; } });
+  if (hold) return hold;
+  if (!Array.isArray(rawPr?.files) || rawPr.files.length >= 100 || rawPr.files.some(f => typeof f?.path !== 'string' || !f.path.trim()
+    || ![f.additions, f.deletions].every(n => Number.isSafeInteger(n) && n >= 0)))
+    return 'scope inputs unreadable or incomplete; inspect full changed files before retrying';
+  if (!repoKeyForSlug(repo)) return 'planner options unreadable; inspect reconciliation';
+  const options = plan?.plannerOptions ?? plan?.nominationOptions;
+  const safety = planReconcile({ ...options, repo: repoKeyForSlug(repo), prs: [rawPr], agents: [],
+    requiredChecks: options?.requiredChecks ?? plan?.plannerRequiredChecks,
+    reviewSafetyOnly: true, shadowDeps: { mode: 'off' } });
+  return safety.refusals.find(r => !['no-findings', 'already-reviewed-head'].includes(r.kind)
+    && !(r.kind === 'review-ci' && r.ci?.affected?.length && r.ci.affected.every(c => row.checkEvidence.perName[c.name]?.state === 'held')))?.kind
+    ?? safety.dispatch.find(r => r.kind !== 'review')?.kind
+    ?? (safety.dispatch.length || safety.refusals.length ? null : 'no review owed; inspect reconciliation');
+}
+
+export const RED_TEAM_NOMINATION_KINDS = ['already-reviewed-head', 'review-ci', 'ci-heal-escalated', 'owed-ci-rerun'];
 
 /**
  * Read one refusal without flattening its folded reviewRefusal. Always classify the current input;

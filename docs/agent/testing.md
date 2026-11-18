@@ -4570,6 +4570,13 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 
 ## Red-team planner row parity
 
+Nomination and `run.mjs red-team-enqueue --pr=<N> --actor=<login> --reason=<text>` share
+the staged recovery planner and normal review guards. Nomination requires `pass`/`held`
+check evidence and a strict witness; incomplete evidence containing a failure stays unknown.
+Automatic nomination only runs a red team after a finished live-head review. A stale human
+advisory needs the head-bound operator request and the resolved handoff-advisory setting.
+The enqueue parity suite pins holds, missing evidence, marker trust and head-move races.
+
 The daemon receives a raw PR snapshot, while reconciliation hydrates checks and annotates
 review-owned merge-gate holds. `plannerRows` records that enriched snapshot's classification;
 use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining

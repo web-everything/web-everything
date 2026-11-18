@@ -1885,7 +1885,7 @@ export function runReconcilePass({
   const refusals = [...hydrated.refusals, ...plan.refusals].map(row =>
     row.headSha === undefined ? { ...row, headSha: row.headRefOid } : row);
   const plannerRows = readPlannerRows({ repo: resolvedRepo, refusals, rawPrs: prs, requiredChecks, rosterSource });
-  return { ...plan, plannerRows, plannerRequiredChecks: requiredChecks, plannerRequiredChecksSource: rosterSource, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals, prs: rawPrs.length, agents: agents.length,
+  return { ...plan, nominationPrs: prs, nominationOptions: plannerOptions, plannerRows, plannerRequiredChecks: requiredChecks, plannerRequiredChecksSource: rosterSource, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals, prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };
