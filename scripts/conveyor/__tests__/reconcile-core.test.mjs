@@ -121,7 +121,8 @@ describe('live send-back supersedes stale accepted phase and verdict', () => {
       headRefOid: head, mergeStateStatus: evidence === 'merge-state' ? 'DIRTY' : 'CLEAN',
       comments: [{ ...accepted, body: buildReviewedShaMarker(head) }, sentBack],
     })], agents: [], now: NOW });
-    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', isConflict: true }]);
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced' }]);
+    expect(plan.dispatch[0].isConflict).toBe(evidence === 'label' ? true : undefined);
     expect(plan.refusals).toEqual([]);
   });
   it('keeps the no-findings guard for a send-back without conflict evidence', () => {
@@ -1934,7 +1935,9 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
   it.each([NEGOTIATION_ROUND_CAP, NEGOTIATION_ROUND_CAP + 1])('a DIRTY bounce without the conflict label refuses cap-exhausted after %i shared rounds', (attempts) => {
     const shared = Array.from({ length: attempts }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
     const plan = planReconcile({
-      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared] })], agents: [], now: NOW,
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
     });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({
@@ -1943,15 +1946,19 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     })]);
   });
 
-  it('a DIRTY bounce without the conflict label dispatches a conflict fix while the shared cap is not spent', () => {
+  it('a DIRTY review:changes bounce with a live finding dispatches an ordinary fix at four shared rounds plus one completed conflict round', () => {
     const shared = Array.from({ length: NEGOTIATION_ROUND_CAP - 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
     const plan = planReconcile({
-      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared] })], agents: [], now: NOW,
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
     });
     expect(plan.refusals).toEqual([]);
     expect(plan.dispatch).toEqual([expect.objectContaining({
-      kind: 'fix', prNumber: 1563, isConflict: true, attempts: 0, cap: CONFLICT_FIX_ROUND_CAP,
+      kind: 'fix', prNumber: 1563, phase: 'bounced', attempts: NEGOTIATION_ROUND_CAP - 1,
     })]);
+    expect(plan.dispatch[0].isConflict).toBeUndefined();
+    expect(plan.dispatch[0].why).toContain(`${NEGOTIATION_ROUND_CAP - 1} of ${NEGOTIATION_ROUND_CAP} attempts are spent`);
   });
 
   it('`countConflictFixComments` narrows on the leading line, like every sibling counter', async () => {
