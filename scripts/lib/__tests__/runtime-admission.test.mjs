@@ -1,5 +1,5 @@
 import { deliverItemDetachedProvider } from '../../operations/dispatch-providers/build.mjs';
-import { defaultSpawnDetached, defaultSpawnDiagnosticDetached } from '../../operations/detached-dispatch.mjs';
+import { defaultSpawnDetached, defaultSpawnDiagnosticDetached, DiagnosticTargetError, REPO_ROOT } from '../../operations/detached-dispatch.mjs';
 import { routeDispatchProvider, defaultClaudeProvider, spawnAgentToCompletion, reserveBuildLane } from '../../operations/dispatch-lane-io.mjs';
 import { cliRetryInfraBlocked, cliEffects } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
 import { resumeOpen, infraRecoveryCard, parseInfraStore } from '../../conveyor/infra-blocked.mjs';
@@ -209,6 +209,21 @@ it('nested launch re-reads the injected reader after intermediate work revokes a
   expect(effect).not.toHaveBeenCalled();
 });
 
+it.each(['12', '13', '14'])('nested lead-only boundaries retain every outer roster and their own identity when %s is revoked', revoked => {
+  let settings = only(['12', '13', '14']);
+  const readSettings = vi.fn(() => settings);
+  const effect = vi.fn();
+  const result = withRuntimeAdmission({ num: 12, groupMembers: [12, 13] }, 'build', () =>
+    withRuntimeAdmission({ num: 14 }, 'prepare', () => {
+      settings = only(['12', '13', '14'].filter(num => num !== revoked));
+      return withRuntimeAdmission({ num: 12 }, 'build', effect);
+    }), { readSettings });
+  expect(result).toMatchObject({ outcome: 'runtime-refused' });
+  expect(result.runtimeRefused).toContainEqual({ num: revoked, kind: revoked === '14' ? 'prepare' : 'build', reason: 'runtime-only' });
+  expect(readSettings).toHaveBeenCalledTimes(3);
+  expect(effect).not.toHaveBeenCalled();
+});
+
 it('refuses a caller that omits known persisted group membership', async () => {
   const effect = vi.fn();
   await withRuntimeAdmissionTick(() => ({ mode: 'lift' }), async () => {
@@ -270,7 +285,7 @@ it('diagnostic card filing still spawns under an empty runtime allowlist', async
   const spawn = vi.fn(() => ({ pid: 7, unref() {} }));
   const closeLog = vi.fn();
   await withRuntimeAdmissionTick(() => only([]), async () => {
-    expect(defaultSpawnDiagnosticDetached([], { logPath: 'fixture.log' }, {
+    expect(defaultSpawnDiagnosticDetached([join(REPO_ROOT, 'scripts/operations/land-prevention-card.mjs')], { logPath: 'fixture.log' }, {
       ensureDir: () => {}, openLog: () => 123, closeLog, spawn,
     }).pid).toBe(7);
     expect(spawn).toHaveBeenCalledTimes(1);
@@ -278,3 +293,27 @@ it('diagnostic card filing still spawns under an empty runtime allowlist', async
     return {};
   });
 });
+
+it.each([
+  'deliver-item-wrapper.mjs', 'worker-wrapper.mjs', 'dispatch-lane.mjs',
+  'build-dispatch.mjs', 'prepare-item.mjs', 'fix-pr.mjs', 'ci-heal-pr-dispatch.mjs',
+  'unknown.mjs', '../elsewhere/land-prevention-card.mjs',
+])('diagnostic spawner rejects %s before any admission read or IO', async target => {
+  const readSettings = vi.fn(() => only([]));
+  const spawn = vi.fn(), ensureDir = vi.fn(), openLog = vi.fn();
+  await withRuntimeAdmissionTick(readSettings, async () => {
+    expect(() => defaultSpawnDiagnosticDetached([`scripts/operations/${target}`, '--num=9999'],
+      { cwd: REPO_ROOT, logPath: 'fixture.log' }, { spawn, ensureDir, openLog }))
+      .toThrow(DiagnosticTargetError);
+    expect(readSettings).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(ensureDir).not.toHaveBeenCalled();
+    expect(openLog).not.toHaveBeenCalled();
+    return {};
+  });
+});
+
+it.each([[], null, ['--eval', 'anything'], ['--import=anything', 'scripts/operations/land-prevention-card.mjs']].map(argv => [argv]))(
+  'diagnostic spawner refuses missing targets and Node options: %j', argv => {
+    expect(() => defaultSpawnDiagnosticDetached(argv)).toThrow(DiagnosticTargetError);
+  });

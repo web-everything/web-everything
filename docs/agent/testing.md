@@ -4734,6 +4734,12 @@ Mechanical providers are included in the spawn inventory without exceptions. Kee
 `runtime-admission.test.mjs`'s marker-read revocation cases for both lead and member,
 and its log-open revocation probe at the detached primitive. Diagnostic card filing
 uses its explicit diagnostic spawner and stays available under an empty allowlist.
+Nested boundaries carry every enclosing admitted roster and recheck it with fresh settings,
+even when the nested caller supplies only a lead. The diagnostic spawner accepts only the
+exact `scripts/operations/land-prevention-card.mjs` entry point; other targets throw
+`DiagnosticTargetError` before admission reads or IO. Delivery callers must use the gated
+spawner. Keep the lead-only nested revocation cases and diagnostic target rejection tests
+in `runtime-admission.test.mjs`, and the readonly exception's allowlist assertion in the spawn guard.
 Orphan resume pending writes must roll back on final refusal: remove the pending
 marker and restore any previous dead attempt count. The named final-refusal cases
 in `build-dispatch-orphan-adopt.test.mjs` prove a later tick sees dead work and recovers.

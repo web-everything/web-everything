@@ -165,11 +165,32 @@ export function wrapperExecutorFor(deliveryAgent) {
   return name;
 }
 
+const DIAGNOSTIC_TARGETS = new Set([
+  join(REPO_ROOT, 'scripts', 'operations', 'land-prevention-card.mjs'),
+]);
+
+export class DiagnosticTargetError extends TypeError {
+  constructor() {
+    super('Diagnostic target refused; delivery launches must use the runtime-gated spawner.');
+    this.name = 'DiagnosticTargetError';
+    this.code = 'ERR_DIAGNOSTIC_TARGET';
+  }
+}
+
+/** Exact entry-point allowlist; no Node options or arbitrary delivery scripts. */
+export function assertDiagnosticTarget(argv, cwd) {
+  if (!Array.isArray(argv) || typeof argv[0] !== 'string' || !argv[0]
+    || argv[0].startsWith('-') || !DIAGNOSTIC_TARGETS.has(resolve(cwd ?? process.cwd(), argv[0]))) {
+    throw new DiagnosticTargetError();
+  }
+}
+
 /** Diagnostic card filing has no delivery identity and remains available during a runtime hold. */
 export function defaultSpawnDiagnosticDetached(argv, { cwd, logPath, settingsEnv = null } = {}, {
   spawn = nodeSpawn, ensureDir = d => mkdirSync(d, { recursive: true }),
   openLog = p => openSync(p, 'a'), closeLog = closeSync,
 } = {}) {
+  assertDiagnosticTarget(argv, cwd);
   ensureDir(dirname(logPath));
   const fd = openLog(logPath);
   try {

@@ -68,7 +68,7 @@ export function withRuntimeAdmission(card, kind, effect, { readSettings } = {}) 
   // Batch ports (hold routing) retain their single-call contract. Each row still
   // carries its own full persisted group; admission of the batch is atomic too.
   const cards = Array.isArray(card) ? card : [card];
-  const identities = [];
+  const identities = [...(tick?.roster ?? [])];
   let invalid = false;
   for (const lead of cards) {
     const members = lead?.groupMembers === undefined ? [] : lead.groupMembers;
@@ -77,7 +77,7 @@ export function withRuntimeAdmission(card, kind, effect, { readSettings } = {}) 
       || (persisted !== undefined && (!validRuntimeGroupMembers(persisted)
         || persisted.some(member => !members.some(num => key(num) === key(member)))));
     invalid ||= malformed;
-    identities.push({ card: lead, kind });
+    identities.push({ card: { ...lead }, kind });
     if (!malformed) for (const num of new Set(members.map(key))) {
       if (num !== key(lead?.num)) identities.push({ card: { num }, kind: kind.startsWith('prepare') ? 'prepare' : kind });
     }
@@ -85,13 +85,17 @@ export function withRuntimeAdmission(card, kind, effect, { readSettings } = {}) 
   const runtimeRefused = [];
   for (const { card: identity, kind: identityKind } of identities) {
     const decision = assertRuntimeAdmitted(identity, identityKind, { readSettings: () => invalid ? null : settings });
-    if (!decision.admitted) runtimeRefused.push({ num: key(identity?.num), kind: identityKind, reason: decision.reason });
+    if (!decision.admitted && !runtimeRefused.some(refusal => refusal.num === key(identity?.num)
+      && refusal.kind === identityKind && refusal.reason === decision.reason)) {
+      runtimeRefused.push({ num: key(identity?.num), kind: identityKind, reason: decision.reason });
+    }
   }
   if (runtimeRefused.length) return {
     outcome: 'runtime-refused', refused: true, held: true, ok: false, spawned: false, dispatching: false,
     reason: runtimeRefused[0].reason, detail: runtimeRefused[0].reason, runtimeRefused,
   };
   // Nested provider ports inherit the reader, never its snapshot. Every nested
-  // launch re-reads it, including a trust retry or a fallback provider.
-  return ticks.run({ readSettings: reader, cards: tick?.cards ?? new Map(), refused: tick?.refused ?? [] }, effect);
+  // launch re-reads it and checks every enclosing roster, including a trust retry
+  // or a fallback provider that projects only the lead identity.
+  return ticks.run({ readSettings: reader, roster: identities, cards: tick?.cards ?? new Map(), refused: tick?.refused ?? [] }, effect);
 }

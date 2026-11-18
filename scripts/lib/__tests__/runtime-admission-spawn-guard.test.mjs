@@ -111,7 +111,7 @@ function scan(source) {
 }
 // Reviewed exceptions are keyed by file + function, never by argv or line number.
 const reviewedReads = new Map([
-  ['scripts/operations/detached-dispatch.mjs#defaultSpawnDiagnosticDetached', 'Files diagnostic cards only; never delivery work.'],
+  ['scripts/operations/detached-dispatch.mjs#defaultSpawnDiagnosticDetached', 'readonly: exact diagnostic target allowlist checked by assertDiagnosticTarget before spawn; no delivery work.'],
   ['scripts/conveyor/infra-blocked.mjs#originSlugOf', 'Reads the origin URL.'],
   ['scripts/conveyor/infra-blocked.mjs#readResumeGit', 'Fetches and reads the already-published ref; never publishes or starts delivery.'],
   ['skills-src/conveyor/build-dispatch-daemon.mjs#cliPlanTick', 'Reads the tick plan; never executes its proposed work.'],
@@ -142,6 +142,19 @@ const reviewedReads = new Map([
   ['scripts/operations/dispatch-lane-io.mjs#defaultLaneRefForPr', 'Reads a PR head ref.'],
   ['scripts/operations/dispatch-lane-io.mjs#fetch', 'Lists existing Claude agents; starts no agent.'],
 ]);
+it('diagnostic readonly exception asserts the target allowlist before spawning', () => {
+  const file = 'scripts/operations/detached-dispatch.mjs';
+  expect(reviewedReads.get(`${file}#defaultSpawnDiagnosticDetached`)).toContain('readonly');
+  const ast = ts.createSourceFile(file, readFileSync(join(root, file), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const entry = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'defaultSpawnDiagnosticDetached');
+  expect(entry.body.statements[0].getText()).toBe('assertDiagnosticTarget(argv, cwd);');
+  const check = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'assertDiagnosticTarget');
+  expect(check.getText()).toContain('DIAGNOSTIC_TARGETS.has(resolve(cwd ?? process.cwd(), argv[0]))');
+  expect(check.getText()).toContain('throw new DiagnosticTargetError()');
+  const targets = ast.statements.find(n => ts.isVariableStatement(n) && n.declarationList.declarations[0].name.getText() === 'DIAGNOSTIC_TARGETS');
+  expect(targets.declarationList.declarations[0].initializer.arguments[0].elements.map(n => n.getText()))
+    .toEqual(["join(REPO_ROOT, 'scripts', 'operations', 'land-prevention-card.mjs')"]);
+});
 it('inventories every conveyor process site and rejects unguarded or stale exceptions', () => {
   const files = RUNTIME_ADMISSION_SPAWN_SCAN.flatMap(entry => typeof entry === 'string' ? [entry]
     : readdirSync(join(root, entry.directory)).filter(f => entry.files.test(f)).map(f => `${entry.directory}/${f}`));
