@@ -1095,7 +1095,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
 
   it('host admission (verify-admission): the CLI daemon\'s review pass is wired to defaultReviewHostAdmission', async () => {
     const { cliReviewTickOpts, defaultReviewHostAdmission, defaultRecoveryLaneNumbers } = await import('../review-daemon.mjs');
-    const opts = cliReviewTickOpts({ log: { error: () => {} } });
+    const opts = cliReviewTickOpts({ log: { error: () => {} }, listCommands: () => '' });
     expect(typeof defaultReviewHostAdmission).toBe('function');
     expect(opts.hostAdmission).toBe(defaultReviewHostAdmission);
     expect(opts.recoveryAcquirableLanes).toBe(defaultRecoveryLaneNumbers);
@@ -1109,7 +1109,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
       const effects = buildCliDaemonEffects({ owner: 'test', log: { error: () => {} }, reapSessions: () => null,
         runPrepReview: noPrepReview, convertAdvisoryEnabled: false,
-        reviewTickOpts: (args) => ({ ...cliReviewTickOpts(args), tick, repos: ['repo-a'], authGateOverride: () => ({ paused: false, reason: null }) }) });
+        reviewTickOpts: (args) => ({ ...cliReviewTickOpts({ ...args, listCommands: () => '' }), tick, repos: ['repo-a'], authGateOverride: () => ({ paused: false, reason: null }) }) });
       await effects.tickOnce();
       expect(tick).toHaveBeenCalledTimes(1);
       expect(seen[0].hostAdmission()).toMatchObject({ admitted: true, maxPerTick: 2 });
