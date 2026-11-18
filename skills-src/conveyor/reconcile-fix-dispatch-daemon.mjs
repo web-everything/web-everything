@@ -1424,7 +1424,8 @@ export async function runTickAllRepos({
       ? (() => ({ applied: [], refusals: [] })) : sweepMechanicalConflictRebases)),
   }));
   phasePrCounts['conflict-rebase'] = { handled: conflictRebase.dispatched.filter(row => !row.deferred).length, deferred: 0 };
-  planCache?.markTouched(conflictRebase);
+  // Only a PR whose head actually moved is touched; skips/errors stay visible to fix dispatch and escalation notes.
+  planCache?.markTouched({ dispatched: conflictRebase.dispatched.filter(row => row.ok && row.action === 'rebased') });
   // Refresh discovery before fix plans against a head this mechanical step just moved.
   for (const row of conflictRebase.dispatched) {
     if (row.action === 'rebased') snapshots.delete(row.repo);
