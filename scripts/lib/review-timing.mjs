@@ -1,7 +1,6 @@
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
-import { reviewCiGate } from './review-ci-gate.mjs';
+import { reviewCiGate, reviewRequiredChecks, isReviewOwnedCheck } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
-import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
@@ -134,25 +133,13 @@ function readableEarlyChecks(checks, headSha) {
 }
 
 /** Pending is the only relaxation: every prerequisite needs its own readable row on this head. */
-function registeredStartGate({ headSha, checks, requiredChecks }) {
-  const strict = reviewCiGate({ headSha, checks, requiredChecks });
-  if (!checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
+function registeredStartGate({ headSha, checks, requiredChecks, rowsComplete, rosterSource }) {
+  const strict = reviewCiGate({ headSha, checks, requiredChecks, rowsComplete, rosterSource });
+  if (strict.unknown || !checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
+  // Registration may relax pending CI only; it cannot erase a resolver failure.
+  if (strict.affected.some(row => !['pending', 'missing'].includes(row.reason))) return strict;
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
-  // Same implication rule as the strict gate: a green aggregate (test) proves a split-out job (integration). The
-  // strict gate reads a legacy commit status (`{context, state}`) as a check row first, so a green STATUS aggregate
-  // implies too; the per-row judgment below reads the raw row, which already handles `state`. Only a row with NO
-  // `status` key is a status (as review-ci-gate.mjs#statusAsCheckRow): `status: null` stays raw and implies nothing.
-  // The WHOLE mapping mirrors statusAsCheckRow, `state` overriding any `conclusion` on the row: a contradictory
-  // `{state: 'failure', conclusion: 'success'}` aggregate is red to the strict gate, so it must imply nothing here.
-  const asCheckRow = row => {
-    if (!row || typeof row !== 'object' || row.status !== undefined || typeof row.state !== 'string') return row;
-    const state = row.state.toLowerCase();
-    if (state === 'success') return { ...row, status: 'completed', conclusion: 'success' };
-    if (state === 'failure' || state === 'error') return { ...row, status: 'completed', conclusion: state };
-    if (state === 'pending' || state === 'expected') return { ...row, status: 'pending' };
-    return row;
-  };
-  const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, [...latest.values()].map(asCheckRow)))].flatMap(name => {
+  const affected = [...new Set(reviewRequiredChecks(requiredChecks))].flatMap(name => {
     const row = latest.get(name);
     let reason;
     if (!row) reason = 'missing';
@@ -173,22 +160,28 @@ function registeredStartGate({ headSha, checks, requiredChecks }) {
     reason: affected.length ? 'required-checks-not-successful' : 'required-checks-successful', affected };
 }
 
+/** Review-owned checks cannot block the review they await; other CI consumers retain their rules. */
+export const reviewAdmissionCiRed = args => ciRedOnHead({ ...args, checks: Array.isArray(args.checks)
+  ? args.checks.filter(row => !isReviewOwnedCheck(row?.name ?? row?.context)) : args.checks });
+
 /** Start permission only. Merge/ready decisions must continue using their strict CI gates. */
-export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
-  const strict = () => reviewCiGate({ headSha, checks, requiredChecks });
+export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete = false, rosterSource, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  const strict = () => reviewCiGate({ headSha, checks, requiredChecks, rowsComplete, rosterSource });
+  if (rowsComplete !== true) return strict();
   // Rollback preserves the original strict CI-green result, including its reason and affected rows.
   if (policy.startEarly === 'off' && !policy.startBeforeCi && policy.startAfter === 'ci-green') return strict();
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;
-  const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites });
+  const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites, rowsComplete, rosterSource: policy.startAfter === 'ci-green' || !fastChecksFor(policy.fastChecks, repo) ? rosterSource : 'live' });
   const pendingStart = gate => {
+    if (gate.unknown) return gate;
     const mode = policy.startEarly ?? REVIEW_TIMING_DEFAULTS.startEarly;
     if (!['shadow', 'on'].includes(mode)) return gate;
-    if (!gate.allowed && ciRedOnHead({ headSha, checks, requiredChecks })) return { ...gate, reason: 'ci-red' };
-    // Retain other strict refusals; registration also applies when an aggregate implied a missing prerequisite.
+    if (!gate.allowed && reviewAdmissionCiRed({ headSha, checks, requiredChecks })) return { ...gate, reason: 'ci-red' };
+    // Retain other strict refusals; every prerequisite must be registered.
     if (gate.allowed || !gate.affected?.length || gate.affected.every(row => ['pending', 'missing'].includes(row.reason))) gate = registered();
     if (gate.allowed || !['shadow', 'on'].includes(mode) || typeof headSha !== 'string' || !headSha.trim()
       || !gate.affected?.length || !gate.affected.every(row => row.reason === 'pending')
-      || !readableEarlyChecks(checks, headSha) || ciRedOnHead({ headSha, checks, requiredChecks })) return gate;
+      || !readableEarlyChecks(checks, headSha) || reviewAdmissionCiRed({ headSha, checks, requiredChecks })) return gate;
     if (mode === 'on') return { allowed: true, reason: 'early-pending-ci', earlyStart: true, headSha, affected: gate.affected };
     return { ...gate, wouldStartEarly: true,
       earlyStartNote: `review-early-start: would start early on ${headSha} (pending: ${gate.affected.map(row => `${row.name}=${row.reason}`).join(', ')})` };
@@ -197,27 +190,31 @@ export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyG
   if (Array.isArray(checks) && Array.from(checks).some(row => !row || typeof row !== 'object' || Array.isArray(row)))
     return { allowed: false, headSha, reason: 'malformed', affected: [] };
   // With a known required set, only its healable failures block review.
-  if (Array.isArray(requiredChecks) && requiredChecks.length && ciRedOnHead({ headSha, checks, requiredChecks }))
+  if (Array.isArray(requiredChecks) && requiredChecks.length && reviewAdmissionCiRed({ headSha, checks, requiredChecks }))
     return { allowed: false, headSha, reason: 'ci-red', affected: policy.startAfter === 'ci-green' ? strict().affected : [] };
+  // Verification adds a prerequisite; it cannot relax resolver evidence or pending CI.
+  if (policy.startBeforeCi) {
+    if (reviewAdmissionCiRed({ headSha, checks, requiredChecks: checkNames(requiredChecks) ? requiredChecks : null }))
+      return { allowed: false, headSha, reason: 'ci-red', affected: [] };
+    const gate = reviewCiGate({ headSha, checks, requiredChecks: prerequisites, rowsComplete,
+      rosterSource: policy.startAfter === 'ci-green' || !fastChecksFor(policy.fastChecks, repo) ? rosterSource : 'live' });
+    if (!gate.allowed) return gate;
+    if (verifyGreen !== true) return { allowed: false, headSha, reason: 'verify-not-green', affected: [] };
+    return { ...gate, reason: 'verify-marker' };
+  }
   if (policy.startAfter === 'push') {
     const refuse = reason => ({ allowed: false, headSha, reason, affected: [] });
     if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
     // Unknown requirements cannot excuse red CI; use the same heal rule as the verification-marker path.
-    if (ciRedOnHead({ headSha, checks, requiredChecks: checkNames(requiredChecks) ? requiredChecks : null }))
+    if (reviewAdmissionCiRed({ headSha, checks, requiredChecks: checkNames(requiredChecks) ? requiredChecks : null }))
       return refuse('ci-red');
     const gate = registered();
-    if (!gate.allowed && !(gate.affected.length && gate.affected.every(row => row.reason === 'pending'))) return gate;
+    if (gate.unknown || !gate.allowed && !(gate.affected.length && gate.affected.every(row => row.reason === 'pending'))) return gate;
     return { allowed: true, headSha, reason: 'push', affected: [] };
   }
   if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return pendingStart(strict());
-  if (policy.startBeforeCi && verifyGreen === true && typeof headSha === 'string' && headSha.trim()) {
-    // An unknown required set must not let a red check ride past the marker: any healable red blocks, as in CI-green.
-    if (ciRedOnHead({ headSha, checks, requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
-      return { allowed: false, headSha, reason: 'ci-red', affected: [] };
-    return { allowed: true, headSha, reason: 'verify-marker', affected: [] };
-  }
   if (policy.startAfter === 'ci-green') return pendingStart(strict());
-  return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: prerequisites }));
+  return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: prerequisites, rowsComplete, rosterSource: policy.startAfter === 'ci-green' || !fastChecksFor(policy.fastChecks, repo) ? rosterSource : 'live' }));
 }
 export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks, requiredChecks }));

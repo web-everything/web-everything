@@ -23,6 +23,7 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { redTeamEnqueueOperation, createRedTeamEnqueueSinks, RED_TEAM_ENQUEUE_OP } from './red-team-enqueue.mjs';
 import { appendEntry } from './ruled-weakened-store.mjs';
 import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
@@ -267,6 +268,7 @@ export const CLI_ONLY_OPERATIONS = Object.freeze({
 });
 
 export const OPERATIONS = Object.freeze({
+  [RED_TEAM_ENQUEUE_OP]: () => ({ declaration: redTeamEnqueueOperation(), sinks: createRedTeamEnqueueSinks() }),
   [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
     const routing = resolveAiRouting();
     return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,

@@ -1,3 +1,5 @@
+import { readPlannerRows } from './red-team-planner-row.mjs';
+import { RED_TEAM_NOMINATION_KINDS } from './red-team-planner-row.mjs';
 import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
@@ -301,8 +303,9 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
   floor, readCpuIdlePct, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const candidates = [], cardOnlyCandidates = [];
-  for (const row of plan?.refusals ?? []) {
-    if (row.kind !== 'already-reviewed-head') continue;
+  const plannerRows = readPlannerRows({ repo, plan, rawPrs });
+  for (const { refusal: row } of plannerRows) {
+    if (!RED_TEAM_NOMINATION_KINDS.includes(row.kind)) continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
     if (!isRealHead(head)) continue;
     const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
@@ -354,14 +357,14 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const blocked = new Set(queue.entries().filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)).map(entry => entry.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: ${blocked.has(pr) ? readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled' : 'capacity'}; waiting for a later tick`);
     // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
-    const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    const kept = plannerRows.map(row => row.refusal).filter(row => !held.has(Number(row.prNumber)));
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>
-      row.kind === 'already-reviewed-head' && Number(row.prNumber) === entry.pr));
+      RED_TEAM_NOMINATION_KINDS.includes(row.kind) && Number(row.prNumber) === entry.pr));
     let index = 0;
     const options = { repo, plan: { ...plan, refusals: refusals.map(row =>
-      row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
+      RED_TEAM_NOMINATION_KINDS.includes(row.kind) && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
     rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
     const finish = result => {
       queue.settle(repo, result);

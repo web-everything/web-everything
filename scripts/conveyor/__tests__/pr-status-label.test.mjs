@@ -304,7 +304,7 @@ describe('required CI determines status (#5241, #5267, #5270, #5254)', () => {
     ['required-review-gate-conflict', { requiredChecks: ['review-gate'], checks: [] }, 'awaiting-review'],
     ['required-checks-successful', {}, 'awaiting-ci'],
   ])('classifies the gate reason %s conservatively', (reason, overrides, expected) => {
-    const ci = reviewCiGate({ headSha: HEAD, requiredChecks: ['merge-gate'],
+    const ci = reviewCiGate({ rowsComplete: true, headSha: HEAD, requiredChecks: ['merge-gate'],
       checks: [{ name: 'merge-gate', status: 'completed', conclusion: 'success' }], ...overrides });
     expect(ci.reason).toBe(reason);
     expect(derive({ pr: subject({ baseRefName: 'lane/base', statusCheckRollup: green() }),

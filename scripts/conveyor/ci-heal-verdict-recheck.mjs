@@ -14,7 +14,7 @@
  *   - {@link unsettledRequiredChecks}: the escalation CLI refuses to record `not-a-ci-break` while a required check is
  *     still pending, missing, or red — the verdict can only be true once they have all finished green.
  *
- * Reuses the shared check-state predicate, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
+ * Reuses the shared required-check evidence contract, without implication of absent required checks.
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
@@ -23,8 +23,7 @@ import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
+import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
@@ -72,10 +71,10 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 }
 
 /** No known required set means no evidence that CI is green. Pure. */
-export function ciGreenForEscalation({ rollup, requiredChecks }) {
+export function ciGreenForEscalation(options) {
+  const { requiredChecks } = options;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
-  const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
-  return !red.length && !pending.length && !missing.length;
+  return ['pass', 'held'].includes(checkEvidence(options).state);
 }
 
 export const sameSha = (a, b) => {
@@ -85,66 +84,46 @@ export const sameSha = (a, b) => {
 };
 
 const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
-const lowerState = state => String(state ?? '').toLowerCase();
-const normalizeRollupCheck = row => {
-  const check = { ...row, name: row?.name || row?.context };
-  if (row?.status == null && row?.state != null) {
-    if (['pending', 'expected'].includes(lowerState(row.state))) check.status = 'pending';
-    else check.conclusion = row.state;
-  }
-  return check;
-};
-
 /** Compatibility export: preserve every rollup row; metadata never selects evidence. */
 export function latestRollupAttempts(rollup) {
   return Array.isArray(rollup) ? [...rollup] : [];
 }
 
-/** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
-function checkEvidence(rollup, requiredChecks) {
-  const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
-  // Only the shared merge-gate hold classifier's annotation proves a review hold.
-  // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
-  const holdGateNames = [REVIEW_GATE_CHECK];
-  const mergeGates = checks.filter(row => row.name === 'merge-gate');
-  if (mergeGates.length && mergeGates.every(row =>
-    classifyCheck({ ...row, required: true }) === 'green' || row.mergeGateReviewHold)) {
-    holdGateNames.push('merge-gate');
+/** Bind rollup evidence to its read head; never infer a head or roster from rows. */
+function checkEvidence({ rollup, requiredChecks, headSha, rowsHead = headSha, rowsComplete = false, rosterSource, holds }) {
+  const rows = Array.isArray(rollup) ? rollup : [];
+  const roster = Array.isArray(requiredChecks) ? [...requiredChecks] : [];
+  // Observed CodeQL and review gates participate even outside branch protection.
+  for (const name of [...gateNames, CODEQL_CHECK_NAME]) {
+    if (rows.some(row => (row?.name ?? row?.context) === name) && !roster.includes(name)) roster.push(name);
   }
-  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
-    .filter(name => !holdGateNames.includes(name));
-  // CodeQL evidence is never excused by a drain setting or an optional roster.
-  if (checks.some(row => row.name === CODEQL_CHECK_NAME) && !roster.includes(CODEQL_CHECK_NAME)) {
-    roster.push(CODEQL_CHECK_NAME);
-  }
-  return { checks, roster, holdGateNames };
+  // A capped rollup can hide failures even when every required name is present.
+  return resolveRequiredChecks({ rows: rollup, rowsHead, rowsComplete, head: headSha, requiredNames: roster,
+    rosterSource: Array.isArray(requiredChecks) && requiredChecks.length ? rosterSource : 'unavailable', holds });
 }
 
-/**
- * The required checks (minus review-gate and proven merge-gate review holds), judged across every row. PURE.
- * An empty/unknown required set judges only observed CodeQL evidence.
- * @returns {{red: string[], pending: string[], missing: string[], green: string[]}}
- */
-export function requiredCheckStates({ rollup, requiredChecks }) {
-  const out = { red: [], pending: [], missing: [], green: [] };
-  const { checks, roster } = checkEvidence(rollup, requiredChecks);
-  const { redSet, pendingSet } = summarize(checks, { requiredNames: roster });
-  const observed = new Set(checks.map(row => row.name));
-  for (const name of roster) {
-    if (!observed.has(name)) out.missing.push(name);
-    else if (redSet.has(name)) out.red.push(name);
-    else if (pendingSet.has(name)) out.pending.push(name);
-    else out.green.push(name);
+/** Required CI blockers; held evidence is review work, never a passing check. */
+export function requiredCheckStates(options) {
+  const result = checkEvidence(options), out = { red: [], pending: [], missing: [], green: [] };
+  for (const name of new Set([...(Array.isArray(options.requiredChecks) ? options.requiredChecks : []), ...Object.keys(result.perName)])) {
+    const r = result.perName[name];
+    if (!r) continue;
+    if (r.state === 'held') continue;
+    // Gates outside the roster contribute failures, but their pending state is review work.
+    if (gateNames.includes(name) && !options.requiredChecks?.includes(name) && r.state === 'pending') continue;
+    out[r.state === 'pass' ? 'green' : r.state === 'unknown' || r.reasons.includes('missing') ? 'missing'
+      : r.state === 'pending' ? 'pending' : 'red'].push(name);
   }
+  // Unknown evidence blocks admission without inventing a failed check.
+  if (result.state === 'unknown') out.missing.push('check-evidence');
   return out;
 }
 
-/** Include gates and CodeQL evidence, even outside the required roster. */
-export function gateOnlyRedStates({ rollup, requiredChecks }) {
-  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
-  const requiredNames = [...roster, ...gateNames];
-  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
-  return { gateOnlyRed, red: [...redSet] };
+/** Only a fully resolved review hold prevents CI-heal escalation. */
+export function gateOnlyRedStates(options) {
+  const result = checkEvidence(options);
+  const red = Object.entries(result.perName).filter(([, r]) => ['held', 'fail'].includes(r.state)).map(([name]) => name);
+  return { gateOnlyRed: result.state === 'held', red, waitingOnReview: result.state === 'held' };
 }
 
 /**
@@ -152,9 +131,14 @@ export function gateOnlyRedStates({ rollup, requiredChecks }) {
  * @param {{escalation:{outcome?:string, headSha?:string}|null, headSha:string, rollup:Array<object>, requiredChecks:string[]}} o
  * @returns {string[]}
  */
-export function contradictingChecks({ escalation, headSha, rollup, requiredChecks }) {
+export function contradictingChecks({ escalation, headSha, rollup, requiredChecks, rowsComplete = false, rowsHead = headSha, rosterSource }) {
   if (escalation?.outcome !== 'not-a-ci-break' || !sameSha(escalation.headSha, headSha)) return [];
-  return requiredCheckStates({ rollup, requiredChecks }).red;
+  const result = checkEvidence({ rollup, requiredChecks, headSha, rowsHead, rowsComplete, rosterSource });
+  // An incomplete snapshot can still contain an observed failure, but absence
+  // of proof (including malformed or foreign-head rows) never voids a verdict.
+  return Object.entries(result.perName).filter(([name, r]) => r.state === 'fail'
+    || r.rows.some(row => checkEvidence({ rollup: [row], requiredChecks: [name], headSha, rowsHead, rowsComplete: true, rosterSource })
+      .perName[name]?.state === 'fail')).map(([name]) => name);
 }
 
 /** {@link contradictingChecks} as a yes/no. PURE. */
@@ -167,7 +151,7 @@ export function notCiBreakContradicted(o) {
  * recordable yet — still running, not started, or red. `[]` means they all finished green. PURE.
  * @returns {{pending: string[], missing: string[], red: string[]}}
  */
-export function unsettledRequiredChecks({ rollup, requiredChecks }) {
-  const s = requiredCheckStates({ rollup, requiredChecks });
+export function unsettledRequiredChecks(options) {
+  const s = requiredCheckStates(options);
   return { pending: s.pending, missing: s.missing, red: s.red };
 }

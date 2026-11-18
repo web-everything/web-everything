@@ -29,6 +29,7 @@
  *   say when.
  */
 import { describe, it, expect } from 'vitest';
+import { mapGraphqlPr } from '../../lib/pr-list-paged.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
   staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
@@ -82,7 +83,7 @@ const AUTOMATION = { login: 'web-everything' };
 
 const lbl = (...names) => names.map((name) => ({ name }));
 // These fixtures model a repository whose one required check is gate. Specific CI cases override the set.
-const planReconcile = options => planReconcileCore({ reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'], ...options });
+const planReconcile = options => planReconcileCore({ rosterSource: 'live', reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'], ...options });
 const greenRollup = [{ name: 'gate', status: 'completed', conclusion: 'success' }];
 const pendingRollup = [{ name: 'gate', status: 'in_progress', conclusion: null }];
 const redRollup = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
@@ -91,6 +92,8 @@ const finding = (text = 'the cap is not derived from the PR; derive it from the 
 
 /** PR #1563 — open 2026-08-25T22:00:51Z, merged 16:39:23Z, 18 h 39 m and TWELVE review rounds against a cap of 5. */
 const pr1563 = (over = {}) => ({
+  rowsComplete: true,
+  rowsHead: over.headRefOid ?? 'aa11bb22cc33dd44ee55ff6677889900aabbccdd',
   number: 1563,
   state: 'OPEN',
   headRefName: 'lane/2612-converge-pr-drive',
@@ -460,6 +463,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
 describe('case 3 — refusal 2: a PR with nothing to fix never gets a fixer (#3296)', () => {
   /** #1576 shape with successful required CI added for review eligibility. */
   const pr1576 = (over = {}) => ({
+    rowsComplete: true, rowsHead: over.headRefOid ?? '1576'.repeat(10),
     number: 1576, state: 'OPEN',
     headRefName: 'lane/review-slice-scopes', headRefOid: '1576'.repeat(10),
     labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN',
@@ -757,6 +761,7 @@ describe('case 5b — refusal 4, name-based bind: a review session the cwd/oid r
   /** #1576 re-armed `review:changes → review:pending` — one prior finding, one re-arm marker; label back to
    *  `review:pending`. Mirrors the real PR (`#1765`) whose re-arm round is what let the bug run seven ticks. */
   const rearmed1576 = (over = {}) => ({
+    rowsComplete: true, rowsHead: over.headRefOid ?? '1576'.repeat(10),
     number: 1576, state: 'OPEN',
     headRefName: 'lane/review-slice-scopes', headRefOid: '1576'.repeat(10),
     labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN',
@@ -3321,6 +3326,7 @@ describe('#2588/review-loops — the zero-findings review population now hits th
   /** Shaped exactly like case 3's `pr1576` (`review:pending`, no real findings) but with a comment thread of
    *  pure re-arm bookkeeping — zero findings by `countFindings`, but a real, non-zero durable attempt count. */
   const zeroFindingsPr = (over = {}) => ({
+    rowsComplete: true, rowsHead: over.headRefOid ?? '2588'.repeat(10),
     number: 2588, state: 'OPEN',
     headRefName: 'lane/review-loop-2588', headRefOid: '2588'.repeat(10),
     labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN',
@@ -3365,6 +3371,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
   it('a PR whose CURRENT head already carries a `reviewed-sha` accept marker is refused `already-reviewed-head`, never re-dispatched — the exact #2588 shape (a verdict already landed on this commit)', () => {
     const pr = {
       number: 2588, state: 'OPEN', headRefName: 'lane/review-loop-2588', headRefOid: HEAD,
+      rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       // #4140 — parseReviewedSha only counts a TRUSTED author's marker; a real accept comment always carries
       // one (review-set-label.mjs stamps it under the automation's own credential or the operator's).
@@ -3390,6 +3397,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
   // but the human still needs an advisory on the new head.
   const restamped = (phase, advisoryHead) => ({
     number: 5323, state: 'OPEN', headRefName: 'lane/5323', headRefOid: HEAD,
+    rowsComplete: true, rowsHead: HEAD,
     labels: lbl(phase === 'needs-human' ? 'review:human' : 'review:pending'),
     mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
     comments: [{ author: AUTOMATION, createdAt: '2026-10-15T00:00:00Z',
@@ -3425,6 +3433,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
   it('#4140 — a FORGED reviewed-sha marker (untrusted author) never suppresses re-dispatch', () => {
     const pr = {
       number: 2592, state: 'OPEN', headRefName: 'lane/review-loop-2592', headRefOid: HEAD,
+      rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
       comments: [{ body: buildReviewedShaMarker(HEAD), author: { login: 'mallory' } }],
     };
@@ -3436,6 +3445,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
   it('does not refuse when the `reviewed-sha` marker covers an OLDER head — a fresh push after a stale accept is not "already reviewed" for its OWN new commit', () => {
     const pr = {
       number: 2591, state: 'OPEN', headRefName: 'lane/review-loop-2591', headRefOid: HEAD,
+      rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
       comments: [{ body: buildReviewedShaMarker(OLDER_HEAD), author: { login: 'web-everything' } }],
     };
@@ -3452,6 +3462,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
     });
     const stuckPr = (over = {}) => ({
       number: 4352, state: 'OPEN', headRefName: 'lane/4352', headRefOid: HEAD,
+      rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
       comments: [acceptAt(ACCEPT_LABEL_GRACE_MS + 60_000)], ...over,
     });
@@ -3531,6 +3542,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('THE LIVE #2766/#2767 SHAPE: needs-human + accepted-then-test-gaming-parked-then-healed on the SAME head dispatches `convert-advisory`, never `already-reviewed-head`', () => {
     const pr = {
+      rowsComplete: true, rowsHead: HEAD,
       number: 2766, state: 'OPEN', headRefName: 'lane/2766', headRefOid: HEAD,
       labels: lbl('review:human', 'review:awaiting-advisory'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment(), testGamingParkComment(), healComment()],
@@ -3547,6 +3559,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('a needs-human PR accepted then healed with NO substantive park reason still converts, off the heal comment alone', () => {
     const pr = {
+      rowsComplete: true, rowsHead: HEAD,
       number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment(), healComment()],
@@ -3674,6 +3687,18 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     expect(result.refusals).toEqual([]);
   });
 
+  it('admits review with unannotated red review-owned checks after not-a-ci-break escalation', () => {
+    // #7037 excludes both review-owned gates regardless of hold annotations.
+    const result = plan({ isDraft: false,
+      statusCheckRollup: [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')],
+      comments: [{ author: AUTOMATION, body: buildCiHealEscalationComment({ headSha: pr1563().headRefOid,
+        outcome: 'not-a-ci-break', reason: 'review hold' }) }],
+    });
+    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
+    expect(result.refusals.flatMap(row => [row, row.reviewRefusal]))
+      .not.toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+  });
+
   it.each([
     ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
@@ -3700,7 +3725,6 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 
   it.each([
-    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
   ])('reviewChecksAllow still refuses a non-draft with %s even after not-a-ci-break escalation', (_, rollup) => {
     const result = plan({ isDraft: false, statusCheckRollup: rollup(), comments: [{ author: AUTOMATION,
@@ -3950,7 +3974,7 @@ it('x6n7c2p required checks before review — repaired ready head waits', () => 
   const reviews = snapshots.map(([head, status, conclusion]) => {
     const plan = planReconcile({
       prs: [{ number: 3432, state: 'OPEN', isDraft: false, headRefName: 'lane/x6n7c2p-fix',
-        headRefOid: head.repeat(40), labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', comments: [],
+        headRefOid: head.repeat(40), rowsComplete: true, rowsHead: head.repeat(40), labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', comments: [],
         statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' },
           { name: 'daemon-soak', status, conclusion }] }],
       requiredChecks: ['test', 'daemon-soak'], agents: [], durableCounts: {}, now: NOW,
@@ -3974,7 +3998,7 @@ it('required review-gate conflict refuses without repeatedly healing review comp
   const plan = planReconcile({ requiredChecks: ['review-gate'], agents: [], now: NOW,
     prs: [pr1563({ labels: lbl('review:pending'), statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })] });
   expect(plan.dispatch).toEqual([]);
-  expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'required-review-gate-conflict' }) })]);
+  expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-hold-red' })]);
 });
 describe('required review-gate conflict is scoped to the review it gates', () => {
   const failed = name => ({ name, status: 'completed', conclusion: 'failure' });
@@ -3999,13 +4023,34 @@ describe('required review-gate conflict still refuses a superseded-verdict conve
     { author: { login: 'web-everything' }, createdAt: '2026-09-26T23:15:40Z',
       body: '**`review:accepted` removed — mutual exclusivity (#2766/#2767).**\n\nThis PR carried both `review:accepted` and `review:human` at once.' },
   ];
-  it.each(['failure', 'in_progress'])('needs-human PR with a %s required review-gate gets review-ci, not convert-advisory', state => {
-    const pr = { number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
+  it.each([
+    ['incomplete', { rowsComplete: false }, { reason: 'rows-incomplete' }],
+    ['malformed', { statusCheckRollup: [{ name: 'test' }] }, { unknown: true }],
+    ['unknown roster', { requiredChecks: [] }, { reason: 'unknown-required-set' }],
+  ])('refuses conversion with %s evidence even without a review-gate conflict', (_label, over, expected) => {
+    const pr = { rowsComplete: true, rowsHead: HEAD, number: 2777, state: 'OPEN', headRefName: 'lane/2777',
+      headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
+      statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], ...over };
+    const plan = planReconcile({ requiredChecks: over.requiredChecks ?? ['test'], prs: [pr], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining(expected) })]);
+  });
+  it.each([[true, 'failure'], [true, 'in_progress'], [false, 'failure'], [false, 'in_progress']])('needs-human conversion with completeness %s and review-owned %s keeps CI ownership separate', (rowsComplete, state) => {
+    const pr = { rowsComplete, rowsHead: HEAD, number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
       statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' },
         state === 'failure' ? { name: 'review-gate', status: 'completed', conclusion: 'failure' } : { name: 'review-gate', status: 'in_progress', conclusion: null }] };
     const plan = planReconcile({ requiredChecks: ['test', 'review-gate'], prs: [pr], agents: [], durableCounts: {}, now: NOW });
-    expect(plan.dispatch).toEqual([]);
-    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'required-review-gate-conflict' }) })]);
+    if (state === 'failure') {
+      // A failing held gate retains the existing review-daemon ownership before conversion.
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-hold-red' })]);
+    } else if (rowsComplete) {
+      expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'convert-advisory', prNumber: 2777 }));
+    } else {
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci',
+        ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) })]);
+    }
   });
 });
 
@@ -4352,14 +4397,24 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
 
 
 describe('green-head needs-human retirement (#5012)', () => {
-  const head = '9dd77ac9123456789abcdef0123456789abcdef0123';
+  const head = '9dd77ac9123456789abcdef0123456789abcdef0';
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate', 'review-gate'];
-  const pr = { number: 5012, state: 'OPEN', headRefOid: head, mergeStateStatus: 'BLOCKED',
+  const pr = { rowsComplete: true, rowsHead: head, number: 5012, state: 'OPEN', headRefOid: head, mergeStateStatus: 'BLOCKED',
     labels: [{ name: 'review:pending' }], comments: [{ author: { login: 'web-everything' },
       body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human' }) }],
     statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: name === 'review-gate' ? 'FAILURE' : 'SUCCESS' })),
   };
-  const plan = (row = pr, on = true) => planReconcileCore({ prs: [row], requiredChecks, verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
+  const plan = (row = pr, on = true) => planReconcileCore({ prs: [row], requiredChecks, rosterSource: 'live', verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
+  it.each([undefined, 'fallback', 'declared'])('never retires needs-human with unavailable roster provenance %s', rosterSource => {
+    const result = planReconcileCore({ prs: [pr], requiredChecks, rosterSource,
+      verdictSettings: { voidNeedsHumanWhenCiGreen: true } });
+    expect(result.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+  });
+  it('never retires human escalation when review-gate timed out (Rule 7)', () => {
+    const result = plan({ ...pr, statusCheckRollup: pr.statusCheckRollup.map(row =>
+      row.name === 'review-gate' ? { ...row, conclusion: 'TIMED_OUT' } : row) });
+    expect(result.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+  });
   it('emits one moot note outside ci-red without changing dispatch/refusals', () => {
     const on = plan(), off = plan(pr, false);
     expect(on.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([expect.objectContaining({ prNumber: 5012, headSha: head, outcome: 'needs-human' })]);
@@ -4384,7 +4439,8 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
   const reviewTiming = { startAfter: 'fast-checks', fastChecks: ['test', 'integration', 'standards'] };
   const head = 'a'.repeat(40);
-  const rows = requiredChecks.map(name => ({
+  // Rule 6 removal: integration has its own green row; only standards is missing.
+  const rows = [...requiredChecks, 'integration'].map(name => ({
     name, status: 'completed', conclusion: 'success', head_sha: head,
   }));
   const pr = (over = {}) => pr1563({ headRefOid: head, baseRefName: 'main', comments: [],
@@ -4396,7 +4452,7 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     prs: [pr(over)], agents: [], now: NOW, requiredChecks, reviewTiming, mainSha: 'b'.repeat(40), ...options,
   });
 
-  it('finds standards on settled live-shape CI, respecting implied integration', () => {
+  it('finds standards on settled CI with an own integration row', () => {
     expect(repair()).toEqual({ missing: ['standards'] });
     expect(repair({ baseRefName: undefined })).toEqual({ missing: ['standards'] });
   });
@@ -4421,7 +4477,8 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     expect(repair({}, required)).toBeNull();
   });
   it('collapses superseded failures and ignores other-head rows', () => {
-    expect(repair({ statusCheckRollup: [{ ...rows[0], conclusion: 'failure' }, ...rows,
+    expect(repair({ statusCheckRollup: [{ ...rows[0], conclusion: 'failure', id: 1, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', run_id: 1, run_attempt: 1 },
+      ...rows.map(row => ({ ...row, id: 2, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', run_id: 1, run_attempt: 2 })),
       { name: 'other', status: 'queued', head_sha: 'old' }] })).toEqual({ missing: ['standards'] });
   });
   it.each([
@@ -4812,4 +4869,139 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
     expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
     expect(off.dispatch).toEqual(baseline.dispatch);
   });
+});
+
+it('review-hold override permits complete rows whose affected rows are only review failures', () => {
+  const pr = pr1563({ labels: lbl('review:pending'), comments: [], rowsComplete: true,
+    rowsHead: pr1563().headRefOid, statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] });
+  const result = planReconcile({ prs: [pr], requiredChecks: ['review-gate'], agents: [], durableCounts: {}, now: NOW,
+    advisoryReviewOnHumanHandoff: 'on',
+    reviewTiming: { startAfter: 'fast-checks', fastChecks: ['review-gate'], startEarly: 'off' } });
+  expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: pr.number }));
+  expect(result.refusals.flatMap(row => [row, row.reviewRefusal])).not.toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+});
+
+it('review-hold override refuses incomplete rows whose affected rows are only failures', () => {
+  const pr = pr1563({ labels: lbl('review:pending'), comments: [], rowsComplete: false,
+    rowsHead: pr1563().headRefOid, statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] });
+  const result = planReconcile({ prs: [pr], requiredChecks: ['review-gate'], agents: [], durableCounts: {}, now: NOW,
+    advisoryReviewOnHumanHandoff: 'on',
+    reviewTiming: { startAfter: 'fast-checks', fastChecks: ['review-gate'], startEarly: 'off' } });
+  expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  expect(result.refusals.flatMap(row => [row, row.reviewRefusal])).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+    ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) }));
+});
+
+
+it('paged fetch evidence remains unknown to the planner even when every fetched row is green', () => {
+  const base = pr1563({ labels: lbl('review:pending'), comments: [] });
+  const fetched = mapGraphqlPr({ ...base, commits: { nodes: [{ commit: { oid: base.headRefOid,
+    statusCheckRollup: { contexts: { pageInfo: { hasNextPage: true }, totalCount: 2,
+      nodes: [{ __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] } } } }] } });
+  const result = planReconcile({ prs: [{ ...base, rowsHead: fetched.rowsHead, rowsComplete: fetched.rowsComplete,
+    statusCheckRollup: fetched.statusCheckRollup }], agents: [], now: NOW });
+  expect(fetched.rowsComplete).toBe(false);
+  expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  expect(result.refusals.flatMap(row => [row, row.reviewRefusal])).toContainEqual(expect.objectContaining({
+    // No review-gate row was observed, so no more specific reason exists: rows-incomplete stays the (fail-closed) reason.
+    kind: 'review-ci', ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) }));
+});
+
+
+describe('advisory review admission excludes review-owned checks unconditionally', () => {
+  const head = pr1563().headRefOid;
+  const bound = { jobId: 7, headSha: head, holdIds: ['review-acceptance'] };
+  const run = (hold, { rows = [], prOverrides = {}, ...options } = {}) => planReconcile({ prs: [pr1563({ labels: lbl('review:pending'), comments: [],
+    rowsComplete: true, rowsHead: head, statusCheckRollup: [{ name: 'merge-gate', status: 'completed', conclusion: 'failure',
+      detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', mergeGateReviewHold: hold }, ...rows], ...prOverrides })],
+    requiredChecks: ['merge-gate'], agents: [], durableCounts: {}, now: NOW, advisoryReviewOnHumanHandoff: 'on',
+    reviewTiming: { startAfter: 'fast-checks', fastChecks: ['merge-gate'], startEarly: 'off' }, ...options });
+  it('dispatches advisory review for a job/head-bound human review hold', () => {
+    expect(run(bound).dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
+  });
+  it.each([
+    ['wrong job', { ...bound, jobId: 8 }],
+    ['wrong head', { ...bound, headSha: 'b'.repeat(40) }],
+    ['empty IDs', { ...bound, holdIds: [] }],
+    ['non-human gate', { ...bound, holdIds: ['codeql'] }],
+    ['mixed gates', { ...bound, holdIds: ['review-acceptance', 'codeql'] }],
+    ['missing binding', {}],
+  ])('admits advisory review despite %s on an excluded merge-gate', (_name, hold) => {
+    // #7037 excludes review-owned checks unconditionally; Rule 7 binding governs other CI consumers.
+    const result = run(hold);
+    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
+    expect(result.refusals.flatMap(row => [row, row.reviewRefusal]))
+      .not.toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+  });
+  it.each([
+    ['failed required CI', [{ name: 'test', status: 'completed', conclusion: 'failure' }]],
+    ['pending required CI', [{ name: 'test', status: 'queued', conclusion: null }]],
+    ['malformed required CI', [{ name: 'test' }]],
+    ['missing required CI', []],
+  ])('refuses %s beside an excluded merge-gate with an operator-visible review-ci reason', (_name, rows) => {
+    const result = run(bound, { rows, requiredChecks: ['merge-gate', 'test'],
+      // A recorded escalation reaches review admission instead of dispatching another CI healer first.
+      prOverrides: { comments: [{ author: AUTOMATION, body: buildCiHealEscalationComment({ headSha: head,
+        outcome: 'not-a-ci-break', reason: 'review hold' }) }] },
+      reviewTiming: { startAfter: 'fast-checks', fastChecks: ['merge-gate', 'test'], startEarly: 'off' } });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.refusals.flatMap(row => [row, row.reviewRefusal]))
+      .toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+  });
+  it('refuses incomplete evidence even when the only required check is review-owned', () => {
+    const result = run(bound, { prOverrides: { rowsComplete: false } });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.refusals.flatMap(row => [row, row.reviewRefusal]))
+      .toContainEqual(expect.objectContaining({ kind: 'review-ci',
+        ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) }));
+  });
+});
+
+
+describe('reconcile review admission preserves required-roster provenance', () => {
+  const pr = () => pr1563({ labels: lbl('review:pending'), comments: [],
+    statusCheckRollup: greenRollup });
+  const plan = (rosterSource, row = pr()) => planReconcileCore({ prs: [row], agents: [], now: NOW,
+    requiredChecks: ['gate'], rosterSource, reviewTiming: { startAfter: 'ci-green', startEarly: 'off' } });
+  it.each(['live', 'cache'])('complete same-head green CI admits review under ci-green with %s provenance', rosterSource => {
+    const result = plan(rosterSource);
+    expect(result.dispatch).toContainEqual(expect.objectContaining({ prNumber: 1563, kind: 'review' }));
+    expect(result.refusals.filter(row => row.kind === 'review-ci')).toEqual([]);
+  });
+  it.each([undefined, 'declared', 'stale-cache', 'fallback'])('unknown or untrusted %s provenance refuses review even if PR carries old live provenance', rosterSource => {
+    const result = plan(rosterSource, { ...pr(), rosterSource: 'live' });
+    expect(result.dispatch.filter(row => row.kind === 'review')).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+      ci: expect.objectContaining({ allowed: false, unknown: true, reason: 'unknown-required-set' }) }));
+  });
+  it('trusted provenance cannot excuse incomplete CI evidence', () => {
+    const result = plan('live', { ...pr(), rowsComplete: false });
+    expect(result.dispatch.filter(row => row.kind === 'review')).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+      ci: expect.objectContaining({ allowed: false, reason: 'rows-incomplete' }) }));
+  });
+
+});
+
+
+it('reconcile gate call sites explicitly forward roster provenance instead of inventing live evidence', async () => {
+  const { readFileSync } = await import('node:fs');
+  const ts = await import('typescript');
+  const source = ts.createSourceFile('reconcile-core.mjs',
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-core.mjs'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  let calls = 0;
+  const visit = node => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+      && ['reviewCiGate', 'reviewStartGate'].includes(node.expression.text)) {
+      calls++;
+      const options = node.arguments[0];
+      expect(ts.isObjectLiteralExpression(options)).toBe(true);
+      const property = options.properties.find(prop => prop.name?.getText(source) === 'rosterSource');
+      expect(property, `${node.expression.text} at ${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}`).toBeDefined();
+      expect(property.initializer.getText(source)).toMatch(/^pr\??\.rosterSource$/);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  expect(calls).toBeGreaterThanOrEqual(4);
 });

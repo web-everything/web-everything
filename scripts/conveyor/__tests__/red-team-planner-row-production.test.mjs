@@ -1,0 +1,96 @@
+import { expect, it, vi } from 'vitest';
+import { readPlannerRow } from '../../lib/red-team-planner-row.mjs';
+import { mapGraphqlPr } from '../../lib/pr-list-paged.mjs';
+import { runReconcilePass } from '../reconcile-pass.mjs';
+import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
+import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { REVIEW_TIMING_DEFAULTS } from '../../lib/review-timing.mjs';
+
+vi.mock('node:child_process', async original => ({ ...await original(), execFileSync: vi.fn(() => '[]') }));
+vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(),
+  execFileSyncThrottled: vi.fn(() => '[]'), runGhSync: vi.fn(() => '[]') }));
+const identity = value => value;
+const head = 'a'.repeat(40), pr = 5762;
+const check = (name, conclusion = 'failure', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+it.each([['b'.repeat(40), 'unknown'], [head, 'pass'], [undefined, 'unknown']])(
+  'uses the GraphQL rollup parent commit %s for planner evidence', (snapshotHead, state) => {
+    const raw = mapGraphqlPr({ number: pr, headRefOid: head, commits: { nodes: [{ commit: {
+      oid: snapshotHead, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 1,
+        nodes: [{ __typename: 'CheckRun', ...check('test', 'success') }] } },
+    } }] } });
+    const row = readPlannerRow({ pr, rawPrs: [raw], requiredChecks: ['test'], rosterSource: 'live',
+      refusals: [{ kind: 'review-ci', prNumber: pr, headSha: head }] });
+    expect(row.checkEvidence.state).toBe(state);
+    expect(row.reviewOwnedChecks.onlyRed).toBe(state === 'pass');
+  });
+const options = source => ({ repo: 'we', now: 2_000_000, env: {},
+  readPrs: () => [source], readAgents: () => [], enrich: identity,
+  readRequiredChecks: () => ({ checks: ['test', 'review-gate', 'merge-gate'], source: 'live' }), resolveMainSha: () => null,
+  excuseMergeGateHolds: prs => prs.map(row => ({ ...row, statusCheckRollup: row.statusCheckRollup.map(c =>
+    c.name === 'merge-gate' ? { ...c, mergeGateReviewHold: { holdIds: ['review-acceptance'], headSha: head, jobId: 5874001 } } : c) })),
+  enrichMainRed: prs => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: identity,
+  enrichBaseRef: identity, enrichSystemFix: identity, enrichEscalationBase: identity,
+  enrichFixClaims: identity, enrichTimeouts: identity, enrichReferralHolds: identity,
+  enrichReferralAutoResolve: identity, enrichLedgerHolds: identity,
+  enrichRulings: identity, enrichScopeBloat: identity, enrichCodeQL: identity,
+  enrichOwedMainRule: identity, enrichStandingRulingGrants: identity, enrichMechanicalRound: identity,
+  loadMechanicalRoundsSetting: () => ({ value: true, source: 'fixture' }), stepLog: () => {},
+});
+const source = () => ({ number: pr, headRefOid: head, rowsComplete: true, rowsHead: head, headRefName: 'lane/5762-example', state: 'OPEN',
+  labels: [{ name: 'review:pending' }], comments: [], mergeStateStatus: 'CLEAN',
+  statusCheckRollup: [check('test', 'success'), check('review-gate'), check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/5874001' })] });
+
+it.each([false, true])('recomputes daemon and external classifications from their current snapshots (readOnly=%s)', readOnly => {
+  const raw = source();
+  const plan = runReconcilePass({ ...options(raw), readOnly });
+  expect(plan.plannerRequiredChecks).toEqual(['test', 'review-gate', 'merge-gate']);
+  expect(plan.plannerRequiredChecksSource).toBe('live');
+  if (readOnly) expect(plan.plannerOptions.rosterSource).toBe('live');
+  const row = readPlannerRow({ repo: 'web-everything/web-everything', pr, plan, rawPrs: [raw] });
+  expect(row.absent).toBe(false);
+  expect(row.refusal).toBe(plan.refusals.find(r => r.prNumber === pr));
+  expect(row.refusal.headSha).toBe(head);
+  expect(plan.plannerRows[0].checkEvidence.state).toBe('held');
+  expect(plan.plannerRows[0].reviewOwnedChecks).toMatchObject({ reviewOwned: ['merge-gate', 'review-gate'],
+    nonReviewOwned: [], gatesOnlyRed: true, onlyRed: true });
+  expect(row.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate'],
+    nonReviewOwned: ['merge-gate'], gatesOnlyRed: false, onlyRed: false });
+  expect(raw.statusCheckRollup[2]).not.toHaveProperty('mergeGateReviewHold');
+  expect(row.reviewOwnedChecks).not.toBe(plan.plannerRows[0].reviewOwnedChecks);
+});
+
+it('exposes scope-bloat folded by the normal not-a-ci-break escalation, without nominating a new path', () => {
+  const scopeBloat = { stale: true, why: 'stale base carries unrelated changes' };
+  const raw = { ...source(), scopeBloat, statusCheckRollup: [check('test')],
+    comments: [{ author: { login: 'web-everything' }, body: buildCiHealEscalationComment({
+      headSha: head, outcome: 'not-a-ci-break', reason: 'review hold' }) }] };
+  const plan = runReconcilePass({ ...options(raw), readOnly: true, readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) });
+  const row = readPlannerRow({ pr, plan });
+  expect(row.refusal).toMatchObject({ kind: 'ci-heal-escalated', reviewRefusal: { kind: 'scope-bloat', scopeBloat } });
+  expect(row.refusal.reviewRefusal).not.toHaveProperty('ciHealNotCiBreak');
+  expect(plan.dispatch).toEqual([]);
+});
+
+it.each([false, true])('an allow-listed nomination consumes hydrated bound holds without changing raw CI (readOnly=%s)', readOnly => {
+  const raw = { ...source(), labels: ['review:human'], isDraft: false, reviews: [],
+    files: [{ path: 'scripts/guard.mjs', additions: 2, deletions: 1 }],
+    statusCheckRollup: [...source().statusCheckRollup, ...REVIEW_TIMING_DEFAULTS.fastChecks.we.map(name => check(name, 'success'))] };
+  const p = runReconcilePass({ ...options(raw), readOnly, loadPrOwnership: () => ({
+    advisoryReviewOnHumanHandoff: { value: 'off', source: 'fixture' } }) });
+  const run = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } };
+  const dispatch = vi.fn(() => ({ jobPid: 42 }));
+  // This producer fixture yields review-hold-red, which is outside PR-B's allow-list. Exercise the
+  // dispatch consumer with the task's review-ci refusal, retaining the real producer's hydration/options.
+  expect(p.refusals[0].kind).toBe('review-hold-red');
+  const nominated = { ...p, refusals: [{ kind: 'review-ci', prNumber: pr, headSha: head }] };
+  const out = runRedTeamOnSkip({ repo: 'web-everything/web-everything', plan: nominated, rawPrs: [raw],
+    dispatch, now: () => 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+    readWitness: () => ({ rawWriter: { parsed: null }, seats: [], newest: run }),
+    readEvidence: () => ({ loopPayload: run, recorded: false }), readStatus: () => null,
+    capacity: { lanes: 1, remainingStarts: 1, budget: { left: 1 } } });
+  expect(readPlannerRow({ pr, plan: p, rawPrs: [raw] }).checkEvidence.state).toBe('fail');
+  expect(p.nominationPrs[0].statusCheckRollup[2]).toHaveProperty('mergeGateReviewHold');
+  expect(raw.statusCheckRollup[2]).not.toHaveProperty('mergeGateReviewHold');
+  expect(out.dispatched, JSON.stringify(out.rows)).toHaveLength(1);
+  expect(dispatch).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr, expectedHead: head, redTeamOnly: true, redTeamMode: 'fresh' });
+});
