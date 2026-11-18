@@ -2215,6 +2215,8 @@ a delayed request starts later and remains active at 28 minutes.
 
 Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
 operator-confirmed cleanup remain the fallback while capacity is retained.
+Cancel-finish waits for the supervisor, then proves the reserved UID empty before clearing a stale
+`executing` lock; unprovable cleanup holds the marker and raises one needs-you alert naming the slot (throttled per slot).
 Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
 finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
 lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
@@ -3355,6 +3357,10 @@ reclamation: acquisition, prepare, execution, and finish hold shared leases on
 persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
 leases through scanning and deletion and proves UID process absence before
 removing a reservation.
+Cancel-finish clears a stale `executing` lock only with both proven UID emptiness and
+an `lstat` mtime age at least the hard max runtime, measured with the injected clock.
+Before that bound, even successful UID cleanup retains the lock and requires an operator
+to stop the reserved UID; failed cleanup also retains it past the bound.
 The root supervisor requires reservation evidence and rechecks it under its own shared lease;
 a forked child retains that lease through UID drop and closes it before task exec.
 Only reservations declaring `writerGuard: 1` participate; historical or uncertain
