@@ -28,6 +28,7 @@ function fixture() {
   let clone;
   const commands = [];
   const spawnAgy = vi.fn();
+  const log = vi.fn();
   const run = async (act = () => {}, options = {}) => {
     spawnAgy.mockImplementation(async args => {
       clone = args.dir;
@@ -44,7 +45,7 @@ function fixture() {
     });
     return runConfinedAgyBuild({ task: 'repair', laneDir: lane, kind: 'doc-fix', size: 1, scope: ['docs'],
       ...options.input, deps: {
-        env: options.env ?? {}, log: vi.fn(), spawnAgy: options.production ? undefined : spawnAgy,
+        env: options.env ?? {}, log, spawnAgy: options.production ? undefined : spawnAgy,
         platform: options.platform ?? 'unsupported-test-platform', sandboxExists: () => options.sandboxExists ?? false,
         mkTempDir: prefix => { clone = mkdtempSync(prefix); roots.push(clone); return clone; },
         readFile: p => {
@@ -63,7 +64,7 @@ function fixture() {
         },
       } });
   };
-  return { root, lane, run, spawnAgy, commands, clone: () => clone };
+  return { root, lane, run, spawnAgy, commands, log, clone: () => clone };
 }
 
 describe('agy build fail-closed admission', () => {
@@ -88,16 +89,18 @@ describe('agy build fail-closed admission', () => {
     expect(readFileSync(hostTarget, 'utf8')).toBe('valuable untracked host data\n');
   });
   it.each([
-    ['doc-fix', 2], ['test-fix', 2], ['feature', 1],
-  ])('admits allowed kind OR bounded size (%s, %s)', async (kind, size) => {
+    ['doc-fix', 2], ['test-fix', 2], ['doc-fix', 3], ['test-fix', 3], ['feature', 1],
+  ])('admits bounded allowed kind OR bounded size (%s, %s)', async (kind, size) => {
     const f = fixture();
     expect(await f.run(undefined, { input: { kind, size } })).toMatchObject({ status: 'ok', applied: [] });
     expect(f.spawnAgy).toHaveBeenCalledOnce();
   });
   it.each([
-    { kind: 'feature', size: 2 }, { kind: undefined }, { size: undefined }, { size: '1' },
+    { kind: 'feature', size: 2 }, { kind: 'doc-fix', size: 4 }, { kind: 'test-fix', size: 4 },
+    { kind: undefined }, { size: undefined }, { size: '1' }, { size: Infinity },
     { size: NaN }, { scope: undefined }, { scope: [] }, { scope: ['/docs'] },
     { scope: ['docs/../outside.txt'] }, { scope: ['.git'] }, { scope: ['**'] },
+    { scope: Array.from({ length: 21 }, (_, i) => `docs/${i}.md`) },
   ])('refuses missing, oversized or unsafe admission %j without launching', async input => {
     const f = fixture();
     const r = await f.run(undefined, { input });
@@ -107,6 +110,8 @@ describe('agy build fail-closed admission', () => {
   });
   it.each([{ settingsError: true }, { settingsText: '{' }, { settingsText: 'null' },
     { settings: { maxSize: '2' } }, { env: { WE_AGY_BUILD_MAX_SIZE: 'invalid' } },
+    ...['invalid', '', '0', '-1', '1.5', 'NaN', 'Infinity'].map(value => ({ env: { WE_AGY_BUILD_KIND_MAX_SIZE: value } })),
+    ...['3', 0, -1, 1.5, null].map(kindMaxSize => ({ settings: { kindMaxSize } })),
   ])('refuses unreadable or malformed settings/env %j', async options => {
     const f = fixture();
     expect((await f.run(undefined, options)).status).toBe('refused');
@@ -124,6 +129,23 @@ describe('agy build fail-closed admission', () => {
     expect((await f.run(undefined, { input: { kind: 'feature', size: 2 },
       settings: { allowedKinds: ['feature'], maxSize: 10 },
       env: { WE_AGY_BUILD_KINDS: 'doc-fix,test-fix', WE_AGY_BUILD_MAX_SIZE: '1' } })).status).toBe('refused');
+  });
+  it('admits twenty scope entries independently of size', async () => {
+    const f = fixture();
+    expect((await f.run(undefined, { input: { scope: Array.from({ length: 20 }, (_, i) => `docs/${i}.md`) } })).status).toBe('ok');
+    expect(f.spawnAgy).toHaveBeenCalledOnce();
+  });
+  it.each([
+    [{ kindMaxSize: 3 }, '4', 4, 'ok'],
+    [{ kindMaxSize: 4 }, '3', 4, 'refused'],
+    [{ kindMaxSize: 4 }, undefined, 4, 'ok'],
+  ])('resolves kindMaxSize env above settings: %j, %s', async (settings, override, size, status) => {
+    const f = fixture();
+    expect((await f.run(undefined, { settings, input: { size },
+      env: override === undefined ? {} : { WE_AGY_BUILD_KIND_MAX_SIZE: override } })).status).toBe(status);
+    expect(f.spawnAgy).toHaveBeenCalledTimes(status === 'ok' ? 1 : 0);
+    expect(f.log.mock.calls.flat().join(' ')).toContain(`kindMaxSize=${override ?? settings.kindMaxSize}`);
+    expect(f.log.mock.calls.flat().join(' ')).toContain(override === undefined ? '(tool)' : '(env)');
   });
 });
 

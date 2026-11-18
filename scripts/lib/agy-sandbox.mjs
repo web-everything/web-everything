@@ -76,26 +76,31 @@ export function preparePrivateAgyHome(homeDir, privateHomeDir, cloneDir) {
 
 /** Pure SBPL builder. Inputs are canonical absolute paths resolved by the launcher.
  * deniedPaths lets the launcher resolve secret symlinks; extraDeniedPaths supports isolated probes. */
-export function buildSandboxProfile({ cloneDir, privateTempDir, laneDir, homeDir, privateHomeDir, workspaceOps,
-  agyBinDir, workspaceDir = join(homeDir, 'workspace'), deniedPaths = sandboxSecretPaths(homeDir), extraDeniedPaths = [] }) {
+export function buildSandboxProfile({ cloneDir, privateTempDir, laneDir, homeDir, privateHomeDir, workspaceOps, osTempBase,
+  agyBinDir, homebrewPrefix, workspaceDir = join(homeDir, 'workspace'), deniedPaths = sandboxSecretPaths(homeDir), extraDeniedPaths = [] }) {
   const privateState = join(privateHomeDir, '.gemini');
   const writable = [cloneDir, privateTempDir, privateState];
-  const readable = [cloneDir, privateTempDir, privateHomeDir,
-    ...(agyBinDir && inside(agyBinDir, homeDir) ? [agyBinDir] : [])];
+  safePath(osTempBase);
+  const readDenied = ['/Users', '/Volumes', '/private/tmp', '/tmp',
+    inside(osTempBase, '/private/var/folders') ? '/private/var/folders' : osTempBase, homeDir];
+  const binaryRoots = [agyBinDir, homebrewPrefix].filter(Boolean);
+  const readable = [cloneDir, privateTempDir, privateHomeDir, ...binaryRoots];
+  readDenied.forEach(safePath);
   [homeDir, workspaceDir, workspaceOps, laneDir, ...writable, ...readable, ...(agyBinDir ? [agyBinDir] : []), ...deniedPaths, ...extraDeniedPaths].forEach(safePath);
-  if (agyBinDir && inside(agyBinDir, join(homeDir, '.gemini'))) throw new Error('agy binary overlaps real state');
+  if (binaryRoots.some(bin => [workspaceDir, join(homeDir, 'workspace')].some(p => inside(bin, p) || inside(p, bin))))
+    throw new Error('agy binary overlaps workspace; use another provider or request operator review');
+  if (binaryRoots.some(p => inside(p, join(homeDir, '.gemini')) || inside(join(homeDir, '.gemini'), p)))
+    throw new Error('agy binary overlaps real state');
   if ([...writable, privateHomeDir].some(p => inside(p, join(homeDir, '.gemini')) || inside(join(homeDir, '.gemini'), p)))
     throw new Error('sandbox path overlaps real agy state');
   if ([cloneDir, laneDir, workspaceDir, join(homeDir, 'workspace')].some(p => inside(privateHomeDir, p) || inside(p, privateHomeDir)))
     throw new Error('private home overlaps clone, lane or workspace');
-  if (agyBinDir && [workspaceDir, join(homeDir, 'workspace')].some(p => inside(agyBinDir, p) || inside(p, agyBinDir)))
-    throw new Error('agy binary overlaps workspace; use another provider or request operator review');
   if (writable.some(p => [workspaceDir, join(homeDir, 'workspace'), laneDir].some(root => inside(p, root) || inside(root, p))))
     throw new Error('sandbox writable path under home/workspace or lane; use another provider or request operator review');
   if (inside(privateTempDir, cloneDir) || inside(cloneDir, privateTempDir))
     throw new Error('sandbox temp must be outside clone; use another provider or request operator review');
   const subpath = p => `(subpath ${JSON.stringify(p)})`;
-  return ['(version 1)', '(allow default)', `(deny file-read* ${subpath(homeDir)})`,
+  return ['(version 1)', '(allow default)', ...readDenied.map(p => `(deny file-read* ${subpath(p)})`),
     `(allow file-read* ${readable.map(subpath).join(' ')})`, '(deny file-write*)',
     `(allow file-write* ${writable.map(subpath).join(' ')} (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper"))`,
     `(deny file-read* ${[...deniedPaths, workspaceDir, join(homeDir, 'workspace'), workspaceOps, ...extraDeniedPaths].map(subpath).join(' ')})`, ''].join('\n');

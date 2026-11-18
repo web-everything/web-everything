@@ -4664,7 +4664,9 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 
 `agy-confined-build.test.mjs` uses temporary local Git repositories and injected fake agy
 execution; it never launches agy. Admission requires kind, numeric size and literal repo-relative
-file/directory scope prefixes. Allowed kinds **or** size at/below the bound admit the repair;
+file/directory scope prefixes (at most 20 entries). Allowed kinds require size at/below
+`kindMaxSize` (default 3, `WE_AGY_BUILD_KIND_MAX_SIZE`, positive integer); alternatively,
+any kind with size at/below `maxSize` remains admitted (R1062). Missing/nonfinite sizes refuse;
 settings must remain readable, with environment overrides above settings above defaults.
 Keep whole-run rejection cases for mixed scope, Git controls, escaping/new symlinks, modes,
 binary/submodule changes, traversal, Git calls, moved HEAD, changed real lane and incomplete
@@ -4690,7 +4692,12 @@ and scope checks still gate the launcher-owned patch application. No agy Git ope
 `agy-sandbox.test.mjs` covers profile grants/denials and unsafe paths; its Darwin-only REAL shell
 probe uses only temporary directories, demonstrates allowed clone writes, rejects outside writes
 with EPERM and checks that the target never appears, and rejects reads from a temporary denied
-directory. It never touches real home secrets or launches agy. The injected build tests separately
+directory. Broad read denies cover `/Users`, `/Volumes`, both tmp aliases and the canonical OS
+temp base (`/private/var/folders` on Darwin), before explicit clone/private home/temp and resolved
+binary-directory/Homebrew-prefix grants; secret/workspace denies remain last. Binary grants
+overlapping the home workspace refuse. The REAL probe also rejects sibling-temp reads with EPERM,
+allows clone/private-temp reads, and runs system sh/cat/ls. It never touches real home secrets
+or launches agy. The injected build tests separately
 cover unsupported hosts and missing sandbox-exec without launching a worker. Run these focused
 files and the fix-run fixtures only via the host heavy-admission queue; fake-worker evidence alone
 does not establish confinement. These slice B tests were authored without running them.

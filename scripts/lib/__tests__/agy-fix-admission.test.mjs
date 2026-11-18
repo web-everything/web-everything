@@ -30,10 +30,16 @@ describe('repair scope admission', () => {
     expect(deriveAgyFixAdmission({ taskKind: 'fix', size: 1, scope: [path] })).toBeNull();
   });
   it.each([
-    { size: 1, scope: ['a.md', 'b.md'] }, { size: 0, scope: ['a.md'] },
+    { size: 1, scope: Array.from({ length: 21 }, (_, i) => `docs/${i}.md`) }, { size: 0, scope: ['a.md'] },
+    { size: NaN, scope: ['a.md'] },
     { size: 2, scope: ['a.md'] }, { size: 1, scope: [] }, { size: 1, scope: ['fui:docs'] },
     { size: 1, scope: ['../a.md'] }, { scope: ['a.md'] },
   ])('refuses missing, oversized or unsafe evidence %j', item => {
     expect(deriveAgyFixAdmission({ taskKind: 'doc-fix', ...item })).toBeNull();
+  });
+  it.each([2, 20])('admits %s scope entries independently of size', count => {
+    const scope = Array.from({ length: count }, (_, i) => `docs/${i}.md`);
+    expect(deriveAgyFixAdmission({ taskKind: 'doc-fix', size: 1, scope }))
+      .toEqual({ kind: 'doc-fix', size: 1, scope });
   });
 });

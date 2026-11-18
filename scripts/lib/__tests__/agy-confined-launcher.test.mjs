@@ -50,15 +50,26 @@ it('production launcher consults persisted quota holds and refuses before sandbo
   expect(spawn).not.toHaveBeenCalled();
 });
 
-it('production sandbox callback records quota exhaustion using the real store and passes a scrubbed environment', async () => {
+it.each(['direct', 'homebrew-symlink'])('production sandbox callback resolves %s grants, records quota and scrubs environment', async installation => {
   const { options } = fixture();
+  const homebrewPrefix = join(host.home, 'brew');
+  if (installation === 'homebrew-symlink') {
+    const target = join(homebrewPrefix, 'Cellar/agy/1/bin/agy');
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    const link = join(host.home, 'bin/linked-agy');
+    symlinkSync(target, link);
+    options.cli = link;
+  }
   vi.stubEnv('GH_TOKEN', 'must-not-reach-child');
   vi.stubEnv('SSH_AUTH_SOCK', '/host-agent');
   spawn.mockImplementation((bin, args, opts) => {
     expect(bin).toBe('/usr/bin/sandbox-exec');
     expect(args).toContain(realpathSync(options.cli));
     const profile = readFileSync(args[1], 'utf8');
-    expect(profile).toContain(`(subpath ${JSON.stringify(dirname(options.cli))})`);
+    const readRule = profile.split('\n').find(line => line.startsWith('(allow file-read*'));
+    expect(readRule).toContain(`(subpath ${JSON.stringify(dirname(realpathSync(options.cli)))})`);
+    if (installation === 'homebrew-symlink') expect(readRule).toContain(`(subpath ${JSON.stringify(homebrewPrefix)})`);
     expect(opts.env).not.toHaveProperty('GH_TOKEN');
     expect(opts.env).not.toHaveProperty('SSH_AUTH_SOCK');
     expect(opts.env).not.toHaveProperty('ANTIGRAVITY_QUOTA_DIR');

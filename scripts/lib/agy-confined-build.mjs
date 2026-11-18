@@ -15,7 +15,7 @@ import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
 // The juror's SAFE_GIT is private; keep its pins at every git boundary, including injected exec.
 const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false'];
-const DEFAULTS = { allowedKinds: ['doc-fix', 'test-fix'], maxSize: 1 };
+const DEFAULTS = { allowedKinds: ['doc-fix', 'test-fix'], maxSize: 1, kindMaxSize: 3 };
 const WRITE_TOOLS = new Set(['write_to_file', 'replace_file_content', 'multi_replace_file_content']);
 const validPath = p => typeof p === 'string' && !!p && !isAbsolute(p)
   && !/[\x00-\x1f\x7f\\*?\[\]{}:]/.test(p)
@@ -57,8 +57,9 @@ export async function defaultSpawnAgy(options) {
     const privateHomeDir = profileDir;
     preparePrivateAgyHome(homeDir, privateHomeDir, realpathSync(options.dir));
     const privateTempDir = mkdtempSync(join(profileDir, 'tmp-'));
-    const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir, privateTempDir, privateHomeDir,
+    const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir, privateTempDir, privateHomeDir, osTempBase: temp,
       laneDir: realpathSync(options.laneDir), workspaceDir, agyBinDir: dirname(cli),
+      homebrewPrefix: cli.match(/^(.*)\/(?:Cellar|Caskroom)\//)?.[1],
       workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
       deniedPaths: sandboxSecretPaths(homeDir).map(canonicalPath) });
     const profileFile = join(profileDir, 'profile.sb');
@@ -143,14 +144,18 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
         allowedKinds: env.WE_AGY_BUILD_KINDS === undefined ? undefined : env.WE_AGY_BUILD_KINDS.split(',').map(s => s.trim()),
         maxSize: env.WE_AGY_BUILD_MAX_SIZE === undefined ? undefined
           : env.WE_AGY_BUILD_MAX_SIZE.trim() ? Number(env.WE_AGY_BUILD_MAX_SIZE) : NaN,
+        kindMaxSize: env.WE_AGY_BUILD_KIND_MAX_SIZE === undefined ? undefined
+          : env.WE_AGY_BUILD_KIND_MAX_SIZE.trim() ? Number(env.WE_AGY_BUILD_KIND_MAX_SIZE) : NaN,
       }, valid: { allowedKinds: v => Array.isArray(v) && v.length > 0 && v.every(k => typeof k === 'string' && /^[a-z][a-z0-9-]*$/.test(k)),
+        kindMaxSize: v => Number.isInteger(v) && v > 0,
         maxSize: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 } });
     log(formatCascadeSourcesLine('agyBuild', resolved));
     if (resolved.invalid.length || typeof kind !== 'string' || !kind.trim() || !Number.isFinite(size) || size < 0
-      || !Array.isArray(scope) || !scope.length || !scope.every(validPath)
+      || !Array.isArray(scope) || !scope.length || scope.length > 20 || !scope.every(validPath)
       || typeof laneDir !== 'string' || !laneDir.trim() || typeof task !== 'string' || !task.trim())
       return result('refused', ['missing or invalid kind/size/scope/task/lane; use another fix provider or request human review']);
-    if (!resolved.value.allowedKinds.includes(kind) && size > resolved.value.maxSize)
+    if (!(resolved.value.allowedKinds.includes(kind) && size <= resolved.value.kindMaxSize)
+      && size > resolved.value.maxSize)
       return result('refused', ['kind and size exceed agy build admission; use another fix provider or request operator review']);
     if (spawnAgy === defaultSpawnAgy && (platform !== 'darwin' || !sandboxExists('/usr/bin/sandbox-exec')))
       return result('refused', [

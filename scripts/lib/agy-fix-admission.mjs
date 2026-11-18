@@ -25,8 +25,8 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
   });
   const taskKind = item.taskKind ?? item.taskType ?? item.kind ?? launch.taskKind ?? 'fix';
   const size = item.size ?? launch.size;
-  if (!scope.length || !scope.every(p => isAgyFixPathAllowed(p, taskKind))) return null;
-  if (!Number.isFinite(size) || size < scope.length || size > 1) return null;
+  if (!scope.length || scope.length > 20 || !scope.every(p => isAgyFixPathAllowed(p, taskKind))) return null;
+  if (!Number.isFinite(size) || size !== 1) return null;
   if (typeof taskKind !== 'string' || !/^[a-z][a-z0-9-]*$/.test(taskKind)) return null;
   const kind = taskKind === 'fix' && scope.every(isDoc) ? 'doc-fix'
     : taskKind === 'fix' && scope.every(isTest) ? 'test-fix' : taskKind;
