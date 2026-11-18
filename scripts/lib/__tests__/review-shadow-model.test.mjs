@@ -361,11 +361,11 @@ it('persists served-model evidence through the shadow runner for promotion count
   expect(summarizeCarbonPromotion(result.rows).agreeingPrs).toBe(1);
   const legacy = await run([ok], { model: servedModel });
   expect(legacy.rows[0].servedModel).toBeNull();
-  expect(summarizeCarbonPromotion(legacy.rows).comparedPrs).toBe(0);
+  expect(summarizeCarbonPromotion(legacy.rows)).toMatchObject({ agreeingPrs: 0, comparedPrs: 1 });
 });
 
 it('promotion evidence rejects a PR where Carbon misses a Claude finding', () => {
   const row = (pr, overlap) => ({ repo: 'r', pr, status: 'ok', servedModel: 'gemini-4-carbon-high', verdictAgree: true, overlap });
-  const rows = [row(1, { matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 }), row(2, { matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 })];
-  expect(summarizeCarbonPromotion(rows, { threshold: 10 })).toMatchObject({ agreeingPrs: 1, comparedPrs: 2, reached: false });
+  const rows = [row(1, { matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 }), row(2, { matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 }), row(3, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), row(4, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), { repo: 'r', pr: 4, status: 'failed', model: 'gemini-4-carbon-high', servedModel: null }];
+  expect(summarizeCarbonPromotion(rows, { threshold: 10 })).toMatchObject({ agreeingPrs: 1, comparedPrs: 4, reached: false });
 });

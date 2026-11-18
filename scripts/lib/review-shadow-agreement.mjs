@@ -187,14 +187,17 @@ export function summarizeShadowAgreement(rows = []) {
 export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
   if (!Number.isSafeInteger(threshold) || threshold <= 0) throw new RangeError('promotion threshold must be a positive safe integer');
   const prs = new Map();
+  const isCarbon = (row) => `${row?.servedModel ?? ''} ${row?.model ?? ''}`.toLowerCase().includes('carbon');
   for (const row of rows) {
-    if (typeof row?.servedModel !== 'string' || !row.servedModel.toLowerCase().includes('carbon') || row.status !== 'ok'
-      || !row.overlap || Object.hasOwn(row, 'fellBackTo') || row.repo == null || row.pr == null) continue;
+    if (!isCarbon(row) || Object.hasOwn(row, 'fellBackTo') || row.repo == null || row.pr == null) continue;
     const key = `${row.repo}#${row.pr}`;
-    // Carbon must find every Claude finding (none Claude-only); extra Carbon-only findings do not disqualify it.
-    const findingsAgree = (row.overlap.claudeOnly ?? row.overlap.claudeCount) === 0
-      && (row.overlap.matched > 0 || (row.overlap.claudeCount === 0 && row.overlap.agyCount === 0));
-    prs.set(key, (prs.get(key) ?? true) && row.verdictAgree === true && findingsAgree);
+    // Any failed, voided, skipped, uncompared or unserved Carbon trial on the PR disqualifies it: incomplete evidence.
+    const complete = typeof row.servedModel === 'string' && row.servedModel.toLowerCase().includes('carbon')
+      && row.status === 'ok' && Boolean(row.overlap);
+    // Carbon must match every Claude finding and add none of its own (no Claude-only, no Carbon-only findings).
+    const findingsAgree = complete && (row.overlap.claudeOnly ?? row.overlap.claudeCount) === 0
+      && (row.overlap.agyOnly ?? row.overlap.agyCount) === 0;
+    prs.set(key, (prs.get(key) ?? true) && complete && row.verdictAgree === true && findingsAgree);
   }
   const agreeingPrs = [...prs.values()].filter(Boolean).length;
   return { agreeingPrs, comparedPrs: prs.size, threshold, reached: agreeingPrs >= threshold };
