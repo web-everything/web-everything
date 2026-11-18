@@ -1,13 +1,14 @@
 /** R1062/S7: sandbox-exec enforced filesystem confinement plus patch/transcript checks.
  * The launcher alone applies admitted hunks; agy's git operations remain forbidden. */
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
   stateChangingToolCalls, READ_ONLY_AGY_TOOLS, scrubPaths, MODULE_REPO_ROOT } from './agy-review-juror.mjs';
 import { buildScratchCloneArgv, summarizeAgyEvents, runAgyDirectExec } from '../gemini-direct-task.mjs';
-import { buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
+import { buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
+import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
@@ -38,11 +39,17 @@ function canonicalPath(path) {
   }
 }
 
-async function defaultSpawnAgy(options) {
+export async function defaultSpawnAgy(options) {
   const homeDir = realpathSync(homedir());
   const temp = realpathSync(tmpdir());
+  const requested = options.cli ?? 'agy';
+  const candidates = isAbsolute(requested) ? [requested]
+    : (process.env.PATH ?? '').split(':').filter(isAbsolute).map(p => join(p, requested));
+  const executable = candidates.find(p => { try { accessSync(p, constants.X_OK); return true; } catch { return false; } });
+  if (!executable) throw new Error('agy executable unavailable; use another provider or request operator review');
+  const cli = realpathSync(executable);
   const state = join(homeDir, '.gemini/antigravity-cli');
-  if (canonicalPath(state) !== state || canonicalPath(join(homeDir, '.gemini/projects.json')) !== join(homeDir, '.gemini/projects.json'))
+  if ([state, join(homeDir, '.gemini/projects.json'), join(homeDir, '.gemini/config')].some(p => canonicalPath(p) !== p))
     throw new Error('redirected agy state; use another provider or request operator review');
   mkdirSync(state, { recursive: true, mode: 0o700 });
   const profileDir = mkdtempSync(join(temp, 'we-agy-sandbox-'));
@@ -52,15 +59,15 @@ async function defaultSpawnAgy(options) {
       throw new Error('sandbox profile must be outside clone, lane and workspace');
     const privateTempDir = mkdtempSync(join(profileDir, 'tmp-'));
     const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir, privateTempDir,
-      laneDir: realpathSync(options.laneDir), workspaceDir,
+      laneDir: realpathSync(options.laneDir), workspaceDir, agyBinDir: dirname(cli),
       workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
       deniedPaths: sandboxSecretPaths(homeDir).map(canonicalPath) });
     const profileFile = join(profileDir, 'profile.sb');
     writeFileSync(profileFile, profile, { mode: 0o600, flag: 'wx' });
-    return await runAgyDirectExec({ ...options, spawnFn: (bin, args, opts) => {
+    return await runAgyDirectExec({ ...options, cli, readHold: readAgyHold, saveHold: saveAgyHold, spawnFn: (bin, args, opts) => {
       const [, ...argv] = sandboxedSpawnArgv(profileFile, [bin, ...args]);
       return spawn('/usr/bin/sandbox-exec', argv, { ...opts,
-        env: { ...process.env, ...opts.env, TMPDIR: privateTempDir, TMP: privateTempDir, TEMP: privateTempDir } });
+        env: buildSandboxEnv(process.env, privateTempDir) });
     } });
   } finally { rmSync(profileDir, { recursive: true, force: true }); }
 }

@@ -514,7 +514,7 @@ describe('fallback chain routing', () => {
     [{ taskKind: 'doc-fix', size: 1, scope: ['we:docs'] }, 'antigravity'],
     [{ taskKind: 'fix', size: 1, scope: ['we:docs/a.md'] }, 'antigravity'],
     [{ taskKind: 'test-fix', size: 1, scope: ['we:tests'] }, 'antigravity'],
-    [{ taskKind: 'feature', size: 1, scope: ['we:docs'] }, 'claude'],
+    [{ taskKind: 'feature', size: 1, scope: ['we:docs'] }, 'antigravity'], // R1062: size-1 builds are admitted
     [{ taskKind: 'doc-fix', size: 3, scope: ['we:docs'] }, 'claude'],
     [{ taskKind: 'doc-fix', scope: ['we:docs'] }, 'claude'],
     [{ taskKind: 'doc-fix', size: 1, scope: [] }, 'claude'],

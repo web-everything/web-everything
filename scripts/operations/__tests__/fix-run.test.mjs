@@ -542,7 +542,8 @@ describe('runFixCli', () => {
     expect(m.spawn).toHaveBeenCalledOnce();
   });
   it.each([
-    ['doc-fix', 1, ['we:docs'], true], ['feature', 1, ['we:docs'], false],
+    ['doc-fix', 1, ['we:docs'], true], ['feature', 1, ['we:docs'], true],
+    ['doc-fix', 1, ['scripts/operations/fix-run.mjs'], false], ['test-fix', 1, ['src'], false],
     ['doc-fix', 3, ['we:docs'], false], ['doc-fix', 1, [], false],
   ])('real detached dispatch derives repair admission from item %s size %s scope %j', async (taskKind, size, scope, admitted) => {
     const m = mk(['aaa', 'aaa']);
@@ -562,7 +563,7 @@ describe('runFixCli', () => {
       recordRouted: entry => recordRoutedOutcome({ ...entry, store, readClaim: () => null }),
     });
     expect(out.code).toBe(admitted ? 0 : 1);
-    if (admitted) expect(runTask).toHaveBeenCalledWith(expect.objectContaining({ kind: 'doc-fix', size: 1, scope: ['docs'] }));
+    if (admitted) expect(runTask).toHaveBeenCalledWith(expect.objectContaining({ kind: taskKind, size: 1, scope: ['docs'] }));
     else {
       expect(runTask).not.toHaveBeenCalled();
       expect(consecutiveUnproductiveOnHead(store.read(), { repo: 'we', pr: 7, head: 'aaa' })).toBe(4);
@@ -2128,12 +2129,12 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
   });
 });
 
-it('fix provider passes kind, size and scope to the confined Antigravity worker', async () => {
+it.each([['doc-fix', 'docs'], ['fix', 'src/main.ts'], ['feature', 'src/main.ts']])('fix provider passes %s kind, size and %s scope to the confined Antigravity worker', async (kind, path) => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
   const runTask = vi.fn(async ()=>({status:'ok',finalMessage:'done',stdout:'trace'}));
-  expect(await provider.spawn({prompt:'edit',kind:'doc-fix',size:1,scope:['docs'],model:'gemini-4-argon-high',effort:'high',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask})).toEqual({finalMessage:'done',stdout:'trace'});
-  expect(runTask).toHaveBeenCalledWith({task:'edit',laneDir:'/lane',kind:'doc-fix',size:1,scope:['docs'],model:'gemini-4-argon-high',effort:'high'});
+  expect(await provider.spawn({prompt:'edit',kind,size:1,scope:[path],model:'gemini-4-argon-high',effort:'high',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask})).toEqual({finalMessage:'done',stdout:'trace'});
+  expect(runTask).toHaveBeenCalledWith({task:'edit',laneDir:'/lane',kind,size:1,scope:[path],model:'gemini-4-argon-high',effort:'high'});
 });
 
 it('every fix executor declares confinement or is unavailable for dispatch', () => {
