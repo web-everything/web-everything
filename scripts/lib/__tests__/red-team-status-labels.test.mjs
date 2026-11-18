@@ -5,12 +5,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
-import { reviewedRead, idleEvidence } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, idleEvidence, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
 const broken = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break';
 const input = { repo: 'o/n', pr: 42, head, env: {}, labels: ['red-team:clear'] };
+const proof = () => ({ ...idleEvidence(), recorded: true, scheduled: true,
+  loopPayload: { findings: { read: reviewedRead(head) } }, seats: [completedSeat(head, { repo: input.repo })] });
+it('canonical audit: a trusted marker-only comment with recorded in-flight execution and no seat proof cannot clear or remove blocked', () => {
+  const plan = planRedTeamStatusLabels({ ...input, labels: ['red-team:blocked', 'red-team:clear'], comments: [result()],
+    evidence: { ...idleEvidence(), recorded: true, inFlight: true, loopPayload: { findings: { read: reviewedRead(head) } } } });
+  expect(plan).toEqual({ add: null, remove: ['red-team:clear'] });
+});
 describe('head-bound red-team operator labels', () => {
   it('shows scheduled/in-flight as pending and provisions through the label provider', () => {
     const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
@@ -23,7 +30,7 @@ describe('head-bound red-team operator labels', () => {
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/statusLabels=true.*standard/));
   });
   it('a clean recorded result is clear', () => {
-    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [result()] }))
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [completedComment(42, head)], evidence: proof() }))
       .toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
   });
   it.each(['sent-back', 'round-cap'])('a %s break is blocked', outcome => {
@@ -32,7 +39,7 @@ describe('head-bound red-team operator labels', () => {
   });
   it('cards and advisories are clear', () => {
     const gate = { author: { login: 'web-everything' }, body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=card-queued -->\n- 1 finding(s) filed as a follow-up card (#1).` };
-    expect(planRedTeamStatusLabels({ ...input, labels: [], comments: [result(broken), gate] }).add).toBe('red-team:clear');
+    expect(planRedTeamStatusLabels({ ...input, labels: [], evidence: proof(), comments: [completedComment(42, head, [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true, file: 'scripts/x.mjs', line: 1 }]), gate] }).add).toBe('red-team:clear');
   });
   it('drops old-head labels without trusting stale or forged results', () => {
     for (const comments of [[result()], [{ ...result(), author: { login: 'attacker' } }]]) {
@@ -49,7 +56,7 @@ describe('head-bound red-team operator labels', () => {
   it('shows a card-only head as pending only when the pass is not skipped or has started', () => {
     const loopPayload = { findings: { read: reviewedRead(head, ['backlog/123-card.md']) } };
     const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { ...idleEvidence(), loopPayload, ...evidence } }).add;
-    expect(plan({}, { scheduled: true })).toBeNull();
+    expect(plan({}, { scheduled: true })).toBe('red-team:clear');
     expect(plan({ WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, { scheduled: true })).toBe('red-team:pending');
     expect(plan({}, { scheduled: true, inFlight: true })).toBe('red-team:pending');
   });
@@ -76,13 +83,13 @@ it('a pending label with no result and nothing owed is kept, never planned for r
 
 describe('finished stored results without a marker', () => {
   it.each([
-    ['changes', 1, 'red-team:blocked'], ['accept', 0, 'red-team:clear'],
-    ['changes', 0, 'red-team:blocked'], ['changes', undefined, 'red-team:blocked'],
-    ['accept', 3, 'red-team:clear'],
-  ])('finished %s with %s confirmed becomes %s, never pending', (foldedVerdict, confirmedMissCount, desired) => {
+    ['changes', 1, 'red-team:pending'], ['accept', 0, 'red-team:pending'],
+    ['changes', 0, 'red-team:pending'], ['changes', undefined, 'red-team:pending'],
+    ['accept', 3, 'red-team:pending'],
+  ])('stored %s with %s confirmed remains %s without completed proof', (foldedVerdict, confirmedMissCount, desired) => {
     expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [],
       evidence: { scheduled: true, status: { status: 'finished', result: { foldedVerdict, confirmedMissCount } } } }))
-      .toEqual({ add: desired, remove: ['red-team:pending'] });
+      .toEqual({ add: null, remove: [] });
   });
   it('keeps existing scheduling behavior for a finished result without a verdict', () => {
     expect(planRedTeamStatusLabels({ ...input, comments: [], evidence: { scheduled: true, status: { status: 'finished', result: {} } } }).add).toBe('red-team:pending');
@@ -109,16 +116,16 @@ it('the real drain evidence reader exposes the finished status and its full resu
       runsDir: env.WE_SHARED_RUNS_DIR, list: () => [], readScorecards: () => [] });
     expect(evidence.status).toMatchObject({ repo: input.repo, pr: input.pr, head, status: 'finished', result: storedResult });
     expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence }))
-      .toEqual({ add: 'red-team:blocked', remove: ['red-team:pending'] });
+      .toEqual({ add: null, remove: [] });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 describe('stale pending on a card-only current head', () => {
   const card = ['backlog/123-card.md'];
   const plan = (headFiles, extra = {}, env = {}) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env, headFiles, evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, ...extra } });
-  it('drops pending when the current head is card-only and nothing is owed', () => {
-    expect(plan(card)).toEqual({ add: null, remove: ['red-team:pending'] });
-    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending', 'red-team:clear'], comments: [], headFiles: card, evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } } }).remove.sort()).toEqual(['red-team:clear', 'red-team:pending']);
+  it('current head filenames alone cannot prove a card-only exemption', () => {
+    expect(plan(card)).toEqual({ add: null, remove: [] });
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending', 'red-team:clear'], comments: [], headFiles: card, evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } } }).remove.sort()).toEqual(['red-team:clear']);
   });
   it('keeps pending for a mixed diff', () => {
     expect(plan([...card, 'scripts/x.mjs'])).toEqual({ add: null, remove: [] });
@@ -131,8 +138,8 @@ describe('stale pending on a card-only current head', () => {
     expect(plan(card, {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }).remove).toEqual([]);
     expect(plan(card, { inFlight: true }).remove).toEqual([]);
     expect(plan(card, { carryConflict: { reason: 'conflicting carry' } }).remove).toEqual([]);
-    expect(plan(card, { status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }).remove).toEqual(['red-team:pending']);
-    expect(plan(card, { status: { status: 'finished', result: { foldedVerdict: 'changes' } } }).add).toBe('red-team:blocked');
+    expect(plan(card, { status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }).remove).toEqual([]);
+    expect(plan(card, { status: { status: 'finished', result: { foldedVerdict: 'changes' } } }).add).toBeNull();
     expect(plan(card, { skipCardOnly: undefined }).remove).toEqual([]);
     for (const status of [undefined, { status: 'finished', result: {} }, { status: 'finished' }, { status: 'finished', result: { status: 'skipped' } }]) expect(plan(card, { status }).remove).toEqual([]);
     expect(plan([' backlog/123-card.md '], {}).remove).toEqual([]);
@@ -140,7 +147,7 @@ describe('stale pending on a card-only current head', () => {
   it('sync reads the live head files only for a pending label and survives an unreadable read', () => {
     const run = (readPrFiles, movedTo) => {
       const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles, readPrState: () => ({ headRefOid: movedTo ?? head }) };
-      return { plan: syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider }), provider };
+      return { plan: syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: { ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(head, card) } }, status: { head, status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider }), provider };
     };
     expect(run(() => card).plan.remove).toEqual(['red-team:pending']);
     expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
@@ -164,7 +171,7 @@ describe('stale pending on a card-only current head', () => {
 });
 
 it('headFiles path keeps pending when the settings file is unreadable (the default is not proof)', () => {
-  const evidence = { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } };
+  const evidence = { ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(head, ['backlog/1-c.md']) } }, status: { head, status: 'finished', result: { status: 'skipped', policy: 'card-only' } } };
   const planFor = settingsPath => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env: {}, headFiles: ['backlog/1-c.md'], evidence, settingsPath });
   expect(planFor('/nonexistent/red-team.json').remove).toEqual([]);
   expect(planFor(undefined).remove).toEqual(['red-team:pending']);
@@ -174,12 +181,12 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
   const card = { findings: { read: reviewedRead(head, ['backlog/8182-card.md']) } };
   const plan = (labels, evidence, env = {}) => planRedTeamStatusLabels({ ...input, labels, comments: [], env, evidence: { ...idleEvidence(), ...evidence } });
   it('removes red-team:pending when the head is proven card-only and nothing is owed', () => {
-    expect(plan(['red-team:pending'], { loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
+    expect(plan(['red-team:pending'], { loopPayload: card })).toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
   });
-  it('never removes red-team:blocked on a card-only head', () => {
-    expect(plan(['red-team:blocked'], { loopPayload: card })).toEqual({ add: null, remove: [] });
+  it('a proven exemption replaces a stale blocked label through the decision', () => {
+    expect(plan(['red-team:blocked'], { loopPayload: card })).toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
   });
-  it.each([['inFlight'], ['scheduled'], ['recorded']])('keeps pending while a pass is %s', key => {
+  it.each([['inFlight'], ['recorded']])('keeps pending while a pass is %s', key => {
     expect(plan(['red-team:pending'], { loopPayload: card, [key]: true })).toEqual({ add: null, remove: [] });
   });
   it('keeps pending when the card-only skip policy is off (evidence or env)', () => {
@@ -211,12 +218,12 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
     const planWith = (evidence, settingsPath) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env: {}, evidence: { ...idleEvidence(), ...evidence }, settingsPath });
     expect(planWith({ loopPayload: card }, '/nonexistent/red-team.json')).toEqual({ add: null, remove: [] });
     expect(planWith({ loopPayload: card, skipCardOnly: true }, '/nonexistent/red-team.json')).toEqual({ add: null, remove: [] });
-    expect(planWith({ loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
+    expect(planWith({ loopPayload: card })).toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
   });
   it('keeps pending when the run evidence is unreadable', () => {
     expect(plan(['red-team:pending'], { ok: false, loopPayload: card })).toEqual({ add: null, remove: [] });
   });
-  it('still removes a stale clear label alongside the pending one', () => {
-    expect(plan(['red-team:pending', 'red-team:clear'], { loopPayload: card }).remove.sort()).toEqual(['red-team:clear', 'red-team:pending']);
+  it('keeps clear and removes pending only when the decision proves exemption', () => {
+    expect(plan(['red-team:pending', 'red-team:clear'], { loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
   });
 });

@@ -33,15 +33,9 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
     const index = updated.findIndex(row => Number(row?.number) === pr);
     const row = updated[index];
     if (!row || row.headRefOid !== head || !Array.isArray(row.labels)) continue;
-    const names = row.labels.map(labelName);
-    if (!names.includes('red-team:pending')
-      && (names.includes('red-team:clear') || names.includes('red-team:blocked'))) continue;
     try {
-      if (!redTeamForHead(row.comments, pr, head)) continue;
-      if (readSeal({ repo, pr, head, env })?.unsealed === true) {
-        // Only the legacy bare `ran` status: the publisher recovers it from the exact-head seat row and checks that row is
-        // self-consistent. A non-legacy result's findings are trusted as stored, so it never seals here (the sweep owns it).
-        if (!isLegacyRan({ repo, pr, head, env })) continue;
+      if (readSeal({ repo, pr, head, env })?.unsealed === true && redTeamForHead(row.comments, pr, head) && isLegacyRan({ repo, pr, head, env })) {
+        // Legacy seal repair does not authorize labels; the shared decision still verifies all evidence.
         const sealed = sealStored({ status: { repo, pr, head }, sealOnly: true,
           listComments: () => row.comments,
           postComment: () => { throw Error('seal-only never posts'); } });

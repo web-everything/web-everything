@@ -4625,3 +4625,12 @@ legacy deadline handling and check-run admission can request one pass per head,
 with the attempt persisted before dispatch, while continuing to hold admission.
 A green check ends that wait only once live evidence clears; a deadline override
 cannot waive blocking debt.
+
+Red-team admission treats an explicitly configured missing platform preferences file
+as unreadable even though the shared cascade reader permits absent optional layers.
+Status labels have one authority: `redTeamOwedDecision` over normalized evidence.
+Only `cleared` produces clear; a confirmed break produces blocked, and incomplete
+proof stays pending without erasing blocked. A marker, stored verdict, current file
+list, or historical clear cannot substitute for completed proof. Structural mutations
+remove the label decision and restore comment-only clear paths; both must fail.
+Already-reviewed result-label repair rechecks historical labels through that planner.

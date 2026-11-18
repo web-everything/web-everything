@@ -2,15 +2,21 @@
 import { readRedTeamDisposition, redTeamHoldPendingOnly, redTeamResultCommentForHead, RED_TEAM_SETTINGS_FILE, resolveRedTeamProbes } from './red-team-gate.mjs';
 
 import { readFileSync } from 'node:fs';
-import { readPlatformPreferences } from './policy-cascade.mjs';
+import { readPlatformPreferences, PLATFORM_PREFERENCES_ENV, operatorPreferencesPath } from './policy-cascade.mjs';
 
 // Unlike the scheduler's permissive fallback, admission needs a readable, valid cascade.
 function admissionSettings({ env, settingsPath, readSettings }) {
   try {
     const file = JSON.parse(readSettings(settingsPath, 'utf8'));
-    const { prefs, errors } = readPlatformPreferences({ env, readFile: readSettings });
+    const configured = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
+    let configuredRead = !configured;
+    const { prefs, errors } = readPlatformPreferences({ env, readFile: (path, ...args) => {
+      const data = readSettings(path, ...args);
+      if (path === operatorPreferencesPath(env)) configuredRead = true;
+      return data;
+    } });
     const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
-    if (!object(file) || (Object.hasOwn(file, 'redTeam') && !object(file.redTeam))
+    if (!configuredRead || !object(file) || (Object.hasOwn(file, 'redTeam') && !object(file.redTeam))
       || (Object.hasOwn(prefs, 'redTeam') && !object(prefs.redTeam)) || errors.length) return null;
     const resolved = resolveRedTeamProbes({ file, platform: prefs.redTeam, env });
     return resolved.invalid.length ? null : resolved.value;

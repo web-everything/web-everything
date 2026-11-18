@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
+import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { reviewedRead, idleEvidence } from './fixtures/red-team-owed.mjs';
 import { redTeamForHead } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { syncResultOnHeadLabels } from '../red-team-result-label-sync.mjs';
@@ -61,13 +63,13 @@ describe('syncResultOnHeadLabels', () => {
     expect(input.sync).toHaveBeenCalledTimes(1);
   });
 
-  it('ignores a same-head marker from an untrusted author', () => {
+  it('delegates an untrusted marker to the evidence planner without sealing', () => {
     const input = fixture();
     input.rawPrs[0].comments[0].author.login = 'untrusted-contributor';
+    input.sync.mockReturnValue({ add: null, remove: [] });
     expect(syncResultOnHeadLabels(input)).toEqual({ rawPrs: input.rawPrs, applied: [], errors: [] });
-    expect(input.readSeal).not.toHaveBeenCalled();
     expect(input.sealStored).not.toHaveBeenCalled();
-    expect(input.sync).not.toHaveBeenCalled();
+    expect(input.sync).toHaveBeenCalledTimes(1);
   });
 
   it.each(['throw', 'retry', 'failed', 'held'])('leaves labels alone and records/logs a seal failure: %s', failure => {
@@ -90,9 +92,10 @@ describe('syncResultOnHeadLabels', () => {
     const input = fixture();
     input.readSeal.mockReturnValue({ unsealed: true });
     input.isLegacyRan.mockReturnValue(false);
+    input.sync.mockReturnValue({ add: null, remove: [] });
     const result = syncResultOnHeadLabels(input);
     expect(input.sealStored).not.toHaveBeenCalled();
-    expect(input.sync).not.toHaveBeenCalled();
+    expect(input.sync).toHaveBeenCalledTimes(1);
     expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
   });
 
@@ -149,24 +152,30 @@ describe('syncResultOnHeadLabels', () => {
     expect(input.rawPrs).toEqual(before);
   });
 
-  it('fails closed when the trusted result is only for an older head', () => {
+  it('delegates an older result to the evidence planner without treating it as current proof', () => {
     const input = fixture();
     input.rawPrs[0].comments = [resultComment(olderHead)];
-    expect(redTeamForHead(input.rawPrs[0].comments, pr, olderHead)).toMatchObject({ rev: olderHead });
-    expect(redTeamForHead(input.rawPrs[0].comments, pr, head)).toBeNull();
-
+    input.sync.mockReturnValue({ add: null, remove: [] });
     expect(syncResultOnHeadLabels(input)).toEqual({ rawPrs: input.rawPrs, applied: [], errors: [] });
-    expect(input.sync).not.toHaveBeenCalled();
-    expect(input.readSeal).not.toHaveBeenCalled();
+    expect(input.sync).toHaveBeenCalledTimes(1);
     expect(input.sealStored).not.toHaveBeenCalled();
   });
 
-  it.each(['red-team:clear', 'red-team:blocked'])('skips an already settled %s label without pending', label => {
+  it.each(['red-team:clear', 'red-team:blocked'])('rechecks historical %s through the planner even without pending', label => {
     const input = fixture();
     input.rawPrs[0].labels = ['bug', label];
-
+    input.sync.mockReturnValue({ add: null, remove: [] });
     expect(syncResultOnHeadLabels(input)).toEqual({ rawPrs: input.rawPrs, applied: [], errors: [] });
-    expect(input.sync).not.toHaveBeenCalled();
+    expect(input.sync).toHaveBeenCalledTimes(1);
+  });
+
+  it('canonical audit: historical clear plus a marker-only comment cannot bypass the real evidence decision', () => {
+    const input = fixture();
+    input.rawPrs[0].labels = ['bug', 'red-team:clear'];
+    input.rawPrs[0].comments = [{ author: { login: OPERATOR_LOGINS[0] }, body: `<!-- we:red-team-advisory pr=${pr} rev=${head} -->` }];
+    input.sync = args => planRedTeamStatusLabels({ ...args, labels: input.rawPrs[0].labels, comments: input.rawPrs[0].comments,
+      evidence: { ...idleEvidence(), recorded: true, inFlight: true, loopPayload: { findings: { read: reviewedRead(head) } } } });
+    expect(syncResultOnHeadLabels(input).rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
   });
 
   it('fails closed when refusal headSha mismatches the live head despite a current-head result', () => {
@@ -199,9 +208,10 @@ describe('syncResultOnHeadLabels', () => {
     expect(first.applied).toHaveLength(1);
     expect(input.sync).toHaveBeenCalledTimes(1);
 
+    input.sync.mockReturnValue({ add: null, remove: [] });
     const second = syncResultOnHeadLabels({ ...input, rawPrs: first.rawPrs });
 
-    expect(input.sync).toHaveBeenCalledTimes(1);
+    expect(input.sync).toHaveBeenCalledTimes(2);
     expect(second).toEqual({ rawPrs: first.rawPrs, applied: [], errors: [] });
   });
 });

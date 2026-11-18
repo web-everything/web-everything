@@ -40,9 +40,9 @@ const DRAIN = 'drain-bot';
 
 function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {} } = {}) {
   // Unrelated queue tests get a proven card-only exemption; accepted-code tests get a scored read.
-  const defaultEvidence = (head = HEAD) => ({ ...idleEvidence(), seats: undefined, loopPayload: { verdict: labels.includes('review:accepted') ? { verdict: 'accept' } : null,
-    findings: { read: reviewedRead(head, labels.includes('review:accepted') ? ['scripts/example.mjs'] : ['backlog/fixture.md']) } },
-    inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') });
+  const defaultEvidence = (head = HEAD) => ({ ...idleEvidence(), seats: undefined, loopPayload: { verdict: labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted') ? { verdict: 'accept' } : null,
+    findings: { read: reviewedRead(head, labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted') ? ['scripts/example.mjs'] : ['backlog/fixture.md']) } },
+    inFlight: false, recorded: false, scheduled: labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted') });
   const admissionEvidence = (raw, key) => {
     if (raw == null) return raw;
     if (raw?.readError) throw new Error('evidence unreadable');
@@ -1170,6 +1170,8 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
       expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
       expect(syncRedTeamStatusLabels({ repo: LOCAL, pr: 5283, head: HEAD, env,
         live: { headRefOid: HEAD, labels }, comments: thread, provider: labelProvider, standingRuling: null,
+        evidence: { ...idleEvidence(), recorded: true, loopPayload: { findings: { read: reviewedRead(HEAD) } },
+          seats: [completedSeat(HEAD, { repo: LOCAL, pr: 5283 })] },
       })).toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
       expect(labels).toContain('red-team:clear');
       expect(labels).not.toContain('red-team:blocked');

@@ -129,6 +129,18 @@ it.each([undefined, null, false, 'true', 'unknown'])('a seat row without valid:t
   expect(redTeamOwedDecision(input)).toMatchObject({ owed: true, cleared: false });
   expect(redTeamOwedDecision(input).reasons.map(h => h.kind)).toContain('seat-rows-invalid');
 });
+it('canonical audit: explicitly configured missing preferences are unreadable and hold; unconfigured defaults still clear', () => {
+  const f = fixture();
+  const defaultInput = readDrainRedTeamEvidence(f).decisionInput;
+  expect(defaultInput.scheduling.settingsReadable).toBe(true);
+  expect(redTeamOwedDecision(defaultInput)).toMatchObject({ owed: false, cleared: true });
+  const configured = { ...f, env: { ...f.env, WE_PLATFORM_PREFERENCES_FILE: join(f.env.CONVEYOR_STATE_ROOT, 'missing-prefs.json') } };
+  const evidence = readDrainRedTeamEvidence(configured);
+  expect(evidence.decisionInput.scheduling.settingsReadable).toBe(false);
+  expect(redTeamOwedDecision(evidence.decisionInput)).toMatchObject({ owed: true, cleared: false });
+  expect(redTeamOwedDecision(evidence.decisionInput).reasons.map(hold => hold.kind)).toContain('evidence-unknown');
+  expect(redTeamAdmissionHold({ ...configured, ...evidence })).toMatchObject({ blocking: true });
+});
 it.each(['EACCES', 'missing', 'malformed JSON', 'invalid object', 'invalid setting', 'invalid env', 'unreadable platform', 'invalid platform'])(
   'canonical audit: %s settings cannot prove the card-only exemption', variant => {
     const f = fixture(), path = join(f.env.CONVEYOR_STATE_ROOT, 'red-team-settings.json');
@@ -175,7 +187,7 @@ it.each([
 });
 
 // Parse the actual source: call deletion and prose-based routing must fail independently of runtime fixtures.
-const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs', 'drain-red-team-input.mjs', 'review-red-team-policy.mjs']
+const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs', 'drain-red-team-input.mjs', 'review-red-team-policy.mjs', 'red-team-status-labels.mjs']
   .map(file => [file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')]));
 const parse = (file, text) => ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 function all(node, predicate) {
@@ -214,6 +226,23 @@ function assertStructure(source) {
   expect(policy.text).toContain('Object.entries(RED_TEAM_CLEARANCE_INPUTS)');
   expect(policy.text).toContain('!RED_TEAM_EXEMPTION_INPUTS[key](input)');
   expect(source['drain-queue-safety.mjs']).not.toContain('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE');
+  expect(source['drain-red-team-input.mjs']).toContain('!configuredRead ||');
+  expect(source['drain-red-team-input.mjs']).toContain('path === operatorPreferencesPath(env)');
+  const labels = parse('red-team-status-labels.mjs', source['red-team-status-labels.mjs']);
+  const planner = all(labels, n => ts.isFunctionDeclaration(n) && n.name?.text === 'planRedTeamStatusLabels');
+  expect(planner).toHaveLength(1);
+  expect(calls(planner[0], 'redTeamOwedDecision')).toHaveLength(1);
+  const labelDecision = all(planner[0], n => ts.isVariableDeclaration(n) && n.name.getText() === 'decision');
+  expect(labelDecision).toHaveLength(1);
+  expect(labelDecision[0].initializer.getText()).toBe('redTeamOwedDecision(decisionInput)');
+  expect(labels.text).not.toMatch(/disposition\.result|foldedVerdict|redTeamForHead|readRedTeamDisposition/);
+  const desired = all(planner[0], n => ts.isVariableDeclaration(n) && n.name.getText() === 'desired');
+  expect(desired).toHaveLength(1);
+  expect(desired[0].initializer.condition.getText()).toBe('decision.cleared');
+  expect(desired[0].initializer.whenTrue.text).toBe('red-team:clear');
+  const clearValues = all(planner[0], n => ts.isStringLiteral(n) && n.text === 'red-team:clear');
+  expect(clearValues).toHaveLength(1);
+  expect(clearValues[0].parent).toBe(desired[0].initializer);
   const queue = parse('drain-queue-safety.mjs', source['drain-queue-safety.mjs']);
   const merge = parse('drain-merge-strategy.mjs', source['drain-merge-strategy.mjs']);
   for (const file of [queue, merge]) {
@@ -262,6 +291,11 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
+  ['configured preferences proof removed', 'drain-red-team-input.mjs', text => text.replace('!configuredRead || ', '')],
+  ['label decision deleted', 'red-team-status-labels.mjs', text => text.replace('redTeamOwedDecision(decisionInput)', '({ cleared: true, reasons: [] })')],
+  ['label decision conditionally bypassed', 'red-team-status-labels.mjs', text => text.replace('const decision = redTeamOwedDecision', 'const decision = comments.length ? { cleared: true, reasons: [] } : redTeamOwedDecision')],
+  ['label comment shortcut restored', 'red-team-status-labels.mjs', text => text.replace('decision.cleared ?', 'comments.length ?')],
+  ['label early marker clear restored', 'red-team-status-labels.mjs', text => text.replace('  const decision = redTeamOwedDecision', "  if (comments.length) return { add: 'red-team:clear', remove: [] };\n  const decision = redTeamOwedDecision")],
   ['owed debt made non-blocking', 'review-red-team-policy.mjs', text => text.replace("'pass-owed': [true,", "'pass-owed': [false,")],
   ['pending publication made blocking', 'review-red-team-policy.mjs', text => text.replace("'pending-publish': [false,", "'pending-publish': [true,")],
   ['fixed hold lookup bypassed', 'review-red-team-policy.mjs', text => text.replace('reasons.push(RED_TEAM_HOLDS[kind])', 'reasons.push({ kind, blocking: false })')],
