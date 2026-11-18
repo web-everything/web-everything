@@ -5,8 +5,12 @@ import { realRequiredFailures, retryOutcome, buildExhaustedRetryComment } from '
 import { handleStaleMergeGate } from '../merge-queue-enqueue.mjs';
 
 const head = 'a'.repeat(40);
-const row = (conclusion, extra = {}) => ({ name: 'test', status: 'completed', conclusion,
-  head_sha: head, run_id: 10, run_attempt: 1, id: 1, completedAt: '2026-11-18T02:00:00Z', ...extra });
+// Attempts of one job share the Actions job identity (contract: only a proven identity orders attempts).
+const row = (conclusion, extra = {}) => {
+  const base = { name: 'test', status: 'completed', conclusion,
+    head_sha: head, run_id: 10, run_attempt: 1, id: 1, completedAt: '2026-11-18T02:00:00Z', ...extra };
+  return { detailsUrl: `https://github.com/o/r/actions/runs/${base.run_id}/job/5`, ...base };
+};
 const pr = rows => ({ headRefOid: head, rowsComplete: true, statusCheckRollup: rows });
 const retry = { body: buildExhaustedRetryComment({ headSha: head }),
   createdAt: '2026-11-18T01:00:00Z', author: { login: 'web-everything' } };
