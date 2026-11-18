@@ -4567,3 +4567,65 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## Required-check row completeness (PR1)
+
+`resolveRequiredChecks` requires `rowsComplete === true`: all-success rows from a capped
+rollup can hide a newer failure. Missing or false completeness produces `unknown` with
+`rows-incomplete`; observing every required name alone is insufficient. Retry by exhausting
+pagination or explicitly fetching every required name, then supply the completeness proof.
+The PR1 acceptance tests numbered 10 and 11 cover incomplete rows and the rule that neutral
+and skipped conclusions fail unless the exact name is in `optionalNames`.
+
+Both `reviewCiGate` and the CI-heal evidence adapter default completeness to false. Bare
+`statusCheckRollup` callers (merge listing, reconcile, drain prestage, merge enqueue, human
+landing and escalation recording) cannot attest completeness. `readReviewChecks` exhausts
+REST pagination for check runs and commit statuses, then marks its array with non-enumerable
+`rowsComplete: true`. `readReviewCiGate` captures that proof before hold excusal replaces the
+array and forwards it through `reviewStartGate`. Bare arrays and serialized historical rows
+carry no proof and fail closed. Never infer completeness from row count or successful names.
+`review-ci-completeness.test.mjs` exercises the real reader-to-start-gate path with multiple
+pages, a hidden failure, incomplete arrays, and unreadable later-page evidence.
+
+Reconcile re-reads an excused candidacy hold through the complete exact-head review reader
+before scheduling its review. The injected hydration reader keeps its complete-feed contract;
+an explicit `rowsComplete: false` refuses proof. Carry an excusal only for the same immutable
+job, preserve observed real CI failures, and reuse the already-read hold verdict. The
+`merge-gate-hold-class.test.mjs` planner cases cover unreadable/incomplete feeds, foreign heads,
+pending checks and replacement jobs. Recording refusals retain the required-check names even
+when incomplete evidence also blocks the verdict; an unavailable roster still refuses recording.
+
+
+REST check-run rows omit workflow run/attempt fields. For duplicate GitHub Actions check
+names, `readReviewChecks` reads the Actions jobs and validates each job ID, workflow run,
+head, exact name, and check-run URL before supplying `run_id`/`run_attempt` to the resolver.
+A check ID, suite ID, timestamp, or URL alone never proves attempt ordering. Job reads are
+cached within the read and capped at 20; missing/mismatched evidence or overflow blocks
+review with an operator-visible request to inspect Actions jobs/reruns before retrying.
+The REST rerun integration cases in `review-ci-completeness.test.mjs` cover successful reruns,
+different runs, invalid lineage, foreign repositories, unavailable jobs, and the read cap.
+
+## Required-check evidence opt-in and provenance (PR1)
+
+`resolveRequiredChecks` leaves absent required checks pending by default. Only the
+`review-ci-gate` adapter opts into `allowImplication`; CI-heal requires an own row.
+CI-heal fixtures that prove green or held evidence must explicitly attest both
+`rowsComplete: true` and `rosterSource: live|cache`. Preserve the required-check
+reader's `source` through escalation recording and reconcile; an omitted source
+is unavailable evidence, never an implicit live roster. Named negative tests in
+`check-state-predicate`, `ci-heal-verdict-recheck`, and `ci-heal-escalation-mark`
+pin these defaults and the recording preflights.
+
+## Review CI refusal ordering
+
+An observed pending or failed required check takes precedence over `rows-incomplete`
+in the review adapter's primary reason. Incompleteness remains in `secondaryReasons`
+and preserves `unknown: true` with `allowed: false`. Missing checks alone do not
+establish an observed blocker. The ordering cases in `review-ci-gate.test.mjs` and
+the producer formatting cases in `review-ci-gate-io.test.mjs` pin these guarantees.
+Retry after exhausting pagination or explicitly reading every required name;
+successful observed names alone cannot establish admission.
+Consumers that decide whether to recheck evidence must inspect `unknown`, rather
+than infer completeness from the primary reason. The facts-first regression in
+`merge-gate-hold-class.test.mjs` requires a live recheck of an incomplete failure.

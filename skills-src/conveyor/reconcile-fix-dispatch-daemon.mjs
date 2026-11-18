@@ -97,6 +97,7 @@ import { readCompletePrComments } from '../../scripts/conveyor/pr-comments-compl
 import { excusePrMergeGateHolds } from '../../scripts/lib/merge-gate-hold-class.mjs';
 import { ciGreenForEscalation, contradictingChecks, resolveCiHealVerdictSettings } from '../../scripts/conveyor/ci-heal-verdict-recheck.mjs'; // card x9zznl9
 import { buildCiHealVerdictVoidComment, notCiBreakVerdictVoidState, needsHumanVoidState, latestCiHealEscalationForHead } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
+import { classifyCheck } from '../../scripts/lib/check-state-predicate.mjs';
 import { getRequiredStatusChecks } from '../../scripts/lib/required-status-checks.mjs'; // card x9zznl9
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
@@ -573,7 +574,7 @@ export function runReconcileNotesAllRepos({
 
 /** The repo's live required-check set (branch protection, cached) — the SAME reader `reconcile-pass.mjs` uses. */
 export function defaultReadRequiredChecks({ repo }) {
-  return getRequiredStatusChecks({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo }).checks;
+  return getRequiredStatusChecks({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo });
 }
 
 /** card x9zznl9 — most verdicts one head may have voided before the verdict stands for an operator to decide. */
@@ -587,15 +588,13 @@ export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredC
   if (!verdictSettings?.recheckNotCiBreak || note?.kind !== 'ci-heal-escalated' || note?.outcome !== 'not-a-ci-break' || !pr) return null;
   // Cheap pre-filter first: with no failing run other than review-gate on the PR at all, nothing can contradict the
   // verdict, so the required-check set is never read.
-  const anyRed = contradictingChecks({
-    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup,
-    requiredChecks: [...new Set((pr.statusCheckRollup ?? []).map((r) => r?.name ?? r?.context).filter(Boolean))],
-  });
-  if (!anyRed.length) return null;
-  let requiredChecks = [];
-  try { requiredChecks = readRequiredChecks({ repo }) ?? []; } catch { return null; }
+  if (!(pr.statusCheckRollup ?? []).some(row => row && classifyCheck({ ...row, required: true }) === 'red')) return null;
+  let requiredChecks, rosterSource;
+  try { ({ checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo }) ?? {}); } catch { return null; }
   const red = contradictingChecks({
-    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup, requiredChecks,
+    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid,
+    rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete === true, rosterSource,
+    rollup: pr.statusCheckRollup, requiredChecks,
   });
   if (!red.length) return null;
   const head = String(note.headSha).toLowerCase();
@@ -627,9 +626,10 @@ export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequir
     key: `ci-heal-needs-human-void:${note.prNumber}:${head}:${escalationIndex}` };
   if (voided) return { ...row, alreadyPosted: true };
   if (voidCount >= MAX_VERDICT_VOIDS_PER_HEAD) return null;
-  let requiredChecks;
-  try { requiredChecks = readRequiredChecks({ repo }); } catch { return null; }
-  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })) return null;
+  let requiredChecks, rosterSource;
+  try { ({ checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo }) ?? {}); } catch { return null; }
+  if (!ciGreenForEscalation({ headSha: pr.headRefOid, rowsHead: pr.rowsHead,
+    rowsComplete: pr.rowsComplete === true, rosterSource, rollup: pr.statusCheckRollup, requiredChecks })) return null;
   return { ...row, alreadyPosted: false,
     body: buildCiHealVerdictVoidComment({ headSha: head, voids: 'needs-human', cause: 'required-ci-green' }) };
 }
