@@ -42,6 +42,30 @@ function assertAllowlist(findings, allowlist) {
 
 describe('single agent launch boundary', () => {
   it.each([
+    ...['child_process', 'worker_threads', 'cluster', 'vm', 'inspector', 'inspector/promises',
+      'repl', 'module', 'v8', 'wasi', 'process'].flatMap(name => [name, `node:${name}`])
+      .flatMap(module => ['import', 'export', 'require', 'dynamic import'].map(form => ({
+        name: `R37.20 execution builtin ${module} via ${form}`, bare: true, refused: true,
+        builtin: module,
+        source: form === 'import' ? `import * as api from '${module}';`
+          : form === 'export' ? `export * from '${module}';`
+            : form === 'require' ? `const api=require('${module}');` : `import('${module}');`,
+      }))),
+    { name: 'R37.20 benign builtin positive control', bare: true,
+      source: "import {basename} from 'node:path'; basename('git')" },
+    ...[
+      `(async()=>{})['con'+'structor']("return (await import('node:child_process')).spawn('claude',[])")()`,
+      'const run=(async()=>{})[key];', 'const run=target[key];', 'const run=target?.[key];',
+      'const run=target[0+0];', 'const run=target[("safe")];', 'const run=target[`con${suffix}`];',
+      'const run=target.constructor;', 'const run=target["constructor"];',
+      'const run=target["__proto__"];', 'const run=target["prototype"];',
+      'const run=Reflect.get(target,key);', 'const run=Object.getPrototypeOf(target).constructor;',
+      'const run=Function;', 'const run=AsyncFunction;', 'const run=GeneratorFunction;',
+      'const run=AsyncGeneratorFunction;', 'import(specifier);', 'require(specifier);',
+      "const key='a'; const data={a:'hello'}; console.log(data[key])",
+    ].map(source => ({ name: `R37.21 capability access fails closed: ${source}`, source, bare: true, refused: true })),
+    ...['"safe"', '0', '`safe`'].map(key => ({ name: `R37.21 literal member positive control: ${key}`,
+      source: `const data={safe:'ok',0:'ok'}; console.log(data[${key}]);`, bare: true })),
     { name: 'R37.17 existing exported helper cannot bypass the caller boundary',
       source: "spawnToCompletion('claude', ['--resume','unchecked-id'])", bare: true, refused: true },
     ...["spawn('npx', ['claude'])", "spawn('pnpm', ['exec', 'codex'])",
@@ -159,11 +183,12 @@ describe('single agent launch boundary', () => {
       source: `const options={shell:false}; spawn('git',[${JSON.stringify("clau'de'")}],options)`, refused: true },
     { name: 'R37.16 known empty options now requires boundary', source: "const options={}; spawn('git',['$tool'],options)", refused: true },
     { name: 'R37.16 literal unrelated shell command now requires boundary', source: "const options={shell:true}; spawn('git',['status'],options)", refused: true },
-  ])('$name', ({ source, refused, bare }) => {
+  ])('$name', ({ source, refused, bare, builtin }) => {
     const findings = (bare ? scanAgentLaunches : findAgentLaunches)({ 'scripts/r37-structure.mjs': source });
     if (refused) {
       expect(findings.length).toBeGreaterThan(0);
       expect(findings[0].reason).toContain('outside approved boundary');
+      if (builtin) expect(findings[0].reason).toContain(`execution builtin: ${builtin}`);
     } else expect(findings).toEqual([]);
   });
 
@@ -212,6 +237,21 @@ describe('single agent launch boundary', () => {
   const inventoryFor = source => launchInventory(scanAgentLaunches({ [approvedFile]: source }));
   const helperFile = 'scripts/lib/spawn-to-completion.mjs';
   const helperSource = readFileSync(resolve(root, helperFile), 'utf8');
+  it.each([
+    ["export function run(target,key){return target[key]}", 'computed access'],
+    ["export function run(){return (async()=>{})['con'+'structor']}", 'computed constructor'],
+    ["export function run(specifier){return import(specifier)}", 'dynamic import'],
+    ["export function run(specifier){return require(specifier)}", 'dynamic require'],
+    ["export {Session as run} from 'node:inspector'", 'inspector re-export'],
+  ])('R37.20–21 propagates %s to imported bindings (%s)', (implementation) => {
+    const findings = scanAgentLaunches({ 'scripts/local.mjs': implementation,
+      'scripts/consumer.mjs': "import {run} from './local.mjs'; const alias=run; accept(alias)" });
+    expect(findings.find(f => f.file.endsWith('/consumer.mjs'))?.reason).toContain('launcher export reference');
+  });
+  it('R37.21 literal-key export positive control stays clear through aliases', () => {
+    expect(scanAgentLaunches({ 'scripts/local.mjs': "export function read(target){return target['safe']}",
+      'scripts/consumer.mjs': "import {read} from './local.mjs'; const alias=read; accept(alias)" })).toEqual([]);
+  });
   it('R37.17 flags a new caller of the existing spawnToCompletion export without changing approved fingerprints', () => {
     const sources = { [helperFile]: helperSource };
     const before = scanAgentLaunches(sources);
@@ -380,7 +420,7 @@ describe('single agent launch boundary', () => {
     "const {basename}=require('node:path'); basename('git')",
     "import('node:path')", "export {basename} from 'node:path'",
     "const env=process.env; const pid=process.pid; module.exports={env,pid}",
-    "const key='a'; const data={a:'hello'}; console.log(data[key])",
+    "const data={a:'hello'}; console.log(data['a'])",
     "function launch(){return 'claude'} launch()",
     "const launch=console.log; launch('git')",
     "const pattern=/claude/; pattern.exec('hello')",
@@ -489,6 +529,11 @@ describe('single agent launch boundary', () => {
       'scripts/lib/daemon-rebuild/index.mjs',
       'scripts/operations/reopen-items-io.mjs',
       'scripts/lib/raised-by.mjs',
+      // R37.21: inspected existing data-key readers and classifier re-exports. Their complete
+      // fingerprints remain required; computed access is never exempted by argument semantics.
+      'scripts/lib/daemon-rebuild/smoke-classify/index.mjs',
+      'scripts/lib/model-settings.mjs',
+      'scripts/lib/node-heap-cap.mjs',
     ];
     expect(AGENT_LAUNCH_ALLOWLIST).toHaveLength(1857 + reviewedExistingCallers.length);
     expect(new Set(AGENT_LAUNCH_ALLOWLIST).size).toBe(AGENT_LAUNCH_ALLOWLIST.length);

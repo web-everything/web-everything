@@ -4570,6 +4570,19 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 
 ## Agent launch normalisation (R37)
 
+R37.19 splits string commands into words and validates every shell segment before matching an
+executable; a trailing `/bin/claude` must not hide an earlier unchecked resume. Pair operator,
+shell `-c`, expansion-refusal and mismatched-id rows with matching native-id controls.
+R37.20 inventories execution builtins (including inspector/promises, repl, v8 and wasi) in both
+bare and `node:` forms, through imports, re-exports and loaders. R37.21 treats unknown computed
+keys, constructor/prototype access and Function-family references as capabilities in both direct
+and transitive binding scans. Only literal non-capability string/number keys remain clear;
+even a variable initialized to a safe string requires review. Non-literal module specifiers
+require review too. Use literal argv at runtime or an approved boundary after complete source
+review for structural refusals; never expand migration membership from scanner output alone.
+The R37.21 migration explicitly pins the inspected existing `model-settings`, `node-heap-cap`
+data readers and `smoke-classify/index` re-exports, with their whole-module fingerprints.
+
 `agent-launch.test.mjs` contains one R37 audit table covering reassigned primitive bindings,
 Codex global short-option values, unresolved shell executable words, and guard mutation, with
 positive controls. Exercise the real `launchAgent` boundary with an injected primitive and assert

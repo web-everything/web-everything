@@ -9,13 +9,23 @@ import { isBuiltin } from 'node:module';
 // It is independent of the fingerprint snapshot: updating fingerprints cannot approve a new file.
 export const AGENT_LAUNCH_ALLOWLIST = Object.freeze(JSON.parse(
   readFileSync(join(import.meta.dirname, 'agent-launch-approved.json'), 'utf8')));
-const executionBuiltin = /^(?:node:)?(?:child_process|worker_threads|cluster|vm|process|module)(?:\/|$)/;
-const capabilityNames = new Set(['process', 'require', 'module', 'eval', 'Function', 'Worker',
+const executionBuiltin = /^(?:node:)?(?:child_process|worker_threads|cluster|vm|inspector|repl|module|v8|wasi|process)(?:\/|$)/;
+const capabilityNames = new Set(['process', 'require', 'module', 'eval', 'Function', 'AsyncFunction', 'GeneratorFunction', 'AsyncGeneratorFunction', 'Worker',
   'globalThis', 'global', 'window', 'self', 'Reflect',
   'spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork', 'cp', 'child_process', 'childProcess']);
 const primitiveNames = /^(?:spawn(?:Sync)?|exec(?:File(?:Sync)?|Sync)?|fork)$/;
 const dataProcessMembers = new Set(['env', 'pid', 'ppid', 'argv', 'execArgv', 'platform', 'arch', 'versions', 'version', 'exitCode']);
-const capabilityMembers = new Set(['binding', '_linkedBinding', 'dlopen', 'eval', 'Function', 'Worker', 'constructor']);
+const capabilityMembers = new Set(['binding', '_linkedBinding', 'dlopen', 'eval', 'Function', 'AsyncFunction',
+  'GeneratorFunction', 'AsyncGeneratorFunction', 'Worker', 'constructor', '__proto__', 'prototype']);
+
+// Without evaluating arbitrary code, only literal keys can rule out constructor/prototype access.
+// Apply the same rule to direct evidence and exported bindings in the dependency graph.
+function capabilityAccess(node) {
+  if (!ts.isElementAccessExpression(node)) return false;
+  const key = node.argumentExpression;
+  return !key || !(ts.isStringLiteralLike(key) || ts.isNumericLiteral(key))
+    || capabilityNames.has(key.text) || capabilityMembers.has(key.text);
+}
 // Hash the whole syntax/token tree. Trivia is absent; literal lexemes and ASI structure remain.
 // Unlike reprinting or regex stripping, this ignores ONLY formatting/comments, not token edits.
 function moduleFingerprint(file) {
@@ -237,8 +247,7 @@ function launcherReferences(files) {
         writes(node.left);
         link(owner, assignment); owner = assignment;
       }
-      if (capabilityReference(node) || ts.isElementAccessExpression(node) && node.argumentExpression && ts.isStringLiteralLike(node.argumentExpression)
-        && (capabilityNames.has(node.argumentExpression.text) || capabilityMembers.has(node.argumentExpression.text))) {
+      if (capabilityReference(node) || capabilityAccess(node)) {
         if (owner) owner.tainted = true;
       }
       if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
@@ -348,13 +357,7 @@ export function findAgentLaunches(sources) {
       }
       // References, declarations, aliases and escapes all require the same boundary.
       if (capabilityReference(node)) evidence.add(`capability reference: ${node.text}`);
-      if (ts.isElementAccessExpression(node)) {
-        const key = node.argumentExpression;
-        if (key && ts.isStringLiteralLike(key)
-          && (capabilityNames.has(key.text) || capabilityMembers.has(key.text))) {
-          evidence.add(`capability access: ${key.text}`);
-        }
-      }
+      if (capabilityAccess(node)) evidence.add('capability access: computed or execution member');
       ts.forEachChild(node, visit);
     };
     visit(file);

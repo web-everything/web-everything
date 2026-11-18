@@ -4105,12 +4105,12 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   {
     "count": 1,
     "file": "scripts/lib/agent-launch-structure.mjs",
-    "sha256": "4b27f5548db92929be9b366faab1e427f93ef6463db5403087d41f81afb5cba5",
+    "sha256": "e13c364cdf35a78139e7216d6bf4f4f2b422060fd3294c0fed1f8247a9783381",
   },
   {
     "count": 1,
     "file": "scripts/lib/agent-launch.mjs",
-    "sha256": "94743efdcae0439148abb65352e54d33b67aff4c95cf4b3bcb67ddc2d9fa6cb7",
+    "sha256": "5a70638571da5cd503d8c4faa94f6e6dea4ee291a03498c677c59c3197b9f42c",
   },
   {
     "count": 1,
@@ -4746,6 +4746,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/lib/daemon-rebuild/smoke-classify/env-unavailable.mjs",
     "sha256": "dcf6760044416e3a94ab6a4ae7eddd9dff5ca3c4237a1e9f3f6e2620ee2202c4",
+  },
+  {
+    "count": 1,
+    "file": "scripts/lib/daemon-rebuild/smoke-classify/index.mjs",
+    "sha256": "0c8f70860eea71e424c27200d1c0c9dfcfccf62eb28d92c5a9021a7af0137ac3",
   },
   {
     "count": 1,
@@ -5804,6 +5809,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
   },
   {
     "count": 1,
+    "file": "scripts/lib/model-settings.mjs",
+    "sha256": "f928e281504a36fd307561888fd91f59219cdd5e17b865dc724b705a89152836",
+  },
+  {
+    "count": 1,
     "file": "scripts/lib/mq-failure-evidence.mjs",
     "sha256": "55fe46bd90d14b678cc81d47be3e1a61ad2b57cfb49dab14e5ad967524277edb",
   },
@@ -5851,6 +5861,11 @@ exports[`single agent launch boundary > permits exactly the unmigrated allowlist
     "count": 1,
     "file": "scripts/lib/no-search-backed-pr-list.mjs",
     "sha256": "e8c95e8049559ac840536c1622d44d69cc2b98f8434c331aef91959ef2aef17c",
+  },
+  {
+    "count": 1,
+    "file": "scripts/lib/node-heap-cap.mjs",
+    "sha256": "1b19dadc5f5b45d84048d17c5b186162f0ee13fb2a3dbe38ff851f3715f0b4b9",
   },
   {
     "count": 1,

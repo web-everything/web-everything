@@ -134,7 +134,7 @@ export function agentShellEvidence(text) {
 // Parse quoting only. Unsupported shell grammar refuses with the literal-argv fallback; never evaluate it.
 function shellWords(text) {
   if (agentShellEvidence(text).ambiguous) throw new SyntaxError('unresolved shell quoting, escape or expansion; use literal argv');
-  const words = []; let word = '', quote = '', started = false;
+  const words = []; let word = '', quote = '', started = false, needsCommand = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (quote !== "'" && /[$`]/.test(c)) throw new SyntaxError('unresolved shell expansion');
@@ -151,11 +151,22 @@ function shellWords(text) {
     else if (/\s|[;|&]/.test(c)) {
       if (started) words.push(word);
       word = ''; started = false;
-      if (/[;|&\n]/.test(c)) words.push(separator);
+      if (/[;|&\n]/.test(c)) {
+        // Keep operator pairs together and reject incomplete/empty command segments.
+        let operator = c;
+        if (/[|&]/.test(c) && text[i + 1] === c) operator += text[++i];
+        if (!words.length || words.at(-1) === separator) {
+          if (c === '\n') continue;
+          throw new SyntaxError('missing shell command; use literal argv');
+        }
+        words.push(separator);
+        needsCommand = ['|', '&&', '||'].includes(operator);
+      }
     } else { word += c; started = true; }
   }
   if (quote) throw new SyntaxError('unterminated shell quote');
   if (started) words.push(word);
+  if (needsCommand && words.at(-1) === separator) throw new SyntaxError('incomplete shell command; use literal argv');
   return words;
 }
 
@@ -181,7 +192,7 @@ function normaliseCommand(words, depth = 0, shell = false) {
   if (shell) while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] ?? '')) words = words.slice(1);
   if (!words.length) return [];
   const [command, ...argv] = words;
-  if (!command || /[$`~*?\[\]{}()<>\n\r]/.test(command)) throw new SyntaxError('unresolved executable word');
+  if (!command || /[\s;|&'"$`~*?\[\]{}()<>]/.test(command)) throw new SyntaxError('unresolved executable word');
   const executable = agentExecutable.exec(command)?.[1];
   if (executable) return [normaliseOptions(argv, executable)];
   if (shellExecutable.test(command)) {
@@ -226,7 +237,8 @@ function normaliseInvocation(args, primitive) {
   // A shell joining array argv destroys word boundaries. Require an explicit, literal -c script instead.
   if (Array.isArray(argv) && args[2]?.shell) throw new SyntaxError('shell execution of array argv is ambiguous');
   if (typeof command !== 'string') throw new SyntaxError('nonliteral executable');
-  if (!agentExecutable.test(command) && /\s|[;|&'" ($`]/.test(command)) {
+  // Match executables only after shell text has been split into individual command words.
+  if (/[\s;|&'"($`]/.test(command)) {
     if (Array.isArray(argv) && argv.length) throw new SyntaxError('ambiguous command string and argv');
     return normaliseScript(command, 0);
   }

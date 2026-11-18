@@ -1860,5 +1860,8 @@
   "scripts/conveyor/maintenance-marker.mjs",
   "scripts/lib/daemon-rebuild/index.mjs",
   "scripts/operations/reopen-items-io.mjs",
-  "scripts/lib/raised-by.mjs"
+  "scripts/lib/raised-by.mjs",
+  "scripts/lib/daemon-rebuild/smoke-classify/index.mjs",
+  "scripts/lib/model-settings.mjs",
+  "scripts/lib/node-heap-cap.mjs"
 ]
