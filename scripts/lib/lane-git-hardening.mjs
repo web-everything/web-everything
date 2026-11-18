@@ -64,9 +64,6 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.checkStat', 'default'],
   ['core.trustctime', 'true'],
   ['core.ignoreStat', 'false'],
-  // PR #7012 self-review: a lane-written commit-graph supplies commit parents without being an object, so neither
-  // index-pack nor GIT_NO_REPLACE_OBJECTS checks it; a forged one hides a commit from every history and review proof.
-  ['core.commitGraph', 'false'],
 ]);
 
 // Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
@@ -218,14 +215,23 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
 /**
  * {@link laneGitHardeningEnv} for a git call that proves a lane's history (parents, ranges, diffs): also points the
  * graft file at `/dev/null`, since replace refs off still reads `<git-dir>/info/grafts` and a lane-written one forges
- * parents (PR #7012 self-review). Not part of the shared env: the health-watch fresh-safety probe resolves
- * `--git-path info/grafts` to DETECT a lane grafts file, and a pinned path would hide it. Pure.
+ * parents, and pins `core.commitGraph=false`: a lane-written commit-graph supplies commit parents without being an
+ * object, so neither index-pack nor GIT_NO_REPLACE_OBJECTS checks it (PR #7012 self-review). Neither belongs in the
+ * shared env: the health-watch fresh-safety probe resolves `--git-path info/grafts` to DETECT a lane grafts file (a
+ * pinned path would hide it), and lane-repair both reads the lane's on-disk `core.commitGraph` to decide whether to
+ * persist `false` and runs `git commit-graph write` to regenerate a shared store's graph (a command-scope `false`
+ * would mask the first and make the second write nothing). Pure.
  * @param {Record<string,string|undefined>} env
  * @param {Parameters<typeof laneGitHardeningEnv>[1]} [options]
  * @returns {Record<string,string|undefined>}
  */
 export function laneHistoryProofEnv(env = process.env, options) {
-  return { ...laneGitHardeningEnv(env, options), GIT_GRAFT_FILE: '/dev/null' };
+  const out = { ...laneGitHardeningEnv(env, options), GIT_GRAFT_FILE: '/dev/null' };
+  const at = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
+  out[`GIT_CONFIG_KEY_${at}`] = 'core.commitGraph';
+  out[`GIT_CONFIG_VALUE_${at}`] = 'false';
+  out.GIT_CONFIG_COUNT = String(at + 1);
+  return out;
 }
 
 /** The argv that lists a lane's effective config with each entry's scope, NUL-separated (`scope\0key\nvalue\0…`). Reading

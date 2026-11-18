@@ -47,14 +47,24 @@ describe('laneGitHardeningEnv lane-owned parent metadata', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it.each([undefined, { credentialPins: false }])('never reads a lane commit-graph, even when lane config enables it, with options %j', options => {
+  it.each([undefined, { credentialPins: false }])('history proofs never read a lane commit-graph, even when lane config enables it, with options %j', options => {
     const { dir, base } = hermetic();
     try {
       const lane = join(dir, 'lane');
       git(dir, base, ['init', '-q', lane]);
       git(lane, base, ['config', '--local', 'core.commitGraph', 'true']);
-      const env = laneGitHardeningEnv(base, options);
+      const env = laneHistoryProofEnv(base, options);
       expect(git(lane, env, ['config', '--get', 'core.commitGraph'])).toBe('false');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps the shared hardening env from pinning core.commitGraph, so lane-repair sees the on-disk value and can write a graph', () => {
+    const { dir, base } = hermetic();
+    try {
+      const lane = join(dir, 'lane');
+      git(dir, base, ['init', '-q', lane]);
+      git(lane, base, ['config', '--local', 'core.commitGraph', 'true']);
+      expect(git(lane, laneGitHardeningEnv(base), ['config', '--get', 'core.commitGraph'])).toBe('true');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -62,7 +72,7 @@ describe('laneGitHardeningEnv lane-owned parent metadata', () => {
     const env = laneHistoryProofEnv({ GIT_GRAFT_FILE: '/lane/info/grafts' });
     expect(env.GIT_GRAFT_FILE).toBe('/dev/null');
     expect(env.GIT_NO_REPLACE_OBJECTS).toBe('1');
-    expect(env.GIT_CONFIG_COUNT).toBe(laneGitHardeningEnv({}).GIT_CONFIG_COUNT);
+    expect(env.GIT_CONFIG_COUNT).toBe(String(Number(laneGitHardeningEnv({}).GIT_CONFIG_COUNT) + 1)); // + core.commitGraph
   });
 
   it('leaves the shared hardening env graft path alone so health-watch can still detect a lane grafts file', () => {
