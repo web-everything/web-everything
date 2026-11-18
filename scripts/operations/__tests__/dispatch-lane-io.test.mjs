@@ -7,6 +7,8 @@ import { createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatc
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+import { applyPendingEffects, inFlightEntries } from '../effect-executor.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
 
 describe('the tick reader handoff', () => {
   const at = '2026-10-06T12:00:00.000Z';
@@ -172,6 +174,72 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
     expect(provider).toHaveBeenCalledOnce();
     expect(provider.mock.calls[0][0].groupMembers).toBe(groupMembers);
     expect(provider.mock.calls[0][0].prompt).toBe(prompt);
+  });
+  describe.each(['build', 'prepare-item'])('fresh %s admission at provider launch', launchKind => {
+    it.each([
+      ['empty list during reservation', [], 'reserve'],
+      ['member removed during reservation', ['12'], 'reserve'],
+      ['lead removed during reservation', ['13'], 'reserve'],
+      ['empty list during final settings setup', [], 'settings'],
+      ['unreadable settings after reservation', null, 'reserve'],
+    ])('refuses all work and clears reservations: %s', async (_name, ids, phase) => {
+      let settings = { mode: 'only', only: true, ids: ['12', '13'] };
+      const revoke = () => { settings = ids === null ? null : { ...settings, ids }; };
+      const reservation = { reserved: true, lane: 2, session: 'conveyor-12' };
+      const leases = new Set();
+      const releaseLane = vi.fn(r => leases.delete(r));
+      const provider = vi.fn(async () => 'pid:123');
+      const readRuntimeSettings = vi.fn(() => {
+        if (settings === null) throw new Error('settings unreadable');
+        return settings;
+      });
+      const sinks = baseSinks({ provider, releaseLane, readRuntimeSettings,
+        reserveLane: () => {
+          leases.add(reservation);
+          if (phase === 'reserve') revoke();
+          return reservation;
+        },
+        resolveSettingsEnv: () => { if (phase === 'settings') revoke(); return {}; },
+      });
+      const run = { v: 1, id: 'runtime-race', op: 'dispatch-lane', input: { num: '12' },
+        cursor: 2, findings: {}, verdict: null, telemetry: [], pending: { kind: 'effect', stepIndex: 2, step: 'dispatch' },
+        effects: [{ key: 'runtime-race#2#0', stepIndex: 2, index: 0, type: DISPATCH_EFFECT,
+          status: 'declared', dispatch: true, idempotent: false,
+          payload: { ...payload, num: '12', launchKind, groupMembers: ['13'] } }],
+      };
+      const store = createMemoryRunStore();
+      const result = await applyPendingEffects(run, { sinks, store });
+      const kind = launchKind.startsWith('prepare') ? 'prepare' : 'build';
+      const refused = ['12', '13'].filter(num => ids === null || !ids.includes(num))
+        .map(num => ({ num, kind: num === '12' ? launchKind : kind,
+          reason: ids === null ? 'runtime-malformed' : 'runtime-only' }));
+      expect(result.error).toMatchObject({ notApplied: true, outcome: 'runtime-refused', runtimeRefused: refused });
+      expect(readRuntimeSettings).toHaveBeenCalledTimes(4);
+      expect(provider).not.toHaveBeenCalled();
+      expect(releaseLane).toHaveBeenCalledTimes(1);
+      expect(releaseLane).toHaveBeenCalledWith(reservation);
+      expect(leases.size).toBe(0);
+      expect(result.inFlight).toEqual([]);
+      expect(store.read(run.id).effects[0]).toMatchObject({ status: 'failed', handle: null });
+      expect(inFlightEntries(store.read(run.id))).toMatchObject({ running: [], overdue: [], unknown: [] });
+    });
+    it('launches a still-listed lead and member after reservation', async () => {
+      let reserved = false;
+      const readRuntimeSettings = vi.fn(() => ({ mode: 'only', only: true, ids: ['12', '13'] }));
+      const provider = vi.fn(async request => {
+        expect(reserved).toBe(true);
+        expect(readRuntimeSettings).toHaveBeenCalledTimes(4);
+        expect(request).toMatchObject({ num: '12', launchKind, groupMembers: ['13'] });
+        return 'pid:123';
+      });
+      const releaseLane = vi.fn();
+      const sinks = baseSinks({ provider, readRuntimeSettings, releaseLane,
+        reserveLane: () => { reserved = true; return { reserved: true, lane: 2, session: 'conveyor-12' }; },
+      });
+      await sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind, groupMembers: ['13'] });
+      expect(provider).toHaveBeenCalledOnce();
+      expect(releaseLane).not.toHaveBeenCalled();
+    });
   });
   it('reserves lane N under the worker\'s own session slug', () => {
     const calls = [];

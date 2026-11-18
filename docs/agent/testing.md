@@ -4698,3 +4698,9 @@ all-members admission check. Keep the grouped-provider capability guard intact.
 forwarding; `build-dispatch-orphan-adopt.test.mjs` covers persisted-group refusal
 including admission changing at the final spawn check, with unchanged claims,
 markers and attempt counts.
+
+Dispatch-lane must also re-read admission for the lead and every member immediately
+before calling the provider, after lane reservation and session/settings setup.
+`dispatch-lane-io.test.mjs` changes the allowlist during reservation and final settings
+setup, including unreadable evidence, and asserts no provider call, lane lease release,
+`runtime-refused`, and no in-flight run-store entry. Still-listed groups launch unchanged.

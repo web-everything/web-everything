@@ -49,7 +49,7 @@ function groupsGuarded(call) {
   }
   const initializerFor = name => priorStatements.filter(ts.isVariableStatement).flatMap(s => [...s.declarationList.declarations])
     .find(d => d.name.getText() === name)?.initializer;
-  for (const arg of call.arguments) contains(arg, node => {
+  for (const arg of call.arguments) contains((ts.isIdentifier(arg) && initializerFor(arg.text)) || arg, node => {
     if ((ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) && node.name.getText() === 'groupMembers') {
       groups.push(ts.isPropertyAssignment(node) ? node.initializer : node.name);
     }
@@ -172,6 +172,11 @@ it('detects a bypass despite a gate in a sibling branch or comment', () => {
   }`).bypasses).toEqual([]);
 });
 it('rejects forwarding unchecked group members despite an admitted lead', () => {
+  expect(scan(`function run(payload) {
+    if (!assertRuntimeAdmitted(payload, 'build').admitted) return;
+    const request = { num: payload.num, groupMembers: payload.groupMembers };
+    provider(request);
+  }`).bypasses).toHaveLength(1);
   expect(scan(`function run(payload) {
     if (!assertRuntimeAdmitted(payload, 'build').admitted) return;
     provider({ num: payload.num, groupMembers: payload.groupMembers });

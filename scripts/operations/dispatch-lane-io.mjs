@@ -1626,7 +1626,7 @@ export function createDispatchSinks({
       let wrappedPid = null;
       let handle;
       try {
-        handle = await provider({
+        const request = {
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
           reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
@@ -1679,7 +1679,20 @@ export function createDispatchSinks({
           // (via `ensureWorktreeIsolation` above) the same durable settings.local.json this dispatch's cwd
           // already carries the gh-shim env/lane-grant overrides in.
           worktreeSettings,
-        });
+        };
+        // Reservation and session setup can change runtime settings. Re-read every card at the launch boundary.
+        const runtimeRefused = [];
+        const admission = assertRuntimeAdmitted(payload, payload?.launchKind ?? 'build', { readSettings: readRuntimeSettings });
+        if (!admission.admitted) runtimeRefused.push({ num: String(payload?.num), kind: payload?.launchKind ?? 'build', reason: admission.reason });
+        const allMembersAdmitted = groupMembers.map(member => {
+          const kind = payload?.launchKind?.startsWith('prepare') ? 'prepare' : 'build';
+          const admission = assertRuntimeAdmitted({ num: member }, kind, { readSettings: readRuntimeSettings });
+          if (!admission.admitted) runtimeRefused.push({ num: String(member), kind, reason: admission.reason });
+          return admission.admitted;
+        }).every(Boolean);
+        if (!admission.admitted) throw notApplied(admission.reason, { outcome: 'runtime-refused', runtimeRefused });
+        if (!allMembersAdmitted) throw notApplied('runtime admission refused group', { outcome: 'runtime-refused', runtimeRefused });
+        handle = await provider(request);
       } catch (e) {
         // x87v3ed — a launch that definitely started nothing hands its reserved lane back; an INDETERMINATE one
         // (below) keeps it, because a session may be running in it.
