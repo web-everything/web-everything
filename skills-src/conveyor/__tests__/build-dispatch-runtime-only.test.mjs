@@ -191,7 +191,11 @@ it('runtime-only removes an unlisted epic child before lane and rival-scope assi
   const plan = dispatchPlan({ queue, leases: [], freeLanes: [20, 21], buildPriority: settings });
   const out = planTick({ state: { queue }, plan, freeLanes: [20, 21], config: { buildPriority: settings } });
   expect(nums(out.decisions.spawnBuilds)).toEqual(['8001']);
-  expect(plan.held).toEqual([{ num: '7000', reason: 'needs-slice' }]);
+  expect(plan.launch).toEqual([{ num: '8001', lane: 20 }]);
+  expect(plan.held).toEqual([
+    { num: '7000', reason: 'needs-slice' },
+    { num: '7001', reason: 'runtime-only' },
+  ]);
 });
 
 it.each(['build', 'prepare'])('durable bornAs alias survives the %s planning and daemon filters', async kind => {
@@ -214,5 +218,5 @@ it.each([only([]), { ...only(['xabcdef0']), held: true }])('dispatch assignment 
   const plan = dispatchPlan({ queue: [{ num: '8001', bornAs: 'xabcdef0', scope: ['scripts/shared.mjs'] }],
     leases: [], freeLanes: [20, 21], buildPriority });
   expect(plan.launch).toEqual([]);
-  expect(plan.held).toEqual([]);
+  expect(plan.held).toEqual([{ num: '8001', reason: 'runtime-only' }]);
 });
