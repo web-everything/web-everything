@@ -402,7 +402,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       throw new Error(`unexpected or unavailable fixture read: ${command} ${args.join(' ')}`);
     });
     f.guard = () => mqSameHeadGuard({ repo, pr: exactPr, head, exec: f.exec, log: f.log,
-      now: f.now, readFreeze: () => null,
+      now: f.now, readFreeze: () => f.freeze ?? null,
       quarantine: { readList: () => ({ ok: false, error: 'no quarantine' }), now: () => NOW } });
     test(f);
   }
@@ -738,7 +738,17 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     const infraLog = 'fatal: could not fetch abc123 from promisor remote\n';
     if (route === 'merge-gate freeze') {
       f.mqChecks = [check(36, 'merge-gate', 800, 'failure')];
-      f.logs[36] = '2026-11-07T23:00:00Z hold  red-main-freeze  main is RED (freeze: fixture)\n';
+      // The ordinary freeze hold needs a complete gate log, merge-gate run identity and a clear shared freeze.
+      const rows = ['required-check-read', 'candidate-label', 'producer-certified', 'default-base', 'required-check-green',
+        'codeql', 'mergeable', 'landable-state', 'non-empty-body', 'red-team', 'review-hold-labels', 'review-acceptance',
+        'manifest-baseline', 'test-gaming', 'head-pin', 'freshness', 'red-main-freeze', 'duplicate-id-on-main', 'couple-whole',
+        'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'].map(n => n === 'red-main-freeze'
+        ? '2026-11-07T23:00:00Z   hold              red-main-freeze        main is RED (freeze: fixture)'
+        : `2026-11-07T23:00:00Z   pass              ${n.padEnd(22)} ok`);
+      f.logs[36] = [`2026-11-07T23:00:00Z #${exactPr}: HOLD`, ...rows, `2026-11-07T23:00:00Z merge-gate: HOLD — held: #${exactPr}`].join('\n');
+      f.jobs[36] = { id: 36, run_id: 800, name: 'merge-gate', workflow_name: 'Merge gate', head_sha: mergeCommit, status: 'completed', conclusion: 'failure' };
+      f.runs[800] = { ...f.runs[800], path: '.github/workflows/merge-gate.yml' };
+      f.freeze = { frozen: false };
     } else if (route === 'runner-loss pattern') {
       f.mqChecks = [check(31, 'test-shard (1)', 800, 'failure')];
       f.logs[31] = infraLog;
