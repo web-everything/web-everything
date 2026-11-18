@@ -3699,11 +3699,15 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
 
   it.each([
     ['annotated merge-gate and review-gate red', heldRollup],
-    ['review-gate red only', reviewOnlyRollup],
   ])('promotes a draft with %s instead of refusing review-hold-red', (_, rollup) => {
     const result = plan({ statusCheckRollup: rollup() });
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'promote-draft', prNumber: 1563 })]);
     expect(result.refusals).toEqual([]);
+  });
+
+  it('does not promote a draft whose only evidence is an unannotated review-gate failure', () => {
+    const result = plan({ statusCheckRollup: reviewOnlyRollup() });
+    expect(result.dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
   });
 
   it.each([

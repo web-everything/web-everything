@@ -50,7 +50,7 @@ const fixPushAfterHeals = () => [
 const pr4631 = (comments, rollup = rollup4631()) => ({
   number: 4631, state: 'OPEN', headRefName: 'lane/accept-carry-forward', headRefOid: HEAD,
   labels: lbl('review:human', 'merge-status:conflicting', 'review-round:8'), mergeStateStatus: 'DIRTY',
-  statusCheckRollup: rollup, comments,
+  statusCheckRollup: rollup, comments, rowsHead: HEAD, rowsComplete: true, rosterSource: 'live',
 });
 
 const plan = (pr, extra = {}) => planReconcile({ prs: [pr], agents: [], now: NOW, requiredChecks: REQUIRED, ...extra });

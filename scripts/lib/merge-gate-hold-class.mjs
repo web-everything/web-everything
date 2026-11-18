@@ -72,6 +72,15 @@ export function resolveReviewRequiredChecks({ labels, ...evidence } = {}) {
     result.perName['merge-gate'] = { ...result.perName['merge-gate'], state: 'held',
       rows: evidence.rows.filter(row => row?.name === 'merge-gate') };
     if (result.state === 'pass') result.state = 'held';
+    // A bound human-review hold on this head also proves a plain failed review-gate on that head is review-owned.
+    const reviewGate = result.perName['review-gate'];
+    if (reviewGate?.state === 'fail' && reviewGate.rows.length
+      && reviewGate.rows.every(row => String(row?.conclusion).toLowerCase() === 'failure' && String(row?.status).toLowerCase() === 'completed')) {
+      result.perName['review-gate'] = { ...reviewGate, state: 'held' };
+      const rank = { pass: 0, held: 1, pending: 2, fail: 3, unknown: 4 };
+      if (result.state === 'fail' && !result.reasons.includes('roster-unavailable'))
+        result.state = Object.values(result.perName).map(value => value.state).reduce((a, b) => rank[b] > rank[a] ? b : a, 'pass');
+    }
   }
   return result;
 }

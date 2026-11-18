@@ -22,7 +22,8 @@ describe('review-hold-only red draft promotion', () => {
 
   it.each([
     ['annotated merge-gate and review-gate red', heldRows(), 'red', true],
-    ['review-gate red only', [check('test'), check('review-gate', 'failure'), check('merge-gate')], 'red', true],
+    // An unannotated review-gate failure has no bound hold evidence: it is a real red, never review-owned.
+    ['review-gate red only', [check('test'), check('review-gate', 'failure'), check('merge-gate')], 'red', false],
     ['green', [check('test'), check('review-gate'), check('merge-gate')], 'green', false],
     ['another required failure', heldRows().map(row => row.name === 'test' ? check('test', 'failure') : row), 'red', false],
     ['another required check pending', heldRows().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row), 'pending', false],
