@@ -4435,3 +4435,36 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## Fast-drain round listing and final live admission
+
+Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
+`WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC` retains the existing override. Publication time starts
+the TTL after the cold listing completes. Rows retain both PR number and head OID; the target
+row is replaced wholesale by a live read, so checks/body from an old head never carry forward.
+The writer stores the resolved default branch with the rows; readers reuse it in process. A
+historical snapshot missing the branch is upgraded under the same lock without listing again.
+
+Waiters retry while the writer owns a live heartbeat lease, including beyond 180 seconds.
+The shared clone-lock primitive reclaims a dead PID or stale lease; the next writer refreshes
+the snapshot. Lock IO failures defer to the next pass with an explicit error rather than
+launching independent live listings. Context-only constellation repos share separate files
+under the round lock root, removed by the existing catch-up cleanup.
+
+Sibling context uses the same short-TTL, label/base-blind rows. Newly opened siblings can take
+until the next refresh to appear, as with siblings opened after a full drain's pass-start
+listing. This window supplies ordering context, never enqueue clearance: missing dependency
+proof still defers through the planner, and enqueue's mutating path runs a final LIVE target
+head and required-check verification. A moved head, red/missing check, unreadable target or
+unknown required set retains the hold. Cached sibling labels never authorize dequeue; a fast
+drain reads minimal live queue membership and then only queued PRs for eviction, including
+manually queued siblings omitted from the snapshot. Whole-repo drains retain their live sweep.
+
+`fast-drain-round-lock.test.mjs` covers concurrent single-flight, a waiter past the old deadline,
+stale-writer takeover, lock failure, historical branch upgrade, branch failure, TTL bounds,
+oversized/incomplete/foreign evidence, target head invalidation, unfiltered context reuse, and
+final live evidence winning over a cached green row on the actual `enqueuePr` mutation path.
+Run it with `fast-drain-scope.test.mjs`, `enqueue-on-event.test.mjs` and
+`merge-queue-enqueue.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
+comparison against daemon observations; fixtures prove IO counts without live GitHub calls.

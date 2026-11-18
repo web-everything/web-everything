@@ -129,7 +129,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
+import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, verifyFastDrainEnqueue, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
@@ -2502,7 +2502,7 @@ export function partitionListings(listings) {
 }
 
 export function buildLiveListingsByRepo(listings) {
-  return new Map((Array.isArray(listings) ? listings : []).filter((l) => l.listing !== 'snapshot').map((l) => [l.repo, l.rows]));
+  return new Map((Array.isArray(listings) ? listings : []).filter((l) => l.listing !== 'snapshot' || l.roundContext).map((l) => [l.repo, l.rows]));
 }
 
 /** #4308 — GitHub's own files-connection page size a listing was fetched with is not independently known at the
@@ -5027,8 +5027,15 @@ async function runCli() {
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
-      sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
-        allowAlreadyQueued: false, refresh, dryRun: DRY_RUN, log: line => process.stderr.write(`${line}\n`) }) });
+      sameHeadAdmission: () => {
+        const admission = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+          allowAlreadyQueued: false, refresh, dryRun: DRY_RUN, log: line => process.stderr.write(`${line}\n`) });
+        if (admission.hold || !listingSnapshot || !isFastDrainTarget(c.repo, { number: c.num })) return admission;
+        return verifyFastDrainEnqueue({ headSha: sha, requiredChecks: queueRequiredChecksOf(c.repo),
+          readLive: () => JSON.parse(createMqLiveReader()('gh', ['pr', 'view', String(c.num), '--repo', c.repo ?? localSlug,
+            '--json', 'state,headRefOid,statusCheckRollup'], { encoding: 'utf8', timeout: 60_000,
+            maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
+      } });
     if (result?.enqueued === true) {
       try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
     }
@@ -5300,13 +5307,21 @@ async function runCli() {
       // Reuse its heavy fields only after matching them against the live pages.
       const slug = repo || localSlug;
       if (slug) {
-        let seed = [];
-        try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
-          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
-          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
-        drainHeavyCacheByRepo.set(repo, listed.cache);
-        return resolveListedChecks(repo, listed.rows);
+        const listLiveContext = async () => {
+          let seed = [];
+          try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
+          const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+            heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+            maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
+          drainHeavyCacheByRepo.set(repo, listed.cache);
+          return resolveListedChecks(repo, listed.rows);
+        };
+        // Context-only constellation repos share the round too, with their own repo-keyed writer.
+        // Keep these files under the round lock root so catch-up cleanup removes them together.
+        return listingSnapshot ? readFastDrainRoundListing({
+          path: join(`${listingSnapshot}.locks`, `context-${encodeURIComponent(slug)}.json`), repo: slug,
+          listLive: listLiveContext,
+        }) : listLiveContext();
       }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return resolveListedChecks(repo, parseListOutput(stdout, { repo }));
@@ -5663,8 +5678,8 @@ async function runCli() {
       const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
       const fields = RECONCILE ? SWEEP_LIST_FIELDS
         : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
-      const readTarget = () => __t.timeAsync('listing.target', async () => {
-        const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},updatedAt,state`],
+      const readTarget = (number = onlyPr) => __t.timeAsync('listing.target', async () => {
+        const { stdout } = await execFileP('gh', ['pr', 'view', String(number), '--repo', slug, '--json', `${fields},updatedAt,state`],
           { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
         const target = JSON.parse(stdout.trim() || 'null');
         return target ? (await resolveListedChecks(repo, [target]))[0] : null;
@@ -5711,18 +5726,23 @@ async function runCli() {
         return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       };
       const rows = roundPath && slug
-        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget,
-          defaultBranch: () => defaultBranchByRepo.get(repo) ?? null,
-          listLive: async () => { const rows = await listLive(); await resolveDefaultBranch(repo); return rows; } })
+        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: true,
+          defaultBranch: async () => {
+            await __t.timeAsync('listing.defaultBranch', () => resolveDefaultBranch(repo));
+            return defaultBranchByRepo.get(repo) ?? null;
+          },
+          reuseDefaultBranch: name => { if (typeof name === 'string' && name.trim()) defaultBranchByRepo.set(repo, name); },
+          listLive })
         : await listLive();
       const listedRows = Array.isArray(rows) ? rows : [];
       const truncated = Array.isArray(rows) && isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT);
       // Preparation observes the same release-label and operator label filter as the full drain.
       const prs = listedRows.filter(operatorSelects);
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
-      // A round listing is candidate evidence only, even after its target is refreshed.
-      // Context must re-list live to discover newly opened blockers/carriers/siblings.
-      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive };
+      // The short-TTL round includes label/base-blind sibling context. Target head/checks are live here
+      // and reverified at enqueue; absent dependencies still require the planner's landed proof.
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', roundContext: !!roundPath,
+        complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive, readTarget };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
@@ -5735,6 +5755,7 @@ async function runCli() {
         return;
       }
     }
+    defaultBranchByRepo.set(repo, null); // Memoize even an unreadable read; retry on the next pass.
     try {
       const { stdout } = await execFileP('gh', ['repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], { encoding: 'utf8' });
       const name = stdout.trim();
@@ -5761,7 +5782,7 @@ async function runCli() {
       prs: listing.prs.map(pr => ({ repo, num: pr.number })), listedRepos: [repo],
     }));
   }
-  // #4108 — reuse only this pass's live listings; round snapshot rows never serve context.
+  // Reuse this pass's live listings and the short-TTL round context, without narrowing siblings.
   // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
@@ -5779,15 +5800,21 @@ async function runCli() {
     repoll: async () => { await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
-  // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
-  // Round snapshots are candidate evidence only. Reuse the live context listing when available; a bare
-  // fast drain must obtain its own fresh rows. Failed context reads already log and contribute no rows.
+  // Eviction uses live labels: full drains sweep every open PR, target drains refresh only their target.
   for (const listing of listings) {
     if (DRY_RUN || !mergeStrategy.enqueues(listing.repo)) continue;
     try {
-      const rows = listing.listing !== 'snapshot' ? listing.rows
-        : RECONCILE ? openPrContext.prsByRepo.get(listing.repo) ?? []
-          : await __t.timeAsync('listing.eviction', listing.readLiveRows);
+      // Discover manually queued siblings through minimal LIVE queue membership, then read only
+      // those PRs. Cached labels never authorize dequeue, and no open-PR listing is needed.
+      const readQueuedRows = async () => {
+        const queue = readQueueFacts({ repo: listing.repo || localSlug, exec: createMqLiveReader() });
+        if (queue.error || !(queue.inQueue instanceof Set)) throw new Error(queue.error || 'queue membership unreadable');
+        return mapWithConcurrency([...queue.inQueue], resolvedMergePolicy.policy.concurrency.gateReads, listing.readTarget);
+      };
+      const rows = listing.roundContext ? await __t.timeAsync('listing.eviction', readQueuedRows)
+        : listing.listing !== 'snapshot' ? listing.rows
+          : RECONCILE ? openPrContext.prsByRepo.get(listing.repo) ?? []
+            : await __t.timeAsync('listing.eviction', listing.readLiveRows);
       mergeStrategy.dequeueSendBacks(rows, listing.repo);
     } catch (e) {
       process.stderr.write(`  ⚠ merge-queue dequeue sweep for ${repoTag(listing.repo) || 'cwd'} failed (${describeGhListError(e).text}) — retried next pass\n`);
