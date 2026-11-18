@@ -453,8 +453,8 @@ export function probeDaemonStatus({ collect = collectDaemonStatus, assess = asse
       log,
       role: d.kind ?? null,
       pid: entry?.pid ?? null,
-      pidAlive: !!d.running || outsideLaunchd === true,
-      // Launchd absence does not prove that the process holding the daemon lease is dead.
+      pidAlive: !!d.running, // unchanged: a bare signal-0 probe never feeds the silent-daemon investigation
+      // Launchd absence does not prove that the process holding the daemon lease is dead; the alert smell reads this.
       outsideLaunchd,
       heartbeatAt: ms(entry?.heartbeatAt),
       lastActivityAt: activity.length ? Math.max(...activity) : null,

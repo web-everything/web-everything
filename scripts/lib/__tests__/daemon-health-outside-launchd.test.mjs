@@ -13,7 +13,7 @@ it('health-watch alerts on a live lease outside launchd and never plans interven
   const alive = vi.fn(() => true);
   const leases = probe([row()], alive);
   expect(alive).toHaveBeenCalledWith(42);
-  expect(leases[0]).toMatchObject({ outsideLaunchd: true, pid: 42, pidAlive: true });
+  expect(leases[0]).toMatchObject({ outsideLaunchd: true, pid: 42, pidAlive: false });
   expect(SMELLS.some(s => s.id === outsideLaunchd.id)).toBe(true);
   expect(outsideLaunchd.action).toBe('alert');
   const result = runHealthTick(emptyHealthState(), { leases }, [outsideLaunchd], Date.parse('2026-11-18T15:10:00Z'));
