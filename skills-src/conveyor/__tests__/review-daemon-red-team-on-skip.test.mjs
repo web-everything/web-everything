@@ -494,7 +494,7 @@ it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery r
 
 
 it.each(['on', 'off'])('capability-disabled tick still enforces overdue send-backs and gates without starting reviews (queue %s)', queue => {
-  const repo = 'web-everything/web-everything';
+  const repo = 'fixture/capability';
   const { plan, rawPrs } = owedPrs(repo, [9601, 9602]);
   const head = rawPrs[0].headRefOid;
   rawPrs[0].comments = [{
@@ -514,7 +514,7 @@ it.each(['on', 'off'])('capability-disabled tick still enforces overdue send-bac
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', queue);
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() }, listCommands: () => '' });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() }, listCommands: () => '' });
     const out = runReviewTick({ repo,
       resolveProfile: () => ({ capabilities: { review: false } }),
       reconcile: () => ({ ...plan, dispatch: [] }),
