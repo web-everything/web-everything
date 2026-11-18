@@ -56,6 +56,16 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       } catch { return { ...data, workflows: null }; }
     },
     overlayState: r => readState(r.clone, { env }),
+    containsOverlay: r => {
+      try {
+        exec('git', ['merge-base', '--is-ancestor', r.sha, 'HEAD'],
+          { cwd: r.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+        return true;
+      } catch (e) {
+        if (e.status === 1) return false;
+        throw new Error('unreadable clone HEAD ancestry; inspect the daemon build manually');
+      }
+    },
     remove: r => remove({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
       reason: `urgent-sweep: CI failed for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
@@ -67,12 +77,35 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
   const results = [], fallback = 'NEEDS-YOU: inspect urgent-loads and CI, repair unreadable evidence or unload the recorded overlay manually, then rerun urgent-sweep.';
   const escalate = (id, target, detail) => deps.escalate({ id: `urgent-${id}`, kind: 'needs-you', target,
     createdAt: deps.now(), status: 'open', evidence: [detail], question: fallback, ladder: { next: 'L3 operator' } });
+  const notificationsComplete = r => r.status === 'settled-unloaded'
+    || (r.unloadEventSent === true && r.unloadEscalationSent === true);
+  const notifyUnload = async (id, r, receipt, errors) => {
+    // Legacy settlements followed both notifications. New receipts checkpoint each sink separately.
+    if (notificationsComplete(receipt)) return { ...receipt, unloadEventSent: true, unloadEscalationSent: true };
+    for (const [flag, send] of [
+      ['unloadEventSent', () => deps.event({ type: 'prototype-load.urgent-unloaded', at: receipt.removedAt ?? receipt.at,
+        id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration })],
+      ['unloadEscalationSent', () => escalate(id, r.ref, `Unloaded ${r.sha}: CI failed. Inspect and repair before reloading.`)],
+    ]) {
+      if (receipt[flag] === true) continue;
+      try {
+        await send();
+        const next = { ...receipt, [flag]: true };
+        await deps.settle(next);
+        receipt = next;
+      } catch (e) { errors.push(`${flag}: ${e.message}`); }
+    }
+    return receipt;
+  };
   try {
     const settlements = deps.state();
-    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-green', 'settled-green', 'settled-unloaded', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
+    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
     // Historical time-based green receipts never prove an overlay is no longer registered.
-    const settled = new Set(settlements.filter(r => ['settled-unloaded', 'settled-unregistered'].includes(r.status)).map(r => r.id));
+    // Old unload receipts prove removal only; resume them through the adoption check too.
+    const unloaded = new Map(settlements.filter(r => ['settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted'].includes(r.status)).map(r => [r.id, r]));
+    const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered').map(r => r.id));
+    for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && notificationsComplete(r)) settled.add(id);
     const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
     const records = deps.loads();
     const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
@@ -88,15 +121,46 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     if (batch.length) await deps.settle({ id: batch.at(-1)[0], status: 'sweep-cursor', at: deps.now() });
     // Three GitHub reads per load, at most 96 per tick. Remaining entries wait for the next orchestrator tick.
     for (const [id, r] of batch) {
+      const notificationErrors = [];
+      const report = result => results.push(notificationErrors.length
+        ? { id, status: 'needs-you', detail: `Unload notifications incomplete; retry next sweep: ${notificationErrors.join('; ')}` } : result);
       try {
         if (!validSha(r.sha) || !safeRegistrationRef(r.ref) || !isAbsolute(r.clone ?? '')
           || r.registration?.clone !== r.clone || !safeRegistrationRef(r.registration?.ref) || !validSha(r.registration?.sha))
           throw new Error('legacy or incomplete urgent registration; recover clone and ref manually');
+        let pending = unloaded.get(id);
+        if (pending) {
+          pending = await notifyUnload(id, r, pending, notificationErrors);
+          if (pending.status === 'unloaded-adopted') {
+            report({ id, status: 'unloaded-adopted' });
+            continue;
+          }
+        }
         const overlay = await deps.overlayState(r);
         if (!overlay || overlay.corrupt !== false || !Array.isArray(overlay.overlays)
           || overlay.overlays.some(e => !safeRegistrationRef(e?.ref)))
           throw new Error('unreadable overlay state; repair store or inspect registration manually');
-        if (!overlay.overlays.some(e => e.ref === r.registration.ref)) {
+        const registered = overlay.overlays.some(e => e.ref === r.registration.ref);
+        if (pending) {
+          const removedAt = pending.removedAt ?? pending.at, now = Date.parse(deps.now());
+          if (!Number.isFinite(Date.parse(removedAt)) || !Number.isFinite(now) || now < Date.parse(removedAt))
+            throw new Error('unreadable unload timestamp; inspect the daemon build manually');
+          const contains = await deps.containsOverlay(r);
+          if (typeof contains !== 'boolean') throw new Error('unreadable clone HEAD ancestry; inspect the daemon build manually');
+          if (!registered && !contains) {
+            await deps.settle({ ...pending, removedAt, at: deps.now(), status: 'unloaded-adopted' });
+            report({ id, status: 'unloaded-adopted' });
+          } else if (!registered && contains && now - Date.parse(removedAt) >= 15 * 60 * 1000) {
+            const detail = `The daemon fell back to a last-good build containing the failed overlay ${r.sha} after registration removal. Inspect and repair the daemon build in ${r.clone}.`;
+            if (!pending.fallbackEscalated) {
+              await escalate(`${id}-fallback`, r.ref, detail);
+              await deps.settle({ ...pending, removedAt, status: 'unloaded-pending-adoption', fallbackEscalated: true });
+            }
+            report({ id, status: 'needs-you', detail });
+          } else report({ id, status: 'unloaded-pending-adoption' });
+          continue;
+        }
+        if (!registered) {
           await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-unregistered' });
           results.push({ id, status: 'settled-unregistered' });
           continue;
@@ -106,10 +170,10 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           const removal = await deps.remove(r);
           if (!removal || removal.refused || (removal.removed !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };
-          await deps.event(event);
-          await escalate(id, r.ref, `Unloaded ${r.sha}: CI failed. Inspect and repair before reloading.`);
-          await deps.settle({ ...event, status: 'settled-unloaded' });
-          results.push({ id, status: 'settled-unloaded' });
+          const receipt = { ...event, removedAt: event.at, status: 'unloaded-pending-adoption', unloadEventSent: false, unloadEscalationSent: false };
+          await deps.settle(receipt);
+          await notifyUnload(id, r, receipt, notificationErrors);
+          report({ id, status: 'unloaded-pending-adoption' });
         } else {
           if (!Number.isInteger(data?.total_count)
             || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
