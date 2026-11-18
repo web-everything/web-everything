@@ -1673,7 +1673,11 @@ export function dispatchFix(planned, {
         unknownTokens, resumed: false, ...(resumeAttempt ? { resumeAttempt } : {}),
       };
     }
-    if (planned.mode === 'red-team-sent-back') publishRedTeamRound({ repo, planned });
+    if (planned.mode === 'red-team-sent-back' && !publishRedTeamRound({ repo, planned })) {
+      const reason = 'launch already spent; new dispatch required';
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} skipping: ${reason}`);
+      throw new Error(reason); // Release the claim through the same cleanup as any pre-launch refusal.
+    }
     const sessionId = String(mintSessionId());
     // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself (see
     // `dispatchSessionCwd`'s own header at the io shell for why — the identical bug `createDispatchSinks` had).

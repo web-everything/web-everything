@@ -2514,20 +2514,41 @@ describe('Claude red-team repair round publication', () => {
     expect(tryResumeFix(planned)).toEqual({ resumed: false, resumeAttempt: null });
     expect(tryResumeRoundFix({ ...planned, attempts: 1 })).toEqual({ resumed: false, resumeAttempt: null });
   });
-  it('counts the Claude round before the agent starts, bound to head/result and idempotent per attempt', () => {
+  it.each([false, true])('launches a replayed Claude plan once and charges a new attempt before launch (wrapped=%s)', wrapFix => {
     const { comments, result } = thread();
     const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
     const publishRedTeamRound = request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec });
+    let expectedRound = 1;
+    const checkReceipt = () => {
+      expect(countRedTeamFixComments(comments)).toBe(expectedRound);
+      expect(comments.at(-1).body).toContain(`head=${head} result=${result} attempt=${expectedRound}`);
+    };
     const spawnAgent = vi.fn(() => {
-      expect(countRedTeamFixComments(comments)).toBe(1);
-      expect(comments.at(-1).body).toContain(`head=${head} result=${result} attempt=1`);
+      checkReceipt();
       return '';
     });
-    dispatchFix(planned, { ...options(), publishRedTeamRound, spawnAgent });
-    expect(spawnAgent).toHaveBeenCalledOnce();
-    expect(publishRedTeamRound({ repo: 'we', planned })).toBe(false);
+    const launchWrapped = vi.fn(() => {
+      checkReceipt();
+      return { handle: 'pid:99' };
+    });
+    const io = { ...options(), wrapFix, publishRedTeamRound, spawnAgent, launchWrapped };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      dispatchFix(planned, io);
+      expect(() => dispatchFix(planned, io)).toThrow('launch already spent; new dispatch required');
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('skipping: launch already spent; new dispatch required'));
+    } finally {
+      log.mockRestore();
+    }
+    expect(wrapFix ? launchWrapped : spawnAgent).toHaveBeenCalledOnce();
+    expect(wrapFix ? spawnAgent : launchWrapped).not.toHaveBeenCalled();
+    expect(io.releaseClaim).toHaveBeenCalledOnce();
     expect(exec).toHaveBeenCalledOnce();
-    publishRedTeamRound({ repo: 'we', planned: { ...planned, attempts: 1 } });
+    expectedRound = 2;
+    dispatchFix({ ...planned, attempts: 1 }, io);
+    expect(wrapFix ? launchWrapped : spawnAgent).toHaveBeenCalledTimes(2);
+    expect(io.releaseClaim).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledTimes(2);
     expect(countRedTeamFixComments(comments)).toBe(2);
     expect(comments.at(-1).body).toContain(RED_TEAM_FIX_COMMENT_MARKER);
   });
