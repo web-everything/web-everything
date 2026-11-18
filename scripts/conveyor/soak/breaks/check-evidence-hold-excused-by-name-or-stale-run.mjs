@@ -14,8 +14,7 @@ const head = ${JSON.stringify(HEAD)};
 const row = { name: 'merge-gate', status: 'completed', conclusion: 'failure', head_sha: head, detailsUrl: ${JSON.stringify(URL(123))},
   mergeGateReviewHold: { holds: ['review-acceptance'], holdIds: ['review-acceptance'], headSha: head, jobId: 123, originalConclusion: 'failure' } };
 const ok = typeof m.boundMergeGateReviewHold === 'function' && typeof m.resolveReviewRequiredChecks === 'function'
-  && m.boundMergeGateReviewHold(row, { headSha: head, labels: ['review:pending'] }) === true
-  && m.boundMergeGateReviewHold({ ...row, conclusion: 'cancelled', mergeGateReviewHold: { ...row.mergeGateReviewHold, originalConclusion: 'cancelled' } }, { headSha: head, labels: [] }) === false;
+  && m.boundMergeGateReviewHold(row, { headSha: head, labels: ['review:pending'] }) === true;
 process.stdout.write(String(ok));`;
 
 export default {
@@ -23,7 +22,9 @@ export default {
   title: 'a merge-gate hold or check was excused by name or by an unbound/stale run, letting a PR advance',
   card: 'check-evidence-contract stack #7084 (PR2c)',
   fixedBy: { sha: 'e17b7a309a', where: 'lane/check-evidence-contract-pr2c', paths: [MODULE] },
-  // Decided by behaviour (a child process runs the scenario against this tree), never by marker strings.
+  // Decided by behaviour (a child process runs the capability probe against this tree), never by marker strings.
+  // The probe only proves the bound-hold resolver exists and accepts a valid hold; every invariant under test is
+  // judged in run(), so a regression of one stays a required failure instead of flipping this to expected-fail.
   fixPresent(root) {
     try {
       const out = spawnSync(process.execPath, ['--input-type=module', '-e', SCENARIO, pathToFileURL(join(root, MODULE)).href], { encoding: 'utf8', timeout: 60000 });
