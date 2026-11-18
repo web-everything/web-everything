@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import { foldReviewRefusalInto, planReconcile } from '../../conveyor/reconcile-core.mjs';
-import { reviewCiGate } from '../review-ci-gate.mjs';
 import { readPlannerRow, readPlannerRows } from '../red-team-planner-row.mjs';
 import { planRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../red-team-dispatch-queue.mjs';
@@ -9,7 +8,7 @@ import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../red-team-dis
 // reconcile-core.test.mjs (foldReviewRefusalInto and the annotated held-gate fixtures).
 const repo = 'web-everything/web-everything', pr = 5762, head = 'a'.repeat(40);
 const check = (name, conclusion = 'failure', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
-const rawPr = (statusCheckRollup = []) => ({ number: pr, headRefOid: head, comments: [], reviews: [], statusCheckRollup });
+const rawPr = (statusCheckRollup = []) => ({ number: pr, headRefOid: head, rowsComplete: true, comments: [], reviews: [], statusCheckRollup });
 const refusal = (kind, extra = {}) => ({ kind, prNumber: pr, headSha: head, ...extra });
 const scopeBloat = { stale: true, why: 'stale base carries unrelated changes' };
 function folded(kind) {
@@ -61,213 +60,94 @@ describe('readPlannerRow', () => {
     expect(row.refusal.reviewRefusal).toEqual({ kind: 'scope-bloat', scopeBloat });
   });
 
+  const classify = (checks, extra = {}) => readPlannerRow({ pr, refusals: [refusal('review-ci')],
+    rawPrs: [rawPr(checks)], requiredChecks: ['test'], rosterSource: 'live', ...extra });
+
   it.each([
-    ['review-gate', check('review-gate'), ['review-gate']],
-    ['review-owned merge-gate', check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }), ['merge-gate']],
-    ['plain merge-gate', check('merge-gate'), []],
-    ['red-team', check('red-team'), []],
-    ['ordinary test', check('test'), []],
-  ])('reuses normal ownership for a required %s failure', (_, failed, owned) => {
-    const checks = [check('gate', 'success'), failed];
-    const requiredChecks = ['gate', failed.name];
-    const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
-    expect(result.reviewOwnedChecks).toEqual({
-      ci: reviewCiGate({ headSha: head, requiredChecks, checks }),
-      required: [failed.name], nonRequired: [], reviewOwned: owned,
-      nonReviewOwned: owned.length ? [] : [failed.name], gatesOnlyRed: !!owned.length, onlyRed: !!owned.length,
+    ['pass', [check('test', 'success')], 'pass', [], []],
+    ['missing status', [{ name: 'test', conclusion: 'success' }], 'unknown', [], ['test']],
+    ['foreign-head failure', [check('test', 'failure', { head_sha: 'b'.repeat(40) })], 'unknown', [], ['test']],
+    ['held review-gate', [check('review-gate')], 'held', ['review-gate'], []],
+    ['merge-gate without a bound hold', [check('merge-gate', 'failure', {
+      mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 },
+    })], 'fail', [], ['merge-gate']],
+    ['rerun in flight', [check('test', 'success', { run_id: 1, run_attempt: 1 }),
+      check('test', null, { run_id: 1, run_attempt: 2, status: 'in_progress' })], 'pending', [], ['test']],
+  ])('mirrors the contract for %s', (_, checks, state, reviewOwned, nonReviewOwned) => {
+    const result = classify(checks, { requiredChecks: [checks[0].name] });
+    expect(result.checkEvidence.state).toBe(state);
+    expect(result.checkEvidence.perName[checks[0].name].state).toBe(state);
+    expect(result.reviewOwnedChecks).toMatchObject({
+      ci: { allowed: state === 'pass' }, required: state === 'pass' ? [] : [checks[0].name],
+      nonRequired: [], reviewOwned, nonReviewOwned,
+      gatesOnlyRed: ['pass', 'held'].includes(state), onlyRed: ['pass', 'held'].includes(state),
     });
-  });
-
-  it('does not count optional failures as required review holds', () => {
-    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr([check('review-gate')])], requiredChecks: ['test'] });
-    expect(result.reviewOwnedChecks).toMatchObject({ required: [], nonRequired: ['review-gate'], reviewOwned: [], onlyRed: false });
-    expect(result.reviewOwnedChecks.ci.affected).toEqual([{ name: 'test', reason: 'missing' }]);
-  });
-
-  it('keeps unknown, missing, pending and wrong-head evidence closed', () => {
-    for (const checks of [undefined, [], [check('review-gate', null, { status: 'in_progress' })],
-      [check('review-gate', 'success', { head_sha: 'b'.repeat(40) })]]) {
-      const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks: ['review-gate'] });
-      expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
-      expect(result.reviewOwnedChecks.onlyRed).toBe(false);
-    }
-  });
-
-  it('recomputes the current snapshot while preserving an adapted refusal', () => {
-    const original = refusal('nothing-owed', { phase: 'queued' });
-    const requiredChecks = ['review-gate'];
-    const saved = readPlannerRow({ repo, pr, refusals: [original], rawPrs: [rawPr([check('review-gate')])], requiredChecks });
-    const adapted = { ...original, kind: 'already-reviewed-head' };
-    const result = readPlannerRow({ repo, pr, plan: { refusals: [adapted], plannerRows: [saved] }, rawPrs: [rawPr()], requiredChecks });
-    expect(result.refusal).toBe(adapted);
-    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
-    expect(result.reviewOwnedChecks.reviewOwned).toEqual([]);
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'review-gate', reason: 'missing' }] });
-  });
-
-  it.each(['failure', 'success'])('rejects %s checks entirely from another head for CI and red-only evidence', conclusion => {
-    const checks = [check('test', 'success'), check('review-gate', conclusion)]
-      .map(row => ({ ...row, head_sha: 'b'.repeat(40) }));
-    const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')],
-      rawPrs: [rawPr(checks)], requiredChecks: ['test', 'review-gate'] });
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [
-      { name: 'test', reason: 'wrong-head' }, { name: 'review-gate', reason: 'wrong-head' },
-    ] });
-  });
-
-  it.each([
-    ['integration'], ['test', 'integration'], ['review-gate', 'integration'],
-  ])('wrong-head test success never implies missing required checks: %j', (...requiredChecks) => {
-    const checks = [check('test', 'success', { head_sha: 'b'.repeat(40) })];
-    if (requiredChecks.includes('review-gate')) checks.push(check('review-gate', 'failure', { head_sha: head }));
-    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
-    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
-    expect(result.reviewOwnedChecks.ci.affected).toContainEqual({ name: 'integration', reason: 'missing' });
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
-  });
-
-  it('preserves the wrong-head refusal when a newer wrong-head test rerun shadows current success', () => {
-    const checks = [check('test', 'success', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' }),
-      check('test', 'failure', { head_sha: 'b'.repeat(40), id: 2, completedAt: '2026-11-17T11:00:00Z' })];
-    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
-      rawPrs: [rawPr(checks)], requiredChecks: ['test', 'integration'] });
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [
-      { name: 'test', reason: 'wrong-head' }, { name: 'integration', reason: 'missing' },
-    ] });
-    expect(result.reviewOwnedChecks.required).toEqual(['test']);
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
-  });
-
-  it.each([false, true])('preserves wrong-head integration failure beside current test success (review hold=%s)', reviewHold => {
-    const checks = [check('test', 'success', { head_sha: head }),
-      check('integration', 'failure', { head_sha: 'b'.repeat(40) })];
-    const requiredChecks = ['test', 'integration'];
-    if (reviewHold) {
-      checks.push(check('review-gate', 'failure', { head_sha: head }));
-      requiredChecks.push('review-gate');
-    }
-    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
-    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
-    expect(result.reviewOwnedChecks.ci.affected).toContainEqual({ name: 'integration', reason: 'wrong-head' });
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+    if (state === 'pending') expect(result.checkEvidence.perName.test.rerunInFlight).toBe(true);
   });
 
   it.each([head, 'b'.repeat(40)])('rejects optional non-review red on any head for red-only eligibility: %s', failedHead => {
-    const checks = [check('test', 'success', { head_sha: head }), check('review-gate', 'failure', { head_sha: head }),
-      check('optional', 'failure', { head_sha: failedHead })];
-    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)],
-      requiredChecks: ['test', 'review-gate'] });
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
-  });
-
-  it.each([
-    ['missing status', { name: 'test', conclusion: 'success' }],
-    ['unknown conclusion', check('test', 'unknown')],
-    ['in_progress status with success', check('test', 'success', { status: 'in_progress' })],
-    ['missing conclusion', { name: 'test', status: 'completed' }],
-  ])('fails closed on direct and implied required checks with %s', (_, malformed) => {
-    for (const requiredChecks of [['integration'], ['test']]) {
-      const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
-        rawPrs: [rawPr([{ ...malformed, head_sha: head }])], requiredChecks });
-      expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false,
-        affected: [{ name: requiredChecks[0], reason: 'missing' }] });
-      expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+    for (const reviewHeld of [false, true]) {
+      const checks = [check('test', 'success', { head_sha: head }),
+        check('optional', 'failure', { head_sha: failedHead })];
+      const requiredChecks = ['test'];
+      if (reviewHeld) {
+        checks.push(check('review-gate', 'failure', { head_sha: head }));
+        requiredChecks.push('review-gate');
+      }
+      const result = classify(checks, { requiredChecks });
+      expect(result.checkEvidence.state).toBe(reviewHeld ? 'held' : 'pass');
+      expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: !reviewHeld },
+        reviewOwned: reviewHeld ? ['review-gate'] : [], nonRequired: ['optional'],
+        nonReviewOwned: [], gatesOnlyRed: true, onlyRed: false });
     }
   });
 
-  it('allows completed same-head test success to imply integration when only integration is required', () => {
-    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
-      rawPrs: [rawPr([check('test', 'success', { head_sha: head })])], requiredChecks: ['integration'] });
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: true, affected: [] });
-  });
-
-  it('preserves same-head test implication and review-only failures', () => {
-    const checks = [check('test', 'success', { head_sha: head })];
-    const input = { pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks: ['test', 'integration'] };
-    expect(readPlannerRow(input).reviewOwnedChecks.ci.allowed).toBe(true);
-    checks.push(check('review-gate', 'failure', { head_sha: head }));
-    input.requiredChecks.push('review-gate');
-    expect(readPlannerRow(input).reviewOwnedChecks).toMatchObject({ ci: { allowed: false }, onlyRed: true });
-  });
-
-  it('preserves unheaded rollup checks as current for the fetched PR head, including implication', () => {
-    const checks = [check('test', 'success')];
-    const requiredChecks = ['test', 'integration'];
-    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
-    expect(result.reviewOwnedChecks.ci).toEqual(reviewCiGate({ headSha: head, requiredChecks, checks }));
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: true, affected: [] });
+  it('uses the refusal head rather than accepting checks fetched for a moved PR head', () => {
+    const result = classify([check('test', 'success')], {
+      rawPrs: [{ ...rawPr([check('test', 'success')]), headRefOid: 'b'.repeat(40) }],
+    });
+    expect(result.checkEvidence.state).toBe('unknown');
+    expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: false, headSha: head }, onlyRed: false });
   });
 
   it.each([
-    ['same head and required set', {}],
-    ['reordered and duplicated required set', { requiredChecks: ['review-gate', 'test', 'test'] }],
-    ['head B with no checks', { rawPrs: [{ ...rawPr(), headRefOid: 'b'.repeat(40) }] }],
-    ['changed required set', { requiredChecks: ['test', 'review-gate', 'integration'] }],
-    ['different repo', { repo: 'other/repo' }],
-    ['different PR', { pr: pr + 1, rawPrs: [{ ...rawPr(), number: pr + 1 }],
-      refusals: [refusal('review-ci', { prNumber: pr + 1 })] }],
-    ['missing repo', { repo: undefined }],
-    ['missing head', { rawPrs: [{ ...rawPr(), headRefOid: undefined }] }],
-    ['missing required set', { requiredChecks: null }],
-    ['empty required set', { requiredChecks: [] }],
-    ['malformed required set', { requiredChecks: ['test', ''] }],
-  ])('recomputes saved classification from current evidence: %s', (_, changed) => {
-    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test', 'review-gate'] };
-    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success'), check('review-gate', 'success')])] });
+    ['unstated roster source', { rosterSource: undefined }],
+    ['declared roster', { rosterSource: 'declared' }],
+    ['unstated completeness', { rawPrs: [{ ...rawPr([check('test', 'success')]), rowsComplete: undefined }] }],
+  ])('fails closed with %s', (_, extra) => {
+    const result = classify([check('test', 'success')], extra);
+    expect(result.checkEvidence.state).toBe('unknown');
+    expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: false }, onlyRed: false });
+  });
+
+  it.each(['plannerOptions', 'plannerRequiredChecks'])('reads the roster provenance from %s', location => {
+    const plan = location === 'plannerOptions'
+      ? { plannerOptions: { requiredChecks: ['test'], rosterSource: 'cache' } }
+      : { plannerRequiredChecks: ['test'], plannerRequiredChecksSource: 'live' };
+    expect(classify([check('test', 'success')], { plan, requiredChecks: undefined, rosterSource: undefined })
+      .reviewOwnedChecks.ci.allowed).toBe(true);
+  });
+
+  it('passes bound hold annotations on the plan to the contract', () => {
+    const result = classify([check('merge-gate', 'failure', {
+      detailsUrl: 'https://github.com/o/r/actions/runs/1/job/1',
+    })], { requiredChecks: ['merge-gate'], plan: {
+      holds: [{ jobId: 1, headSha: head, holdIds: ['review-acceptance'] }],
+    } });
+    expect(result.checkEvidence.state).toBe('held');
+    expect(result.reviewOwnedChecks).toMatchObject({ reviewOwned: ['merge-gate'], nonReviewOwned: [], onlyRed: true });
+  });
+
+  it('recomputes saved classification from current evidence while preserving an adapted refusal', () => {
+    const saved = classify([check('test', 'success')]);
     expect(saved.reviewOwnedChecks.ci.allowed).toBe(true);
-    const result = readPlannerRow({ ...input, rawPrs: [rawPr()], plan: { plannerRows: [saved] }, ...changed });
+    const adapted = refusal('already-reviewed-head');
+    const result = classify([check('test')], { refusals: undefined,
+      plan: { refusals: [adapted], plannerRows: [saved] } });
+    expect(result.refusal).toBe(adapted);
     expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
-    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
-  });
-
-  it('rejects a current test failure on the same head despite a saved green classification', () => {
-    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test', 'review-gate'] };
-    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success'), check('review-gate', 'success')])] });
-    expect(saved.reviewOwnedChecks.ci.allowed).toBe(true);
-    const checks = [check('test'), check('review-gate', 'success')];
-    const result = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [saved] } });
-    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
-    expect(result.reviewOwnedChecks.ci).toEqual(reviewCiGate({ headSha: head, requiredChecks: input.requiredChecks, checks }));
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
-  });
-
-  it('reclassifies check reruns with changed conclusions on the same head', () => {
-    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['review-gate'] };
-    const checks = [check('review-gate', 'failure', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' })];
-    const saved = readPlannerRow({ ...input, rawPrs: [rawPr(checks)] });
-    expect(saved.reviewOwnedChecks.onlyRed).toBe(true);
-    checks.push(check('review-gate', 'success', { head_sha: head, id: 2, completedAt: '2026-11-17T11:00:00Z' }));
-    const green = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [saved] } });
-    expect(green.reviewOwnedChecks.ci.allowed).toBe(true);
-    expect(green.reviewOwnedChecks.onlyRed).toBe(false);
-    checks.push(check('review-gate', 'failure', { head_sha: head, id: 3, completedAt: '2026-11-17T12:00:00Z' }));
-    const red = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [green] } });
-    expect(red.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'review-gate', reason: 'failure' }] });
-    expect(red.reviewOwnedChecks.onlyRed).toBe(true);
-  });
-
-  it('recomputes legacy saved rows with no classification key', () => {
-    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test'] };
-    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success')])] });
-    delete saved.classificationKey;
-    const result = readPlannerRow({ ...input, rawPrs: [rawPr()], plan: { plannerRows: [saved] } });
-    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'missing' }] });
-  });
-
-  it.each([
-    ['missing head', { headRefOid: undefined }, ['review-gate'], 'missing-head'],
-    ['missing required set', {}, null, 'unknown-required-set'],
-    ['empty required set', {}, [], 'unknown-required-set'],
-    ['malformed required set', {}, {}, 'unknown-required-set'],
-  ])('fails closed on red-only evidence with %s', (_, changed, requiredChecks, reason) => {
-    const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')],
-      rawPrs: [{ ...rawPr([check('review-gate')]), ...changed }], requiredChecks });
-    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, reason });
-    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+    expect(result.checkEvidence.state).toBe('fail');
+    expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: false }, nonReviewOwned: ['test'], onlyRed: false });
   });
 
   it('preserves refusal order and multiple refusals for the same PR', () => {

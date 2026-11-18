@@ -4534,12 +4534,17 @@ top-level ownership and the folded `reviewRefusal` separately. The planner-row u
 production suites pin refusal parity and propagation through normal and read-only passes.
 Always recompute from the current checks and required set; saved classifications cannot
 reflect check reruns on the same head. Explicit raw snapshots carry only their own ownership
-annotations. Normal passes carry `plannerRequiredChecks` for validation.
-Derive red-only eligibility from the same head-aware CI classification: wrong-head,
-missing-head and unknown-required-set evidence must remain closed.
-Classify the full rollup to preserve wrong-head refusals, and require a second classification
-without wrong-head rows so their successes cannot imply missing required checks. Non-review-owned
-failures on any head must prevent red-only eligibility, including optional failures.
+annotations. Normal passes carry `plannerRequiredChecks` and `plannerRequiredChecksSource`;
+read-only passes also carry the roster and its `rosterSource` in `plannerOptions`.
+Use one `resolveRequiredChecks` call with the refusal's head, the snapshot's `headRefOid`,
+and explicit snapshot completeness. Preserve bound hold annotations on the rows. Missing
+roster provenance defaults to `declared` and fails closed; retry with live/cache roster
+and complete head-bound evidence. `checkEvidence` records the contract result. Only `held`
+required names are review-owned; non-held fail/unknown/pending names block red-only eligibility.
+Global unknown evidence must also block eligibility even when no per-name entries exist.
+The contract covers required names only. Independently retain optional failures in
+`nonRequired` and veto `onlyRed` on any such failure, including foreign-head rows.
+The named optional non-review red regression covers both passing and held required checks.
 
 ## Required-check row completeness (PR1)
 
