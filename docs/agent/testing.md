@@ -4632,6 +4632,11 @@ carry no proof and fail closed. Never infer completeness from row count or succe
 `review-ci-completeness.test.mjs` exercises the real reader-to-start-gate path with multiple
 pages, a hidden failure, incomplete arrays, and unreadable later-page evidence.
 
+Pure planner soak fixtures must also declare `rowsHead` and `rowsComplete` when their
+positive case supplies a complete current-head feed. Keep a current-tree assertion for
+behavioral `fixPresent` probes: missing fixture evidence can otherwise switch a shipped
+regression into expected-failure mode and silently stop protecting its positive case.
+
 Reconcile re-reads an excused candidacy hold through the complete exact-head review reader
 before scheduling its review. The injected hydration reader keeps its complete-feed contract;
 an explicit `rowsComplete: false` refuses proof. Carry an excusal only for the same immutable
