@@ -4586,6 +4586,8 @@ review-job and review-daemon suites.
 
 `effective-policy.test.mjs` round-trips the cascade formatter; the operator-override cases in
 `http-adapter.test.mjs` exercise before/after adoption, environment shadows and bounded waits.
-Observation success requires a changed policy log line as well as the expected value/source;
-unchanged or unavailable evidence stays “not yet seen”, even when the stored override matches.
+Observation success requires every discovered daemon to log the requested policy with the expected
+value/source, a changed line, and a file mtime strictly newer than both the readable pre-write
+snapshot and override publication. Missing policy lines stay pending as “no policy line seen”; stale
+or unavailable freshness evidence stays “not yet seen”, even when the stored override matches.
 Run these tests through heavy-admission, using `--wait-ms=0` in store-only CLI fixtures.

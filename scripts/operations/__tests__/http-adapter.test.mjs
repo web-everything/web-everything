@@ -1220,13 +1220,13 @@ describe('capacity writers are CLI only', () => {
 describe('effective override observations', () => {
   const key = 'reviewConcurrency.maxLiveReviewRounds';
   const line = (value, layer, stamp = 'now') => `${stamp} policy-cascade · reviewConcurrency: maxLiveReviewRounds=${value} (${layer})`;
-  const reader = getText => () => readEffectivePolicies({ discover: () => ({ review: 'review.log' }), tail: () => ({ text: getText() }) });
+  const reader = (getText, getMtime = () => 0) => () => readEffectivePolicies({ discover: () => ({ review: 'review.log' }), tail: () => ({ text: getText(), mtimeMs: getMtime() }) });
   const input = { key, value: 8, reason: 'test', actor: 'human', waitMs: 20 };
   const runWrite = async ({ initial = line(6, 'env'), next = initial, clear = false, waitMs = 20, changes } = {}) => {
-    let text = initial, clock = 0;
-    const write = vi.fn(() => { text = next; return { key, new: clear ? null : 8, ...(changes ? { changes } : {}) }; });
+    let text = initial, clock = 0, mtimeMs = -1;
+    const write = vi.fn(() => { text = next; mtimeMs = 1; return { key, new: clear ? null : 8, ...(changes ? { changes } : {}) }; });
     const sleep = vi.fn(ms => { clock += ms; });
-    const result = await writeWithEffective({ ...input, waitMs }, { read: reader(() => text), write,
+    const result = await writeWithEffective({ ...input, waitMs }, { read: reader(() => text, () => mtimeMs), write,
       now: () => clock, sleep, pollMs: 10 });
     return { result, write, sleep };
   };
@@ -1274,7 +1274,7 @@ describe('effective override observations', () => {
     for (const discover of [() => ({ review: 'missing' }), () => ({})]) {
       const result = await writeWithEffective({ ...input, waitMs: 0 }, { write: () => ({ key, new: 8 }),
         read: () => readEffectivePolicies({ discover, tail: () => { throw Error('denied'); } }) });
-      expect(result.pending.join(' ')).toContain('not yet seen'); expect(result.warnings).not.toEqual([]);
+      expect(result.pending.join(' ')).toMatch(/not yet seen|no policy line seen/); expect(result.warnings).not.toEqual([]);
     }
   });
   it('zero wait skips sleeping; oversized waits refuse before writing with a fallback', async () => {
@@ -1295,7 +1295,7 @@ describe('effective override observations', () => {
     const result = await writeWithEffective(input, {
       read: () => readEffectivePolicies({ discover: () => ({ first: 'first', second: 'second' }), tail: path => {
         const adopted = clock >= (path === 'first' ? 10 : 20);
-        return { text: line(adopted ? 8 : 6, adopted ? 'operator-db' : 'env', `${path}-${adopted}`) };
+        return { text: line(adopted ? 8 : 6, adopted ? 'operator-db' : 'env', `${path}-${adopted}`), mtimeMs: clock };
       } }), write: () => ({ key, new: 8 }), now: () => clock, sleep, pollMs: 10,
     });
     expect(sleep).toHaveBeenCalledTimes(2);
@@ -1305,7 +1305,7 @@ describe('effective override observations', () => {
     let clock = 0, published = false;
     const result = await writeWithEffective(input, {
       read: () => readEffectivePolicies({ discover: () => ({ review: 'review', other: 'other' }), tail: path => ({ text:
-        line(published && clock >= 10 ? 8 : 6, published && clock >= 10 ? 'operator-db' : 'env', `${path}-${clock}`) }) }),
+        line(published && clock >= 10 ? 8 : 6, published && clock >= 10 ? 'operator-db' : 'env', `${path}-${clock}`), mtimeMs: clock }) }),
       write: () => { published = true; return { key, new: 8, changes: [{ key, new: 8 }, { key: 'reviewConcurrency.other', new: 2 }] }; },
       now: () => clock, sleep: ms => { clock += ms; }, pollMs: 10,
     });

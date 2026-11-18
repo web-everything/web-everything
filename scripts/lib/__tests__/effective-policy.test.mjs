@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { formatCascadeSourcesLine } from '../policy-cascade.mjs';
-import { parseCascadeLines, effectiveForKeys, shadowWarnings, readEffectivePolicies } from '../effective-policy.mjs';
+import { parseCascadeLines, effectiveForKeys, shadowWarnings, readEffectivePolicies, writeWithEffective } from '../effective-policy.mjs';
 import { discoverDaemonLogPaths } from '../../operations/daemon-log-paths.mjs';
 
 const key = 'reviewConcurrency.maxLiveReviewRounds';
@@ -23,10 +23,41 @@ describe('effective policy observations', () => {
     expect(parseCascadeLines(formatCascadeSourcesLine('test', { value: 'a'.repeat(80), sources: { '': 'env' } }))).toEqual({ test: {} });
     expect(parseCascadeLines('policy-cascade · test: cap=8 (mystery)')).toEqual({ test: {} });
   });
-  it('maps nested keys per relevant daemon and retains unknown unreadable logs', () => {
+  it('maps nested keys for every discovered daemon, including unrelated and unreadable logs', () => {
     expect(effectiveForKeys({ review: parseCascadeLines(line(6, 'env')), unreadable: {}, unrelated: { host: {} } }, [key])).toEqual({
-      [key]: { review: { value: 6, layer: 'env' }, unreadable: { value: null, layer: 'unknown' } },
+      [key]: { review: { value: 6, layer: 'env' }, unreadable: { value: null, layer: 'unknown' }, unrelated: { value: null, layer: 'unknown' } },
     });
+  });
+  it('keeps a readable daemon with no requested policy line pending after another adopts', async () => {
+    let published = false;
+    const result = await writeWithEffective({ waitMs: 1 }, {
+      read: () => readEffectivePolicies({ discover: () => ({ review: 'review', other: 'other' }),
+        tail: path => ({ text: path === 'other' ? 'policy-cascade · host: cap=2 (env)'
+          : line(published ? 8 : 6, published ? 'operator-db' : 'env'), mtimeMs: published ? 101 : 90 }) }),
+      write: () => { published = true; return { key, new: 8 }; }, now: () => 100, sleep: async () => {}, pollMs: 1,
+    });
+    expect(result.observation).toBe('timeout');
+    expect(result.pending).toEqual([`${key}: no policy line seen (other)`]);
+    expect(result.warnings[0]).toContain('other: effective value unavailable');
+  });
+  it.each([
+    ['stale changed line', 90, 95, false, 'timeout'],
+    ['publish-time boundary', 90, 100, false, 'timeout'],
+    ['unchanged pre-write mtime', 101, 101, false, 'timeout'],
+    ['initially unreadable stale log', 90, 95, true, 'timeout'],
+    ['missing mtime evidence', undefined, undefined, false, 'timeout'],
+    ['post-publish line', 90, 101, false, 'observed'],
+  ])('requires post-publish mtime proof: %s', async (_name, beforeMtime, afterMtime, unreadable, observation) => {
+    let published = false;
+    const result = await writeWithEffective({ waitMs: 1 }, {
+      read: () => readEffectivePolicies({ discover: () => ({ review: 'review' }), tail: () => {
+        if (!published && unreadable) throw Error('denied');
+        return { text: line(published ? 8 : 6, published ? 'operator-db' : 'env'), mtimeMs: published ? afterMtime : beforeMtime };
+      } }),
+      write: () => { published = true; return { key, new: 8 }; }, now: () => 100, sleep: async () => {}, pollMs: 1,
+    });
+    expect(result.observation).toBe(observation);
+    expect(result.pending).toEqual(observation === 'observed' ? [] : [`${key}: not yet seen by review`]);
   });
   it('warns once per key on env-shadow, value mismatch, and missing evidence; operator-db match is clean', () => {
     expect(shadowWarnings({ [key]: 8 }, { [key]: { review: { value: 6, layer: 'env' } } })[0]).toContain('env shadows');

@@ -25,12 +25,11 @@ export function parseCascadeLines(text) {
   return parsed;
 }
 
-/** PURE: a daemon with no readable policies remains explicitly unknown. */
+/** PURE: every discovered daemon stays unknown until it logs the requested policy. */
 export function effectiveForKeys(parsedByDaemon, keys) {
   return Object.fromEntries(keys.map(key => {
     const policy = policyOf(key), leaf = key.slice(policy.length + 1);
     return [key, Object.fromEntries(Object.entries(parsedByDaemon)
-      .filter(([, policies]) => Object.hasOwn(policies, policy) || !Object.keys(policies).length)
       .map(([daemon, policies]) => [daemon, policies[policy]?.[leaf] ?? { value: null, layer: 'unknown' }]))];
   }));
 }
@@ -60,17 +59,20 @@ export function readEffectivePolicies({ discover = discoverDaemonLogPaths, tail 
   let paths;
   try { paths = discover(); } catch { return {}; }
   return Object.fromEntries(Object.entries(paths).map(([daemon, path]) => {
-    let text = '';
+    let text = '', mtimeMs;
     try {
       const result = tail(path, { maxBytes });
-      if (result && !result.error) text = result.truncated ? (result.text.includes('\n') ? result.text.slice(result.text.indexOf('\n') + 1) : '') : result.text;
+      if (result && !result.error) {
+        text = result.truncated ? (result.text.includes('\n') ? result.text.slice(result.text.indexOf('\n') + 1) : '') : result.text;
+        mtimeMs = result.mtimeMs;
+      }
     } catch { /* Keep the daemon with unknown evidence. */ }
     const parsed = parseCascadeLines(text), stamps = {};
     for (const line of text.split('\n')) {
       const match = line.match(marker);
       if (match) Object.defineProperty(stamps, match[1], { value: line, configurable: true });
     }
-    Object.defineProperty(parsed, evidence, { value: stamps });
+    Object.defineProperty(parsed, evidence, { value: { stamps, mtimeMs } });
     return [daemon, parsed];
   }));
 }
@@ -85,6 +87,7 @@ export async function writeWithEffective(input, { write, read = readEffectivePol
   const safeRead = () => { try { return read(); } catch { return {}; } };
   const initial = safeRead();
   const result = await write(payload);
+  const publishedAt = now();
   const changes = result.changes ?? [{ key: result.key, new: result.new }];
   const values = Object.fromEntries(changes.map(c => [c.key, c.new])), keys = Object.keys(values);
   const before = effectiveForKeys(initial, keys);
@@ -97,9 +100,14 @@ export async function writeWithEffective(input, { write, read = readEffectivePol
       if (!daemons.size) return [`${key}: not yet seen by any daemon (inspect daemon logs)`];
       return [...daemons].flatMap(daemon => {
         const seen = after[key][daemon], policy = policyOf(key);
-        const oldStamp = initial[daemon]?.[evidence]?.[policy];
-        const newStamp = latest[daemon]?.[evidence]?.[policy];
-        const fresh = newStamp !== undefined && newStamp !== oldStamp;
+        if (!Object.hasOwn(latest[daemon] ?? {}, policy))
+          return [clean(`${key}: no policy line seen (${daemon})`)];
+        const oldLog = initial[daemon]?.[evidence], newLog = latest[daemon]?.[evidence];
+        // A changed tail alone can reveal old bytes. Require a readable pre-write
+        // snapshot and an mtime strictly beyond both that snapshot and publication.
+        const fresh = newLog?.stamps[policy] !== undefined && newLog.stamps[policy] !== oldLog?.stamps[policy]
+          && Number.isFinite(oldLog?.mtimeMs) && Number.isFinite(newLog.mtimeMs)
+          && newLog.mtimeMs > oldLog.mtimeMs && newLog.mtimeMs > publishedAt;
         const matches = seen && seen.layer !== 'unknown' && (values[key] === null
           ? seen.layer !== 'operator-db' : seen.layer === 'operator-db' && Object.is(seen.value, values[key]));
         return fresh && matches ? [] : [clean(`${key}: not yet seen by ${daemon}`)];
