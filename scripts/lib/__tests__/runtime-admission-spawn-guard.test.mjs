@@ -37,6 +37,78 @@ function guarded(call) {
   }
   return false;
 }
+// Group forwarding needs a member predicate, independently of the lead's admission.
+function groupsGuarded(call) {
+  const groups = [];
+  const priorStatements = [];
+  let cursor = call;
+  while (cursor.parent && !ts.isFunctionLike(cursor.parent)) {
+    if (ts.isBlock(cursor.parent) || ts.isSourceFile(cursor.parent)) priorStatements.push(...[...cursor.parent.statements].filter(s => s.end <= cursor.pos));
+    cursor = cursor.parent;
+  }
+  const initializerFor = name => priorStatements.filter(ts.isVariableStatement).flatMap(s => [...s.declarationList.declarations])
+    .find(d => d.name.getText() === name)?.initializer;
+  for (const arg of call.arguments) contains(arg, node => {
+    if ((ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) && node.name.getText() === 'groupMembers') {
+      groups.push(ts.isPropertyAssignment(node) ? node.initializer : node.name);
+    }
+    return false;
+  });
+  // A detached process can receive the group through an argv variable instead of an object.
+  for (const arg of call.arguments) {
+    const value = ts.isIdentifier(arg) ? initializerFor(arg.text) : arg;
+    if (value && ts.isArrayLiteralExpression(value)) contains(value, node => {
+      if (ts.isIdentifier(node) && node.text === 'groupMembers') groups.push(node);
+      return false;
+    });
+  }
+  const memberCheck = (callback, refused = false) => {
+    const name = callback.parameters?.[0]?.name.getText();
+    if (!name || !callback.body) return false;
+    const statements = ts.isBlock(callback.body) ? [...callback.body.statements] : [];
+    let result = statements.length ? statements.at(-1)?.expression : callback.body;
+    if (statements.length && !ts.isReturnStatement(statements.at(-1))) return false;
+    if (refused) {
+      if (!result || !ts.isPrefixUnaryExpression(result) || result.operator !== ts.SyntaxKind.ExclamationToken) return false;
+      result = result.operand;
+    }
+    if (!result || !ts.isPropertyAccessExpression(result) || result.name.text !== 'admitted') return false;
+    let check = result.expression;
+    if (ts.isIdentifier(check)) check = statements.filter(ts.isVariableStatement).flatMap(s => [...s.declarationList.declarations])
+      .find(d => d.name.getText() === check.getText())?.initializer;
+    return check && isAssert(check) && ts.isObjectLiteralExpression(check.arguments[0])
+      && check.arguments[0].properties.some(p => (ts.isPropertyAssignment(p) && p.name.getText() === 'num' && p.initializer.getText() === name)
+        || (ts.isShorthandPropertyAssignment(p) && p.name.text === 'num' && name === 'num'));
+  };
+  const filtered = value => ts.isCallExpression(value) && ts.isPropertyAccessExpression(value.expression)
+    && value.expression.name.text === 'filter' && value.arguments.some(callback => memberCheck(callback));
+  return groups.every(group => {
+    if (filtered(group)) return true;
+    const forwarded = ts.isArrayLiteralExpression(group) && group.elements.length === 1 && ts.isSpreadElement(group.elements[0])
+      ? group.elements[0].expression : group;
+    let node = call;
+    while (node.parent && !ts.isFunctionLike(node.parent)) {
+      const parent = node.parent;
+      if (ts.isBlock(parent) || ts.isSourceFile(parent)) {
+        for (const statement of parent.statements) {
+          if (statement.end > node.pos) continue;
+          if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(d =>
+            d.name.getText() === group.getText() && d.initializer && filtered(d.initializer))) return true;
+          if (ts.isExpressionStatement(statement) && ts.isBinaryExpression(statement.expression)
+            && statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+            && statement.expression.left.getText() === group.getText() && filtered(statement.expression.right)) return true;
+          const condition = ts.isIfStatement(statement) ? statement.expression : null;
+          if (condition && exits(statement.thenStatement) && ts.isCallExpression(condition)
+            && ts.isPropertyAccessExpression(condition.expression) && condition.expression.name.text === 'some'
+            && condition.expression.expression.getText() === forwarded.getText()
+            && condition.arguments.some(callback => memberCheck(callback, true))) return true;
+        }
+      }
+      node = parent;
+    }
+    return false;
+  });
+}
 function scan(source, { delegatedExecHelpers = [] } = {}) {
   const ast = ts.createSourceFile('spawn.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   const sites = [], bypasses = [];
@@ -47,7 +119,7 @@ function scan(source, { delegatedExecHelpers = [] } = {}) {
     if (ts.isCallExpression(node) && (launches.test(node.expression.getText()) || /io\.dispatch\s*\?\?\s*dispatchCiHeal/.test(node.expression.getText()) || (!delegatedExec && node.expression.getText() === 'exec' && node.arguments[1]?.getText() === 'argv'))) {
       const site = { call: node.expression.getText(), line: ast.getLineAndCharacterOfPosition(node.getStart()).line + 1 };
       sites.push(site);
-      if (!guarded(node)) bypasses.push(site);
+      if (!guarded(node) || !groupsGuarded(node)) bypasses.push(site);
     }
     ts.forEachChild(node, visit);
   }
@@ -90,4 +162,32 @@ it('detects a bypass despite a gate in a sibling branch or comment', () => {
     if (!assertRuntimeAdmitted(card, 'build').admitted) return;
     effects.dispatch(card);
   }`).bypasses).toEqual([]);
+});
+it('rejects forwarding unchecked group members despite an admitted lead', () => {
+  expect(scan(`function run(payload) {
+    if (!assertRuntimeAdmitted(payload, 'build').admitted) return;
+    provider({ num: payload.num, groupMembers: payload.groupMembers });
+  }`).bypasses).toHaveLength(1);
+  expect(scan(`function run(payload) {
+    if (!assertRuntimeAdmitted(payload, 'build').admitted) return;
+    const groupMembers = payload.groupMembers.filter(member => assertRuntimeAdmitted({ num: member }, 'build').admitted);
+    provider({ num: payload.num, groupMembers });
+  }`).bypasses).toEqual([]);
+  for (const predicate of ["member => { assertRuntimeAdmitted({ num: member }, 'build'); return true; }",
+    "member => assertRuntimeAdmitted({ num: payload.num }, 'build').admitted"]) {
+    expect(scan(`function run(payload) {
+      if (!assertRuntimeAdmitted(payload, 'build').admitted) return;
+      const groupMembers = payload.groupMembers.filter(${predicate});
+      provider({ groupMembers });
+    }`).bypasses).toHaveLength(1);
+  }
+});
+it('rejects unchecked groups encoded in detached spawn argv', () => {
+  const source = `function run(num, groupMembers) {
+    if (!assertRuntimeAdmitted({ num }, 'resume').admitted) return null;
+    const argv = ['worker.mjs', '--group-members=' + groupMembers.join(',')];
+    return spawnDetached(argv);
+  }`;
+  expect(scan(source).bypasses).toHaveLength(1);
+  expect(scan(source.replace("const argv =", "groupMembers = groupMembers.filter(member => assertRuntimeAdmitted({ num: member }, 'resume').admitted); const argv =")).bypasses).toEqual([]);
 });

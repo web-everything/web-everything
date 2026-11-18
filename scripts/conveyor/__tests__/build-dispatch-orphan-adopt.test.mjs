@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
+import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
 import { recordBuildFailure, listBuildBackoffs, dispatchAttemptKey } from '../build-dispatch-failures.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
@@ -326,6 +327,14 @@ describe('checkResumable — TWO safety checks: lane-lease-currency, then foreig
 });
 
 describe('spawnResumeDelivery — PR #2921 review: the resume settles the ORIGINAL run-store row', () => {
+  it('drops refused members before encoding resume argv', () => {
+    const spawnDetached = vi.fn(() => ({ pid: 7 }));
+    expect(spawnResumeDelivery({ num: '12', lane: 9, sessionSlug: 'group', groupMembers: ['12', '13'] }, {
+      readSettings: () => ({ mode: 'only', only: true, ids: ['12'] }), spawnDetached, logPathFor: () => '/dev/null',
+    })).toBe(7);
+    expect(spawnDetached.mock.calls[0][0]).toContain('--group-members=12');
+    expect(spawnDetached.mock.calls[0][0].join(' ')).not.toContain('13');
+  });
   it('recovery forwards every grouped member to the resumed wrapper', () => {
     let argv;
     spawnResumeDelivery({ num: '7101', lane: 9, scope: 'we:a', sessionSlug: 'group',
@@ -363,6 +372,41 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
   const buildRow = ({ num, handle, status = 'in-flight', result = null, lane = 3, sessionSlug = `conveyor-${num}` }) => ({
     runId: 'dispatch-lane-x',
     entry: { key: 'step:1:0', status, handle, result, payload: { num, launchKind: 'build', lane, sessionSlug, scope: [] } },
+  });
+  it.each(['absent', 'bound', 'stale'])('fresh spawn-boundary refusal preserves %s resume attempts and markers without a pending write', async marker => {
+    acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot, pid: 1 });
+    if (marker !== 'absent') markBuildDispatchResume({ num: '4131', pid: 999, runId: marker === 'stale' ? 'old-run' : 'dispatch-lane-x', rowKey: 'step:1:0', attempts: 1, lockRoot: resumeRoot });
+    const before = readBuildDispatchResume({ num: '4131', lockRoot: resumeRoot });
+    const claimsBefore = listBuildDispatchClaims({ lockRoot, ignoreExpiry: true });
+    const releaseResumeMarker = vi.fn(({ num }) => releaseBuildDispatchResume({ num, lockRoot: resumeRoot }));
+    const markResume = vi.fn(o => markBuildDispatchResume({ ...o, lockRoot: resumeRoot }));
+    const readSettings = vi.fn().mockReturnValueOnce({ mode: 'lift', ids: [] }).mockReturnValue({ mode: 'only', only: true, ids: [] });
+    const { results: result } = await withRuntimeAdmission(() => ({ mode: 'only', only: true, ids: [] }), async () => ({ results: await adoptFixtureClaims({
+      listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }), isPidAlive: () => false,
+      findRow: () => buildRow({ num: '4131', handle: 'pid:74142' }),
+      readResumeMarker: () => readBuildDispatchResume({ num: '4131', lockRoot: resumeRoot }),
+      resolveResumability: () => ({ resumable: true }), readSettings, markResume,
+      spawnResume: undefined,
+      releaseResumeMarker,
+    }) }));
+    expect(result).toEqual([{ num: '4131', action: 'runtime-refused', reason: expect.any(String) }]);
+    expect(markResume).not.toHaveBeenCalled();
+    expect(releaseResumeMarker).not.toHaveBeenCalled();
+    expect(readBuildDispatchResume({ num: '4131', lockRoot: resumeRoot })).toEqual(before);
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true })).toEqual(claimsBefore);
+    expect(readSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it('never records a null spawn as a successful resume or leaves a pending marker', async () => {
+    const markResume = vi.fn(o => markBuildDispatchResume({ ...o, lockRoot: resumeRoot }));
+    const result = await adoptFixtureClaims({
+      listClaims: () => [{ pid: 1, meta: { kind: 'build', num: '4131' } }], isPidAlive: () => false,
+      findRow: () => buildRow({ num: '4131', handle: 'pid:74142' }), readResumeMarker: () => null,
+      resolveResumability: () => ({ resumable: true }), readSettings: () => ({ mode: 'lift', ids: [] }),
+      spawnResume: () => null, markResume,
+    });
+    expect(result).toEqual([expect.objectContaining({ action: 'error', reason: expect.stringContaining('no pid') })]);
+    expect(readBuildDispatchResume({ num: '4131', lockRoot: resumeRoot }).meta).toMatchObject({ spawnFailed: true });
   });
 
   it.each(['pid:999', 'claude-session', 'resume'])('restart keeps member claims using the live lead worker evidence (%s)', async (mode) => {

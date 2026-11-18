@@ -1612,9 +1612,16 @@ export function createDispatchSinks({
       let attemptId = null;
       let wrappedPid = null;
       let handle;
+      const runtimeRefused = [];
       try {
         const admission = assertRuntimeAdmitted(payload, payload?.launchKind ?? 'build', { readSettings: readRuntimeSettings });
         if (!admission.admitted) throw notApplied(admission.reason);
+        const groupMembers = payload?.groupMembers?.filter(member => {
+          const kind = payload?.launchKind?.startsWith('prepare') ? 'prepare' : 'build';
+          const admission = assertRuntimeAdmitted({ num: member }, kind, { readSettings: readRuntimeSettings });
+          if (!admission.admitted) runtimeRefused.push({ num: String(member), kind, reason: admission.reason });
+          return admission.admitted;
+        });
         handle = await provider({
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
@@ -1644,7 +1651,7 @@ export function createDispatchSinks({
           // the effect payload; part of the port's request because a MECHANICAL provider (a wrapper, not an
           // agent reading a brief) needs them as data. The `claude --bg` path ignores all five.
           launchKind: payload?.launchKind,
-          groupMembers: payload?.groupMembers,
+          groupMembers,
           lane: payload?.lane,
           scope: payload?.scope,
           pr: payload?.pr,
@@ -1722,6 +1729,7 @@ export function createDispatchSinks({
         // (live: the build-daemon dry run printed `routed=claude executed=codex` for #3604, and the operator
         // could not tell which one ran). The recommendation survives as `criteriaRecommendation`, named as one.
         dispatch: {
+          ...(runtimeRefused.length ? { runtimeRefused } : {}),
           ...(attemptId ? { attemptId } : {}),
           ...(wrappedPid ? { wrapped: true, runnerPid: wrappedPid } : {}),
           launchKind: payload?.launchKind ?? 'build',

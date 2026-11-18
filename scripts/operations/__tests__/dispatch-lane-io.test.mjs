@@ -147,6 +147,18 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
     resolveLaneGrant: () => ({}), grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
     ...extra,
   });
+  it.each(['build', 'prepare'])('drops refused group members at the %s provider boundary and records evidence', async launchKind => {
+    const provider = vi.fn(async () => 'pid:123');
+    const sinks = baseSinks({ provider, reserveLane: () => ({}),
+      readRuntimeSettings: () => ({ mode: 'only', only: true, ids: ['12'] }) });
+    const result = await sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind, groupMembers: ['12', '13'] });
+    expect(provider).toHaveBeenCalledOnce();
+    expect(provider.mock.calls[0][0].groupMembers).toEqual(['12']);
+    expect(result.dispatch.runtimeRefused).toEqual([{ num: '13', kind: launchKind, reason: 'runtime-only' }]);
+    await expect(sinks[DISPATCH_EFFECT]({ ...payload, num: '13', launchKind, groupMembers: ['12'] }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(provider).toHaveBeenCalledOnce();
+  });
   it('reserves lane N under the worker\'s own session slug', () => {
     const calls = [];
     const r = reserveBuildLane(payload, { enabled: true, run: (cmd, argv, o) => { calls.push({ cmd, argv, env: o.env }); return ''; }, root: '/r' });
