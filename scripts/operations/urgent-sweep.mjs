@@ -135,6 +135,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
     for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && notificationsComplete(r)) settled.add(id);
     const ciEscalated = new Set();
+    const conflictEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.conflictEscalated === true).map(r => r.id));
     const failureEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.failureEscalated === true).map(r => r.id));
     const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
     const nonGreen = new Map();
@@ -245,32 +246,42 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           validateChecks(data, r.sha);
           // GitHub cannot run CI without a merge ref. Resume normal monitoring as soon as checks appear.
           if (r.conflict && data.total_count === 0) {
-            results.push({ id, status: 'pending' });
-            continue;
-          }
-          // Like testCheckEvidence, reruns supersede only their own suite. Check IDs
-          // increase across workflow run attempts; keep distinct job/shard names apart.
-          const latestByCheck = new Map();
-          for (const c of data.check_runs) {
-            const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
-            if (!latestByCheck.has(key) || c.id > latestByCheck.get(key).id) latestByCheck.set(key, c);
-          }
-          const latestChecks = [...latestByCheck.values()];
-          anyFailure = latestChecks.some(c => failedCheck(c, r.sha));
-          const required = await deps.required(r, data?.testWorkflowPath);
-          if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
-            throw new Error('unreadable required CI jobs');
-          const checks = latestChecks.filter(c =>
-            c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
-            && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)
-            && required.some(n => c.name === n || c.name.startsWith(`${n} (`))
-            && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, r.sha, data.testWorkflowPath));
-          boundFailure = checks.find(c => failedCheck(c, r.sha));
-          unload = Boolean(boundFailure);
-          if (!unload) {
-            requiredSucceeded = !anyFailure && testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
-              && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
-              && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
+            if (age >= 24 * 60 * 60 * 1000 && !conflictEscalated.has(id)) {
+              await escalate(`${id}-conflict-unresolved`, r.ref, 'conflict load still unresolved');
+              await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', conflictEscalated: true });
+              conflictEscalated.add(id);
+            }
+            if (age < 72 * 60 * 60 * 1000) {
+              results.push({ id, status: 'pending' });
+              continue;
+            }
+            unload = true;
+            unloadReason = `Unloaded ${r.sha}: conflict load still unresolved after 72h. Inspect and repair before reloading.`;
+          } else {
+            // Like testCheckEvidence, reruns supersede only their own suite. Check IDs
+            // increase across workflow run attempts; keep distinct job/shard names apart.
+            const latestByCheck = new Map();
+            for (const c of data.check_runs) {
+              const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
+              if (!latestByCheck.has(key) || c.id > latestByCheck.get(key).id) latestByCheck.set(key, c);
+            }
+            const latestChecks = [...latestByCheck.values()];
+            anyFailure = latestChecks.some(c => failedCheck(c, r.sha));
+            const required = await deps.required(r, data?.testWorkflowPath);
+            if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
+              throw new Error('unreadable required CI jobs');
+            const checks = latestChecks.filter(c =>
+              c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
+              && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)
+              && required.some(n => c.name === n || c.name.startsWith(`${n} (`))
+              && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, r.sha, data.testWorkflowPath));
+            boundFailure = checks.find(c => failedCheck(c, r.sha));
+            unload = Boolean(boundFailure);
+            if (!unload) {
+              requiredSucceeded = !anyFailure && testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
+                && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
+                && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
+            }
           }
         } catch (e) { evidenceError = e; }
         if (!requiredSucceeded && everGreen.has(id)) {
