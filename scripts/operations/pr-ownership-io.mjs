@@ -142,7 +142,8 @@ export function createPrOwnershipReader({
       try {
         plan = reconcile({
           repo: slug, now: nowMs,
-          readAgents: () => null,
+          // An empty (readable) listing: the real agents arrive through `enrich` below, so a null here would read as unreadable evidence.
+          readAgents: () => [],
           enrich: () => (kept.agents = sharedAgents()),
           enrichFixClaims: (prs, o) => (kept.prs = enrichFixClaims(prs, o)),
           readRequiredChecks: (o) => (kept.required = readRequiredChecks(o)),

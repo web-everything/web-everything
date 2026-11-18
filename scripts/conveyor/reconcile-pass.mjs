@@ -1829,8 +1829,8 @@ export function runReconcilePass({
   const rulingPrs = step('enrich-review-churn', () => enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug }));
   const listedAgents = readAgents(readOnly ? { readOnly: true } : {});
   const agents = preserveIncomplete(listedAgents, enrich(listedAgents));
-  // Judge the ENRICHED inventory: a caller may list nothing (readAgents: () => null) and supply the real agents through `enrich`.
-  const agentsIncomplete = !Array.isArray(agents) || Object.hasOwn(agents, 'incomplete');
+  // Unreadable evidence is judged on the RAW listing too: enrichAgents silently turns a non-array into [], which would read as a complete empty inventory.
+  const agentsIncomplete = !Array.isArray(listedAgents) || !Array.isArray(agents) || Object.hasOwn(agents, 'incomplete');
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
