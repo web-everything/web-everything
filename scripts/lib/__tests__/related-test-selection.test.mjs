@@ -342,3 +342,25 @@ describe('CI static edge policy', () => {
     expect(graph(files).get('b.mjs')?.has('src.mjs')).toBe(true);
   });
 });
+
+
+describe('trace settings cascade', () => {
+  const load = extra => loadCiSelection({ env: {}, tool: {}, platform: {}, ...extra });
+  it('defaults to enabled shadow tracing and logs effective provenance', () => {
+    expect(load().trace).toEqual({ enabled: true, maxEdgesPerTest: 5000 });
+    const log = [];
+    expect(load({ env: { WE_POLICY_CASCADE_LOG: '1', WE_CI_SELECTION: '{"trace":{"enabled":false,"maxEdgesPerTest":12}}' }, log: line => log.push(line) }).trace)
+      .toEqual({ enabled: false, maxEdgesPerTest: 12 });
+    expect(log.join(' ')).toMatch(/ci.selection.trace:.*enabled=false.*env/);
+  });
+  it('retains each lower-layer leaf for invalid values and accepts zero', () => {
+    const platform = { trace: { enabled: false, maxEdgesPerTest: 20 } };
+    for (const trace of [null, 'bad', { enabled: 'yes', maxEdgesPerTest: -1 }, { maxEdgesPerTest: 1.5 }, { maxEdgesPerTest: Number.MAX_SAFE_INTEGER + 1 }]) {
+      expect(load({ platform, tool: { trace } }).trace).toEqual(platform.trace);
+    }
+    expect(load({ platform, tool: { trace: { enabled: true } }, env: { WE_CI_SELECTION: '{"trace":{"enabled":42,"maxEdgesPerTest":0}}' } }).trace)
+      .toEqual({ enabled: true, maxEdgesPerTest: 0 });
+    expect(load({ tool: undefined, readFile: () => '{"ci":{"selection":{"trace":{"enabled":false,"maxEdgesPerTest":7}}}}' }).trace)
+      .toEqual({ enabled: false, maxEdgesPerTest: 7 });
+  });
+});

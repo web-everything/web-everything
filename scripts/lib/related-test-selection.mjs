@@ -27,7 +27,7 @@ import { readFileSync } from 'node:fs';
 import { posix } from 'node:path';
 
 /** Standard values; the configured ones come from ci-selection-settings.mjs (kept out of this widely imported module). */
-export const DEFAULT_SELECTION = { maxTests: 0, maxTestsInCi: 0, staticEdges: { spawnPath: true, alias: true, literalRead: true } };
+export const DEFAULT_SELECTION = { maxTests: 0, maxTestsInCi: 0, staticEdges: { spawnPath: true, alias: true, literalRead: true }, trace: { enabled: true, maxEdgesPerTest: 5000 } };
 
 let aliases;
 function repoAliases() {

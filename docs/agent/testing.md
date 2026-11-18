@@ -4750,3 +4750,15 @@ with failing/related test lists to assess misses; absent evidence is labelled in
 A historical miss cannot be attributed to the parser merely because it happened:
 probe the actual imports. The current merge-gate-hold-class test is a direct importer
 and is reached even with all new static edge kinds disabled.
+
+
+## Shadow dependency tracing (S2)
+
+Append ` --import="file:///absolute/repo/scripts/ci/dep-trace.mjs"` to existing `NODE_OPTIONS`
+and set `WE_TRACE_TEST` to the repo-relative test file and `WE_TRACE_DIR` to an artifact directory.
+Node 22 uses `module.register` plus a loader message port; synchronous exit drains pending loader edges.
+Each process emits `trace-<pid>.json`; merge with `mergeTraces`, then replay via
+`scripts/readiness/trace-coverage.mjs trace-map.json misses.json [static-selected.json]`.
+Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
+rerun with a larger `ci.selection.trace.maxEdgesPerTest` before interpreting coverage.
+Keep tracer tests mock-only: inject filesystem/child-process objects and exercise loader hooks directly.

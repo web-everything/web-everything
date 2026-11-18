@@ -358,6 +358,7 @@
   "scripts/ci/__tests__/ci-timings-refresh-workflow.test.mjs": 0.66,
   "scripts/ci/__tests__/ci-unit-shard-step.test.mjs": 0.15,
   "scripts/ci/__tests__/coverage-reach.test.mjs": 0.33,
+  "scripts/ci/__tests__/dep-trace.test.mjs": 0.05,
   "scripts/ci/__tests__/quarantine-job-wiring.test.mjs": 0.12,
   "scripts/ci/__tests__/quarantine-skip.test.mjs": 0.82,
   "scripts/ci/__tests__/refresh-timings.test.mjs": 1.35,
