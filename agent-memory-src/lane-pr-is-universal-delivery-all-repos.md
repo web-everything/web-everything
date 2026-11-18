@@ -26,7 +26,7 @@ where the marker *is* reachable, so the strict gate applies and a missing or sta
 
 **The failure (2026-07-19):** I glanced at `plateau-app:scripts/`, saw no lane/pr-land script, and told the
 user "plateau has none of the lane/PR tooling" — reasoning from *local absence* instead of the established
-universal invariant (rule 104, which was loaded in my context). Nicolas: "I established lane as the only way to
+universal invariant (rule 104, which was loaded in my context). the operator: "I established lane as the only way to
 deliver any of the repos … very important." A dangerous assumption — it could lead to bypassing the lane
 guarantee (isolation / review / drain) with a direct-to-main edit.
 
