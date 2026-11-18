@@ -255,7 +255,13 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         }
         const manifestKnown = record.manifest && typeof record.manifest === 'object' && !Array.isArray(record.manifest);
         // A final receipt has no manifest: its siblingShas say which digest names the profile.
-        const siblings = manifestKnown ? !!record.manifest.siblings
+        // The writer omits this field without siblings and otherwise emits a nonempty SHA map.
+        const invalidSiblingShas = suffix === 'receipt' && record.siblingShas !== undefined
+          && !(record.siblingShas !== null && typeof record.siblingShas === 'object'
+            && Object.getPrototypeOf(record.siblingShas) === Object.prototype
+            && Object.keys(record.siblingShas).length > 0
+            && Object.values(record.siblingShas).every(sha => typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha)));
+        const siblings = invalidSiblingShas ? undefined : manifestKnown ? !!record.manifest.siblings
           : typeof record.siblings === 'boolean' ? record.siblings
             : suffix === 'receipt' ? record.siblingShas !== undefined : undefined;
         const digest = siblings === undefined ? undefined : (siblings ? record.manifestDigest : record.inputDigest);

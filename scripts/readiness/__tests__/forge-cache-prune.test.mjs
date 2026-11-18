@@ -673,6 +673,36 @@ describe('live reservation compatibility', () => {
 
 describe('readLiveEvidence', () => {
   it.each([
+    {scenario: 'null siblingShas', siblingShas: null},
+    {scenario: 'string siblingShas', siblingShas: 'd'.repeat(40)},
+    {scenario: 'array siblingShas', siblingShas: ['d'.repeat(40)]},
+    {scenario: 'empty siblingShas map', siblingShas: {}},
+    {scenario: 'non-hex sibling SHA', siblingShas: {frontierui: 'g'.repeat(40)}},
+    {scenario: 'short sibling SHA', siblingShas: {frontierui: 'd'.repeat(39)}},
+    {scenario: 'non-string sibling SHA', siblingShas: {frontierui: null}},
+    {scenario: 'mixed valid and invalid sibling SHAs', siblingShas: {frontierui: 'd'.repeat(40), other: 'bad'}},
+    {scenario: 'valid siblingShas', siblingShas: {frontierui: 'd'.repeat(40)}, resolved: true},
+    {scenario: 'valid uppercase sibling SHA', siblingShas: {frontierui: 'D'.repeat(40)}, resolved: true},
+  ])('leaked reservation with $scenario protects the whole lock unless valid', async ({siblingShas, resolved = false}) => {
+    const run = await reserve();
+    const preparedPath = join(receipts, `${run}.prepared`);
+    const receiptPath = join(receipts, `${run}.receipt`);
+    await json(preparedPath, record(true));
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), siblingShas});
+    await fs.utimes(join(receipts, 'worker-active', 'reservation.json'), (now - 3 * HOUR) / 1000, (now - 3 * HOUR) / 1000);
+    await fs.utimes(preparedPath, (now - 3000) / 1000, (now - 3000) / 1000);
+    await fs.utimes(receiptPath, (now - 2000) / 1000, (now - 2000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(resolved ? [] : [lock]));
+    expect(live.profiles).toEqual(new Set());
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), resolved ? profiles : [], resolved ? [] : profiles);
+  });
+
+  it.each([
     {scenario: 'protects the whole lock for an expired reservation with unresolved siblings evidence', resolved: false},
     {scenario: 'reclaims an expired reservation with fully resolved siblings evidence', resolved: true},
   ])('$scenario', async ({resolved}) => {
