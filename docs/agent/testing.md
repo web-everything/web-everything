@@ -4614,3 +4614,11 @@ preparation and enqueue must evaluate evidence even when tool/platform settings 
 waiting. Cover missing results and invalid reads/rows with both setting values and no
 hold labels. Structural mutations restore setting/env guards and early check-run success
 returns, proving every successful admission route still reaches the evidence decision.
+
+
+Operator amendment: `redTeamHold` materializes `pass-owed` with `blocking: true` whenever
+same-head work is running or queued. Only explicit `inFlight: false` and `queued: false`
+permit a non-blocking pass-owed hold; unknown flags remain blocking. `pending-publish`
+stays non-blocking. Check-run preparation and enqueue must hold an earlier successful
+same-head check when newer work is active. Mutations remove each live-debt guard and
+bypass typed hold construction; consumers route only on the resulting kind/blocking.

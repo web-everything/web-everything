@@ -209,11 +209,11 @@ describe('status persistence and check publication share one claim', () => {
     it('pins the unsealed-hold prefix to the gate\'s own wording', () => {
       const f = fixture();
       recordRedTeamStatus(finished(f), { env: f.env });
-      const hold = redTeamEnqueueHold({ ...finished(f), seats: [completedSeat(f.head)], head: f.head, comments: [cleanResultComment(f)], scheduled: true,
+      const hold = redTeamEnqueueHold({ ...finished(f), inFlight: false, queued: false, seats: [completedSeat(f.head)], head: f.head, comments: [cleanResultComment(f)], scheduled: true,
         recorded: true, env: f.env });
       expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
       sealAtFinish(f, { comments: [] })({ repo: f.repo, pr: f.pr, head: f.head });
-      expect(redTeamEnqueueHold({ ...finished(f), seats: [], head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
+      expect(redTeamEnqueueHold({ ...finished(f), inFlight: false, queued: false, seats: [], head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
         .toBe(RED_TEAM_HOLDS['result-incomplete'].message);
     });
   });

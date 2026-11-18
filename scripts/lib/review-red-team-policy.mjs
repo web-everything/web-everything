@@ -53,7 +53,7 @@ export function redTeamCardOnly(read) {
   return isCardOnlyDiff(paths);
 }
 
-/** Fixed routing: prose is operator output, never a machine discriminator. */
+/** Routing defaults for idle work; pass-owed is materialized by redTeamHold below. */
 export const RED_TEAM_HOLDS = Object.freeze(Object.fromEntries(Object.entries({
   break: [true, 'post-accept red team confirmed a break requiring send-back'],
   'evidence-unknown': [true, 'post-accept red team evidence unknown; hold and inspect run evidence'],
@@ -64,6 +64,14 @@ export const RED_TEAM_HOLDS = Object.freeze(Object.fromEntries(Object.entries({
   'pending-publish': [false, 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it'],
   'pass-owed': [false, 'post-accept red team has no recorded result on the live head'],
 }).map(([kind, [blocking, message]]) => [kind, Object.freeze({ kind, blocking, message })])));
+
+/** Live or unproven work blocks an older success; only explicit idle flags permit deferral. */
+export function redTeamHold(kind, scheduling = {}) {
+  const hold = RED_TEAM_HOLDS[kind];
+  return kind === 'pass-owed'
+    ? { ...hold, blocking: scheduling.inFlight !== false || scheduling.queued !== false }
+    : hold;
+}
 
 /** Empty or unscored reads cannot prove either a pass or a card-only exemption. */
 export function redTeamReadReviewable(read, head) {
@@ -112,7 +120,7 @@ export function redTeamOwedDecision(input = {}) {
   const { head, read, seats, result, carry, scheduling = {},
     ok, reason, carryConflict, hasBreak = false, pendingPublish = false } = input;
   const reasons = [];
-  const hold = kind => reasons.push(RED_TEAM_HOLDS[kind]);
+  const hold = kind => reasons.push(redTeamHold(kind, scheduling));
   if (hasBreak) hold('break');
   if (ok === false) reasons.push({ ...RED_TEAM_HOLDS['evidence-unknown'],
     message: `post-accept red team evidence unknown (${reason}); hold and inspect run evidence` });

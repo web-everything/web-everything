@@ -6,7 +6,7 @@ import ts from 'typescript';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRecoveryWitness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
-import { redTeamOwedDecision, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS, RED_TEAM_CLEARANCE_INPUTS } from '../review-red-team-policy.mjs';
+import { redTeamOwedDecision, redTeamHold, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS, RED_TEAM_CLEARANCE_INPUTS } from '../review-red-team-policy.mjs';
 import { redTeamAdmissionHold } from '../drain-queue-safety.mjs';
 import { failedRedTeamRetry } from '../red-team-run-result.mjs';
 import { reviewedRead, completedSeat, completedComment, exemptInput } from './fixtures/red-team-owed.mjs';
@@ -187,6 +187,17 @@ const calls = (node, name) => all(node, n => ts.isCallExpression(n) && n.express
 function assertStructure(source) {
   expect(source['drain-red-team-input.mjs']).toMatch(/recorded: raw\.recorded/);
   const policy = parse('review-red-team-policy.mjs', source['review-red-team-policy.mjs']);
+  const factory = all(policy, n => ts.isFunctionDeclaration(n) && n.name?.text === 'redTeamHold');
+  expect(factory).toHaveLength(1);
+  expect(factory[0].getText().replace(/^export /, '')).toBe(redTeamHold.toString());
+  const decisionFn = all(policy, n => ts.isFunctionDeclaration(n) && n.name?.text === 'redTeamOwedDecision');
+  expect(decisionFn).toHaveLength(1);
+  expect(calls(decisionFn[0], 'redTeamHold').map(call => call.arguments.map(arg => arg.getText())))
+    .toEqual([['kind', 'scheduling']]);
+  expect(redTeamHold('pass-owed', { inFlight: false, queued: false }).blocking).toBe(false);
+  expect(redTeamHold('pass-owed', { inFlight: true, queued: false }).blocking).toBe(true);
+  expect(redTeamHold('pass-owed', { inFlight: false, queued: true }).blocking).toBe(true);
+  expect(redTeamHold('pending-publish', { inFlight: true, queued: true }).blocking).toBe(false);
   const table = all(policy, n => ts.isVariableDeclaration(n) && n.name?.getText() === 'RED_TEAM_EXEMPTION_INPUTS');
   expect(table).toHaveLength(1);
   const properties = table[0].initializer.arguments[0].properties;
@@ -253,6 +264,10 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
+  ['running debt blocking guard deleted', 'review-red-team-policy.mjs', text => text.replace('scheduling.inFlight !== false || ', '')],
+  ['queued debt blocking guard deleted', 'review-red-team-policy.mjs', text => text.replace(' || scheduling.queued !== false', '')],
+  ['live debt forced non-blocking', 'review-red-team-policy.mjs', text => text.replace('scheduling.inFlight !== false || scheduling.queued !== false', 'false')],
+  ['typed blocking construction bypassed', 'review-red-team-policy.mjs', text => text.replace('redTeamHold(kind, scheduling)', 'RED_TEAM_HOLDS[kind]')],
   ['prestage setting bypass restored', 'drain-merge-strategy.mjs', text => text.replace(
     'const comments = pages.flat();\n        const evidence',
     'const comments = pages.flat();\n        if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true };\n        const evidence')],

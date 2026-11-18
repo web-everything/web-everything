@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { RED_TEAM_HOLDS, redTeamOwedDecision, redTeamReadReviewable } from '../review-red-team-policy.mjs';
+import { RED_TEAM_HOLDS, redTeamHold, redTeamOwedDecision, redTeamReadReviewable } from '../review-red-team-policy.mjs';
 import { parseRedTeamComment } from '../red-team-gate.mjs';
 import { reviewedRead, completedSeat, completedComment, exemptInput } from './fixtures/red-team-owed.mjs';
 
@@ -33,11 +33,22 @@ describe('redTeamOwedDecision', () => {
       const input = pass();
       if (value === undefined) delete input.scheduling[key]; else input.scheduling[key] = value;
       expect(redTeamOwedDecision(input)).toMatchObject({ owed: true, cleared: false });
-      expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS['pass-owed']);
+      expect(redTeamOwedDecision(input).reasons).toContainEqual(redTeamHold('pass-owed', input.scheduling));
       const carried = { ...pass(), seats: [], carry: { fromRev, proof: { ...input, head: fromRev,
         read: reviewedRead(fromRev), result: pass(fromRev).result, seats: pass(fromRev).seats } } };
       expect(redTeamOwedDecision(carried).cleared).toBe(false);
     }
+  });
+  it.each([
+    [true, false, true], [false, true, true], [true, true, true], [false, false, false],
+    [undefined, false, true], [false, undefined, true], ['false', false, true], [false, null, true],
+  ])('pass-owed blocking is computed for inFlight=%j queued=%j', (inFlight, queued, blocking) => {
+    const input = { ...pass(), result: null, seats: [], scheduling: { ...pass().scheduling, inFlight, queued } };
+    const reasons = redTeamOwedDecision(input).reasons;
+    expect(reasons.find(hold => hold.kind === 'pass-owed')).toMatchObject({ kind: 'pass-owed', blocking });
+    const publishing = redTeamOwedDecision({ ...input, pendingPublish: true });
+    expect(publishing.reasons.find(hold => hold.kind === 'pending-publish').blocking).toBe(false);
+    expect(publishing.reasons.find(hold => hold.kind === 'pass-owed').blocking).toBe(blocking);
   });
   it('a publishable policy-clear never pays execution debt, and one bad row poisons a completed pass', () => {
     expect(redTeamOwedDecision({ ...pass(), result: { ...pass().result, shapedLines: [],
@@ -89,13 +100,13 @@ describe('redTeamOwedDecision', () => {
       expect(redTeamOwedDecision({ ...input, carry: { fromRev, proof } }).reasons).toContainEqual(RED_TEAM_HOLDS['carry-conflict']);
     }
   });
-  it('uses a fixed blocking table and cleared is exactly absence of holds', () => {
+  it('uses fixed hold kinds with computed live-debt blocking; cleared is exactly absence of holds', () => {
     expect(Object.values(RED_TEAM_HOLDS).filter(h => !h.blocking).map(h => h.kind).sort()).toEqual(['pass-owed', 'pending-publish']);
     for (const input of [pass(), {}, { ...pass(), ok: false, reason: 'scan-capped' },
       { ...pass(), hasBreak: true }, { ...pass(), pendingPublish: true }, { ...pass(), carryConflict: true }]) {
       const d = redTeamOwedDecision(input);
       expect(d.cleared).toBe(d.reasons.length === 0);
-      for (const hold of d.reasons) expect(hold.blocking).toBe(RED_TEAM_HOLDS[hold.kind].blocking);
+      for (const hold of d.reasons) expect(hold.blocking).toBe(redTeamHold(hold.kind, input.scheduling).blocking);
     }
   });
 });
