@@ -118,7 +118,7 @@ overlays unless it merges to `main`. Amended to a dedicated clone running overla
 
 Fork-existence: (c) "nothing dispatches" contradicts the operator's explicit ask. The strongest rival, (b)
 "dispatch on every smell no other watch already covers", is excluded on merit, not cost: many smells are
-self-explaining (load 12 on 8 cores), so an agent report adds noise and no diagnosis; and some smells break
+self-explaining (load 12 against the host core count), so an agent report adds noise and no diagnosis; and some smells break
 the investigator's own tools (a failing GitHub App token breaks the gh shim the investigator would use).
 
 - **(a) Deterministic first, agent last.** Every smell may carry a **deterministic diagnosis** (a declared
