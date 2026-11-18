@@ -1056,8 +1056,10 @@ if (exitCode !== 0 && !signal && !infrastructureNow(exitCode, signal, failureDet
   try {
     const verdict = quarantinedVerdict({ phaseResults, read: readQuarantine({ board: REPO }), changedFiles: diffFiles, now: Date.now(), runAllPhases,
       // Lane clones keep a local branch named `main` whatever they carry, so main means "HEAD is origin/main's tip".
-      onMain: tryGit(['rev-parse', 'origin/main']) === headSha,
-      touchesDiff: (file) => { const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } });
+      // A missing origin/main is unknown (undefined), never "not main": the verdict keeps red.
+      onMain: (() => { const tip = tryGit(['rev-parse', 'origin/main']); return tip ? tip === headSha : undefined; })(),
+      // reachesChanged reads missing/unreadable files as "outside"; unreadable evidence must stay unknown instead.
+      touchesDiff: (file) => { if (![file, ...diffFiles].every(f => { try { readRepoFile(f); return true; } catch { return false; } })) return 'unknown'; const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } });
     if (verdict.excused) {
       quarantined = { files: verdict.files, why: verdict.why };
       exitCode = 0;
