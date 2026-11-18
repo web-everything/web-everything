@@ -15,7 +15,7 @@ const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/
 // whole line ambiguous, so retain its original HTML evidence rather than hiding it.
 function outsideInlineCode(line) {
   // An escaped backtick is not a code delimiter in Markdown; treat such lines as ambiguous.
-  if (line.includes('\\`')) return line;
+  if (line.includes('\\`')) return undefined;
   let delimiter;
   let start = 0;
   let plain = '';
@@ -29,7 +29,7 @@ function outsideInlineCode(line) {
       delimiter = undefined;
     }
   }
-  return delimiter ? line : plain + line.slice(start);
+  return delimiter ? undefined : plain + line.slice(start);
 }
 
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
@@ -82,6 +82,7 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
     const markers = [];
     const htmlLines = [];
+    let ambiguousTicks = false;
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
@@ -91,7 +92,10 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       if (unclosedComment) {
         return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
       }
-      htmlLines.push(fence || delimiter ? line : outsideInlineCode(line));
+      const stripped = fence || delimiter ? line : outsideInlineCode(line);
+      // One ambiguous backtick line may open a multiline span: no inline-code exemption anywhere in the snapshot.
+      if (stripped === undefined) ambiguousTicks = true;
+      htmlLines.push(stripped ?? line);
       if (line.includes('authored-by-actor:')) {
         // A stamp is evidence only as a whole, unindented line outside code fences.
         const marker = line.match(/^(<!--[ \t]*authored-by-actor:[^<>\r\n]*-->)[^\S\r\n]*$/)?.[1];
@@ -107,7 +111,7 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
     // Tags can span lines and contain an apparently standalone stamp in an attribute.
     // Preserve snapshot-wide detection after exempting only validated inline spans.
-    if (/<\/?[a-z][^>]*>/i.test(htmlLines.join('\n'))) {
+    if (/<\/?[a-z][^>]*>/i.test(ambiguousTicks ? edit.diff : htmlLines.join('\n'))) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
     }
     // GitHub lists newest first for equal timestamps: the later position is older.
