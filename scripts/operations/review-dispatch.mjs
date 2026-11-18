@@ -541,8 +541,9 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
   }
   const repoStr = String(repo ?? '').trim();
   const repoKey = repoKeyForSlug(repoStr);
-  if (repoKey === null) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
-  const laneRepo = repoProfile(repoKey, { home }).lanePoolRepo;
+  const profile = repoKey === null ? null : repoProfile(repoKey, { home });
+  if (!profile?.capabilities?.review) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
+  const laneRepo = profile.lanePoolRepo;
   if (repoKey !== 'we' && !checkoutExists(laneRepo)) {
     throw new Error(`unsupported-repo: ${repoKey} checkout does not exist at ${laneRepo}`);
   }

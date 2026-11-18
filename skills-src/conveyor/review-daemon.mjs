@@ -809,10 +809,16 @@ export function runReviewTick({
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
-  const live = liveReviewBudget?.live + (initialReviewCapacity - liveCap);
-  const capReason = Number.isFinite(live)
+  const earlierDispatches = Number.isFinite(liveReviewBudget?.max) && Number.isFinite(liveReviewBudget?.live)
+    ? Math.max(0, liveReviewBudget.max - liveReviewBudget.live - initialReviewCapacity) : 0;
+  // Never clamp: an overrun (10 live of max 8) must still read "10 of 8".
+  const live = Number.isFinite(liveReviewBudget?.live)
+    ? liveReviewBudget.live + earlierDispatches + (initialReviewCapacity - liveCap)
+    : Number.isFinite(liveReviewBudget?.max) ? liveReviewBudget.max - liveCap : NaN;
+  let capReason = Number.isFinite(live)
     ? liveReviewBudget?.reason?.replace(/live review rounds \d+ of /, `live review rounds ${live} of `)
     : liveReviewBudget?.reason;
+  if (capReason && earlierDispatches > 0) capReason += `; ${earlierDispatches} seat(s) taken by dispatches earlier in this tick`;
   const hostBound = !paused && (!host.admitted || hostLimit - occupiedLanes <= 0);
   const capBound = !paused && !hostBound && liveCap === 0;
   const deferredTotal = reviews.length - dispatchable.length;
@@ -920,10 +926,11 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  * per-PR, one level up. Every downstream step this daemon already calls (`reconcile-pass.mjs`,
  * `review-dispatch.mjs`, both tag scripts) was already fully repo-generic before this — the daemon's own tick
  * was the only WE-hardcoded link (see `runReviewTick`'s own `repo` fix above, filed the same day this was).
- * @param {{repos?:string[], tick?:Function, authGateOverride?:Function}} [o] - `tick` is injectable (defaults to
+ * @param {{repos?:string[], tick?:Function, authGateOverride?:Function, startIndex?:number}} [o] - `tick` is injectable (defaults to
  *   `runReviewTick`); every other option is forwarded to it for EVERY repo except `repo` itself, which this
  *   loop supplies per-iteration. `authGateOverride` (card x5kagse) is a test-only injection point for
  *   {@link planClaudeAuthDispatchGate}'s own real IO decision — see the block below for when the real one runs.
+ *   `startIndex` pins the first repo; omitted, successive ticks rotate first access to shared capacity.
  * @returns {{repos:Array<{repo:string, result?:object, error?:string}>, reviewsOwed:number,
  *   dispatched:Array<object>, failed:Array<object>, refusals:number, reconcileFailed:Array<{repo:string, error:string}>,
  *   deferredForLanes:number, deferredForAuth:number, authPaused:boolean, authPauseReason:(string|null),
@@ -937,7 +944,8 @@ const malformedReviewStartBudgets = new Set();
 export function sharedHostBudget(hostAdmission, log = console.error) {
   let verdict = null;
   let left = 0;
-  return () => {
+  let spentTotal = 0;
+  const shared = () => {
     if (!verdict) {
       try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
       catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
@@ -957,11 +965,23 @@ export function sharedHostBudget(hostAdmission, log = console.error) {
       verdict = { ...verdict, maxPerTick: budget };
       left = verdict.admitted ? budget : 0;
     }
-    return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
+    return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { const before = left; left = Math.max(0, left - n); spentTotal += before - left; } };
   };
+  // Seats spent so far through ANY path (dispatch, failed dispatch, red-team recovery): the rotation reads this
+  // per repo instead of trusting `dispatched`, which misses seats a failed or recovery start still consumed.
+  shared.spent = () => spentTotal;
+  return shared;
 }
 
-export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
+// Round-robin cursor for first access to the shared review seats. It moves only when a tick actually handed out
+// a seat (see the end of the repo loop below): a tick with no free seat must not spend any repo's turn, or a
+// seat pattern that repeats with the rotation (1,0,0 over three repos) would serve the same repo forever.
+let reviewRepoRotation = 0;
+
+export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride,
+  startIndex, ...tickOpts } = {}) {
+  const pinnedStart = startIndex !== undefined;
+  if (!pinnedStart) startIndex = reviewRepoRotation;
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -970,15 +990,47 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   // `authGateOverride` to test the gate itself.
   const authGate = authGateOverride ? authGateOverride()
     : (tick === runReviewTick ? planClaudeAuthDispatchGate() : { paused: false, reason: null });
-  const perRepoMs = {};
+  const perRepoMs = Object.fromEntries(repos.map(repo => [repo, 0]));
   // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
   // the per-tick cap is host-wide (never cap × repos).
   if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission, tickOpts.log);
-  const perRepo = forEachRepo(repos, (repo) => {
+  // Give each repo first access to the shared seats on successive ticks. An injected index pins
+  // execution order for callers/tests without advancing the default round-robin counter.
+  const start = repos.length && Number.isSafeInteger(startIndex)
+    ? ((startIndex % repos.length) + repos.length) % repos.length : 0;
+  const orderedRepos = [...repos.slice(start), ...repos.slice(0, start)];
+  const seatTakers = new Set();
+  const rotatedResults = forEachRepo(orderedRepos, (repo) => {
     const started = Date.now();
+    const spentBefore = tickOpts.hostAdmission?.spent?.() ?? 0;
+    // The live-review pool is a second shared seat pool: a live-job skip can keep its seat without a host take or a
+    // dispatch entry, so a net drop in `left` over this repo's tick also counts as a seat spent.
+    const leftBefore = tickOpts.liveReviewBudget?.left;
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
-    finally { perRepoMs[repo] = Date.now() - started; }
+    finally {
+      perRepoMs[repo] = Date.now() - started;
+      const leftAfter = tickOpts.liveReviewBudget?.left;
+      if ((tickOpts.hostAdmission?.spent?.() ?? 0) > spentBefore
+        || (Number.isFinite(leftBefore) && Number.isFinite(leftAfter) && leftAfter < leftBefore)) seatTakers.add(repo);
+    }
   });
+  // Preserve the public result (and aggregate) order even when execution starts at another repo.
+  const split = repos.length - start;
+  const perRepo = [...rotatedResults.slice(split), ...rotatedResults.slice(0, split)];
+  // Advance the default rotation past the last repo (in execution order) that actually took a seat — a seat
+  // spent from the shared host budget (dispatch, failed dispatch, red-team recovery, or a tick that threw after
+  // spending) or a reported dispatch; leave it untouched when nobody did, and never move it for an injected
+  // `startIndex`. Over-counting is safe (the repo just goes last); missing a spender would pin it first.
+  if (!pinnedStart && repos.length) {
+    let lastServed = -1;
+    rotatedResults.forEach((entry, i) => {
+      const r = entry?.result;
+      // `failed` is deliberately NOT a signal: it also lists non-seat failures (pause notice, scope-bloat) that
+      // happen on ticks with no free seat and must not spend a repo's turn.
+      if (seatTakers.has(orderedRepos[i]) || (r?.dispatched?.length ?? 0) > 0) lastServed = i;
+    });
+    if (lastServed >= 0) reviewRepoRotation = (start + lastServed + 1) % repos.length;
+  }
   const dispatched = [];
   const failed = [];
   const notStarted = [];
