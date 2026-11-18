@@ -2,6 +2,7 @@ import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamRecoveryRefusals, redTeamRequestBody } from '../red-team-request.mjs';
 import { REFUSAL_KINDS } from '../../conveyor/reconcile-core.mjs';
+import { GATE_IDS } from '../merge-gate-inventory.mjs';
 import { publishRedTeamPolicyClearCheck, POLICY_CLEAR_HOLD_OWED } from '../red-team-check-run.mjs';
 import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
@@ -3305,12 +3306,13 @@ describe('human hold red-team recovery respects reconcile refusals', () => {
     expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
     expect(o.dispatch).not.toHaveBeenCalled();
   });
-  it.each(['red-team', 'review-gate', 'merge-gate'])('%s failure alone still permits human recovery', name => {
+  it.each(['red-team', 'merge-gate'])('%s failure without review-owned evidence refuses human recovery', name => {
     const o = options('review-ci', { requiredChecks: ['test', name],
       rawPrs: [{ ...humanPr(), statusCheckRollup: [...humanPr().statusCheckRollup,
         { name, status: 'COMPLETED', conclusion: 'FAILURE' }] }] });
-    expect(runRedTeamOnSkip(o).rows[0].action).toBe('review');
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(`${name}=failure`) });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.capacity.budget.left).toBe(1);
   });
   it('does not carry an old accepting read onto a content-changed human head', () => {
     const old = { ...payload(), findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } };
@@ -3372,6 +3374,38 @@ describe('one recovery admission guard for normal, human and explicit requests',
     }, /test=failure/],
     ['unknown required checks', o => { o.requiredChecks = null; }, /unknown-required-set/],
     ['missing required check', o => { o.rawPrs[0].statusCheckRollup = []; }, /test=missing/],
+    ...['merge-gate', 'red-team', 'review-gate'].map(name => [
+      `required ${name} absent`, o => { o.requiredChecks.push(name); }, new RegExp(`${name}=missing`)]),
+    ['merge-gate failure not review-owned', o => {
+      o.requiredChecks.push('merge-gate');
+      o.rawPrs[0].statusCheckRollup.push({ name: 'merge-gate', id: 123, status: 'COMPLETED', conclusion: 'FAILURE' });
+      o.readMergeGateVerdict = () => mergeVerdict('non-empty-body', 'empty body');
+    }, /merge-gate=failure/],
+    ['merge-gate failure evidence unreadable', o => {
+      o.requiredChecks.push('merge-gate');
+      o.rawPrs[0].statusCheckRollup.push({ name: 'merge-gate', id: 123, status: 'COMPLETED', conclusion: 'FAILURE' });
+      o.readMergeGateVerdict = () => { throw Error('unreadable'); };
+    }, /merge-gate=failure/],
+    ...['merge-gate', 'review-gate'].map(name => [`${name} pending without review-owned evidence`, o => {
+      o.requiredChecks.push(name);
+      o.rawPrs[0].statusCheckRollup.push({ name, status: 'IN_PROGRESS' });
+    }, new RegExp(`${name}=pending`)]),
+    ['red-team failure without a recoverable reason', o => {
+      o.requiredChecks.push('red-team');
+      o.rawPrs[0].statusCheckRollup.push({ name: 'red-team', status: 'COMPLETED', conclusion: 'FAILURE' });
+    }, /red-team=failure/],
+    ['review-gate failure without a review hold', o => {
+      o.rawPrs[0].labels = ['review:accepted'];
+      o.plan.refusals = o.plan.refusals.map(row => row.kind === 'review-ci' ? { ...row, kind: 'already-reviewed-head' } : row);
+      o.requiredChecks.push('review-gate');
+      o.rawPrs[0].statusCheckRollup.push({ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' });
+    }, /review-gate=failure/],
+    ['explicit request with no reconciliation evidence', o => {
+      o.plan.refusals = [{ kind: 'red-team-requested', prNumber: pr, headSha: head }];
+    }, refusalWhy],
+    ['explicit request with enriched scope-bloat evidence', o => {
+      o.plan.refusals.push({ kind: 'scope-bloat', prNumber: pr, headSha: head, scopeBloat: { stale: true } });
+    }, refusalWhy],
     ['pending required check', o => { o.rawPrs[0].statusCheckRollup[0].status = 'IN_PROGRESS'; }, /test=pending/],
     ['wrong-head required check', o => { o.rawPrs[0].statusCheckRollup[0].head_sha = 'b'.repeat(40); }, /test=wrong-head/],
     ['unreadable reviews', o => { o.rawPrs[0].reviews = null; }, 'PR reviews unreadable; inspect formal reviews before full review'],
@@ -3381,6 +3415,8 @@ describe('one recovery admission guard for normal, human and explicit requests',
     ['live head mismatch', o => { o.rawPrs[0].headRefOid = 'b'.repeat(40); }, 'live head missing or changed'],
     ['enriched refusal head mismatch', o => { o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr, headSha: 'b'.repeat(40) }); }, 'live head missing or changed'],
   ];
+  const mergeVerdict = (id, reason) => ({ num: pr, head_sha: head, ok: false,
+    results: GATE_IDS.map(gate => ({ id: gate, status: gate === id ? 'hold' : 'pass', reason: gate === id ? reason : 'ok' })) });
   function options(path, current) {
     const raw = { ...fixture().rawPrs[0], state: 'OPEN', isDraft: false,
       labels: path === 'human' ? ['review:human'] : path === 'normal' ? ['review:accepted'] : [] };
@@ -3390,7 +3426,8 @@ describe('one recovery admission guard for normal, human and explicit requests',
     // Preserve the queue's nomination before live evidence changes, exercising unreadability and head movement too.
     const nominated = redTeamRecoveryRefusals({ repo, rawPrs: [raw], refusals });
     expect(nominated.some(row => row.kind === (path === 'normal' ? 'already-reviewed-head' : 'red-team-requested'))).toBe(true);
-    return runFixture({ env: {}, rawPrs: [raw], plan: { refusals: nominated },
+    return runFixture({ env: {}, rawPrs: [raw], plan: { refusals: [...nominated,
+      ...(path === 'request' ? [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] : [])] },
       readReviews: () => raw.reviews,
       readEvidence: () => ({ loopPayload: current ? payload() : null, inFlight: false, queued: false,
         recorded: false, seatRecorded: false, completedRecorded: false }) });
@@ -3435,13 +3472,29 @@ describe('one recovery admission guard for normal, human and explicit requests',
         expect(o.dispatch).not.toHaveBeenCalled();
       }
     });
-  it.each(['red-team', 'review-gate', 'merge-gate'])('all paths retain only the existing %s CI exception', name => {
+  it.each(['red-team', 'merge-gate'])('all paths allow a present %s check held only by a missing red-team result', name => {
     for (const path of ['normal', 'human', 'request']) {
       const o = options(path, true);
       o.requiredChecks.push(name);
-      o.rawPrs[0].statusCheckRollup.push({ name, status: 'COMPLETED', conclusion: 'FAILURE' });
+      o.rawPrs[0].statusCheckRollup.push({ name, id: 123,
+        status: name === 'red-team' ? 'IN_PROGRESS' : 'COMPLETED', conclusion: name === 'red-team' ? null : 'FAILURE' });
+      o.readMergeGateVerdict = () => mergeVerdict('red-team', 'no red-team check run on head');
       expect(runRedTeamOnSkip(o).rows[0].action).toBe('dispatch');
       expect(o.dispatch).toHaveBeenCalledOnce();
     }
+  });
+  it('allows review-gate failure only with the review hold it will settle', () => {
+    const o = options('human', true);
+    o.requiredChecks.push('review-gate');
+    o.rawPrs[0].statusCheckRollup.push({ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' });
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('dispatch');
+    expect(o.dispatch).toHaveBeenCalledOnce();
+  });
+  it.each([undefined, null, {}])('explicit request refuses unreadable reconciliation refusals: %j', refusals => {
+    const o = options('request', true);
+    o.plan.refusals = refusals;
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: refusalWhy });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.capacity.budget.left).toBe(1);
   });
 });

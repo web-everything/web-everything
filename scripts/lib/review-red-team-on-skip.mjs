@@ -29,12 +29,13 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { formatReviewCiSkip } from './review-ci-gate-io.mjs';
+import { excuseMergeGateRows, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
-import { parseClearedHumanProse } from './review-escalation.mjs';
+import { parseClearedHumanProse, isReviewHoldLabel } from './review-escalation.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
@@ -332,13 +333,13 @@ function publishableClearGuard({ labels, acceptance, comments, reviews, settlesP
 }
 
 /** Single admission boundary for ordinary, human-held and explicitly requested recovery. PURE. */
-function redTeamRecoveryGuard({ refusal, rawPr, requiredChecks, referralsRuled = false, allowHumanHold = false }) {
+function redTeamRecoveryGuard({ refusal, rawPr, requiredChecks, readMergeGateVerdict, referralsRuled = false, allowHumanHold = false }) {
   const skip = why => ({ ok: false, why,
     ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
   const human = rawPr?.labels?.some?.(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
   const originals = refusal.reconcileRefusals;
   const allowed = human ? ['review-ci', 'ci-heal-escalated', 'owed-ci-heal', 'already-reviewed-head'] : ['already-reviewed-head'];
-  if ((human && !originals.length) || originals.some(original => !allowed.includes(original.kind))) {
+  if (!originals.length || originals.some(original => !allowed.includes(original.kind))) {
     return skip('reconciliation refusal prevents recovery; inspect the original review hold');
   }
   if ([rawPr, refusal, ...originals].some(original => original?.scopeBloat || original?.referralHold)) {
@@ -359,9 +360,16 @@ function redTeamRecoveryGuard({ refusal, rawPr, requiredChecks, referralsRuled =
   if (labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string')) return skip('PR labels unreadable');
   const head = rawPr?.headRefOid;
   const ci = reviewCiGate({ headSha: head, requiredChecks, checks: rawPr?.statusCheckRollup });
-  // Recovery itself completes these gate checks; every other required check must succeed.
-  const recoveryGatesOnly = ci.affected.length > 0 && ci.affected.every(check =>
-    ['red-team', 'review-gate', 'merge-gate'].includes(check.name) && !['wrong-head', 'malformed'].includes(check.reason));
+  // Only present checks held by the review work itself may be completed by recovery.
+  const recoveryGatesOnly = ci.affected.length > 0 && ci.affected.every(({ name, reason }) => {
+    if (name === 'red-team') return reason === 'pending' && !redTeamForHead(comments, rawPr.number, head);
+    if (name === 'review-gate') return reason === 'failure'
+      && rawPr.labels.some(label => isReviewHoldLabel(typeof label === 'string' ? label : label?.name));
+    // Recovery is review work, not a merge: classify candidacy holds even if ready-to-merge remains.
+    return name === 'merge-gate' && reason === 'failure' && excuseMergeGateRows(rawPr.statusCheckRollup, {
+      prNumber: Number(rawPr.number), headSha: head, labels: [], setting: 'on', readVerdict: readMergeGateVerdict,
+    }).excused;
+  });
   if (!ci.allowed && !recoveryGatesOnly) return skip(`${formatReviewCiSkip(ci)}; inspect required checks before recovery`);
   if (!isRealHead(head) || [refusal, ...originals].some(original => original.headSha != null && original.headSha !== head)) {
     return skip('live head missing or changed');
@@ -522,7 +530,7 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
  */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
-  setting, lastDispatch, requiredChecks, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
+  setting, lastDispatch, requiredChecks, readCheckFact, readMergeGateVerdict, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
   return redTeamRecoveryRefusals({ repo, refusals, rawPrs }).filter(isRedTeamRecoveryRefusal).map(nomination => ({
     ...nomination,
@@ -578,7 +586,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
     const dispatchDecision = (decision, context = {}) => {
-      const { ok, ...guard } = redTeamRecoveryGuard({ refusal, rawPr, requiredChecks,
+      const { ok, ...guard } = redTeamRecoveryGuard({ refusal, rawPr, requiredChecks, readMergeGateVerdict,
         allowHumanHold: decision.action === 'dispatch' || Boolean(decision.advisoryHead), ...context });
       if (!ok) return { ...row, ...guard };
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
@@ -884,6 +892,7 @@ export const carriedCheckPublisher = ({ repo, env = process.env, run = runGhSync
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, requiredChecks, readRequiredChecks = getRequiredStatusChecks,
+  readMergeGateVerdict = args => defaultReadMergeGateVerdict({ ...args, repo }),
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviewRuns = isUnderTest() || isUnderTest(env) ? () => [] : readReviewRunEvidence,
@@ -959,7 +968,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   try {
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
-    const refusals = redTeamRecoveryRefusals({ repo, refusals: plan?.refusals, rawPrs });
+    const refusals = redTeamRecoveryRefusals({ repo, refusals: Array.isArray(plan?.refusals) ? plan.refusals : [], rawPrs });
     // Reconcile rows omit formal reviews. Read recovery candidates, including unaccepted not-owed heads,
     // once per PR, without mutating the daemon's shared snapshot. Failed/oversized
     // reads stay unknown: the planner requires operator inspection before clearing.
@@ -995,7 +1004,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       } catch { /* Unknown required checks keep recovery closed. */ }
     }
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env, requiredChecks: recoveryRequiredChecks,
+      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, readMergeGateVerdict, env, requiredChecks: recoveryRequiredChecks,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));

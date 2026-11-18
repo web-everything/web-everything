@@ -4438,8 +4438,8 @@ loop before red-team-only recovery; never re-key an old accepting payload to a c
 All recovery dispatches share `redTeamRecoveryGuard`; requests retain enriched reconciliation holds.
 Recovery never supplies a CI waiver or consults the ownership advisory setting. Required
 checks must succeed before dispatch; unknown requirements, missing checks and unreadable evidence
-keep recovery closed. The red-team/review/merge gate checks themselves remain recovery prerequisites
-that the recovery can complete, so their holds alone do not block nomination.
+keep recovery closed. Only present gate checks held by review work itself may be completed by recovery.
+Merge-gate failures need a head-bound job verdict proving review-owned holds; unreadable evidence blocks.
 Formal review holds and other review-hold labels block all three dispatch paths. The guard parity
 table exercises every refusal kind and hold for normal, human-held and non-human requested heads.
 The advisory preserves the human hold and shares the queue, retry cooldown, lane allowance
