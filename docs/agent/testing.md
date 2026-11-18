@@ -4569,7 +4569,7 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 
 
-## R986 I1 probation core (production wiring pending)
+## R986 I1 probation core and report-only wiring
 
 `scripts/lib/daemon-rebuild/probation.mjs` is a pure transition core, not a running
 probation service. At adoption, `freezeProbation` takes the complete registered roster
@@ -4587,7 +4587,24 @@ Legacy single-record state cannot promote; it requires operator recovery.
 
 The probation tests adapt the WIP adoption clock/heads and invalid-tick cases. The
 self-sync test uses the WIP injected rebuild/lock/closure fixture as a core consumer;
-it does not establish production probation integration. Remaining wiring: enumerate
-clone registrations, read both import closures by SHA, persist adoption and daemon
-boot/tick records under a shared mutation lock, and advance proven-good only on pass.
-No rollback, boot counting or probation deadline policy ships in this I1 core.
+it does not establish production probation integration. `probation-io.mjs` now observes the legacy prepare/finalize adoption paths inside
+their existing `withWriteLock` holds. It freezes launchd labels (stable daemon IDs),
+entry paths and SHA-specific Git blob closures in a per-clone `.probation.json`
+under `stateDir`. The previous smoke-adopted head supplies the legacy comparison
+baseline; this observer never promotes it. Unknown package/dynamic imports or
+failed closure reads conservatively owe proof. Roster failure produces an invalid
+record and requires operator recovery of registrations. Every persisted read is
+validated; missing, unreadable and malformed records report invalid, never empty.
+Self-sync submits only its own immutable PID/start/boot-head and completed tick
+head after releasing its read lock; ambiguous process identity earns no proof.
+`createProbationObserver().status()` exposes pending/pass and reason under the
+shared write lock. Results are logged and have NO effect on tick, adoption,
+proven-good, rollback or marker decisions. Missing records are not reconstructed
+by a sibling tick. No boot counting or probation deadline policy ships here.
+`probation-io.test.mjs` uses real Git objects, temp files and the shared clone lock
+to exercise selective owed sets, invalid reads and concurrent proof writers.
+`probation-callers.test.mjs` exercises the real observer through self-sync and the
+locked prepare/finalize callers. Telemetry-only hooks need caller tests for pass,
+invalid persistence and lock refusal: assert lifecycle results, rebuild state and
+protected marker bytes, not only the observer's return value. Prepare/planning and
+launchd identity are stubbed; probation persistence and the shared lock remain real.

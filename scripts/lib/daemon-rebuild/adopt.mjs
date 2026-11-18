@@ -12,6 +12,7 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
+import { observeAdoptionLocked } from './probation-io.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 
 /**
@@ -376,11 +377,13 @@ export async function finalizeRebuild({
     } catch { /* best-effort audit trail only */ }
   };
   const state = readRebuildState(root, stEnv);
+  const previousAdoption = state.adopted;
   const writeState = () => writeRebuildState(root, state, stEnv);
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
   releaseBuildLease(state, lease);
   const terminal = (result) => {
     writeState();
+    if (result.adopted) observeAdoptionLocked({ root, env: stEnv, now, log }, previousAdoption, state.adopted);
     const stale = staleAlertDetail(result, state);
     if (stale) alert('clone-held-stale', stale);
     // fix-rebuild-finalize — an adopted build leaves nothing passed-but-unadopted behind.
