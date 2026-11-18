@@ -445,6 +445,9 @@ describe('R972 tier-three patterns', () => {
     `addr:${v4(192, 168, 1, 2)}`, `(${v4(10, 2, 3, 4)}),`, `${v4(10, 2, 3, 4)};`, `see ${v4(172, 16, 0, 2)}!`,
     `::ffff:${v4(10, 2, 3, 4)}.`, `::ffff:${v4(10, 2, 3, 4)}:80`, `${ula('', '', 'ffff', 'a00', '1')}.`,
     `ULA ${ula('fd12', '', '1')}.`, `ULA ${ula('fd12', '', '1')}:`, `addr:${ula('fd12', '', '1')}`,
+    // A key ending in a hex letter (source, type, node) is a word, not a preceding IPv6 group.
+    `source:${ula('fd12', '3456', '', '1')}`, `type:${ula('fc00', '', '1')}`, `node:${ula('fe80', '', '1')}`,
+    `mode:${ula('', '', 'ffff', 'a00', '1')}`,
   ])('detects private IPs beside ordinary punctuation: %s', text => {
     expect(scanText(text).some(hit => hit.pattern === 'private-network-ip')).toBe(true);
   });
