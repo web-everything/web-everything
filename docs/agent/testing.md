@@ -4462,3 +4462,13 @@ Confirmed closed/merged PRs can still be pruned. Corrupt counters or pending dro
 registrations and alert for operator repair/recovery. Pruning takes the existing add-guard fence,
 refuses unsettled drop intents, and uses the rebuild's list-locked removal helper with the observed
 registration identity. `overlay-prune.test.mjs` covers these closed paths with injected IO and no network.
+
+
+### Overlay pruning uses the registration drop protocol
+
+`overlay-prune` shares `overlay-registration.mjs` with the overlay CLI: an add-guard lock,
+a durable drop intent, and current remote tip checks before and after removal. The synchronous
+main-sync kicker uses the guard's no-wait mode and retains registrations on contention. Recover
+interrupted drops with `daemon-overlay recover-drops`; unknown or moved tips restore the snapshot.
+Prune tests must retain pinned overlays and unregistered-PR carriers, and check adopted-tip alerts
+at preparation level. Keep the open-PR inventory hermetic rather than disabling pruning across fixtures.

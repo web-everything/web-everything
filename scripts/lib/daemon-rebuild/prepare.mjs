@@ -26,7 +26,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { pruneOverlays } from './overlay-prune.mjs';
+import { pruneOverlays, resolveOverlayPrune } from './overlay-prune.mjs';
 import { planRebuild } from './plan.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
@@ -366,7 +366,14 @@ export async function prepareRebuild({
   if (remaining.length > 0) alert('untracked-kept', { paths: remaining });
 
   if (!readyOnly && !mainOnly) {
-    pruneOverlays({ root, env, deps: { git, alert: message => alert('overlay-prune-failed', message) } });
+    const pruneStates = new Map();
+    if (prState && overlaysBefore.length <= 100 && resolveOverlayPrune(env).enabled) {
+      for (const entry of overlaysBefore) if (entry.pr > 0 && !pruneStates.has(entry.pr)) {
+        try { pruneStates.set(entry.pr, await prState(entry.pr)); } catch { pruneStates.set(entry.pr, null); }
+      }
+    }
+    pruneOverlays({ root, env, deps: { git, ...(prState ? { prState: pr => pruneStates.get(pr) } : {}), adopted: state.adopted?.head === prevHead ? state.adopted.applied : [],
+      alertAdopted: item => alert('overlay-pruned-adopted', item), alert: message => alert('overlay-prune-failed', message) } });
     const remainingOverlays = readOverlayState(root, { env });
     if (remainingOverlays.corrupt) {
       alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
