@@ -56,19 +56,45 @@ describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
     'title: "unterminated\nstatus: open',
   ])('refuses a longshore card without a real top-level status: %s', frontmatter => {
     expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
-      readOnPr: () => `---\n${frontmatter}\n---\n# card\n`,
+      fingerprint: 'finding-123', head: SHA, readOnPr: () => `---\n${frontmatter}\n---\nfinding-123 ${SHA}\n`,
     })).toBe(false);
   });
 
   it.each(['resolved', '"closed"', "'folded'"])('accepts a terminal Longshore card naming the fingerprint: %s', status => {
     expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
-      fingerprint: 'finding-123', readOnPr: () => `---\nstatus: ${status}\n---\nfinding-123`,
+      fingerprint: 'finding-123', head: SHA, readOnPr: () => `---\nstatus: ${status}\n---\nfinding-123 ${SHA}`,
     })).toBe(true);
+  });
+
+  it.each([undefined, null, '', 'bad', 'a'.repeat(39), 'a'.repeat(40) + '\n'])('fails closed for Longshore without a valid head: %s', head => {
+    expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
+      fingerprint: 'finding-123', head, readOnPr: () => `---\nstatus: resolved\n---\nfinding-123 ${SHA}`,
+    })).toBe(false);
+  });
+
+  it.each(['', 'a'.repeat(40)])('rejects the same fingerprint with absent or different head: %s', citedHead => {
+    const text = `---\nstatus: resolved\n---\nfinding-123 ${citedHead}`;
+    expect(cardResolvesFinding(text, 'finding-123', { head: SHA })).toBe(false);
+    for (const prefix of ['we', 'longshore']) {
+      expect(referralCardReadable(`${prefix}:backlog/xabcdef-card.md@pr7`, root, {
+        fingerprint: 'finding-123', head: SHA, readOnPr: () => text, readMainByBornAs: () => null,
+      })).toBe(false);
+    }
+  });
+
+  it.each([SHA, SHA.slice(0, 12)])('accepts terminal fingerprint proof bound to head %s, including published bornAs fallback', citedHead => {
+    const text = `---\nbornAs: xabcdef\nstatus: resolved\n---\nfinding-123 ${citedHead}`;
+    expect(cardResolvesFinding(text, 'finding-123', { head: SHA })).toBe(true);
+    const ref = 'we:backlog/xabcdef-card.md@pr7';
+    for (const proof of [text, text.replace(citedHead, 'a'.repeat(40))]) {
+      expect(referralCardReadable(ref, root, { fingerprint: 'finding-123', head: SHA,
+        readOnPr: () => null, readMainByBornAs: () => proof })).toBe(proof === text);
+    }
   });
 
   it.each(['open', 'resolved', 'closed', 'folded'])('fails closed without a fingerprint option: %s', status => {
     expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
-      readOnPr: () => `---\nstatus: ${status}\n---\n`,
+      head: SHA, readOnPr: () => `---\nstatus: ${status}\n---\n${SHA}`,
     })).toBe(false);
   });
 

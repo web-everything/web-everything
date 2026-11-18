@@ -55,7 +55,7 @@ const heldAfter = comments => readRedTeamDisposition({ comments, pr: PR, head: H
 describe('published backing cards at the production reader and release boundary', () => {
   const file = '6935-prevention-require-named-refusal-and-post-failure-coverage-f.md';
   const ref = `we:backlog/${file}`;
-  const text = '---\nbornAs: xabc123\nstatus: open\n---\n# Published card\n';
+  const text = `---\nbornAs: xabc123\nstatus: resolved\n---\n${roundCardsFindingsFingerprint(payloadFor().findings)} ${HEAD}\n`;
   const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
   const main = (files = {}, fail = '') => {
     const calls = [];
@@ -119,6 +119,31 @@ describe('published backing cards at the production reader and release boundary'
     expect(reader(main())(input({ card: oldRef })).card.readable).toBe(false);
   });
 
+  it.each([ref, 'we:backlog/xabc123-follow-up.md'])('refuses unrelated frontmatter on main with a supplied fingerprint: %s', ask => {
+    const unrelated = `---\nbornAs: xabc123\nstatus: resolved\n---\nunrelated finding ${HEAD}`;
+    const context = reader(main({ [file]: unrelated }))(input({ card: ask }));
+    expect(context.card.readable).toBe(false);
+    expect(() => planRedTeamRuling(context, input({ card: ask }))).toThrow(/does not resolve to a readable backlog card/);
+  });
+
+  it.each([ref, 'we:backlog/xabc123-follow-up.md', `${ref}@pr5829`])('rejects an old card at the existing-card release recheck: %s', ask => {
+    const comments = thread(), posted = [];
+    const stale = text.replace(HEAD, OTHER);
+    const io = main({ [file]: text });
+    const sinks = createRecordRedTeamRulingSinks({ ...io,
+      runGit: args => args[0] === 'show' && posted.length > 0 ? stale : io.runGit(args),
+      readOnPr: () => posted.length > 0 ? stale : text,
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: [...comments] }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body }); },
+      syncLabels: () => { throw new Error('must remain held'); },
+    });
+    const plan = payloadFor({ card: ask }, { card: { ...card, ref: ask } });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/no release record written/);
+    expect(posted).toHaveLength(1);
+    expect(heldAfter(comments)).toHaveLength(1);
+  });
+
   it.each(['fetch', 'show', 'ls-tree'])('fails closed when main %s fails', fail => {
     const context = reader(main({ [file]: text }, fail))(input({ card: fail === 'ls-tree' ? '6935' : ref }));
     expect(context.card.readable).toBe(false);
@@ -131,7 +156,7 @@ describe('published backing cards at the production reader and release boundary'
   it('keeps explicit open-PR references on the PR readability path', () => {
     const reads = [];
     const io = main();
-    const context = reader({ ...io, readOnPr: (name, pr) => { reads.push([name, pr]); return `---\nstatus: resolved\n---\n${roundCardsFindingsFingerprint(payloadFor().findings)}`; } })(input({ card: `${ref}@pr5829` }));
+    const context = reader({ ...io, readOnPr: (name, pr) => { reads.push([name, pr]); return `---\nstatus: resolved\n---\n${roundCardsFindingsFingerprint(payloadFor().findings)} ${HEAD}`; } })(input({ card: `${ref}@pr5829` }));
     expect(context.card).toMatchObject({ ref: `${ref}@pr5829`, foundIn: 'pr-head', readable: true });
     expect(reads).toEqual([[file, '5829']]);
     expect(io.calls).toEqual([]);
@@ -523,7 +548,7 @@ describe('existing-card IO', () => {
 });
 
 describe('standalone CLI', () => {
-  it.each(['readable', 'vanished', 'unsafe', 'status-only', 'duplicate', 'open', 'quoted-status'])('handles a Longshore card through the shared reader and writer (%s)', async state => {
+  it.each(['readable', 'vanished', 'unsafe', 'status-only', 'duplicate', 'open', 'quoted-status', 'absent-head', 'different-head'])('handles a Longshore card through the shared reader and writer (%s)', async state => {
     const { main } = await import('../record-red-team-ruling-cli.mjs');
     const { createMemoryRunStore } = await import('../run-store.mjs');
     const { createMemoryCallLogStore } = await import('../call-log-store.mjs');
@@ -541,7 +566,7 @@ describe('standalone CLI', () => {
         const frontmatter = state === 'duplicate' ? 'status: resolved\nstatus: closed'
           : state === 'open' ? 'status: open'
           : state === 'quoted-status' ? 'title: "start\nstatus: resolved\nend"' : 'status: resolved';
-        return `---\n${frontmatter}\n---\n${state === 'status-only' ? '' : fingerprint}`;
+        return `---\n${frontmatter}\n---\n${state === 'status-only' ? '' : fingerprint} ${state === 'absent-head' ? '' : state === 'different-head' ? OTHER : HEAD}`;
       },
     };
     const sinks = createRecordRedTeamRulingSinks({ ...io,

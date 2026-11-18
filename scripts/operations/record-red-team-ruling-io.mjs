@@ -16,7 +16,7 @@ import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
-import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
+import { CARD_REF_RE, cardResolvesFinding, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { roundCardsFindingsFingerprint } from '../lib/review-loop-policy.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
@@ -62,7 +62,7 @@ const git = args => {
 /** Unsuffixed references mean published on main, never the feature checkout. Each resolution (including
  * the final sink recheck) fetches afresh; failed refreshes cannot fall back to stale local evidence.
  * Open-PR cards require the explicit @pr<N> form and retain the shared PR-state/readability checks. */
-const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead, fingerprint } = {}) => {
+const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead, fingerprint, head } = {}) => {
   let attempted = false, fetchError;
   const main = args => {
     if (!attempted) {
@@ -81,8 +81,11 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead, f
     if (!CARD_REF_RE.test(ref)) return false;
     // No published-card lookup here: the sink re-resolves the unsuffixed ref through the fresh origin/main fetch
     // below (bornAs included), so a renumbered card still releases; a probe of its own would be a live git read.
-    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr, readMainByBornAs: () => null, fingerprint });
-    try { return hasFrontmatter(readText(ref)); }
+    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr, readMainByBornAs: () => null, fingerprint, head });
+    try {
+      const text = readText(ref);
+      return fingerprint === undefined ? hasFrontmatter(text) : cardResolvesFinding(text, fingerprint, { head });
+    }
     catch {
       // Preserve references to provisional cards renumbered on landing, using only main's content.
       const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
@@ -91,7 +94,7 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead, f
         return listFiles().some(file => {
           if (!/^\d+-/.test(file)) return false;
           const text = readText(file);
-          return hasFrontmatter(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
+          return (fingerprint === undefined ? hasFrontmatter(text) : cardResolvesFinding(text, fingerprint, { head })) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
         });
       } catch { return false; }
     }
@@ -119,7 +122,7 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
   readStandingRulingScope = standingRulingScope, readFile = readFileSync,
   readEvents = repo => readJudgeLedgerSync(repo, { env }),
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
-  resolveCard = (card, ctx) => resolveCardDefault(card, { runGit, readOnPr, fingerprint: ctx?.fingerprint }),
+  resolveCard = (card, ctx) => resolveCardDefault(card, { runGit, readOnPr, fingerprint: ctx?.fingerprint, head: ctx?.head }),
   resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
   return ({ repo, pr, card, actor, asJudge, evidenceFile, break: breakSpec }) => {
@@ -210,7 +213,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
-  resolveCard = (card, ctx) => resolveCardDefault(card, { runGit, readOnPr, fingerprint: ctx?.fingerprint }),
+  resolveCard = (card, ctx) => resolveCardDefault(card, { runGit, readOnPr, fingerprint: ctx?.fingerprint, head: ctx?.head }),
   resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }),
   coordinationRoot = resolveCoordinationRoot(), actions = createActionStore({ root: coordinationRoot }), fileCard = spawnStableCardJob,
   post = (repo, pr, body, actor) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env, actor),

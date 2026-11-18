@@ -1,4 +1,5 @@
 /** #2949 fidelity: resolve an operator's existing card against a real backlog tree. */
+import { roundCardsFindingsFingerprint } from '../../lib/review-loop-policy.mjs';
 import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, it } from 'vitest';
@@ -13,17 +14,18 @@ it('reads published cards from a real origin and refuses checkout-only cards in 
     const file = 'backlog/5100-follow-up.md';
     const unmerged = 'backlog/6935-prevention-require-named-refusal-and-post-failure-coverage-f.md';
     const body = '---\nbornAs: xvm9vbu\nstatus: open\n---\n# Follow-up\n';
-    seedOriginBranch('main', { [file]: body });
     const rev = commit({ [file]: body, [unmerged]: body });
     // A feature-only refspec must not leave origin/main stale after a successful fetch.
     git(['config', 'remote.origin.fetch', '+refs/heads/feature:refs/remotes/origin/feature']);
     const repo = 'o/r';
     const pr = 9;
+    const findings = [{ summary: 'Recovery omits the rejected parent edge', category: 'edge-case',
+      impactIfUnfixed: 'broken', file: 'scripts/example.mjs', line: 24, confirmedByRecheck: true }];
+    seedOriginBranch('main', { [file]: `---\nbornAs: xvm9vbu\nstatus: resolved\n---\n${roundCardsFindingsFingerprint(findings)} ${rev}\n` });
     const comments = [
       { author: { login: 'web-everything' }, createdAt: '2026-10-20T23:00:00Z',
         body: renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
-          findings: [{ summary: 'Recovery omits the rejected parent edge', category: 'edge-case',
-            impactIfUnfixed: 'broken', file: 'scripts/example.mjs', line: 24, confirmedByRecheck: true }] }) },
+          findings }) },
       { author: { login: 'web-everything' }, createdAt: '2026-10-20T23:41:12Z', body: redTeamGateMarker(pr, rev, 'round-cap') },
     ];
     // Only GitHub is stubbed: enumeration, content and refresh use real Git against a local origin.

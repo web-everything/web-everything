@@ -20,9 +20,11 @@ const CARD_REPO = CONSTELLATION_REPOS.we.slug;
 const CARD_BASE = 'main'; // a card only "will land" if its PR targets the branch the backlog is read from
 const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
 
-/** Strict, pure proof that a flat frontmatter card resolves the named finding set. */
-export function cardResolvesFinding(text, fingerprint) {
+/** Strict, pure proof that a flat frontmatter card resolves the named finding set, optionally at a ruled head. */
+export function cardResolvesFinding(text, fingerprint, { head } = {}) {
   if (typeof text !== 'string' || typeof fingerprint !== 'string' || !fingerprint.trim()) return false;
+  if (head !== undefined && (typeof head !== 'string' || !/^[0-9a-f]{40}(?![\s\S])/i.test(head)
+    || !text.toLowerCase().includes(head.slice(0, 12).toLowerCase()))) return false;
   const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)?.[1];
   if (!frontmatter) return false;
   const lines = frontmatter.split(/\r?\n/);
@@ -54,7 +56,7 @@ export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSyn
 }
 
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
-export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead, readMainByBornAs = readMainCardByBornAs, fingerprint } = {}) {
+export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead, readMainByBornAs = readMainCardByBornAs, fingerprint, head } = {}) {
   if (!CARD_REF_RE.test(ref ?? '')) return false;
   // Prefer the PR head. After landing, JIT numbering may have renamed the card there, so when the PR read fails
   // ONLY the provisional (`x…`) birth name may resolve through a card PUBLISHED on origin/main whose `bornAs:` names
@@ -63,11 +65,12 @@ export function referralCardReadable(ref, root = process.cwd(), { readOnPr = rea
   const onPr = PR_REF_RE.exec(ref);
   if (onPr) {
     const [, prefix, file, pr] = onPr;
+    if (prefix === 'longshore' && head === undefined) return false;
     const repo = prefix === 'longshore' ? CONSTELLATION_REPOS.longshore.slug : CARD_REPO;
     try {
       const text = (prefix === 'we' ? readOnPr(file, pr) : readOnPr(file, pr, { repo })) ?? '';
       if (prefix === 'longshore' || fingerprint !== undefined) {
-        if (cardResolvesFinding(text, fingerprint)) return true;
+        if (cardResolvesFinding(text, fingerprint, { head })) return true;
       } else if (hasFrontmatter(text)) return true;
     } catch { /* try the published WE card */ }
     if (prefix !== 'we') return false;
@@ -75,7 +78,7 @@ export function referralCardReadable(ref, root = process.cwd(), { readOnPr = rea
     if (!born) return false;
     try {
       const text = readMainByBornAs(born, root) ?? '';
-      return hasBornAs(text, born) && (fingerprint === undefined || cardResolvesFinding(text, fingerprint));
+      return hasBornAs(text, born) && (fingerprint === undefined || cardResolvesFinding(text, fingerprint, { head }));
     } catch { return false; }
   }
   try { return hasFrontmatter(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
