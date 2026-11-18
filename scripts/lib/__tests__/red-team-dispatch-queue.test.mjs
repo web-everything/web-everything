@@ -57,7 +57,7 @@ describe('R907 red-team reader retains operator authority under test flags', () 
       env: { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
         WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '6', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '4' }, log,
     });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   });
 });
@@ -72,7 +72,7 @@ const prefix = 'review-daemon: red-team queue ';
 // Sync IO doubles match node:fs semantics without touching the operator's queue.
 // No persisted envelope is assumed: restart assertions exercise the public reader.
 // maxAttempts is deliberately NOT defaulted here: omitting it exercises the production default (3).
-function fixture({ maxAttempts, logger } = {}) {
+function fixture({ maxAttempts, logger, readLivePr = ({ pr }) => ({ state: 'OPEN', headRefOid: head(pr) }) } = {}) {
   const file = join('queue-fixture', 'queue.json');
   const files = new Map();
   const operations = [];
@@ -96,11 +96,11 @@ function fixture({ maxAttempts, logger } = {}) {
   const unlink = vi.fn(path => { files.delete(path); });
   const log = logger ?? ((...parts) => logs.push(parts.join(' ')));
   const open = () => createRedTeamDispatchQueue({
-    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts,
+    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts, readLivePr,
   });
   return {
     file, files, operations, logs, log, readFile, writeFile, rename, unlink, open,
-    queue: open(), advance: () => { clock += 1000; },
+    queue: open(), advance: (ms = 1000) => { clock += ms; },
   };
 }
 
@@ -146,7 +146,7 @@ describe('setting-driven red-team queue floor', () => {
     ['missing minimum', { redTeam: { queue: { minConcurrentIdlePct: 10 } } }],
   ])('%s disables the floor without increasing capacity', (_name, configuration) => {
     const configured = load(JSON.stringify(configuration));
-    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     const bound = floorCapacity(1);
     const log = vi.fn();
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100, log });
@@ -161,7 +161,7 @@ describe('setting-driven red-team queue floor', () => {
     ['nonfinite environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: 'Infinity' }],
   ])('%s defaults to 10 while retaining the configured minimum', (_name, env) => {
     const configured = load(JSON.stringify({ redTeam: { queue: { minConcurrent: 3 } } }), env);
-    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     const bound = floorCapacity(1);
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 9 });
     expect(bound.remainingStarts).toBe(1);
@@ -176,7 +176,7 @@ describe('setting-driven red-team queue floor', () => {
     ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
   ])('%s minimum resolves with a hard cap of six and invalid overrides disable it', (_name, text, env, expected) => {
     const configured = load(text, env);
-    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 10 } };
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100 });
     expect(bound.remainingStarts).toBe(Math.max(1, expected));
@@ -205,7 +205,7 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it('loads defaults 6/10 from the real shipped settings file with no environment overrides', () => {
-    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6 });
+    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6, plannerSkipReplanMinutes: 15 });
     expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_MAX).toBe(24);
     expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(6);
   });
@@ -214,13 +214,13 @@ describe('setting-driven red-team queue floor', () => {
     expect(load(settings(4, 80), {
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '1',
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: '20',
-    })).toEqual({ minConcurrent: 1, idlePct: 20, reviewStartsPerTick: 0 });
+    })).toEqual({ minConcurrent: 1, idlePct: 20, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
   });
 
   it.each([['file', 99, {}], ['environment', 2, { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }]])(
     '%s oversized file/env minimum clamps to six and admits only six', async (_source, minimum, env) => {
       const configured = load(settings(minimum), env);
-      expect(configured).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 0 });
+      expect(configured).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
       const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } };
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
       expect(redTeamQueueAdmitCount(bound)).toBe(6);
@@ -291,7 +291,7 @@ describe('setting-driven red-team queue floor', () => {
 
   it('zero minimum explicitly disables the floor in both file and environment', () => {
     for (const configured of [load(settings(0)), load(settings(2), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '0' })]) {
-      expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+      expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
       const bound = floorCapacity(1);
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
       expect(bound).toEqual(floorCapacity(1));
@@ -299,14 +299,14 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j disables the floor', value => {
-    expect(load(settings(2, value))).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
-    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0 });
+    expect(load(settings(2, value))).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
+    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
   });
 
   it.each([0, 100])('accepts idle threshold boundary %s', idlePct => {
-    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     expect(load(settings(), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(idlePct) }))
-      .toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+      .toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
   });
 
   it.each([null, undefined, NaN, Infinity, -Infinity, '38', -1])(
@@ -706,7 +706,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
-  it('planner skip rows (not in notStarted) count as attempts, rotate, and no longer starve the next PR', async () => {
+  it('planner skip rows count one attempt and free capacity during the replan cooldown', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'stale re-dispatch already spent';
     const dispatchedPrs = [];
@@ -723,7 +723,8 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     }
     expect(dispatchedPrs).toEqual([2]); // PR2 really dispatched on tick 2 despite capacity 1
     expect(numbers(f.queue.entries())).toEqual([1]);
-    expect(f.logs.some(line => line.includes('requeue') && line.includes(reason))).toBe(true);
+    expect(f.queue.entries()[0]).toMatchObject({ attempts: 1, blocked: 'planner-skip' });
+    expect(f.logs.some(line => line.includes('requeue'))).toBe(false);
   });
 
   it('stuck head skip-and-requeue after K attempts logs reason and lets the rest dispatch', async () => {
@@ -889,11 +890,10 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     f.operations.length = 0;
     const error = new Error('runner failed after sync mutations');
     const options = inputs([2, 3, 4], { capacity: capacity(1) });
-    options.plan.refusals[0].headSha = 'f'.repeat(40);
     const run = vi.fn(() => {
-      // Sync removed PR 1, replaced PR 2's head and appended PR 4 before admission.
-      expect(numbers(f.queue.entries())).toEqual([3, 2, 4]);
-      expect(f.queue.entries()[1]).toMatchObject({ head: 'f'.repeat(40), attempts: 0 });
+      // Sync removed PR 1 and appended PR 4 before admission; live head changes reconcile separately.
+      expect(numbers(f.queue.entries())).toEqual([2, 3, 4]);
+      expect(f.queue.entries()[0]).toMatchObject({ head: head(2), attempts: 0 });
       if (mode === 'async') return Promise.reject(error);
       throw error;
     });
@@ -1067,10 +1067,10 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(turn(7)).toBeGreaterThan(turn(6));
       expect(f.open().entries()).toEqual(after);
     });
-    it('reprobes waiting heads within the rotation bound despite two new planner skips every tick', () => {
+    it('reprobes waiting heads within the rotation bound despite two new unfinished reviews every tick', () => {
       const f = fixture();
       let queue = f.queue;
-      const skip = ids => ({ rows: ids.map(prNumber => ({ prNumber, action: 'skip', why: 'later verdict' })) });
+      const skip = ids => ({ notStarted: ids.map(prNumber => ({ prNumber, reason: 'review-unfinished' })) });
       queue.sync(repo, candidates([1, 2, 3, 4]));
       queue.admit(repo, 4);
       queue.settle(repo, skip([1, 2, 3, 4]));
@@ -1096,8 +1096,8 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
             }
           }
           // Arrivals clear when their next probe reaches them; original heads stay blocked.
-          return { rows: admitted.map(prNumber => ({ prNumber,
-            action: arrivals.includes(prNumber) ? 'clear' : 'skip', why: 'later verdict' })) };
+          return { rows: admitted.filter(prNumber => arrivals.includes(prNumber)).map(prNumber => ({ prNumber, action: 'clear' })),
+            notStarted: admitted.filter(prNumber => !arrivals.includes(prNumber)).map(prNumber => ({ prNumber, reason: 'review-unfinished' })) };
         } });
         expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(2);
         arrivals = [...arrivals, ...fresh];
@@ -1110,7 +1110,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     });
     it('a runnable entry with an old turn rejoins the tail when it blocks again', () => {
       const f = fixture();
-      const queue = persistedBlocked(f, 'planner-skip');
+      const queue = persistedBlocked(f, 'review-unfinished');
       queue.admit(repo, 0);
       queue.settle(repo, { notStarted: [1, 2].map(prNumber => ({ prNumber, reason: 'temporary start failure' })) });
       queue.admit(repo, 0);
@@ -1122,7 +1122,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     });
     it('settlement rebases overflowing turns within its repository before appending new blocks', () => {
       const f = fixture();
-      const queue = persistedBlocked(f, 'planner-skip', [6, 7]);
+      const queue = persistedBlocked(f, 'review-unfinished', [6, 7]);
       const own = queue.entries().map((entry, index) => entry.pr <= 5
         ? { ...entry, lastProbeTurn: Number.MAX_SAFE_INTEGER - 4 + index } : entry);
       const foreign = { ...own[4], repo: otherRepo, key: `${otherRepo}#5` };
@@ -1136,7 +1136,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(f.open().entries()).toEqual(reopened.entries());
       expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
     });
-    it.each(['review-unfinished', 'planner-skip'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
+    it.each(['review-unfinished'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
       const f = fixture();
       let queue = persistedBlocked(f, reason);
       const turns = [[1, 2], [3, 4], [1, 5]]; // selected entries retain queue order in runner input
@@ -1162,7 +1162,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       }
       expect([...seen]).toEqual([1, 2, 3, 4, 5]);
     });
-    it.each(['review-unfinished', 'planner-skip'])('settles all five persisted %s entries over capped ticks', reason => {
+    it.each(['review-unfinished'])('settles all five persisted %s entries over capped ticks', reason => {
       const f = fixture();
       const queue = persistedBlocked(f, reason);
       const remaining = [[1, 2, 3, 4, 5], [3, 4, 5], [5]];
@@ -1181,7 +1181,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     });
     it('two probes use no runnable slots and only excess runnable entries log capacity holds', () => {
       const f = fixture();
-      const queue = persistedBlocked(f, 'planner-skip', [6, 7]);
+      const queue = persistedBlocked(f, 'review-unfinished', [6, 7]);
       runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5, 6, 7], { capacity: capacity(1) }), log: f.log,
         run: options => {
           expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 6]);
@@ -1198,7 +1198,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     });
     it('the two-probe cap applies independently to each repository', () => {
       const f = fixture();
-      const queue = persistedBlocked(f, 'planner-skip');
+      const queue = persistedBlocked(f, 'review-unfinished');
       const original = queue.entries();
       f.files.set(f.file, JSON.stringify([...original, ...original.map(entry => ({
         ...entry, repo: otherRepo, key: `${otherRepo}#${entry.pr}`,
@@ -1210,7 +1210,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     });
     it('rebases persisted probe turns before overflow while preserving fair order', () => {
       const f = fixture();
-      const queue = persistedBlocked(f, 'planner-skip');
+      const queue = persistedBlocked(f, 'review-unfinished');
       f.files.set(f.file, JSON.stringify(queue.entries().map((entry, index) => ({
         ...entry, lastProbeTurn: Number.MAX_SAFE_INTEGER - 4 + index,
       }))));
@@ -1222,7 +1222,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     });
     it('disabled probes fail closed for five blocked entries and never log capacity holds', () => {
       const f = fixture();
-      const queue = persistedBlocked(f, 'planner-skip');
+      const queue = persistedBlocked(f, 'review-unfinished');
       expect(queue.admit(repo, 4, { allowProbes: false })).toEqual([]);
       runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5], { capacity: undefined }), log: f.log,
         run: options => {
@@ -1334,7 +1334,7 @@ describe('red-team queue floor idle override', () => {
     const text = JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 80 } } });
     for (const bad of ['bad', '', ' ', 'Infinity', '-1', '101', '1.5']) {
       expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: bad }, file: 'x', readFile: () => text }))
-        .toEqual({ minConcurrent: 2, idlePct: 80, reviewStartsPerTick: 0 });
+        .toEqual({ minConcurrent: 2, idlePct: 80, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     }
   });
 });
@@ -1435,7 +1435,7 @@ it('corrupt operator store disables red-team capacity raises and logs operator-d
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1470,10 +1470,143 @@ it.each([
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes: 15 });
     const bound = { lanes: 20, startsCeiling: 20, remainingStarts: 0, budget: { left: 20 } };
     applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
     expect(redTeamQueueAdmitCount(bound)).toBe(0);
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+describe('live red-team queue reconciliation and planner-skip expiry', () => {
+  const seed = f => {
+    f.queue.sync(repo, candidates([1, 2]));
+    f.queue.admit(repo, 1);
+    f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'superseded acceptance' }] });
+  };
+  it.each(['MERGED', 'CLOSED'])('evicts a live %s PR before sync can re-enqueue its stale planner row', state => {
+    const readLivePr = vi.fn(({ pr }) => ({ state: pr === 1 ? state : 'OPEN', headRefOid: head(pr) }));
+    const f = fixture({ readLivePr }); seed(f);
+    const run = vi.fn(options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([2]);
+      return refused(2, 'no review capacity left');
+    });
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run });
+    expect(numbers(f.open().entries())).toEqual([2]);
+    expect(f.logs.join(' ')).toContain(`live PR ${state.toLowerCase()}`);
+    expect(readLivePr).toHaveBeenCalledTimes(2);
+  });
+  it.each(['MERGED', 'CLOSED'])('maintenance followed by dispatch never re-enqueues or dispatches a stale %s planner candidate', state => {
+    const readLivePr = vi.fn(({ pr }) => ({ state: pr === 1 ? state : 'OPEN', headRefOid: head(pr) }));
+    const f = fixture({ readLivePr }); seed(f);
+    f.queue.reconcile();
+    expect(numbers(f.open().entries())).toEqual([2]);
+    const afterMaintenance = f.logs.length;
+    const run = vi.fn(options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([2]);
+      expect(options.rawPrs.map(pr => pr.number)).toEqual([2]);
+      return started(options);
+    });
+    const result = runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run });
+    expect(run).toHaveBeenCalledOnce();
+    expect(result.dispatched.map(row => row.prNumber)).toEqual([2]);
+    expect(f.logs.slice(afterMaintenance).some(line => line.includes(`enqueue ${repo}#1`))).toBe(false);
+    expect(f.open().entries()).toEqual([]);
+  });
+  it('re-keys a changed live head in place, resets attempts/block, and defers stale planner evidence', () => {
+    const readLivePr = ({ pr }) => ({ state: 'OPEN', headRefOid: pr === 1 ? head(100) : head(pr) });
+    const f = fixture({ readLivePr }); seed(f);
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run: options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([2]);
+      return refused(2, 'no review capacity left');
+    } });
+    const entries = f.open().entries();
+    expect(numbers(entries)).toEqual([1, 2]);
+    expect(entries[0]).toMatchObject({ head: head(100), attempts: 0 });
+    expect(entries[0].blocked).toBeUndefined();
+    expect(f.logs.join(' ')).toContain('re-key');
+  });
+  it.each(['null', 'throw', 'incomplete'])('keeps and logs %s live evidence even when absent from candidates', mode => {
+    const f = fixture(); seed(f);
+    const before = f.queue.entries();
+    const readLivePr = () => { if (mode === 'throw') throw new Error('offline'); return mode === 'null' ? null : { state: 'OPEN' }; };
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([]), readLivePr, run: () => ({}) });
+    expect(f.open().entries()).toEqual(before);
+    expect(f.logs.filter(line => line.includes('live PR unreadable'))).toHaveLength(2);
+  });
+  it.each(['null', 'throw', 'incomplete'])('blocks runnable persisted candidates from dispatch on %s live evidence and keeps them persisted', mode => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([1, 2]));
+    const before = f.open().entries();
+    expect(before.every(entry => entry.blocked === undefined)).toBe(true);
+    const readLivePr = vi.fn(() => {
+      if (mode === 'throw') throw new Error('offline');
+      return mode === 'null' ? null : { state: 'OPEN' };
+    });
+    const run = vi.fn(options => {
+      expect(options.plan.refusals).toEqual([]);
+      expect(options.rawPrs).toEqual([]);
+      return started(options);
+    });
+    const result = runWithRedTeamQueue({ queue: f.open(), ...inputs([1, 2]), readLivePr, run });
+    expect(run).toHaveBeenCalledOnce();
+    expect(readLivePr).toHaveBeenCalledTimes(2);
+    expect(result.dispatched).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+    expect(f.logs.filter(line => line.includes('live PR unreadable'))).toHaveLength(2);
+  });
+  it('honors the configured interval across restarts and replans as runnable at the boundary', () => {
+    const f = fixture(); seed(f);
+    let expectedIds = [2];
+    const tick = queue => runWithRedTeamQueue({ queue, ...inputs([1, 2]),
+      floor: { plannerSkipReplanMinutes: 20 }, run: options => {
+        const ids = options.plan.refusals.map(row => row.prNumber);
+        expect(ids).toEqual(expectedIds);
+        return { rows: ids.map(prNumber => ({ prNumber, action: 'skip', why: 'still superseded' })) };
+      } });
+    f.advance(20 * 60000 - 1);
+    tick(f.open());
+    expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(0);
+    f.advance(1);
+    expectedIds = [1];
+    const queue = f.open(); tick(queue);
+    expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(1);
+    expect(queue.entries()[0].blocked).toBe('planner-skip');
+    expectedIds = [];
+    tick(f.open());
+    expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(1);
+  });
+  it('migrates a legacy planner-skip without blockedAt using enqueuedAt and admits it as runnable', () => {
+    const f = fixture(); seed(f);
+    f.files.set(f.file, JSON.stringify(f.queue.entries().map(({ blockedAt, ...entry }) => entry)));
+    f.advance(15 * 60000);
+    const queue = f.open();
+    runWithRedTeamQueue({ queue, ...inputs([1, 2]), capacity: capacity(1), run: options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1]);
+      expect(queue.entries()[0].blocked).toBeUndefined();
+      return refused(1, 'no review capacity left');
+    } });
+    expect(f.logs.join(' ')).toContain('planner-skip interval elapsed');
+  });
+  it.each([-1, 1.5, null, '1', Number.MAX_VALUE])('rejects invalid persisted blockedAt %j', blockedAt => {
+    const f = fixture(); seed(f);
+    f.files.set(f.file, JSON.stringify(f.queue.entries().map(entry => ({ ...entry, blockedAt }))));
+    expect(f.open().entries()).toEqual([]);
+    expect(f.logs.join(' ')).toContain('invalid persisted entries');
+  });
+  it.each([undefined, null, 0, -1, 1.5, '30', 525601])('defaults missing/invalid replanMinutes %j to 15 and logs provenance', value => {
+    const log = vi.fn();
+    const floor = loadRedTeamQueueFloor({ env: {}, log,
+      readFile: () => JSON.stringify({ redTeam: { queue: { 'planner-skip': { replanMinutes: value } } } }) });
+    expect(floor.plannerSkipReplanMinutes).toBe(15);
+    expect(log.mock.calls.flat().join(' ')).toContain('default 15');
+  });
+  it('loads a valid planner-skip interval through the existing settings loader', () => {
+    const log = vi.fn();
+    expect(loadRedTeamQueueFloor({ env: {}, log,
+      readFile: () => JSON.stringify({ redTeam: { queue: { 'planner-skip': { replanMinutes: 30 } } } })
+    }).plannerSkipReplanMinutes).toBe(30);
+    expect(log.mock.calls.flat().join(' ')).toContain('source: scripts/settings/red-team-queue.json');
+  });
 });

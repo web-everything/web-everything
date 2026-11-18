@@ -99,7 +99,7 @@ import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
 import { sampleHost } from '../../scripts/lib/host-sample.mjs';
 import { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
-import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
+import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue, readLiveRedTeamPr } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
 import { runGateCatchUp } from '../../scripts/lib/red-team-gate-catchup.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
@@ -388,6 +388,7 @@ export function runReviewTick({
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   redTeamOnSkip = null,
+  reconcileRedTeamQueue = null,
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
   statusCandidates = selectStatusCandidates,
@@ -458,6 +459,9 @@ export function runReviewTick({
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
   // below must never suppress it. Isolated in its own try/catch, same "one bad entry never aborts the rest"
   // discipline as every other step in this tick — a `gh` hiccup here must not cost a review dispatch.
+  // Maintenance also runs on paused ticks and before any reconcile/read failure can return early.
+  try { reconcileRedTeamQueue?.({ repo }); }
+  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let rawPrs = null;
   let rawPrsError = null;
@@ -1428,8 +1432,16 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 let redTeamDispatchQueue;
 const redTeamGateRetryHistory = new Map();
 let lastRedTeamQueueFloorLine;
-export function cliReviewTickOpts({ log = console, factCache = null, listCommands } = {}) {
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
+  const livePrs = new Map();
+  const readQueuePr = args => {
+    const key = `${args.repo}#${args.pr}`;
+    if (!livePrs.has(key)) {
+      try { livePrs.set(key, readLivePr(args)); } catch { livePrs.set(key, null); }
+    }
+    return livePrs.get(key);
+  };
   return {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
@@ -1437,6 +1449,15 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
+    reconcileRedTeamQueue: () => {
+      livePrs.clear();
+      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      let plannerSkipReplanMinutes = 15;
+      try { plannerSkipReplanMinutes = loadRedTeamQueueFloor({ log: line => log.error(line) }).plannerSkipReplanMinutes; }
+      catch { log.error('review-daemon: red-team queue planner-skip settings unreadable; default 15 minutes'); }
+      redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr, plannerSkipReplanMinutes });
+    },
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;
       try {
@@ -1481,7 +1502,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
         lastRedTeamQueueFloorLine = floorLine;
       }
       return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
-        floor, readCpuIdlePct: () => sampleHost().idlePct });
+        floor, readLivePr: readQueuePr, readCpuIdlePct: () => sampleHost().idlePct });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,

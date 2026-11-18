@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 let directory;
@@ -161,4 +161,29 @@ it('R907 a throwing floor diagnostic logger still passes refreshed policy to rec
   expect(passedMinimums()).toEqual([12, 3]);
   expect(floorLines()).toHaveLength(2);
   expect(storeRead).toHaveBeenCalledTimes(2);
+});
+
+
+it.each([false, true])('queue maintenance runs before a failed reconcile, including paused=%s ticks', async paused => {
+  const { runReviewTick } = await import('../review-daemon.mjs');
+  const maintenance = vi.fn();
+  const recovery = vi.fn();
+  runReviewTick({ repo: 'example/project', paused, reconcileRedTeamQueue: maintenance,
+    redTeamOnSkip: recovery, holdReconcile: () => [],
+    reconcile: () => { expect(maintenance).toHaveBeenCalledWith({ repo: 'example/project' }); throw new Error('deferred'); } });
+  expect(maintenance).toHaveBeenCalledTimes(1);
+  expect(recovery).not.toHaveBeenCalled();
+});
+
+it('production maintenance evicts a merged persisted entry without invoking redTeamOnSkip', async () => {
+  const file = join(directory, 'queue.json');
+  writeFileSync(file, JSON.stringify([{ key: 'example/project#7012', repo: 'example/project', pr: 7012,
+    head: 'a'.repeat(40), blocked: 'planner-skip', attempts: 1, enqueuedAt: 1 }]));
+  const readLivePr = vi.fn(() => ({ state: 'MERGED', headRefOid: 'a'.repeat(40) }));
+  const { cliReviewTickOpts } = await import('../review-daemon.mjs');
+  const opts = cliReviewTickOpts({ log, readLivePr });
+  opts.reconcileRedTeamQueue({ repo: 'example/project' });
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([]);
+  expect(readLivePr).toHaveBeenCalledWith({ repo: 'example/project', pr: 7012 });
+  expect(queueRun).not.toHaveBeenCalled();
 });
