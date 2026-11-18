@@ -13,7 +13,8 @@ we:scripts/lib/drain-api-reads.mjs#readOriginSlug accepts any https login part m
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npm run test:unit -- scripts/lib/__tests__/drain-api-reads*.test.mjs` with new cases asserting `readOriginSlug` throws `origin-unparseable` for `https://evil.example#@github.com/o/r`, `?@`, backslash-`@` and a login part with a space or newline; fails before (they parse as `o/r`), passes after.
+- [A2] **Must** — an https origin whose login part is an access-token user name plus token (RFC 3986 userinfo characters only) still parses as `o/r`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
