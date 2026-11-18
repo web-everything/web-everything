@@ -224,7 +224,10 @@ export async function rebuildCloneAsJob({
   };
 
   // Adoption always precedes reattach: even a queued/retryable job must yield to a passed build.
-  const r = await adopt();
+  // Without a ready record and with a job in flight there is nothing to adopt, so the adopt-only pass (which can reach
+  // a versioned inline build) is left until the job settles, exactly as before.
+  let inFlight = mine().find((x) => !TERMINAL_JOB_STATUSES.includes(x.job.status)) ?? null;
+  let r = inFlight && !readReadyCandidate(root, env) ? null : await adopt();
   // Only a completed adoption short-circuits; a ready record that did not adopt must not suppress job recovery below.
   if (r?.moved || r?.adopted) {
     housekeeping();
@@ -232,7 +235,6 @@ export async function rebuildCloneAsJob({
   }
 
   // 2. A job in flight: reattach (launch / stalled / dead handling) and tick on the current tree.
-  let inFlight = mine().find((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)) ?? null;
   if (inFlight) {
     await pass();
     const cur = store.read(inFlight.id);
@@ -240,6 +242,11 @@ export async function rebuildCloneAsJob({
       return { moved: false, reason: 'rebuild-job-running', job: describe(cur), finishedJobs, alerts: [] };
     }
     inFlight = null; // finished during the pass — fall through, the next tick consumes it
+  }
+  r ??= await adopt();
+  if (r?.moved || r?.adopted) {
+    housekeeping();
+    return { ...r, finishedJobs };
   }
 
   // Reattach can finish a job and publish a candidate during this call. Keep it for adoption.

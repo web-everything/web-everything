@@ -212,7 +212,7 @@ describe('rebuildCloneAsJob — the tick side', () => {
     return { store: createJobStore(dir), reattach: vi.fn(async () => ({ slept: false, actions: [] })) };
   };
 
-  it('queues one job when a build is due, then attempts adoption again before reporting it running', async () => {
+  it('queues one job when a build is due, then reports it running without calling adopt again (no ready record)', async () => {
     const { store, reattach } = setup();
     const adopt = vi.fn(async () => ({ moved: false, reason: 'needs-build', plan: { finalSha: 'abc123' } }));
     const first = await rebuildCloneAsJob({
@@ -224,7 +224,7 @@ describe('rebuildCloneAsJob — the tick side', () => {
       root: '/tmp/x', adopt, store, reattach, codeSha: 'a'.repeat(40), log: quietLog, evict: () => ({ evicted: [] }),
     });
     expect(second.reason).toBe('rebuild-job-running');
-    expect(adopt).toHaveBeenCalledTimes(2);
+    expect(adopt).toHaveBeenCalledTimes(1);
     expect(store.list().records).toHaveLength(1);
   });
 
