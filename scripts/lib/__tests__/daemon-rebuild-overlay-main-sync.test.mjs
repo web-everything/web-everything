@@ -62,7 +62,7 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     "process.stdout.write('[]');",
     "process.on('exit', () => { console.log('[]'); process.stdout.write('late'); });",
     "export default { test: { include: ['*.test.mjs'] } };", ''].join('\n'));
-  if (advisoryIndex) write(root, 'scripts/conveyor/soak/breaks/index.mjs', 'export const breaks = [];\n');
+  if (advisoryIndex) write(root, 'scripts/conveyor/soak/breaks/index.mjs', '/**\n * registry\n */\nexport const breaks = [];\n');
   if (mainUnion) write(root, 'docs/agent/testing.md', '# Testing\n');
   for (let i = 0; i < count; i++) write(root, `worker${i}.test.mjs`, "import './worker.mjs';\n");
   if (deleteFinalTest) write(root, 'scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs',
@@ -72,7 +72,7 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   ok(root, ['checkout', '-qb', ref]);
   const branch = [...lines]; branch[0] = 'export const value0 = 100;';
   write(root, 'worker.mjs', `${branch.join('\n')}\n`);
-  if (advisoryIndex) fs.appendFileSync(join(root, 'scripts/conveyor/soak/breaks/index.mjs'), '// overlay\n');
+  if (advisoryIndex) write(root, 'scripts/conveyor/soak/breaks/index.mjs', '/**\n * registry\n * overlay\n */\nexport const breaks = [];\n');
   if (overlayTest) write(root, 'overlay.test.mjs', "import './worker.mjs';\n");
   if (deleteFinalTest) fs.unlinkSync(join(root, 'worker0.test.mjs'));
   if (mainUnion) fs.appendFileSync(join(root, 'docs/agent/testing.md'), 'Overlay testing notes\n');
@@ -81,7 +81,7 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   ok(root, ['checkout', '-q', 'main']);
   const main = [...lines]; main[conflict ? 0 : 29] = `export const value${conflict ? 0 : 29} = 200;`;
   write(root, unrelated ? 'unrelated.mjs' : 'worker.mjs', unrelated ? 'export default 1;\n' : `${main.join('\n')}\n`);
-  if (advisoryIndex) fs.appendFileSync(join(root, 'scripts/conveyor/soak/breaks/index.mjs'), '// main\n');
+  if (advisoryIndex) write(root, 'scripts/conveyor/soak/breaks/index.mjs', '/**\n * registry\n * main\n */\nexport const breaks = [];\n');
   if (mainUnion) {
     fs.appendFileSync(join(root, 'docs/agent/testing.md'), 'Main testing notes\n');
     write(root, '.gitattributes', 'docs/agent/testing.md merge=union\n');
@@ -145,8 +145,8 @@ describe('overlay main sync', () => {
     const f = fixture({ advisoryIndex: true });
     expect(await job(f)).toMatchObject({ pushed: true });
     const text = ok(f.origin, ['show', `${ref}:scripts/conveyor/soak/breaks/index.mjs`]);
-    expect(text).toContain('// overlay');
-    expect(text).toContain('// main');
+    expect(text).toContain(' * overlay');
+    expect(text).toContain(' * main');
     expect(synced(f)).toHaveLength(1);
     expect(alerts(f)).toEqual([]);
     unchanged(f);
