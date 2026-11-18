@@ -4,10 +4,10 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-tick-speed.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "490e7d6644d9abb0237cc628cc9f8da7a4814511"
+preparedDate: "2026-11-18"
+preparedAgainstSha: "bdcf17b75673b6d6f0673952f1c89b5d81c93973"
 tags: []
 ---
 
@@ -21,21 +21,23 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Progress
 
-Preparation research on 2026-10-02 found this goal still outstanding; no implementation or stamp is made here.
+Preparation research on 2026-11-18 confirms the guard remains outstanding. No implementation or new stamp is made here.
 
-- **Old premise/scope:** three review bullets cited the daemon at lines 624, 146, and 258, requested a dry-run seam plus reader-error fallback, and described counting “every open PR.” Scope paired the daemon with its existing test file.
-- **Corrected premise/scope:** retain that source/test pair. The dry-run report now lives at `we:skills-src/conveyor/build-dispatch-daemon.mjs:1332`; both planning paths already call `deriveDispatchedByBuilder` (definition at line 188, tick call at line 404, report call at line 1358), but no test exercises report assembly. Readers at lines 734 and 778 still hide directory errors and skip individual unreadable records. Cover both failure modes. Requests 2 and 3 collapse into one conservative-attribution change and its tick-level regression.
-- **Source evidence:** `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs:258` tests tick WIP accounting, line 281 tests worker exclusion, and line 300 tests only the shared helper. Real-reader tests at lines 1135 and 1173 explicitly expect empty arrays after ENOTDIR. These assertions preserve the old fail-open behavior; they do not prove report parity or conservative dispatch on error.
-- **Counting correction:** `we:scripts/conveyor/build-dispatch-policy.mjs:252` already accepts null attribution and forms the deduplicated union of in-flight item numbers and item numbers delivered by open PRs. “Every open PR” therefore means every recognizable delivered item without the builder-ownership filter, not one WIP slot per PR or a slot for PRs with no delivery reference. Raw PR-count and scope-overlap gates remain independent. This is supporting evidence, not an additional implementation target.
-- **Read-error evidence:** `we:scripts/operations/run-store.mjs:107` throws for corrupt records; the daemon catches those errors separately from directory-list errors. The live shell caches both build reads at `we:skills-src/conveyor/build-dispatch-daemon.mjs:1452`, so error status must survive that caching as well as the dry-run shell. The same readers also serve prepare-item work; preserve those callers' array contract.
+- **Old premise/scope:** the prior preparation targeted two independently failing readers, cited the dry-run at line 1332 and live caching at line 1452, and scoped only the daemon and its main test. Those locations and the independent-reader premise are stale.
+- **Corrected premise/scope:** `we:skills-src/conveyor/build-dispatch-daemon.mjs:1760` now owns the shared `readDispatchLaneRunRecords` scan. It swallows listing errors and skips unreadable records before either reader can observe failure. The wrappers at `we:skills-src/conveyor/build-dispatch-daemon.mjs:1774` and `we:skills-src/conveyor/build-dispatch-daemon.mjs:1811` consume that snapshot; dry-run caching starts at `we:skills-src/conveyor/build-dispatch-daemon.mjs:2953` and live caching at `we:skills-src/conveyor/build-dispatch-daemon.mjs:3103`. Carry status from the scan, not merely from wrappers. Add the existing shared-read regression file to scope.
+- **Source evidence:** the tick still derives an attribution set unconditionally at `we:skills-src/conveyor/build-dispatch-daemon.mjs:808`; the hypothetical report does so at `we:skills-src/conveyor/build-dispatch-daemon.mjs:2979`. The report re-fetches PRs and claims at `we:skills-src/conveyor/build-dispatch-daemon.mjs:2968`, so sharing the derivation alone does not establish snapshot parity. No exported report assembly seam exists.
+- **Tests/callers:** `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs:744` covers successful worker exclusion; its helper tests start at line 763, and real ENOTDIR expectations at lines 1616 and 1654 retain empty-array behavior. `we:skills-src/conveyor/__tests__/build-dispatch-tick-speed.test.mjs:20` covers shared reads and prepare compatibility; its “unreadable” case at line 67 actually supplies a missing directory, which is an ordinary empty store under `we:scripts/operations/run-store.mjs:198`. Add a genuine ENOTDIR fixture rather than relabeling missing storage as failure. Corrupt records throw under `we:scripts/operations/run-store.mjs:163`.
+- **Counting correction:** `we:scripts/conveyor/build-dispatch-policy.mjs:275` accepts null attribution and counts recognizable delivered item numbers once, excluding borrowed fixes from the in-flight WIP union. It does not count raw PRs or PRs without item references. Preserve this existing contract; the policy is evidence, not an implementation target.
+- **Additional caller:** queue pruning receives run rows at `we:skills-src/conveyor/build-dispatch-daemon.mjs:628`, before the main normalization point at line 641. Normalize before every array consumer, including this caller; preserve prepare-item array returns.
+- **Sizing:** retain story size 3. The bounded touch set is one daemon (approximately 140–200 changed lines for status propagation and report extraction), its main test (approximately 140–200 lines), and its existing shared-read test (approximately 40–70 lines). Evidence is the scanner, two shell assemblies, and three existing regression groups cited above. No new policy or implementation file is required.
 
 ## Design
 
-Implement the review's specified fallback in `we:skills-src/conveyor/build-dispatch-daemon.mjs`. Add an opt-in status result to both readers: with `withStatus: true`, return `{ rows, readFailed }`; otherwise retain the existing array return for prepare-item and older callers. Mark `readFailed` on a thrown directory listing or individual record read, retaining all successfully read rows. Successful empty reads remain distinguishable from failures.
+Implement the review's specified fallback in `we:skills-src/conveyor/build-dispatch-daemon.mjs`. Add an opt-in status result to the shared scanner and both readers: with `withStatus: true`, return `{ rows, readFailed }`; otherwise retain the existing array return for prepare-item and older callers. At the scanner, mark `readFailed` on a thrown directory listing or individual record read, retaining all successfully read rows. Both wrappers accept either legacy record arrays or the status-bearing snapshot and propagate its failure bit. Do not rescan a supplied snapshot. A missing directory remains successful empty storage under the existing run-store contract. Successful empty reads remain distinguishable from failures.
 
-Have the live and dry-run build shells request status results and inject them intact. Normalize legacy array effects as successful reads inside the tick. Use the successful rows for existing in-flight and settlement bookkeeping. Derive attribution through one shared adapter: return null when either build read failed, otherwise call `deriveDispatchedByBuilder` with the two row arrays. Both planning paths must use this adapter. Do not replace failure with an empty set or discard successful in-flight rows. Update the daemon's fail-direction comments to describe this change.
+Have the live and dry-run build shells request status results and inject them intact. Normalize legacy array effects as successful reads before queue pruning and all other tick consumers; unwrap rows for bookkeeping while retaining status for attribution. Keep the default reader return as an array, and opt live/dry-run build callers into status explicitly. Prepare callers receive the shared rows without changing their failure policy. Use the successful rows for existing in-flight and settlement bookkeeping. Derive attribution through one shared adapter: return null when either build read failed, otherwise call `deriveDispatchedByBuilder` with the two row arrays. Both planning paths must use this adapter. Do not replace failure with an empty set or discard successful in-flight rows. Update the daemon's fail-direction comments to describe this change.
 
-Extract `buildDryRunReport` as an exported, injected assembly seam used by the actual dry-run CLI. Inject the existing external reads, route prediction, policy, focus, and clock; keep stdout formatting in the CLI shell. Return enough assembly evidence for tests to inspect the tick plan, hypothetical `ifFreed` plan, and rendered report without duplicating the planner in the test. Reuse one captured input snapshot for PRs, claims, build-reader results, fix claims, and kill-switch state across the two plans; their candidate sets may differ, but their pre-dispatch open-item union must agree. Keep the public JSON/text report shape stable.
+Extract `buildDryRunReport` as an exported, injected assembly seam used by the actual dry-run CLI. Inject the existing external reads, route prediction, policy, focus, and clock; keep stdout formatting in the CLI shell. Return enough assembly evidence for tests to inspect the tick plan, hypothetical `ifFreed` plan, and rendered report without duplicating the planner in the test. Reuse the tick’s effective pre-planning accounting inputs (after claim retirement/recovery), including PRs, in-flight claims, build-reader results, borrowed fixes, fix claims, main-red freeze and kill-switch state, for the hypothetical plan; their candidate sets may differ, but their pre-dispatch open-item union must agree. Keep the public JSON/text report shape stable.
 
 This is a bounded daemon correction using the planner's existing null behavior. It does not change attribution on successful reads, global PR caps, or prepare-item failure policy.
 
@@ -48,7 +50,7 @@ This is a bounded daemon correction using the planner's existing null behavior. 
 
 ## Test plan
 
-All matching tests live in `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs`.
+Tick/report tests live in `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs`; scanner and snapshot compatibility tests live in `we:skills-src/conveyor/__tests__/build-dispatch-tick-speed.test.mjs`.
 
 - Reader matrix: successful empty store, valid in-flight/settled records, ENOTDIR using a file as the run-store directory, and a corrupt dispatch record alongside a valid record. Exercise each reader with status enabled; assert failures are explicit and successful rows survive. Preserve array-mode compatibility and prepare-item tests. Restore temporary directories and environment after each case.
 - Tick matrix: fail only the in-flight attribution read, only the settled read, and both. Seed open builder PRs at `maxOpenItems`, leave concurrency/global-PR/scope gates permissive, enable the tick's live branch with injected dispatch spies, and assert zero dispatch calls plus `wip-cap` holds naming the counted items. Feed real-reader failure results into at least one case rather than constructing every sentinel by hand.
@@ -59,19 +61,26 @@ All matching tests live in `we:skills-src/conveyor/__tests__/build-dispatch-daem
 
 During implementation, add the regression cases first and record their failure against the old behavior: errors are indistinguishable from empty success, or a capacity-full tick dispatches. For the report seam, prove the wired CLI assembly path is tested, not just the attribution helper; temporarily removing attribution from only the hypothetical planner call must fail the worker-PR parity assertion. A missing export alone is not behavioral proof.
 
-Run the focused test command from the WE checkout (the path argument denotes `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs`):
+Run the affected tests through the host queue using the commands defined below. These commands use shell variables so every authored file reference retains its repository prefix; strip `we:` only when passing a path to Node/Vitest. Run from the WE checkout. Temporary stores belong under the task's `$TMPDIR`. If admission is busy, use its supported bounded wait once, then stop and report; do not poll.
 
 ```sh
-npx vitest run skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs
+queue=we:scripts/readiness/heavy-admission.mjs
+main=we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs
+shared=we:skills-src/conveyor/__tests__/build-dispatch-tick-speed.test.mjs
+node "${queue#we:}" run -- npx vitest run "${main#we:}" "${shared#we:}"
+node "${queue#we:}" run -- npm run check:standards
 ```
 
-Record before/after assertions for zero live dispatch effects at capacity and matching dry-run counts, then run `npm run check:standards`. Use temporary run stores and injected effects; no production dispatch is needed for this guard. These are implementation acceptance checks, not tests claimed as completed by this preparation.
+These are future implementation checks, not tests claimed as completed by preparation. The runner owns preparation checks and stamping.
 
-## Done when
+## Acceptance
 
-1. The focused test command above passes with real read-error fixtures, a capacity-full live tick that never dispatches, and the actual report assembly path covered.
-2. Successful attribution still excludes worker PRs; failed attribution uses the existing unfiltered item union in both planning paths, including partial read failures.
-3. The source/test scope remains complete and `npm run check:standards` passes.
+The named tests below are to be added to the scoped test files and run with the queued focused command above. Each must demonstrate a behavioral failure before implementation and pass afterward; a missing export is not sufficient red evidence. Compatibility assertions accompany a new status assertion so the regression fails on the old code without weakening historical expectations.
+
+- [A1] Executable: `status survives shared scan failures` in `we:skills-src/conveyor/__tests__/build-dispatch-tick-speed.test.mjs` exercises real ENOTDIR, corrupt-plus-valid records, successful empty and missing stores, and verifies both wrappers preserve failure status and valid rows from one scan. Assert scan/read call counts, legacy array defaults, and prepare-item compatibility in the same matrix.
+- [A2] Executable: `unreadable attribution holds live dispatch at WIP capacity` in `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs` feeds real scanner failure into a live tick, plus isolated in-flight/settled/both failure variants. With other gates permissive, assert zero dispatch calls, a `wip-cap` reason and exact counted numbers. Include duplicate delivery refs, worker PRs, unknown-item PRs and borrowed fixes; successful-read controls retain builder-only attribution. This tests the conservative fallback and its operator-visible hold reason.
+- [A3] Executable: `status-aware cached reads preserve queue pruning and prepare callers` in `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs` enables pruning and prepare work with partial read failure. Assert pruning receives an array containing surviving rows, prepare bookkeeping retains its prior behavior, and the build plan still uses conservative attribution. Exercise the shared snapshot wiring used by both CLI shells, not only a hand-built sentinel.
+- [A4] Executable: `dry-run assembly shares effective WIP inputs with tick` in `we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs` drives the exported assembly used by the CLI with successful and failed attribution, changing-on-second-read effects, retired claims and a capacity-held candidate. Assert identical pre-dispatch counts/numbers in tick and hypothetical plans, matching report `filling` and hold reasons, stable public report fields, and no dispatch effects. Removing attribution from only the hypothetical call or restoring a second accounting read must fail this test.
 
 ## Follow-ups
 
