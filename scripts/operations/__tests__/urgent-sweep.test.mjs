@@ -1,10 +1,11 @@
+import { createHash } from 'node:crypto';
 import { describe, it, expect, vi } from 'vitest';
 import { urgentSweep, createSweepDeps } from '../urgent-sweep.mjs';
 import { removeRegistration } from '../../daemon-overlay.mjs';
 import { resolveOperation } from '../run.mjs';
 
 const sha = 'a'.repeat(40);
-const load = { type: 'prototype-load.urgent', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
+const load = { type: 'prototype-load.urgent', trackingId: 'first-load', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
   registration: { clone: '/clone', ref: 'lane/repair-m1', sha: 'b'.repeat(40) } };
 const workflows = { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: sha, path: '.github/workflows/ci.yml' }] };
 const required = ['changes', 'test-shard', 'test'];
@@ -13,6 +14,7 @@ const check = (name, conclusion = 'success', extra = {}) => ({ id: ++checkId, he
 function fixture(rows = required.map(n => check(n))) {
   const state = [], events = [], loads = [load];
   const d = { loads: () => loads, state: () => state, now: () => '2026-11-18T12:00:00Z', required: vi.fn(() => required),
+    overlayState: vi.fn(() => ({ corrupt: false, overlays: loads.map(r => ({ ref: r.registration?.ref })) })),
     checks: vi.fn(() => ({ total_count: rows.length, check_runs: rows, workflows })), remove: vi.fn(() => ({ removed: true })),
     event: vi.fn(e => events.push(e)), settle: vi.fn(e => state.push(e)), escalate: vi.fn() };
   return { d, state, settlements: () => state.filter(r => r.status !== 'sweep-cursor'), events, loads, run: () => urgentSweep({}, d) };
@@ -26,24 +28,73 @@ describe('urgent CI sweep', () => {
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU'), status: 'open' }));
     await f.run(); expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.escalate).toHaveBeenCalledTimes(1);
   });
-  it('rechecks green on every pass until 24 hours after first green, then settles', async () => {
+  it('rechecks green on every pass beyond 24 hours until the overlay is unregistered', async () => {
     const f = fixture(); await f.run();
     expect(f.settlements()[0].status).toBe('monitoring-green');
-    f.d.now = () => '2026-11-19T11:59:59Z';
-    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(2);
+    f.d.now = () => '2026-11-25T12:00:00Z';
+    await f.run(); await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(3);
     expect(f.settlements()).toHaveLength(1);
-    f.d.now = () => '2026-11-19T12:00:00Z';
-    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-green' }] });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: 'lane/other' }] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unregistered' }] });
     await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(3);
+    expect(f.d.overlayState).toHaveBeenCalledTimes(4);
     expect(f.d.remove).not.toHaveBeenCalled();
   });
-  it('unloads a failing same-SHA rerun within the persisted green monitoring window', async () => {
+  it('unloads a failing same-SHA rerun more than 24 hours after persisted green', async () => {
     const f = fixture(); await f.run();
-    f.d.now = () => '2026-11-19T11:59:59Z';
+    f.d.now = () => '2026-11-25T12:00:00Z';
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
     expect(await urgentSweep({}, { ...f.d })).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load);
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
+  });
+  it.each(['settled-unloaded', 'settled-unregistered', 'monitoring-green'])('starts fresh for a reload with a new trackingId after %s', async status => {
+    const f = fixture(); await f.run();
+    const first = f.settlements()[0]; first.status = status;
+    f.loads[0] = { ...load, trackingId: 'reload' };
+    f.d.now = () => '2026-11-25T12:00:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.checks).toHaveBeenCalledTimes(2);
+    expect(f.settlements().at(-1)).toMatchObject({ greenAt: f.d.now(), status: 'monitoring-green' });
+    expect(f.settlements().at(-1).id).not.toBe(first.id);
+  });
+  it('rechecks historical time-complete green receipts while still registered', async () => {
+    const f = fixture(); await f.run();
+    Object.assign(f.settlements()[0], { status: 'settled-green', monitoringComplete: true,
+      greenAt: '2026-11-16T12:00:00Z', at: '2026-11-18T12:00:00Z' });
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('smoke', 'failure')] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
+  });
+  it('rechecks pre-trackingId identity receipts instead of inheriting their settlement', async () => {
+    const f = fixture([check('smoke', 'failure')]);
+    const id = createHash('sha256').update(JSON.stringify([load.ref, load.sha, load.clone, load.registration])).digest('hex');
+    f.state.push({ id, status: 'settled-green', monitoringComplete: true,
+      greenAt: '2026-11-16T12:00:00Z', at: '2026-11-18T12:00:00Z' });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
+  });
+  it.each([null, { corrupt: true, overlays: [] }, { corrupt: false, overlays: [{}] }])('keeps unreadable overlay state tracked and escalates (%j)', async overlay => {
+    const f = fixture(); f.d.overlayState.mockReturnValue(overlay);
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }], fallback: expect.stringContaining('manually') });
+    expect(f.settlements()).toEqual([]); expect(f.d.checks).not.toHaveBeenCalled();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: load.registration.ref }] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+  });
+  it('unloads any failing check before attempting an unreadable required-job parse', async () => {
+    const f = fixture([check('smoke', 'failure', { app: { id: 1 } })]);
+    f.d.required.mockImplementation(() => { throw new Error('workflow parse failed'); });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.required).not.toHaveBeenCalled(); expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
+  });
+  it('never settles green on unreadable required jobs and retries next pass', async () => {
+    const f = fixture(); f.d.required.mockImplementation(() => { throw new Error('workflow parse failed'); });
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(f.settlements()).toEqual([]); expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.required.mockReturnValue(required);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.checks).toHaveBeenCalledTimes(2);
   });
   it.each([
     ['missing suite', undefined, { check_suite: undefined }],
@@ -199,7 +250,10 @@ describe('production sweep storage and removal guards', () => {
       if (p.endsWith('prototype-load.json')) return JSON.stringify({ testWorkflowPath: '.github/workflows/custom.yml' });
       throw Object.assign(new Error('missing'), { code: 'ENOENT' });
     } };
-    const deps = createSweepDeps({ exec, ghExec, remove, env, io });
+    const readState = vi.fn(() => ({ corrupt: false, overlays: [{ ref: load.registration.ref }] }));
+    const deps = createSweepDeps({ exec, ghExec, remove, readState, env, io });
+    expect(deps.overlayState(load)).toEqual({ corrupt: false, overlays: [{ ref: load.registration.ref }] });
+    expect(readState).toHaveBeenCalledWith(load.clone, { env });
     expect(deps.checks(load)).toEqual({ total_count: 0, check_runs: [], workflows, testWorkflowPath: '.github/workflows/custom.yml' });
     expect(ghExec.mock.calls[2][1]).toEqual(['api', `repos/org/repo/actions/runs?head_sha=${sha}&per_page=100`, '--hostname', 'example.com']);
     expect(ghExec.mock.calls[1][1]).toEqual(['api', `repos/org/repo/commits/${sha}/check-runs?per_page=100&filter=all`, '--hostname', 'example.com']);
@@ -207,8 +261,11 @@ describe('production sweep storage and removal guards', () => {
     deps.remove(load);
     expect(remove).toHaveBeenCalledWith(expect.objectContaining({ root: '/clone', ref: 'lane/repair-m1', expectedTip: load.registration.sha, env }));
   });
-  it('preserves failing checks when the production workflow reader is unavailable', async () => {
-    const exec = vi.fn(() => load.repo);
+  it('retrieves failures before the production workflow and required-job readers', async () => {
+    const exec = vi.fn((cmd, args) => {
+      if (args[0] === 'show') throw new Error('workflow unavailable');
+      return load.repo;
+    });
     const ghExec = vi.fn((cmd, args) => {
       if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: 'org/repo', url: load.repo });
       if (args[1].includes('/actions/runs')) throw new Error('workflow unavailable');
@@ -218,11 +275,15 @@ describe('production sweep storage and removal guards', () => {
       if (p.endsWith('prototype-load.json')) return '{}';
       throw Object.assign(new Error('missing'), { code: 'ENOENT' });
     } };
-    const data = createSweepDeps({ exec, ghExec, io }).checks(load);
-    expect(data.workflows).toBeNull();
+    const production = createSweepDeps({ exec, ghExec, io });
+    const data = production.checks(load);
+    expect(data.workflows).toBeUndefined();
+    expect(ghExec.mock.calls.some(([, args]) => args[1]?.includes('/actions/runs'))).toBe(false);
     const f = fixture(); f.d.checks.mockReturnValue(data);
+    f.d.required = vi.fn(production.required);
     expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
-    expect(f.d.escalate).toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled(); expect(f.d.required).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'show')).toBe(false);
   });
   it('bounds ledgers before reading and uses the shared escalation packet writer', async () => {
     const io = { statSync: () => ({ size: 4 * 1024 * 1024 + 1 }), readFileSync: vi.fn(), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn() };

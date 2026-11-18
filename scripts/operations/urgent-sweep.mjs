@@ -7,14 +7,17 @@ import { dirname, join, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readOverlayState } from '../lib/daemon-overlays.mjs';
 import { removeRegistration } from '../daemon-overlay.mjs';
 import { resolveOriginRepository } from './prototype-retire.mjs';
 import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID, testCheckEvidence, testWorkflowBound } from './prototype-load.mjs';
 import { ciGatePlan, urgentLedger, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
 import { writeEscalationPacket } from './land-advance-escalations.mjs';
 
-const identity = r => createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration])).digest('hex');
-export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync, ghExec = execFileSyncThrottled, remove = removeRegistration, env = process.env } = {}) {
+const failedCheck = (c, sha) => c?.head_sha === sha && c.status === 'completed'
+  && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(c.conclusion);
+const identity = r => createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
+export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync, ghExec = execFileSyncThrottled, remove = removeRegistration, readState = readOverlayState, env = process.env } = {}) {
   const read = name => {
     const path = urgentLedger(home, name);
     try {
@@ -41,6 +44,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       const result = origin.gh(['api', `repos/${origin.repo}/commits/${r.sha}/check-runs?per_page=100&filter=all`]);
       if (result.code !== 0) throw new Error('unreadable CI checks');
       const data = JSON.parse(result.stdout);
+      if (Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha))) return data;
       // Preserve raw failures even when workflow/config evidence is unavailable.
       try {
         const tool = JSON.parse(io.readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../settings/prototype-load.json'), 'utf8'));
@@ -51,6 +55,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
         return { ...data, workflows: runs.code === 0 ? JSON.parse(runs.stdout) : null, testWorkflowPath: config.testWorkflowPath };
       } catch { return { ...data, workflows: null }; }
     },
+    overlayState: r => readState(r.clone, { env }),
     remove: r => remove({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
       reason: `urgent-sweep: CI failed for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
@@ -64,12 +69,10 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     createdAt: deps.now(), status: 'open', evidence: [detail], question: fallback, ladder: { next: 'L3 operator' } });
   try {
     const settlements = deps.state();
-    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-green', 'settled-green', 'settled-unloaded', 'sweep-cursor'].includes(r.status)))
+    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-green', 'settled-green', 'settled-unloaded', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
-    // Historical green receipts start a fresh monitoring window; they never proved reruns safe.
-    const settled = new Set(settlements.filter(r => r.status === 'settled-unloaded'
-      || (r.status === 'settled-green' && r.monitoringComplete === true
-        && Number.isFinite(Date.parse(r.greenAt)) && Date.parse(r.at) - Date.parse(r.greenAt) >= 86400000)).map(r => r.id));
+    // Historical time-based green receipts never prove an overlay is no longer registered.
+    const settled = new Set(settlements.filter(r => ['settled-unloaded', 'settled-unregistered'].includes(r.status)).map(r => r.id));
     const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
     const records = deps.loads();
     const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
@@ -89,8 +92,17 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         if (!validSha(r.sha) || !safeRegistrationRef(r.ref) || !isAbsolute(r.clone ?? '')
           || r.registration?.clone !== r.clone || !safeRegistrationRef(r.registration?.ref) || !validSha(r.registration?.sha))
           throw new Error('legacy or incomplete urgent registration; recover clone and ref manually');
-        const required = await deps.required(r), data = await deps.checks(r);
-        if (!Array.isArray(required) || !required.includes('test') || !Number.isInteger(data?.total_count)
+        const overlay = await deps.overlayState(r);
+        if (!overlay || overlay.corrupt !== false || !Array.isArray(overlay.overlays)
+          || overlay.overlays.some(e => !safeRegistrationRef(e?.ref)))
+          throw new Error('unreadable overlay state; repair store or inspect registration manually');
+        if (!overlay.overlays.some(e => e.ref === r.registration.ref)) {
+          await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-unregistered' });
+          results.push({ id, status: 'settled-unregistered' });
+          continue;
+        }
+        const data = await deps.checks(r);
+        if (!Number.isInteger(data?.total_count)
           || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
           || data.check_runs.length !== data.total_count || new Set(data.check_runs.map(c => c?.id)).size !== data.total_count
           || data.check_runs.some(c => !Number.isSafeInteger(c?.id)
@@ -98,9 +110,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
             || !['queued', 'in_progress', 'completed'].includes(c.status)
             || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
           throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
-        const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
-          && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
-        if (data.check_runs.some(c => c.status === 'completed' && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(c.conclusion))) {
+        if (data.check_runs.some(c => failedCheck(c, r.sha))) {
           const removal = await deps.remove(r);
           if (!removal || removal.refused || (removal.removed !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };
@@ -108,17 +118,22 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           await escalate(id, r.ref, `Unloaded ${r.sha}: CI failed. Inspect and repair before reloading.`);
           await deps.settle({ ...event, status: 'settled-unloaded' });
           results.push({ id, status: 'settled-unloaded' });
-        } else if (testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
-          && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
-          && checks.every(c => c.status === 'completed' && c.conclusion === 'success')
-          && data.check_runs.every(c => c.status === 'completed')) {
-          const at = deps.now(), greenAt = green.get(id) ?? at;
-          if (!Number.isFinite(Date.parse(at)) || !Number.isFinite(Date.parse(greenAt))) throw new Error('unreadable green monitoring timestamp');
-          const monitoringComplete = Date.parse(at) - Date.parse(greenAt) >= 86400000;
-          const status = monitoringComplete ? 'settled-green' : 'monitoring-green';
-          if (!green.has(id) || monitoringComplete) await deps.settle({ id, ref: r.ref, sha: r.sha, at, greenAt, status, checksComplete: true, monitoringComplete });
-          results.push({ id, status });
-        } else results.push({ id, status: 'pending' });
+        } else {
+          const required = await deps.required(r);
+          if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
+          const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
+            && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
+          if (testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
+            && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
+            && checks.every(c => c.status === 'completed' && c.conclusion === 'success')
+            && data.check_runs.every(c => c.status === 'completed')) {
+            const at = deps.now(), greenAt = green.get(id) ?? at;
+            if (!Number.isFinite(Date.parse(at)) || !Number.isFinite(Date.parse(greenAt))) throw new Error('unreadable green monitoring timestamp');
+            const status = 'monitoring-green';
+            if (!green.has(id)) await deps.settle({ id, ref: r.ref, sha: r.sha, at, greenAt, status, checksComplete: true });
+            results.push({ id, status });
+          } else results.push({ id, status: 'pending' });
+        }
       } catch (e) {
         await escalate(id, r.ref, String(e.message));
         results.push({ id, status: 'needs-you', detail: String(e.message) });

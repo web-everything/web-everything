@@ -4665,7 +4665,11 @@ the orchestrator schedules it. Its durable settlement ledger prevents repeat han
 Cursor records never settle a load; older ledgers without a cursor start at the beginning. Completed
 failures in any check-run on the SHA, regardless of job or app, remove the recorded clone/ref with a tip guard and open a NEEDS-YOU escalation through
 `land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
-require operator repair or manual unloading. Keep these paths in `urgent-sweep.test.mjs`.
+require operator repair or manual unloading. Settlement identity includes the load tracking ID, so a reload
+starts fresh. Check failures are handled before required-job/workflow parsing; unreadable green evidence
+stays tracked. Green loads are checked every pass while their clone/ref remains in the shared overlay
+store, including historical time-complete receipts. Only confirmed absence ends monitoring; corrupt
+overlay state escalates and stays tracked. Keep these paths in `urgent-sweep.test.mjs`.
 
 The CI mirror also pins each run step's directory, environment, shell, condition and error policy,
 and refuses job run defaults, environments and containers. A context change requires updating the
