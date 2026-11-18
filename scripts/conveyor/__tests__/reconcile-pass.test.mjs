@@ -674,16 +674,31 @@ describe('enrichPrsWithConflictDisposition', () => {
         compute: opts => gitMergeTreeParsed({ ...opts, exec }) })[0].conflictDisposition).toBeNull();
     });
 
-  it.each([null, undefined, '', 'invalid'])('refuses missing or unreadable planner head %j', async headRefOid => {
+  it.each([null, undefined, '', 'invalid'])('refuses missing or unreadable planner head %j without probing', async headRefOid => {
     const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
-    expect(enrichPrsWithConflictDisposition([dirty({ headRefOid })], { mainSha: base,
-      compute: () => evidence('clean') })[0].conflictDisposition).toBeNull();
+    const compute = vi.fn(() => evidence('clean'));
+    expect(enrichPrsWithConflictDisposition([dirty({ headRefOid, conflictDisposition: 'clean' })], { mainSha: base,
+      compute })[0].conflictDisposition).toBeNull();
+    expect(compute).not.toHaveBeenCalled();
   });
 
-  it.each([null, '', 'invalid'])('refuses missing or unreadable main tip %j', async mainSha => {
+  it.each([null, '', 'invalid'])('refuses missing or unreadable main tip %j without probing', async mainSha => {
     const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
-    expect(enrichPrsWithConflictDisposition([dirty()], { mainSha,
-      compute: () => evidence('clean') })[0].conflictDisposition).toBeNull();
+    const compute = vi.fn(() => evidence('clean'));
+    expect(enrichPrsWithConflictDisposition([dirty({ conflictDisposition: 'clean' })], { mainSha,
+      compute })[0].conflictDisposition).toBeNull();
+    expect(compute).not.toHaveBeenCalled();
+  });
+
+  it('reserves probe capacity for pinned rows after an unpinned head', async () => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const compute = vi.fn(() => evidence('clean'));
+    const pinned = dirty({ number: 2 });
+    const rows = enrichPrsWithConflictDisposition([dirty({ headRefOid: null }), pinned],
+      { mainSha: base, compute, max: 1 });
+    expect(rows.map(pr => pr.conflictDisposition)).toEqual([null, 'clean']);
+    expect(compute).toHaveBeenCalledTimes(1);
+    expect(compute).toHaveBeenCalledWith({ pr: pinned, includeRefEvidence: true });
   });
 
   it.each([false, undefined])('refuses unconfirmed fetch status %j', async fetchSucceeded => {

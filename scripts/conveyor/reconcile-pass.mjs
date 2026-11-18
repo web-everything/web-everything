@@ -1395,6 +1395,8 @@ export function enrichPrsWithConflictDisposition(prs, { compute = gitMergeTreePa
     const stripped = Object.hasOwn(pr, 'conflictDisposition') ? { ...pr, conflictDisposition: null } : pr;
     if (!remaining || (pr.state != null && pr.state !== 'OPEN') || pr.baseRefName !== defaultBranch
       || !(pr.mergeable === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY' || hasLabel(pr.labels, 'merge-status:conflicting'))) return stripped;
+    // Without both planner pins the result cannot qualify; do not fetch refs or spend probe capacity.
+    if (!isSha(mainSha) || !isSha(pr.headRefOid)) return { ...stripped, conflictDisposition: null };
     remaining--;
     let conflictDisposition = null;
     try {
