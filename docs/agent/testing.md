@@ -4580,3 +4580,16 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Prepare repeat refusal stop (R981)
+
+`prepare-refusals.json` under the coordination state root keeps launch refusals across daemon
+restarts. `prepare.repeatRefusalMax` (2) refusals within `repeatRefusalWindowHours` (24)
+exclude a card before prepare planning and cost admission. Reads ignore expired records;
+writes prune them, so the TTL starts at each refusal, never at the latest tick. Missing
+history is an empty first run; unreadable or malformed history stops planning with an
+operator instruction to restore the file or remove it after review.
+`prepare-refusal-stop.test.mjs` pins expiration, isolation, persistence and corrupt evidence;
+`build-dispatch-daemon.test.mjs` pins zero planned prepares and cost decisions next tick,
+restart durability, expiry re-entry and the unreadable-state stop. Run these and
+`prepare-policy-settings.test.mjs` through heavy admission.

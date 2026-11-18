@@ -32,6 +32,8 @@
  */
 
 import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/build-dispatch-policy.mjs';
+import { repeatedPrepareRefusals } from '../../scripts/conveyor/prepare-refusal-stop.mjs';
+import { readPrepareRefusals, recordPrepareRefusal } from '../../scripts/conveyor/prepare-refusal-stop-io.mjs';
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
@@ -478,6 +480,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // decided here, after planning, so tick-core keeps offering the same refused cards in its two slots. Hold each one
   // out of the plan while its refusal is fresh, so the slots rotate to clean cards; it is re-checked once it ages out.
   const tickNowMs = effects.now?.() ?? Date.now();
+  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
+  const refusalOptions = { ...preparePolicy, now: tickNowMs };
+  const skippedRepeatRefusal = repeatedPrepareRefusals(await effects.readPrepareRefusals?.(refusalOptions) ?? [], refusalOptions);
+  const repeatRefusalNums = new Set(skippedRepeatRefusal.map(r => normNum(r.num)));
   // An operator release or a stamp lifts a cached refusal at once.
   const freshRefusals = (Array.isArray(bookkeeping.prepareRefusals) ? bookkeeping.prepareRefusals : [])
     .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS
@@ -499,7 +505,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   catch { /* the build pass below reads the backoffs again and owns that failure */ }
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
   bookkeeping = { ...bookkeeping, prepareHeldNums: [...new Set([...holds.map((h) => normNum(h.num)),
-    ...refusalHeldNums, ...prepareBackoffNums,
+    ...refusalHeldNums, ...repeatRefusalNums, ...prepareBackoffNums,
     ...prepareClaims.filter(c => c.meta?.groupLead != null).map(c => normNum(c.meta.num))])] };
   const tickBookkeeping = bookkeeping;
   // 78b — settle detached launches from earlier ticks BEFORE planning: a launched one keeps its claim (the run-store
@@ -539,7 +545,6 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
   // (max age + scope drift → `prepare-stale`).
-  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   // Explicit daemon controls beat the prepare cascade, including null (off). Older direct callers
   // without provenance still override the cascade when they change the declared default.
   const effectivePrepareAheadWindow = (policy.prepareAheadWindowExplicit
@@ -1062,6 +1067,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { runner, runnerSource, batchSize: preparePolicy.batchSize ?? 6, aheadCount: effectivePrepareAheadWindow, sources: preparePolicy.sources, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
   prepare.skippedInPlanning = planningSkips;
+  prepare.skippedRepeatRefusal = skippedRepeatRefusal;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && r.launchOutcome !== 'prepared-commit' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
@@ -1369,13 +1375,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       refusal = { reason: 'prepare PR listing unavailable' };
     }
     if (!refusal) return null;
+    await effects.recordPrepareRefusal?.({ num, reason: refusal.reason }, { ...preparePolicy, now: effects.now?.() ?? Date.now() });
     refusedPrepares.add(num);
     prepare.refused.push({ num, ...refusal });
     console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);
     return refusal;
   };
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
-    && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
+    && !repeatRefusalNums.has(normNum(num)) && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
     && !sameTickClash(num, scopeByNum.get(normNum(num)));
@@ -1428,7 +1435,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const num = normNum(pick.num);
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
       if (prepareGroupPlan.absorbed.has(num) || prepareMembers.has(num)
-        || finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || refusalHeldNums.has(num)
+        || finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || refusalHeldNums.has(num) || repeatRefusalNums.has(num)
         || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
       const group = prepareGroupPlan.groups.find(g => normNum(g.lead) === num);
       let groupMembers = [];
@@ -2742,6 +2749,8 @@ export function cliEffects() {
     recordBuildFailure: (o) => recordBuildFailure(o),
     clearBuildFailure: ({ num }) => clearBuildFailure(num),
     listBuildBackoffs: () => listBuildBackoffs(),
+    readPrepareRefusals,
+    recordPrepareRefusal,
     listPrepareFailures: () => Object.values(readFailureState().failures),
     listPrepareReleases: () => readPrepareReleases(join(SCRIPTS, 'conveyor', 'prepare-failure-releases.json'), REPO_ROOT),
     recordPrepareFailure: async input => recordPrepareFailure(input, { fileCard: async card => {
