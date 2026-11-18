@@ -1062,6 +1062,13 @@ describe('merge-queue same-head failure admission', () => {
         expect(f.mainReads).toBeUndefined();
       });
     });
+    it('cancelled/regroup still holds past two failed removals even with fewer than two re-enqueues', () => {
+      const result = retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax: 2,
+        mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: [] },
+      [removed(), removed(), removed()]);
+      expect(result.hold).toBe(true);
+      expect(result.line).toMatch(/3 removals on this head/);
+    });
     it('a configured cancellation limit of one allows the first retry and holds the second', () => {
       for (const spent of [0, 1]) {
         const result = retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax: 1,

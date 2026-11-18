@@ -167,7 +167,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     return hold('invalid cancellation retry bound; operator must inspect history and enqueue manually');
   if (cancelledRegroup && reenqueuedAfterFailure >= cancelledMax)
     return hold(`failed_checks (cancelled/regroup retries already spent: ${reenqueuedAfterFailure}/${cancelledMax}); operator must inspect history and enqueue manually`);
-  if (!cancelledRegroup && failedChecksRemovals > 2)
+  if (failedChecksRemovals > 2)
     return hold(`failed_checks (${failedChecksRemovals} removals on this head); operator must inspect history and enqueue manually`);
   if (!cancelledRegroup && failedChecksRemovals > 0 && reenqueuedAfterFailure >= 2)
     return hold('failed_checks (the two infrastructure retries were already spent); operator must inspect history and enqueue manually');
