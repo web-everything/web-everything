@@ -471,7 +471,7 @@ describe('live red-team alert suppression', () => {
     });
     expect(readLive({ repo, pr, head })).toEqual({ clear: false });
   });
-  it.each(['completed result', 'check', 'stale head'])('settles %s without publishing or retrying', kind => {
+  it.each(['completed result', 'check', 'stale head'])('suppresses %s without recording publication and rechecks the same key', kind => {
     const f = fixture();
     const provider = { readPrState: vi.fn(() => ({ headRefOid: kind === 'stale head' ? 'b'.repeat(40) : head,
       labels: [] })) };
@@ -481,10 +481,13 @@ describe('live red-team alert suppression', () => {
       readPublicationHoldFact: () => ({ ok: true }) });
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
-    expect(f.markers()).toHaveLength(1);
-    delete f.io.readLiveRedTeam;
+    expect(f.markers()).toEqual([]);
+    expect(readdirSync(join(redTeamStatusDir(f.io.env), 'skip-pending'))).toEqual([]);
+    f.io.readLiveRedTeam = vi.fn(() => ({ clear: false }));
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
-    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(f.io.readLiveRedTeam).toHaveBeenCalledTimes(1);
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(f.markers()).toHaveLength(1);
   });
   it.each(['not clear', 'throws', 'missing', 'unreadable head', 'forged marker', 'old marker',
     'stale clear label', 'bare marker', 'malformed result', 'old result'])
@@ -509,9 +512,14 @@ describe('live red-team alert suppression', () => {
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     f.io.publishNeedsYou.mockClear();
     f.io.readLiveRedTeam = vi.fn(() => ({ clear }));
-    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    f.settle(policy);
     expect(f.io.readLiveRedTeam).toHaveBeenCalledTimes(1);
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(clear ? 0 : 1);
+    expect(f.markers()).toHaveLength(clear ? 0 : 1);
+    expect(readdirSync(join(redTeamStatusDir(f.io.env), 'skip-pending'))).toEqual([]);
+    f.io.readLiveRedTeam.mockReturnValue({ clear: false });
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
     expect(f.markers()).toHaveLength(1);
   });
 });

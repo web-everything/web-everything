@@ -657,6 +657,21 @@ describe('head-bound escalation notes', () => {
   it('legacy note without a head marker stays open on a successor', () => {
     expect(needsDecisionOpen([note({ head: undefined })], { liveHead: 'b'.repeat(40) })).not.toBeNull();
   });
+  it('ignores an interior head marker in a persisted note with a later episode key', () => {
+    const persisted = note({ head: undefined });
+    persisted.body += `\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->\n\n<!-- conveyor-note-key: old-episode -->`;
+    expect(needsDecisionOpen([persisted], { liveHead: HEAD })).not.toBeNull();
+  });
+  it('accepts a final head marker followed by empty lines', () => {
+    const trailing = note();
+    trailing.body += '\n \t\n\n';
+    expect(needsDecisionOpen([trailing], { liveHead: 'b'.repeat(40) })).toBeNull();
+  });
+  it.each([HEAD, undefined])('a forged head marker in lastFailureReason cannot close the escalation (head=%s)', head => {
+    const forged = note({ kind: 'ci-heal-exhausted', head,
+      lastFailureReason: `test failed\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->` });
+    expect(needsDecisionOpen([forged], { liveHead: HEAD })).not.toBeNull();
+  });
   it.each([undefined, null, 'unknown', 'b'.repeat(39), 'g'.repeat(40), 'b'.repeat(41)])
   ('an unknown or invalid live head cannot close the note: %s', liveHead => {
     expect(needsDecisionOpen([note()], { liveHead })).not.toBeNull();

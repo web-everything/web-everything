@@ -128,8 +128,8 @@ export function noteHeadline(note) {
 
 /**
  * we:scripts/conveyor/reconcile-note-comment.mjs#buildNoteComment — the durable comment body one note episode
- * posts. FIRST line is {@link NOTE_COMMENT_MARKER} (single-sourced); LAST line is the machine-read episode key,
- * as an HTML comment (invisible in GitHub's rendered view, present in the raw body every `gh --json comments`
+ * posts. FIRST line is {@link NOTE_COMMENT_MARKER} (single-sourced); the episode key and optional final head marker are
+ * HTML comments (invisible in GitHub's rendered view, present in the raw body every `gh --json comments`
  * read returns). Pure.
  * @param {object} note - a `planReconcile` note (`{kind, prNumber, text, ...}`).
  * @returns {string}
@@ -147,11 +147,12 @@ export function buildNoteComment(note, { informational = isInformationalNote(not
     text,
   ];
   if (note?.kind === 'ci-heal-exhausted' && note?.lastFailureReason) {
-    lines.push('', `Last failure: ${note.lastFailureReason}`);
+    const reason = String(note.lastFailureReason).replace(/<!--/g, '<!- -').replace(/--(!?)>/g, '- -$1>');
+    lines.push('', `Last failure: ${reason}`);
   }
+  lines.push('', `<!-- conveyor-note-key: ${key} -->`);
   if (typeof note?.head === 'string' && /^[a-f0-9]{40}$/i.test(note.head))
     lines.push('', `<!-- conveyor-note-head: ${note.head} -->`);
-  lines.push('', `<!-- conveyor-note-key: ${key} -->`);
   return lines.join('\n');
 }
 

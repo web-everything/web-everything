@@ -142,7 +142,8 @@ export function needsDecisionOpen(comments, { headCommittedAt = null, liveHead =
     if (pushed !== null && pushed > note.at) continue;
     for (const e of list) if (e.at !== null && e.at > note.at && isOperatorAuthored(e.c)) return null;
     const body = bodyOf(note.c);
-    const noteHead = /^<!-- conveyor-note-head: ([a-f0-9]{40}) -->$/im.exec(body)?.[1];
+    const lastLine = body.split('\n').filter(line => line.trim()).at(-1) ?? '';
+    const noteHead = /^<!-- conveyor-note-head: ([a-f0-9]{40}) -->$/i.exec(lastLine.trim())?.[1];
     if (noteHead && typeof liveHead === 'string' && /^[a-f0-9]{40}$/i.test(liveHead)
       && noteHead.toLowerCase() !== liveHead.toLowerCase()) continue;
     return { at: note.at, dispute: /disagree about a ruling|operator ruled .* came back/i.test(body),

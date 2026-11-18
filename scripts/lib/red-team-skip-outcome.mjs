@@ -161,7 +161,8 @@ function flushPending(io, note) {
         if (attempted >= 25) { overflow = true; continue; }
         attempted++;
         try {
-          if (!suppressLiveAlert(io, item)) io.publishNeedsYou(item);
+          if (suppressLiveAlert(io, item)) { unlinkSync(pending); continue; }
+          io.publishNeedsYou(item);
           mkdirSync(dirname(published), { recursive: true });
           writeJsonAtomic(published, item);
           unlinkSync(pending);
@@ -237,7 +238,11 @@ export function settleRedTeamSkip(input = {}) {
     const pending = join(redTeamStatusDir(io?.env ?? process.env), 'skip-pending', `${key}.json`);
     mkdirSync(dirname(pending), { recursive: true });
     writeJsonAtomic(pending, item);
-    if (!suppressLiveAlert(io, item)) io.publishNeedsYou(item);
+    if (suppressLiveAlert(io, item)) {
+      unlinkSync(pending);
+      return { outcome: 'non-policy', reason };
+    }
+    io.publishNeedsYou(item);
     mkdirSync(dirname(path), { recursive: true });
     writeJsonAtomic(path, item);
     unlinkSync(pending);

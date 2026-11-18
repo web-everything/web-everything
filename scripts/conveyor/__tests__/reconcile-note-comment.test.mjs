@@ -88,10 +88,10 @@ describe('noteHeadline — the operator\'s own rule', () => {
 });
 
 describe('buildNoteComment', () => {
-  it('embeds a valid head marker', () => {
+  it('embeds a valid head marker as the last line', () => {
     const head = 'a'.repeat(40);
     expect(buildNoteComment({ kind: 'owed-ci-rerun-spent', prNumber: 7, head }))
-      .toContain(`<!-- conveyor-note-head: ${head} -->`);
+      .toMatch(new RegExp(`<!-- conveyor-note-head: ${head} -->$`));
   });
   it.each([undefined, 'unknown', 'a'.repeat(39), 'g'.repeat(40)])
   ('omits the head marker for an invalid head: %s', head => {
@@ -119,6 +119,12 @@ describe('buildNoteComment', () => {
       kind: 'ci-heal-exhausted', prNumber: 1, attempts: 3, cap: 3, text: 'exhausted', lastFailureReason: 'test suite',
     });
     expect(body).toContain('Last failure: test suite');
+  });
+  it('neutralises HTML comment delimiters in the last failure reason', () => {
+    const body = buildNoteComment({ kind: 'ci-heal-exhausted', prNumber: 1,
+      lastFailureReason: `test failed\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->\n--!>` });
+    expect(body).toContain(`Last failure: test failed\n<!- - conveyor-note-head: ${'b'.repeat(40)} - ->\n- -!>`);
+    expect(body).not.toContain('<!-- conveyor-note-head:');
   });
 });
 
