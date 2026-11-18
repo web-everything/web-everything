@@ -162,8 +162,8 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const cancelledRegroup = retryEvidence?.infra === 'cancelled-regroup';
   const cancelledMax = retryEvidence?.mqCancelledRetryMax ?? 2;
   const cancelledRetry = cancelledRegroup && retryEvidence.mergeState === 'CLEAN'
-    && Number.isSafeInteger(cancelledMax) && cancelledMax >= 1 && cancelledMax <= 5;
-  if (cancelledRegroup && (!Number.isSafeInteger(cancelledMax) || cancelledMax < 1 || cancelledMax > 5))
+    && Number.isSafeInteger(cancelledMax) && cancelledMax >= 1 && cancelledMax <= 2;
+  if (cancelledRegroup && (!Number.isSafeInteger(cancelledMax) || cancelledMax < 1 || cancelledMax > 2))
     return hold('invalid cancellation retry bound; operator must inspect history and enqueue manually');
   if (cancelledRegroup && reenqueuedAfterFailure >= cancelledMax)
     return hold(`failed_checks (cancelled/regroup retries already spent: ${reenqueuedAfterFailure}/${cancelledMax}); operator must inspect history and enqueue manually`);
@@ -801,12 +801,17 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     if (cancelledRegroup) {
       if (rawFailed.length > MQ_INFRA_MAX_JOBS)
         return { logReason: `failed-job count exceeds ${MQ_INFRA_MAX_JOBS}-job limit; operator must inspect failed jobs and enqueue manually` };
-      const failures = rawFailed.filter(check => check.conclusion === 'failure');
+      // Apply the failure validator to cancellations too, without changing ordinary retry evidence.
+      // This binds each cancelled/startup_failure original and its reruns to the head and Actions run.
+      const regroupAttempts = inspectMqReruns({
+        checks: rawChecks.map(check => cancelled(check) ? { ...check, conclusion: 'failure' } : check),
+        repo, commit: oid, removedAt,
+      });
       // An absent reason is not proof: unreadable attempts also have no reason.
-      // Every failure must have a validated original candidate, or all reruns must be confirmed green.
-      if (attempts.reason || failures.length > 0 && attempts.confirmed !== true
-        && attempts.candidates.length !== failures.length)
-        return { logReason: attempts.reason || 'job attempt evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually' };
+      // Every non-passing check must have a validated original candidate, or confirmed green reruns.
+      if (regroupAttempts.reason || regroupAttempts.confirmed !== true
+        && regroupAttempts.candidates.length !== rawFailed.length)
+        return { logReason: regroupAttempts.reason || 'job attempt evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually' };
     }
     // Other evidence kinds retain their historical removal and re-enqueue limits.
     if (!cancelledRegroup && (removals.length > 2 || timeline.nodes.filter(event => event?.__typename === 'AddedToMergeQueueEvent'
@@ -1221,7 +1226,7 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
     env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqInfraSignatures: MQ_INFRA_SIGNATURES, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
-    valid: { mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 5, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    valid: { mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
     envValues: { mqAggregateJobs, mqInfraSignatures, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
