@@ -281,6 +281,16 @@ describe('planReconcile incomplete agent inventory', () => {
     expect(planReconcile({ ...facts, agents: [] }).dispatch.map(row => row.kind)).toEqual(before.dispatch.map(row => row.kind));
   });
 
+  it('an explicit `agents: undefined` holds, while an omitted agents key keeps its historical empty-inventory meaning', () => {
+    const facts = input();
+    const before = planReconcile(facts);
+    const held = planReconcile({ ...facts, agents: undefined });
+    expect(held.dispatch).toEqual([]);
+    expect(held.refusals.filter(row => row.kind === 'agents-incomplete')).toHaveLength(facts.prs.length);
+    const { agents: _omitted, ...without } = facts;
+    expect(planReconcile(without)).toEqual(before);
+  });
+
   it.each([null, {}, 'unreadable', 1])('non-array agents fail closed even with an explicit false flag: %j', agents => {
     const facts = input();
     const before = planReconcile(facts);

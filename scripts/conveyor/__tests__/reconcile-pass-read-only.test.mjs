@@ -106,7 +106,8 @@ describe('read-only live reconciliation', () => {
     expect(probe.writes).toEqual([]);
     const passed = planReconcile.mock.calls[0][0];
     expect(result.enrichedPrs).toBe(passed.prs); expect(result.agentList).toBe(passed.agents);
-    const { prs, agents, repo, now, durableCounts, ...rest } = passed;
+    const { prs, agents, agentsIncomplete: passedIncomplete, repo, now, durableCounts, ...rest } = passed;
+    expect(result.agentsIncomplete).toBe(passedIncomplete);
     expect(result.plannerOptions).toEqual(rest);
     expect(result.plannerOptions.shadowDeps.mode).toBe('off');
     expect(result.agentsIncomplete).toBe(false);

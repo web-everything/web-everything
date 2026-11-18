@@ -2091,7 +2091,7 @@ const liveWhy = (pr, opts) => ` (live: ${liveCheckNames(pr, opts).slice(0, 5).jo
  * @param {Array<object>} [o.agents] - `claude agents --json` entries, each optionally carrying the two facts the
  *   listing cannot supply and the IO shell resolves: `laneHeadOid` (the `HEAD` of the lane at `cwd`) and
  *   `pidAlive` (`process.kill(pid, 0)` → `true`/`false`; absent = not probed = UNKNOWN).
- * @param {boolean} [o.agentsIncomplete=false] - incomplete inventory holds every dispatch; non-array agents, or an array carrying the `incomplete` marker, also hold.
+ * @param {boolean} [o.agentsIncomplete=false] - incomplete inventory holds every dispatch; non-array agents, an EXPLICIT `agents: undefined` (an omitted key still means none), or an array carrying the `incomplete` marker, also hold.
  * @param {object} [o.durableCounts] - `{ [prNumber]: n }`, the PR-derived attempt count the shell reads back
  *   with `countRearmComments`. There is NO in-process tally parameter and none is consulted: a cap that a
  *   restart can reset is not a cap.
@@ -4105,7 +4105,8 @@ export function planReconcile({
     } else timedDispatch.push(entry);
   }
   // COMMON refusal path: every dispatch kind crosses this fence, including multiple actions on one PR.
-  if (agentsIncomplete === true || !Array.isArray(agents) || Object.hasOwn(agents, 'incomplete')) {
+  const explicitUndefinedAgents = Object.hasOwn(arguments[0] ?? {}, 'agents') && arguments[0].agents === undefined;
+  if (agentsIncomplete === true || explicitUndefinedAgents || !Array.isArray(agents) || Object.hasOwn(agents, 'incomplete')) {
     const held = new Set();
     for (const entry of timedDispatch) {
       if (held.has(entry.prNumber)) continue;
