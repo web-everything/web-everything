@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
+import { createHash } from 'node:crypto';
+import { invariantsSection } from '../prototype-load.mjs';
+import { createPrLandRunner } from '../open-pr-io.mjs';
+import { admitCanonicalAudit } from '../../pr-land.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +18,7 @@ const ref = 'lane/audit-gate';
 const green = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
 const weak = { ...green, verdict: 'WEAKENED', findings: ['missing guard'] };
 const waiver = { ref, sha, ruling: 'R123', findings: weak.findings };
-function fixture({ records = [green], auditText, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore } = {}) {
+function fixture({ records = [green], auditText, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore, refName = ref, extra = {} } = {}) {
   const reads = [], calls = [];
   const env = { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: '/fixture-prefs' };
   const enoent = () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; };
@@ -28,8 +32,8 @@ function fixture({ records = [green], auditText, tool = {}, writerSettings, targ
     if (path === auditAt) return auditText ?? records.map(r => JSON.stringify(r)).join('\n');
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   };
-  const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
-    exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved) : resolved; } });
+  const result = checkCanonicalAuditForOpen({ repo: '/repo', ref: refName, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
+    exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved) : resolved; }, ...extra });
   return { result, reads, calls };
 }
 describe('canonical audit before opening a PR', () => {
@@ -207,5 +211,70 @@ describe('canonical audit before opening a PR', () => {
   it('a short unresolved source fails closed before any evidence read', () => {
     const { result, reads } = fixture({ resolved: 'aaaaaaa' });
     expect(result.ok).toBe(false); expect(reads).toEqual([]);
+  });
+
+  // Scoped (scope=invariants) passes bind to the INVARIANTS block of the backlog card the PR branch names, resolved
+  // through the same helper the prototype loader uses. Real records and real card text; admission is not mocked.
+  describe('scoped passes at PR admission', () => {
+    const itemRef = 'lane/4242-scoped-item';
+    const card = '# Item\n\n## Invariants\n\n- Keep the guard.\n\n## Notes\n\nx\n';
+    const invariantsHash = createHash('sha256').update(invariantsSection(card)).digest('hex');
+    const scopedPass = { ...green, scope: 'invariants', invariantsHash, followUps: [] };
+    // readOverride must serve the audit file and settings as well as the card.
+    const run = (records, over = {}) => {
+      const extra = { invariantsRoot: '/repo', readDir: () => ['4242-scoped-item.md'], ...over.extra };
+      return fixture({ records, refName: over.refName ?? itemRef, extra, readOverride: (path) => {
+        if (path === '/repo/backlog/4242-scoped-item.md') return over.card ?? card;
+        if (path === WRITER_SETTINGS) return JSON.stringify({ auditRecordPath: '~/audit.jsonl' });
+        if (path === '/fixture-prefs') return JSON.stringify({ prototypeLoad: {} });
+        if (path === '/fixture-home/audit.jsonl') return records.map(r => JSON.stringify(r)).join('\n');
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      } }).result;
+    };
+    it('a scoped NOT WEAKENED pass with the matching invariants hash is the only record: admitted', () => {
+      expect(run([scopedPass])).toMatchObject({ ok: true, sha, record: scopedPass });
+    });
+    it.each([
+      ['wrong hash', { ...scopedPass, invariantsHash: 'f'.repeat(64) }],
+      ['missing hash', { ...scopedPass, invariantsHash: undefined }],
+    ])('a scoped pass with a %s is not evidence: canonical-audit-missing', (_name, record) => {
+      expect(run([record])).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+    });
+    it('an open NOT WEAKENED for the same head and base still admits when the scoped pass is unbound', () => {
+      const unbound = { ...scopedPass, invariantsHash: 'f'.repeat(64), at: '2026-11-17T01:00:00Z' };
+      expect(run([green, unbound])).toMatchObject({ ok: true, sha, record: green });
+    });
+    it.each([
+      ['a card with no INVARIANTS block', { card: '# Item\n\nno section\n' }],
+      ['no card for the item', { extra: { readDir: () => [] } }],
+      ['several cards for the item', { extra: { readDir: () => ['4242-a.md', '4242-b.md'] } }],
+      ['an unreadable backlog directory (never a throw)', { extra: { readDir: () => { throw new Error('EACCES'); } } }],
+      ['a repo that is not the WE checkout', { extra: { invariantsRoot: '/elsewhere' } }],
+    ])('no trusted invariants (%s) fails closed: the scoped pass is not evidence', (_name, over) => {
+      expect(run([scopedPass], over)).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+    });
+    it('a branch that names no item binds to nothing', () => {
+      expect(run([scopedPass], { refName: 'lane/r968-no-item' })).toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
+    });
+    it('a scoped pass never hides an open WEAKENED at admission', () => {
+      const w = { ...weak, at: '2026-11-17T00:00:00Z' };
+      expect(run([w, { ...scopedPass, at: '2026-11-17T02:00:00Z' }])).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    });
+  });
+
+  describe('both PR-open producers hand the branch ref to the gate', () => {
+    it('open-pr-io createPrLandRunner passes --ref to the canonical audit check', () => {
+      const seen = [];
+      const run = createPrLandRunner({ canonicalAudit: (req) => { seen.push(req); return { ok: false, reason: 'canonical-audit-missing', message: 'stop' }; },
+        prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), dupBornAs: () => [], env: {},
+        spawn: () => ({ status: 0, stdout: '{}' }), git: null });
+      run({ argv: ['--ref=lane/4242-scoped-item', `--sha=${sha}`, '--title=x', '--body=y'] });
+      expect(seen[0]).toMatchObject({ ref: 'lane/4242-scoped-item', sha });
+    });
+    it('pr-land admitCanonicalAudit forwards the whole request, ref included', () => {
+      const seen = [];
+      admitCanonicalAudit({ repo: 'r', ref: 'lane/4242-scoped-item', sha }, { check: (req) => { seen.push(req); return { ok: true }; }, refuse: () => { throw new Error('refused'); } });
+      expect(seen[0]).toMatchObject({ ref: 'lane/4242-scoped-item' });
+    });
   });
 });

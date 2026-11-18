@@ -3,7 +3,10 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { canonicalAuditEvidence, validSha } from './prototype-load.mjs';
-import { loadRuledWeakened } from './prototype-load-io.mjs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { readdirSync } from 'node:fs';
+import { loadRuledWeakened, readBranchInvariants } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
@@ -27,6 +30,9 @@ function wellFormedAudit(record) {
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, ancestor: ancestorOpt,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
+  // Scoped (scope=invariants) passes bind to the INVARIANTS block of the card the PR branch names. Only a WE checkout
+  // (the one these scripts live in) owns that backlog; a sibling-repo PR has no binding. Injectable for hermetic tests.
+  readDir = readdirSync, invariantsRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
     env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
@@ -85,16 +91,25 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return fp;
     } catch (e) { throw Object.assign(new Error(`live diff fingerprint unavailable (${String(e?.message || e).slice(0, 120)})`), { fingerprintLookup: true }); }
   });
+  // No binding available (other repo, no item, no unique card, no block, any read error) leaves invariantsText unset:
+  // fail closed, a scoped pass is then not evidence. Never throws.
+  let invariantsText = null;
+  try {
+    if (typeof ref === 'string' && resolve(repo) === resolve(invariantsRoot)) {
+      invariantsText = readBranchInvariants({ repo: invariantsRoot, branch: ref, fs: { readdirSync: readDir, readFileSync: readFile } });
+    }
+  } catch { invariantsText = null; }
+  const scopedBinding = invariantsText ? { invariantsText } : {};
   let evidence;
   try {
     const fp = liveFingerprint(records);
-    evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
+    evidence = canonicalAuditEvidence(records, fullSha, covers, fp, { ...scopedBinding });
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
         if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
-        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
+        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ...scopedBinding, ruledWeakened: {
           ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
         } });
         if (waived.ok) { evidence = waived; break; }

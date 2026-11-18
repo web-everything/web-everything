@@ -222,6 +222,22 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 /** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
+/**
+ * INVARIANTS section of the single backlog card for the item a `lane/<item>-<slug>` branch names, read from `repo`'s
+ * `backlog/`. The one implementation shared by the loader and the PR-open admission gate. Any failure or ambiguity
+ * (no item, no readable backlog, zero or several cards, no section) returns null, so a scoped pass is never evidence.
+ * Callers decide whether `repo` is a trusted WE checkout; a non-WE repo must not call this.
+ */
+export function readBranchInvariants({ repo: root, branch, fs: io = nodeFs }) {
+  try {
+    const item = itemNumberFromBranch(branch);
+    if (!item || typeof io?.readdirSync !== 'function' || typeof io?.readFileSync !== 'function') return null;
+    const dir = join(root, 'backlog');
+    const cards = io.readdirSync(dir).filter((name) => typeof name === 'string' && name.startsWith(`${item}-`) && name.endsWith('.md'));
+    return cards.length === 1 ? invariantsSection(String(io.readFileSync(join(dir, cards[0]), 'utf8'))) : null;
+  } catch { return null; }
+}
+
 export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn }) {
   const merged = mergeRuledWeakened(platform, tool, warn);
   const store = readStore({ path: storePath(env), fs, warn });
@@ -325,15 +341,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     };
     // INVARIANTS section of the single backlog card for the item a `lane/<item>-<slug>` branch names, from this trusted
     // checkout. Any failure or ambiguity (non-WE repo, no item, zero or several cards, no section) returns null.
-    const branchInvariants = (branch) => {
-      try {
-        const item = itemNumberFromBranch(branch);
-        if (!item || gitRepo !== repo || typeof fs.readdirSync !== 'function') return null;
-        const dir = join(repo, 'backlog');
-        const cards = fs.readdirSync(dir).filter((name) => typeof name === 'string' && name.startsWith(`${item}-`) && name.endsWith('.md'));
-        return cards.length === 1 ? invariantsSection(read(join(dir, cards[0]))) : null;
-      } catch { return null; }
-    };
+    const branchInvariants = (branch) => (gitRepo !== repo ? null : readBranchInvariants({ repo, branch, fs: { readdirSync: fs.readdirSync, readFileSync: (p) => read(p) } }));
     const liveFingerprint = (evidence) => {
       if (liveFpMemo !== undefined) return liveFpMemo;
       // The record must name another head (audit) or sha (ready record): a headless record can never carry (main #6353).
