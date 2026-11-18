@@ -37,8 +37,6 @@ it.each(['different workflow', 'display only', 'unknown third producer', 'pendin
     expect(ciFailed(rollup, ['test'])).toBe(true);
     expect(ciRollup(rollup)).toBe('fail');
     expect(rollupToCheckRows(rollup)).toContainEqual({ name: 'test', bucket: 'fail' });
-    const gateRows = rollup.map(row => ({ ...row, name: 'merge-gate' }));
-    expect(latestFailingMergeGate(gateRows)?.conclusion).toBe('FAILURE');
   }
 });
 it('required verdict consumers release on a completed success in the same stable workflow', () => {
@@ -53,7 +51,7 @@ it('required verdict consumers release on a completed success in the same stable
   }
 });
 
-it('excusing one merge-gate hold retains another workflow failure', () => {
+it('a newer merge-gate failure cannot use an older workflow hold verdict', () => {
   const hold = { ...failed, name: 'merge-gate', id: 10, mergeGateReviewHold: true };
   const failure = { ...hold, workflow_id: 2, id: 20, mergeGateReviewHold: undefined };
   for (const rows of [[hold, failure], [failure, hold]]) {
@@ -61,10 +59,10 @@ it('excusing one merge-gate hold retains another workflow failure', () => {
   }
   const result = excuseMergeGateRows([hold, failure], {
     setting: 'on', prNumber: 1, headSha, labels: [],
-    readVerdict: () => ({ num: 1, head_sha: headSha, ok: false,
-      results: [{ id: 'candidate-label', status: 'hold', reason: 'labels: ready-to-merge required' }] }),
+    readVerdict: ({ jobId }) => jobId === 10 ? ({ num: 1, head_sha: headSha, ok: false,
+      results: [{ id: 'candidate-label', status: 'hold', reason: 'labels: ready-to-merge required' }] }) : null,
   });
-  expect(result.excused).toBe(true);
+  expect(result.excused).toBe(false);
   expect(result.rows).toContain(failure);
   expect(isRequiredCheckGreen({ statusCheckRollup: result.rows }, 'merge-gate')).toBe(false);
 });
@@ -75,4 +73,11 @@ it.each(['NEUTRAL', 'SKIPPED'])('strict required consumers cannot hide %s behind
     expect(everyOtherRequiredGreen(['test'], checks)).toBe(false);
     expect(reviewStartGate({ headSha, checks, requiredChecks: ['test'], policy: { startEarly: 'on' } }).allowed).toBe(false);
   }
+});
+
+
+it('merge-gate recovery requires a current completed failure, never an older failed run', () => {
+  const older = { ...failed, name: 'merge-gate', completedAt: '2026-10-28T01:30:00Z' };
+  const running = { ...success, name: 'merge-gate', status: 'IN_PROGRESS', conclusion: null, completedAt: null };
+  for (const rows of [[older, running], [running, older]]) expect(latestFailingMergeGate(rows)).toBeNull();
 });

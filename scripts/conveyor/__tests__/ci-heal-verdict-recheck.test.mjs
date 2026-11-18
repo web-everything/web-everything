@@ -859,3 +859,14 @@ it.each([null, 'SKIPPED', 'NEUTRAL', 'CANCELLED'])('CodeQL rerun (%s) cannot tur
     expect(verdictRecheck.gateOnlyRedStates({ ...args, rollup: [...args.rollup, success] }).gateOnlyRed).toBe(true);
   }
 });
+
+
+it('validates conflicting required flags before a successful rerun can hide them', () => {
+  const older = { name: 'test', workflow_id: 1, status: 'COMPLETED', conclusion: 'FAILURE',
+    required: true, startedAt: '2026-10-28T01:00:00Z' };
+  const newer = { ...older, conclusion: 'SUCCESS', required: false, startedAt: '2026-10-28T02:00:00Z' };
+  for (const rollup of [[older, newer], [newer, older]]) {
+    expect(() => requiredCheckStates({ rollup, requiredChecks: ['test'] }))
+      .toThrow('Check rows have conflicting required flags');
+  }
+});

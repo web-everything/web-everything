@@ -4457,11 +4457,13 @@ green policy. Pending, skipped, neutral, cancelled and stale attempts cannot cle
 it; select the worst of the uncleared evidence and latest attempts.
 `resolveCheckNames` selects the worst remaining workflow for consumers requiring
 a single row per name; never build a last-wins
-Map from `resolveCheckRows`. `rollup-collapse.mjs` remains a display helper, not a
-required-check verdict reader. Probe the resolver, CodeQL drain and ci-heal gates
+Map from `resolveCheckRows`. `rollup-collapse.mjs` also retains the prior current-attempt policy for completion
+and recovery readers: fix push completion, shadow head evidence, renamed-PR refresh,
+verify infrastructure retry, exhausted-retry completion, and merge-gate hold lookup.
+An older terminal failure must not hide a running rerun and grant those actions. Probe the resolver, CodeQL drain and ci-heal gates
 in both input orders through heavy admission.
 
-Required-verdict caller inventory (display collapse removed):
+Check-reader inventory (current-attempt exceptions listed above):
 
 - Drain and enqueue: `scripts/merge-ai-prs.mjs`,
   `scripts/lib/merge-queue-enqueue.mjs`.
@@ -4480,3 +4482,12 @@ Remaining direct display-collapse consumers do not decide required-check admissi
 `operations/fix-run.mjs` collects repair context; `conveyor/stale-base-refresh.mjs`
 collects workflow-specific remediation facts. The helper itself and its display
 compatibility exports remain unchanged.
+
+
+Resolver admission ranking treats CANCELLED, TIMED_OUT, ACTION_REQUIRED and
+STARTUP_FAILURE as red. The shared check-state predicate retains its separate
+cancelled-as-pending policy for ci-heal. Validate raw normalized check identities
+and required flags with `latestAttempts` before resolving ci-heal evidence;
+resolution must never hide conflicting required flags, even with an explicit roster.
+The audit probes in review-timing, check-row-resolver and ci-heal-verdict-recheck
+pin these contracts in both input orders, including the fixed-deadline fallback.

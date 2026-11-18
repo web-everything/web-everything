@@ -1,4 +1,3 @@
-import { resolveCheckRows } from './check-row-resolver.mjs';
 /** Refresh drain-numbered cards when main gains their CI rule, and root scratch-only conflicts.
  * Log verdicts and successful refreshes are durable, head-scoped facts; read failures never become facts.
  */
@@ -12,6 +11,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, trustedDrainAuthors, trustedDrainSubject } from './queue-branch-numbering.mjs';
 import { parseMergeTree } from './rebase-drop-manifest.mjs';
+import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { fetchFresh } from './git-fetch-fresh.mjs';
 // The watcher imports reconcile-pass, which imports this module. Load it only when refreshing.
 async function refreshOntoMain(...args) {
@@ -30,7 +30,7 @@ const stateFile = () => join(resolveCoordinationRoot(), 'renamed-pr-refresh.json
 const headKey = pr => `${pr.number}@${pr.headRefOid}`;
 const eligible = pr => !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? '') && !!pr.headRefOid;
 // Latest run per name only: a superseded red `test` row must never prove a hold over a newer run's failure.
-const redTest = pr => resolveCheckRows(pr.statusCheckRollup ?? []).find(c => c.name === 'test' && String(c.conclusion).toLowerCase() === 'failure');
+const redTest = pr => collapseRollupToLatestPerName(pr.statusCheckRollup ?? []).find(c => c.name === 'test' && String(c.conclusion).toLowerCase() === 'failure');
 
 export function resolveRefreshSettings({ env = process.env, read = readSettings } = {}) {
   const result = { invalid: [] };

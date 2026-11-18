@@ -24,7 +24,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
+import { classifyCheck, summarize, latestAttempts } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 import { resolveCheckRows } from '../lib/check-row-resolver.mjs';
 
@@ -105,7 +105,10 @@ export function latestRollupAttempts(rollup) {
 function checkEvidence(rollup, requiredChecks) {
   // Resolve workflow identities before summarizing names. A skipped/neutral
   // latest attempt cannot replace earlier red/pending evidence with proof of a rerun.
-  const checks = resolveCheckRows((Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck),
+  const rawChecks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
+  // Validate every row before resolution can discard conflicting required flags.
+  latestAttempts(rawChecks);
+  const checks = resolveCheckRows(rawChecks,
     row => row.name === 'merge-gate' && row.mergeGateReviewHold
       ? 'green' : classifyCheck({ ...row, required: true }));
   // Only the shared merge-gate hold classifier's annotation proves a review hold.

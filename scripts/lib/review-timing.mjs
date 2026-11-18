@@ -1,4 +1,5 @@
 import { resolveCheckNames } from './check-row-resolver.mjs';
+import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
@@ -106,7 +107,7 @@ export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen,
     };
     // Judge every RAW row (before rollup collapse or head filtering) so a malformed or contradictory row cannot vanish.
     if (!checks.every(row => readable(row) && !(row.state != null && (row.conclusion != null || row.status != null)))) return result('incomplete-checks');
-    const rows = resolveCheckNames(checks).filter(row => !row.head_sha || row.head_sha === headSha);
+    const rows = collapseRollupToLatestPerName(checks).filter(row => !row.head_sha || row.head_sha === headSha);
     if (!requiredChecks.every(name => rows.some(row => (row.name ?? row.context) === name && readable(row)))) return result('incomplete-checks');
     if (rows.some(row => !readable(row))) return result('incomplete-checks');
     if (ciRedOnHead({ headSha, checks, requiredChecks })) return result('ci-red');
@@ -272,7 +273,8 @@ export function fixPushGate({ previousHeadChecks, requiredChecks, firstHeldAt, n
   const maxMin = Number.isSafeInteger(policy.pushAfterCiMaxMin) && policy.pushAfterCiMaxMin >= 0
     ? policy.pushAfterCiMaxMin : FIX_TIMING_DEFAULTS.pushAfterCiMaxMin;
   const deadline = firstHeldAt + maxMin * 60_000;
-  const latest = resolveCheckNames(previousHeadChecks);
+  // Completion must observe the current attempt, including a running rerun.
+  const latest = collapseRollupToLatestPerName(previousHeadChecks);
   const rows = latest.filter(row => !isReviewHoldGate(row));
   const required = Array.isArray(requiredChecks) && requiredChecks.length
     ? requiredChecks.filter(name => name !== 'review-gate' && !latest

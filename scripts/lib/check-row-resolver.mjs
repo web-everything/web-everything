@@ -26,7 +26,10 @@ function attemptTime(row) {
   return Number.isFinite(time) && time > 0 ? time : null;
 }
 
-const stateOf = row => classifyCheck({ ...row, required: true,
+// Admission readers must retain terminal failures above unfinished attempts.
+const terminalRed = new Set(['CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
+const stateOf = row => terminalRed.has(String(row?.conclusion ?? row?.state ?? '').toUpperCase())
+  ? 'red' : classifyCheck({ ...row, required: true,
   ...(row?.status == null && row?.state != null
     ? { status: /^(pending|expected)$/i.test(row.state) ? 'pending' : 'completed', conclusion: row.state } : {}),
 });

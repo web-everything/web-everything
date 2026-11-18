@@ -1,7 +1,7 @@
 import { resolveCheckRows } from '../lib/check-row-resolver.mjs';
 /** One durable retry after exhaustion — live PR #5195, 2026-10-14.
  * Review-HOLD and premature-spent correction: live PR #5169, 2026-10-14. */
-import { isRequiredCheckFailed } from '../merge-ai-prs.mjs';
+import { collapseRollupToLatestPerName, isRequiredCheckFailed } from '../merge-ai-prs.mjs';
 import { isAutomationAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readFileSync } from 'node:fs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
@@ -52,18 +52,16 @@ export function realRequiredFailures(pr, requiredChecks) {
 
 function requiredCompleted(pr, requiredChecks, after = null) {
   if (!pr?.headRefOid || !requiredChecks?.length) return false;
-  const rows = resolveCheckRows(pr.statusCheckRollup);
+  const rows = collapseRollupToLatestPerName(pr.statusCheckRollup);
   return requiredChecks.every(name => {
-    const matches = rows.filter(r => (r.name || r.context) === name);
-    return matches.length > 0 && matches.every(row => {
-      if (!row || (row.headSha && row.headSha !== pr.headRefOid)) return false;
-      const statusContext = !row.status && typeof row.context === 'string';
-      const completed = statusContext
-        ? ['success', 'failure', 'error'].includes(String(row.state).toLowerCase())
-        : String(row.status ?? '').toLowerCase() === 'completed';
-      // StatusContext publishes a new row per state change; it has createdAt, never completedAt.
-      return completed && (after === null || Date.parse(statusContext ? row.createdAt : row.completedAt) > after);
-    });
+    const row = rows.find(r => (r.name || r.context) === name);
+    if (!row || (row.headSha && row.headSha !== pr.headRefOid)) return false;
+    const statusContext = !row.status && typeof row.context === 'string';
+    const completed = statusContext
+      ? ['success', 'failure', 'error'].includes(String(row.state).toLowerCase())
+      : String(row.status ?? '').toLowerCase() === 'completed';
+    // StatusContext publishes a new row per state change; it has createdAt, never completedAt.
+    return completed && (after === null || Date.parse(statusContext ? row.createdAt : row.completedAt) > after);
   });
 }
 

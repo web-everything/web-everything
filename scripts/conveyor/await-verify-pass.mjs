@@ -1,4 +1,3 @@
-import { resolveCheckNames } from '../lib/check-row-resolver.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * The fix daemon's verify-verdict pass — we:backlog/5137-harness-owns-the-verify-wait-not-the-model.md slices 2+3.
@@ -57,6 +56,7 @@ import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { readReviewHead, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { headCiVerdict } from './fix-push-ci.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -520,7 +520,7 @@ async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VER
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
     const required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }));
     if (required?.source !== 'live' || !(required.checks ?? []).includes('test')) return null;
-    const rows = resolveCheckNames(await io.readPreviousChecks({ repo: record.repo, headSha: record.sha }));
+    const rows = collapseRollupToLatestPerName(await io.readPreviousChecks({ repo: record.repo, headSha: record.sha }));
     const isFailure = r => (r?.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'FAILURE' : String(r?.state).toUpperCase() === 'FAILURE');
     const test = rows.find(r => (r?.name || r?.context) === 'test');
     if (!test || !isFailure(test)) return null;

@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
 import { GATE_IDS } from './merge-gate-inventory.mjs';
-import { resolveCheckNames } from './check-row-resolver.mjs';
+import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -155,9 +155,9 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
   return { excused, kind, holds, others, why: candidate ? 'current candidate must pass merge-gate' : excused ? 'only candidacy or cleared shared-freeze holds' : 'real or absent blocking evidence' };
 }
 
-/** Worst unresolved completed failure; only a proven successful rerun clears it. */
+/** Latest failing completed run only; success/pending supersedes all older failures. */
 export function latestFailingMergeGate(rows) {
-  const row = resolveCheckNames(rows).find(r => r.name === 'merge-gate');
+  const row = collapseRollupToLatestPerName(rows).find(r => r.name === 'merge-gate');
   return row && String(row.status).toLowerCase() === 'completed'
     && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase()) ? row : null;
 }

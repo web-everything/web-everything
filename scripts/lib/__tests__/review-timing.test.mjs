@@ -518,3 +518,25 @@ describe('R359 early start shadow (xtxt36v / xrz0ezn)', () => {
     expect(input).toEqual(before);
   });
 });
+
+
+it('a newer running rerun keeps the fix push completion guard until its deadline', () => {
+  const older = { name: 'test', workflow_id: 1, status: 'COMPLETED', conclusion: 'FAILURE',
+    startedAt: '2026-10-28T01:00:00Z', completedAt: '2026-10-28T01:30:00Z' };
+  const newer = { ...older, status: 'IN_PROGRESS', conclusion: null,
+    startedAt: '2026-10-28T02:00:00Z', completedAt: null };
+  for (const previousHeadChecks of [[older, newer], [newer, older]]) {
+    const args = { previousHeadChecks, requiredChecks: ['test'], firstHeldAt: 1000, now: 1000,
+      policy: { pushAfterCi: true, pushAfterCiMaxMin: 1 } };
+    expect(fixPushGate(args)).toEqual({ action: 'wait', reason: 'ci-pending', deadline: 61000 });
+    expect(fixPushGate({ ...args, now: 61000 })).toEqual({ action: 'push', reason: 'bound', deadline: 61000 });
+  }
+});
+it('required cancelled CI remains red beside an older queued attempt', () => {
+  const older = { name: 'test', workflow_id: 1, status: 'QUEUED', conclusion: null,
+    startedAt: '2026-10-28T01:00:00Z' };
+  const newer = { ...older, status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: '2026-10-28T02:00:00Z' };
+  for (const checks of [[older, newer], [newer, older]]) {
+    expect(ciRedOnHead({ headSha: 'head', checks, requiredChecks: ['test'] })).toBe(true);
+  }
+});

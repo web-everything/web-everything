@@ -634,6 +634,15 @@ describe('retried CI verdicts', () => {
     expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'pending' });
     expect(retryOutcome({ comments: [], pr, requiredChecks: required })).toBeNull();
   });
+  it('a running retried attempt keeps completion pending beside an older failure', () => {
+    const pr = green();
+    const older = { ...pr.statusCheckRollup[0], conclusion: 'FAILURE' };
+    Object.assign(pr.statusCheckRollup[0], { status: 'IN_PROGRESS', conclusion: null, completedAt: null });
+    for (const statusCheckRollup of [[older, ...pr.statusCheckRollup], [...pr.statusCheckRollup, older]]) {
+      expect(retryOutcome({ comments: [retry], pr: { ...pr, statusCheckRollup }, requiredChecks: required }))
+        .toEqual({ state: 'pending' });
+    }
+  });
   it('posts spent once only for completed real failures, with the lapse trailer last', () => {
     const pr = green();
     pr.statusCheckRollup.find(row => row.name === 'daemon-soak').conclusion = 'FAILURE';
@@ -667,7 +676,11 @@ describe('retried CI verdicts', () => {
   it('uses latest rows and treats excused merge-gate as a hold even if still red', () => {
     const pr = green();
     pr.statusCheckRollup.find(row => row.name === 'merge-gate').mergeGateHoldExcused = { kind: 'candidacy' };
-    pr.statusCheckRollup.unshift({ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at });
+    // Prove the successful rerun belongs to the same workflow as the older failure.
+    Object.assign(pr.statusCheckRollup.find(row => row.name === 'test'),
+      { workflow_id: 1, startedAt: '2026-10-14T02:30:00Z' });
+    pr.statusCheckRollup.unshift({ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at,
+      workflow_id: 1, startedAt: '2026-10-14T01:00:00Z' });
     expect(realRequiredFailures(pr, required)).toEqual([]);
     expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'recovered' });
     pr.statusCheckRollup.find(row => row.name === 'daemon-soak').conclusion = 'FAILURE';

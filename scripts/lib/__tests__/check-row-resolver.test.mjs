@@ -20,12 +20,11 @@ describe('fail-closed workflow/check attempt resolver', () => {
       conclusion: state === 'PENDING' ? null : state });
     const older = attempt(failed, before);
     const newer = attempt(passed, after);
-    const expected = after === 'SUCCESS' || after === 'FAILURE' ? newer : older;
+    const expected = ['SUCCESS', 'FAILURE', 'CANCELLED'].includes(after) ? newer : older;
     for (const rows of [[older, newer], [newer, older]]) {
       const resolved = resolveCheckRows(rows);
       expect(resolved).toHaveLength(1);
-      // Both attempts are pending in this case; either represents the worst state.
-      expect(after === 'CANCELLED' ? [older, newer] : [expected]).toContainEqual(resolved[0]);
+      expect(resolved[0]).toEqual(expected);
     }
   });
   it('only a SUCCESS classified green by the caller clears earlier pending evidence', () => {
@@ -73,7 +72,10 @@ describe('fail-closed workflow/check attempt resolver', () => {
   });
   it.each(['SKIPPED', 'NEUTRAL', 'CANCELLED', 'STALE'])('a latest %s cannot erase earlier failure', conclusion => {
     const fresh = { ...passed, conclusion };
-    for (const rows of [[failed, fresh], [fresh, failed]]) expect(resolveCheckRows(rows)).toEqual([failed]);
+    for (const rows of [[failed, fresh], [fresh, failed]]) {
+      // CANCELLED now ties FAILURE at red; neither may admit the check.
+      expect(resolveCheckRows(rows)).toEqual([conclusion === 'CANCELLED' ? rows[0] : failed]);
+    }
     expect(resolveCheckRows([fresh])).toEqual([fresh]);
     expect(resolveCheckRows([failed, fresh, { ...passed, startedAt: '2026-10-28T03:00:00Z' }]))
       .toEqual([{ ...passed, startedAt: '2026-10-28T03:00:00Z' }]);
@@ -166,3 +168,11 @@ it('a later completed success clears failure even when followed by another pendi
   const pending = { ...passed, startedAt: '2026-10-28T03:00:00Z', status: 'in_progress', conclusion: null };
   expect(resolveCheckRows([failed, passed, pending])).toEqual([pending]);
 });
+
+
+it.each(['CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'])(
+  'default resolver ranks %s red above pending in either input order', conclusion => {
+    const queued = { ...failed, status: 'QUEUED', conclusion: null };
+    const red = { ...passed, conclusion };
+    for (const rows of [[queued, red], [red, queued]]) expect(resolveCheckRows(rows)).toEqual([red]);
+  });
