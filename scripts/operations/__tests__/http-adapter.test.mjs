@@ -603,6 +603,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Card 105 — NOT read-only: its one `act` step is an effect (pause files, kill file, test session); the
     // declaring module is a leaf and every write lives in `maintenance-io.mjs`, behind the sink `../run.mjs` wires.
     [MAINTENANCE_OP]: 'maintenance.mjs',
+    // Writes: its one `act` step is an effect (GitHub update-branch); the host IO lives in `update-branch-io.mjs`.
+    'update-branch': 'update-branch.mjs',
     // Writes operator routing preferences; listed here for module-map coverage only.
     'routing-override': 'routing-override.mjs',
     'operator-override-set': 'operator-override.mjs',
