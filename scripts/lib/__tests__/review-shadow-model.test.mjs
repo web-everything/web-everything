@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { resolveReviewSeatSafeguards, resolveShadowSeatModel, resolveShadowPromotionPrs, resolveShadowPromotionReplaces, SHADOW_AGY_MODEL_ENV } from '../review-seat-settings.mjs';
 import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } from '../review-seat-caps.mjs';
-import { assertCrossVendorPanel, settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
+import { assertCrossVendorPanel, vendorOfModel, settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport } from '../review-shadow-agreement.mjs';
 import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
@@ -402,14 +402,39 @@ describe('Carbon replacement target', () => {
   it('unreadable settings fall back to one Claude seat', () => {
     expect(resolveShadowPromotionReplaces({ env: {}, readFile: () => { throw Error('unreadable'); } })).toEqual({ value: 'claude', source: 'default' });
   });
-  it('reports a one-seat replacement against every builder through the production renderer', () => {
-    const settings = { seatProvider: { correctness: 'shadow', security: 'claude', simplicity: 'codex' } };
+  it('reports a one-seat replacement for Claude and Codex builders using routed models', () => {
+    const settings = settingsFromRoutingPolicy(DEFAULT_ROUTING_POLICY, { aiRouting: {} });
     const before = structuredClone(settings);
     const lines = renderShadowReport([], undefined, 'claude', settings);
-    for (const builder of ['claude', 'codex', 'agy']) {
+    for (const builder of ['claude', 'codex']) {
       expect(lines).toContain(`Post-promotion cross-vendor panel for ${builder} builder: pass`);
     }
+    expect(lines.join('\n')).toContain('Post-promotion cross-vendor panel for agy builder: refused');
     expect(settings).toEqual(before);
+  });
+  it.each(['claude-sonnet-5-5', 'gemini-4-carbon-high'])('uses the advisory agy seat actual model %s', agyModel => {
+    const settings = { seatProvider: { correctness: 'claude' }, claudeSeatModel: { correctness: 'claude-opus-5-5' }, agyCorrectnessAdvisory: true, agyModel };
+    const lines = renderShadowReport([], undefined, 'claude', settings);
+    expect(lines).toContain('Post-promotion cross-vendor panel for codex builder: pass');
+    expect(lines).toContain('Post-promotion cross-vendor panel for claude builder: pass');
+    if (agyModel.startsWith('claude-')) expect(() => assertCrossVendorPanel([agyModel], 'claude')).toThrow(/operator must replace/);
+    else expect(assertCrossVendorPanel([agyModel], 'claude')).toBe(true);
+  });
+  it.each([undefined, null, 'unreadable', 'agy'])('refuses an unreadable advisory model %j', agyModel => {
+    const settings = { seatProvider: { correctness: 'claude' }, agyCorrectnessAdvisory: true, agyModel };
+    expect(renderShadowReport([], undefined, 'claude', settings).join('\n')).toContain('Post-promotion cross-vendor panel for claude builder: refused');
+  });
+  it('refuses a remaining Claude seat whose routing model cannot be read', () => {
+    const settings = { seatProvider: { correctness: 'shadow', security: 'claude' } };
+    expect(renderShadowReport([], undefined, 'claude', settings).join('\n')).toContain('Post-promotion cross-vendor panel for codex builder: refused');
+  });
+  it.each([
+    ['claude-opus-5-5', 'Anthropic'], ['gemini-4-carbon-high', 'Google'], ['gpt-6.1-sol', 'OpenAI'],
+    ['claude-sonnet-5-5', 'Anthropic'], ['claude', 'Anthropic'], ['shadow', 'Anthropic'],
+    ['codex', 'OpenAI'], ['carbon', 'Google'], ['agy-claude', 'Anthropic'], ['agy-gemini', 'Google'],
+    ['agy', null], ['unreadable', null], [undefined, null],
+  ])('maps model or unambiguous provider %j to %j', (id, vendor) => {
+    expect(vendorOfModel(id)).toBe(vendor);
   });
   it('reports refused without throwing for same-vendor, unknown or absent replacement evidence', () => {
     for (const [seatProvider, target, builder] of [
@@ -423,12 +448,16 @@ describe('Carbon replacement target', () => {
     }
   });
   it('refuses same-vendor and unknown evidence with an operator replacement fallback', () => {
-    for (const [panel, builder] of [[['codex'], 'codex'], [['agy'], 'agy'], [['shadow'], 'claude'], [['unknown', 'codex'], 'claude'], [['claude'], 'unknown']]) {
+    for (const [panel, builder] of [[['codex'], 'codex'], [['agy'], 'agy'], [['shadow'], 'claude'], [['unknown', 'codex'], 'claude'], [['claude'], 'unknown'], [['claude', 'carbon'], 'agy']]) {
       expect(() => assertCrossVendorPanel(panel, builder)).toThrow(/operator must replace an existing seat/);
     }
   });
   it('refuses the ambiguous agy panel provider for a Claude builder', () => {
     expect(() => assertCrossVendorPanel(['agy'], 'claude')).toThrow(/operator must replace an existing seat/);
+  });
+  it('accepts explicit panel and builder model IDs', () => {
+    expect(assertCrossVendorPanel(['claude-opus-5-5', 'gemini-4-carbon-high'], 'gpt-6.1-sol')).toBe(true);
+    expect(() => assertCrossVendorPanel(['claude-sonnet-5-5'], 'claude-opus-5-5')).toThrow(/operator must replace/);
   });
   it.each(['carbon', 'agy-gemini'])('recognizes %s as Google and agy-claude as Anthropic', provider => {
     expect(() => assertCrossVendorPanel([provider], 'claude')).not.toThrow();

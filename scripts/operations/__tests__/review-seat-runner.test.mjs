@@ -49,14 +49,30 @@ describe('settings — review.seatProvider.<lens> comes from the routing policy 
     expect(seatProviderDirective(s, 'security')).toEqual({ mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'claude' });
     const c = settingsFromRoutingPolicy(withEntries({ 'review-seat:mandatory:correctness': { provider: 'claude', model: 'sonnet', fallback: [] } }));
     expect(c.seatProvider.correctness).toBe('claude');
+    expect(c.claudeSeatModel.correctness).toBe('claude-sonnet-5-5');
   });
 
   it('the shipped routing policy: correctness and security in shadow on claude-opus-5-5-high, the advisory agy seat on', () => {
     const s = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY });
     expect(s.seatProvider).toEqual({ correctness: 'shadow', security: 'shadow' });
     expect(s.seatModel).toEqual({ correctness: 'claude-opus-5-5-high', security: 'claude-opus-5-5-high' });
+    expect(s.claudeSeatModel).toEqual({ correctness: 'claude-sonnet-5-5', security: 'claude-sonnet-5-5' });
     expect(s.agyCorrectnessAdvisory).toBe(true);
     expect(s.agyModel).toBe('claude-opus-5-5-high');
+  });
+
+  it.each([
+    ['agy-claude', 'sonnet', 'claude-sonnet-5-5-high'],
+    ['agy-gemini', 'gemini-4-carbon-high', 'gemini-4-carbon-high'],
+  ])('preserves the actual advisory model for %s', (provider, model, actual) => {
+    const settings = settingsFromRoutingPolicy(withEntries({
+      'review-seat:advisory:agy-correctness': { provider, model, fallback: [] },
+    }), { aiRouting: {} });
+    expect(settings.agyModel).toBe(actual);
+    for (const builder of ['claude', 'codex']) {
+      expect(renderShadowReport([], undefined, 'claude', settings))
+        .toContain(`Post-promotion cross-vendor panel for ${builder} builder: pass`);
+    }
   });
 
   it('the policy refuses a shadow with no Claude route to count, and an unknown mode', () => {

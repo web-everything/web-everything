@@ -235,11 +235,16 @@ export function renderShadowReport(summary, carbonPromotion = summarizeCarbonPro
   let panel, refusal;
   try {
     settings ??= loadReviewSeatSettings();
-    panel = Object.values(settings.seatProvider);
-    if (settings.agyCorrectnessAdvisory) panel.push('agy');
-    const index = panel.findIndex(p => (p === 'shadow' ? 'claude' : p) === promotionReplaces);
+    const seats = Object.entries(settings.seatProvider).map(([lens, provider]) => ({
+      provider: provider === 'shadow' ? 'claude' : provider,
+      model: provider === 'shadow' || provider === 'claude'
+        ? settings.claudeSeatModel?.[lens] : settings.seatModel?.[lens],
+    }));
+    if (settings.agyCorrectnessAdvisory) seats.push({ provider: 'agy', model: settings.agyModel });
+    const index = seats.findIndex(s => s.provider === promotionReplaces);
     if (index < 0) throw new Error('replacement target absent; operator must replace an existing seat');
-    panel[index] = 'carbon';
+    panel = seats.map(s => s.model);
+    panel[index] = 'gemini-4-carbon-high';
   } catch (error) { refusal = error.message; }
   const checks = ['claude', 'codex', 'agy'].map(builder => {
     try {
