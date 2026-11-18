@@ -15,6 +15,7 @@ export default {
   async run({ sourceRoot = ROOT, log } = {}) {
     const { tagReviewStatus } = await import(pathToFileURL(join(sourceRoot, PATH)).href);
     const { CONFIRMED_BREAKS_DEFAULTS, parseRedTeamComment, redTeamResultId } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/red-team-gate.mjs')).href);
+    const { ghRepoSlug } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/constellation-repos.mjs')).href);
     const violations = [];
     const check = (ok, name) => {
       if (!ok) violations.push(name);
@@ -44,7 +45,7 @@ export default {
       [accepted, 'review-stalled', 'red-team', {}, { state: 'blocked' }],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => null, null],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => null, 'unreadable'],
-      [accepted, null, 'ready-to-merge', {}, {}, false, () => null,
+      [accepted, 'reviewing', 'red-team', {}, {}, false, () => null,
         { status: 'started', endedAt: null, run: null, heartbeatAt: new Date(now - 300_000).toISOString(), timeoutMs: 120_000 }],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => null,
         { status: 'started', endedAt: null, run: null, heartbeatAt: new Date(now - 60_000).toISOString(), timeoutMs: 120_000 }],
@@ -105,9 +106,10 @@ export default {
         readReviewRecord: () => {
           if (recordFields === 'unreadable') throw Error('review record unreadable');
           return recordFields === null ? null : { session: 'review-7099', pid: 7099,
-            startedAt: new Date(now - 600_000).toISOString(), status: 'done',
+            startedAt: new Date(now - 600_000).toISOString(), status: 'done', runId: 'review-pr-7099',
             endedAt: new Date(now - 180_000).toISOString(),
-            run: { op: 'review-pr', pending: null, findings: { read: { netBasis: { rev: headRefOid } }, confirm: 'accept' },
+            run: { id: 'review-pr-7099', op: 'review-pr', outcome: 'complete', pending: null, effects: [{ status: 'applied' }],
+              findings: { read: { repo: ghRepoSlug('we'), pr: 7099, netBasis: { rev: headRefOid } }, confirm: 'accept' },
               verdict: { verdict: 'accept' }, stepTimings: [{ step: 'record', finishedAt: new Date(now - 180_000).toISOString() }] },
             ...recordFields };
         },

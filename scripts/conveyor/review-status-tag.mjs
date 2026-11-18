@@ -144,7 +144,7 @@ function readReviewRunRecord(row) {
   const record = tryReadCompletion(row.name);
   return record && { ...record, run: record.runId ? tryReadRun(record.runId) : null };
 }
-function concludedReviewRow(row, evidence, now, readRecord) {
+function concludedReviewRow(row, evidence, now, readRecord, pr, repo) {
   const start = timestampMs(row.startedAt);
   const verdict = timestampMs(evidence?.createdAt);
   if (row.state !== 'working' || !Number.isFinite(start) || start <= 0 || !Number.isFinite(verdict)
@@ -155,15 +155,13 @@ function concludedReviewRow(row, evidence, now, readRecord) {
     if (!record || record.session !== row.name || record.pid !== row.pid || !Number.isInteger(record.pid)
       || !Number.isFinite(began) || began < start || began >= verdict) return false;
     const run = record.run;
-    if (run?.op === 'review-pr' && run.pending === null && /^[a-f0-9]{40}$/.test(evidence.head)
-      && run.findings?.read?.netBasis?.rev === evidence.head
+    return typeof record.runId === 'string' && record.runId.length > 0 && run?.id === record.runId
+      && run.op === 'review-pr' && run.outcome === 'complete' && run.pending === null
+      && Array.isArray(run.effects) && run.effects.every(e => e?.status === 'applied')
+      && run.findings?.read?.repo === ghRepoSlug(repo) && Number(run.findings.read.pr) === Number(pr)
+      && /^[a-f0-9]{40}$/.test(evidence.head) && run.findings.read.netBasis?.rev === evidence.head
       && ['accept', 'changes'].includes(run.verdict?.verdict)
-      && ['accept', 'changes'].includes(run.findings?.confirm)
-      && run.stepTimings?.some(t => t?.step === 'record' && Number.isFinite(timestampMs(t.finishedAt))
-        && timestampMs(t.finishedAt) >= began && timestampMs(t.finishedAt) <= now)) return true;
-    const heartbeat = timestampMs(record.heartbeatAt);
-    return Number.isFinite(heartbeat) && heartbeat >= began && heartbeat <= now
-      && Number.isSafeInteger(record.timeoutMs) && record.timeoutMs > 0 && now - heartbeat > record.timeoutMs;
+      && ['accept', 'changes'].includes(run.findings?.confirm);
   } catch { return false; }
 }
 
@@ -197,7 +195,7 @@ export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = fal
   const liveFor = (name) => {
     const matches = list.filter((a) => a?.name === name && Object.hasOwn(LIVE_STATES, a.state)
       && !(a.state !== 'blocked' && name !== reviewName && isFinishedOverride(a))
-      && !(name === reviewName && concludedReviewRow(a, reviewConcluded, now, readReviewRecord)));
+      && !(name === reviewName && concludedReviewRow(a, reviewConcluded, now, readReviewRecord, pr, repo)));
     return matches.find((a) => a.state === 'working') ?? matches[0] ?? null;
   };
   if (escalation?.outcome === 'needs-human') return { role: 'ci-heal', state: 'needs-human' };

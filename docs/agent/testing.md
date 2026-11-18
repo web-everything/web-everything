@@ -4676,7 +4676,7 @@ disposition reader so every head in a verdict carry chain is checked.
 
 Clearance additionally requires `commentsComplete === true`; a supplied snapshot alone is no proof.
 Blocked rows stay visible. Working review rows require their own matching process record:
-a recorded finish, a completed live-head verdict, or heartbeat (`heartbeatAt`) older than
-that record's `timeoutMs`. Missing/unreadable records or timestamps preserve the hold; operators
-can inspect the review job and completion records while the tagger retains the visible status.
-Current review-job envelopes have no heartbeat field; `updatedAt` alone is not heartbeat proof.
+a linked review run with explicit `outcome: complete`, every effect `applied`, and matching
+repo/PR/live head. Finish stamps and expired heartbeats never prove success. Missing, unreadable,
+refused, partial or unknown evidence preserves the hold; operators can inspect the review job
+and completion records while the tagger retains the visible status.

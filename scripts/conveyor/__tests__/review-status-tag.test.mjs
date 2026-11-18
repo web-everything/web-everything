@@ -1,3 +1,4 @@
+import { ghRepoSlug } from '../../lib/constellation-repos.mjs';
 /**
  * @file review-status-tag.test.mjs — `review-status:<state>` is purely informative, derived fresh from
  * `claude agents --json` on every read (never cached, never a second source of truth). PURE logic tests +
@@ -562,8 +563,9 @@ describe('concluded head review with a lingering process', () => {
   const subject = { number: 7099, headRefOid, commentsComplete: true, comments: [gate, comment] };
   const row = { name: 'review-7099', state: 'working', pid: 12345, startedAt: now - 600_000 };
   const finished = { session: row.name, pid: row.pid, startedAt: new Date(row.startedAt).toISOString(),
-    status: 'done', endedAt: new Date(now - 120_000).toISOString(),
-    run: { op: 'review-pr', pending: null, findings: { read: { netBasis: { rev: headRefOid } }, confirm: 'accept' },
+    status: 'done', runId: 'review-pr-7099', endedAt: new Date(now - 120_000).toISOString(),
+    run: { id: 'review-pr-7099', op: 'review-pr', outcome: 'complete', pending: null, effects: [{ status: 'applied' }],
+      findings: { read: { repo: ghRepoSlug('we'), pr: 7099, netBasis: { rev: headRefOid } }, confirm: 'accept' },
       verdict: { verdict: 'accept' }, stepTimings: [{ step: 'record', finishedAt: new Date(now - 120_000).toISOString() }] } };
   const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
     reviewConcluded: reviewConcluded(accepted, subject), readReviewRecord: () => finished, now, agents: [{ ...row, ...fields }], ...options });
@@ -576,7 +578,7 @@ describe('concluded head review with a lingering process', () => {
     expect(derive({ state: 'blocked' })?.state).toBe('review-stalled');
     expect(derive({ state: 'blocked', selfReportedDone: true })?.state).toBe('review-stalled');
   });
-  it('clears a working row with acceptance and its finished record', () => {
+  it('clears only a successful linked run with all effects applied and acceptance', () => {
     expect(derive()).toBeNull();
   });
   it.each(['accept', 'needs-human'])('keeps a suspended run whose advise finished with %s', verdict => {
@@ -588,7 +590,7 @@ describe('concluded head review with a lingering process', () => {
     expect(derive({}, { readReviewRecord: () => ({ ...finished, status: 'started', endedAt: null }) })).toBeNull();
   });
   it('keeps a final verdict recorded for a different head', () => {
-    const run = { ...finished.run, findings: { ...finished.run.findings, read: { netBasis: { rev: 'b'.repeat(40) } } } };
+    const run = { ...finished.run, findings: { ...finished.run.findings, read: { ...finished.run.findings.read, netBasis: { rev: 'b'.repeat(40) } } } };
     expect(derive({}, { readReviewRecord: () => ({ ...finished, run }) })?.state).toBe('reviewing');
   });
   it.each([
@@ -597,24 +599,19 @@ describe('concluded head review with a lingering process', () => {
     { ...finished.run, verdict: { verdict: 'needs-human' } },
     { ...finished.run, findings: { ...finished.run.findings, confirm: 'abstain' } },
     { ...finished.run, findings: { ...finished.run.findings, confirm: undefined } },
-    { ...finished.run, stepTimings: undefined },
-    { ...finished.run, stepTimings: [{ step: 'record' }] },
-    { ...finished.run, stepTimings: [{ step: 'record', finishedAt: 'bad' }] },
-  ])('keeps a done process without complete final verdict evidence %j', run => {
+    ...[undefined, null, 'unknown'].map(outcome => ({ ...finished.run, outcome })),
+    { ...finished.run, outcome: 'refused', effects: [{ status: 'refused', error: 'SELF-CLEAR REFUSED', attempts: 1 }] },
+    ...[undefined, null, {}, [{ status: 'applied' }, { status: 'pending' }],
+      ...['declared', 'in-flight', 'failed', 'refused', 'unknown', 'skipped', undefined].map(status => [{ status }])]
+      .map(effects => ({ ...finished.run, effects })),
+    { ...finished.run, findings: { ...finished.run.findings, read: { ...finished.run.findings.read, pr: 7105 } } },
+    { ...finished.run, findings: { ...finished.run.findings, read: { ...finished.run.findings.read, repo: 'other/repo' } } },
+  ])('keeps refused, partial, unknown or foreign run evidence despite record finish %j', run => {
     expect(derive({}, { readReviewRecord: () => ({ ...finished, run }) })?.state).toBe('reviewing');
   });
-  it.each([
-    ['stale heartbeat', 120_001, 120_000, null],
-    ['fresh heartbeat', 119_999, 120_000, 'reviewing'],
-    ['timeout boundary', 120_000, 120_000, 'reviewing'],
-    ['missing timeout', 180_000, undefined, 'reviewing'],
-    ['invalid timeout', 180_000, 'bad', 'reviewing'],
-    ['missing heartbeat', undefined, 120_000, 'reviewing'],
-    ['invalid heartbeat', 'bad', 120_000, 'reviewing'],
-  ])('%s requires the run own timeout and heartbeat', (_name, age, timeoutMs, expected) => {
-    const heartbeatAt = typeof age === 'number' ? new Date(now - age).toISOString() : age;
-    const result = derive({}, { readReviewRecord: () => ({ ...finished, status: 'started', endedAt: null, run: null, heartbeatAt, timeoutMs }) });
-    expect(result?.state ?? null).toBe(expected);
+  it('keeps an old heartbeat alone without a linked run (no timeout fallback)', () => {
+    expect(derive({}, { readReviewRecord: () => ({ ...finished, run: null,
+      heartbeatAt: new Date(now - 300_000).toISOString(), timeoutMs: 120_000 }) })?.state).toBe('reviewing');
   });
   it.each(['missing', 'unreadable'])('keeps a working row when its record is %s', mode => {
     expect(derive({}, { readReviewRecord: () => {
@@ -622,7 +619,7 @@ describe('concluded head review with a lingering process', () => {
       return null;
     } })?.state).toBe('reviewing');
   });
-  it.each([{ pid: 999 }, { session: 'review-7105' }, { startedAt: now - 700_000 }])('keeps a row on another run record %j', fields => {
+  it.each([{ runId: undefined }, { runId: 'another-run' }, { pid: 999 }, { session: 'review-7105' }, { startedAt: now - 700_000 }])('keeps a row on another run record %j', fields => {
     expect(derive({}, { readReviewRecord: () => ({ ...finished, ...fields }) })?.state).toBe('reviewing');
   });
   it('requires both labels in either supported label shape', () => {
