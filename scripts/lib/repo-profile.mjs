@@ -147,7 +147,8 @@ export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
  * bare `npm run test:unit && npm run check:standards`, i.e. the FULL suite for every fix — observed 2026-09-25 as
  * several 10+ minute runs at once starving the host. The WE root is always this checkout's own root (the
  * dispatcher's current code), so a lane on an older base still gets today's selection policy.
- * Returns `null` when the profile is unknown OR the checkout does not exist (never throws). `readPackageJson`
+ * Returns `null` when the profile is unknown, its verification gate is not wired, or the checkout does not exist
+ * (never throws). Pending repos must wire a real gate before dispatch can use them. `readPackageJson`
  * is still accepted (and ignored) for call-site compatibility — script detection now happens inside verify-lane.
  * @param {unknown} keyOrSlugOrPrefix
  * @param {{home?: string, checkoutExists?: (p: string) => boolean, readPackageJson?: (p: string) => string, weRoot?: string}} [o]
@@ -156,6 +157,9 @@ export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
 export function gateFor(keyOrSlugOrPrefix, { home, checkoutExists = existsSync, weRoot = WE_CHECKOUT_ROOT } = {}) {
   const profile = repoProfile(keyOrSlugOrPrefix, { home });
   if (!profile) return null;
+  // Pending profiles (e.g. longshore's check:cards) are not wired into verify-lane's script selection.
+  // Sending them there would allow its "nothing to run" echo to count as successful verification.
+  if (!Object.hasOwn(CONSTELLATION_REPOS, profile.key)) return null;
   if (!checkoutExists(profile.checkoutPath)) return null;
   return `node ${join(weRoot, 'scripts', 'verify-lane.mjs')} run --repo=.`;
 }
