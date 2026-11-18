@@ -4524,3 +4524,15 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Detached juror cancellation
+
+`judge-spawn.killgroup.test.mjs` uses inherited pipes/sockets to prove that the juror
+and grandchild have stopped, avoiding zombie-pid false positives. Production
+`judgeSpawn` launches a Node supervisor as the detached process-group leader; the
+juror inherits that group. Per-spawn caller signal/exit hooks kill the group and
+are removed on settlement. The supervisor independently polls caller existence
+every 2000 ms and enforces the spawn deadline plus grace, so caller SIGKILL cannot
+leave an unbounded juror. A disabled caller timeout retains the default hard
+supervisor lifetime. Injected `spawnFn` implementations retain direct CLI argv
+for unit fixtures; real caller-death probes must use the production spawn path.
