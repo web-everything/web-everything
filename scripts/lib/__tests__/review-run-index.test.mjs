@@ -128,6 +128,39 @@ it('writer overflow stays a fallback sentinel instead of dropping a review', () 
   expect(JSON.parse(readFileSync(reviewRunIndexPath(f.runsDir), 'utf8')).entries).toEqual({ [`${f.repo}#${f.pr}`]: [] });
   expect(readReviewRunIndex(f.runsDir, f.repo, f.pr)).toEqual([]);
 });
+it.each(['changes', 'unfinished'])('evicted key recreated by an older accept falls back to the newer %s until backfill', verdict => {
+  const f = fixture();
+  const newer = { ...f.run, id: 'review-pr-newer', verdict: verdict === 'changes' ? { verdict } : null,
+    pending: verdict === 'unfinished' ? { kind: 'confirm', step: 'confirm', stepIndex: 1 } : null,
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(50_000).toISOString() }] };
+  const others = Array.from({ length: 512 }, (_, i) => ({ ...f.run, id: `review-pr-other-${i}`, input: { repo: f.repo, pr: i + 8 } }));
+  const records = [f.run, newer, ...others];
+  let oldMtime = 2000;
+  const io = { list: () => records.map(run => run.id), read: id => records.find(run => run.id === id),
+    stat: path => ({ mtimeMs: path.endsWith(`${f.run.id}.json`) ? oldMtime : path.endsWith(`${newer.id}.json`) ? 3000 : 100_000 }),
+    warn: () => {} };
+  const backfill = { ...f, openPrs: new Set([f.pr, ...others.slice(0, -1).map(run => run.input.pr)]),
+    maxParses: 300, list: io.list, read: io.read, stat: id => io.stat(join(f.runsDir, `${id}.json`)) };
+  expect(backfillReviewRunIndex(backfill).complete).toBe(false);
+  expect(backfillReviewRunIndex(backfill).complete).toBe(true);
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr, backfill)).toContain(newer.id);
+  expect(appendReviewRunIndex(others.at(-1), f.runsDir, 100_000)).toBe(true);
+  const path = reviewRunIndexPath(f.runsDir);
+  expect(JSON.parse(readFileSync(path, 'utf8')).entries).not.toHaveProperty(`${f.repo}#${f.pr}`);
+  // Rewriting an old acceptance gives it a fresh mtime, but keeps its older review start.
+  oldMtime = 200_000;
+  expect(appendReviewRunIndex(f.run, f.runsDir, oldMtime)).toBe(true);
+  expect(JSON.parse(readFileSync(path, 'utf8')).entries[`${f.repo}#${f.pr}`]).toEqual([{ id: f.run.id, mtimeMs: oldMtime }]);
+  expect(readDrainRedTeamEvidence({ ...f, ...io })).toMatchObject({ ok: false, reason: 'scan-capped' });
+  const result = readDrainRedTeamEvidence({ ...f, ...io,
+    scanSettings: { file: { runs: { scan: { maxParses: 600 } } }, platform: {}, env: {} } });
+  if (verdict === 'unfinished') expect(result).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  else expect(result.loopPayload).toEqual(newer);
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr, backfill)).toEqual([]);
+  expect(backfillReviewRunIndex(backfill).complete).toBe(false);
+  expect(backfillReviewRunIndex(backfill).complete).toBe(true);
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr, backfill)).toContain(newer.id);
+});
 
 function completeIndex(f, io) {
   writeFileSync(join(f.runsDir, `${f.run.id}.json`), JSON.stringify(f.run));

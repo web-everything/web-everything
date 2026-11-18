@@ -86,7 +86,8 @@ function add(index, key, row) {
   index[key] = entries.length > MAX_IDS ? [] : entries;
   if (Object.keys(index).length > MAX_KEYS) {
     const oldest = Object.keys(index).sort((a, b) => (index[a][0]?.mtimeMs ?? -Infinity) - (index[b][0]?.mtimeMs ?? -Infinity))[0];
-    delete index[oldest]; // evicted keys use the original bounded scan
+    delete index[oldest];
+    return true;
   }
 }
 /** One shared backfill budget for the existing drain tick, never one batch per PR/repo. */
@@ -114,7 +115,11 @@ export function appendReviewRunIndex(record, runsDir, mtimeMs) {
         if (error.code !== 'ENOENT') throw error;
         index = { version: 2, entries: {} };
       }
-      add(index.entries, key, { id: record.id, mtimeMs });
+      if (add(index.entries, key, { id: record.id, mtimeMs })) {
+        // Eviction can discard a newer rejection while a later append recreates
+        // the key with only an older acceptance. Only backfill restores completeness.
+        delete index.completeness;
+      }
       writeBounded(path, index);
       return true;
     }, { timeoutMs: 0 });
