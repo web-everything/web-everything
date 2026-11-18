@@ -19,6 +19,7 @@ import {
   runAllRepos, runHistory,
 } from '../review-ledger-check.mjs';
 import { DEFAULT_REPOS } from '../lib/review-ledger-history.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs } from '../lib/constellation-repos.mjs';
 import {
   VERDICTS, AGREEMENT, DISAGREE_DIRECTION, buildVerdictRecord, foldVerdictLedger, summarizeAgreement,
 } from '../lib/verdict-ledger.mjs';
@@ -350,8 +351,13 @@ describe('configured store check run', () => {
 });
 
 
-describe('#3930 — every constellation repo, and the run history as a query', () => {
-  it('runAllRepos checks each constellation repo once and returns the worst exit code', async () => {
+describe('#3930 — every review-capable constellation repo, and the run history as a query', () => {
+  it('defaults to review-capable repos, excluding the cards-only longshore repo', () => {
+    expect(DEFAULT_REPOS).toEqual(capableRepoSlugs('review'));
+    expect(DEFAULT_REPOS).not.toContain(CONSTELLATION_REPOS.longshore.slug);
+  });
+
+  it('runAllRepos checks each review-capable constellation repo once and returns the worst exit code', async () => {
     const seen = [];
     const res = await runAllRepos({ stdout: () => {}, run: async ({ repo }) => { seen.push(repo); return { exitCode: repo === DEFAULT_REPOS[1] ? 1 : 0 }; } });
     expect(seen).toEqual([...DEFAULT_REPOS]);

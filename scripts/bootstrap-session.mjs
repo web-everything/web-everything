@@ -60,7 +60,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeLineSync } from './lib/write-all-sync.mjs';
-import { CONSTELLATION_REPOS, repoKeyForDir, siblingKeys } from './lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos, repoKeyForDir } from './lib/constellation-repos.mjs';
 import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT, invokedAsScript } from './lib/git-identity.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -130,8 +130,9 @@ export function selfKey(root = REPO_ROOT) {
  */
 export function siblingsFor(root = REPO_ROOT, exists = existsSync) {
   const parents = constellationParents(root, exists);
-  return siblingKeys(selfKey(root)).map((key) => {
-    const dirs = CONSTELLATION_REPOS[key].dirs;
+  const self = selfKey(root);
+  // Only operational peers need a local checkout; cards-only entries require no bootstrap work.
+  return Object.entries(capableRepos()).filter(([key]) => key !== self).map(([key, { dirs }]) => {
     const found = parents.flatMap((parent) => dirs.map((d) => join(parent, d))).find((p) => exists(p));
     return { name: key, path: found ?? join(parents[0], dirs[0]), present: Boolean(found) };
   });

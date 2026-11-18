@@ -24,7 +24,7 @@
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
-import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { capableRepoSlugs, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
@@ -83,7 +83,7 @@ export function defaultReadPrView({ repoSlug, prNumber, runGh = runGhSync, readC
  * @returns {{rows:Array<{repo:string, pr:number|null, action:'promoted'|'skip'|'error', why:string}>}}
  */
 export function runDraftPromotionStep({
-  repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
+  repos = capableRepoSlugs(),
   listDrafts = defaultListDrafts,
   readHeadCheckState = defaultReadHeadCheckState,
   readPrView = defaultReadPrView,

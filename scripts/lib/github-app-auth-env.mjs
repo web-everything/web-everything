@@ -37,7 +37,7 @@ import { homedir } from 'node:os';
 import { mintInstallationToken, getInstallationInfo, readPrivateKeyRef, canReadPrivateKeyRef } from './github-app-token.mjs';
 import { readDeliveryIdentity, resolveRequestedRole, buildIdentityChain, ROLE_ENV, LEGACY_ROLE, shimRoleTable } from './github-app-identity.mjs';
 import { readGithubAuthPolicy, isDaemonCaller } from './github-auth-policy.mjs';
-import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+import { capableRepoSlugs } from './constellation-repos.mjs';
 import { installationMap, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
 
 /** A missing refusal boundary is fatal even to callers that tolerate transient refresh errors. */
@@ -73,7 +73,7 @@ export const REQUIRED_APP_PERMISSIONS = Object.freeze({
 
 /** Every constellation repo the fleet touches — a token that can't see one of them would fail every call to
  *  it with "Could not resolve to a Repository", with no fallback (live-caught 2026-09-23 on plateau-app). */
-export const REQUIRED_APP_REPOS = Object.freeze(Object.values(CONSTELLATION_REPOS).map((r) => r.slug));
+export const REQUIRED_APP_REPOS = Object.freeze(capableRepoSlugs());
 
 const LEVEL = { read: 1, write: 2, admin: 3 };
 

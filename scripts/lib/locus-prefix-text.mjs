@@ -11,12 +11,12 @@
  * Shared by the ruling-card builder (`record-referral-ruling.mjs`) and by the partial-dedupe retitle
  * (`land-prevention-card.mjs#retitle`) so the title of a reduced card is built by the SAME code as the original.
  */
-import { IN_REPO_LOCUS } from './citation-check.mjs';
+import { IN_REPO_LOCUS, LOCUS_PREFIX_RE_SOURCE } from './citation-check.mjs';
 
 // Longer/prefix-conflicting extensions first + a no-trailing-letter guard so `blocks.json` matches
 // `json` (not `js` + leftover `on`).
 const PATHLIKE_RE = /[\w./-]+\.(?:tsx|ts|json|mjs|cjs|js|md|njk|css|html|yaml|yml)(?![a-z])(?::\d+(?:-\d+)?)?/g;
-const LOCUS_MARKER_RE = /(?:we|fui|plateau|webeverything|frontierui|plateau-app):$/;
+const LOCUS_MARKER_RE = new RegExp(`(?:${LOCUS_PREFIX_RE_SOURCE}):$`);
 const EXEMPT_FIELD_RE = /^\s*(?:relatedReport|graduatedTo|crossRef|codifiedIn)\s*:/;
 // #885 false-positive carve-outs (these are NOT repo code-path references): JS-ecosystem product
 // names (`Node.js`/`Next.js`/`Three.js` — a single Capitalized word + `.js`) and bare type-suffix
@@ -70,7 +70,7 @@ export const locusPrefixRefs = (text) => {
   const at = new Set();
   for (const ref of findUnmarkedLocusRefs(src)) {
     const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const hits = [...src.matchAll(new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)(?<![\\w./-])${escaped}(?![a-z])`, 'g'))].map(m => m.index);
+    const hits = [...src.matchAll(new RegExp(`(?<!(?:${LOCUS_PREFIX_RE_SOURCE}):)(?<![\\w./-])${escaped}(?![a-z])`, 'g'))].map(m => m.index);
     for (const hit of hits) {
       const probe = hits.reduce((s, h) => (h === hit ? s : `${s.slice(0, h)}${'x'.repeat(ref.length)}${s.slice(h + ref.length)}`), src);
       if (findUnmarkedLocusRefs(probe).includes(ref)) at.add(hit);

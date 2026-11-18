@@ -26,7 +26,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildAnchorOwners, findAnchorRulingMismatches, findDanglingLoci, findOutOfScopeHashSlugs,
-  findDanglingMemoryHashSlugs, makeMemoizedLineCounter,
+  findDanglingMemoryHashSlugs, makeMemoizedLineCounter, LOCUS_PREFIX_NAMES,
 } from '../lib/citation-check.mjs';
 import { isHash } from '../backlog/id.mjs';
 
@@ -136,6 +136,9 @@ describe.skipIf(!hasCargo)('we-scan citation-check — cross-language parity wit
       'backlog/303-heading-definition-passes.md': '## Some heading {#some-rule} (#999, elsewhere)\n',
       // Dangling locus: missing file.
       'backlog/400-dangling-locus.md': 'See we:scripts/does-not-exist.mjs:10 for details.\n',
+      ...Object.fromEntries(LOCUS_PREFIX_NAMES.map((prefix) => [
+        `backlog/prefix-${prefix}.md`, `Fix ${prefix}:scripts/does-not-exist.mjs:12\n`,
+      ])),
       // Out-of-scope hash slug (reports/ is out of the at-land rewrite scope).
       'reports/2026-01-01-report.md': 'Filed as #xoutscp earlier.\n',
       // Memory hash slugs: one dead-landed (cites 200's bornAs), one unresolved, one pending (must pass).

@@ -24,7 +24,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, realpat
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos, repoKeyForSlug } from './constellation-repos.mjs';
 import { isAiGeneratedPr, hasLabel } from './ai-pr-authorship.mjs'; // the zero-dependency leaf (we:xniq7xs) — never merge-ai-prs.mjs directly, which would drag its whole land/merge/review import graph into this small module's consumers (operator-queue.mjs, dispatch-plan.mjs)
 import { REVIEW_LABELS } from './review-escalation.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -419,7 +419,7 @@ export function countOpenPrsForDispatch(repoKey, o = {}) {
 /** Every constellation repo's live count, in one call (the shape both the CLI `status`/`dry-run` and the
  *  operator-queue alert want). */
 export function countOpenPrsAllRepos(o = {}) {
-  return Object.keys(CONSTELLATION_REPOS).map((repoKey) => countOpenPrsForRepo(repoKey, o));
+  return Object.keys(capableRepos()).map((repoKey) => countOpenPrsForRepo(repoKey, o));
 }
 
 // ── THE DECISION — reused verbatim by pr-land's pre-create check AND the dispatcher's intake hold ─────────

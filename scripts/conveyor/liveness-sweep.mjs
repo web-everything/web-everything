@@ -18,7 +18,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { readSettings } from '../lib/settings-files.mjs';
 import { platformPreference, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../lib/constellation-repos.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
@@ -154,7 +154,8 @@ export async function gatherSnapshot(options = {}, deps = {}) {
   const optional = async (source, fn) => { try { return await fn(); } catch (e) { if (e?.code !== 'ENOENT') errors.push({ source, error: message(e) }); } };
   const fields = 'number,title,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,comments';
   const completeRepos = new Set();
-  for (const { slug: repo } of Object.values(deps.repos ?? CONSTELLATION_REPOS)) {
+  // Only capable repos: a cards-only repo (longshore) has no PR flow, and reading it reported false stalls (PR #6911).
+  for (const { slug: repo } of Object.values(capableRepos(undefined, deps.repos ?? CONSTELLATION_REPOS))) {
     let prs = await optional(`prs:${repo}:shared`, () => (deps.readSharedOpenPrs ?? readSharedOpenPrs)({ repo, fields: fields.split(','), env }));
     if (prs == null) prs = await optional(`prs:${repo}:gh`, () => JSON.parse(exec('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', fields], { encoding: 'utf8', timeout: 60_000 })));
     if (Array.isArray(prs)) { snapshot.prs.push(...prs.map(p => normalizePr(p, repo))); completeRepos.add(repo); }

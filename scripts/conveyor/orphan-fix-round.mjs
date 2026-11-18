@@ -42,7 +42,7 @@ import { parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { openReferralFindings, isBlockedFinding, isAwaitingRuling } from '../operations/record-referral-ruling.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../lib/ruling-ledger.mjs';
@@ -265,7 +265,7 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
 export async function runOrphanFixRoundPass({
   env = process.env,
   nowMs = Date.now(),
-  repos = Object.entries(CONSTELLATION_REPOS).map(([key, r]) => ({ key, slug: r.slug })),
+  repos = Object.entries(capableRepos()).map(([key, r]) => ({ key, slug: r.slug })),
   listBounced = (slug) => defaultListBounced(slug),
   readComments = defaultReadComments,
   isOwned = defaultOwned,

@@ -6,6 +6,7 @@ import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
 import { reviewCiGate } from '../review-ci-gate.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
+import { capableRepos } from '../constellation-repos.mjs';
 const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
@@ -244,6 +245,13 @@ describe('parallel review start and void', () => {
     expect(resolve({ 'Web-Everything/Web-Everything': ['standards'] })).toEqual({ we: ['standards'] });
     expect(resolve(['lint'])).toEqual({ we: ['lint'], frontierui: ['lint'], 'plateau-app': ['lint'] });
     for (const bad of [{ nope: ['x'] }, { we: [] }, {}, []]) expect(resolve(bad)).toEqual(review.fastChecks);
+  });
+  it('expands legacy fast-check lists only to review-capable repos while preserving explicit repo settings', () => {
+    const normalized = reviewTiming.normalizeFastChecks(['lint']);
+    expect(Object.keys(normalized)).toEqual(Object.keys(capableRepos('review')));
+    expect(normalized).not.toHaveProperty('longshore');
+    expect(fastChecksFor(normalized, 'longshore')).toBeNull();
+    expect(reviewTiming.normalizeFastChecks({ 'longshoreai/longshore': ['cards'] })).toEqual({ longshore: ['cards'] });
   });
   it('merges fastChecks per repo across layers, so a lower-layer list never overrides a higher-layer repo entry', () => {
     const resolve = (platform, tool) => resolveTimingPolicy({ env: {}, read: () => '{}', fix: {}, platformFix: {}, log: () => {},

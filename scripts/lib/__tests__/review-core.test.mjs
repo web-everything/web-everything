@@ -2752,7 +2752,7 @@ describe('review-parked-prs.mjs — required-check read goes through the shared 
 });
 
 it('the sandbox parked-review repo table uses the shared owner-qualified slugs', async () => {
-  const { CONSTELLATION_REPOS } = await import('../constellation-repos.mjs');
+  const { capableRepos, CONSTELLATION_REPOS } = await import('../constellation-repos.mjs');
   const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../workflows/review-parked-prs.mjs'), 'utf8');
   // The harness body cannot import modules; pin its isolated pure table to the authoritative mapping.
   const table = src.match(/const REPOS = (\{[\s\S]*?\n\});/)[1];
@@ -2760,12 +2760,14 @@ it('the sandbox parked-review repo table uses the shared owner-qualified slugs',
   const discover = src.match(/function discoverPrompt\(\) \{[\s\S]*?\n\}/)[0];
   const prompt = new Function(`const REPOS = ${table}; const RETURN_HYGIENE = ''; const REVIEW_PENDING = 'review:pending';
     ${discover}; return discoverPrompt();`)();
-  for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
+  for (const { slug } of Object.values(capableRepos('review'))) {
     expect(prompt).toContain(`gh pr list --repo ${slug} --label review:pending`);
   }
+  // a repo with no review capability is never swept
+  expect(prompt).not.toContain(`--repo ${CONSTELLATION_REPOS.longshore.slug} `);
   expect(prompt).not.toContain('checkout path if it exists');
   expect(Object.fromEntries(Object.entries(repos).map(([key, { slug }]) => [key, slug])))
-    .toEqual(Object.fromEntries(Object.entries(CONSTELLATION_REPOS).map(([key, { slug }]) => [key, slug])));
+    .toEqual(Object.fromEntries(Object.entries(capableRepos('review')).map(([key, { slug }]) => [key, slug])));
 });
 
 /**

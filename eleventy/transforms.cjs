@@ -35,8 +35,8 @@ function registerTransforms(eleventyConfig, repoRoot) {
   // put 4 `weCard`s on all ~2167 backlog item pages, so a cold `build:docs` serially spawned ~2167
   // subprocesses (~16 min) — long enough that the 11ty dev server never bound its port in a usable time and
   // the Vite `/backlog/…` proxy ECONNREFUSED'd the whole window. Instead the placeholders survive into the
-  // written page and `eleventy.after` splices EVERY page's placeholders through the pinned FUI CLI in ONE
-  // subprocess (`spliceComponentsBatch` → `renderComponents`), paying the cold start once. Output is
+  // written page and `eleventy.after` shares bounded batches of every page's placeholders through the
+  // pinned FUI CLI (`spliceComponentsBatch` → `renderComponents`), amortizing cold starts. Output is
   // byte-identical (the placeholder's `data-we-spec` is self-describing). In `--serve`, `results` is only
   // the changed pages, so a dev edit re-splices just what it touched. Same subprocess boundary +
   // pinned-artifact/missing-artifact hard error as the data-table hook above; the block factories live in
@@ -47,7 +47,7 @@ function registerTransforms(eleventyConfig, repoRoot) {
     const { pages, components } = spliceComponentsBatch(results, repoRoot);
     if (components > 0) {
       // eslint-disable-next-line no-console
-      console.log(`[component-render build] SSR-spliced ${components} component(s) across ${pages} page(s) in one subprocess.`);
+      console.log(`[component-render build] SSR-spliced ${components} component(s) across ${pages} page(s) in bounded batches.`);
     }
   });
 }

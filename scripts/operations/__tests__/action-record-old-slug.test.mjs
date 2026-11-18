@@ -32,12 +32,20 @@ describe('normalizeRepo pre-transfer owner alias', () => {
       expect(normalizeRepo(slug)).toBe(slug);
       expect(normalizeRepo(`  ${slug}  `)).toBe(slug);
     }
-    for (const [key, { slug, dirs }] of Object.entries(CONSTELLATION_REPOS)) {
+    for (const [key, { slug, dirs }] of Object.entries(CONSTELLATION_REPOS).filter(([, repo]) => sweptRepos.includes(repo.slug))) {
       expect(normalizeRepo(key)).toBe(slug);
       for (const dir of dirs) {
         expect(normalizeRepo(dir)).toBe(slug);
         expect(normalizeRepo(`  ${dir}  `)).toBe(slug);
       }
+    }
+
+    // Registration alone does not make a cards-only repo a coordination repo.
+    expect(sweptRepos).not.toContain(CONSTELLATION_REPOS.longshore.slug);
+    expect(() => normalizeRepo('longshore')).toThrow('Unknown coordination repo: longshore');
+    for (const repo of [CONSTELLATION_REPOS.longshore.slug, ...CONSTELLATION_REPOS.longshore.dirs]) {
+      expect(() => normalizeRepo(repo)).toThrow(`Unknown coordination repo: ${repo}`);
+      expect(() => normalizeRepo(`  ${repo}  `)).toThrow(`Unknown coordination repo: ${repo}`);
     }
   });
 

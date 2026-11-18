@@ -1235,6 +1235,7 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'queue-store.mjs',            // the sidecar GRAMMAR — parseQueue / normNum
       'quiet-hours-io.mjs',         // card xmvc6oc — branch-sync's notify goes through the quietHours gate
       'quiet-hours.mjs',            // card xmvc6oc — its pure core (leaf: no imports)
+      'repo-names.mjs',            // the registry's import-free repo-name setting
       'resolve-runner-checkout.mjs',// lease pid → checkout
       'runner-lock.mjs',            // the singleton lease
       'under-test.mjs',             // #5187 — claude-agents-cache's runner-neutral test-isolation predicate

@@ -7,7 +7,7 @@ import { writeBacklogMd } from '../backlog/guarded-write.mjs';
 import { localToday } from '../lib/local-date.mjs';
 import { execFileSync } from 'node:child_process';
 import { listOpenPrsPagedHydrated, resolvePrListPaging } from '../lib/pr-list-paged.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { capableRepoSlugs } from '../lib/constellation-repos.mjs';
 import { readQueueFile, writeQueueFile, removeFromQueue, resolveQueuePath } from '../conveyor/queue-store.mjs';
 import { CLOSE_ITEMS_EFFECT } from './close-items.mjs';
 import { REOPEN_ITEMS_EFFECT } from './reopen-items.mjs';
@@ -25,7 +25,7 @@ function readPrFiles({ repo, number, exec }) {
  * and the full changed-file list. Fails closed — a primary-repo failure is `unavailable`, a sibling failure is
  * `partial`, and a capped page listing or a file list shorter than `changedFiles` is `truncated`.
  */
-export function readOpenPrsForClose({ exec = execFileSync, repos = Object.values(CONSTELLATION_REPOS).map(r => r.slug),
+export function readOpenPrsForClose({ exec = execFileSync, repos = capableRepoSlugs(),
   paging = resolvePrListPaging(), maxRows = 1000 } = {}) {
   const prs = [], partial = [], truncated = [];
   for (const [i, repo] of repos.entries()) {

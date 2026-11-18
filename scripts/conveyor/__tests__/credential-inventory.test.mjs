@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { collectCredentialInventory as collect, normalizeInventory, DEFAULT_REPOS } from '../credential-inventory.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs } from '../../lib/constellation-repos.mjs';
 const now = Date.parse('2026-10-01T12:00:00Z');
 const run = (overrides = {}) => ({ id: 42, run_attempt: 1, name: 'CI', status: 'completed', conclusion: 'failure', updated_at: new Date(now - 1000).toISOString(), ...overrides });
 const secret = (name = 'FUI_READ_TOKEN') => ({ name, updated_at: '2026-01-01T00:00:00Z', value: 'SECRET_CANARY' });
@@ -15,9 +16,12 @@ function runner({ secrets = [secret()], runs = [run()], logs = 'step Bad credent
   return { exec, calls };
 }
 describe('credential metadata collector', () => {
-  it('collects all repositories, projects allowlists and never retains logs or extra API fields', () => {
+  it('collects capable repositories, skips longshore and never retains logs or extra API fields', () => {
     const { exec, calls } = runner(); const result = collect({ now, exec });
     expect(result.repositories).toHaveLength(3); expect(result.secrets).toHaveLength(3);
+    expect(DEFAULT_REPOS).toEqual(capableRepoSlugs());
+    expect(result.repositories.map((r) => r.repo)).not.toContain(CONSTELLATION_REPOS.longshore.slug);
+    expect(calls.flat().some((arg) => arg.includes(CONSTELLATION_REPOS.longshore.slug))).toBe(false);
     expect(result.secrets.map((r) => r.repo)).toEqual([...DEFAULT_REPOS].sort());
     expect(result.ciFindings.every((r) => r.badCredentials)).toBe(true);
     expect(JSON.stringify(result)).not.toContain('SECRET_CANARY');

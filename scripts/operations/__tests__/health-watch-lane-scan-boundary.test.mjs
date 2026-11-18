@@ -356,6 +356,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards",
       "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf",
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents",
+      "helper:../lib/constellation-repos.mjs#capableRepos:capableRepos",
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches",
       "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots",
       "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync",
@@ -476,6 +477,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards": 1,
       "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 9,
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents": 1,
+      "helper:../lib/constellation-repos.mjs#capableRepos:capableRepos": 3,
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches": 1,
       "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 6,
       "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync": 1,
@@ -687,7 +689,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     // Repeating an already reviewed mutation must fail even though the distinct
     // module/export inventory is unchanged. Pin each occurrence in both readers.
     const repeatedHelpers = file === 'scripts/conveyor/health-watch.mjs'
-      ? ['writeFileSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'runArchiveRetentionTick']
+      ? ['writeFileSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'runArchiveRetentionTick', 'capableRepos']
       : ['cachedLaneScan', 'laneRedirectConfig', 'hardenLaneGitArgs', 'laneProbeEnv', 'assertPushRef'];
     for (const callee of repeatedHelpers) {
       const call = Object.keys(allowedHelpers).find(key => key.endsWith(`:${callee}`));

@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { findUnmarkedLocusRefs as gate } from '../../check-standards-rules.mjs';
 import { findUnmarkedLocusRefs as local } from '../../lib/locus-prefix-text.mjs';
+import { LOCUS_PREFIX_NAMES } from '../../lib/citation-check.mjs';
 
 // The ruling-card helpers carry a local copy of the detector (they must not import check-standards-rules.mjs).
 // Prove that copy matches the gate on the same inputs.
 const SAMPLES = [
+  ...LOCUS_PREFIX_NAMES.map((prefix) => `Fix ${prefix}:scripts/check-cards.mjs:12 and scripts/bare.mjs`),
   'see scripts/a.mjs and we:scripts/b.mjs',
   'link [we:x](scripts/c.mjs) and @scope/pkg.js and https://e.com/f.md',
   'Node.js, *.test.ts, .d.ts, dup scripts/a.mjs scripts/a.mjs',

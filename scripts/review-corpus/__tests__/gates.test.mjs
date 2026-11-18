@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { LOCUS_PREFIX_NAMES } from '../../lib/citation-check.mjs';
 import {
   doneWhenSection,
   doneWhenCriteria,
@@ -65,6 +66,10 @@ describe('doneWhenCriteria — criteria wrap across physical lines', () => {
 });
 
 describe('candidateNeedles — the path being grepped is not the needle', () => {
+  it.each(LOCUS_PREFIX_NAMES)('recognizes %s paths and line citations', (prefix) => {
+    expect(candidateNeedles(`grep \`${prefix}:scripts/check-cards.mjs\` and \`${prefix}:scripts/check-cards.mjs:12\` for \`needle\``))
+      .toEqual(['needle']);
+  });
   it('drops bare paths and path:line loci, keeps the literal', () => {
     const n = candidateNeedles('grepping `we:skills-src/conveyor/SKILL.md` for `dispatch-lane` returns nothing');
     expect(n).toEqual(['dispatch-lane']);

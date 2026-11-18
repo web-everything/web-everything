@@ -90,7 +90,7 @@ import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from '
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
 import { collectImportClosure, closureHits } from './import-closure.mjs';
-import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs } from './constellation-repos.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { DAEMON_BOOT_SMOKE_CHECK, DEFAULT_DAEMON_BOOT_MS } from './daemon-boot-smoke.mjs';
 import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
@@ -916,7 +916,7 @@ export function decideSmokeVerdict(results) {
  * @returns {Promise<{pass:boolean, disabled:boolean, results:Array<object>, sessionSlug:string}>}
  */
 export async function runLiveSmoke({
-  root, env = process.env, repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
+  root, env = process.env, repos = capableRepoSlugs('review'),
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
   clock = Date.now, hostBusy = undefined, reuseCode = false,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
@@ -1217,7 +1217,7 @@ export async function runLiveSmokeWithRetry({
       && isGithubEnvCandidateSet(smoke.results, { minElapsedMs })) {
       const budgets = resolveSmokeBudgets(env);
       const probe = await probeGithubApiAvailability({ env: runEnv, runChild, budgets,
-        repos: Object.values(CONSTELLATION_REPOS).map((r) => r.slug) });
+        repos: capableRepoSlugs('review') });
       githubEnv ??= { confirmed: false, attempts: [] };
       if (probe.unavailable) githubEnv.confirmed = true;
       const failed = smoke.results.filter((r) => !r.ok).map((r) => r.name);
@@ -1495,7 +1495,7 @@ export function resolveSmokeGithubEnvProbe(env = process.env) {
  * @returns {Promise<{unavailable:boolean, ok:boolean, detail:string, repos:Array<{repo:string, ok:boolean, unavailable:boolean, detail:string}>}>}
  */
 export async function probeGithubApiAvailability({ env, runChild = runBounded, budgets = resolveSmokeBudgets(env),
-  repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug) }) {
+  repos = capableRepoSlugs('review') }) {
   const results = [];
   for (const repo of repos) {
     try {

@@ -2268,7 +2268,7 @@ describe('lane-pool probes under a busy pool are SKIPPED (recorded), never allow
 // Live 2026-10-12 13:10 ET: tree read failure + dispatch kill during GitHub's 502/504 outage.
 import { SMOKE_ENVIRONMENT_VERDICTS } from '../daemon-rebuild/smoke-classify/index.mjs';
 import * as liveSmoke from '../daemon-live-smoke.mjs';
-import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../constellation-repos.mjs';
 import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
 
 const probeFields = 'number,headRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files';
@@ -2382,7 +2382,7 @@ describe('GitHub API outage — gate-owned confirmation, never tree-text launder
     const entries = log.error.mock.calls.map(([line]) => JSON.parse(line.split('smoke-env-github ')[1]));
     expect(entries.map((e) => e.action)).toEqual(['retry', 'retry', 'hold-env-unavailable']);
     expect(entries.map((e) => e.backoffMs)).toEqual([10, 20, 0]);
-    expect(host.probes).toHaveLength(Object.keys(CONSTELLATION_REPOS).length * 3);
+    expect(host.probes).toHaveLength(Object.keys(capableRepos('review')).length * 3);
     for (const { args, opts } of host.probes) {
       expect(args).toEqual(['pr', 'list', '--state', 'open', '--limit', '200', '--repo', expect.any(String), '--json', probeFields]);
       expect(opts).toMatchObject({ env: { GH_TOKEN: 'probe-marker' }, timeoutMs: 60000 });

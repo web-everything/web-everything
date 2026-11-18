@@ -26,7 +26,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-const CROSS_REPO_LOCI: &[&str] = &["fui:", "plateau:"];
+use crate::locus_prefix::locus_prefix_re_source;
 
 fn escape_regex(s: &str) -> String {
     regex::escape(s)
@@ -154,7 +154,7 @@ pub struct DanglingLocus {
 fn locus_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"\b(we|fui|plateau):([A-Za-z0-9._\-/]+/[A-Za-z0-9._\-]+):([0-9]+)(?:-([0-9]+))?\b").unwrap()
+        Regex::new(&format!(r"\b({}):([A-Za-z0-9._\-/]+/[A-Za-z0-9._\-]+):([0-9]+)(?:-([0-9]+))?\b", locus_prefix_re_source())).unwrap()
     })
 }
 
@@ -180,7 +180,7 @@ pub fn find_dangling_loci(
         let start_str = caps.get(3).unwrap().as_str();
         let end_str = caps.get(4).map(|m| m.as_str());
 
-        if CROSS_REPO_LOCI.contains(&format!("{prefix}:").as_str()) {
+        if prefix != "we" && prefix != "webeverything" {
             continue;
         }
         if !is_in_repo_path(path) {
@@ -489,6 +489,20 @@ pub fn scan_citations_parallel(root: &Path) -> Vec<CitationFinding> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_registered_prefix_is_parsed_and_resolved_in_its_own_repo() {
+        for prefix in crate::locus_prefix::LOCUS_PREFIX_NAMES {
+            let text = format!("Fix {prefix}:scripts/check-cards.mjs:12");
+            assert_eq!(super::locus_re().captures(&text).unwrap().get(1).unwrap().as_str(), *prefix);
+            let local = *prefix == "we" || *prefix == "webeverything";
+            let findings = super::find_dangling_loci(&text, |_| {
+                assert!(local, "cross-repo citations must not read local files");
+                false
+            }, |_| panic!("missing files have no line count"));
+            assert_eq!(findings.len(), usize::from(local));
+        }
+    }
+
     use super::*;
     use crate::backlog_meta::BacklogItem;
     use std::fs;

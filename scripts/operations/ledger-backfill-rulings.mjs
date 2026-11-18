@@ -20,7 +20,7 @@ import '../lib/verdict-ledger-io.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { capableRepoSlugs } from '../lib/constellation-repos.mjs';
 
 const CLEARING_RULINGS = new Set(['not-real', 'card']);
 const hashed = key => /^sha256:[0-9a-f]{64}$/.test(key);
@@ -169,7 +169,7 @@ function readHome(repo) {
 }
 
 export async function main({
-  repos = Object.values(CONSTELLATION_REPOS).map(r => r.slug), since = newYorkMidnight(), apply = false, migrateRaw = false,
+  repos = capableRepoSlugs(), since = newYorkMidnight(), apply = false, migrateRaw = false,
   readHome: home = readHome,
   readGit = ctx => getLedgerStore('git').read(ctx),
   listOpenPrs = repo => ghJson(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '500', '--json', 'number']).map(pr => pr.number),

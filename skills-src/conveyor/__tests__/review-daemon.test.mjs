@@ -57,7 +57,7 @@ import {
 } from '../review-daemon.mjs';
 import { planReviewDispatch } from '../../../scripts/operations/review-dispatch.mjs';
 import { tagReviewStatus } from '../../../scripts/conveyor/review-status-tag.mjs';
-import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../../../scripts/lib/constellation-repos.mjs';
 import { REPO_ROOT as SESSION_REAPER_REPO_ROOT, DEFAULT_IDLE_REAP_THRESHOLD_MS } from '../../../scripts/conveyor/session-reaper.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
 
@@ -1922,7 +1922,8 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
 
 describe('REVIEW_DAEMON_REPOS', () => {
   it('is every constellation repo\'s real slug, not just WE (live-caught 2026-09-22, #xvyuwtg: plateau-app PR #167 sat unwatched)', () => {
-    expect(REVIEW_DAEMON_REPOS.sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
+    expect([...REVIEW_DAEMON_REPOS].sort()).toEqual(Object.values(capableRepos('review')).map((r) => r.slug).sort());
+    expect(REVIEW_DAEMON_REPOS).not.toContain(CONSTELLATION_REPOS.longshore.slug); // no review capability
     expect(REVIEW_DAEMON_REPOS).toContain('plateauapp/plateau-app');
     expect(REVIEW_DAEMON_REPOS).toContain('frontier-ui/frontierui');
     expect(REVIEW_DAEMON_REPOS).toContain('web-everything/web-everything');

@@ -7,7 +7,7 @@
  * condition 2): "has the checker shown 7 clean days PER LABEL FAMILY?" — so it is a query, never a judgement.
  *
  * WHAT A CLEAN DAY IS (per family, per America/New_York calendar day):
- *   • every expected repo (default: all constellation repos) has at least one run record that day, AND
+ *   • every expected repo (default: all review-capable constellation repos) has at least one run record that day, AND
  *   • every one of those runs has `disagree === 0` for that family, AND
  *   • every one of those runs has `unreadable === 0` (an unread PR is unknown, and unknown is never clean).
  * A day where some expected repo has no run is `incomplete`; a day with no run at all is `missing`. Both break
@@ -24,7 +24,7 @@
  * Pure except `readCheckRuns`, whose IO is injectable.
  */
 
-import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+import { capableRepoSlugs } from './constellation-repos.mjs';
 import { listRunIds, resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 
 export const CHECK_OP = 'review-ledger-check';
@@ -33,8 +33,8 @@ export const SHADOW_OP = 'drain-ledger-shadow';
 export const REQUIRED_CLEAN_DAYS = 7;
 export const HISTORY_TZ = 'America/New_York';
 
-/** The gh slugs of every constellation repo — the default set a clean day must cover. */
-export const DEFAULT_REPOS = Object.freeze(Object.values(CONSTELLATION_REPOS).map((r) => r.slug));
+/** The gh slugs of every review-capable constellation repo — the default set a clean day must cover. */
+export const DEFAULT_REPOS = Object.freeze(capableRepoSlugs('review'));
 
 const dayFmt = new Intl.DateTimeFormat('en-CA', { timeZone: HISTORY_TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
 

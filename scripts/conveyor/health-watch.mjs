@@ -83,7 +83,7 @@ import {
 } from './health-file-request.mjs';
 
 export { healthDir, healthSectionLines };
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../lib/constellation-repos.mjs';
 import { laneJournalPath, readLaneJournalTail, reconcileLaneJournalEntry } from '../lib/lane-history.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
@@ -605,7 +605,7 @@ export function probeUntrackedBacklogCards({
 /** The last `{"checked":true,"health":{…}}` line each lane-pool-health-watch log printed. */
 export function probeLanePools(logsDir) {
   const out = [];
-  for (const key of Object.keys(CONSTELLATION_REPOS)) {
+  for (const key of Object.keys(capableRepos())) {
     const path = join(logsDir, `lane-pool-health-watch-${key}.log`);
     if (!existsSync(path)) continue;
     const st = statSync(path);
@@ -741,7 +741,7 @@ export function probeGraphqlBudget({ exec = run, lockRoot = ghThrottleLockRoot()
 /** #4066 `open-prs-over-limit`'s input: the open-PR backpressure limit per repo key and whether the operator has
  *  it globally off — both read through `we:scripts/lib/pr-limit.mjs`'s own resolvers, never re-derived. */
 export function probePrLimit({ env = process.env, readState = readLimitState, nowMs = Date.now() } = {}) {
-  const limits = Object.fromEntries(Object.keys(CONSTELLATION_REPOS).map((k) => [k, resolvePrLimit(k, env)]));
+  const limits = Object.fromEntries(Object.keys(capableRepos()).map((k) => [k, resolvePrLimit(k, env)]));
   const globalOff = String(env.WE_PR_LIMIT_OFF || '') === '1' || isGlobalOffNow(readState(), nowMs);
   return { limits, globalOff };
 }
@@ -764,7 +764,7 @@ export function probeRestBudget({ exec = run } = {}) {
 
 export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now() } = {}) {
   const out = [];
-  for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
+  for (const { slug } of Object.values(capableRepos())) {
     // #gh-graphql-budget — the host-shared open-PR snapshot when this is the real `run` (never a test's fake exec).
     // `isDraft` (draft-first PRs, operator-approved 2026-09-27) — already part of `SNAPSHOT_FIELDS`, added here
     // so the `draft-not-promoted` smell can read it; the shared-cache path costs nothing extra for it.

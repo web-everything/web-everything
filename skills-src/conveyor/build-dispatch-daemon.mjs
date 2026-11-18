@@ -1742,9 +1742,10 @@ export function createRoundRoutePredictor({ predict = cliPredictRoute, loadInput
 // `gh` that fails the `graphql` bucket but serves `core` — the exact live incident this card fixes.
 export async function cliFetchOpenPrs() {
   const { fetchOpenPrsRest } = await import('../../scripts/conveyor/open-pr-fetch.mjs');
-  const { CONSTELLATION_REPOS } = await import('../../scripts/lib/constellation-repos.mjs');
+  const { capableRepos } = await import('../../scripts/lib/constellation-repos.mjs');
   const out = [];
-  for (const [key, { slug }] of Object.entries(CONSTELLATION_REPOS)) {
+  // Cards-only repos must never add an access requirement to build dispatch.
+  for (const [key, { slug }] of Object.entries(capableRepos('build'))) {
     out.push({ repo: key, prs: fetchOpenPrsRest({ repo: slug }) });
   }
   return out;

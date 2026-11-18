@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanRepoLocusPrefixes } from '../check-standards-rules.mjs';
+import { LOCUS_PREFIX_NAMES } from '../lib/citation-check.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
@@ -25,6 +26,15 @@ const CRATE = join(ROOT, 'scripts', 'rust-scan');
 const BIN = join(CRATE, 'target', 'release', 'we-scan');
 
 const hasCargo = spawnSync('cargo', ['--version'], { stdio: 'ignore' }).status === 0;
+
+// This contract runs even without cargo. Removing a prefix from Rust must fail,
+// including cross-repo prefixes whose omission in citation-check otherwise yields no finding.
+it('Rust mirrors every JS locus prefix, including aliases', () => {
+  const source = readFileSync(join(CRATE, 'src/locus_prefix.rs'), 'utf8');
+  const names = source.match(/pub const LOCUS_PREFIX_NAMES:[\s\S]*?= &\[([\s\S]*?)\];/);
+  expect(names).not.toBeNull();
+  expect([...names[1].matchAll(/"([^"]+)"/g)].map((m) => m[1])).toEqual(LOCUS_PREFIX_NAMES);
+});
 
 function normalize(findings) {
   return findings.map((f) => `${f.file}::${f.count}::${f.sample}`).sort();
@@ -78,6 +88,9 @@ describe.skipIf(!hasCargo)('we-scan locus-prefix — cross-language parity with 
       // The `(?![a-z])` lookahead case: `.json` must NOT match inside a `.jsonlines`-shaped token.
       'backlog/012-jsonlines-passes.md': 'data.jsonlines has no repo path here\n',
       'reports/2026-01-01-report.md': 'Bare ref in a report: scripts/report-bare.mjs\n',
+      ...Object.fromEntries(LOCUS_PREFIX_NAMES.map((prefix) => [
+        `backlog/prefix-${prefix}.md`, `Fix ${prefix}:scripts/check-cards.mjs:12\n`,
+      ])),
     };
     for (const [rel, content] of Object.entries(files)) writeFileSync(join(dir, rel), content);
 
@@ -88,6 +101,8 @@ describe.skipIf(!hasCargo)('we-scan locus-prefix — cross-language parity with 
       expect(rust).toEqual(js);
       expect(js.some((f) => f.startsWith('backlog/012'))).toBe(false);
       expect(rust.some((f) => f.startsWith('backlog/012'))).toBe(false);
+      expect(js.some((f) => f.startsWith('backlog/prefix-'))).toBe(false);
+      expect(rust.some((f) => f.startsWith('backlog/prefix-'))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

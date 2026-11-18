@@ -41,11 +41,12 @@ const SCOPE_PREFIXES = Object.freeze({
   we: Object.freeze(['we', 'webeverything']),
   frontierui: Object.freeze(['fui', 'frontierui']),
   'plateau-app': Object.freeze(['plateau', 'plateau-app']),
+  longshore: Object.freeze(['longshore']),
 });
 
 // The prefix each repo's own backlog cards actually write today (grepped `backlog/*.md`, 2026-09-23):
 // `we:` 31513 vs `webeverything:` 5; `fui:` 4147 vs `frontierui:` 281; `plateau:` 1667 vs `plateau-app:` 1436.
-const CANONICAL_PREFIX = Object.freeze({ we: 'we', frontierui: 'fui', 'plateau-app': 'plateau' });
+const CANONICAL_PREFIX = Object.freeze({ we: 'we', frontierui: 'fui', 'plateau-app': 'plateau', longshore: 'longshore' });
 
 // TODAY'S truth. `review` is true everywhere already; multi-repo slice 5 (`we:backlog/3966-*.md`) turned `fix`
 // on for the couple-repos — `reconcile-fix-dispatch.mjs#runReconcileFixDispatch` dispatches a real fix agent
@@ -54,11 +55,7 @@ const CANONICAL_PREFIX = Object.freeze({ we: 'we', frontierui: 'fui', 'plateau-a
 // a durable `kind:'ci-heal'` entry for ANY repo's red CI, capped by `countCiHealComments`, and
 // `we:scripts/operations/ci-heal-pr-dispatch.mjs#runReconcileCiHealDispatch` is the capability-gated dispatcher
 // that reads it — mirroring `runReconcileFixDispatch`'s own gate for `fix` exactly.
-const CAPABILITIES = Object.freeze({
-  we: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'direct' }),
-  frontierui: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }),
-  'plateau-app': Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }),
-});
+const CAPABILITIES = Object.freeze(Object.fromEntries(Object.entries(CONSTELLATION_REPOS).map(([key, meta]) => [key, meta.capabilities])));
 
 // A scope prefix or full name that is not already a key/slug/slugTag (those are covered by `repoKeyForSlug` /
 // `slugTag` lookups below) — the remaining aliases `SCOPE_PREFIXES` introduces.
@@ -113,7 +110,7 @@ function resolveProfileKey(input) {
  * @returns {{
  *   key: string, slug: string, slugTag: string, checkoutPath: string, lanePoolRepo: string,
  *   scopePrefixes: string[], canonicalPrefix: string,
- *   capabilities: {review: boolean, fix: boolean, ciHeal: boolean, build: 'couple'|'direct'},
+ *   capabilities: {review: boolean, fix: boolean, ciHeal: boolean, build: 'couple'|'direct'|'none'},
  * }|null}
  */
 export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {

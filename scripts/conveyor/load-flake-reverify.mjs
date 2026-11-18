@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runBounded } from '../lib/bounded-child.mjs';
 import { resolveMergeMainBeforeRetry, logMergeMainSource, describeMergeMain, defaultMergeMain } from './load-flake-merge-main.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
@@ -94,7 +94,7 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
 
 /** Programmatic default stays WE; the CLI sweeps the constellation when no repo is specified. */
 export const REVERIFY_DEFAULT_REPO = 'we';
-export const REVERIFY_SWEEP_REPOS = Object.keys(CONSTELLATION_REPOS);
+export const REVERIFY_SWEEP_REPOS = Object.keys(capableRepos());
 
 export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo(config)) {
   const now = io.now();

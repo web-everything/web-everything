@@ -11,7 +11,10 @@ import {
   DAEMON_MANIFEST, isSafeManifestScriptPath, assertValidManifestEntry, resolveManifestEntry,
 } from '../daemon-manifest.mjs';
 import { defaultLaunchNames } from '../supervisor-launcher.mjs';
-import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../../../scripts/lib/constellation-repos.mjs';
+// Load the worker graph during collection; the coverage assertion has no async work.
+import { LOAD_FLAKE_REVERIFY_REPOS } from '../../../scripts/conveyor/stand-down.mjs';
+import { REVERIFY_DEFAULT_REPO } from '../../../scripts/conveyor/load-flake-reverify.mjs';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +22,13 @@ import { fileURLToPath } from 'node:url';
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
-  const REPO_KEYS = Object.keys(CONSTELLATION_REPOS);
+  it('never launches a daemon for capability-less longshore', () => {
+    expect(Object.keys(DAEMON_MANIFEST).filter(name => name.endsWith('-longshore'))).toEqual([]);
+    expect(Object.values(DAEMON_MANIFEST).flatMap(entry => entry.args ?? []))
+      .not.toContain(`--repo=${CONSTELLATION_REPOS.longshore.slug}`);
+  });
+
+  const REPO_KEYS = Object.keys(capableRepos());
 
   it('has the host passes plus 7 passes per repo', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
@@ -110,9 +119,9 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
     expect(DAEMON_MANIFEST['merge-orphan-sweep'].args.some((a) => a.startsWith('--label'))).toBe(false);
   });
 
-  it('the 6 repo-generic passes each get one entry per constellation repo, with the matching --repo=<slug>', () => {
+  it('the 6 repo-generic passes each get one entry per capable repo, with the matching --repo=<slug>', () => {
     for (const passName of ['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch']) {
-      for (const [key, { slug }] of Object.entries(CONSTELLATION_REPOS)) {
+      for (const [key, { slug }] of Object.entries(capableRepos())) {
         const entry = DAEMON_MANIFEST[`${passName}-${key}`];
         expect(entry, `${passName}-${key}`).toBeDefined();
         expect(entry.args).toContain(`--repo=${slug}`);
@@ -233,9 +242,7 @@ it('does not register the dedicated heavy-run sampler as a pass', () => {
 });
 
 describe('load-flake hold repositories have a reverify worker (PR #3945 advisory, round 3)', () => {
-  it('every repository allowed to record a load-flake hold is served by the registered reverify pass', async () => {
-    const { LOAD_FLAKE_REVERIFY_REPOS } = await import('../../../scripts/conveyor/stand-down.mjs');
-    const { REVERIFY_DEFAULT_REPO } = await import('../../../scripts/conveyor/load-flake-reverify.mjs');
+  it('every repository allowed to record a load-flake hold is served by the registered reverify pass', () => {
     const pass = DAEMON_MANIFEST['load-flake-reverify'];
     expect(pass).toBeTruthy();
     // The pass carries no --repo flag, so it sweeps the default repository only: that is the whole supported set.
@@ -272,11 +279,11 @@ describe('DAEMON_MANIFEST — eventRole (R689)', () => {
     const roles = Object.fromEntries(Object.entries(DAEMON_MANIFEST).filter(([, e]) => e.eventRole).map(([n, e]) => [n, e.eventRole]));
     expect(roles['merge-orphan-sweep']).toBe('drain');
     expect(roles['pr-merge-watch']).toBe('pr-merge-watch');
-    for (const key of Object.keys(CONSTELLATION_REPOS)) {
+    for (const key of Object.keys(capableRepos())) {
       expect(roles[`ci-red-recovery-watch-${key}`]).toBe('ci-red-recovery');
       expect(roles[`advisory-label-sweep-${key}`]).toBe('advisory-label-sweep');
     }
-    expect(Object.keys(roles).length).toBe(2 + 2 * Object.keys(CONSTELLATION_REPOS).length);
+    expect(Object.keys(roles).length).toBe(2 + 2 * Object.keys(capableRepos()).length);
   });
   it('does not change those passes intervals', () => {
     expect(DAEMON_MANIFEST['pr-merge-watch'].intervalMs).toBe(5 * 60_000);

@@ -1,8 +1,8 @@
 /** Read-only credential metadata and failed Actions signature collection (#4378). */
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-export const DEFAULT_REPOS = Object.values(CONSTELLATION_REPOS).map((repo) => repo.slug);
+import { capableRepoSlugs } from '../lib/constellation-repos.mjs';
+export const DEFAULT_REPOS = capableRepoSlugs();
 export const DAY = 86400000;
 const codes = new Set(['denied', 'unavailable', 'malformed', 'timeout', 'output-limit', 'incomplete']);
 const repoName = (s) => typeof s === 'string' && /^[\w.-]+\/[\w.-]+$/.test(s);

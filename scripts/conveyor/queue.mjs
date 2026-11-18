@@ -49,7 +49,7 @@ import {
 import { readField } from '../backlog/frontmatter.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
 import { fetchOpenPrsRest } from './open-pr-fetch.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { capableRepoSlugs } from '../lib/constellation-repos.mjs';
 import { prDeliveredNum } from './build-dispatch-policy.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
 import { listFixDispatchClaims } from './fix-claim-store.mjs';
@@ -152,19 +152,26 @@ function readinessOf(num) {
  * list cannot be read (callers fail closed). `CONVEYOR_PRUNE_PROTECTED` (comma list) replaces the live reads
  * for hermetic tests.
  */
-async function loadProtectedNums() {
-  const override = protectedOverride(process.env.CONVEYOR_PRUNE_PROTECTED);
+export async function loadProtectedNums({
+  env = process.env, fetchPrs = fetchOpenPrsRest,
+  readClaims = listBuildDispatchClaims,
+  readFixClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }),
+  readRuns = async () => {
+    const { cliListRunStoreInFlight } = await import('../../skills-src/conveyor/build-dispatch-daemon.mjs');
+    return cliListRunStoreInFlight();
+  },
+} = {}) {
+  const override = protectedOverride(env.CONVEYOR_PRUNE_PROTECTED);
   if (override) return override;
   const prs = [];
-  for (const { slug } of Object.values(CONSTELLATION_REPOS)) prs.push(...fetchOpenPrsRest({ repo: slug }));
+  for (const repo of capableRepoSlugs()) prs.push(...fetchPrs({ repo }));
   // The in-flight run store reader lives with the daemon. A failure to LOAD it refuses the prune; the reader itself
   // degrades an unreadable run-store directory to `[]` (same as the daemon tick), so that case does not refuse.
-  const { cliListRunStoreInFlight } = await import('../../skills-src/conveyor/build-dispatch-daemon.mjs');
   return collectProtectedNums({
     prs,
-    claims: listBuildDispatchClaims(),
-    fixClaims: listFixDispatchClaims(undefined, { liveOnly: true }),
-    runs: await cliListRunStoreInFlight(),
+    claims: readClaims(),
+    fixClaims: readFixClaims(),
+    runs: await readRuns(),
     prNum: prDeliveredNum,
   });
 }

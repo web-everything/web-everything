@@ -104,7 +104,7 @@ const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..
 import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
-import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 /** Per-owner App auth: this daemon fixes PRs in every org (live 2026-10-04: plateau-app calls failed with the
@@ -183,11 +183,10 @@ export async function runDaemonLoop({
  *  `REVIEW_DAEMON_REPOS`. Multi-repo slice 2 (#x1rr9rh, the ratified `#conveyor-multi-repo-model` rule, see
  *  we:reports/2026-09-23-conveyor-multi-repo-gap-map.md): before this, `tickOnce` called
  *  `runReconcileFixDispatch({})` with no repo, so a PR owed a fix in frontierui/plateau-app was never even
- *  recorded as unsupported — the daemon only ever looked at WE. Fix/CI-heal dispatch itself stays WE-only
- *  today ({@link ../../scripts/lib/repo-profile.mjs}'s `capabilities.fix`/`ciHeal` — turning them on for the
- *  couple repos is a later slice), but every repo is now actually TICKED, so the existing `unsupported-repo`
- *  refusal + ledger write run and are recorded for them instead of being skipped silently. */
-export const FIX_DISPATCH_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+ *  recorded as unsupported — the daemon only ever looked at WE. The shared roster includes repos with any
+ *  capability because this daemon also runs CI recovery, draft promotion and review-note passes. Repos
+ *  declaring no capabilities have no work for any of these passes and must never be queried by default. */
+export const FIX_DISPATCH_DAEMON_REPOS = capableRepoSlugs();
 
 /**
  * Run {@link runReconcileFixDispatch} once per watched repo via the shared {@link forEachRepo} helper,

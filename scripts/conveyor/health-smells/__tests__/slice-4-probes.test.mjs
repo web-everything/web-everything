@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { probePrs, probePrLimit, probeAppToken, probeRestBudget, tick, healthDir } from '../../health-watch.mjs';
+import { probePrs, probePrLimit, probeLanePools, probeAppToken, probeRestBudget, tick, healthDir } from '../../health-watch.mjs';
 import { emptyLimitState, setGlobalOff } from '../../../lib/pr-limit.mjs';
 
 let dir;
@@ -29,6 +29,18 @@ describe('probePrs — the fields the queue smells read', () => {
     expect(calls[0].at(-1)).toContain('mergeable,comments');
     expect(out[0].mergeable).toBe('MERGEABLE');
     expect(out[0].comments).toEqual([{ body: 'hi', createdAt: 'c', author: { login: 'chalbert' }, viewerDidAuthor: false }]);
+    expect(calls.map((args) => args[args.indexOf('--repo') + 1])).toEqual([
+      'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
+    ]);
+  });
+});
+
+describe('probeLanePools', () => {
+  it('ignores stale logs for a capabilityless repo while reading capable pool health', () => {
+    for (const key of ['we', 'frontierui', 'plateau-app', 'longshore']) {
+      writeFileSync(join(dir, `lane-pool-health-watch-${key}.log`), '{"checked":true,"health":{"free":2}}\n');
+    }
+    expect(probeLanePools(dir).map((row) => row.repo)).toEqual(['we', 'frontierui', 'plateau-app']);
   });
 });
 

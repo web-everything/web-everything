@@ -65,7 +65,7 @@ describe('readOneLanePool — counts free/leased/dirty from injected lane-pool.m
 });
 
 describe('readAllLanePools', () => {
-  it('reads every constellation repo, we with no --repo, siblings with an expanded --repo path', () => {
+  it('reads every capable repo, we with no --repo, siblings with an expanded --repo path', () => {
     const calls = [];
     const out = readAllLanePools({
       execFn: (cmd, args) => { calls.push(args); return JSON.stringify({ lanes: [{ exists: true, clean: true, leased: false }] }); },
@@ -75,6 +75,19 @@ describe('readAllLanePools', () => {
     expect(calls[0].some((a) => a.startsWith('--repo='))).toBe(false); // we: cwd-derived, no --repo
     expect(calls[1]).toContain('--repo=/Users/x/workspace/frontierui');
     expect(calls[2]).toContain('--repo=/Users/x/workspace/plateau-app');
+    expect(calls).toHaveLength(3);
+  });
+
+  it('ignores even a pre-read pool status for a repo with no capabilities', () => {
+    const calls = [];
+    const rows = readAllLanePools({
+      home: '/Users/x',
+      statusFor: { longshore: { parsed: { lanes: [{ exists: true, clean: true, leased: false }] } } },
+      execFn: (cmd, args) => { calls.push(args); return '{"lanes":[]}'; },
+    });
+    expect(rows.map((row) => row.repoKey)).toEqual(['we', 'frontierui', 'plateau-app']);
+    expect(calls).toHaveLength(3);
+    expect(calls.flat().join(' ')).not.toContain('longshore');
   });
 });
 

@@ -533,8 +533,7 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 500));
     const info = makeIdleFinishedResolver({ thresholdMs: 10 * 60_000, now: () => now })({ cwd, sessionId, status: 'idle' });
-    expect(info.finished).toBe(false);
-    expect(info.reason).toBe('pending-tool-call');
+    expect(info).toMatchObject({ finished: false, reason: 'pending-tool-call', transcriptPath: transcriptFile });
   });
 
   it('reaper path unchanged: without trustIdleRow an idle row + dangling call stays unfinished', () => {

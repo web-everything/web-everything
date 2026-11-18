@@ -775,8 +775,9 @@ describe('the declaration', () => {
 });
 
 it('gate-health accepts exactly the shared constellation slugs', async () => {
-  const { CONSTELLATION_REPOS } = await import('../../lib/constellation-repos.mjs');
-  expect(GATE_HEALTH_REPOS).toEqual(Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug));
+  const { CONSTELLATION_REPOS, capableRepoSlugs } = await import('../../lib/constellation-repos.mjs');
+  expect(GATE_HEALTH_REPOS).toEqual(capableRepoSlugs());
+  expect(GATE_HEALTH_REPOS).not.toContain(CONSTELLATION_REPOS.longshore.slug); // no capabilities: not a gate-health repo
   const reader = createHistoryReader({ classify: classifyFollowUp });
   expect(() => reader({ repo: CONSTELLATION_REPOS.frontierui.slug }))
     .toThrow(`bound to ${CONSTELLATION_REPOS.we.slug}`);

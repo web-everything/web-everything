@@ -401,6 +401,9 @@ describe('existing-card IO', () => {
     '--we:backlog/x.md', 'we:backlog/../x.md', 'we:backlog/x/../y.md',
     'we:other/x.md', 'we:backlog/ｘ.md', 'we:backlog/x\u200b.md',
     'we:backlog/x.mdwe:backlog/y.md', 'we:backlog/x.md@pr0',
+    'longshore:backlog/1234-a.md', 'longshore:backlog/1234-a.md@pr0',
+    'longshore:backlog/../1234-a.md@pr77', 'longshore:backlog/1234-a.md@pr77?ref=main',
+    'longshore:backlog/1234-a.md@pr77\n', 'longshore:backlog/1234-a.md`@pr77',
   ])('unsafe card reference %j throws before posting anything', cardRef => {
     const f = fake();
     expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT]({ ...payloadFor(), cardRef })).toThrow(/unsafe reference.*nothing written/s);
@@ -519,6 +522,52 @@ describe('existing-card IO', () => {
 });
 
 describe('standalone CLI', () => {
+  it.each(['readable', 'vanished', 'unsafe'])('handles a Longshore card through the shared reader and writer (%s)', async state => {
+    const { main } = await import('../record-red-team-ruling-cli.mjs');
+    const { createMemoryRunStore } = await import('../run-store.mjs');
+    const { createMemoryCallLogStore } = await import('../call-log-store.mjs');
+    const ref = state === 'unsafe' ? 'longshore:backlog/../1234-a.md@pr77' : 'longshore:backlog/1234-a.md@pr77';
+    const comments = thread(), posted = [], reads = [];
+    const io = {
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: [...comments] }),
+      readStandingRulingScope: () => null, readScope: () => ({ value: { anyState: false } }),
+      resolveIdentity: () => OP,
+      runGit: () => { throw new Error('Longshore must never read the WE backlog'); },
+      readOnPr: (file, pr, options) => {
+        reads.push({ file, pr, options, posts: posted.length });
+        return state === 'vanished' && posted.length ? null : '---\nstatus: open\n---\n# Card\n';
+      },
+    };
+    const sinks = createRecordRedTeamRulingSinks({ ...io,
+      post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body, createdAt: '2026-10-20T23:55:00Z' }); },
+      syncLabels: () => null,
+    });
+    const entry = () => ({ declaration: recordRedTeamRulingOperation({ readRulingContext: createRecordRedTeamRulingReader({
+      ...io, assertFresh: () => {}, readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+    }) }), sinks });
+    const chunks = [];
+    const output = vi.spyOn(await import('../../lib/write-all-sync.mjs'), 'writeAllSync')
+      .mockImplementation((_fd, text) => chunks.push(String(text)));
+    try {
+      const code = await main(['--pr=5530', '--repo=o/r', '--break=1', '--ruling=card', `--card=${ref}`,
+        '--actor=chalbert', '--channel=chat', '--reason=ok'],
+      { entry, stores: { store: createMemoryRunStore(), callLog: createMemoryCallLogStore() } });
+      if (state === 'readable') {
+        expect(code, chunks.join('')).toBe(0);
+        expect(posted).toHaveLength(2);
+        expect(posted[1]).toContain(`carded by the operator to \`${ref}\``);
+        expect(heldAfter(comments)).toHaveLength(0);
+      } else {
+        expect(code).not.toBe(0);
+        expect(posted).toHaveLength(state === 'vanished' ? 1 : 0);
+        expect(chunks.join('')).toMatch(state === 'vanished' ? /no release record written/ : /does not resolve to a readable backlog card/);
+        expect(heldAfter(comments)).toHaveLength(1);
+      }
+      expect(reads).toEqual(state === 'unsafe' ? [] : [0, 1].map(posts => ({
+        file: '1234-a.md', pr: '77', options: { repo: 'longshoreai/longshore' }, posts,
+      })));
+    } finally { output.mockRestore(); }
+  });
   it.each([
     [['--preview'], true], [['--preview=true'], true], [['--preview=1'], true],
     [['--preview=false'], false], [['--preview=0'], false],

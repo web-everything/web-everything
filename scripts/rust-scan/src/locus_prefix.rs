@@ -19,6 +19,15 @@ use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
+// Mirror of citation-check.mjs; the JS/Rust parity test checks the complete vocabulary.
+pub const LOCUS_PREFIX_NAMES: &[&str] = &[
+    "we", "fui", "plateau", "longshore", "webeverything", "frontierui", "plateau-app",
+];
+
+pub fn locus_prefix_re_source() -> String {
+    LOCUS_PREFIX_NAMES.iter().map(|prefix| regex::escape(prefix)).collect::<Vec<_>>().join("|")
+}
+
 struct Patterns {
     fenced: Regex,
     pathlike: FancyRegex,
@@ -41,7 +50,7 @@ fn patterns() -> &'static Patterns {
             r"[A-Za-z0-9_./-]+\.(?:tsx|ts|json|mjs|cjs|js|md|njk|css|html|yaml|yml)(?![a-z])(?::[0-9]+(?:-[0-9]+)?)?",
         )
         .unwrap(),
-        locus_marker: Regex::new(r"(?:we|fui|plateau|webeverything|frontierui|plateau-app):$").unwrap(),
+        locus_marker: Regex::new(&format!(r"(?:{}):$", locus_prefix_re_source())).unwrap(),
         exempt_field: Regex::new(r"^\s*(?:relatedReport|graduatedTo|crossRef|codifiedIn)\s*:").unwrap(),
         product_js: Regex::new(r"^[A-Z][a-z]+\.js$").unwrap(),
         type_fragment: Regex::new(r"^\.(?:d|test|spec|stories|sw\.spec)\.[a-z]+$").unwrap(),

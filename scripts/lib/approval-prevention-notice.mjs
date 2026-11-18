@@ -72,7 +72,7 @@ const trustedComments = (comments) => (Array.isArray(comments) ? comments : []).
 // locus prefix (the write-time `lint-locus-prefix.mjs` hook enforces this on every scaffold/file-item write, no
 // exceptions) — reusing the SAME token `citation-check.mjs` already exports rather than re-typing the literal
 // `'we:'` a second place could drift from.
-import { IN_REPO_LOCUS } from './citation-check.mjs';
+import { IN_REPO_LOCUS, LOCUS_PREFIX_RE_SOURCE } from './citation-check.mjs';
 // web-everything/web-everything#2766 approval (2026-09-27) — the REAL detector the write-time gate itself runs,
 // reused as the digest safety net's second pass below (mirrors `we:scripts/lib/review-loop-policy.mjs
 // #buildPreventionFilingInput`'s own fix for the identical gap, landed in #2766). A true leaf like
@@ -377,7 +377,7 @@ export function buildApprovalPreventionFilingInput({
     .reduce((text, ref) => {
       const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       return text.replace(
-        new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)(?<![\\w./-])${escaped}(?![\\w/-])`, 'g'),
+        new RegExp(`(?<!(?:${LOCUS_PREFIX_RE_SOURCE}):)(?<![\\w./-])${escaped}(?![\\w/-])`, 'g'),
         `${IN_REPO_LOCUS}${ref}`,
       );
     }, basenamesQualified);

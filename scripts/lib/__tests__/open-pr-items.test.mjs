@@ -5,6 +5,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { itemNumsFromPr, extractItemNums, openPrItemNums, openPrsByItem, deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr, resolvedStatusIdsFromDiff } from '../open-pr-items.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs } from '../constellation-repos.mjs';
 
 describe('itemNumsFromPr', () => {
   it('a batch lane ref → the item numbers, with the YYYY-MM-DD date prefix NOT read as items', () => {
@@ -365,7 +366,7 @@ describe('openPrItemNums (fail-soft IO)', () => {
 });
 
 describe('openPrItemNums (multi-repo)', () => {
-  it('reads every constellation repo with an explicit --repo and unions the item numbers', () => {
+  it('reads every capable repo with an explicit --repo, skips longshore and unions the item numbers', () => {
     const calls = [];
     const byRepo = {
       'web-everything/web-everything': [{ headRefName: 'lane/2100-spec', title: '' }],
@@ -375,6 +376,8 @@ describe('openPrItemNums (multi-repo)', () => {
     const run = (args) => { calls.push(args); return { status: 0, stdout: JSON.stringify(byRepo[args[args.indexOf('--repo') + 1]]) }; };
     const r = openPrItemNums({ run });
     expect(calls.map((a) => a[a.indexOf('--repo') + 1])).toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
+    expect(calls.map((a) => a[a.indexOf('--repo') + 1])).toEqual(capableRepoSlugs());
+    expect(calls.flat()).not.toContain(CONSTELLATION_REPOS.longshore.slug);
     expect(new Set(r.nums)).toEqual(new Set(['2100', '2072']));
     expect(r.partial).toBeUndefined();
   });
@@ -398,6 +401,16 @@ describe('openPrsByItem (the PR identity the Decision Docket lists under each it
     { number: 2376, headRefName: 'lane/ratify-3375', title: 'ratify #3375: proof', url: 'https://github.com/o/we/pull/2376' },
     { number: 12, headRefName: 'lane/3375-impl', title: 'impl', url: 'https://github.com/o/fui/pull/12' },
   ];
+
+  it('preserves an explicitly requested repo even when it has no daemon capabilities', () => {
+    const calls = [];
+    const repo = CONSTELLATION_REPOS.longshore.slug;
+    const run = (args) => { calls.push(args); return { status: 0, stdout: JSON.stringify([prs[0]]) }; };
+    const result = openPrsByItem({ run, repos: [repo] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain(repo);
+    expect(result.byItem['3375'][0].repo).toBe(repo);
+  });
 
   it('keeps every PR under each item it lands, with its repo, number, title and url — from ONE gh call per repo', () => {
     const calls = [];

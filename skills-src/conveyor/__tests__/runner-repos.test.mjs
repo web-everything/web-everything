@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { makeCliMechanicalPasses } from '../runner.mjs';
-import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
+import { capableRepos } from '../../../scripts/lib/constellation-repos.mjs';
 import { readUnsupported, recordUnsupported } from '../../../scripts/conveyor/unsupported-repo.mjs';
 import { writeOpenPrSnapshot } from '../../../scripts/conveyor/open-pr-snapshot.mjs';
 
@@ -32,20 +32,20 @@ async function sweep(repo = null, fail = null) {
   for (const file of files) expect(existsSync(file)).toBe(false);
   return { exec, fetchOpenPrs, files, stderr, unsupportedPath };
 }
-it('sweeps all three repo slugs with separate snapshots and runs WE passes once', async () => {
+it('sweeps every capable repo slug (a repo with no capabilities is skipped) with separate snapshots and runs WE passes once', async () => {
   const { exec, fetchOpenPrs, files } = await sweep();
-  expect(fetchOpenPrs.mock.calls).toEqual(Object.values(CONSTELLATION_REPOS).map(({ slug }) => [{ repo: slug }]));
-  expect(files.size).toBe(3);
+  expect(fetchOpenPrs.mock.calls).toEqual(Object.values(capableRepos()).map(({ slug }) => [{ repo: slug }]));
+  expect(files.size).toBe(Object.keys(capableRepos()).length);
   for (const pass of perRepo) {
     const calls = exec.mock.calls.filter(([, args]) => basename(args[0]) === `${pass}.mjs`);
-    expect(calls).toHaveLength(3);
-    expect(calls.map(([, args]) => args.find((arg) => arg.startsWith('--repo=')))).toEqual(Object.values(CONSTELLATION_REPOS).map(({ slug }) => `--repo=${slug}`));
+    expect(calls).toHaveLength(Object.keys(capableRepos()).length);
+    expect(calls.map(([, args]) => args.find((arg) => arg.startsWith('--repo=')))).toEqual(Object.values(capableRepos()).map(({ slug }) => `--repo=${slug}`));
   }
   for (const pass of once) expect(exec.mock.calls.filter(([, args]) => basename(args[0]) === `${pass}.mjs`)).toHaveLength(1);
 });
 it('isolates child failures and records unsupported review work', async () => {
   const { exec, stderr, unsupportedPath } = await sweep(null, (args) => args[0].endsWith('review-dispatch.mjs') && args.includes('--repo=frontier-ui/frontierui'));
-  expect(exec.mock.calls.filter(([, args]) => args[0].endsWith('review-dispatch.mjs'))).toHaveLength(3);
+  expect(exec.mock.calls.filter(([, args]) => args[0].endsWith('review-dispatch.mjs'))).toHaveLength(Object.keys(capableRepos()).length);
   expect(stderr.mock.calls.flat().join('')).toContain('operations/review-dispatch.mjs [frontierui] failed (non-fatal)');
   expect(readUnsupported({ path: unsupportedPath })).toEqual([expect.objectContaining({ repo: 'frontierui', prNumber: 7, action: 'review' })]);
   recordUnsupported({ repo: 'frontierui', rows: [{ action: 'fix', prNumber: 8 }, { action: 'review', prNumber: 7 }], path: unsupportedPath });
