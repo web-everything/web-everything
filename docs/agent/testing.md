@@ -1090,6 +1090,8 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
+`promotionReplaces` names the existing seat Carbon replaces on manual promotion (default `claude`); the pure `assertCrossVendorPanel` helper checks that the resulting panel retains a non-builder vendor, with tests preserving seat count for Claude, Codex and agy builders.
+
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
 `scope` / `WE_REVIEW_SHADOW_AGY_SCOPE` defaults to `high-care`: use the read's

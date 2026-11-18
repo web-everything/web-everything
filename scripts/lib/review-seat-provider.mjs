@@ -44,6 +44,7 @@ export const AGY_PROVIDERS = Object.freeze(['agy-claude', 'agy-gemini']);
 export const REVIEW_SEAT_PLATFORM_DEFAULT = Object.freeze({
   seatProvider: Object.freeze({ correctness: 'claude', security: 'claude' }),
   seatModel: Object.freeze({}),
+  claudeSeatModel: Object.freeze({}),
   agyModel: null,
   shadowModelOverride: null,
   agyCorrectnessAdvisory: false,
@@ -57,13 +58,16 @@ function routeFor(policy, task, aiRouting, operatorKeys) {
  * Derive the seat settings from a validated routing policy (inject aiRouting for a pure projection).
  * @param {object} policy - a `validateRoutingPolicy` result.
  * @returns {{seatProvider: {correctness: string, security: string}, seatModel: Object<string,string>,
- *   agyModel: string|null, agyCorrectnessAdvisory: boolean, shadowModelOverride: object|null}}
+ *   claudeSeatModel: Object<string,string>, agyModel: string|null, agyCorrectnessAdvisory: boolean, shadowModelOverride: object|null}}
  */
 export function settingsFromRoutingPolicy(policy, { shadowModel = null, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator, operatorKeys = Object.keys(policy.operations) } = {}) {
   const seatProvider = { ...REVIEW_SEAT_PLATFORM_DEFAULT.seatProvider };
   const seatModel = {};
+  const claudeSeatModel = {};
   for (const lens of SEAT_PROVIDER_LENSES) {
     const route = routeFor(policy, mandatorySeatTask(lens), aiRouting, operatorKeys);
+    const claudeRoute = route?.provider === 'claude' ? route : route?.fallback?.find(r => r.provider === 'claude');
+    if (claudeRoute) claudeSeatModel[lens] = claudeRoute.model;
     if (!route || !AGY_PROVIDERS.includes(route.provider)) continue;
     seatProvider[lens] = route.mode === 'shadow' ? 'shadow' : 'agy';
     seatModel[lens] = route.model;
@@ -73,6 +77,7 @@ export function settingsFromRoutingPolicy(policy, { shadowModel = null, aiRoutin
   return Object.freeze({
     seatProvider: Object.freeze(seatProvider),
     seatModel: Object.freeze(seatModel),
+    claudeSeatModel: Object.freeze(claudeSeatModel),
     agyModel: advisoryOn ? advisory.model : null,
     agyCorrectnessAdvisory: advisoryOn,
     shadowModelOverride: shadowModel?.value ? Object.freeze({ model: shadowModel.value, source: shadowModel.source }) : null,
@@ -166,4 +171,24 @@ export function shadowSeatStatus(settings, { repo, pr, earnedShape, careLevel, r
   const bucket = createHash('sha256').update(`${repo.trim().toLowerCase()}#${Number(pr)}`).digest().readUInt32BE(0);
   // Integer threshold always leaves at least one hash bucket out, even for a rate just below 1.
   return bucket < Math.floor(rate * 2 ** 32) ? 'sampled' : 'off (sample)';
+}
+
+/** Model identity owns the vendor; only unambiguous legacy provider IDs are fallbacks. PURE. */
+export function vendorOfModel(modelOrProvider) {
+  if (typeof modelOrProvider !== 'string') return null;
+  if (modelOrProvider.startsWith('claude-')) return 'Anthropic';
+  if (modelOrProvider.startsWith('gemini-')) return 'Google';
+  if (modelOrProvider.startsWith('gpt-')) return 'OpenAI';
+  const vendors = { claude: 'Anthropic', shadow: 'Anthropic', codex: 'OpenAI', carbon: 'Google', 'agy-gemini': 'Google', 'agy-claude': 'Anthropic' };
+  return Object.hasOwn(vendors, modelOrProvider) ? vendors[modelOrProvider] : null;
+}
+
+/** Count actual panel vendors; unknown model or builder evidence refuses. */
+export function assertCrossVendorPanel(models, builder) {
+  const panel = models.map(vendorOfModel);
+  const vendor = vendorOfModel(builder);
+  if (!panel.length || panel.some(v => !v) || !vendor || !panel.some(v => v !== vendor)) {
+    throw new Error('review panel lacks proven cross-vendor independence; operator must replace an existing seat before review');
+  }
+  return true;
 }

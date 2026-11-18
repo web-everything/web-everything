@@ -203,6 +203,7 @@ describe('graduation-progress-report-io: promotions and probation sources', () =
     expect(real.entries.map(({ provider, model }) => ({ provider, model }))).toEqual([
       { provider: 'codex', model: 'gpt-6-astra' },
       { provider: 'antigravity', model: 'gemini-4-argon-high' },
+      { provider: 'antigravity', model: 'gemini-4-carbon-high' },
     ]);
   });
 });
