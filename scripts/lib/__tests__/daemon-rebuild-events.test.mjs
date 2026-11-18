@@ -261,7 +261,7 @@ describe('rebuildClone coordination events', () => {
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
       'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',
       'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
-      'index-locked', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
+      'index-locked', 'invalid-probation', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',
