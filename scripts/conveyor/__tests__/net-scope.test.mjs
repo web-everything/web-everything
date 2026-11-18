@@ -85,7 +85,12 @@ describe('replay 2026-10-09 — fix side: scope-overlap fences are the git net d
   const opts = { now: Date.parse(LIVE.capturedAt), maxWaitMinutes: null, rebaseExempt: null };
 
   it('before: on GitHub\'s lists every stuck PR waits behind the in-flight fix #4527, as the fix daemon logged', () => {
-    const r = filterFixesByInFlightScope(planned('githubFiles'), [], claim(INFLIGHT.githubFiles), opts);
+    // R1048 exempts backlog prose: preserve the historical overlap graph using code paths.
+    const codePaths = (files) => files.map((path) => path.replace(/^(we:)?backlog\/(.*)\.md$/, '$1scripts/replay-overlap/$2.mjs'));
+    const entries = planned('githubFiles').map((entry) => ({
+      ...entry, scope: codePaths(entry.scope), overlapScope: codePaths(entry.overlapScope),
+    }));
+    const r = filterFixesByInFlightScope(entries, [], claim(codePaths(INFLIGHT.githubFiles)), opts);
     expect(r.planned).toEqual([]);
     for (const p of STUCK) expect(p.beforeFix, `#${p.number}`).toMatch(/scope-overlap .* overlaps in-flight fix PR #\d+/);
   });
