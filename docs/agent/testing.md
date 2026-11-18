@@ -4580,3 +4580,22 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+
+## Pinned diff basis (PR-A)
+
+DRAIN and PR-LAND share `resolvePinnedDiffBasis`: one base fetch, a checked FETCH_HEAD,
+fully qualified tracking refs, exact head commits and SHA-only ancestry/diffs under isolated Git.
+Keep the real-Git shadow-ref, moved-ref, replacement-object and missing-head regressions in
+`pinned-diff-basis.test.mjs`. Unscored or head-mismatched evidence preserves the drain hold
+and refuses producer certification; retry with fresh evidence or request human review of the full diff.
+The structural ratchet scans executable call arguments throughout non-test `scripts/**/*.mjs`;
+its counted file:function allowlist records existing legacy sites. New sites fail, and removing
+a legacy site requires deleting its stale entry. Run these tests and affected drain/PR-LAND suites
+through heavy-admission with `--wait-ms=550000`.
+
+The base fetch must not request the producer head: PR-LAND resolves its cached basis before
+publishing. Keep the real local-remote unpublished-head regression (the remote must lack that
+object), the consumer's separate missing-head fetch, and the failed missing-head refusal.
+Only a missing local commit triggers the bounded second fetch; preserve the verified base's
+FETCH_HEAD with `--no-write-fetch-head` and never retry the base fetch.

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolvePinnedDiffBasis, requireScoredNetDiff, readPinnedDiff, pinnedGit } from './lib/pinned-diff-basis.mjs';
 /**
  * pr-land.mjs — the `/pr` PRODUCER: open a self-approved PR, wait for green, label it, and hand the merge to
  * the drain (#2138 Fork 5, #2153; #2290).
@@ -916,6 +917,10 @@ async function runCli() {
   // 1. Resolve the SOURCE commit to publish (the lane clone's HEAD, or an explicit --sha). No local
   //    branch is created (that's guarded) — the lane model pushes `<source>:lane/<n>` straight to origin.
   const refSha = tryGit(['rev-parse', SRC]);
+  const diffExec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: REPO, ...opts });
+  let pinnedBasis;
+  const getDiffBasis = () => pinnedBasis ??= resolvePinnedDiffBasis({
+    exec: diffExec, remote: REMOTE, baseRef: BASE, headSha: refSha });
   // E3 (#3929) — record the producer's own hold in the verdict ledger, ALONGSIDE the label (strictly additive).
   // Fail-soft by construction: `recordParkVerdict` never throws, a miss is reported on stderr only, and nothing
   // here is read by any park / label / land decision. Written BEFORE the label call, like the drain's park.
@@ -945,9 +950,9 @@ async function runCli() {
   let readyOnOpen = false;
   try {
     // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
-    const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
+    const guardConfigPaths = JSON.parse(pinnedGit(diffExec, ['show', `${getDiffBasis().baseSha}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
     let changedFiles = [];
-    try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* fail closed: stays a draft */ }
+    try { changedFiles = String(readPinnedDiff(diffExec, getDiffBasis(), ['--name-only'])).split('\n').filter(Boolean); } catch { /* fail closed: stays a draft */ }
     readyOnOpen = decideReadyOnOpen({ body: CREATE_BODY, changedFiles, guardConfigPaths }).ready;
   } catch { /* fail closed: stays a draft */ }
   const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '', readyOnOpen });
@@ -962,7 +967,7 @@ async function runCli() {
     if (!soakPrecheckEnabled()) return { ok: true, skipped: 'disabled' };
     let files;
     try {
-      files = parseNameStatus(gitC(['diff', '--name-status', '-M', `${REMOTE}/${BASE}...${refSha}`]));
+      files = parseNameStatus(readPinnedDiff(diffExec, getDiffBasis(), ['--name-status']));
     } catch (e) {
       process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
       return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
@@ -1163,7 +1168,7 @@ async function runCli() {
     {
       const repoKeyForLimit = repoKeyForSlug(originSlugOf(REPO)) || 'we';
       let changedFilesForLimit = [];
-      try { changedFilesForLimit = gitC(['diff', '--name-only', '--no-renames', `${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* --no-renames: both sides of a rename, as `isCardOnlyDiff` requires; best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
+      try { changedFilesForLimit = readPinnedDiff(diffExec, getDiffBasis(), ['--name-only']).split('\n').filter(Boolean); } catch { /* --no-renames: both sides of a rename, as `isCardOnlyDiff` requires; best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
       const { count: openCount, limit, excludeCardOnly, cardOnly: cardOnlyExcluded, accepted: acceptedExcluded, stacked: stackedExcluded } = countOpenPrsForRepo(repoKeyForLimit);
       const limitDecision = decideOpenPr({
         repoKey: repoKeyForLimit, limit, openCount, cardOnlyExcluded, acceptedExcluded, stackedExcluded, excludeCardOnly, changedFiles: changedFilesForLimit, branch: REF,
@@ -1258,7 +1263,11 @@ async function runCli() {
     // of `resolveNetDiffBasis`, measured 5 → 11 git subprocesses and 1 → 2 network fetches per PR open; sharing
     // brings that to 6 subprocesses and 1 fetch. Assembling it here instead would leave that sharing — and the
     // `diffHunks` mapping below — pinned by nothing a test can observe at this call site.
-    const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha });
+    const basis = getDiffBasis();
+    const sig = computeNetDiffSignals({ exec, basis, baseRev });
+    const liveHead = forge.viewPr(prNum, 'headRefOid').headRefOid;
+    requireScoredNetDiff(sig, liveHead);
+    requireScoredNetDiff(sig, refSha);
     const changedFiles = sig.changedFiles;
     const diffLines = sig.diffLines;
     // #2390-review-fix — the CUMULATIVE origin/main…head basis the gate-self/human trigger scores over; a
@@ -1362,7 +1371,7 @@ async function runCli() {
       try { forge.removeLabel(prNum, READY_TO_MERGE_LABEL); labelApplied = false; }
       catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · #${prNum} held ${verdict.label} — could not strip ${READY_TO_MERGE_LABEL} (${String(e.message || e).split('\n')[0]}); the drain reconcile will strip it (#2832)\n`); }
     }
-    return verdict;
+    return { ...verdict, diffBasis: { baseSha: sig.baseSha, headSha: sig.headSha, mergeBaseSha: sig.mergeBaseSha } };
   };
 
   // open-only (`--no-wait`, no `--label-on-green`): open WITHOUT the `ready-to-merge` landing-gate label
@@ -1469,18 +1478,16 @@ async function runCli() {
     if (!bodyGate.ok) emit({ repo: REPO, merged: false, reason: bodyGate.reason, pr: Number(prNum), detail: bodyGate.detail }, 3);
   }
 
-  // Required checks are GREEN — NOW apply the producer-certified label (#2199: never before this point).
-  // R893 — a deferred-to-ci PR is labelled only on a green CI `test` check-run for this exact sha (no new bypass).
+  // Certify the exact live head before granting ready-to-merge or triggering DRAIN.
+  let reviewVerdict = { label: null, apply: false, reasons: [], humanRequired: false };
   if (PLAN.labelWhenGreen) {
     const deferredRefusal = deferredLabelRefusal({ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI });
     if (deferredRefusal) emit({ repo: REPO, merged: false, ...deferredRefusal }, 3);
-    applyLabel();
+    reviewVerdict = applyReviewEscalationLabel();
+    if (!held) {
+      applyLabel();
+    }
   }
-
-  // #2307 — and the deterministic review-escalation label (review:human / review:pending), alongside
-  // ready-to-merge — a green producer PR IS ready; the review label is the *landing gate*, which the drain
-  // already honours (a couple with a human-required half withholds via the existing blockedBy/crossRepo path).
-  const reviewVerdict = PLAN.labelWhenGreen ? applyReviewEscalationLabel() : { label: null, apply: false, reasons: [], humanRequired: false };
 
   // #2290 — pr-land NEVER merges: the drain is the SOLE writer to main. In the DEFAULT (land) mode, trigger a
   // single-couple FAST DRAIN so /pr still feels instant — the drain lands THIS labelled PR immediately. Then
@@ -1494,6 +1501,7 @@ async function runCli() {
     if (SYNC_PRIMARY) primarySynced = syncPrimaryMain();
   }
   emit({
+    ...(reviewVerdict.diffBasis || {}),
     repo: REPO, merged: false, reason: PLAN.triggerDrain ? 'enqueued' : 'labelled-on-green',
     pr: Number(prNum), ref: REF, label: LABEL, labelApplied,
     // #984 finding 4 — `held:true` marks a DELIBERATE review-hold (ready-to-merge stripped on purpose), so the
