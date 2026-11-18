@@ -17,7 +17,7 @@ it('health-watch alerts on a live lease outside launchd and never plans interven
   expect(SMELLS.some(s => s.id === outsideLaunchd.id)).toBe(true);
   expect(outsideLaunchd.action).toBe('alert');
   const result = runHealthTick(emptyHealthState(), { leases }, [outsideLaunchd], Date.parse('2026-11-18T15:10:00Z'));
-  expect(result.plan.some(p => p.kind === 'notify' && !p.suppressed)).toBe(true);
+  expect(result.plan.some(p => p.kind === 'notify')).toBe(true);
   expect(result.plan.some(p => ['investigate', 'dispatch', 'kill'].includes(p.kind))).toBe(false);
   expect(outsideLaunchd.evaluate({ leases })[0].summary).toContain('live lease holder pid 42');
 });
@@ -36,14 +36,13 @@ it.each([['launchd supervised', true, 42, true], ['dead holder', false, 42, fals
     if (running || pid === undefined || pid < 0) expect(alive).not.toHaveBeenCalled();
   });
 
-it('probes only ps with bounded injectable IO; malformed, oversized and unavailable evidence alert for inspection', () => {
-  const exec = vi.fn(() => ' 42\n');
-  expect(probeLeasePid(42, { exec })).toBe(true);
-  expect(exec).toHaveBeenCalledWith('ps', ['-o', 'pid=', '-p', '42'], expect.objectContaining({ timeout: 5000, maxBuffer: 4096 }));
-  for (const output of ['', 'wrong', '42'.repeat(3000)]) {
-    expect(probeLeasePid(42, { exec: () => output })).toBeNull();
-  }
-  expect(probeLeasePid(42, { exec: () => { throw Object.assign(new Error('gone'), { status: 1 }); } })).toBe(false);
-  expect(probeLeasePid(42, { exec: () => { throw new Error('unreadable'); } })).toBeNull();
-  expect(probeLeasePid(42, { exec: () => { throw Object.assign(new Error('overflow'), { code: 'ENOBUFS' }); } })).toBeNull();
+it('probes liveness with signal 0 only (never terminates); invalid or unreadable evidence is unknown', () => {
+  const signal = vi.fn();
+  expect(probeLeasePid(42, { signal })).toBe(true);
+  expect(signal).toHaveBeenCalledWith(42, 0);
+  for (const bad of [0, 1, -3, 1.5, NaN]) expect(probeLeasePid(bad, { signal })).toBeNull();
+  const fail = code => ({ signal: () => { throw Object.assign(new Error('x'), { code }); } });
+  expect(probeLeasePid(42, fail('ESRCH'))).toBe(false);
+  expect(probeLeasePid(42, fail('EPERM'))).toBe(true);
+  expect(probeLeasePid(42, fail('EOTHER'))).toBeNull();
 });

@@ -431,17 +431,14 @@ export function daemonNameForLabel(label) {
  * (every resident daemon that is not a `pass-daemon.mjs` watcher), which the smell already treats as "use the
  * generic default".
  */
-export function probeLeasePid(pid, { exec = execFileSync, timeoutMs = 5000 } = {}) {
+export function probeLeasePid(pid, { signal = process.kill } = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 1) return null;
-  try {
-    const output = String(exec('ps', ['-o', 'pid=', '-p', String(pid)],
-      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] })).trim();
-    return output === String(pid) ? true : null;
-  } catch (e) { return e?.status === 1 ? false : null; }
+  try { signal(pid, 0); return true; } // signal 0 only checks existence; it never terminates anything
+  catch (e) { return e?.code === 'ESRCH' ? false : e?.code === 'EPERM' ? true : null; }
 }
 
 export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000,
-  leasePidAlive = pid => probeLeasePid(pid, { timeoutMs }),
+  leasePidAlive = pid => probeLeasePid(pid),
 } = {}) {
   const exec = (cmd, args, opts = {}) => execFileSync(cmd, args, { ...opts, timeout: timeoutMs });
   const read = assess(collect({ exec }));
