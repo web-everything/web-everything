@@ -34,6 +34,7 @@ export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, r
       carry = { fromRev, proof: readSource({ head: fromRev, comments: hit ? comments.slice(0, hit.commentIndex) : [] }) };
     } catch { /* unreadable source is a carry conflict, never payment */ }
   }
+  const malformedCarry = raw.carry != null && !carry && !fromRev;
   const settings = admissionSettings({ env, settingsPath, readSettings });
   const status = raw.status, resultStatus = typeof status?.result === 'string' ? status.result : status?.result?.status;
   const noExecution = status === null || (status?.head === head && status.status === 'finished'
@@ -52,7 +53,7 @@ export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, r
     && releases.every(release => ['cleared', 'released carded', 'released not-real'].includes(release.state));
   const blocked = Array.isArray(labels) && labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:blocked');
   return { head, read: raw.loopPayload?.findings?.read, seats: raw.seats, result: hit?.parsed ?? null, carry,
-    ok: raw.ok, reason: raw.reason, carryConflict: raw.carryConflict !== undefined && raw.carryConflict !== false ? raw.carryConflict : !!(fromRev && !carry),
+    ok: raw.ok, reason: raw.reason, carryConflict: malformedCarry || (raw.carryConflict !== undefined && raw.carryConflict !== false ? raw.carryConflict : !!(fromRev && !carry)),
     hasBreak, blocked, storedVerdict, breakResolved, pendingPublish,
     scheduling: { inFlight: raw.inFlight, queued: raw.queued, scheduled: raw.scheduled, recorded: raw.recorded,
       execution: noExecution ? 'none' : 'unknown', sealClear, commentsReadable: Array.isArray(comments) && comments.every(comment => typeof comment?.body === 'string'),

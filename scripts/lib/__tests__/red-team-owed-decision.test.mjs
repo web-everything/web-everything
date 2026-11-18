@@ -54,6 +54,57 @@ describe('PR-A v2 acceptance over persisted review, status and scorecard files',
     expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'seat-rows-invalid', blocking: true });
     expect(failedRedTeamRetry({ status: 'finished', result: 'failed' }, evidence)).toBe(false);
   });
+  it('canonical audit: persisted null plus a valid completed seat and completed comment yields seat-rows-invalid', () => {
+    const f = fixture({ netChangedFiles: ['scripts/example.mjs'] });
+    writeFileSync(resolveScorecardStorePath(f.env), JSON.stringify({ version: 1, records: [null, completedSeat(f.head)] }));
+    f.comments = [completedComment(f.pr, f.head)];
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence.seats).toHaveLength(2);
+    expect(evidence.seats.map(row => row.valid)).toEqual([false, true]);
+    expect(redTeamOwedDecision(evidence.decisionInput)).toMatchObject({ owed: true, cleared: false });
+    expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'seat-rows-invalid', blocking: true });
+  });
+  it.each([
+    ['null', null], ['undefined', undefined], ['string', 'bad'], ['number', 3], ['array', []], ['missing fields', {}],
+    ['wrong provider type', { ...completedSeat('a'.repeat(40)), provider: 3 }],
+    ['wrong PR type', { ...completedSeat('a'.repeat(40)), pr: '42' }],
+    ['wrong status type', { ...completedSeat('a'.repeat(40)), status: [] }],
+    ['wrong deductions type', { ...completedSeat('a'.repeat(40)), deductions: {} }],
+    ['non-finite criteria', { ...completedSeat('a'.repeat(40)), criteriaEvaluated: NaN }],
+  ])('malformed row shape %s stays invalid beside completed proof', (_name, bad) => {
+    const f = fixture({ netChangedFiles: ['scripts/example.mjs'] });
+    f.comments = [completedComment(f.pr, f.head)];
+    // Inject only the store IO seam so undefined and NaN survive; the real normalizer/validator/decision run.
+    const evidence = readDrainRedTeamEvidence({ ...f, readScorecards: () => [bad, completedSeat(f.head)] });
+    expect(evidence.seats).toHaveLength(2);
+    expect(evidence.seats[0].valid).toBe(false);
+    expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'seat-rows-invalid', blocking: true });
+    // Already-read snapshots use the identical row normalization path, including array holes.
+    const snapshot = readDrainRedTeamEvidence({ ...f, evidence: { ...evidence, seats: [bad, completedSeat(f.head)] } });
+    expect(snapshot.seats[0].valid).toBe(false);
+    expect(redTeamOwedDecision(snapshot.decisionInput).reasons).toContainEqual(RED_TEAM_HOLDS['seat-rows-invalid']);
+  });
+  it('a sparse row array cannot skip its missing entry during normalization', () => {
+    const f = fixture(), seats = Array(2); seats[1] = completedSeat(f.head);
+    const evidence = readDrainRedTeamEvidence({ ...f, readScorecards: () => seats });
+    expect(evidence.seats.map(row => row.valid)).toEqual([false, true]);
+    expect(redTeamOwedDecision(evidence.decisionInput).reasons).toContainEqual(RED_TEAM_HOLDS['seat-rows-invalid']);
+  });
+  it.each([null, [], 'snapshot', 1])('explicit malformed snapshot %j never falls back to readable live evidence', evidence => {
+    const f = fixture();
+    const normalized = readDrainRedTeamEvidence({ ...f, evidence, readScorecards: () => { throw Error('must not fall back'); } });
+    expect(normalized.ok).toBe(false);
+    expect(redTeamOwedDecision(normalized.decisionInput)).toMatchObject({ owed: true, cleared: false });
+    expect(redTeamOwedDecision(normalized.decisionInput).reasons.map(hold => hold.kind)).toContain('evidence-unknown');
+  });
+  it.each([{}, [], 'carry', 1])('malformed carry %j cannot disappear beside a completed pass', carry => {
+    const f = fixture({ netChangedFiles: ['scripts/example.mjs'] }, [completedSeat('a'.repeat(40))]);
+    f.comments = [completedComment(f.pr, f.head)];
+    const completed = readDrainRedTeamEvidence(f);
+    expect(redTeamOwedDecision(completed.decisionInput).cleared).toBe(true);
+    const normalized = readDrainRedTeamEvidence({ ...f, evidence: { ...completed, carry } });
+    expect(redTeamOwedDecision(normalized.decisionInput).reasons).toContainEqual(RED_TEAM_HOLDS['carry-conflict']);
+  });
   it('5: marker-only result comment is result-incomplete', () => {
     const f = fixture({}, [completedSeat('a'.repeat(40))]);
     f.comments = [{ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${f.head} -->` }];
@@ -187,7 +238,7 @@ it.each([
 });
 
 // Parse the actual source: call deletion and prose-based routing must fail independently of runtime fixtures.
-const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs', 'drain-red-team-input.mjs', 'review-red-team-policy.mjs', 'red-team-status-labels.mjs']
+const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs', 'drain-red-team-input.mjs', 'review-red-team-policy.mjs', 'red-team-status-labels.mjs', 'drain-red-team-evidence.mjs']
   .map(file => [file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')]));
 const parse = (file, text) => ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 function all(node, predicate) {
@@ -198,6 +249,11 @@ function all(node, predicate) {
 const calls = (node, name) => all(node, n => ts.isCallExpression(n) && n.expression.getText() === name);
 function assertStructure(source) {
   expect(source['drain-red-team-input.mjs']).toMatch(/recorded: raw\.recorded/);
+  const rowSource = source['drain-red-team-evidence.mjs'];
+  expect(rowSource).toContain('Array.from(readScorecards(), row => normalizeRedTeamSeatRow(row, false))');
+  expect(rowSource).toContain('.filter(row => row.valid === false ||');
+  expect(rowSource).toContain('Array.from(raw.seats, row => normalizeRedTeamSeatRow(row))');
+  expect(rowSource).toContain('if (!plain) return { valid: false }');
   const policy = parse('review-red-team-policy.mjs', source['review-red-team-policy.mjs']);
   const holds = all(policy, n => ts.isPropertyAssignment(n) && ['pass-owed', 'pending-publish'].includes(n.name?.text));
   expect(holds.map(n => [n.name.text, n.initializer.elements[0].kind])).toEqual([
@@ -310,6 +366,9 @@ it.each([
   ['stored acceptance resolution shortcut restored', 'drain-red-team-input.mjs', text => text.replace(
     'const breakResolved = !hasBreak && releases.length > 0',
     "const breakResolved = (status?.head === head && storedVerdict === 'accept') || !hasBreak && releases.length > 0")],
+  ['invalid rows silently filtered', 'drain-red-team-evidence.mjs', text => text.replace('.filter(row => row.valid === false ||', '.filter(row =>')],
+  ['null rows silently dropped before normalization', 'drain-red-team-evidence.mjs', text => text.replace('Array.from(readScorecards(), row => normalizeRedTeamSeatRow(row, false))', 'Array.from(readScorecards()).filter(Boolean).map(row => normalizeRedTeamSeatRow(row, false))')],
+  ['sparse snapshot normalization bypassed', 'drain-red-team-evidence.mjs', text => text.replace('Array.from(raw.seats, row => normalizeRedTeamSeatRow(row))', 'raw.seats.map(row => normalizeRedTeamSeatRow(row))')],
   ['blocked label input removed', 'red-team-status-labels.mjs', text => text.replace('comments, labels, standingRuling', 'comments, standingRuling')],
   ['stored verdict normalization removed', 'drain-red-team-input.mjs', text => text.replace('status.result?.foldedVerdict ?? null', 'null')],
   ['blocked normalization removed', 'drain-red-team-input.mjs', text => text.replace("=== 'red-team:blocked'", "=== 'unused'")],

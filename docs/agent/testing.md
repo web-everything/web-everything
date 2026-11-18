@@ -4646,3 +4646,13 @@ A stored `accept` verdict alone never normalizes to `breakResolved`. Verified
 shared-disposition releases set that flag; a completed head-bound result, scored
 read and valid completed seat resolve the block inside the decision. Regression
 cases omit seats, scoring or the result and require the blocking break to survive.
+
+Normalize scorecard entries before filtering by seat/repo/PR/head. Retain malformed
+entries with `valid: false`: their identity cannot establish a safe narrower scope.
+Use `Array.from` so sparse entries are invalid too. Completed rows never mask one
+invalid row; `seat-rows-invalid` blocks admission and automatic retry. Structural
+mutations restore silent invalid/null filters and sparse-array skipping.
+
+An explicitly supplied malformed snapshot never falls back to a fresh live read;
+it yields unknown evidence. Malformed carry objects cannot disappear into absent
+carry beside completed proof: normalization preserves them as carry conflicts.

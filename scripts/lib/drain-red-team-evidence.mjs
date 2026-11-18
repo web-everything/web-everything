@@ -932,11 +932,27 @@ export function historicalCardOnlySkipCandidate(old) {
     && !old.recorded && !old.inFlight && !old.queued;
 }
 
+// Malformed store entries have no trustworthy scope: retain their invalid flag before selecting this head.
+function normalizeRedTeamSeatRow(row, redTeamOnly = true) {
+  const plain = row !== null && typeof row === 'object' && !Array.isArray(row)
+    && (Object.getPrototypeOf(row) === Object.prototype || Object.getPrototypeOf(row) === null);
+  if (!plain) return { valid: false };
+  const target = redTeamOnly || (row.dispatchKind === 'review-seat' && (row.seat === 'red-team' || typeof row.seat !== 'string'));
+  const identity = !target || (row.dispatchKind === 'review-seat' && row.seat === 'red-team'
+    && typeof row.repo === 'string' && !!row.repo.trim() && Number.isSafeInteger(row.pr) && row.pr > 0
+    && typeof row.rev === 'string' && !!row.rev.trim() && typeof row.status === 'string' && !!row.status.trim()
+    && (row.seatStatus === undefined || (typeof row.seatStatus === 'string' && !!row.seatStatus.trim())));
+  return { ...row, valid: identity && validateScorecard(row).ok && Number.isFinite(row.criteriaEvaluated)
+    && (row.score === null || Number.isFinite(row.score)) && (!Object.hasOwn(row, 'valid') || row.valid === true) };
+}
+
 /** Normalize one head snapshot for policy. `evidence` supplies an already-read snapshot without another scan. */
 export function readDrainRedTeamEvidence({ evidence, comments, carryHeads = [], ...options } = {}) {
-  const raw = evidence ?? readDrainRedTeamSnapshot(options);
+  const candidate = evidence === undefined ? readDrainRedTeamSnapshot(options) : evidence;
+  const readable = candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate);
+  const raw = readable ? candidate : { ok: false, reason: 'snapshot-invalid' };
   const snapshot = { ...raw, ...(evidence === undefined && raw.ok === undefined ? { ok: true, carry: raw.carry ?? null } : {}),
-    seats: Array.isArray(raw.seats) ? raw.seats.map(row => ({ ...row, valid: validateScorecard(row).ok && (!Object.hasOwn(row, 'valid') || row.valid === true) })) : raw.seats };
+    seats: Array.isArray(raw.seats) ? Array.from(raw.seats, row => normalizeRedTeamSeatRow(row)) : raw.seats };
   const readSource = ({ head, comments }) => {
     if (carryHeads.includes(head) || head === options.head) throw Error('carry cycle; inspect run evidence');
     return readDrainRedTeamEvidence({ ...options, head, comments, carryHeads: [...carryHeads, options.head] }).decisionInput;
@@ -950,11 +966,12 @@ export function readDrainRedTeamEvidence({ evidence, comments, carryHeads = [], 
 function readDrainRedTeamSnapshot({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
-  const seats = readScorecards().filter(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
-    && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
+  const seats = Array.from(readScorecards(), row => normalizeRedTeamSeatRow(row, false))
+    .filter(row => row.valid === false || (row.dispatchKind === 'review-seat' && row.seat === 'red-team'
+      && row.repo === repo && row.pr === Number(pr) && row.rev === head));
   const recorded = seats.length > 0;
-  const seatEvidence = { seats, seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
-    failedSeatCount: seats.every(row => validateScorecard(row).ok) ? seats.filter(row => !completedRedTeamSeat(row)).length : null };
+  const seatEvidence = { seats, seatRecorded: recorded, completedRecorded: seats.some(row => row.valid === true && completedRedTeamSeat(row)),
+    failedSeatCount: seats.every(row => row.valid === true) ? seats.filter(row => !completedRedTeamSeat(row)).length : null };
   // The parse cap covers historical and recovery fallbacks too.
   const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now });
   // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that

@@ -954,7 +954,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   });
   it('honors an existing seat row even when the result comment was never posted', () => {
     const f = fixture();
-    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, status: 'ok' };
+    const row = completedSeat(f.head, { repo: f.repo, pr: f.pr });
     expect(readDrainRedTeamEvidence({ ...f, readScorecards: () => [row] }).recorded).toBe(true);
     for (const mismatch of [{ rev: 'a'.repeat(40) }, { repo: 'other/repo' }, { pr: 5443 }, { dispatchKind: 'review-seat-speculative-discard' }]) {
       expect(readDrainRedTeamEvidence({ ...f, readScorecards: () => [{ ...row, ...mismatch }] }).recorded).toBe(false);
@@ -966,7 +966,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     [{ status: 'ok', seatStatus: 'error' }, false],
   ])('separates an existing seat from a completed execution: %j', (fields, completedRecorded) => {
     const f = fixture();
-    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, ...fields };
+    const row = completedSeat(f.head, { repo: f.repo, pr: f.pr, ...fields });
     expect(readDrainRedTeamEvidence({ ...f, readScorecards: () => [row] }))
       .toMatchObject({ recorded: true, seatRecorded: true, completedRecorded });
   });
