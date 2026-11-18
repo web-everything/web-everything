@@ -292,10 +292,18 @@ export function renderOperatorSendBackReviewBlock(open) {
     + quotedItems(open) + '\n\n';
 }
 
+/** The authenticated operator's repair prose is a finding; metadata and quoted examples alone are not. */
+export function operatorSendBackHasFinding(item) {
+  const body = item?.fullBody ?? item?.body;
+  if (typeof body !== 'string') return false;
+  return !!stripComments(stripQuoted(body))
+    .replace(/^\s*(?:at|on) head\s+`?[a-f0-9]{7,40}`?[.:]?\s*/i, '').trim();
+}
+
 /** An unresolved request owes its first fixer too; completed turns retain the existing retry path. */
 export function sendBackNotAddressed(pr, { includeUnattempted = true } = {}) {
   const comments = commentsOf(pr);
-  const items = openOperatorSendBacks(pr).filter(item => differentHead(item.head, pr?.headRefOid)
+  const items = openOperatorSendBacks(pr).filter(operatorSendBackHasFinding).filter(item => differentHead(item.head, pr?.headRefOid)
     || comments.some((c, index) => index > item.index && isTrustedMarkerAuthor(c)
       && String(c?.body ?? '').trimStart().startsWith('🔓 conveyor fix-end'))
     || (includeUnattempted && item.head && shaOf(pr?.headRefOid) && Number.isFinite(Date.parse(item.at))

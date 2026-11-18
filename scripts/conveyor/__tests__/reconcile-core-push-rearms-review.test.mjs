@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile, countFindings } from '../reconcile-core.mjs';
 import { buildFixEndComment } from '../fix-procedure.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -45,10 +45,35 @@ describe('live send-back on the current head owes its first fixer', () => {
     ['review:changes'],
     ['review:changes', 'red-team:blocked', 'status:sent-back-red-team'],
     ['review:changes', 'review:accepted', 'status:sent-back-review'],
-  ])('dispatches the send-back with labels %j even without machine-parsed findings', (...labels) => {
+  ])('counts authenticated operator repair prose as a finding with labels %j', (...labels) => {
+    expect(countFindings([sendBack()])).toBe(1);
     const result = run(fresh({ labels }));
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced',
+      findings: 1,
       rulingNotAddressed: expect.objectContaining({ source: 'operator-send-back' }) })]);
+    expect(result.refusals).toEqual([]);
+  });
+  it.each([
+    ['empty', ''],
+    ['whitespace', '   \n\t'],
+    ['head metadata only', `At head \`${HEAD}\`.`],
+    ['hidden prose', `At head \`${HEAD}\`.\n\n<!-- Repair the export. -->`],
+    ['quoted example only', `At head \`${HEAD}\`.\n\n> Repair the export.`],
+    ['unparseable', null],
+  ])('refuses an operator send-back with %s repair prose', (_name, prose) => {
+    const request = sendBack({ body: prose === null ? null
+      : `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\n${prose}` });
+    expect(countFindings([request])).toBe(0);
+    const result = run(fresh({ comments: [request] }));
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings', findings: 0 }));
+  });
+  it.each([
+    [true, 'card-batch-extract'],
+    [false, 'fix'],
+  ])('initial send-back preserves card-batch routing when extraction=%s', (cardBatchExtract, kind) => {
+    const result = run(fresh({ headRefName: 'lane/card-batch-6360' }), [], { cardBatchExtract });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind, findings: 1 })]);
     expect(result.refusals).toEqual([]);
   });
   it('a previously queued head becomes owed when the send-back and changes label arrive', () => {

@@ -110,7 +110,7 @@ import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
-import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
+import { openOperatorSendBacks, operatorSendBacks, operatorSendBackRuling, operatorSendBackHasFinding } from '../lib/operator-send-backs.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
@@ -679,6 +679,10 @@ export function countFindings(comments) {
   for (const c of comments) {
     const body = commentBody(c);
     if (typeof body !== 'string') continue;
+    // A canonical operator request supplies its own finding, without file/line markup.
+    // Empty ceremonies and metadata-only/quoted bodies supply no repair work.
+    const request = operatorSendBacks([c])[0];
+    if (request && !operatorSendBackHasFinding(request)) continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
     if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
@@ -2020,7 +2024,7 @@ function operatorSendBackRearm(pr, operatorBudget) {
   const after = comments.slice(comments.indexOf(c) + 1);
   if (Math.max(countRearmComments(after), countAdvisoryComments(after)) > 0) return null;
   const body = operatorSendBackBody(c.body);
-  if (!body) return null;
+  if (!body || !operatorSendBackHasFinding({ body })) return null;
   return { verdictId: c.id, login: c.author.login, body };
 }
 
@@ -2871,10 +2875,13 @@ export function planReconcile({
 
     // An earlier operator request survives later mechanical bounces and advisory accepts. Keep the existing
     // stand-down, liveness and already-landed guards above; an unaddressed request belongs to a fixer.
+    const initialCardBatch = phase === 'bounced' && cardBatchExtract
+      && String(pr?.headRefName ?? '').startsWith('lane/card-batch-')
+      && !operatorSendBackRuling(pr, [], { includeUnattempted: false });
     const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid), {
       // Initial repairs use the ordinary populations. Keep draft and conflict ownership, and the
       // existing same-head advisory one-shot path, intact; completed misses still use this retry path.
-      includeUnattempted: ['bounced', 'open', 'queued'].includes(phase) && !pr?.isDraft
+      includeUnattempted: !initialCardBatch && ['bounced', 'open', 'queued'].includes(phase) && !pr?.isDraft
         && pr?.mergeStateStatus !== 'DIRTY' && !withPhase.labels.includes(CONFLICT_LABEL),
     });
     // An initial repair cannot pre-empt CI's cap, evidence and rerun-reservation refusals.
@@ -3060,7 +3067,7 @@ export function planReconcile({
       continue;
     }
 
-    const sendBack = initialSendBackNeedsCi ? null : (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
+    const sendBack = initialSendBackNeedsCi || initialCardBatch ? null : (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
       ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
         ? operatorSendBackRearm(pr, operatorBudget) : null);
     if (sendBack) {
