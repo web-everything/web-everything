@@ -153,111 +153,49 @@ describe('pure sandbox profile', () => {
   });
 });
 
-describe('private agy home config', () => {
-  function configFixture() {
-    const f = fixture();
-    f.settings = join(f.homeDir, '.gemini/antigravity-cli/settings.json');
-    f.config = join(f.homeDir, '.gemini/config');
-    writeFileSync(f.settings, JSON.stringify({ theme: 'dark', trustedWorkspaces: ['/previous'] }));
-    writeFileSync(f.config, 'auth config');
-    return f;
-  }
-  it('copies settings with only the clone trusted and preserves small config bytes', () => {
-    const f = configFixture();
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    expect(JSON.parse(readFileSync(join(f.privateHomeDir, '.gemini/antigravity-cli/settings.json'), 'utf8')))
-      .toEqual({ theme: 'dark', trustedWorkspaces: [f.cloneDir] });
-    expect(readFileSync(join(f.privateHomeDir, '.gemini/config'), 'utf8')).toBe('auth config');
-    expect(JSON.parse(readFileSync(f.settings, 'utf8')).trustedWorkspaces).toEqual(['/previous']);
-  });
-  it.each(['config', 'settings'])('refuses oversized and redirected %s with operator fallback', key => {
-    for (const invalid of ['oversized', ...(key === 'settings' ? ['directory'] : []), 'symlink', 'dangling-symlink', 'parent-symlink']) {
-      const f = configFixture();
-      rmSync(f[key]);
-      if (invalid === 'oversized') writeFileSync(f[key], Buffer.alloc(65537));
-      if (invalid === 'directory') mkdirSync(f[key]);
-      if (invalid === 'symlink') {
-        const target = join(f.root, 'config-target');
-        writeFileSync(target, '{}');
-        symlinkSync(target, f[key]);
+describe('private agy home settings', () => {
+  it.each(['file', 'directory', 'symlink', 'absent'])(
+    'creates exactly one settings file and never copies host config (%s)', configKind => {
+      const f = fixture();
+      const settings = join(f.homeDir, '.gemini/antigravity-cli/settings.json');
+      const config = join(f.homeDir, '.gemini/config');
+      const hostSettings = { theme: 'dark', trustedWorkspaces: ['/previous'],
+        apiKey: 'secret', credentials: { token: 'secret' }, mcpServers: { host: {} } };
+      writeFileSync(settings, JSON.stringify(hostSettings));
+      writeFileSync(join(f.homeDir, '.gemini/antigravity-cli/mcp_config.json'), 'host MCP secret');
+      if (configKind === 'file') writeFileSync(config, 'host auth secret');
+      if (configKind === 'directory') {
+        mkdirSync(config);
+        writeFileSync(join(config, 'mcp_config.json'), 'host MCP secret');
       }
-      if (invalid === 'dangling-symlink') symlinkSync(join(f.root, 'missing-target'), f[key]);
-      if (invalid === 'parent-symlink') {
-        const gemini = join(f.homeDir, '.gemini');
-        rmSync(gemini, { recursive: true });
-        symlinkSync(f.privateHomeDir, gemini);
-      }
-      expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir)).toThrow('operator review');
-    }
-  });
-  it.each(['config', 'settings', 'both', 'gemini'])('accepts absent %s as empty state', missing => {
-    const f = configFixture();
-    if (missing === 'gemini') rmSync(join(f.homeDir, '.gemini'), { recursive: true });
-    else for (const key of missing === 'both' ? ['config', 'settings'] : [missing]) rmSync(f[key]);
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    expect(JSON.parse(readFileSync(join(f.privateHomeDir, '.gemini/antigravity-cli/settings.json'), 'utf8')))
-      .toEqual({ ...(missing === 'config' ? { theme: 'dark' } : {}), trustedWorkspaces: [f.cloneDir] });
-    const config = join(f.privateHomeDir, '.gemini/config');
-    if (missing === 'settings') expect(readFileSync(config, 'utf8')).toBe('auth config');
-    else expect(existsSync(config)).toBe(false);
-  });
-  function directoryConfigFixture() {
-    const f = configFixture();
-    rmSync(f.config);
-    mkdirSync(join(f.config, 'projects'), { recursive: true });
-    writeFileSync(join(f.config, 'projects/private-data'), 'must not be copied');
-    f.files = { '.migrated': '', 'config.json': JSON.stringify({ auth: 'fixture' }), 'mcp_config.json': '' };
-    for (const [name, content] of Object.entries(f.files)) writeFileSync(join(f.config, name), content);
-    return f;
-  }
-  it('copies the three immediate config files at 0600 and recreates projects empty at 0700', () => {
-    const f = directoryConfigFixture();
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    const target = join(f.privateHomeDir, '.gemini/config');
-    expect(readdirSync(target).sort()).toEqual(['.migrated', 'config.json', 'mcp_config.json', 'projects']);
-    expect(statSync(target).mode & 0o777).toBe(0o700);
-    for (const [name, content] of Object.entries(f.files)) {
-      expect(readFileSync(join(target, name), 'utf8')).toBe(content);
-      expect(statSync(join(target, name)).mode & 0o777).toBe(0o600);
-    }
-    expect(readdirSync(join(target, 'projects'))).toEqual([]);
-    expect(statSync(join(target, 'projects')).mode & 0o777).toBe(0o700);
-  });
-  it.each(['symlink', 'directory-symlink', 'oversize', 'fifo'])('refuses a %s directory-config entry with operator fallback', invalid => {
-    const f = directoryConfigFixture();
-    const entry = join(f.config, 'unsafe');
-    if (invalid === 'oversize') writeFileSync(entry, Buffer.alloc(65537));
-    else if (invalid === 'fifo') expect(spawnSync('mkfifo', [entry]).status).toBe(0);
-    else symlinkSync(invalid === 'directory-symlink' ? join(f.config, 'projects') : f.settings, entry);
-    expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir)).toThrow('operator review');
-  });
-  it('refuses ENOTDIR from settings lookup instead of treating it as absent', () => {
-    const f = configFixture();
-    const parent = join(f.homeDir, '.gemini/antigravity-cli');
-    rmSync(parent, { recursive: true });
-    writeFileSync(parent, 'not a directory');
-    expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir)).toThrow('operator review');
-  });
-  it.each([16, 17])('bounds directory config to 16 immediate entries: %s', count => {
-    const f = directoryConfigFixture();
-    for (let i = 4; i < count; i++) writeFileSync(join(f.config, `extra-${i}`), Buffer.alloc(65536));
-    if (count > 16) expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir)).toThrow('operator review');
-    else {
+      if (configKind === 'symlink') symlinkSync(settings, config);
       preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-      expect(readdirSync(join(f.privateHomeDir, '.gemini/config'))).toHaveLength(16);
-      expect(readFileSync(join(f.privateHomeDir, '.gemini/config/extra-4'))).toHaveLength(65536);
-    }
-  });
-  it('accepts a config exactly at the 64KB limit', () => {
-    const f = configFixture();
-    writeFileSync(f.config, Buffer.alloc(65536, 'x'));
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    expect(readFileSync(join(f.privateHomeDir, '.gemini/config'))).toEqual(Buffer.alloc(65536, 'x'));
-  });
-  it.each(['null', '[]', '{'])('refuses malformed settings %s', content => {
-    const f = configFixture();
-    writeFileSync(f.settings, content);
+      expect(readdirSync(f.privateHomeDir)).toEqual(['.gemini']);
+      expect(readdirSync(join(f.privateHomeDir, '.gemini'))).toEqual(['antigravity-cli']);
+      const state = join(f.privateHomeDir, '.gemini/antigravity-cli');
+      expect(readdirSync(state)).toEqual(['settings.json']);
+      expect(JSON.parse(readFileSync(join(state, 'settings.json'), 'utf8')))
+        .toEqual({ trustedWorkspaces: [f.cloneDir] });
+      expect(statSync(join(state, 'settings.json')).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(readFileSync(settings, 'utf8'))).toEqual(hostSettings);
+    });
+  it.each(['absent', 'malformed', 'oversized', 'symlink'])(
+    'seeds settings without reading host settings (%s)', state => {
+      const f = fixture();
+      const settings = join(f.homeDir, '.gemini/antigravity-cli/settings.json');
+      if (state === 'malformed') writeFileSync(settings, '{');
+      if (state === 'oversized') writeFileSync(settings, Buffer.alloc(65537));
+      if (state === 'symlink') symlinkSync(join(f.root, 'missing'), settings);
+      preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
+      expect(JSON.parse(readFileSync(join(f.privateHomeDir, '.gemini/antigravity-cli/settings.json'), 'utf8')))
+        .toEqual({ trustedWorkspaces: [f.cloneDir] });
+    });
+  it('refuses an existing private settings file with operator fallback', () => {
+    const f = fixture();
+    const settings = join(f.privateHomeDir, '.gemini/antigravity-cli/settings.json');
+    writeFileSync(settings, 'existing state');
     expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir)).toThrow('operator review');
+    expect(readFileSync(settings, 'utf8')).toBe('existing state');
   });
 });
 

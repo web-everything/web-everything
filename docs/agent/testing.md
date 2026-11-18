@@ -4704,16 +4704,25 @@ does not establish confinement. These slice B tests were authored without runnin
 
 The build profile grants only clone, private per-run temp and the private HOME's `.gemini`
 writes (plus the named devices). The launcher creates that HOME outside workspace/lane/clone,
-copies settings with only the clone trusted, and copies config using no-follow regular-file reads
-bounded to 64KB. Directory config permits at most 16 immediate entries: files copied at mode 0600
-and directories recreated empty at mode 0700. Absent config/settings are empty state; redirected,
-malformed, special-file or oversized configuration refuses with a provider/
-operator fallback. The launcher removes only its own mkdtemp root after the run. `HOME` is replaced;
-`TMPDIR`, `TMP` and `TEMP` point to the private temp. Real home `.gemini` receives no read or write
-allowance. The REAL probe covers private state writes and real state write/conversation-read denial.
-Private-config fixtures cover the size boundary, symlinks and invalid evidence. The shared admission
-predicate rechecks every tracked/untracked applied path for protected components at every depth and
-the declared doc/test classification; a single violation voids the whole patch before application. Build transcript admission checks
+writes only `.gemini/antigravity-cli/settings.json` containing exactly
+`{ trustedWorkspaces: [clone] }`. It never reads or copies host settings keys, config directories,
+MCP config or credentials; absent host settings give the same empty starting state. Failure to create
+private settings refuses with a provider/operator fallback. The launcher removes only its own mkdtemp
+root after the run. `HOME` is replaced; `TMPDIR`, `TMP` and `TEMP` point to the private temp.
+Real home `.gemini` receives no read or write allowance. The REAL probe covers private state writes
+and real state write/conversation-read denial. Private-HOME fixtures assert exactly one settings file,
+no inherited host keys, and no config copy, including absent, redirected and oversized host inputs.
+The shared kind-agnostic `isAdmissibleTargetPath` allowlist gates scope admission and every
+tracked/untracked changed path. Only normalized repo-relative documentation (`docs/**` or `.md`/`.mdx`)
+and tests (`**/__tests__/**` or `.test.*`/`.spec.*`) qualify. Refuse `.github/**`, `scripts/settings/**`,
+`backlog/**`, `agent-memory-src/**`, soak/breaks tests, `.real.test.mjs`, JSON/YAML/TOML,
+config names, lockfiles, tsconfig names, and every path the shared critical-work verdict marks critical.
+Traversal, empty/dot/backslash segments, controls, glob characters and `.git` segments at any depth
+refuse. All other paths refuse by default, including source, scripts and enforcement code.
+Every test path must also be inside the item's scope; the item may only narrow the launch scope.
+A single violation voids the whole patch before application. Kind gates and `kindMaxSize`/`maxSize`
+settings remain independent: even a size-1 feature job can change only allowlisted paths.
+Build transcript admission checks
 every tool update against the native-tool allowlist and clone containment regardless of status;
 errored tools cannot bypass it. The juror's separate error exemption does not apply to builds.
 
@@ -4731,7 +4740,7 @@ Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER. It runs
 private HOME and a scrubbed environment (no secrets or credentials), under a sandbox-exec profile that confines
 writes to the clone, its private temp and its private HOME. Shells and tools inside that copy are out of scope:
 the copy can only damage itself. The boundary is the diff: we keep ONLY the git diff, and our code applies it
-through the shared protected-path predicate, intersected with the launch scope (an item scope may only narrow
+through the shared documentation/test allowlist predicate, intersected with the launch scope (an item scope may only narrow
 it, with criticality re-checked), before the normal review and audit path. Network stays allowed (agy needs its
 API) and size-1 jobs of any kind are admitted by operator ruling R1062; neither is a confinement claim.
 
@@ -4739,13 +4748,13 @@ The launcher hashes clone Git redirect/configuration controls with filesystem re
 post-run Git invocation; unreadable or changed controls and a missing Git directory void the run. Clone Git reads
 pin both Git directories and the work tree, disable external diff/textconv and external configuration,
 and never accept clone controls as routing authority. Recheck every tracked and untracked diff path
-against the shared critical-work verdict as well as the protected-path predicate before applying anything.
+against the shared critical-work verdict as well as the allowlist predicate before applying anything.
 Keep regression cases asserting zero post-run exec calls after control tampering and atomic refusal
 of critical descendants within an otherwise permitted directory scope.
 
 The confinement depth-1 regression checks static local imports from all four enforcement
 entrypoints, plus the named AgY spawn/juror chain, and requires each module and existing sibling
 test to pass the shared critical verdict. New direct dependencies must be added to the pinned
-critical list; deeper generic infrastructure is intentionally not critical merely by transitive import. Scope admission and applied paths use
-`isAgyFixPathAllowed`, including policy paths; keep the admission-denylist parity table and the
-tracked/untracked policy-cascade refusal under a broader `scripts/lib` scope.
+critical list; deeper generic infrastructure is intentionally not critical merely by transitive import.
+Scope admission and applied paths use `isAdmissibleTargetPath`; keep the shared table-driven
+admissible/refused cases, tracked/untracked policy-cascade refusal, and out-of-item-scope test refusal.

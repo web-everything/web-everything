@@ -4,7 +4,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { criticalWorkVerdict } from '../critical-work.mjs';
-import { deriveAgyFixAdmission } from '../agy-fix-admission.mjs';
+import { deriveAgyFixAdmission, isAdmissibleTargetPath } from '../agy-fix-admission.mjs';
+
+import { admissibleTargets, refusedTargets } from './fixtures/agy-target-path-cases.mjs';
 
 const admit = item => deriveAgyFixAdmission(item, { scope: item.scope });
 
@@ -53,18 +55,16 @@ describe('repair scope admission', () => {
     expect(deriveAgyFixAdmission({ size: 1, scope }, { scope: launchScope })).toBeNull();
   });
   it('admits only item paths contained in a launch entry, normalizing repo prefixes', () => {
-    expect(deriveAgyFixAdmission({ size: 1, scope: ['we:docs/guide.md'] }, { scope: 'we:docs,tests' }))
+    expect(deriveAgyFixAdmission({ size: 1, scope: ['we:docs/guide.md'] }, { scope: 'we:docs' }))
       .toEqual({ kind: 'doc-fix', size: 1, scope: ['docs/guide.md'] });
   });
-  it('admits a test item inside a broader source launch scope', () => {
-    expect(deriveAgyFixAdmission({ taskKind: 'test-fix', size: 1, scope: ['src/__tests__/a.ts'] }, { scope: ['src'] })?.kind)
-      .toBe('test-fix');
+  it('admits a test item inside its declared launch scope', () => {
+    expect(deriveAgyFixAdmission({ taskKind: 'test-fix', size: 1, scope: ['src/__tests__/a.test.ts'] },
+      { scope: ['src/__tests__/a.test.ts'] })?.kind).toBe('test-fix');
   });
-  it.each(['docs/agent', 'docs/agent/testing.md', 'scripts/hooks', 'scripts/hooks/check.mjs',
-    'scripts/lib/review-policy.mjs', 'scripts/lib/new-policy.mjs', 'scripts/lib/critical-work.mjs',
-    'scripts/settings/agy-build.json', '.github', '.github/CODEOWNERS', 'AGENTS.md'])
-  ('refuses effective critical path %s with next-provider/operator fallback', path => {
-    expect(admit({ size: 1, scope: [path] })).toBeNull();
+  it('refuses a test item outside the launch scope', () => {
+    expect(deriveAgyFixAdmission({ size: 1, scope: ['src/a.test.ts'] },
+      { scope: ['src/b.test.ts'] })).toBeNull();
   });
   it('refuses explicit critical metadata even for ordinary scope', () => {
     expect(admit({ size: 1, scope: ['docs/guide.md'], humanRequired: true })).toBeNull();
@@ -75,25 +75,15 @@ describe('repair scope admission', () => {
   ])('refuses explicit %s on mismatched scope %s even at size 1', (taskKind, path) => {
     expect(admit({ taskKind, size: 1, scope: [path] })).toBeNull();
   });
-  it.each(['notes.md', 'notes.mdx', 'notes.txt', 'notes.rst', 'docs', 'docs/example.mjs', 'backlog/item.md', 'agent-memory-src/topic'])
-  ('admits real documentation scope %s', path => {
-    expect(admit({ taskKind: 'doc-fix', size: 1, scope: [`we:${path}`] }))
-      .toEqual({ kind: 'doc-fix', size: 1, scope: [path] });
+  it.each(admissibleTargets)('admits allowlisted path %s independently of kind', path => {
+    expect(isAdmissibleTargetPath(path)).toBe(true);
+    for (const taskKind of ['doc-fix', 'test-fix', 'fix', 'feature'])
+      expect(admit({ taskKind, size: 1, scope: [`we:${path}`] })).not.toBeNull();
   });
-  it.each(['tests', 'tests/helpers/run.mjs', 'src/__tests__', 'src/__tests__/case.ts', 'src/foo.test.ts', 'src/foo.spec.mjs'])
-  ('admits real test scope %s', path => {
-    expect(admit({ taskKind: 'test-fix', size: 1, scope: [path] })?.kind).toBe('test-fix');
-  });
-  it.each(['fix', 'feature'])('admits bounded size-1 source scope for %s', taskKind => {
-    expect(admit({ taskKind, size: 1, scope: ['src/main.ts'] }))
-      .toEqual({ kind: taskKind, size: 1, scope: ['src/main.ts'] });
-  });
-  it.each(['.git/config', '.GIT/config', '.github/workflows/ci.yml', '.github', 'package.json',
-    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'npm-shrinkwrap.json',
-    'docs/.github/workflows/x.yml', 'tests/deep/pnpm-lock.yaml', 'docs/scripts/settings/config.json',
-    'scripts/settings/agy-build.json', 'scripts/settings', 'scripts', 'nested/package.json'])
-  ('refuses protected scope %s with operator fallback via null admission', path => {
-    expect(admit({ taskKind: 'fix', size: 1, scope: [path] })).toBeNull();
+  it.each(refusedTargets)('refuses non-allowlisted scope %s for every kind', path => {
+    expect(isAdmissibleTargetPath(path)).toBe(false);
+    for (const taskKind of ['doc-fix', 'test-fix', 'fix', 'feature'])
+      expect(admit({ taskKind, size: 1, scope: [path] })).toBeNull();
   });
   it.each([
     { size: 1, scope: Array.from({ length: 21 }, (_, i) => `docs/${i}.md`) }, { size: 0, scope: ['a.md'] },

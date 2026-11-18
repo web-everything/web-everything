@@ -1,5 +1,5 @@
-import { constants, openSync, closeSync, fstatSync, readSync, lstatSync, realpathSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, normalize } from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, normalize } from 'node:path';
 
 export const sandboxSecretPaths = home => ['.ssh', '.aws', '.gnupg', '.config/gh',
   'Library/Keychains', '.plateau'].map(p => join(home, p));
@@ -10,67 +10,14 @@ const safePath = p => {
 };
 const inside = (p, root) => p === root || p.startsWith(`${root}/`);
 
-/** Copy bounded config files and empty immediate directories; redirected paths refuse. */
-export function preparePrivateAgyHome(homeDir, privateHomeDir, cloneDir) {
-  const inspect = (relative, optional = false) => {
-    const source = join(homeDir, '.gemini', relative);
-    // Check the nearest existing parent even when optional state has not been created yet.
-    let parent = dirname(source);
-    for (;;) {
-      try { lstatSync(parent); }
-      catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-        parent = dirname(parent);
-        continue;
-      }
-      if (realpathSync(parent) !== parent) throw new Error('redirected agy config');
-      break;
-    }
-    let stat;
-    try { stat = lstatSync(source); }
-    catch (error) {
-      if (optional && error.code === 'ENOENT') return null;
-      throw error;
-    }
-    if (stat.isSymbolicLink()) throw new Error('redirected agy config');
-    return stat;
-  };
-  const copy = relative => {
-    const source = join(homeDir, '.gemini', relative);
-    inspect(relative);
-    const fd = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    try {
-      const stat = fstatSync(fd);
-      if (!stat.isFile() || stat.size > 65536) throw new Error('agy config must be a regular file at most 64KB');
-      const bytes = Buffer.alloc(65537);
-      let length = 0, count;
-      while (length < bytes.length && (count = readSync(fd, bytes, length, bytes.length - length, null))) length += count;
-      if (length > 65536 || length !== stat.size) throw new Error('agy config exceeds 64KB or changed during copy');
-      return bytes.subarray(0, length);
-    } finally { closeSync(fd); }
-  };
+/** Seed private state without reading host settings, MCP config or credentials. */
+export function preparePrivateAgyHome(_homeDir, privateHomeDir, cloneDir) {
   try {
-    const settings = inspect('antigravity-cli/settings.json', true)
-      ? JSON.parse(copy('antigravity-cli/settings.json').toString('utf8')) : {};
-    if (!settings || Array.isArray(settings) || typeof settings !== 'object') throw new Error('invalid agy settings');
-    const config = inspect('config', true);
     const stateDir = join(privateHomeDir, '.gemini/antigravity-cli');
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(stateDir, 'settings.json'), JSON.stringify({ ...settings, trustedWorkspaces: [cloneDir] }), { mode: 0o600, flag: 'wx' });
-    const target = join(privateHomeDir, '.gemini/config');
-    if (config?.isDirectory()) {
-      const entries = readdirSync(join(homeDir, '.gemini/config'));
-      if (entries.length > 16) throw new Error('agy config exceeds 16 entries');
-      mkdirSync(target, { mode: 0o700 });
-      for (const entry of entries) {
-        const relative = join('config', entry);
-        const stat = inspect(relative);
-        if (stat.isDirectory()) mkdirSync(join(target, entry), { mode: 0o700 });
-        else writeFileSync(join(target, entry), copy(relative), { mode: 0o600, flag: 'wx' });
-      }
-    } else if (config) writeFileSync(target, copy('config'), { mode: 0o600, flag: 'wx' });
+    writeFileSync(join(stateDir, 'settings.json'), JSON.stringify({ trustedWorkspaces: [cloneDir] }), { mode: 0o600, flag: 'wx' });
   } catch {
-    throw new Error('private agy config copy failed; use another provider or request operator review');
+    throw new Error('private agy settings preparation failed; use another provider or request operator review');
   }
 }
 

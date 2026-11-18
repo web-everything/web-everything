@@ -11,7 +11,7 @@ import { buildScratchCloneArgv, summarizeAgyEvents, runAgyDirectExec } from '../
 import { buildSandboxEnv, buildSandboxProfile, preparePrivateAgyHome, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
 import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { isAgyFixPathAllowed } from './agy-fix-admission.mjs';
+import { isAdmissibleTargetPath } from './agy-fix-admission.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
 // The juror's SAFE_GIT is private; keep its pins at every git boundary, including injected exec.
@@ -19,9 +19,6 @@ const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'
   '-c', 'core.attributesFile=/dev/null', '-c', 'core.pager=cat', '-c', 'diff.external='];
 const DEFAULTS = { allowedKinds: ['doc-fix', 'test-fix'], maxSize: 1, kindMaxSize: 3 };
 const WRITE_TOOLS = new Set(['write_to_file', 'replace_file_content', 'multi_replace_file_content']);
-const validPath = p => typeof p === 'string' && !!p && !isAbsolute(p)
-  && !/[\x00-\x1f\x7f\\*?\[\]{}:]/.test(p)
-  && !p.split('/').some(s => !s || s === '.' || s === '..' || s.toLowerCase() === '.git');
 const inScope = (p, scope) => scope.some(s => p === s || p.startsWith(`${s}/`));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -180,7 +177,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
         maxSize: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 } });
     log(formatCascadeSourcesLine('agyBuild', resolved));
     if (resolved.invalid.length || typeof kind !== 'string' || !kind.trim() || !Number.isFinite(size) || size < 0
-      || !Array.isArray(scope) || !scope.length || scope.length > 20 || !scope.every(validPath)
+      || !Array.isArray(scope) || !scope.length || scope.length > 20 || !Array.from(scope).every(isAdmissibleTargetPath)
       || typeof laneDir !== 'string' || !laneDir.trim() || typeof task !== 'string' || !task.trim())
       return result('refused', ['missing or invalid kind/size/scope/task/lane; use another fix provider or request human review']);
     if (!(resolved.value.allowedKinds.includes(kind) && size <= resolved.value.kindMaxSize)
@@ -239,7 +236,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     const diffFlags = ['--no-ext-diff', '--no-textconv', '--no-renames'];
     const raw = cloneGit(['-C', clone, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
     const paths = [];
-    const rejectPath = p => !isAgyFixPathAllowed(p, kind) || !inScope(p, scope);
+    const rejectPath = p => !isAdmissibleTargetPath(p) || !inScope(p, scope);
     for (let i = 0; i < raw.length && raw[i]; i += 2) {
       const match = /^:(\d{6}) (\d{6}) [a-f0-9]+ [a-f0-9]+ ([AMD])$/.exec(raw[i]);
       const p = raw[i + 1];

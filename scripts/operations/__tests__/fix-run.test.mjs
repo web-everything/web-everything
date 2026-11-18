@@ -544,6 +544,7 @@ describe('runFixCli', () => {
   it.each([
     ['doc-fix', 1, ['we:docs'], true], ['feature', 1, ['we:docs'], true],
     ['doc-fix', 1, ['scripts/operations/fix-run.mjs'], false], ['test-fix', 1, ['src'], false],
+    ['feature', 1, ['src/main.ts'], false],
     ['doc-fix', 3, ['we:docs'], false], ['doc-fix', 1, [], false],
   ])('real detached dispatch derives repair admission from item %s size %s scope %j', async (taskKind, size, scope, admitted) => {
     const m = mk(['aaa', 'aaa']);
@@ -2129,7 +2130,7 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
   });
 });
 
-it.each([['doc-fix', 'docs'], ['fix', 'src/main.ts'], ['feature', 'src/main.ts']])('fix provider passes %s kind, size and %s scope to the confined Antigravity worker', async (kind, path) => {
+it.each([['doc-fix', 'docs'], ['fix', 'src/a.test.ts'], ['feature', 'README.md']])('fix provider passes %s kind, size and %s scope to the confined Antigravity worker', async (kind, path) => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
   const runTask = vi.fn(async ()=>({status:'ok',finalMessage:'done',stdout:'trace'}));
