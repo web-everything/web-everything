@@ -29,6 +29,15 @@ export function registeredDaemons(root, { env = process.env, exec = execFileSync
   const cloneRoot = canonical(root);
   const labels = new Set(clones.filter(c => canonical(c.path) === cloneRoot).flatMap(c => c.labels));
   if (!labels.size) throw new Error('daemon roster unknown; inspect launchd registrations');
+  // Discovery filters by filename; independently account for EVERY plist in the directory that runs from this clone.
+  for (const name of readdir(dir).filter(n => n.endsWith('.plist'))) {
+    let plist = null;
+    try { plist = readPlistAsJson(join(dir, name), { exec }); } catch { continue; } // unparsable plists cannot run
+    let wd = null;
+    try { wd = typeof plist?.WorkingDirectory === 'string' ? canonical(plist.WorkingDirectory) : null; } catch { /* not this clone */ }
+    if (wd === cloneRoot && !(typeof plist.Label === 'string' && labels.has(plist.Label) && name === `${plist.Label}.plist`))
+      throw new Error('daemon roster incomplete: unregistered plist runs from this clone; inspect launchd registrations');
+  }
   return [...labels].map(id => {
     const plist = readPlistAsJson(join(dir, `${id}.plist`), { exec });
     if (plist?.Label !== id || canonical(plist.WorkingDirectory) !== cloneRoot)

@@ -47,6 +47,14 @@ describe('R986 report-only probation persistence', () => {
     expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
       .toMatchObject({ action: 'pending', owed: ['com.we.Y', 'com.we.X'] });
   });
+  it('refuses a roster when a plist with a non-matching filename also runs from this clone', async () => {
+    const m = await load();
+    const files = { 'com.we.X.plist': { Label: 'com.we.X', WorkingDirectory: root, ProgramArguments: ['node', 'workers/x.mjs'] },
+      'custom-name.plist': { Label: 'com.we.Y', WorkingDirectory: root, ProgramArguments: ['node', 'workers/x.mjs'] } };
+    expect(() => m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
+      readdir: () => Object.keys(files),
+      exec: (_, args) => JSON.stringify(files[basename(args.at(-1))]) })).toThrow(/roster incomplete/);
+  });
   it.each(['duplicate discovery', 'ambiguous label'])('refuses an incomplete roster on %s', async mode => {
     const m = await load();
     expect(() => m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
