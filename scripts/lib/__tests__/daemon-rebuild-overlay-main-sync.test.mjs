@@ -25,7 +25,7 @@ const temps = [], ref = 'lane/fix';
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
 const run = (args, opts = {}) => spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args],
-  { encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024, ...opts, env: { ...process.env, ...opts.env } });
+  { encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024, ...opts, env: { ...process.env, WE_OVERLAY_PRUNE: '0', ...opts.env } });
 const gitCommand = args => args[0] === '--attr-source=origin/main' ? args[1] : args[0];
 const ok = (cwd, args) => { const r = run(args, { cwd }); if (r.status !== 0) throw new Error(`${args}: ${r.stderr}`); return r.stdout.trim(); };
 const write = (root, file, text) => { fs.mkdirSync(dirname(join(root, file)), { recursive: true }); fs.writeFileSync(join(root, file), text); };
@@ -91,7 +91,7 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   ok(root, ['remote', 'add', 'origin', origin]);
   ok(root, ['update-ref', 'refs/remotes/origin/main', mainSha]);
   ok(root, ['update-ref', `refs/remotes/origin/${ref}`, oldSha]);
-  const env = { ...process.env, TMPDIR: base, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'),
+  const env = { ...process.env, WE_OVERLAY_PRUNE: '0', TMPDIR: base, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'),
     WE_DAEMON_STATE_DIR: join(base, 'state'), WE_DAEMON_EVENTS: join(base, 'daemon-events.jsonl'),
     WE_NEEDS_YOU_FEED: join(base, 'needs-you-events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_MAIN_SYNC: 'on' };
   addOverlay(root, { ref, pr: 123 }, { env });

@@ -4435,3 +4435,30 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## Stale overlay prune
+
+`daemon-rebuild/overlay-prune.mjs` runs after the rebuild fetch and before planning, so ancestry
+and conflict probes use the fetched tips. Ready-only and main-only rebuilds skip it. Main-sync
+runs it before selecting registrations (off skips it; shadow previews only). `overlayPrune.enabled`
+defaults on through the policy cascade; `WE_OVERLAY_PRUNE=0` disables it. The effective setting
+and source are logged. `node scripts/daemon-overlay.mjs prune --clone=<path> --dry-run --json`
+previews the candidates without writing counters, events, registrations, or locks.
+
+Only rebuilds increment the consecutive-conflict counter in `<overlay-file>.prune-state`.
+Counts cap at three, reset on clean/unknown evidence, and disappear when unregistered.
+Counter reads use own properties: prototype-named refs such as `constructor` start at zero
+when absent. The named prototype-ref regression checks valid sidecars across repeated runs
+and confirms an unrelated registration can still reach its prune threshold.
+A live PR always retains its overlay; unknown numbered PR state retains it too. Failed or
+incomplete open-PR discovery disables ancestry/conflict pruning. The 1000-head inventory
+bound and the 100-registration per-invocation bound alert for manual registration inspection rather than treating a truncated list as complete.
+Supersession evidence must point directly to a retained overlay or live PR head. A successor
+also selected for pruning cannot justify removing its ancestor; without another retained
+successor, keep the ancestor. The named ancestor/successor regression covers closed, merged,
+and repeated-conflict removal, and the chain regression checks the retained evidence target.
+Confirmed closed/merged PRs can still be pruned. Corrupt counters or pending drops retain all
+registrations and alert for operator repair/recovery. Pruning takes the existing add-guard fence,
+refuses unsettled drop intents, and uses the rebuild's list-locked removal helper with the observed
+registration identity. `overlay-prune.test.mjs` covers these closed paths with injected IO and no network.

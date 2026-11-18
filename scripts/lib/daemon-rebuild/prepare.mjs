@@ -26,6 +26,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
+import { pruneOverlays } from './overlay-prune.mjs';
 import { planRebuild } from './plan.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
@@ -318,7 +319,7 @@ export async function prepareRebuild({
     alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
     if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
   }
-  const overlaysBefore = overlayState.overlays;
+  let overlaysBefore = overlayState.overlays;
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
   // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
   // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
@@ -363,6 +364,16 @@ export async function prepareRebuild({
   }
   unsafe.untracked = remaining;
   if (remaining.length > 0) alert('untracked-kept', { paths: remaining });
+
+  if (!readyOnly && !mainOnly) {
+    pruneOverlays({ root, env, deps: { git, alert: message => alert('overlay-prune-failed', message) } });
+    const remainingOverlays = readOverlayState(root, { env });
+    if (remainingOverlays.corrupt) {
+      alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
+      return terminal({ moved: false, reason: 'overlay-state-corrupt' });
+    }
+    overlaysBefore = remainingOverlays.overlays;
+  }
 
   // ── Step 3: plan + apply list edits ─────────────────────────────────────────────────────────────────
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.

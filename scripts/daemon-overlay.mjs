@@ -106,6 +106,7 @@
  * Accept only if that preview is clean; conflicts with main or other overlays still refuse, and a failed
  * second preview preserves the original refusal.
  */
+import { pruneOverlays } from './lib/daemon-rebuild/overlay-prune.mjs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -713,20 +714,20 @@ export async function withAddGuardLock(root, env, fn, hooks = {}) {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
-  if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops'].includes(cmd)) {
-    fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops, got ${JSON.stringify(cmd ?? null)}`);
+  if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops', 'prune'].includes(cmd)) {
+    fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops|prune, got ${JSON.stringify(cmd ?? null)}`);
     return;
   }
 
   try {
-    pruneStaleOverlayRecords(workspaceFor(dirname(fileURLToPath(import.meta.url))));
+    if (cmd !== 'prune') pruneStaleOverlayRecords(workspaceFor(dirname(fileURLToPath(import.meta.url))));
   } catch { /* self-heal is best-effort */ }
   const flags = parseFlags(rest);
   const clone = typeof flags.clone === 'string' ? flags.clone : null;
   if (!clone) return fail('--clone=<path> is required');
   const root = resolve(clone);
 
-  if (cmd !== 'list' && cmd !== 'recover-drops' && typeof flags.ref !== 'string') {
+  if (cmd !== 'prune' && cmd !== 'list' && cmd !== 'recover-drops' && typeof flags.ref !== 'string') {
     return fail(`--ref=<branch> is required for ${cmd}`);
   }
   if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
@@ -755,7 +756,11 @@ async function main() {
   const env = process.env;
 
   let output;
-  if (cmd === 'list') {
+  if (cmd === 'prune') {
+    const listing = pruneOverlays({ root, env, dryRun: !!flags['dry-run'], deps: { countConflicts: false } });
+    process.stdout.write(asJson ? `${JSON.stringify(listing)}\n` : listing.map(o => `${String(o.ref).replace(/[\p{Cc}\p{Cf}]/gu, '')} pr=${o.pr ?? 0} ${o.reason}\n`).join(''));
+    return;
+  } else if (cmd === 'list') {
     // A corrupt file must not read as a plain empty list: flag it and exit 1 (add/remove throw on it instead).
     const state = readOverlayState(root, { env });
     output = state.corrupt ? { list: [], corrupt: true } : { list: state.overlays };

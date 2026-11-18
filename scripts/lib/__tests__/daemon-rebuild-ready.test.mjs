@@ -76,7 +76,7 @@ function makeFixture() {
   gitOk(cloneDir, ['push', '-q', '-u', 'origin', 'main']);
   gitOk(cloneDir, ['fetch', '-q', 'origin']);
   const env = {
-    ...process.env,
+    ...process.env, WE_OVERLAY_PRUNE: '0',
     WE_DAEMON_STATE_DIR: mktemp('we-rebuild-ready-state-'),
     WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-rebuild-ready-lock-'),
     WE_DAEMON_OVERLAY_DIR: mktemp('we-rebuild-ready-overlay-'),

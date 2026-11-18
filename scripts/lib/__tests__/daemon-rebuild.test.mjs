@@ -123,7 +123,7 @@ function makeFixture() {
   const lockDir = mktemp('we-daemon-rebuild-lock-');
   const overlayDir = mktemp('we-daemon-rebuild-overlay-');
   const env = {
-    ...process.env,
+    ...process.env, WE_OVERLAY_PRUNE: '0',
     WE_DAEMON_STATE_DIR: stateDir,
     WE_DAEMON_CLONE_LOCK_ROOT: lockDir,
     WE_DAEMON_OVERLAY_DIR: overlayDir,
