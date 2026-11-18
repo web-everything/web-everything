@@ -4,8 +4,11 @@ import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import * as childProcess from 'node:child_process';
 import { once } from 'node:events';
 import * as guard from '../daemon-host-guard.mjs';
+
+vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal() }));
 
 const ME = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
@@ -106,6 +109,39 @@ describe('fresh ownership only', () => {
 });
 
 describe('opaque local identity', () => {
+  it.each([0, 7])('legacy discovery uses the remaining resolver budget after %i ms of source work', async (sourceMs) => {
+    let now = 1000;
+    const started = now;
+    // Model a synchronous 100 ms scutil call that respects its supplied timeout.
+    const exec = vi.spyOn(childProcess, 'execFileSync').mockImplementation((_file, _args, options) => {
+      now += Math.min(100, options.timeout);
+      if (options.timeout < 100) throw new Error('scutil timed out');
+      return 'legacy-alpha\n';
+    });
+    try {
+      const decision = await resolve(() => { now += sourceMs; return record('legacy-alpha'); }, {
+        legacyOwnerValues: LEGACY_ALIASES, timeoutMs: 20, clock: () => now,
+      });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith('scutil', ['--get', 'HostName'],
+        expect.objectContaining({ timeout: 20 - sourceMs }));
+      expect(now - started).toBeLessThanOrEqual(20);
+      expect(decision).toEqual({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+    } finally { exec.mockRestore(); }
+  });
+
+  it.each([20, 21])('legacy discovery skips scutil when the resolver budget expired after %i ms', async (sourceMs) => {
+    let now = 1000;
+    const exec = vi.spyOn(childProcess, 'execFileSync').mockReturnValue('legacy-alpha\n');
+    try {
+      const decision = await resolve(() => { now += sourceMs; return record('legacy-alpha'); }, {
+        legacyOwnerValues: LEGACY_ALIASES, timeoutMs: 20, clock: () => now,
+      });
+      expect(exec).not.toHaveBeenCalled();
+      expect(decision).toEqual({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+    } finally { exec.mockRestore(); }
+  });
+
   it('generates once, persists mode 600, and independent homes have different IDs', () => {
     const root = home();
     const id = guard.getThisHost({ home: root });

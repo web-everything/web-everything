@@ -79,12 +79,15 @@ export function getThisHost({ home = homedir(), create = true } = {}) {
 }
 
 /** Local name consulted only for deprecated aliases; any failure fails closed (no OS-hostname fallback). */
-export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = getLegacyOwnerValues() } = {}) {
+export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = getLegacyOwnerValues(),
+  timeoutMs = READ_TIMEOUT_MS } = {}) {
   if (!isBindings(legacyOwnerValues) || Object.keys(legacyOwnerValues).length === 0) return '';
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return '';
+  const timeout = Math.min(READ_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
   let name;
   try {
     name = String(exec('scutil', ['--get', 'HostName'], {
-      encoding: 'utf8', timeout: READ_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     })).trim();
   } catch { return ''; }
   return legacyOwner(name, legacyOwnerValues) ? name : '';
@@ -168,8 +171,9 @@ export async function resolveHostRole({ thisHost = getThisHost(), legacyOwnerVal
       return { ...standby('invalid-input'), source: 'remote-failed' };
     }
     const started = clock();
+    const deadline = started + timeoutMs;
     const result = await Promise.race([
-      Promise.resolve().then(() => source.readOwner({ deadline: started + timeoutMs, clock })),
+      Promise.resolve().then(() => source.readOwner({ deadline, clock })),
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('owner read timeout')), timeoutMs); }),
     ]);
     if (!result || Object.keys(result).some((key) => !['host', 'version'].includes(key))
@@ -178,7 +182,14 @@ export async function resolveHostRole({ thisHost = getThisHost(), legacyOwnerVal
       || /[^A-Za-z0-9._-]/.test(result.version)) {
       throw new Error('unexpected owner result');
     }
-    const localAlias = legacyOwner(result.host, legacyOwnerValues) ? legacyHost ?? getLegacyHost({ legacyOwnerValues }) : '';
+    let localAlias = '';
+    if (legacyOwner(result.host, legacyOwnerValues)) {
+      if (legacyHost != null) localAlias = legacyHost;
+      else {
+        const remaining = Math.max(0, deadline - clock());
+        if (remaining > 0) localAlias = getLegacyHost({ legacyOwnerValues, timeoutMs: remaining });
+      }
+    }
     const finished = clock();
     if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started
       || finished - started >= timeoutMs) throw new Error('owner read expired');
