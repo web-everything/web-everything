@@ -8,7 +8,32 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 
 const DEFAULT_RECORD_PATH = '~/workspace/.operations/coordination/audits.jsonl';
-const SETTINGS = new URL('../settings/prototype-load.json', import.meta.url);
+/**
+ * The one settings file the audit writer reads: beside THIS script, never the audited checkout's own.
+ * node:url's URL, not the global (a DOM test environment replaces the global with a non-file URL).
+ */
+export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/prototype-load.json', import.meta.url));
+
+/**
+ * Read the writer's settings (absent file = {}, unreadable/malformed throws). Shared by the writer and
+ * the open-PR gate so both resolve the same audit record file for any audited checkout (#7011).
+ */
+export function readAuditSettings(readFile = realFs.readFileSync) {
+  let settings;
+  try { settings = JSON.parse(readFile(AUDIT_SETTINGS_PATH, 'utf8')); }
+  catch (error) { if (error?.code !== 'ENOENT') throw error; return {}; }
+  // A JSON null/array/scalar is malformed for writer and gate alike, never a silent default.
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('audit settings malformed');
+  return settings;
+}
+
+/** Resolve the audit record path exactly as appendRecord writes it: `~` = home, relative = the audited cwd. */
+export function resolveAuditRecordPath(settings, { home, cwd }) {
+  const configured = settings?.auditRecordPath ?? DEFAULT_RECORD_PATH;
+  if (typeof configured !== 'string' || !configured.trim()) throw new Error('invalid auditRecordPath');
+  return configured.startsWith('~/') ? join(home, configured.slice(2))
+    : configured === '~' ? home : resolve(cwd, configured);
+}
 
 /** The launcher streams JSONL before its final (potentially pretty-printed) JSON report. */
 function readReport(stdout) {
@@ -68,11 +93,5 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
 
 /** Shared strict path resolution for the writer and the explicit genesis migration. */
 export function auditRecordPath({ cwd = process.cwd(), home = homedir(), fs = realFs } = {}) {
-  let settings;
-  try { settings = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; settings = {}; }
-  const configured = settings.auditRecordPath ?? DEFAULT_RECORD_PATH;
-  if (typeof configured !== 'string' || !configured.trim()) throw new Error('invalid auditRecordPath');
-  return configured.startsWith('~/') ? join(home, configured.slice(2))
-    : configured === '~' ? home : resolve(cwd, configured);
+  return resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
 }

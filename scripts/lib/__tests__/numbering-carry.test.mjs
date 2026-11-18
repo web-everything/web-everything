@@ -1,7 +1,7 @@
 /** The #5025 regression: only proven drain numbering can carry a recorded acceptance. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +12,7 @@ import {
   resolveNumberingHumanClearanceSetting, MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
   planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering as restampWithoutGuard,
   _resetNumberingRestampMemo, numberingWithdrawalOwed, strandedNumberingRecords, MAX_WITHDRAWALS_PER_PASS,
-  readExtraMap,
+  readExtraMap, numberingGitRunner, proveNumberingWithRunner,
 } from '../numbering-carry.mjs';
 import { decideDrainReviewGate } from '../../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
@@ -354,57 +354,124 @@ describe('checkNumberingCommit', () => {
   });
 });
 
-// Exercise the actual IO shell without writing git state: exec observes the same raw
-// bytes cat-file returns, including bytes a permissive UTF-8 decoder would discard.
+// Real objects exercise the owned runner. Trace2 observes child argv without replacing any Git read.
 function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree, mainAliases = '', grepStatus, modes = {} } = {}) {
-  const from = 'a'.repeat(40), numbered = 'b'.repeat(40);
-  const heads = [numbered, 'e'.repeat(40)];
-  const head = heads[subjects.length - 1];
-  const calls = [];
-  const reads = [];
-  // Blobs are keyed by object id, as the proof reads them (never by `<rev>:<path>`).
-  const blobs = new Map();
-  const oids = new Map();
-  const oidFor = (key, bytes) => {
-    const oid = (blobs.size + 1).toString(16).padStart(40, '0');
-    blobs.set(oid, Buffer.from(bytes));
-    oids.set(key, oid);
-  };
-  for (const c of changes) {
-    if (c.before !== undefined) oidFor(`before:${c.path}`, c.before);
-    if (c.after !== undefined) oidFor(`after:${c.path}`, c.after);
+  const r = repo();
+  const { cwd, git } = r;
+  const put = (path, bytes) => { mkdirSync(dirname(join(cwd, path)), { recursive: true }); writeFileSync(join(cwd, path), bytes); };
+  git(['rm', '-r', '-q', '.']);
+  put('main-inventory.txt', 'main inventory\n');
+  for (const path of trees['origin/main'] ?? []) put(path, 'existing');
+  for (const line of mainAliases.split('\n').filter(Boolean)) {
+    const [, path, content] = /origin\/main:(.*?):(.*)/.exec(line);
+    put(path, `${content}\n`);
   }
-  const zero = '0'.repeat(40);
-  const exec = (_cmd, args, opts) => {
-    calls.push(args);
-    reads.push({ args, maxBuffer: opts.maxBuffer, timeout: opts.timeout });
-    let output = '';
-    if (args[0] === 'rev-parse') output = from;
-    else if (args[0] === 'rev-list') output = subjects.map((_s, i) => `${heads[i]} ${i ? heads[i - 1] : from}\n`).join('');
-    else if (args[0] === 'log') output = `${subjects[heads.indexOf(args.at(-1))]}\n`;
-    else if (args[0] === 'grep') {
-      if (grepStatus !== undefined) throw Object.assign(Error('grep failed'), { status: grepStatus });
-      output = mainAliases;
-    } else if (args[0] === 'ls-tree') {
-      if (args.includes(failTree)) throw Error('inventory unreadable');
-      const ref = args.find((a) => a === from || a === 'origin/main');
-      output = (trees[ref] ?? []).map((p) => `${p}\0`).join('');
-    } else if (args[0] === 'diff-tree') {
-      output = changes.map((c) => {
-        const m = modes[c.path] ?? {};
-        const beforeMode = c.status === 'A' ? '000000' : (m.beforeMode ?? '100644');
-        const afterMode = c.status === 'D' ? '000000' : (m.afterMode ?? '100644');
-        return `:${beforeMode} ${afterMode} ${oids.get(`before:${c.path}`) ?? zero} ${oids.get(`after:${c.path}`) ?? zero} ${c.status}\0${c.path}\0`;
-      }).join('');
-    } else if (args[0] === 'cat-file' && ['blob', '-s', '-t'].includes(args[1])) {
-      const bytes = blobs.get(args[2]);
-      if (!bytes) throw Error(`missing fixture blob ${args[2]}`);
-      output = args[1] === '-t' ? 'blob\n' : args[1] === '-s' ? `${bytes.length}\n` : bytes;
+  if (grepStatus === 128) git(['config', 'grep.threads', '-1']);
+  git(['add', '-A']); git(['commit', '--allow-empty', '-q', '-m', 'main inventory']);
+  const main = git(['rev-parse', 'HEAD']);
+  git(['update-ref', 'refs/remotes/origin/main', main]);
+  git(['rm', '-r', '-q', '--ignore-unmatch', '.']);
+  for (const path of trees['a'.repeat(40)] ?? []) put(path, 'existing');
+  for (const c of changes) if (c.before !== undefined) put(c.path, c.before);
+  git(['add', '-A']);
+  for (const [path, mode] of Object.entries(modes)) if (mode.beforeMode === '100755') git(['update-index', '--chmod=+x', path]);
+  git(['commit', '--allow-empty', '-q', '-m', 'accepted head']);
+  const from = git(['rev-parse', 'HEAD']);
+  for (const c of changes) {
+    if (c.after === undefined) rmSync(join(cwd, c.path), { force: true });
+    else put(c.path, c.after);
+  }
+  git(['add', '-A']);
+  for (const [path, mode] of Object.entries(modes)) if (mode.afterMode === '100755') git(['update-index', '--chmod=+x', path]);
+  for (const message of subjects) git(['commit', '--allow-empty', '-q', '-m', message]);
+  const head = git(['rev-parse', 'HEAD']);
+  const removeObject = oid => rmSync(join(cwd, '.git', 'objects', oid.slice(0, 2), oid.slice(2)));
+  if (failTree) removeObject(git(['rev-parse', `${failTree === 'origin/main' ? main : from}^{tree}`]));
+  const calls = [];
+  const exec = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd });
+  const prove = () => {
+    const trace = join(cwd, 'proof-trace.json');
+    const previous = process.env.GIT_TRACE2_EVENT;
+    process.env.GIT_TRACE2_EVENT = trace;
+    let result;
+    try { result = proveNumberingOnlyMove({ exec, cwd, fromSha: from, toSha: head }); }
+    finally {
+      if (previous === undefined) delete process.env.GIT_TRACE2_EVENT;
+      else process.env.GIT_TRACE2_EVENT = previous;
     }
-    return opts.encoding === null ? Buffer.from(output) : Buffer.isBuffer(output) ? output.toString('utf8') : output;
+    for (const line of readFileSync(trace, 'utf8').trim().split('\n')) {
+      const event = JSON.parse(line);
+      if (event.event !== 'start') continue;
+      const args = event.argv.slice(1);
+      while (args[0] === '-c') args.splice(0, 2);
+      calls.push(args);
+    }
+    return result;
   };
-  return { calls, reads, exec, from, head, prove: () => proveNumberingOnlyMove({ exec, fromSha: from, toSha: head }) };
+  return { calls, exec, from, head, cwd, git, prove };
 }
+
+describe('owned numbering Git runner bounds', () => {
+  it('applies exact timeout, byte caps, hardened environment and pins to every proof read', () => {
+    const r = proofReader();
+    r.git(['config', 'remote.secondary.promisor', 'true']);
+    const run = vi.fn(execFileSync);
+    const runner = numberingGitRunner({ cwd: r.cwd, run });
+    expect(proveNumberingWithRunner({ fromSha: r.from, toSha: r.head }, runner)).toMatchObject({ ok: true });
+    expect(runner.readFailed).toBe(false);
+    const calls = run.mock.calls;
+    expect(calls.some(([, args]) => args.includes('blob'))).toBe(true);
+    for (const [cmd, args, options] of calls) {
+      expect(cmd).toBe('git');
+      expect(options).toMatchObject({ cwd: r.cwd, timeout: 5000, encoding: null,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        maxBuffer: args.includes('blob') ? 1024 * 1024 : 8 * 1024 * 1024,
+        env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent', GIT_TERMINAL_PROMPT: '0' } });
+      expect(options.env.GIT_CONFIG_PARAMETERS).toBeUndefined();
+      const config = Object.fromEntries(Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(config).toMatchObject({ 'core.hooksPath': '/dev/null', 'core.fsmonitor': 'false',
+        'credential.helper': '', 'core.askPass': '', 'log.showSignature': 'false' });
+      expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false']);
+      if (!args.includes('--get-regexp')) expect(args.slice(6, 8)).toEqual(['-c', 'remote.secondary.promisor=false']);
+    }
+  });
+  it.each([['grep', 1, false], ['config', 1, false], ['ls-tree', 1, true], ['grep', 128, true], ['config', 128, true]])(
+    'records %s status %s as readFailed=%s', (command, status, failed) => {
+      const runner = numberingGitRunner({ run: (_cmd, args) => {
+        if (args.includes('--get-regexp') && command !== 'config') throw Object.assign(Error('no config'), { status: 1 });
+        throw Object.assign(Error('read error'), { status });
+      } });
+      expect(() => runner.gitBytes([command, ...(command === 'config' ? ['--get-regexp', 'remote'] : [])], { maxBuffer: 8 * 1024 * 1024, timeout: 5000 })).toThrow('read error');
+      expect(runner.readFailed).toBe(failed);
+    });
+  it('fails closed on real Git buffer overflow and refuses oversized proof blobs before reading them', () => {
+    const changes = live().changes;
+    changes[1].before = 'x'.repeat(8 * 1024 * 1024 + 1);
+    const r = proofReader({ changes });
+    const oid = r.git(['rev-parse', `${r.from}:${changes[1].path}`]);
+    for (const args of [['cat-file', 'blob', oid], ['cat-file', '-p', oid]]) {
+      const runner = numberingGitRunner({ cwd: r.cwd });
+      expect(() => runner.gitBytes(args, { maxBuffer: args[1] === 'blob' ? 1024 * 1024 : 8 * 1024 * 1024, timeout: 5000 })).toThrow();
+      expect(runner.readFailed).toBe(true);
+    }
+    expect(r.prove()).toMatchObject({ ok: false, reason: expect.stringMatching(/byte.*limit/) });
+    expect(r.calls.some(args => args[0] === 'cat-file' && args[1] === 'blob' && args[2] === oid)).toBe(false);
+  });
+  it('fails closed with readFailed on a real Git timeout at the catch boundary', () => {
+    const r = proofReader();
+    const oid = r.git(['rev-parse', 'origin/main^{tree}']);
+    const objectPath = join(r.cwd, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+    rmSync(objectPath);
+    execFileSync('mkfifo', [objectPath]);
+    expect(r.prove()).toMatchObject({ ok: false, retryable: true, readFailed: true,
+      reason: expect.stringMatching(/ETIMEDOUT/) });
+  }, 15000);
+  it('returns readFailed=false for refusals before any Git read', () => {
+    expect(proveNumberingOnlyMove()).toMatchObject({ ok: false, readFailed: false });
+  });
+});
 
 describe('proveNumberingOnlyMove read-only regressions', () => {
   const codeChanges = (hash = 'x1b8hlo', number = '5726') => [...live().changes,
@@ -482,18 +549,13 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
   });
   it('bounds blob reads before code rewrite validation', () => {
     const changes = codeChanges();
-    changes.unshift({ status: 'M', path: 'scripts/large.mjs', before: 'x'.repeat(MAX_NUMBERING_BLOB_BYTES + 1), after: '6053' });
+    changes.unshift({ status: 'M', path: '000-large.mjs', before: 'x'.repeat(MAX_NUMBERING_BLOB_BYTES + 1), after: '6053' });
     const oversized = proofReader({ changes });
     refused(oversized.prove(), /byte.*limit/);
     expect(oversized.calls.filter((a) => a[0] === 'cat-file' && a[1] === 'blob')).toEqual([]);
     const bounded = proofReader({ changes: codeChanges('xf74q20', '6053') });
     expect(bounded.prove().ok).toBe(true);
-    const blobReads = bounded.reads.filter(({ args }) => args[0] === 'cat-file' && args[1] === 'blob');
-    expect(blobReads.length).toBeGreaterThan(0);
-    expect(blobReads.every(({ maxBuffer, timeout }) => maxBuffer === MAX_NUMBERING_BLOB_BYTES && timeout === 5000)).toBe(true);
-    const oversizedOutput = (cmd, args, opts) => args[0] === 'cat-file' && args[1] === 'blob'
-      ? Buffer.alloc(MAX_NUMBERING_BLOB_BYTES + 1) : bounded.exec(cmd, args, opts);
-    refused(proveNumberingOnlyMove({ exec: oversizedOutput, fromSha: bounded.from, toSha: bounded.head }), /byte limit/);
+    expect(bounded.calls.some((args) => args[0] === 'cat-file' && args[1] === 'blob')).toBe(true);
   });
   it('refuses a numbering commit that rewrites an existing card\'s bornAs through a main alias (red team #5233)', () => {
     const existing = { status: 'M', path: 'backlog/9000-existing.md', before: '---\nbornAs: xdef456\n---\nbody\n' };
@@ -609,13 +671,13 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
     const r = proofReader({ changes, commitSubject: kind === 'subject' ? 'ordinary author change' : subject,
       trees: kind === 'collision' ? { 'origin/main': ['backlog/6053-existing.md'] } : {} });
     const headDiff = 'diff --git a/x b/x\n-old\n+numbered\n';
-    const carry = proveHumanClearanceCarry({ exec: r.exec, evidence: {
+    const carry = proveHumanClearanceCarry({ exec: r.exec, cwd: r.cwd, evidence: {
       humanClearance: { sha: r.from, diff: normalizeDiffFingerprint('diff --git a/x b/x\n-old\n+new\n'), actor: 'chalbert' },
       headSha: r.head, headDiffSha: r.head, headDiff,
     } });
     expect(carry).toMatchObject({ carry: false, applicable: true });
     const writes = [];
-    const restamp = restampAfterNumbering({ netPatchSetting: { value: false, source: 'test-numbering-only' }, repo: 'o/n', pr: 5025, exec: r.exec,
+    const restamp = restampAfterNumbering({ netPatchSetting: { value: false, source: 'test-numbering-only' }, repo: 'o/n', pr: 5025, exec: r.exec, cwd: r.cwd,
       state: { labels: ['review:pending'], headRefOid: r.head,
         comments: [{ author: { login: 'chalbert' }, body: `✅ review — human cleared\n<!-- reviewed-sha: ${r.from} -->\n<!-- cleared-human: chalbert -->` }] },
       reviews: [], enabled: true, acceptCarry: 'on', guardReferrals: () => {},
@@ -724,8 +786,8 @@ describe('proveNumberingOnlyMove (real git)', () => {
     r.git(['commit', '--amend', '--no-edit', '-q']);
     const toSha = r.git(['rev-parse', 'HEAD']);
     expect(r.git(['-c', 'core.precomposeunicode=false', 'diff', '--name-only', fromSha, toSha])).toContain('0003-cafe');
-    const exec = (cmd, args, opts) => execFileSync(cmd, ['-c', 'core.precomposeunicode=true', ...args], opts);
-    refused(proveNumberingOnlyMove({ exec, cwd: r.cwd, fromSha, toSha }), /rewrite/);
+    r.git(['config', 'core.precomposeunicode', 'true']);
+    refused(proveNumberingOnlyMove({ cwd: r.cwd, fromSha, toSha }), /rewrite/);
   });
   // Self-review (#5233): porcelain `git diff` drops a gitlink when submodules are configured as ignored, so the mode
   // allow-list never saw it. The raw diff is plumbing with --ignore-submodules=none.
@@ -734,8 +796,8 @@ describe('proveNumberingOnlyMove (real git)', () => {
     r.number();
     r.git(['update-index', '--add', '--cacheinfo', `160000,${r.base},backlog/sub`]);
     r.git(['commit', '--amend', '--no-edit', '-q']);
-    const exec = (cmd, args, opts) => execFileSync(cmd, ['-c', 'diff.ignoreSubmodules=all', ...args], opts);
-    refused(r.prove(r.git(['rev-parse', 'HEAD']), exec), /mode/);
+    r.git(['config', 'diff.ignoreSubmodules', 'all']);
+    refused(r.prove(r.git(['rev-parse', 'HEAD'])), /mode/);
   });
   it('refuses numbering combined with an NFC → NFD re-encoding of a card', () => {
     const r = repo();
@@ -778,23 +840,19 @@ describe('proveNumberingOnlyMove (real git)', () => {
     r.git(['add', '-A']); r.git(['commit', '--amend', '--no-edit', '-q']);
     const toSha = r.git(['rev-parse', 'HEAD']);
     expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha }).ok).toBe(true);
-    const unavailable = (cmd, args, opts) => {
-      if (args[0] === 'grep') throw Error('temporary alias read failure');
-      return execFileSync(cmd, args, opts);
-    };
-    expect(proveNumberingOnlyMove({ exec: unavailable, cwd: r.cwd, fromSha, toSha })).toMatchObject({ ok: false, retryable: true });
     expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha, mainRef: 'missing' })).toMatchObject({ ok: false, retryable: true });
     const plain = repo();
     const head = plain.number();
     expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: plain.cwd, fromSha: plain.base, toSha: head, mainRef: 'missing' }))
       .toMatchObject({ ok: false, retryable: true });
   });
-  it('refuses unreadable commits without throwing, fetching only once', () => {
+  it('refuses unreadable commits without throwing, retryable without caller IO', () => {
     const r = repo();
-    const calls = [];
-    const exec = (cmd, args, opts) => { calls.push(args); return execFileSync(cmd, args, opts); };
-    refused(r.prove('abcdef0123456789abcdef0123456789abcdef0123', exec), /failed|readable/);
-    expect(calls.filter((args) => args[0] === 'fetch')).toHaveLength(1);
+    const exec = vi.fn(() => { throw Error('caller must not run'); });
+    const result = r.prove('abcdef0123456789abcdef0123456789abcdef0123', exec);
+    refused(result, /failed|readable/);
+    expect(result.retryable).toBe(true);
+    expect(exec).not.toHaveBeenCalled();
   });
   it('proves successive numbering commits and refuses a chain beyond the limit', () => {
     const r = repo();
@@ -819,39 +877,57 @@ describe('proveNumberingOnlyMove (real git)', () => {
     const toSha = r.number();
     refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha }), /linear/);
   });
-  it('rechecks after fetching once and passes cwd and the blob buffer limit to every call', () => {
+  it('owns its reader even with no exec or a throwing caller exec', () => {
     const r = repo();
-    const head = r.number();
-    const calls = [];
-    let unreadable = true;
-    const exec = (cmd, args, opts) => {
-      calls.push(args);
-      expect(opts.cwd).toBe(r.cwd);
-      expect(opts.maxBuffer).toBe(args[0] === 'cat-file' && args[1] === 'blob' ? MAX_NUMBERING_BLOB_BYTES : 8 * 1024 * 1024);
-      expect(opts.encoding).toBeNull();
-      expect(opts.timeout).toBe(5000);
-      if (args[0] === 'cat-file' && args[1] === '-e' && unreadable) {
-        unreadable = false;
-        throw new Error('simulated missing object');
-      }
-      if (args[0] === 'fetch') return Buffer.alloc(0);
-      return execFileSync(cmd, args, opts);
-    };
-    expect(r.prove(head, exec).ok).toBe(true);
-    expect(calls.slice(0, 3)).toEqual([
-      ['cat-file', '-e', `${r.base}^{commit}`],
-      ['fetch', '--no-tags', '-q', 'origin', r.base],
-      ['cat-file', '-e', `${r.base}^{commit}`],
-    ]);
+    const toSha = r.number();
+    const exec = vi.fn(() => { throw Error('caller must not run'); });
+    expect(r.prove(toSha, exec).ok).toBe(true);
+    expect(proveNumberingOnlyMove({ cwd: r.cwd, fromSha: r.base, toSha }).ok).toBe(true);
+    expect(exec).not.toHaveBeenCalled();
+    refused(proveNumberingOnlyMove(), /no head/);
   });
-  it.each(['rev-list', 'log', 'diff-tree', 'cat-file'])('fails closed on a %s read error', (operation) => {
+  it.each([['origin', false], ['other', false], ['origin', true], ['other', true]])('never lazy-fetches missing heads from partial clone promisor %s (trace: %s)', (remote, traced) => {
     const r = repo();
     const head = r.number();
-    const exec = (cmd, args, opts) => {
-      if (args[0] === operation && (operation !== 'cat-file' || args[1] === 'blob')) throw new Error('read failed');
-      return execFileSync(cmd, args, opts);
-    };
-    refused(r.prove(head, exec), /failed/);
+    const marker = join(r.cwd, 'helper-ran');
+    const helper = join(r.cwd, 'upload-pack-helper');
+    writeFileSync(helper, '#!/bin/sh\nprintf ran > "' + marker + '"\nexit 1\n', { mode: 0o755 });
+    r.git(['config', 'extensions.partialClone', remote]);
+    r.git(['config', `remote.${remote}.promisor`, 'true']);
+    r.git(['config', `remote.${remote}.url`, r.cwd]);
+    r.git(['config', `remote.${remote}.uploadpack`, helper]);
+    // Even a lane-specific transport allow cannot authorize a lazy fetch.
+    r.git(['config', 'protocol.file.allow', 'always']);
+    const missing = 'abcdef0123456789abcdef0123456789abcdef0123';
+    const exec = vi.fn(() => { throw Error('unexpected caller process'); });
+    const traceEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('GIT_TRACE')));
+    for (const key of Object.keys(traceEnv)) delete process.env[key];
+    const trace = join(r.cwd, 'promisor-trace.json');
+    if (traced) process.env.GIT_TRACE2_EVENT = trace;
+    try {
+      for (const [fromSha, toSha] of [[r.base, missing], [missing, head]]) {
+        const result = proveNumberingOnlyMove({ exec, cwd: r.cwd, fromSha, toSha });
+        refused(result, /failed/);
+        expect(result.retryable).toBe(true);
+      }
+    } finally {
+      delete process.env.GIT_TRACE2_EVENT;
+      Object.assign(process.env, traceEnv);
+    }
+    if (traced) {
+      const events = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(events.some(event => event.event === 'start')).toBe(true);
+      expect(events.filter(event => event.event === 'child_start')).toEqual([]);
+    }
+    expect(exec).not.toHaveBeenCalled();
+    expect(existsSync(marker)).toBe(false);
+  });
+  it.each(['commit', 'tree', 'blob'])('fails closed on a genuinely missing %s object', (kind) => {
+    const r = repo();
+    const head = r.number();
+    const oid = kind === 'commit' ? head : r.git(['rev-parse', kind === 'tree' ? `${head}^{tree}` : `${head}:backlog/7001-foo.md`]);
+    rmSync(join(r.cwd, '.git', 'objects', oid.slice(0, 2), oid.slice(2)));
+    expect(r.prove(head)).toMatchObject({ ok: false, retryable: true });
   });
   it('exports the bounded chain limit', () => expect(MAX_NUMBERING_COMMITS).toBe(5));
 });
@@ -1321,17 +1397,16 @@ describe('numbering acceptance restamp', () => {
   });
   it('retries a transient proof read failure on the same head', () => {
     const r = repo(); const head = r.number();
-    let fail = true;
+    const objectPath = join(r.cwd, '.git', 'objects', head.slice(0, 2), head.slice(2));
+    const objectBytes = readFileSync(objectPath);
+    rmSync(objectPath);
     const calls = [];
     const opts = { cwd: r.cwd, state: { labels: ['review:pending'], headRefOid: head, comments: [accept(r.base)] },
-      exec: (cmd, args, opts) => {
-        if (fail) throw Error('fetch unavailable');
-        return execFileSync(cmd, args, opts);
-      }, provider: {
+      exec: execFileSync, provider: {
       postComment: () => calls.push('comment'), setLabels: () => calls.push('labels') },
     };
     expect(run(opts).action).toBe('retry');
-    fail = false;
+    writeFileSync(objectPath, objectBytes);
     expect(run(opts).action).toBe('restamped');
     expect(calls).toEqual(['comment', 'labels']);
   });
