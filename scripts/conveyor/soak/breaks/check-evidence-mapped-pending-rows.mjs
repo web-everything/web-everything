@@ -5,9 +5,10 @@
  *
  * Replay: map a complete current-head GraphQL rollup through the production mapper, resolve it, and require
  * queued/running -> pending, completed success -> pass, and a non-empty conclusion on a running row -> unknown.
- * The fix is decided by behaviour: the replay runs in a child process against the tree under test.
+ * The replay runs in a child process against the tree under test; fixPresent only checks the resolver exists.
  */
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,7 +41,9 @@ export default {
   card: 'PR #7084 red-team confirmed break (check-state-predicate.mjs:204)',
   fixedBy: { sha: 'lane/ce-s1-plumbing', where: 'lane/ce-s1-plumbing', paths: ['scripts/lib/check-state-predicate.mjs'] },
   fixPresent(root) {
-    try { return replay(root)[0] === 'pending'; } catch { return false; }
+    // Only the subject's presence is checked here; probing the behaviour would turn a regression into an
+    // expected failure (it.fails). Once the resolver exists, the replay must be green.
+    try { return readFileSync(join(root, 'scripts/lib/check-state-predicate.mjs'), 'utf8').includes('export function resolveRequiredChecks'); } catch { return false; }
   },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {
     const violations = [];
