@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/real-process-guard.test.mjs',
+    scope: 'full',
+    why: 'lists every tracked *.real.test.mjs and checks each is in the real-tier manifest and starts a real process; a rename or manifest edit anywhere must re-run it',
+    matches: (f) => /\.real\.test\.mjs$/.test(f) || f === 'scripts/settings/real-tier-manifest.json' || f === 'vitest.config.ts' || f === 'vitest.real.config.ts',
+    inputs: ['scripts/__tests__/real-process-guard.test.mjs', 'scripts/settings/real-tier-manifest.json', 'scripts/settings/real-process-test-baseline.json'],
+  },
+  {
     test: 'scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs',
     scope: 'files',
     why: 'inventories health-watch and stale-state command/helper calls so new destructive lane actions require guard coverage',
@@ -139,7 +146,6 @@ export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/readiness/__tests__/forge-r352-sample-secret-files.test.mjs': 'false positive: reads a fixed list of 14 named files plus a readdirSync of backlog/ only to locate four cards by number; not a repo-wide rule scanner',
   'scripts/readiness/__tests__/forge-exec-run.test.mjs': 'false positive: its `function walk(` is inside a string fixture and an in-memory snapshot checker; it enumerates only mkdtemp fixtures, never the live repo (also red on #6017)',
   'scripts/backlog/__tests__/number-at-birth-cli.test.mjs': 'false positive: readdirSync(join(root, ...)) enumerates only the mkdtempSync CLI fixture backlog, never the live repo; this is a hermetic CLI integration test, not a repo rule scanner',
-  'scripts/__tests__/real-process-guard.test.mjs': 'R1063a guard: reads the tracked test list only to compare against its own baseline settings file; not a repo rule scan, and a change to it selects itself',
   'scripts/__tests__/stdout-flush.test.mjs': 'its one-home drain-loop guard lives in a test the default vitest config excludes (runs under vitest.integration.config.ts with real child processes), so `vitest run <file>` cannot select it; CI runs it',
   'scripts/__tests__/check-standards.test.mjs': 'asserts over the real tracked tree via check-standards itself; the verify gate already runs `check:standards --local --files=<changed>`',
   'bun-trial/scripts/lib/__tests__/standards-sections.test.mjs': 'native bun:test copy of the entry below, run only by the bun trial (we:bun-trial/), never by vitest; vitest stays the gate',

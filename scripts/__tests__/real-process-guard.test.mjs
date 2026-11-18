@@ -1,3 +1,4 @@
+// @repo-scanning-test scope=full — the manifest check lists every tracked *.real.test.mjs.
 import { describe, it, expect } from 'vitest';
 import ts from 'typescript';
 import { execFileSync } from 'node:child_process';
