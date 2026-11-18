@@ -4446,8 +4446,8 @@ row is replaced wholesale by a live read, so checks/body from an old head never 
 The writer stores the resolved default branch with the rows; readers reuse it in process. A
 historical snapshot missing the branch is upgraded under the same lock without listing again.
 
-Waiters retry while the writer owns a live heartbeat lease, including beyond 180 seconds,
-up to an overall 600-second default deadline. At expiry they log an exact live-listing fallback
+Waiters retry while the writer owns a live heartbeat lease up to the unchanged overall
+180-second default deadline. At expiry they log an exact live-listing fallback
 without publishing over the writer's shared snapshot.
 The shared clone-lock primitive reclaims a dead PID or stale lease; the next writer refreshes
 the snapshot. Lock IO failures defer to the next pass with an explicit error rather than
@@ -4459,20 +4459,14 @@ siblings, including context-only constellation repos. Candidate repos reuse `rea
 its hydrated heavy-field cache/shared host seed; cached fields require a matching live head and
 `updatedAt`. Default-branch reuse avoids a second branch read without substituting cached rows
 for live sibling discovery. Eviction reuses live context rows, or re-lists when reconcile is off.
-Snapshot-mode eviction also reads live queue membership and fetches queued PRs absent from
-those rows, so a send-back beyond `OPEN_PR_LIST_LIMIT` is still dequeued. Unreadable membership
-skips mutations and logs a retry-next-pass warning. An unreadable missing queued PR is
-individually skipped and logged; other readable PRs still undergo eviction. The named cap and
-unreadable-evidence regressions in `merge-ai-prs.test.mjs` exercise these paths.
 The target always comes from `readTarget` and passes through `resolveListedChecks`, never the
 snapshot's cached target row. Missing target readers throw instead of returning cached rows.
 The existing drain gates and enqueue-time live revalidation run unchanged.
 
-`fast-drain-round-lock.test.mjs` covers concurrent single-flight, a waiter past the old deadline,
+`fast-drain-round-lock.test.mjs` covers concurrent single-flight, a waiter within the 180-second deadline,
 exact live fallback at the overall deadline despite a heartbeating writer,
 stale-writer takeover, lock failure, historical branch upgrade, branch failure, TTL bounds,
 oversized/incomplete/foreign evidence, target head invalidation, snapshot exclusion from live context, and
 a live target replacing a stale cached target with a different head and red check.
-Run it with `fast-drain-scope.test.mjs`, `enqueue-on-event.test.mjs` and
-`merge-queue-enqueue.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
+Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.

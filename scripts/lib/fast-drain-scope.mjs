@@ -158,7 +158,7 @@ export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env =
  * writer here so simultaneous cold children do not all fall back live. Directory identity stays stable
  * across creation of the snapshot file (realpath of an absent file can differ on symlinked temp roots).
  */
-export async function withFastDrainRoundLock(path, fn, { owner = `${hostname()}:${randomUUID()}`, waitMs = 600_000, pollMs = 1000, sleep = delay } = {}) {
+export async function withFastDrainRoundLock(path, fn, { owner = `${hostname()}:${randomUUID()}`, waitMs = 180_000, pollMs = 1000, sleep = delay } = {}) {
   const deadline = Date.now() + waitMs;
   for (;;) {
     const result = await withWriteLock(dirname(path), fn, { owner, lockRoot: `${path}.locks`, waitMs: Math.max(0, deadline - Date.now()) });

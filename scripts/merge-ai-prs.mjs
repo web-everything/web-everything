@@ -5666,8 +5666,8 @@ async function runCli() {
       const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
       const fields = RECONCILE ? SWEEP_LIST_FIELDS
         : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
-      const readTarget = (number = onlyPr) => __t.timeAsync('listing.target', async () => {
-        const { stdout } = await execFileP('gh', ['pr', 'view', String(number), '--repo', slug, '--json', `${fields},updatedAt,state`],
+      const readTarget = () => __t.timeAsync('listing.target', async () => {
+        const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},updatedAt,state`],
           { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
         const target = JSON.parse(stdout.trim() || 'null');
         return target ? (await resolveListedChecks(repo, [target]))[0] : null;
@@ -5729,8 +5729,7 @@ async function runCli() {
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       // A round listing is candidate evidence only, even after its target is refreshed.
       // Context must re-list live to discover newly opened blockers/carriers/siblings.
-      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live',
-        complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive, readTarget };
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
@@ -5791,32 +5790,13 @@ async function runCli() {
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
   // Round snapshots are candidate evidence only. Reuse the live context listing when available; a bare
-  // fast drain must obtain its own fresh rows. Queue membership supplements snapshot-mode eviction
-  // independently of the open-list cap; only missing entries need additional live PR reads.
+  // fast drain must obtain its own fresh rows. Failed context reads already log and contribute no rows.
   for (const listing of listings) {
     if (DRY_RUN || !mergeStrategy.enqueues(listing.repo)) continue;
     try {
-      let rows = listing.listing !== 'snapshot' ? listing.rows
+      const rows = listing.listing !== 'snapshot' ? listing.rows
         : RECONCILE ? openPrContext.prsByRepo.get(listing.repo) ?? []
           : await __t.timeAsync('listing.eviction', listing.readLiveRows);
-      if (listing.listing === 'snapshot') {
-        const queue = readQueueFacts({ repo: listing.repo || localSlug, exec: createMqLiveReader() });
-        if (queue.error || !(queue.inQueue instanceof Set)) throw new Error(queue.error || 'queue membership unreadable');
-        const listedNumbers = new Set(rows.map(pr => Number(pr.number)));
-        const missing = [...queue.inQueue].filter(number => !listedNumbers.has(number));
-        const queuedRows = await __t.timeAsync('listing.eviction', () => mapWithConcurrency(missing,
-          resolvedMergePolicy.policy.concurrency.gateReads, async number => {
-            try {
-              const pr = await listing.readTarget(number);
-              if (!pr || Number(pr.number) !== number || !Array.isArray(pr.labels)) throw new Error(`queued PR #${number} unreadable`);
-              return pr;
-            } catch {
-              process.stderr.write(`  ⚠ merge-queue dequeue sweep for ${repoTag(listing.repo) || 'cwd'}: queued PR #${number} unreadable — skipped; retried next pass\n`);
-              return null;
-            }
-          }));
-        rows = [...rows, ...queuedRows.filter(Boolean)];
-      }
       mergeStrategy.dequeueSendBacks(rows, listing.repo);
     } catch (e) {
       process.stderr.write(`  ⚠ merge-queue dequeue sweep for ${repoTag(listing.repo) || 'cwd'} failed (${describeGhListError(e).text}) — retried next pass\n`);

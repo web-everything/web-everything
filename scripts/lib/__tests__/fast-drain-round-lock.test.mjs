@@ -43,7 +43,7 @@ it('single-flights N concurrent catch-ups into one listing and one default-branc
   expect(readFastDrainRoundSnapshot({ path, repo, env: {} }).defaultBranch).toBe('main');
 });
 
-it('waits beyond 180 seconds for an alive writer and consumes its snapshot without live fallback', async () => {
+it('waits within 180 seconds for an alive writer and consumes its snapshot without live fallback', async () => {
   const path = setup();
   const root = join(path, '..');
   const holder = { owner: 'round-writer-holder', lockRoot: `${path}.locks` };
@@ -52,21 +52,21 @@ it('waits beyond 180 seconds for an alive writer and consumes its snapshot witho
   expect(await acquireWrite(root, holder)).toEqual({ ok: true });
   const sleep = vi.fn(async ms => {
     vi.setSystemTime(Date.now() + ms);
-    // Release after the historical deadline, within the generous overall bound.
-    if (Date.now() - start === 181_000) { save(path); releaseWrite(root, holder); }
-    if (Date.now() - start > 181_000) throw new Error('waiter did not adopt released writer');
+    // Release just before the unchanged overall deadline.
+    if (Date.now() - start === 179_000) { save(path); releaseWrite(root, holder); }
+    if (Date.now() - start > 179_000) throw new Error('waiter did not adopt released writer');
   });
   const listLive = vi.fn(async () => { throw new Error('must not list live'); });
   try {
     expect(await readFastDrainRoundListing({ ...options(path), listLive,
       lock: fn => withFastDrainRoundLock(path, fn, { owner: 'waiter', sleep }),
     })).toEqual([row()]);
-    expect(sleep).toHaveBeenCalledTimes(181);
+    expect(sleep).toHaveBeenCalledTimes(179);
     expect(listLive).not.toHaveBeenCalled();
   } finally { releaseWrite(root, holder); }
 });
 
-it('falls back to exact live rows at the default 600-second deadline while the writer keeps heartbeating', async () => {
+it('falls back to exact live rows at the default 180-second deadline while the writer keeps heartbeating', async () => {
   const path = setup();
   const root = join(path, '..');
   const holder = { owner: 'heartbeating-holder', lockRoot: `${path}.locks` };
@@ -77,8 +77,8 @@ it('falls back to exact live rows at the default 600-second deadline while the w
     vi.setSystemTime(Date.now() + ms);
     expect(await acquireWrite(root, holder)).toEqual({ ok: true });
     // Even a fresh snapshot at expiry must not substitute for the exact live fallback.
-    if (Date.now() - start === 600_000) save(path, [row(99)]);
-    if (Date.now() - start > 600_000) throw Error('overall lock deadline exceeded');
+    if (Date.now() - start === 180_000) save(path, [row(99)]);
+    if (Date.now() - start > 180_000) throw Error('overall lock deadline exceeded');
   });
   const listLive = vi.fn(async () => [row(), row(43)]);
   const write = vi.fn();
@@ -89,7 +89,7 @@ it('falls back to exact live rows at the default 600-second deadline while the w
       defaultBranch, requireDefaultBranch: true,
       lock: fn => withFastDrainRoundLock(path, fn, { owner: 'waiter', sleep }),
     })).toEqual([row(), row(43)]);
-    expect(Date.now() - start).toBe(600_000);
+    expect(Date.now() - start).toBe(180_000);
     expect(listLive).toHaveBeenCalledOnce();
     expect(defaultBranch).toHaveBeenCalledOnce();
     expect(write).not.toHaveBeenCalled();
