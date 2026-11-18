@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createSimClock } from '../../__tests__/sim/clock.mjs';
 import { REPO_ROOT } from '../shard-files.mjs';
-import { ROUND_VIRTUAL_MS, advanceMsForRound, createRoundClock } from '../round-clock.mjs';
+import { CHILD_CLOCK_TOLERANCE_MS, ROUND_VIRTUAL_MS, advanceMsForRound, checkChildClock, createRoundClock } from '../round-clock.mjs';
 
 /** Run `rounds` rounds that each take `realRoundMs` of wall-clock time; return the virtual instant after each. */
 function virtualInstants(rounds, realRoundMs, { pinned }) {
@@ -75,6 +75,17 @@ describe('round clock', () => {
     wall.t += 8_000; // round 1's own work
     pin.endRound(); // round 1 is timed from before the 2 s advance: 10 s
     expect(advances).toEqual([ROUND_VIRTUAL_MS - 10_000, ROUND_VIRTUAL_MS - 10_000]);
+  });
+
+  it('fails closed when a child process does not see the parent\'s virtual time (a preload that read offset 0)', () => {
+    const parentNowMs = 1_000_000_000_000 + ROUND_VIRTUAL_MS;
+    const child = (now) => () => String(now);
+    expect(checkChildClock({ env: {}, parentNowMs, exec: child(parentNowMs + 40) }).ok).toBe(true);
+    const ignored = checkChildClock({ env: {}, parentNowMs, exec: child(parentNowMs - ROUND_VIRTUAL_MS) });
+    expect(ignored.ok).toBe(false);
+    expect(ignored.skewMs).toBe(ROUND_VIRTUAL_MS);
+    expect(ROUND_VIRTUAL_MS).toBeGreaterThan(CHILD_CLOCK_TOLERANCE_MS);
+    expect(checkChildClock({ env: {}, parentNowMs, exec: child('garbage') }).ok).toBe(false);
   });
 
   it('requires begin() before endRound()', () => {

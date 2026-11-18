@@ -32,7 +32,7 @@ import { runScenario, scenario } from '../__tests__/sim/scenario.mjs';
 import { cloneFacts, checkTick, explainNoDispatch, formatTickLine, DEFAULT_BOUNDS, OWED_KIND_DAEMON, sessionMatches } from './invariants.mjs';
 import { seededRandom, stepBehaviours } from './behaviours.mjs';
 import { openChurnPr, seedDefaultFleet } from './fleet.mjs';
-import { createRoundClock, ROUND_VIRTUAL_MS } from './round-clock.mjs';
+import { checkChildClock, createRoundClock, ROUND_VIRTUAL_MS } from './round-clock.mjs';
 
 /** In-process daemon kind → its module in the clone (for the daemon's OWN `hasStaleMainRefusal`). */
 const DAEMON_MODULES = Object.freeze({
@@ -200,6 +200,11 @@ export async function runSoak({
           // The round took longer in real time than its virtual budget, so the clock could not be pinned: this run is
           // not reproducible. Fail closed rather than let a too-slow host pass or fail on timing luck.
           violations.push({ round, daemon: null, tick: null, invariant: 'round-clock', detail: `round ${round} took ${overrunMs} ms of real time more than its ${ROUND_VIRTUAL_MS} ms virtual budget; the soak cannot pin the clock on this host` });
+        }
+        // A child process (what the daemons and the lane pool are) must see the same pinned time as this one.
+        const child = checkChildClock({ env: w.env, parentNowMs: w.clock.now() });
+        if (!child.ok) {
+          violations.push({ round, daemon: null, tick: null, invariant: 'round-clock', detail: `round ${round}: a child process's clock is ${child.skewMs} ms off the soak's virtual time; the sim clock preload did not take the advance` });
         }
       } else w.clock.advance('3m');
     });

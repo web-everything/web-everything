@@ -13,6 +13,8 @@
  * already used, so round `k` ends at `start + k × 3m` on any host.
  */
 
+import { execFileSync } from 'node:child_process';
+
 /** Virtual milliseconds one soak round occupies. */
 export const ROUND_VIRTUAL_MS = 3 * 60_000;
 
@@ -55,4 +57,25 @@ export function createRoundClock(clock, now = Date.now) {
       return { overrunMs: Math.max(0, realElapsedMs - ROUND_VIRTUAL_MS) };
     },
   };
+}
+
+/** Largest tolerated gap between the parent's virtual time and a child process's, in ms (a spawn takes tens of ms). */
+export const CHILD_CLOCK_TOLERANCE_MS = 5_000;
+
+/**
+ * Fail-closed check that the clock the daemons and the lane pool actually run under moved with the parent's: spawn a
+ * child node process with the world's env (the sim clock preload in `NODE_OPTIONS`) and compare its `Date.now()` to
+ * the parent's virtual `now`. The preload reads an unreadable or malformed clock file as offset 0 without complaint
+ * (`fake-clock-preload.mjs`), which would leave every child on real time while the parent believes it is pinned.
+ * @param {{env: Record<string,string|undefined>, parentNowMs: number, exec?: Function}} o
+ * @returns {{ok: boolean, skewMs: number}}
+ */
+export function checkChildClock({ env, parentNowMs, exec = execFileSync }) {
+  const out = exec(process.execPath, ['-e', 'process.stdout.write(String(Date.now()))'], {
+    env: { ...process.env, ...env }, encoding: 'utf8', timeout: 30_000,
+  });
+  const childNowMs = Number(out);
+  if (!Number.isFinite(childNowMs)) return { ok: false, skewMs: Infinity };
+  const skewMs = Math.abs(childNowMs - parentNowMs);
+  return { ok: skewMs <= CHILD_CLOCK_TOLERANCE_MS, skewMs };
 }
