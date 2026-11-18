@@ -108,11 +108,40 @@ describe('runtime build priority', () => {
     expect(settings.runtime.warning).not.toContain('private');
   });
 
-  it.each(['7', ''])('valid env %j overrides valid and malformed runtime', value => {
+  it.each(['7', ''])('absent runtime preserves the previous env %j override', value => {
     const env = { ...options.env, WE_BUILD_PRIORITY: value };
-    const expected = { ids: value ? [value] : [], source: 'env' };
-    expect(read(record, { env })).toEqual(expected);
-    expect(read(null, { env })).toEqual(expected);
+    const readRuntime = vi.fn(missing);
+    expect(read(record, { env, readRuntime })).toEqual({ ids: value ? [value] : [], source: 'env' });
+    expect(readRuntime).toHaveBeenCalledOnce();
+  });
+
+  it.each(['', '9999'])('env %j cannot bypass malformed or unreadable runtime evidence', value => {
+    const env = { ...options.env, WE_BUILD_PRIORITY: value };
+    for (const readRuntime of [() => '{', () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }]) {
+      const settings = read(record, { env, readRuntime });
+      expect(settings).toMatchObject({ ids: [], source: 'runtime-malformed', only: true, held: true });
+      expect(filterIdsToRuntimeOnly(['1', '9999'], settings)).toEqual([]);
+      expect(extraPrepareSlot(settings)).toBeNull();
+    }
+  });
+
+  it.each([
+    ['9999', []], ['9999,2,1', ['2', '1']], ['2', ['2']], ['', []],
+  ])('env %j intersects the runtime only-list and cannot admit outside builds or prepares', (value, ids) => {
+    const settings = read({ ...record, ids: ['1', '2'] }, { env: { ...options.env, WE_BUILD_PRIORITY: value } });
+    expect(settings).toMatchObject({ ids, source: 'env', mode: 'only', only: true });
+    expect(filterIdsToRuntimeOnly(['1', '2', '9999'], settings)).toEqual(['1', '2'].filter(id => ids.includes(id)));
+    expect(extraPrepareSlot(settings)).toBe(ids[0] ?? null);
+    expect(settings.runtime.appliedCount).toBe(ids.length);
+    expect(settings.runtime.line).toContain('runtime+env');
+  });
+
+  it('valid env overrides lift ordering after runtime validation without restricting candidates', () => {
+    const settings = read({ ...record, mode: 'lift' }, { env: { ...options.env, WE_BUILD_PRIORITY: '9999' } });
+    expect(settings).toMatchObject({ ids: ['9999'], source: 'env', mode: 'lift', only: false });
+    const candidates = ['1', '9999'];
+    expect(filterIdsToRuntimeOnly(candidates, settings)).toBe(candidates);
+    expect(extraPrepareSlot(settings)).toBeNull();
   });
 
   it('invalid env cannot bypass a malformed runtime hold', () => {
