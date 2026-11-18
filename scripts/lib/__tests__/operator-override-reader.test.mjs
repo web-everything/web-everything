@@ -119,12 +119,21 @@ describe('unresolvable host account', () => {
   });
 });
 
-it.each(['broken', '{"generation":-1}', '{"generation":1.5}', '{"generation":9007199254740992}'])('generation reader never throws on invalid evidence %s', text => {
-  writeFileSync(reader.operatorGenerationPath(file), text);
+it.each([null, -1, 1.5, 9007199254740992, '42'])('invalid generation %j is unconfirmed while values still read', generation => {
+  const key = 'reviewConcurrency.maxLiveReviewRounds';
+  writeFileSync(file, JSON.stringify({ _generation: generation, [key]: 2 }));
   expect(reader.readOperatorGeneration({ file })).toBeNull();
+  expect(reader.readOperatorSnapshot({ file })).toEqual({ readable: true, generation: null, values: { [key]: 2 } });
 });
-it('generation reader returns null for missing/unreadable evidence', () => {
+it('strips only reserved metadata and still refuses unknown override keys', () => {
+  writeFileSync(file, JSON.stringify({ _generation: 42, 'reviewConcurrency.guard': false }));
+  expect(readOperatorOverrides({ file, log: () => {} })).toEqual({ readable: true, values: {}, invalidPolicies: ['reviewConcurrency'] });
+  expect(reader.readOperatorSnapshot({ file, log: () => {} }).generation).toBeNull();
+});
+it('generation reader returns null for missing, legacy and unreadable evidence', () => {
   expect(reader.readOperatorGeneration({ file })).toBeNull();
-  mkdirSync(reader.operatorGenerationPath(file));
-  expect(reader.readOperatorGeneration({ file })).toBeNull();
+  writeFileSync(file, JSON.stringify({ 'reviewConcurrency.maxLiveReviewRounds': 2 }));
+  expect(reader.readOperatorSnapshot({ file }).generation).toBeNull();
+  rmSync(file); mkdirSync(file);
+  expect(reader.readOperatorGeneration({ file, log: () => {} })).toBeNull();
 });

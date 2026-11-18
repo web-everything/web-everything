@@ -138,19 +138,19 @@ describe('capacity-only operator store', () => {
     vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
     expect(store.readOperatorOverrides().values).toEqual({ [key]: 2 });
     store.writeOperatorOverride({ key, value: 3, reason: 'fixed host path', actor });
-    expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual({ [key]: 3 });
+    expect(store.readOperatorOverrides({ file: fixed }).values).toEqual({ [key]: 3 });
     expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 5 });
     write(4);
     expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 4 });
-    expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual({ [key]: 3 });
+    expect(store.readOperatorOverrides({ file: fixed }).values).toEqual({ [key]: 3 });
     store.clearOperatorOverride({ key, reason: 'fixed host clear', actor });
-    expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual({});
+    expect(store.readOperatorOverrides({ file: fixed }).values).toEqual({});
     expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 4 });
   });
   it('stores flat dotted JSON, preserves siblings, and appends ISO audit records for set and clear', () => {
     write(2); write(3); write(7, { key: 'host.maxReviewDispatchPerTick' });
     store.clearOperatorOverride({ file, key, reason: 'experiment over', actor });
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ 'host.maxReviewDispatchPerTick': 7 });
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ 'host.maxReviewDispatchPerTick': 7 });
     const rows = readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(4);
     expect(rows[0]).toMatchObject({ actor, osUser: userInfo().username, reason: 'capacity experiment', key, old: null, new: 2, source: 'operator-cli' });
@@ -166,13 +166,15 @@ describe('capacity-only operator store', () => {
     expect(append).toBeGreaterThanOrEqual(0); expect(stage).toBeGreaterThan(append); expect(publish).toBeGreaterThan(stage);
     const [, temporary] = io.events[stage];
     expect(temporary).not.toBe(file); expect(temporary.startsWith(dir + '/')).toBe(true);
-    expect(io.events[publish].slice(1)).toEqual([temporary, store.operatorGenerationPath(file)]);
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 3 });
+    expect(io.events[publish].slice(1)).toEqual([temporary, file]);
+    expect(io.events.filter(([op]) => op === 'rename')).toHaveLength(1);
+    expect(JSON.parse(readFileSync(file, 'utf8'))._generation).toBe(store.readOperatorGeneration({ file }));
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 3 });
   });
   it('audit append failure preserves the existing override store and propagates failure', () => {
     write(2); const before = readFileSync(file); io.events = []; io.fail = 'append';
     expect(() => write(3)).toThrow(/audit unavailable/);
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 2 });
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 2 });
     expect(readFileSync(file)).toEqual(before);
     expect(io.events.map(([op]) => op)).toEqual(['append']);
     io.fail = null; write(4); // Failure also releases the transaction lock.
@@ -216,6 +218,7 @@ describe('capacity-only operator store', () => {
   });
   it('concurrent host-wide writers serialize transactions and preserve both keys', async () => {
     // Use a native file URL: the browser test environment may expose an HTTP import.meta.url.
+    const started = Date.now();
     const moduleUrl = pathToFileURL(resolve('scripts/lib/operator-override-store.mjs')).href;
     const owner = makeOwner('concurrent-test-barrier');
     const lockRoot = `${file}.locks`, lockPath = '<operator-overrides:transaction>';
@@ -266,8 +269,10 @@ describe('capacity-only operator store', () => {
       releaseNumberingLockIfOwned(lockRoot, owner, lockPath);
       await Promise.all(children.map(c => c.done));
       expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 3, 'host.maxReviewDispatchPerTick': 3 });
-      expect(store.readOperatorGeneration({ file })).toBe(2);
-      expect(readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(row => JSON.parse(row).generation)).toEqual([1, 2]);
+      const generations = auditRows().map(row => row.generation);
+      expect(generations[0]).toBeGreaterThanOrEqual(started);
+      expect(generations[1]).toBeGreaterThan(generations[0]);
+      expect(store.readOperatorGeneration({ file })).toBe(generations[1]);
       expect(readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)).toHaveLength(2);
     } finally {
       releaseNumberingLockIfOwned(lockRoot, owner, lockPath);
@@ -302,8 +307,8 @@ it.each(['write', 'clear'])('R907 default %s ignores the env-selected path', ope
   const options = { key, value: 3, reason: 'fixed path regression', actor };
   if (operation === 'write') store.writeOperatorOverride(options);
   else store.clearOperatorOverride(options);
-  expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual(operation === 'write' ? { [key]: 3 } : {});
-  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 5 });
+  expect(store.readOperatorOverrides({ file: fixed }).values).toEqual(operation === 'write' ? { [key]: 3 } : {});
+  expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 5 });
 });
 
 const auditRows = () => readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
@@ -319,14 +324,14 @@ describe('normalized writes return and audit every effective change', () => {
   it('a floor write above the stored ceiling reports and audits the value actually stored', () => {
     write(1, { key: CEILING });
     const result = write(7, { key: FLOOR });
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [CEILING]: 1, [FLOOR]: 1 });
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ [CEILING]: 1, [FLOOR]: 1 });
     expect(result).toMatchObject({ key: FLOOR, old: null, new: 1, requested: 7 });
     expect(auditRows().at(-1)).toMatchObject({ key: FLOOR, old: null, new: 1, requested: 7 });
   });
   it('a ceiling write below the stored floor audits the secondary floor change as its own row', () => {
     write(7, { key: FLOOR });
     const result = write(3, { key: CEILING });
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [FLOOR]: 3, [CEILING]: 3 });
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ [FLOOR]: 3, [CEILING]: 3 });
     expect(result.changes).toEqual([
       { key: CEILING, old: null, new: 3 }, { key: FLOOR, old: 7, new: 3 },
     ]);
@@ -336,45 +341,51 @@ describe('normalized writes return and audit every effective change', () => {
     write(5, { key: FLOOR }); write(2, { key: CEILING }); write(9, { key: FLOOR }); write(4, { key: CEILING });
     store.clearOperatorOverride({ file, key: CEILING, reason: 'reset', actor, io: writerIO });
     write(6, { key: key });
-    expect(replayAudit(auditRows())).toEqual(JSON.parse(readFileSync(file, 'utf8')));
+    expect(replayAudit(auditRows())).toEqual(store.readOperatorOverrides({ file }).values);
   });
 });
 
 it('a hand-edited inverted store audits the floor the normalising write actually lowers', () => {
   writeFileSync(file, JSON.stringify({ [FLOOR]: 7, [CEILING]: 1 }));
   write(3);
-  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [FLOOR]: 1, [CEILING]: 1, [key]: 3 });
+  expect(store.readOperatorOverrides({ file }).values).toEqual({ [FLOOR]: 1, [CEILING]: 1, [key]: 3 });
   expect(auditRows()).toMatchObject([{ key, old: null, new: 3 }, { key: FLOOR, old: 7, new: 1 }]);
 });
 
-it('increments persistent generations on every set and clear, including repeated clears', () => {
-  expect(store.readOperatorGeneration({ file })).toBeNull();
-  expect(write(3).generation).toBe(1);
-  expect(write(3).generation).toBe(2);
-  expect(store.clearOperatorOverride({ file, key, reason: 'done', actor }).generation).toBe(3);
-  expect(store.clearOperatorOverride({ file, key, reason: 'again', actor }).generation).toBe(4);
-  expect(store.readOperatorSnapshot({ file })).toMatchObject({ generation: 4, values: {} });
+it('seeds generations from epoch milliseconds and increments even when the clock goes backwards', () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1800000000000);
+  try {
+    expect(write(3).generation).toBe(1800000000000);
+    vi.mocked(Date.now).mockReturnValue(1799999999999);
+    expect(write(3).generation).toBe(1800000000001);
+    expect(store.clearOperatorOverride({ file, key, reason: 'done', actor }).generation).toBe(1800000000002);
+    expect(store.clearOperatorOverride({ file, key, reason: 'again', actor }).generation).toBe(1800000000003);
+    expect(store.readOperatorSnapshot({ file })).toMatchObject({ generation: 1800000000003, values: {} });
+  } finally { vi.restoreAllMocks(); }
 });
-it('never pairs a generation with values during publication and never reuses a failed reservation', () => {
+it.each(['store', 'audit'])('lost generation with existing %s remains unconfirmed and cannot restart at 1', evidence => {
+  if (evidence === 'store') writeFileSync(file, JSON.stringify({ [key]: 2 }));
+  else writeFileSync(join(dir, 'operator-overrides.log.jsonl'), JSON.stringify({ generation: 50 }) + '\n');
+  expect(store.readOperatorSnapshot({ file }).generation).toBeNull();
+  const before = Date.now();
+  expect(write(3).generation).toBeGreaterThanOrEqual(before);
+});
+it.each(['set', 'clear'])('a failed single commit preserves both values and generation on %s', operation => {
   write(2);
+  const before = readFileSync(file), snapshot = store.readOperatorSnapshot({ file });
   const observed = [];
   const io = { ...writerIO, renameSync: (from, to) => {
-    renameSync(from, to);
-    observed.push(store.readOperatorSnapshot({ file }).generation);
-    if (to === file) throw Error('interrupted');
+    observed.push(store.readOperatorSnapshot({ file }));
+    throw Error('commit unavailable');
   } };
-  expect(() => write(3, { io })).toThrow('interrupted');
-  expect(observed).toEqual([null, null]);
-  expect(write(4).generation).toBe(3);
-  expect(store.readOperatorSnapshot({ file })).toMatchObject({ generation: 3, values: { [key]: 4 } });
+  expect(() => operation === 'set' ? write(3, { io }) :
+    store.clearOperatorOverride({ file, key, reason: 'done', actor, io })).toThrow('commit unavailable');
+  expect(observed).toEqual([snapshot]);
+  expect(readFileSync(file)).toEqual(before);
+  expect(store.readOperatorSnapshot({ file })).toEqual(snapshot);
+  expect(readdirSync(dir).filter(name => name.endsWith('.tmp'))).toEqual([]);
 });
-it.each(['broken', JSON.stringify({ generation: Number.MAX_SAFE_INTEGER })])('refuses corrupt/exhausted generation with an operator fallback: %s', text => {
-  writeFileSync(store.operatorGenerationPath(file), text);
+it('refuses exhausted generation with an operator fallback', () => {
+  writeFileSync(file, JSON.stringify({ _generation: Number.MAX_SAFE_INTEGER, [key]: 2 }));
   expect(() => write(3)).toThrow('ask the operator to repair');
-});
-
-it('refuses an unreadable generation sidecar without resetting the counter', () => {
-  mkdirSync(store.operatorGenerationPath(file));
-  expect(() => write(3)).toThrow('ask the operator to repair');
-  expect(existsSync(file)).toBe(false);
 });

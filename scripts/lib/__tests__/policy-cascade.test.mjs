@@ -245,12 +245,14 @@ describe('source log', () => {
     const { writeOperatorOverride } = await import('../operator-override-store.mjs');
     const lines = [];
     const options = { platform: null, env: { [POLICY_CASCADE_LOG_ENV]: '1' }, log: line => lines.push(line) };
-    for (const generation of [1, 2]) {
-      expect(writeOperatorOverride({ file: path, key: 'reviewConcurrency.maxLiveReviewRounds', value: 5, reason: 'repeat', actor: 'test' }).generation).toBe(generation);
+    const generations = [];
+    for (let i = 0; i < 2; i++) {
+      generations.push(writeOperatorOverride({ file: path, key: 'reviewConcurrency.maxLiveReviewRounds', value: 5, reason: 'repeat', actor: 'test' }).generation);
       cascadePolicy('reviewConcurrency', {}, options);
       cascadePolicy('reviewConcurrency', {}, options);
     }
-    expect(lines).toEqual([1, 2].map(n => `policy-cascade · reviewConcurrency: maxLiveReviewRounds=5 (operator-db) · operator-gen=${n}`));
+    expect(generations[1]).toBeGreaterThan(generations[0]);
+    expect(lines).toEqual(generations.map(n => `policy-cascade · reviewConcurrency: maxLiveReviewRounds=5 (operator-db) · operator-gen=${n}`));
   });
   it('is silent under test unless enabled', () => {
     const lines = [];

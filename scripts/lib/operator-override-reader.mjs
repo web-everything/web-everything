@@ -51,29 +51,20 @@ function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics
 export function validateKey(key) {
   if (!Object.hasOwn(CAPACITY_LEAVES, key)) throw Error(`operator-override: refused ${key}; guard leaves need the signed-attestation slice`);
 }
-/** Sidecar is also the commit record: values=null reserves a generation during publication. */
-export const operatorGenerationPath = file => `${file}.generation.json`;
-function generationRecord(file) {
-  try { return JSON.parse(readFileSync(operatorGenerationPath(file ?? operatorOverridesPath()), 'utf8')); }
-  catch { return null; }
+/** Generation and values are read from the same atomic file snapshot. */
+export function readOperatorGeneration(options = {}) {
+  return readOperatorSnapshot(options).generation;
 }
-export function readOperatorGeneration({ file } = {}) {
-  const n = generationRecord(file)?.generation;
-  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+export function readOperatorSnapshot(options = {}) {
+  return { generation: null, ...readStore(options) };
 }
-/** A single committed snapshot supplies both provenance and override values. */
-export function readOperatorSnapshot({ file, ...options } = {}) {
-  const record = generationRecord(file);
-  const result = readOperatorOverrides({ file, ...options, normalize: false });
-  const generation = result.readable && !result.invalidPolicies?.length && record?.values
-    && JSON.stringify(record.values) === JSON.stringify(result.values)
-    && Number.isSafeInteger(record.generation) && record.generation >= 0 ? record.generation : null;
-  if (options.normalize !== false && result.values['resourceGate.fixCap.ceiling'] < result.values['resourceGate.fixCap.floor'])
-    result.values['resourceGate.fixCap.floor'] = result.values['resourceGate.fixCap.ceiling'];
-  return { ...result, generation };
+/** Reserved metadata is never an override key; real unknown keys remain refused. */
+export function readOperatorOverrides(options = {}) {
+  const { generation, ...result } = readStore(options);
+  return result;
 }
-/** `normalize: false` returns the stored values without lowering an inverted floor (the writer audits against them). */
-export function readOperatorOverrides({ file, log = console.error, normalize = true } = {}) {
+/** `normalize: false` returns stored values without lowering an inverted floor (the writer audits against them). */
+function readStore({ file, log = console.error, normalize = true } = {}) {
   if (file === undefined) {
     try { file = operatorOverridesPath(); } catch (error) {
       warn(log, `operator-override: operator-db-unreadable store path (${error.message}); using code value`);
@@ -89,6 +80,8 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
     warn(log, `operator-override: operator-db-unreadable store (${error.message}); using code value`);
     return { readable: false, values: {} };
   }
+  const generation = data._generation;
+  delete data._generation;
   const values = {};
   const invalidPolicies = new Set();
   for (const [key, value] of Object.entries(data)) {
@@ -105,5 +98,7 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
   if (normalize && values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
     values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
   }
-  return { readable: true, values, ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
+  return { readable: true, values,
+    generation: !invalidPolicies.size && Number.isSafeInteger(generation) && generation >= 0 ? generation : null,
+    ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
 }

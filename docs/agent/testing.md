@@ -4589,8 +4589,13 @@ review-job and review-daemon suites.
 Observation success requires every discovered daemon's latest policy line to report a value/source
 and `operator-gen` at least the generation returned by the write. Missing, unknown or lower
 generations, absent policy lines and unreadable logs remain unconfirmed; inspect daemon logs on
-timeout. Shadows still warn even when observation succeeds. The locked writer reserves a persistent
-generation, publishes values, then commits the sidecar snapshot. Readers only attach a generation
-to matching values; interrupted publication cannot confirm adoption or reuse a generation.
-Tests cover set/clear bumps, concurrent ordering, suffix round trips, shadows and bounded timeout.
+timeout. Shadows still warn even when observation succeeds. The locked writer uses a monotonic counter seeded from the clock:
+`max(previous + 1, Date.now())`, a strictly increasing safe integer in epoch milliseconds.
+Losing generation evidence seeds from the clock rather than restarting at 1. The reserved
+`_generation` key and override values commit in one atomic file rename; a failed rename changes
+neither. Readers strip only this metadata before validating override keys. Legacy stores without
+it and missing, invalid or unreadable generation evidence report `null` (unconfirmed) until the
+next write. Counter exhaustion refuses the write and directs the operator to repair the store.
+Tests cover clock seeding/regression, lost evidence, failed set/clear commits, set/clear bumps,
+concurrent ordering, suffix round trips, shadows and bounded timeout.
 Run these tests through heavy-admission, using `--wait-ms=0` in store-only CLI fixtures.

@@ -1164,7 +1164,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
     operatorFixture.file = file;
     try {
       expect((await invoke('operator-override-set', flags)).code).toBe(0);
-      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7, _generation: expect.any(Number) });
       const logFile = join(dir, 'operator-overrides.log.jsonl');
       const before = readFileSync(logFile, 'utf8');
       const row = JSON.parse(before.trim());
@@ -1174,10 +1174,10 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect(show.code).toBe(0);
       expect(JSON.stringify(show)).toContain(key);
       expect(readFileSync(logFile, 'utf8')).toBe(before);
-      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7, _generation: expect.any(Number) });
       expect((await invoke('operator-override-clear', ['--wait-ms=0', `--key=${key}`, '--reason=over', '--actor=on-call human'])).code).toBe(0);
-      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
-      const rows = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ _generation: expect.any(Number) });
+      const rows =readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over', actor: 'on-call human', osUser: userInfo().username, source: 'operator-cli' });
     } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
