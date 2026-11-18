@@ -216,6 +216,17 @@ describe('abandoned builder draft recovery', () => {
       expectedError: '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.',
       log: '2026-09-30T01:00:01.5000000Z passing step\n'
         + '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.' },
+    // A passing `Post`/`if: always()` step starting in the failed step's last second shares that second: the exit
+    // line there is genuinely ambiguous at second resolution, so it fails closed to the published check detail.
+    { evidence: 'a failed-step error in a second shared with a following passing step',
+      metadata: { steps: [
+        { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:05Z' },
+        { conclusion: 'failure', started_at: '2026-09-30T01:00:06Z', completed_at: '2026-09-30T01:00:10Z' },
+        { conclusion: 'success', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:12Z' },
+      ] },
+      expectedError: noDetail,
+      log: '2026-09-30T01:00:01.5000000Z passing step\n'
+        + '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.' },
   ];
   // A literal-titled `it(` opener per row (not `it.each`) keeps the merge-gate's test-case counter honest: it
   // only counts string-titled openers, so an `it.each` rewrite of one case reads as a net removal.
