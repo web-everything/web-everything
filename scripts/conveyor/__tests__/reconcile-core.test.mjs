@@ -31,7 +31,7 @@
 import { describe, it, expect } from 'vitest';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
-  staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
+  staleRequiredBaseRepair, reviewHoldGatesOnlyRed, reviewHoldOnlyRed, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
@@ -3662,10 +3662,36 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   // Shape attached by excuseMergeGateRows: a review hold keeps merge-gate red but annotates its owner.
   const heldRollup = () => [
     check('test'),
-    check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }),
+    check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/7/job/5874001',
+      mergeGateReviewHold: { headSha: pr1563().headRefOid, holdIds: ['review-acceptance'], jobId: 5874001 } }),
     check('review-gate', 'failure'),
   ];
   const reviewOnlyRollup = () => [check('test'), check('merge-gate'), check('review-gate', 'failure')];
+  it.each([
+    ['pending', rows => rows.map(row => row.name === 'test' ? check('test', null, { status: 'in_progress' }) : row)],
+    ['missing', rows => rows.filter(row => row.name !== 'test')],
+  ])('review holds retain ownership with another required check %s, without allowing promotion', (_, change) => {
+    const pr = pr1563({ labels: lbl('review:pending'), comments: [], statusCheckRollup: change(heldRollup()) });
+    expect(reviewHoldGatesOnlyRed(pr, requiredChecks)).toBe(true);
+    expect(reviewHoldOnlyRed(pr, requiredChecks)).toBe(false);
+    const result = planReconcile({ prs: [pr], requiredChecks, agents: [], now: NOW });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
+    expect(planReconcile({ prs: [{ ...pr, isDraft: true }], requiredChecks, agents: [], now: NOW })
+      .dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+  });
+  it.each([
+    ['required failure', { statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row) }],
+    ['malformed check', { statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'unrecognized') : row) }],
+    ['incomplete read', { rowsComplete: false }],
+    ['foreign read head', { rowsHead: 'f'.repeat(40) }],
+    ['missing roster source', { rosterSource: undefined }],
+    ['failed read', { requiredCheckReadError: 'unreadable' }],
+  ])('both hold predicates refuse %s', (_, over) => {
+    const pr = pr1563({ statusCheckRollup: heldRollup(), ...over });
+    expect(reviewHoldGatesOnlyRed(pr, requiredChecks)).toBe(false);
+    expect(reviewHoldOnlyRed(pr, requiredChecks)).toBe(false);
+  });
   const plan = (over = {}) => planReconcile({
     prs: [pr1563({ isDraft: true, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...over })],
     requiredChecks, agents: [], durableCounts: {}, now: NOW,
@@ -3717,6 +3743,62 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
       kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
     }));
   });
+});
+
+describe('strict review hold and promotion evidence (PR2c)', () => {
+  const head = pr1563().headRefOid;
+  const requiredChecks = ['test', 'merge-gate'];
+  const hold = { jobId: 7, headSha: head, holdIds: ['review-acceptance'] };
+  const check = (name, conclusion, extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  const rows = annotation => [check('test', 'success'), check('merge-gate', 'failure', {
+    detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', mergeGateReviewHold: annotation,
+  })];
+  const plan = (statusCheckRollup, over = {}) => planReconcile({
+    prs: [pr1563({ labels: lbl('review:pending'), comments: [], statusCheckRollup, ...over })],
+    requiredChecks, agents: [], now: NOW, advisoryReviewOnHumanHandoff: 'on',
+  });
+  const invalidHolds = [
+    ['mismatched jobId', { ...hold, jobId: 8 }],
+    ['foreign headSha', { ...hold, headSha: 'f'.repeat(40) }],
+    ['non-human holdId', { ...hold, holdIds: ['codeql'] }],
+    ['empty holdIds', { ...hold, holdIds: [] }],
+    ['legacy truthy annotation', true],
+  ];
+  for (const reverse of [false, true]) {
+    const ordered = input => reverse ? [...input].reverse() : input;
+    it.each(invalidHolds)(`%s cannot allow advisory review or promote (reversed=${reverse})`, (_name, annotation) => {
+      const input = ordered(rows(annotation));
+      const comments = [{ author: AUTOMATION, body: buildCiHealEscalationComment({
+        headSha: head, outcome: 'not-a-ci-break', reason: 'review hold',
+      }) }];
+      const advisory = plan(input, { comments });
+      expect(advisory.dispatch.some(row => row.kind === 'review')).toBe(false);
+      expect(advisory.refusals).toContainEqual(expect.objectContaining({
+        kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
+      }));
+      expect(plan(input, { isDraft: true }).dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+    });
+    it(`a properly bound human hold promotes and allows advisory review (reversed=${reverse})`, () => {
+      const input = ordered(rows(hold));
+      expect(plan(input, { isDraft: true }).dispatch.map(row => row.kind)).toEqual(['promote-draft']);
+      expect(plan(input).dispatch).toContainEqual(expect.objectContaining({ kind: 'review', humanHandoffAdvisory: true }));
+    });
+    it(`same-name failure then higher-id success cannot promote (reversed=${reverse})`, () => {
+      const input = ordered([check('test', 'failure', { id: 1 }), check('test', 'success', { id: 2 }), check('merge-gate', 'success')]);
+      expect(plan(input, { isDraft: true }).dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+    });
+    it.each([
+      ['incomplete fallback', { rowsComplete: false, rosterSource: 'fallback' }],
+      ['incomplete live', { rowsComplete: false }],
+      ['complete fallback', { rosterSource: 'fallback' }],
+      ['missing read head', { rowsHead: undefined }],
+      ['foreign read head', { rowsHead: 'f'.repeat(40) }],
+    ])(`%s cannot promote green or held evidence (reversed=${reverse})`, (_name, provenance) => {
+      for (const input of [rows(hold), [check('test', 'success'), check('merge-gate', 'success')]]) {
+        expect(plan(ordered(input), { isDraft: true, ...provenance }).dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+      }
+    });
+  }
 });
 
 describe('fix waiting episode', () => {

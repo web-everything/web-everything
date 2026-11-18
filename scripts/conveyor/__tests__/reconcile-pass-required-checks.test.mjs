@@ -16,17 +16,17 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
 vi.mock('../../lib/write-all-sync.mjs', () => ({ writeAllSync: vi.fn(), writeLineSync: vi.fn() }));
 
 const XX_REQUIRED = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
-const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c2009347';
-const xxPr = () => ({ number: 3336, headRefOid: XX_HEAD, headRefName: 'lane/3336-replay', isDraft: true,
+const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c20093470';
+const xxPr = () => ({ rowsHead: XX_HEAD, rowsComplete: true, number: 3336, headRefOid: XX_HEAD, headRefName: 'lane/3336-replay', isDraft: true,
   labels: [], comments: [], statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({
     name: i ? 'review-gate' : 'soak-replay-gate', status: 'COMPLETED', conclusion: 'SUCCESS',
   })) });
 const xxOptions = () => ({ repo: 'we', readPrs: () => [xxPr()], readAgents: () => [], enrich: a => a,
-  readRequiredChecks: () => ({ checks: XX_REQUIRED }), enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
+  readRequiredChecks: () => ({ checks: XX_REQUIRED, source: 'live' }), enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
   enrichAlreadyLanded: prs => prs, enrichBaseRef: prs => prs, enrichSystemFix: prs => prs,
   enrichFixClaims: prs => prs, resolveMainSha: () => null });
 
-it.each([false, true])('Plateau #198 green checks promote with repo-local 403 fallback (hydrate: %s)', async hydrate => {
+it.each([false, true])('Plateau #198 repo-local 403 fallback cannot promote; complete live evidence can (hydrate: %s)', async hydrate => {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -48,9 +48,14 @@ it.each([false, true])('Plateau #198 green checks promote with repo-local 403 fa
     const plan = runReconcilePass({ ...xxOptions(), repo: 'plateau-app',
       readPrs: () => [pr], readRequiredChecks, readChecks });
     expect(plan.refusals.filter(row => row.kind === 'check-read-failed')).toEqual([]);
-    expect(plan.dispatch).toEqual([expect.objectContaining({ prNumber: 198, kind: 'promote-draft' })]);
+    expect(plan.dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
     expect(readChecks).toHaveBeenCalledTimes(hydrate ? 1 : 0);
     if (hydrate) expect(readChecks).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app', sha: XX_HEAD });
+    // A separate complete live read is the positive control; no fallback provenance is upgraded.
+    const live = runReconcilePass({ ...xxOptions(), repo: 'plateau-app', readPrs: () => [pr], readChecks,
+      readRequiredChecks: () => ({ checks: ['test', 'e2e'], source: 'live' }),
+    });
+    expect(live.dispatch).toEqual([expect.objectContaining({ prNumber: 198, kind: 'promote-draft' })]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

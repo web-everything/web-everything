@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import { planReconcile as planReconcileCore } from '../reconcile-core.mjs';
 // These replays select the serial policy; the default fast gate is covered below.
-const planReconcile = options => planReconcileCore({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
+const planReconcile = options => planReconcileCore({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options,
+  prs: options.prs?.map(pr => ({ rowsHead: pr.headRefOid, rowsComplete: true, rosterSource: 'live', ...pr })),
+});
 import { resolvePrOwnershipSettings, loadPrOwnershipSettings } from '../pr-ownership-settings.mjs';
 import { ownerFor, assessPrOwnership, assessOwnership } from '../../operations/pr-ownership.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
@@ -23,7 +25,9 @@ const healing = { unlabeledRedAgentPr: 'review-label', now: Date.parse(fixture(u
 const reviews = p => p.dispatch.filter(d => d.kind === 'review');
 const annotate = pr => {
   const rows = pr.statusCheckRollup.filter(r => r.name === 'merge-gate');
-  rows[rows.length - 1].mergeGateReviewHold = { holds: ['test-gaming'], jobId: 1 };
+  const row = rows[rows.length - 1];
+  const jobId = Number(/\/job\/(\d+)/.exec(row.detailsUrl)[1]);
+  row.mergeGateReviewHold = { holdIds: ['review-acceptance', 'test-gaming'], jobId, headSha: pr.headRefOid };
 };
 
 describe('cards 273 and 278 incident replays', () => {
@@ -60,6 +64,9 @@ describe('cards 273 and 278 incident replays', () => {
   });
   it.each(['merge-gate', 'review-gate', 'both'])('keeps the advisory fixer reachable on a red %s hold across ticks', gate => {
     const fx = fixture(before);
+    // Replace the archive's historical review runs with this scenario's single current run.
+    fx.pr.statusCheckRollup = fx.pr.statusCheckRollup.filter(r => r.name !== 'review-gate');
+    fx.pr.statusCheckRollup.push({ name: 'review-gate', status: 'COMPLETED', conclusion: 'SUCCESS' });
     annotate(fx.pr);
     const merge = fx.pr.statusCheckRollup.filter(r => r.name === 'merge-gate').at(-1);
     if (gate === 'review-gate') merge.conclusion = 'SUCCESS';
@@ -83,6 +90,7 @@ describe('cards 273 and 278 incident replays', () => {
     expect(empty.dispatch).toEqual([]);
     expect(empty.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings' }));
     const moved = { ...fx.pr, headRefOid: 'b'.repeat(40) };
+    annotate(moved);
     for (const addressed of [false, true]) {
       const pr = { ...moved, comments: [...moved.comments,
         ...(addressed ? [{ author: { login: 'web-everything' }, body: buildAdvisoryFixComment({}) }] : [])] };

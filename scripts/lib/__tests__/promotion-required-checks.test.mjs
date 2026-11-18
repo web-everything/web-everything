@@ -73,10 +73,10 @@ describe('setting cascade', () => {
 
 describe('live #5060 promotion', () => {
   const reader = (rows, options = {}) => defaultReadHeadCheckState({ repoSlug: 'web-everything/web-everything', sha: 'a'.repeat(40),
-    runGh: () => rows.map(row => JSON.stringify(row)).join('\n'), getRequiredChecks: () => ({ checks: required }),
+    runGh: () => rows.map(row => JSON.stringify(row)).join('\n'), getRequiredChecks: () => ({ checks: required, source: 'live' }),
     mergeGateSetting: { value: 'off' }, ...options });
   it('changes only the promotion head read', () => {
-    expect(reader(rollup).state).toBe('unchecked');
+    expect(reader(rollup).state).toBe('pending');
     expect(reader(rollup, { forPromotion: true, absentNotApplicable: ['merge-gate'] }).state).toBe('green');
   });
   it.each([
@@ -86,7 +86,8 @@ describe('live #5060 promotion', () => {
     ['disabled', rollup, [], false],
   ])('%s merge-gate: promotion=%s', (_name, rows, absentNotApplicable, promoted) => {
     const pr = { number: 5060, state: 'OPEN', isDraft: true, headRefName: 'lane/live-5060', baseRefName: 'main',
-      headRefOid: 'a'.repeat(40), labels: [], comments: [], body: '', isCrossRepository: false, statusCheckRollup: rows };
+      headRefOid: 'a'.repeat(40), rowsHead: 'a'.repeat(40), rowsComplete: true, rosterSource: 'live',
+      labels: [], comments: [], body: '', isCrossRepository: false, statusCheckRollup: rows };
     const ready = vi.fn();
     const result = runDraftPromotionStep({ repos: ['web-everything/web-everything'], listDrafts: () => [pr],
       readHeadCheckState: args => reader(rows, { ...args, forPromotion: true, absentNotApplicable }), readPrView: () => pr, readAgents: () => [], readClaim: () => null,

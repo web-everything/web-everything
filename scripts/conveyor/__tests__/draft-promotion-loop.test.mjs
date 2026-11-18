@@ -13,10 +13,12 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
     const clearAwaiting = vi.fn();
     const readHeadCheckState = vi.fn(() => fresh);
     const readPrView = vi.fn(() => ({
-      ...draft, baseRefName: 'main', comments: [], isCrossRepository: false,
+      ...draft, rowsHead: draft.headRefOid, rowsComplete: true, rosterSource: 'live',
+      baseRefName: 'main', comments: [], isCrossRepository: false,
       mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', body: '', ...view,
       statusCheckRollup: [check('test'), check('review-gate', 'failure'),
-        check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 123 } })],
+        check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/123',
+          mergeGateReviewHold: { headSha: draft.headRefOid, holdIds: ['review-acceptance'], jobId: 123 } })],
     }));
     const result = runDraftPromotionStep({
       repos: [fixture.repo], listDrafts: () => [draft], readHeadCheckState, readPrView,
