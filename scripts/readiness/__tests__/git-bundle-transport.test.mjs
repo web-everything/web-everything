@@ -111,6 +111,9 @@ describe('R593 bundle ingest on the runner', () => {
       await fs.writeFile(join(work, path), content);
       entries.push({ path: Buffer.from(path), sha256: hash(content), executable: false, tracked });
     };
+    // `agent-memory-src/empty` is a nested HEAD link inside the bridge target. The client
+    // projects links transitively, so its content also appears under the bridge alias.
+    await addFile('.claude/agent-memory/empty/file.md', 'projected', false);
     await addFile('agent-memory-src/file.md', projection === 'retargeted' ? 'old target' : 'projected', true);
     if (projection === 'retargeted') await addFile('different-src/file.md', 'projected', true);
     if (projection === 'missing-alias') await addFile('agent-memory-src/extra.md', 'extra', true);
@@ -170,6 +173,39 @@ describe('R593 bundle ingest on the runner', () => {
     const staged = git(work, 'ls-files', '--stage');
     expect(staged).toMatch(/^100644 [0-9a-f]+ 0\talias\/new\.md$/m);
     expect(staged).not.toMatch(/^120000 [0-9a-f]+ 0\talias$/m);
+  });
+  it.each([['transitive', true], ['missing-nested-alias', false]])('compares projections of nested HEAD links in the reverse alias check (%s)', async (_name, complete) => {
+    // HEAD: `alias -> src`, `src/nested -> ../inner`, tracked src/keep.md, inner/extra.md.
+    // The client retargeted `alias` (to new-src, same keep.md bytes) without committing.
+    // Its manifest then lacks `alias/nested/extra.md`, so alias is unproven; a client
+    // that really kept alias -> src projects it transitively and alias is restored.
+    const blob = async (text) => (await exec({ file: 'git', args: ['hash-object', '-w', '--stdin'], cwd: lane, input: text })).stdout.toString().trim();
+    const aliasOid = await blob('src'), nestedOid = await blob('../inner');
+    git(lane, 'update-index', '--add', '--cacheinfo', `120000,${aliasOid},alias`);
+    git(lane, 'update-index', '--add', '--cacheinfo', `120000,${nestedOid},src/nested`);
+    const files = [['src/keep.md', 'keep', true], ['inner/extra.md', 'extra', true], ['new-src/keep.md', 'keep', true],
+      ['alias/keep.md', 'keep', false], ['src/nested/extra.md', 'extra', false]];
+    if (complete) files.push(['alias/nested/extra.md', 'extra', false]);
+    const entries = [{ path: Buffer.from('tracked.txt'), sha256: hash('changed'), executable: false, tracked: true }];
+    for (const [path, content, tracked] of files) {
+      await fs.mkdir(join(work, path, '..'), { recursive: true });
+      await fs.writeFile(join(work, path), content);
+      entries.push({ path: Buffer.from(path), sha256: hash(content), executable: false, tracked });
+      if (tracked) { await fs.mkdir(join(lane, path, '..'), { recursive: true }); await fs.writeFile(join(lane, path), content); git(lane, 'add', '--', path); }
+    }
+    git(lane, ...ident, 'commit', '-qm', 'HEAD nested links');
+    const head = git(lane, 'rev-parse', 'HEAD');
+    await fs.rm(join(root, 'repo.git'), { recursive: true, force: true });
+    git(root, 'clone', '--bare', lane, join(root, 'repo.git'));
+    git(join(root, 'repo.git'), 'update-ref', 'refs/remotes/origin/main', runnerMain);
+    entries.sort((a, b) => Buffer.compare(a.path, b.path));
+    const manifest = { ...manifestWire({ entries, excluded: [] }), git: { head } };
+    await materializeWorktree({ work, root, head, manifest, manifestDigest: digestManifest(manifest),
+      bundle: { mode: 'none', maxMainAgeMs: 600000 } });
+    const staged = git(work, 'ls-files', '--stage');
+    expect(staged).toMatch(new RegExp(`^120000 ${nestedOid} 0\\tsrc/nested$`, 'm'));
+    if (complete) expect(staged).toMatch(new RegExp(`^120000 ${aliasOid} 0\\talias$`, 'm'));
+    else expect(staged).not.toMatch(/^120000 [0-9a-f]+ 0\talias$/m);
   });
   it('fetches a verified incremental bundle into a per-run clone and checks out the exact tip', async () => {
     const plan = await run();
