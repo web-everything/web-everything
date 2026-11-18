@@ -139,6 +139,8 @@ export function seedMirror({ repo, body, nowMs, prev, retentionMs = PR_FACTS_DEF
   }
   const bootstrap = (body.coverage?.bootstrap || []).find((x) => repoKey(x?.repo) === r) || null;
   return {
+    // Tombstones survive a full seed: /prs does not serve unattached or evicted checks back.
+    evicted: prev?.evicted || [], evictedShas: prev?.evictedShas || [],
     v: PR_FACTS_VERSION, repo: r, buckets, closedSeen, cursor: body.stateCursor ?? body.head ?? null,
     fetchedAtMs: nowMs, lastOkAt: nowMs, lastFailAt: null, lastError: null,
     lastDeliveryAt: body.lastDeliveryAt ?? null, lastEventAt: body.lastEventAt ?? null,

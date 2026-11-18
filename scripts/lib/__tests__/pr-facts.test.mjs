@@ -460,3 +460,12 @@ describe('mirror compaction sha tombstones', () => {
     expect(lookupInMirror(adopted, { number: 9, nowMs: T })).toEqual({ facts: null, reason: 'evicted' });
   });
 });
+
+describe('tombstones across full seeds', () => {
+  it('a full seed keeps the previous tombstones', () => {
+    const prev = { evicted: [3], evictedShas: ['f'.repeat(40)] };
+    const m = seedMirror({ repo: 'web-everything/web-everything', body: { prs: [], stateCursor: 1 }, nowMs: 1, prev });
+    expect(m.evicted).toEqual([3]);
+    expect(m.evictedShas).toEqual(['f'.repeat(40)]);
+  });
+});
