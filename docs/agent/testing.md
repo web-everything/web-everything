@@ -4639,6 +4639,9 @@ Regressions live in `merge-ai-prs-capability.test.mjs`, `review-daemon.test.mjs`
 `prep-review.test.mjs` and the dispatchers' existing capability suites. The structural
 `capability-dispatch-only.test.mjs` pins admitted boundaries and rejects roster filtering.
 Run affected files through heavy-admission; test effects are injected, never live forge writes.
+Dispatching fixtures, including soak scenarios, must use registered repo identities with
+the required capability. An injected dispatch callback still passes through capability
+admission; keep unknown identities for tests that assert refusal.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
