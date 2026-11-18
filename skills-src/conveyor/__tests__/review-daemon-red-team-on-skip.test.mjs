@@ -207,7 +207,8 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
     const take = vi.fn();
     const out = runReviewTick({ ...production, repo,
       readPrs: () => [{ number: pr, headRefOid: head, labels: [], comments: [] }],
-      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1,
+      // Production wires a separate (unhalved) recovery lane reader; pin both seams so the fixture never reads the real pool.
+      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1, recoveryAcquirableLanes: () => 1,
       liveReviewBudget: { left: 1 }, hostAdmission: () => ({ admitted: true, maxPerTick: 1, take }),
       reconcile: () => ({ dispatch: [], refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }),
       tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
