@@ -107,7 +107,7 @@ describe('same-head referral resume preserves a newer send-back', () => {
   const comment = (body, createdAt) => ({ author: AUTOMATION, body, createdAt });
   const attempt = comment(buildFixEndComment({ who: 'fix-6945', headSha: head }), '2026-11-18T05:00:00Z');
   const advisory = comment(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** accept\n\nNet basis: \`${'a'.repeat(40)}..${head}\``, '2026-11-18T05:10:00Z');
-  const sendBack = comment(`🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\nFix the missing export.\n\nNet basis: \`${'a'.repeat(40)}..${head}\``, '2026-11-18T05:22:00Z');
+  const sendBack = comment(`🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\nFix the missing export.\n\nNet basis: \`${'a'.repeat(40)}..${head}\`\n\n${buildReviewedShaMarker(head)}`, '2026-11-18T05:22:00Z');
   const run = (labels, comments, extra = {}) => planReconcile({ prs: [pr1563({ number: 6945, headRefOid: head,
     labels: lbl('review:human', ...labels), comments,
     referralHold: { kind: 'same-head', head, count: 1, attemptsSinceWake: 1, why: 'all findings ruled' },
@@ -142,9 +142,47 @@ describe('same-head referral resume preserves a newer send-back', () => {
 
   it('a later send-back label event preserves the fixer obligation', () => {
     const result = run(['status:sent-back-review'], [attempt, advisory], {
-      labelEvents: [{ event: 'labeled', label: { name: 'status:sent-back-review' }, created_at: sendBack.createdAt }],
+      headChangedAt: '2026-11-18T04:00:00Z',
+      labelEvents: [{ actor: AUTOMATION, event: 'labeled', label: { name: 'status:sent-back-review' }, created_at: sendBack.createdAt }],
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+  });
+
+  it('an unpinned automated request cannot release the current-advisory hold', () => {
+    const request = { ...sendBack, body: '🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\nFix the missing export.' };
+    const result = run([], [attempt, advisory, request]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it('an unpinned sanctioned operator send-back still releases after review', () => {
+    const request = { id: 'operator-send-back', author: { login: 'chalbert' }, createdAt: sendBack.createdAt,
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nFix the missing export.' };
+    expect(run([], [attempt, advisory, request]).dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+  });
+
+  it('a later accept advisory supersedes a pinned request after the fixer attempt', () => {
+    const result = run([], [attempt, sendBack, { ...advisory, createdAt: '2026-11-18T05:30:00Z' }]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it.each([
+    { name: 'missing actor', actor: undefined },
+    { name: 'untrusted actor', actor: { login: 'outsider' } },
+    { name: 'missing head-change evidence', actor: AUTOMATION, headChangedAt: null },
+    { name: 'unreadable head-change evidence', actor: AUTOMATION, headChangedAt: 'unknown' },
+    { name: 'event before the live head', actor: AUTOMATION, headChangedAt: '2026-11-18T05:30:00Z' },
+    { name: 'event consumed by a fixer', actor: AUTOMATION, attemptAt: '2026-11-18T05:30:00Z' },
+    { name: 'unreadable event time', actor: AUTOMATION, eventAt: 'unknown' },
+    { name: 'event superseded by advisory', actor: AUTOMATION, eventAt: '2026-11-18T05:05:00Z' },
+  ])('a label with $name cannot release the hold', ({ actor, headChangedAt = '2026-11-18T04:00:00Z', eventAt = sendBack.createdAt, attemptAt = attempt.createdAt }) => {
+    const result = run(['status:sent-back-review'], [{ ...attempt, createdAt: attemptAt }, advisory], {
+      headChangedAt,
+      labelEvents: [{ actor, event: 'labeled', label: { name: 'status:sent-back-review' }, created_at: eventAt }],
+    });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
 
   it.each([

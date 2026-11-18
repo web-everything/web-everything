@@ -1507,22 +1507,39 @@ function sendBackAfterFixAttempt(pr) {
   const lastAt = Math.max(-Infinity, ...times);
   const lastIndex = Math.max(-1, ...attempts.map(c => comments.indexOf(c)));
   const verdict = latestChangesVerdict(trusted);
+  const operatorRequest = operatorSendBackAfterReview(pr);
   const requests = trusted.filter(c => {
     const outcomes = gateOutcomesForHead([c], pr.number, pr.headRefOid);
-    return (c === verdict && (!isOperatorAuthored(c) || Boolean(operatorSendBackAfterReview(pr)))) || outcomes.has('sent-back')
+    return (c === verdict && (!isOperatorAuthored(c) || Boolean(operatorRequest))) || outcomes.has('sent-back')
       || (labelNames(pr.labels).includes('red-team:blocked') && outcomes.has('operator-block'));
   });
+  // Requests are not completed reviews. Keep their slots so thread order remains comparable,
+  // and require readable review evidence before reopening an already-reviewed head.
+  const review = latestHeadReview({ ...pr, comments: comments.map(c => requests.includes(c) ? {} : c) }, { currentHeadOnly: true });
+  if (!review) return false;
   if (requests.some(c => {
     const heads = reviewedHeadsOf(c);
-    return (!heads.length || heads.some(head => sameHeadSha(head, pr.headRefOid)))
-      && comments.indexOf(c) > lastIndex && Date.parse(c.createdAt ?? c.created_at) > lastAt;
+    const outcomes = gateOutcomesForHead([c], pr.number, pr.headRefOid);
+    const pinned = heads.some(head => sameHeadSha(head, pr.headRefOid))
+      || outcomes.has('sent-back') || outcomes.has('operator-block');
+    const sanctionedOperator = c === verdict && operatorRequest
+      && String(c.id ?? c.node_id) === operatorRequest.verdictId;
+    return (pinned || sanctionedOperator)
+      && comments.indexOf(c) > Math.max(lastIndex, review.index)
+      && Date.parse(c.createdAt ?? c.created_at) > Math.max(lastAt, review.at);
   })) return true;
   const labels = labelNames(pr.labels);
+  const headChangedAt = Date.parse(standDownHeadChangeAt(pr));
+  // A label has no SHA trailer: unknown actor/head chronology retains the hold. The
+  // operator can instead post a sanctioned send-back, or automation a head-pinned request.
+  if (!Number.isFinite(headChangedAt)) return false;
   return (Array.isArray(pr.labelEvents) ? pr.labelEvents : []).some(e => {
     const label = typeof e?.label === 'string' ? e.label : e?.label?.name;
-    return labels.includes(label) && ['review:changes', 'status:sent-back-review', 'status:sent-back-red-team'].includes(label)
+    const actor = typeof e?.actor === 'string' ? { login: e.actor } : e?.actor;
+    return isTrustedMarkerAuthor({ author: actor })
+      && labels.includes(label) && ['review:changes', 'status:sent-back-review', 'status:sent-back-red-team'].includes(label)
       && (e.event === 'labeled' || e.event === undefined)
-      && Date.parse(e.created_at ?? e.at ?? e.createdAt) > lastAt;
+      && Date.parse(e.created_at ?? e.at ?? e.createdAt) > Math.max(lastAt, review.at, headChangedAt);
   });
 }
 
