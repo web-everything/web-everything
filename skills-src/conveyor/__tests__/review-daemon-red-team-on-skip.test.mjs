@@ -415,7 +415,7 @@ it('production queue floor at idle 100 cannot replenish the shared host allowanc
       liveReviewBudget: { left: 5 }, hostAdmission,
     };
     const first = runReviewTick(tickOptions);
-    const second = runReviewTick({ ...tickOptions, repo: 'web-everything/frontierui' });
+    const second = runReviewTick({ ...tickOptions, repo: 'frontier-ui/frontierui' });
     expect(first.redTeamOnSkip.dispatched).toHaveLength(1);
     expect(second.redTeamOnSkip.dispatched).toEqual([]);
     expect(dispatch).toHaveBeenCalledOnce();
@@ -441,7 +441,7 @@ it('recovery-only starts consume the shared host budget across repos', () => {
   const check = vi.fn(() => ({ admitted: true, maxPerTick: 1 }));
   const hostAdmission = sharedHostBudget(check);
   const first = runReviewTick({ ...options, hostAdmission });
-  const second = runReviewTick({ ...options, repo: 'web-everything/frontierui', hostAdmission });
+  const second = runReviewTick({ ...options, repo: 'frontier-ui/frontierui', hostAdmission });
   expect(first.redTeamOnSkip.dispatched).toHaveLength(1);
   expect(second.redTeamOnSkip.dispatched).toEqual([]);
   expect(recoveryDispatch).toHaveBeenCalledTimes(1);

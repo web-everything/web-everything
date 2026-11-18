@@ -126,7 +126,7 @@ import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-h
 import { runSessionReaperPass, makeReapedLedger, makePidDeadResolver, REPO_ROOT as SESSION_REAPER_REPO_ROOT, DEFAULT_IDLE_REAP_THRESHOLD_MS } from '../../scripts/conveyor/session-reaper.mjs';
 import { mintSessionSlug } from '../../scripts/conveyor/session-slug.mjs';
 import { freeLaneNumbers } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
-import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
+import { assertCapability, repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
@@ -447,6 +447,7 @@ export function runReviewTick({
   log = () => {},
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
+  resolveProfile = repoProfile,
   dispatchState = reviewDispatchState,
   isPidAlive = pidAlive,
 } = {}) {
@@ -743,6 +744,8 @@ export function runReviewTick({
         row.kind === 'nothing-owed' && row.phase === 'queued'
           ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
           : row);
+      const refusal = assertCapability(repo, 'review', { resolveProfile });
+      if (refusal) return;
       redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
         capacity, paused });
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
@@ -768,6 +771,12 @@ export function runReviewTick({
     if (reserved) liveReviewBudget.left--;
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
+      const refusal = assertCapability(repo, 'review', { resolveProfile });
+      if (refusal) {
+        if (reserved) liveReviewBudget.left++;
+        notStarted.push({ prNumber: d.prNumber, reason: refusal.why });
+        continue;
+      }
       const result = dispatch({ pr: d.prNumber, repo,
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),

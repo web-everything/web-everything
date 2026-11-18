@@ -334,6 +334,9 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
     try {
       const options = {
         root: '/repo', repo: 'plateauapp/plateau-app', unsupportedPath,
+        flushOwed: () => { calls.push('flush'); return {}; },
+        flushTimeouts: async () => { calls.push('timeouts'); return []; },
+        pollAttempts: () => [],
         reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }, { kind: 'fix', prNumber: 51 }], refusals: [] }),
         pickFreeLanes: () => { calls.push('pool'); return [2]; },
         dispatch: () => { calls.push('dispatch'); },
@@ -346,7 +349,7 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
       const result = await runReconcileCiHealDispatch(options);
       expect(result.dispatched).toEqual([]);
       expect(result.refusals).toEqual([{ kind: 'unsupported-repo', repo: 'plateau-app', prNumber: 50, action: 'ci-heal', why: expect.any(String) }]);
-      expect(calls).toEqual([]); // never touched the lane pool or a dispatch sink — only `fix` was in the plan's non-ci-heal row
+      expect(calls).toEqual(['flush', 'timeouts']); // Lifecycle publication survives dispatch refusal.
       expect(readUnsupported({ path: unsupportedPath })).toHaveLength(1);
       await expect(runReconcileCiHealDispatch({ repo: 'unknown/repo' })).rejects.toThrow(/not a constellation repo/);
     } finally { rmSync(dir, { recursive: true, force: true }); }

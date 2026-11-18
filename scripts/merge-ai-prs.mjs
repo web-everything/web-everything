@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -5024,6 +5025,8 @@ async function runCli() {
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
     const shown = { line: guard.reason ?? guard.line };
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
+    const refusal = assertCapability(c.repo ?? localSlug, 'review');
+    if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
