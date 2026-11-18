@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /** Refresh unit timings from CI evidence. Refusals exit 2 without replacing existing timings.
- * CLI: --dir=<downloaded-reports> | --run=<id|latest>
+ * CLI: --dir=<downloaded-reports> | --run=<id|latest> | --runs=<1..5> [--min-stale=<ratio>]
  * Soak is left unchanged: run-shard.mjs currently supplies no JSON reporter/output option.
  */
-import { readdir, readFile, writeFile, rename, rm, mkdtemp } from 'node:fs/promises';
+import { readdir, readFile, writeFile, rename, rm, mkdtemp, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import yaml from 'js-yaml';
-import { REPO_ROOT, TIMINGS_FILE, listUnitTestFiles, timingsFromReports, loadTimings, formatUpdatedTimings } from './shard-assign.mjs';
+import { REPO_ROOT, TIMINGS_FILE, listUnitTestFiles, timingsFromReports, loadTimings, formatUpdatedTimings, median, staleRatio } from './shard-assign.mjs';
 
 /** Recursively parse unit reports only; malformed or unreadable evidence throws. Report filenames are appended to `names`. */
 export async function foldReports(dir, names = []) {
@@ -58,16 +58,34 @@ function shardReportProblem(names, shards) {
   return problems.length ? `Found ${names.length} unit reports; need exactly one per CI unit shard (${shards.length}): ${problems.join('; ')}` : null;
 }
 
+/** Each run contributes at most one observation per file. Missing files do not contribute zeroes. */
+export function medianTimings(perRun) {
+  const samples = new Map();
+  for (const timings of perRun) for (const [file, seconds] of Object.entries(timings)) {
+    if (!samples.has(file)) samples.set(file, []);
+    samples.get(file).push(seconds);
+  }
+  return Object.fromEntries([...samples].map(([file, values]) => [file, median(values)]));
+}
+
 /** Validate all evidence before atomically replacing the unit map, preserving soak timings. */
-export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot = REPO_ROOT, io = {} }) {
+export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot = REPO_ROOT, io = {}, dirs, minStale, total = 9 }) {
   const { writeFile: write = writeFile, rename: move = rename } = io;
   let pending;
   try {
-    const names = [];
-    const reports = await foldReports(dir, names);
-    const problem = shardReportProblem(names, expectedUnitShards(repoRoot));
-    if (problem) return { ok: false, reason: `${problem}. Download all timing-unit-* artifacts from one successful full CI run.` };
-    const measured = timingsFromReports(reports, repoRoot);
+    const perRun = [];
+    let count = 0;
+    const skipped = [];
+    for (const runDir of dirs ?? [dir]) {
+      const names = [];
+      const reports = await foldReports(runDir, names);
+      const problem = shardReportProblem(names, expectedUnitShards(repoRoot));
+      if (problem) { skipped.push(problem); continue; }
+      perRun.push(timingsFromReports(reports, repoRoot));
+      count += reports.length;
+    }
+    if (!perRun.length) return { ok: false, reason: `${skipped.join('; ')}. Download all timing-unit-* artifacts from at least one successful full CI run.` };
+    const measured = medianTimings(perRun);
     const files = await listUnitTestFiles(repoRoot);
     // Keep current files only: a run built before a rename/delete still reports the old name.
     const timings = Object.fromEntries(files.filter(file => Object.hasOwn(measured, file)).map(file => [file, measured[file]]));
@@ -75,11 +93,16 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
     if (!files.length || covered / files.length < 0.9) {
       return { ok: false, reason: `Unit timing coverage ${covered}/${files.length} is below 90%. Use a current successful full CI run or rerun CI on main.` };
     }
-    const output = formatUpdatedTimings(loadTimings(timingsFile), 'unit', timings);
+    const all = loadTimings(timingsFile);
+    const ratio = staleRatio(files, all.unit, timings, total);
+    const balance = `stale ratio old-assignment-on-new-timings ${ratio.toFixed(2)}`;
+    const evidence = skipped.length ? ` Skipped ${skipped.length} incomplete runs: ${skipped.join('; ')}.` : '';
+    if (minStale !== undefined && ratio < minStale) return { ok: true, reason: `${balance}; assignment still balanced.${evidence}` };
+    const output = formatUpdatedTimings(all, 'unit', timings);
     pending = `${timingsFile}.${randomUUID()}.pending`;
     await write(pending, output, { flag: 'wx' });
     await move(pending, timingsFile);
-    return { ok: true, reason: `Updated unit timings from ${reports.length} reports: ${covered}/${files.length} current files covered.` };
+    return { ok: true, reason: `Updated unit timings from ${count} reports: ${covered}/${files.length} current files covered. ${balance}.${evidence}` };
   } catch (error) {
     return { ok: false, reason: `Timing refresh refused: ${error.message}. Check the downloaded reports and retry with complete CI evidence.` };
   } finally {
@@ -100,16 +123,41 @@ export async function downloadReports(run, dir, { exec } = {}) {
   exec('gh', ['run', 'download', id, '--pattern=timing-unit-*', '--dir', dir], options);
 }
 
-export async function main(argv) {
-  if (argv.length !== 1 || !/^--(?:dir=.+|run=(?:latest|\d+))$/.test(argv[0])) {
-    throw new Error('usage: refresh-timings.mjs --dir=<reports> | --run=<id|latest>');
+/** Select a bounded rolling window; each run downloads into its own directory. */
+export async function downloadRuns(runs, dir, { exec } = {}) {
+  if (!Number.isInteger(runs) || runs < 1 || runs > 5) throw new Error('--runs must be 1..5; use --run=<id> for a specific run');
+  exec ??= (await import('../lib/gh-throttle.mjs')).execFileSyncThrottled;
+  const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', `--limit=${runs}`, '--json=databaseId'],
+    { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 }));
+  if (!Array.isArray(found) || !found.length || found.length > runs || found.some(r => !/^\d+$/.test(String(r?.databaseId ?? ''))) ||
+      new Set(found.map(r => String(r.databaseId))).size !== found.length) throw new Error('No valid CI run window; supply --run=<id> or retry after successful main CI pushes');
+  const dirs = [];
+  for (const run of found) {
+    const target = join(dir, String(run.databaseId));
+    await mkdir(target);
+    await downloadReports(String(run.databaseId), target, { exec });
+    dirs.push(target);
   }
+  return dirs;
+}
+
+export async function main(argv, { exec, ...options } = {}) {
+  const sources = argv.filter(a => /^--(?:dir=.+|run=(?:latest|\d+)|runs=[1-5])$/.test(a));
+  const threshold = argv.filter(a => /^--min-stale=(?:\d+(?:\.\d+)?)$/.test(a));
+  if (sources.length > 1 || threshold.length > 1 || sources.length + threshold.length !== argv.length ||
+      argv.some(a => /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(a)) ||
+      (!sources.length && !threshold.length) || (threshold.length && (!Number.isFinite(Number(threshold[0].slice(12))) || Number(threshold[0].slice(12)) < 1))) {
+    throw new Error('usage: refresh-timings.mjs --dir=<reports> | --run=<id|latest> | --runs=<1..5> [--min-stale=<ratio>]');
+  }
+  const source = sources[0] ?? '--runs=5';
   let scratch;
   try {
-    const dir = argv[0].startsWith('--dir=') ? resolve(argv[0].slice(6))
+    const dir = source.startsWith('--dir=') ? resolve(source.slice(6))
       : (scratch = await mkdtemp(join(tmpdir(), 'ci-timings-')));
-    if (scratch) await downloadReports(argv[0].slice(6), dir);
-    const result = await refreshFromDir({ dir });
+    let dirs;
+    if (source.startsWith('--runs=')) dirs = await downloadRuns(Number(source.slice(7)), dir, { exec });
+    else if (scratch) await downloadReports(source.slice(6), dir, { exec });
+    const result = await refreshFromDir({ ...options, dir, dirs, minStale: threshold.length ? Number(threshold[0].slice(12)) : undefined });
     process[result.ok ? 'stdout' : 'stderr'].write(`${result.reason.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\n`);
     return result.ok ? 0 : 2;
   } finally {

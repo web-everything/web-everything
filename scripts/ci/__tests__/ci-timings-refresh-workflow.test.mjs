@@ -9,7 +9,7 @@ import { readAuthorActorStamps } from '../../lib/review-independence.mjs';
 
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci-timings-refresh.yml', import.meta.url), 'utf8'));
 const steps = workflow.jobs.refresh.steps;
-const download = steps.find(step => step.run?.includes('refresh-timings.mjs --run=latest'));
+const download = steps.find(step => step.run?.includes('refresh-timings.mjs --runs=5 --min-stale=1.15'));
 const publish = steps.find(step => step.run?.includes('gh pr create'));
 const mint = steps.find(step => step.id === 'publication-token');
 const branch = steps.find(step => step.id === 'branch');
@@ -184,6 +184,16 @@ describe('CI timing refresh workflow permissions and publication', () => {
     expect(workflow.on.schedule).toHaveLength(1);
     expect(workflow.on.schedule[0].cron).toMatch(/^\d+ \d+ \* \* [0-6]$/);
     expect(workflow.on).toHaveProperty('workflow_dispatch');
+  });
+
+  it('refreshes only successful CI main push completions or explicit scheduled/manual runs', () => {
+    const ci = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
+    expect(workflow.on.workflow_run).toEqual({ workflows: [ci.name], types: ['completed'] });
+    expect(workflow.jobs.refresh.if).toBe(
+      "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || " +
+      "(github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && " +
+      "github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')");
+    expect(download.run).toBe('node scripts/ci/refresh-timings.mjs --runs=5 --min-stale=1.15');
   });
 
   it('mints a publication App token scoped to the current repository with contents and PR write access', () => {

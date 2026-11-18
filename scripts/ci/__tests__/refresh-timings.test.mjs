@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
-import { downloadReports, expectedUnitShards, foldReports, main, refreshFromDir } from '../refresh-timings.mjs';
+import { downloadReports, downloadRuns, medianTimings, expectedUnitShards, foldReports, main, refreshFromDir } from '../refresh-timings.mjs';
 import { REPO_ROOT, timingsFromReports } from '../shard-assign.mjs';
 
 // Public contracts for Phase 2:
@@ -327,4 +327,99 @@ describe('refresh-timings CI artifact download trust boundary', () => {
     expect(line).toContain('evil');
     expect(line).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
   }, 20_000);
+});
+
+describe('rolling timing refresh', () => {
+  it('takes odd and even medians across only runs containing each file', () => {
+    expect(medianTimings([{ a: 1, b: 2 }, { a: 100, b: 4 }, { a: 3, c: 9 }])).toEqual({ a: 3, b: 3, c: 9 });
+    expect(medianTimings([])).toEqual({});
+  });
+
+  function rollingExec(samples, calls) {
+    return (cmd, args, options) => {
+      calls.push({ cmd, args, options });
+      if (args[1] === 'list') return JSON.stringify(samples.map((_, i) => ({ databaseId: 100 + i })));
+      const index = Number(args[2]) - 100;
+      const target = args.at(-1);
+      const sample = samples[index];
+      for (let i = 0; i < (sample === null ? 9 : 10); i++) {
+        writeFileSync(join(target, `timing-unit-${i + 1}.json`), JSON.stringify(report(files[i], sample ?? 1000)));
+      }
+      return '';
+    };
+  }
+
+  it('downloads a bounded successful main push window in separate directories, skips an incomplete run and writes medians', async () => {
+    const calls = [];
+    expect(await main(['--runs=5'], { exec: rollingExec([1000, 3000, null, 2000, 99000], calls), timingsFile, repoRoot })).toBe(0);
+    expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=5', '--json=databaseId']);
+    expect(calls.slice(1).map(c => c.args.slice(0, 4))).toEqual([100, 101, 102, 103, 104].map(id => ['run', 'download', String(id), '--pattern=timing-unit-*']));
+    expect(new Set(calls.slice(1).map(c => c.args.at(-1))).size).toBe(5);
+    expect(calls.every(c => c.cmd === 'gh' && c.options.timeout === 120000 && c.options.maxBuffer === 1024 * 1024 && !c.options.shell)).toBe(true);
+    expect(JSON.parse(readFileSync(timingsFile, 'utf8')).unit).toEqual(Object.fromEntries(files.map(file => [file, 2.5])));
+  });
+
+  it('requires at least one complete run and preserves bytes when every run is incomplete', async () => {
+    expect(await main(['--runs=2'], { exec: rollingExec([null, null], []), timingsFile, repoRoot })).toBe(2);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+
+  it('does not write when the old assignment remains below min-stale, defaulting the window to five', async () => {
+    const calls = [];
+    expect(await main(['--min-stale=1.9'], { exec: rollingExec([1000], calls), timingsFile, repoRoot })).toBe(0);
+    expect(calls[0].args).toContain('--limit=5');
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+
+  it('writes when drift meets the threshold', async () => {
+    expect(await main(['--runs=1', '--min-stale=1'], { exec: rollingExec([1000], []), timingsFile, repoRoot })).toBe(0);
+    expect(readFileSync(timingsFile, 'utf8')).not.toBe(original);
+  });
+
+  it.each([0, 6, 100, 1.5])('refuses window size %s before GitHub calls with an explicit-run fallback', async runs => {
+    const calls = [];
+    await expect(downloadRuns(runs, dir, { exec: (...args) => calls.push(args) })).rejects.toThrow(/1..5.*--run=<id>/);
+    expect(calls).toEqual([]);
+  });
+
+  it.each(['[]', '[{}]', '[{"databaseId":"1;x"}]', '[{"databaseId":1},{"databaseId":1}]', '[{"databaseId":1},{"databaseId":2}]'])('refuses invalid or oversized run evidence %s before downloads', async evidence => {
+    const calls = [];
+    await expect(downloadRuns(1, dir, { exec: (_, args) => { calls.push(args); return evidence; } })).rejects.toThrow(/valid CI run window/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each(['--runs=0', '--runs=6', '--runs=1.5', '--min-stale=NaN', '--min-stale=0.5'])('rejects invalid CLI bounds %s', async arg => {
+    await expect(main([arg])).rejects.toThrow(/usage:/);
+  });
+
+  it('rolling refresh retains the 90% coverage requirement', async () => {
+    const exec = rollingExec([1000], []);
+    const incompleteCoverage = (cmd, args, options) => {
+      const result = exec(cmd, args, options);
+      if (args[1] === 'download') for (const index of [9, 10]) {
+        writeFileSync(join(args.at(-1), `timing-unit-${index}.json`), JSON.stringify(report(files[0])));
+      }
+      return result;
+    };
+    expect(await main(['--runs=1'], { exec: incompleteCoverage, timingsFile, repoRoot })).toBe(2);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+});
+
+describe('shard balance CLI', () => {
+  it('prints predicted balance, exits 3 above the limit, and honors max-ratio', () => {
+    const assign = join(dirname(timingsFile), 'shard-assign.mjs');
+    copyFileSync(new URL('../shard-assign.mjs', import.meta.url), assign);
+    writeFileSync(timingsFile, JSON.stringify({ unit: Object.fromEntries(files.map(f => [f, 1])) }));
+    const run = (...args) => spawnSync(process.execPath, [assign, '--suite=unit', '--balance', '--total=9', ...args], {
+      cwd: repoRoot, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+    });
+    const refused = run();
+    expect(refused.status, refused.stderr).toBe(3);
+    expect(refused.stdout).toBe('predicted slowest/average 1.80\n');
+    expect(run('--max-ratio=2').status).toBe(0);
+    expect(run('--max-ratio=NaN').status).toBe(2);
+    const invalid = spawnSync(process.execPath, [assign, '--suite=unit', '--balance', '--total=0'], { encoding: 'utf8', timeout: 15000 });
+    expect(invalid.status).toBe(2);
+  }, 30000);
 });

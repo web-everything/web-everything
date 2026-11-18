@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
+import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
 
 describe('shard-assign — balance by measured time (card 11)', () => {
   const files = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -104,4 +104,28 @@ describe('shard-assign — persisted unit timing freshness', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+describe('shard balance metrics', () => {
+  it('computes max/mean with median fallback for missing timings', () => {
+    expect(balanceRatio([['a', 'missing'], ['b']], { a: 6, b: 2 })).toBeCloseTo(10 / 6);
+    expect(() => balanceRatio([[], []], {})).toThrow(/positive shard loads/);
+  });
+
+  it('balances skewed synthetic timings within 1.2 using LPT', () => {
+    const timings = { a: 100, b: 50, c: 40, d: 30, e: 20, f: 10, g: 10, h: 10 };
+    expect(predictedBalance(Object.keys(timings), timings, 3)).toBeLessThanOrEqual(1.2);
+  });
+
+  it('detects drift in the old assignment while a fresh assignment stays balanced', () => {
+    const old = { a: 1, b: 1, c: 1, d: 1 };
+    const fresh = { a: 10, b: 1, c: 10, d: 1 };
+    expect(staleRatio(Object.keys(old), old, fresh, 2)).toBeCloseTo(20 / 11);
+    expect(predictedBalance(Object.keys(old), fresh, 2)).toBe(1);
+  });
+
+  it('committed unit timings predict at most 1.2 over nine shards using their own keys', () => {
+    const unit = loadTimings().unit;
+    expect(balanceRatio(assignByTime(Object.keys(unit), unit, 9), unit)).toBeLessThanOrEqual(1.2);
+  });
 });

@@ -80,6 +80,23 @@ export function assignByTime(files, timings, total) {
   return shards.map((s) => s.files.sort());
 }
 
+/** Slowest shard relative to the mean, using the assignment's median fallback. */
+export function balanceRatio(shards, timings) {
+  const fallback = median(Object.values(timings));
+  const loads = shards.map(files => files.reduce((sum, file) => sum + (Number.isFinite(timings[file]) ? timings[file] : fallback), 0));
+  const mean = loads.reduce((sum, load) => sum + load, 0) / loads.length;
+  if (!Number.isFinite(mean) || mean <= 0) throw new Error('Cannot measure balance without positive shard loads');
+  return Math.max(...loads) / mean;
+}
+
+export function predictedBalance(files, timings, total) {
+  return balanceRatio(assignByTime(files, timings, total), timings);
+}
+
+export function staleRatio(files, oldTimings, newTimings, total) {
+  return balanceRatio(assignByTime(files, oldTimings, total), newTimings);
+}
+
 export function parseShardArg(argv) {
   const hit = argv.find((a) => a.startsWith('--shard='));
   const m = hit && /^--shard=(\d+)\/(\d+)$/.exec(hit);
@@ -168,7 +185,12 @@ async function main(argv) {
     return 0;
   }
 
-  const { shard, total } = parseShardArg(argv);
+  const balance = argv.includes('--balance');
+  if (balance && suite !== 'unit') throw new Error('--balance only applies to --suite=unit');
+  const { shard, total } = balance
+    ? { total: Number((argv.find(a => a.startsWith('--total=')) ?? '').slice(8)) }
+    : parseShardArg(argv);
+  if (!Number.isSafeInteger(total) || total < 1) throw new Error('--total must be a positive integer');
   if (suite === 'soak') {
     if (argv.some((a) => a.startsWith('--group='))) throw new Error('shard-assign: --group only applies to --suite=unit');
     // Use the soak runner's policy, including its exclusive baseline shard.
@@ -187,6 +209,13 @@ async function main(argv) {
     const { classifyTests } = await import('./coverage-reach.mjs');
     const split = await classifyTests(files);
     files = split[group];
+  }
+  if (balance) {
+    const limit = Number((argv.find(a => a.startsWith('--max-ratio=')) ?? '--max-ratio=1.2').slice(12));
+    if (!Number.isFinite(limit) || limit < 1) throw new Error('--max-ratio must be finite and at least 1');
+    const ratio = predictedBalance(files, loadTimings().unit, total);
+    process.stdout.write(`predicted slowest/average ${ratio.toFixed(2)}\n`);
+    return ratio > limit ? 3 : 0;
   }
   // Keep the soak CLI and its run-shard caller on the same partition (including baseline isolation).
   const mine = suite === 'soak'
