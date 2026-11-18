@@ -4731,3 +4731,10 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+## Owed CI rerun execution
+
+The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
+Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
+daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
+refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
