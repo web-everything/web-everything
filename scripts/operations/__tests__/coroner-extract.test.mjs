@@ -40,6 +40,75 @@ describe('card 130 S2 outcome labels', () => {
     expect(fixOutcome(state, '')).toBe('stopped-without-outcome');
     expect(fixOutcome(state, 'I pushed the repair to lane/x at abc123')).toBe('pushed');
   });
+  it('separates five per-tick prepare observation failures from two launches and one result failure', () => {
+    const observation = (num, reason, extra = {}) => ({ num, reason, cause: 'daemon-observation', stage: 'retirement', retry: true, ...extra });
+    const throttle = observation('41', 'gh-throttle: throttled pr list');
+    const budget = observation('42', 'prepare PR listing call budget exhausted');
+    const command = observation('43', 'Command failed: node gh-throttle.mjs pr list --limit 100');
+    const failure = { num: '44', stage: 'result', reason: 'prepare-unstamped', attempt: 'run failed', recordedAt: at(2) };
+    const launched = [{ num: '45', attempt: 'run a', at: at(1) }, { num: '46', attempt: 'run b', at: at(1) }];
+    const ticks = [
+      { at: at(1), prepare: { launched, failures: [throttle, throttle, budget] } },
+      { at: at(2), prepare: { launched, failures: [throttle, command, failure] } },
+      { at: at(3), prepare: { failures: [{ ...command, reason: command.reason.replace('100', '200'), attempt: 'different metadata' }, failure] } },
+    ];
+    const metrics = builderMetrics(ticks, { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 3, launched: 2 });
+    expect(metrics.prepareObservationFailures).toEqual({ count: 5, byReason: {
+      'gh-throttle: throttled pr list': 2,
+      'prepare PR listing call budget exhausted': 1,
+      'Command failed: node gh-throttle.mjs pr list --limit N': 2,
+    } });
+  });
+  it('observation-only windows have zero prepare attempts and deduplicate normalized reasons within each tick', () => {
+    const reason = `Command failed: node gh-throttle.mjs pr list ${'x'.repeat(100)}`;
+    const failures = [
+      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 123 calls', recordedAt: at(-10), held: true },
+      { num: '41', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 456 calls', attempt: 'another attempt' },
+      { num: '42', cause: 'daemon-observation', stage: 'retirement', reason: 'PR listing call budget exhausted after 789 calls' },
+      { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} first` },
+      { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} second` },
+    ];
+    const metrics = builderMetrics([
+      { at: at(-1), prepare: { failures } },
+      { at: at(1), prepare: { failures } },
+      { at: until, prepare: { failures } },
+    ], { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 0, total: 0, launched: 0 });
+    expect(metrics.prepareObservationFailures).toEqual({ count: 3, byReason: {
+      'PR listing call budget exhausted after N calls': 2,
+      [reason.slice(0, 90)]: 1,
+    } });
+    expect(builderMetrics([], { since, until })).not.toHaveProperty('prepareObservationFailures');
+  });
+  it.each([
+    ['launch', 'failure recording unavailable'],
+    ['launch', 'Command failed: node gh-throttle.mjs pr list'],
+    ['result', 'PR listing failed'],
+    [undefined, 'gh-throttle: throttled pr list'],
+    ['retirement', 'failure recording unavailable'],
+    ['retirement', 'gh-throttle: throttled pr view'],
+    ['retirement', 'gh-throttle: throttled'],
+    ['retirement', 'PR listing failed after 123 calls'],
+    ['retirement', 'other daemon observation pr list'],
+    ['retirement', 'Command failed: node other-command.mjs'],
+    ['retirement', 'Command failed: node gh-throttle.mjs pr view'],
+  ])('counts daemon-observation at stage %s with reason %s as a failed attempt', (stage, reason) => {
+    const metrics = builderMetrics([{ at: at(1), prepare: { failures: [
+      { num: '4501', cause: 'daemon-observation', stage, reason },
+    ] } }], { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 1, launched: 0 });
+    expect(metrics.byKind.prepare.causes.failed.count).toBe(1);
+    expect(metrics).not.toHaveProperty('prepareObservationFailures');
+  });
+  it('counts a retirement-stage prepare-session-dead failure without an observation cause as a failed attempt', () => {
+    const metrics = builderMetrics([{ at: at(1), prepare: { failures: [
+      { num: '4501', stage: 'retirement', reason: 'prepare-session-dead' },
+    ] } }], { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 1, launched: 0 });
+    expect(metrics.byKind.prepare.causes.failed.count).toBe(1);
+    expect(metrics).not.toHaveProperty('prepareObservationFailures');
+  });
   it('prepare failures count per attempt, not per tick, and carried-over rows do not count', () => {
     const fail = (extra) => ({ num: '4341', stage: 'stamp', reason: 'ref-lock', ...extra });
     const tick = (m, failures) => ({ at: at(m), prepare: { launched: [], failures } });
