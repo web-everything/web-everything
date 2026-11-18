@@ -168,7 +168,9 @@ async function main(argv) {
     const all = loadTimings();
     const timings = timingsFromReports(reports);
     // An empty or malformed report must never wipe populated timings.
-    if (!reports.every((r) => Array.isArray(r?.testResults)) || !Object.keys(timings).length) {
+    const wellFormed = reports.every((r) => Array.isArray(r?.testResults) && r.testResults.every((t) =>
+      t && typeof t.name === 'string' && Number.isFinite(t.startTime) && Number.isFinite(t.endTime) && t.endTime >= t.startTime));
+    if (!wellFormed || !Object.keys(timings).length) {
       throw new Error('shard-assign: --update reports hold no timed test files; refusing to overwrite existing timings');
     }
     writeFileSync(TIMINGS_FILE, formatUpdatedTimings(all, suite, timings));

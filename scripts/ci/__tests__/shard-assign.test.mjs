@@ -146,6 +146,8 @@ describe('integration timing persistence', () => {
         expect(result.stderr).toMatch(/requires|forbids/);
       }
       expect(loadTimings(file)).toEqual(updated);
+      writeFileSync(report, JSON.stringify({ testResults: [{ name: join(dir, 'i.test.mjs'), startTime: 5, endTime: 1 }] }));
+      expect(spawnSync(process.execPath, [script, '--suite=integration', `--update=${report}`], { encoding: 'utf8', timeout: 5000 }).status).toBe(2);
       writeFileSync(report, '{}');
       const empty = spawnSync(process.execPath, [script, '--suite=integration', `--update=${report}`], { encoding: 'utf8', timeout: 5000 });
       expect(empty.status).toBe(2);
