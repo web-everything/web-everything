@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
+import childProcess from 'node:child_process';
 import * as pidHelpers from '../../lib/pid-alive.mjs';
 import { join } from 'node:path';
 import { dispatchTimeoutRetry, readTimeoutHold, runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch.mjs';
-import { readTimeoutBudget, timeoutKey } from '../timeout-retry-state.mjs';
+import { readTimeoutBudget, timeoutKey, timeoutRequesterNamespace } from '../timeout-retry-state.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 const repo = 'web-everything/web-everything';
 const t0 = Date.parse('2026-10-14T16:00:00Z');
@@ -21,10 +22,16 @@ const identityExec = (_cmd, args) => {
   if (Number(args[1]) === process.pid) return 'S Wed Oct 14 15:59:00 2026 node test-runner';
   throw Error('unexpected pid');
 };
-const deadRequester = { pid: deadPid, hostname: hostname() };
+const namespace = process.platform === 'linux' ? 'pid:[test]' : 'boot:1:0';
+const deadRequester = { pid: deadPid, hostname: hostname(), namespace };
 let dir;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'owed-rerun-'));
+  vi.spyOn(pidHelpers, 'pidNamespace').mockReturnValue('pid:[test]');
+  vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd, args) => {
+    expect([cmd, args]).toEqual(['sysctl', ['-n', 'kern.boottime']]);
+    return '{ sec = 1, usec = 0 }';
+  });
   vi.spyOn(pidHelpers, 'pidIdentity').mockImplementation((pid, opts) => realIdentity(pid, { ...opts, exec: identityExec }));
   vi.spyOn(pidHelpers, 'pidIdentityStamp').mockImplementation(pid => realStamp(pid, identityExec));
 });
@@ -43,17 +50,55 @@ const plan = budget => planReconcile({ prs: [{ number: evidence.pr, state: 'OPEN
   agents: [], requiredChecks: ['test'], now: t0 + 21 * 60_000, mainRedWindows: [], staleCiRerun: 'once-per-head' });
 
 describe('stale pending recovery', () => {
-  it('releases an observed stale dead-pid reservation and selects a fresh request in the same call without burning cap', async () => {
+  it('an unreadable current namespace defers even a dead same-host pid to the hard ceiling', async () => {
+    seed();
+    vi.spyOn(pidHelpers, 'pidNamespace').mockReturnValue(null);
+    vi.spyOn(childProcess, 'execFileSync').mockImplementation(() => { throw Error('unreadable boot marker'); });
+    const request = vi.fn();
+    const now = t0 + 21 * 60_000;
+    expect(readTimeoutBudget({ ...evidence, dir, now }).pendingStale).toBeUndefined();
+    expect(await dispatchTimeoutRetry(evidence, { repo, dir, now: () => now, effects: { observe, request } }))
+      .toMatchObject({ reason: 'retry-outcome-pending' });
+    expect(pidHelpers.pidIdentity).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(readTimeoutBudget({ ...evidence, dir, now: t0 + 6 * 60 * 60_000 + 1 }).pendingStale).toBe(true);
+  });
+  it('counts a stale ambiguous dead-pid reservation as spent and refuses a replacement at cap', async () => {
+    seed();
+    const request = vi.fn();
+    const now = t0 + 21 * 60_000;
+    const out = await dispatchTimeoutRetry(evidence, { repo, dir, now: () => now, effects: { observe, request } });
+    expect(out).toMatchObject({ reason: 'timeout-retries-exhausted' });
+    expect(request).not.toHaveBeenCalled();
+    expect(state().requests).toHaveLength(1);
+    expect(state().requests[0]).toMatchObject({ status: 'rejected', outcome: 'ambiguous request expired unobserved; counted as spent' });
+    expect(state().requests[0]).not.toHaveProperty('released');
+    expect(readTimeoutBudget({ ...evidence, dir, now })).toEqual({ confirmed: 0, rejected: 1, pending: false });
+  });
+  it('permits only the remaining budget after counting an expired ambiguous request', async () => {
     seed();
     const request = vi.fn(() => ({ status: 'confirmed' }));
-    const out = await dispatchTimeoutRetry(evidence, { repo, dir, now: () => t0 + 21 * 60_000, effects: { observe, request } });
-    expect(out.status).toBe('requested'); expect(request).toHaveBeenCalledTimes(1);
-    expect(state().requests).toEqual([expect.objectContaining({ status: 'rejected', released: true, outcome: 'stale pending reservation released' }),
-      expect.objectContaining({ status: 'confirmed' })]);
-    expect(readTimeoutBudget({ ...evidence, dir })).toMatchObject({ confirmed: 1, rejected: 0, pending: false });
+    const now = t0 + 21 * 60_000;
+    const opts = { repo, dir, now: () => now, effects: { observe, request } };
+    expect(await dispatchTimeoutRetry({ ...evidence, cap: 2 }, opts)).toMatchObject({ status: 'requested' });
+    expect(readTimeoutBudget({ ...evidence, dir, now })).toEqual({ confirmed: 1, rejected: 1, pending: false });
+    expect(await dispatchTimeoutRetry({ ...evidence, cap: 2 }, opts)).toMatchObject({ reason: 'timeout-retries-exhausted' });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+  it('ordinary timeout execution spends an expired ambiguous request against its two-attempt cap', async () => {
+    seed();
+    const current = state();
+    current.requests.push({ id: 1, target: evidence.jobs[0], status: 'confirmed' });
+    writeFileSync(path(), JSON.stringify(current));
+    const request = vi.fn();
+    const now = t0 + 21 * 60_000;
+    expect(await dispatchTimeoutRetry({ ...evidence, infraCancelled: false }, { repo, dir, now: () => now, effects: { observe, request } }))
+      .toMatchObject({ reason: 'timeout-retries-exhausted' });
+    expect(request).not.toHaveBeenCalled();
+    expect(readTimeoutBudget({ ...evidence, dir, now })).toEqual({ confirmed: 1, rejected: 1, pending: false });
   });
   it.each(['live', 'unknown'])('holds a same-host %s requester even past the hard ceiling', async kind => {
-    seed({ requester: { pid: process.pid, hostname: hostname(), ...pidHelpers.pidIdentityStamp(process.pid) } });
+    seed({ requester: { pid: process.pid, hostname: hostname(), namespace, ...pidHelpers.pidIdentityStamp(process.pid) } });
     if (kind === 'unknown') vi.spyOn(pidHelpers, 'pidIdentity').mockReturnValue({ alive: null, reason: 'unreadable' });
     const now = t0 + 7 * 60 * 60_000;
     const request = vi.fn();
@@ -65,13 +110,19 @@ describe('stale pending recovery', () => {
     expect(state().requests[0].status).toBe('pending');
   });
   it('releases a reused pid only after its start identity mismatches', async () => {
-    seed({ requester: { pid: process.pid, hostname: hostname(), runnerStart: 'old start marker' } });
+    seed({ requester: { pid: process.pid, hostname: hostname(), namespace, runnerStart: 'old start marker' } });
     const now = t0 + 21 * 60_000;
     expect(readTimeoutBudget({ ...evidence, dir, now }).pendingStale).toBe(true);
     await dispatchTimeoutRetry({ ...evidence, reconcilePendingOnly: true }, { repo, dir, now: () => now, effects: { observe } });
-    expect(state().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    expect(state().requests[0]).toMatchObject({ status: 'rejected', outcome: 'ambiguous request expired unobserved; counted as spent' });
   });
-  it.each([undefined, { pid: process.pid, hostname: `${hostname()}-remote` }])('legacy/remote requester %j waits until the hard ceiling and observation', async requester => {
+  it.each([
+    undefined,
+    { ...deadRequester, hostname: `${hostname()}-remote` },
+    { ...deadRequester, namespace: undefined },
+    { ...deadRequester, namespace: null },
+    { ...deadRequester, namespace: 'different-pid-namespace' },
+  ])('uncomparable requester %j waits until the hard ceiling and spends budget after observation', async requester => {
     seed({ requester });
     const request = vi.fn();
     for (const age of [21 * 60_000, 6 * 60 * 60_000]) {
@@ -83,11 +134,15 @@ describe('stale pending recovery', () => {
     const now = t0 + 6 * 60 * 60_000 + 1;
     expect(readTimeoutBudget({ ...evidence, dir, now }).pendingStale).toBe(true);
     expect(readTimeoutHold({ ...evidence, dir, now })).not.toBeNull();
+    expect(pidHelpers.pidIdentity).not.toHaveBeenCalled();
     await dispatchTimeoutRetry({ ...evidence, reconcilePendingOnly: true }, { repo, dir, now: () => now,
       effects: { observe: () => { throw Error('unknown'); }, request } });
     expect(state().requests[0].status).toBe('pending');
     await dispatchTimeoutRetry({ ...evidence, reconcilePendingOnly: true }, { repo, dir, now: () => now, effects: { observe, request } });
-    expect(state().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    expect(state().requests[0]).toMatchObject({ status: 'rejected', outcome: 'ambiguous request expired unobserved; counted as spent' });
+    expect(state().requests[0]).not.toHaveProperty('released');
+    expect(readTimeoutBudget({ ...evidence, dir, now })).toEqual({ confirmed: 0, rejected: 1, pending: false });
+    expect(plan(readTimeoutBudget({ ...evidence, dir, now })).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
     expect(request).not.toHaveBeenCalled();
   });
   it('honors the configured hard ceiling for legacy state', () => {
@@ -101,7 +156,7 @@ describe('stale pending recovery', () => {
     const request = vi.fn(() => new Promise(resolve => { release = resolve; }));
     const first = dispatchTimeoutRetry(evidence, { repo, dir, now: () => t0, effects: { observe, request } });
     await Promise.resolve();
-    expect(state().requests[0].requester).toMatchObject({ pid: process.pid, hostname: hostname(), runnerStart: expect.any(String) });
+    expect(state().requests[0].requester).toMatchObject({ pid: process.pid, hostname: hostname(), namespace, runnerStart: expect.any(String) });
     try {
       expect(await dispatchTimeoutRetry(evidence, { repo, dir, now: () => t0 + 21 * 60_000, effects: { observe, request } }))
         .toMatchObject({ reason: 'retry-outcome-pending' });
@@ -126,9 +181,8 @@ describe('stale pending recovery', () => {
     await dispatchTimeoutRetry(row.timeoutRetry, { repo, dir, now: () => now, effects: { observe, request } });
     expect(request).not.toHaveBeenCalled();
     expect(readTimeoutHold({ ...evidence, dir, now })).toBeNull();
-    const retry = plan(readTimeoutBudget({ ...evidence, dir, now })).dispatch[0];
-    expect(retry.timeoutRetry.reconcilePendingOnly).toBeUndefined();
-    await dispatchTimeoutRetry(retry.timeoutRetry, { repo, dir, now: () => now, effects: { observe, request } });
+    expect(readTimeoutBudget({ ...evidence, dir, now })).toEqual({ confirmed: 0, rejected: 1, pending: false });
+    expect(plan(readTimeoutBudget({ ...evidence, dir, now })).dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
     expect(plan(readTimeoutBudget({ ...evidence, dir, now })).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
   });
   it.each([null, 'rejected', 'confirmed'])('expired reservation with failed observation still prevents heal (prior spend=%s)', async spent => {
@@ -166,7 +220,7 @@ describe('stale pending recovery', () => {
     const request = vi.fn();
     await dispatchTimeoutRetry(row.timeoutRetry, { repo, dir, now: () => now, effects: { observe, request } });
     expect(request).not.toHaveBeenCalled();
-    expect(state().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    expect(state().requests[0]).toMatchObject({ status: 'rejected', outcome: 'ambiguous request expired unobserved; counted as spent' });
     expect(readTimeoutHold({ ...evidence, dir, now })).toBeNull();
     expect(plan(readTimeoutBudget({ ...evidence, dir, now })).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
   });
@@ -228,4 +282,27 @@ it('timeout hold refusal carries why into ci-heal output', async () => {
     reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: evidence.pr, headRefOid: evidence.head, labels: [] }], refusals: [] }),
     timeoutHold: () => ({ status: 'refused', reason: 'retry-outcome-pending' }) });
   expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun', why: 'retry-outcome-pending' }));
+});
+
+describe('requester namespace marker', () => {
+  it('reads the Linux PID namespace without falling back to a host boot marker', () => {
+    const exec = vi.fn();
+    expect(timeoutRequesterNamespace({ platform: 'linux', readNamespace: () => 'pid:[123]', exec })).toBe('pid:[123]');
+    expect(timeoutRequesterNamespace({ platform: 'linux', readNamespace: () => null, exec })).toBeNull();
+    expect(timeoutRequesterNamespace({ platform: 'linux', readNamespace: () => { throw Error('EACCES'); }, exec })).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+  });
+  it('uses a bounded per-boot sysctl marker on non-Linux platforms', () => {
+    const exec = vi.fn(() => '{ sec = 123, usec = 456 } Wed Oct 14 2026');
+    expect(timeoutRequesterNamespace({ platform: 'darwin', exec })).toBe('boot:123:456');
+    expect(exec).toHaveBeenCalledWith('sysctl', ['-n', 'kern.boottime'], expect.objectContaining({ timeout: 5000, maxBuffer: 4096 }));
+  });
+  it('fails closed when the boot marker is malformed, unreadable or oversized', () => {
+    for (const output of ['', 'garbage', '{ sec = 123 }']) {
+      expect(timeoutRequesterNamespace({ platform: 'darwin', exec: () => output })).toBeNull();
+    }
+    for (const code of ['EACCES', 'ENOBUFS', 'ETIMEDOUT']) {
+      expect(timeoutRequesterNamespace({ platform: 'darwin', exec: () => { throw Object.assign(Error(code), { code }); } })).toBeNull();
+    }
+  });
 });

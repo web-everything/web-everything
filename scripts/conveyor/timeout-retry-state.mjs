@@ -3,9 +3,21 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
-import { pidIdentity } from '../lib/pid-alive.mjs';
+import childProcess from 'node:child_process';
+import { pidIdentity, pidNamespace } from '../lib/pid-alive.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { ghThrottleLockRoot } from '../lib/gh-throttle.mjs';
+
+/** PID tables are comparable only within the same namespace (or boot on non-Linux hosts). */
+export function timeoutRequesterNamespace({ platform = process.platform, readNamespace = pidNamespace, exec = childProcess.execFileSync } = {}) {
+  try {
+    if (platform === 'linux') return readNamespace() || null;
+    const boot = String(exec('sysctl', ['-n', 'kern.boottime'], {
+      encoding: 'utf8', timeout: 5_000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'pipe'],
+    })).match(/^\{\s*sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)\s*\}/);
+    return boot ? `boot:${boot[1]}:${boot[2]}` : null;
+  } catch { return null; }
+}
 
 /** Eligibility for observation-based release, never proof that a request was not sent.
  * Local live/unknown identities remain held; legacy and remote owners get a hard-ceiling fallback.
@@ -23,7 +35,9 @@ export function timeoutPendingIsStale(pending, now = Date.now(), env = process.e
   const at = Date.parse(pending?.reservedAt);
   if (!Number.isFinite(at) || now - at <= policy.value.pendingStaleMs) return false;
   const owner = pending.requester;
-  if (!owner || owner.hostname !== hostname() || !Number.isInteger(owner.pid) || owner.pid <= 0) {
+  const namespace = timeoutRequesterNamespace();
+  if (!owner || owner.hostname !== hostname() || !namespace || owner.namespace !== namespace
+      || !Number.isInteger(owner.pid) || owner.pid <= 0) {
     return now - at > policy.value.pendingHardStaleMs;
   }
   return pidIdentity(owner.pid, { expectStart: owner.runnerStart, startedBy: at }).alive === false;
@@ -49,9 +63,9 @@ export function readTimeoutBudget({ dir, now = Date.now(), ...evidence }) {
     dir ??= timeoutStateDir(); // resolved inside the guard: an unreadable lock root is "unreadable state", never a throw
     const requests = readTimeoutStates(evidence, dir).flatMap((state) => state.requests);
     // `rejected` = requests GitHub refused (4xx) or whose job was no longer failed at the evidenced attempt. They spend
-    // no confirmed budget, but the planner counts them against the infra re-run cap so a persistently rejected re-run
+    // no confirmed budget, but the planner counts them against the re-run cap so a persistently rejected re-run
     // reaches ci-heal instead of being re-planned forever. An early `released` reservation (a failed observation or a
-    // stale head: nothing was ever sent) is transient and is NOT counted.
+    // stale head: nothing was ever sent) is transient and is NOT counted. Expired ambiguous requests are spent.
     const pending = requests.filter(r => r.status === 'pending');
     return { confirmed: requests.filter((r) => r.status === 'confirmed').length,
       rejected: requests.filter((r) => r.status === 'rejected' && !r.released).length,

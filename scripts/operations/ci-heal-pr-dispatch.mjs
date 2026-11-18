@@ -48,7 +48,7 @@ import { tmpdir, hostname } from 'node:os';
 import { pidIdentityStamp } from '../lib/pid-alive.mjs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { timeoutPendingIsStale, timeoutStateDir, timeoutKey, readTimeoutStates, readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
+import { timeoutPendingIsStale, timeoutRequesterNamespace, timeoutStateDir, timeoutKey, readTimeoutStates, readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -991,12 +991,13 @@ export async function dispatchTimeoutRetry(evidence, {
       const pending = state.requests.find((r) => r.status === 'pending');
       if (pending) return { pending: structuredClone(pending) };
       if (evidence.reconcilePendingOnly) return { waiting: true };
-      if (confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
+      const spent = state.requests.filter(r => r.status === 'confirmed' || (r.status === 'rejected' && !r.released)).length;
+      if (spent >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
       const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
         && r.target.run === j.run && r.target.job === j.job && r.target.attempt === j.attempt));
       if (!target) return { waiting: true };
       reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', requester: { pid: process.pid, hostname: hostname(),
-        runnerStart: pidIdentityStamp(process.pid).runnerStart }, reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
+        namespace: timeoutRequesterNamespace(), runnerStart: pidIdentityStamp(process.pid).runnerStart }, reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
       state.requests.push(reservation);
       return { target };
     });
@@ -1031,8 +1032,8 @@ export async function dispatchTimeoutRetry(evidence, {
         timeoutTransaction(path, initial, (state) => {
           const pending = state.requests[selected.pending.id];
           if (pending?.status === 'pending' && pending.reservedAt === selected.pending.reservedAt) {
-            pending.status = 'rejected'; pending.released = true;
-            pending.outcome = 'stale pending reservation released';
+            pending.status = 'rejected'; delete pending.released;
+            pending.outcome = 'ambiguous request expired unobserved; counted as spent';
           }
         });
         if (evidence.reconcilePendingOnly) return refuse('retry-reconciled-wait-for-evidence');

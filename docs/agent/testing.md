@@ -4627,9 +4627,14 @@ a retry or heal from the observed state. Direct retries may reselect once under 
 Keep the expired-reservation/failed-observation regression asserting zero heal dispatches. Missing timestamps and unreadable state remain held.
 Pin historical young-reservation fixtures to their original clock, and test the spent-budget heal path.
 
-Owed-rerun recovery must retain live or unknown same-host requester identities past expiry,
+Owed-rerun recovery must retain live or unknown same-host, same-namespace requester identities past expiry,
 including while another executor awaits the API. Only proven-dead local owners may release
-after the short stale threshold; legacy/remote owners require the six-hour hard ceiling
+after the short stale threshold; missing/different namespace markers (including legacy/remote
+owners) require the six-hour hard ceiling
 (`WE_TIMEOUT_RERUN_PENDING_HARD_STALE_MS`). Both paths still require bound observation
-with no advanced attempt. Pin dead-owner fixtures explicitly; never infer death from age.
+with no advanced attempt. Expired ambiguous requests become `rejected` without `released: true`
+and spend retry budget; only reservations known never to have sent a request are free releases.
+Test cap-to-heal without an extra rerun. Record Linux PID namespaces or a non-Linux boot marker;
+unreadable markers are unknown, never proof of local death. Pin dead-owner fixtures explicitly;
+never infer death from age.
 The mechanical executor uses the shared main-staleness guard and returns refused rows on refusal.

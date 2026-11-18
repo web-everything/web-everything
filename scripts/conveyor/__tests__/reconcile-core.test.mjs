@@ -3883,6 +3883,13 @@ describe('xng7q1p mechanical timeout precedence', () => {
     const mixedSpent = planReconcile({ prs: [pr({ timeoutRetry: infra, timeoutRetryBudget: { confirmed: 2, rejected: 4, pending: false } })], now: NOW });
     expect(mixedSpent.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
   });
+  it('ordinary timeouts count expired ambiguous requests against the cap before planning another rerun', () => {
+    const under = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, rejected: 1, pending: false } })], now: NOW });
+    expect(under.dispatch.map(row => row.kind)).toEqual(['ci-timeout-rerun']);
+    for (const budget of [{ confirmed: 0, rejected: 2, pending: false }, { confirmed: 1, rejected: 1, pending: false }]) {
+      expect(planReconcile({ prs: [pr({ timeoutRetryBudget: budget })], now: NOW }).dispatch.map(row => row.kind)).toEqual(['ci-heal']);
+    }
+  });
   it('exhausted per-head retries fall through to normal healing', () => {
     const result = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 2, pending: false } })], now: NOW });
     expect(result.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);

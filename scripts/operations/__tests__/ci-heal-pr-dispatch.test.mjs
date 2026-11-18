@@ -846,13 +846,16 @@ describe('xng7q1p retry reservation and restart soak', () => {
     })));
     expect(readFileSync(join(dir, 'deliveries'), 'utf8')).toBe('request\n');
   }), 30_000);
-  it('explicit rejected requests spend no successful budget and never heal', async () => harness(async (dir) => {
+  it('explicit rejected requests spend retry budget and block further requests at cap', async () => harness(async (dir) => {
     const e = evidence(); let reject = true;
-    const opts = { dir, repo: e.repo, effects: { observe, request: () => ({ status: reject ? 'rejected' : 'confirmed' }) } };
+    const request = vi.fn(() => ({ status: reject ? 'rejected' : 'confirmed' }));
+    const opts = { dir, repo: e.repo, effects: { observe, request } };
     expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ reason: 'retry-api-rejected' });
     reject = false;
     expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ status: 'requested' });
-    expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ reason: 'waiting-for-new-attempt' });
+    expect(await dispatchTimeoutRetry(e, opts)).toMatchObject({ reason: 'timeout-retries-exhausted' });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 1, rejected: 1, pending: false });
   }));
   it('owed filing retries independently after CI passes and never reallocates its card identity', async () => harness(async (dir) => {
     const e = evidence(); const ids = []; let reject = true;
