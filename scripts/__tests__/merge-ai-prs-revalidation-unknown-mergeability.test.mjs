@@ -282,8 +282,8 @@ describe('runCli wiring', () => {
     expect(trigger).toBeGreaterThan(seam);
     expect(run.indexOf('await repollUnknownListings({', seam)).toBeGreaterThan(trigger);
     expect(run.slice(trigger, run.indexOf('await repollUnknownListings({', seam))).toContain("execFileP('gh', ['api', `repos/${slug}/pulls/${num}`]");
-    expect(run.indexOf('collectContext(liveListingsByRepo)')).toBeGreaterThan(seam);
-    expect(run.indexOf('collectContext(liveListingsByRepo)')).toBe(run.lastIndexOf('collectContext(liveListingsByRepo)'));
+    expect(run.indexOf('collectContext(liveListingsByRepo, readLiveRowsByRepo)')).toBeGreaterThan(seam);
+    expect(run.indexOf('collectContext(liveListingsByRepo, readLiveRowsByRepo)')).toBe(run.lastIndexOf('collectContext(liveListingsByRepo, readLiveRowsByRepo)'));
     expect(run).toContain('applyCiLifecycleLabelPlan({ plan, pr: p.number');
     expect(run).not.toMatch(/'--add-label', add\]/);
   });

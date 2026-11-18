@@ -87,7 +87,7 @@ import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
-import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision } from './fix-scope-policy.mjs';
+import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision, stripProseScope } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
@@ -2720,7 +2720,8 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     const ms = Date.parse(entry.waitingSince);
     return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
   };
-  const scopeFor = (entry) => entry.overlapScope ?? entry.scope;
+  const scopeFor = (entry) => stripProseScope(entry.overlapScope ?? entry.scope);
+  const overlapClaim = (claim) => ({ ...claim, scope: stripProseScope(claim.scope) });
   const ranks = planned.map((entry) => {
     const blocks = new Set(planned.filter((other) => other.pr !== entry.pr
       && overlapsInFlight(scopeFor(other), [{ scope: scopeFor(entry) }])).map((other) => other.pr)).size;
@@ -2762,11 +2763,11 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     }
     if (settings?.holdMode === 'active-session') {
       for (const c of released.filter(c => !above.has(c.pr))) {
-        if (overlapsInFlight(scopeFor(entry), [c])) decide(entry, c, 'holdMode', false, 'refused waiter has no running fixer session');
+        if (overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) decide(entry, c, 'holdMode', false, 'refused waiter has no running fixer session');
       }
     }
     let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => {
-      if (!overlapsInFlight(scopeFor(entry), [c])) return false;
+      if (!overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) return false;
       if (!settings) return true; // Public API compatibility: historical policy when omitted.
       if (settings.holdMode === 'active-session' && c.claim && expired(c.claim)) {
         decide(entry, c, 'holdMode', false, 'fixer heartbeat exceeds claim TTL'); return false;
@@ -2775,7 +2776,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
       if (settings.overlapGranularity === 'region') {
         const results = [];
         for (const file of scopeFor(entry) ?? []) {
-          for (const held of c.scope ?? []) {
+          for (const held of stripProseScope(c.scope) ?? []) {
             if (!overlapsInFlight([file], [{ scope: [held] }])) continue;
             let result = { overlap: true, why: 'region observation unavailable; retaining file hold', failedClosed: true };
             if (!c.build && file === held && !file.endsWith('/') && regionOverlap) {
@@ -2817,11 +2818,11 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
       }
       blockers = blockers.filter((c) => acceptedIds.has(c.id));
     }
-    const hit = overlapsInFlight(scopeFor(entry), blockers);
+    const hit = overlapsInFlight(scopeFor(entry), blockers.map(overlapClaim));
     // Only pr-lifetime retains refused waiters. Accepted fixes hold in either mode.
     // Deduplicate claims for the same fixer when formatting the queue position.
     const ahead = [...new Set(blockers.map((c) => c.id))];
-    const waiter = { ...entry, id: `fix PR #${entry.pr}`, scope: scopeFor(entry) };
+    const waiter = { ...entry, id: `fix PR #${entry.pr}`, scope: entry.overlapScope ?? entry.scope };
     if (hit && settings?.holdMode === 'active-session') released.push(waiter);
     else picked.push(waiter);
     if (hit) {
