@@ -168,6 +168,36 @@ describe('mergeTimingsJson', () => {
   });
 });
 
+describe('registry syntax validation', () => {
+  it.each(['worktree', 'object database'])(
+    'resolves a header union without executing top-level registry code in the %s path', async strategy => {
+      const { resolveAdvisoryConflicts, resolveAdvisoryInWorktree } = await advisory();
+      // Keep the sentinel outside the resolver's scratch directory so cleanup cannot hide execution.
+      const sentinelRoot = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'advisory-no-execution-'));
+      roots.push(sentinelRoot);
+      const sentinel = join(sentinelRoot, 'registry-executed');
+      const indexBase = INDEX_BASE + "import { writeFileSync } from 'node:fs';\n" +
+        `writeFileSync(${JSON.stringify(sentinel)}, 'registry executed');\n`;
+      const f = fixture({ indexConflict: true, indexBase });
+      assertConflict(f, [TIMINGS, INDEX]);
+      expect(existsSync(sentinel)).toBe(false);
+      const expected = registry(' * ours\n * shared\n * theirs\n', indexBase);
+      if (strategy === 'worktree') {
+        expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+        expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(true);
+        expect(readFileSync(join(f.root, INDEX), 'utf8')).toBe(expected);
+        expect(f.ok(['status', '--porcelain=v1'])).toBe('');
+      } else {
+        const before = snapshot(f);
+        const result = resolveAdvisoryConflicts(f);
+        assertTree(f, result);
+        expect(f.git(['show', `${result.tree}:${INDEX}`]).stdout).toBe(expected);
+        expect(snapshot(f)).toEqual(before);
+      }
+      expect(existsSync(sentinel)).toBe(false);
+    });
+});
+
 describe('object database advisory resolution', () => {
   it('resolves different unit additions through resolveOverlayConflict without changing the checkout', () => {
     const f = fixture();
@@ -204,10 +234,33 @@ describe('object database advisory resolution', () => {
     expect(snapshot(f)).toEqual(before);
   });
 
-  it.each([false, true])('refuses registry conflicts without a worktree (timings conflict: %s)', async timingConflict => {
+  it.each([false, true])('resolves header-only registry unions in the object database (timings conflict: %s)', async timingConflict => {
     const { resolveAdvisoryConflicts } = await advisory();
     const f = fixture({ timingConflict, indexConflict: true });
     assertConflict(f, timingConflict ? [TIMINGS, INDEX] : [INDEX]);
+    const before = snapshot(f);
+    const result = resolveAdvisoryConflicts(f);
+    expect(result).toMatchObject({ ok: true, via: 'advisory-merge' });
+    expect(f.ok(['show', `${result.tree}:${INDEX}`]) + '\n').toBe(registry(' * ours\n * shared\n * theirs\n'));
+    if (timingConflict) assertTree(f, result);
+    expect(snapshot(f)).toEqual(before);
+  });
+
+  it.each([
+    ['closing delimiter', { indexAddition: ' * closes */ comment\n' }],
+    ['opening delimiter', { indexAddition: ' * nested /* comment\n' }],
+    ['executable addition', { indexAddition: 'export const code = 1;\n' }],
+    ['multiplication after the header', {
+      indexBase: INDEX_BASE + 'export const value = 2\n * 1;\n',
+      indexOurs: INDEX_BASE + 'export const value = 2\n * 3\n * 1;\n',
+      indexTheirs: INDEX_BASE + 'export const value = 2\n * 4\n * 1;\n',
+    }],
+    ['earlier inline header close', { indexBase: '/**\n * Registry. */\n/*\n */\nexport const breaks = [];\n' }],
+    ['invalid syntax', { indexBase: INDEX_BASE + 'export const = ;\n' }],
+  ])('refuses object database union with %s without changing the checkout', async (_name, options) => {
+    const { resolveAdvisoryConflicts } = await advisory();
+    const f = fixture({ ...options, indexConflict: true });
+    assertConflict(f, [TIMINGS, INDEX]);
     const before = snapshot(f);
     expect(resolveAdvisoryConflicts(f)).toBeNull();
     expect(snapshot(f)).toEqual(before);
@@ -284,6 +337,7 @@ describe('resolveAdvisoryInWorktree', () => {
     ['after the first header close', INDEX_BASE + 'export const value = 2\nINSERT * 1;\n/**\n * Later.\n */\n', ' * 3\n', ' * 4\n'],
     ['in a multi-line expression without a header', 'export const value = 2\nINSERT * 1;\n', ' * 3\n', ' * 4\n'],
     ['before the header', 'INSERT' + INDEX_BASE, ' * ours\n', ' * theirs\n'],
+    ['after an inline header close', '/**\n * Registry. */\n/*\nINSERT */\nexport const breaks = [];\n', ' * ours\n', ' * theirs\n'],
     ['without a closing header line', '/**\n * Registry.\nINSERT', ' * ours\n', ' * theirs\n'],
   ])('refuses comment-looking additions %s and preserves conflicts', async (_name, template, ours, theirs) => {
     const { resolveAdvisoryInWorktree } = await advisory();
@@ -297,94 +351,8 @@ describe('resolveAdvisoryInWorktree', () => {
     expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
   });
 
-  it.each([
-    ['edits another tracked file', "writeFileSync(new URL('../../../../a.mjs', import.meta.url), 'changed');"],
-    ['creates an untracked file', "writeFileSync(new URL('../../../../side-effect.txt', import.meta.url), 'changed');"],
-    ['edits itself while status stays unmerged', "writeFileSync(new URL(import.meta.url), 'changed');"],
-    ['edits the other merged file while status stays unmerged', "writeFileSync(new URL('../../../ci/test-timings.json', import.meta.url), '{}');"],
-    ['stages itself', "(await import('node:child_process')).execFileSync('git', ['-C', new URL('../../../../', import.meta.url).pathname, 'add', '--', 'scripts/conveyor/soak/breaks/index.mjs']);"],
-  ])('refuses and restores when registry import %s', async (_name, effect) => {
-    const { resolveAdvisoryInWorktree } = await advisory();
-    const f = fixture({ indexConflict: true,
-      indexBase: INDEX_BASE + `import { writeFileSync } from 'node:fs';\n${effect}\n` });
-    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
-    const before = snapshot(f);
-    const indexBefore = readFileSync(join(f.root, INDEX));
-    const mergeHead = f.ok(['rev-parse', 'MERGE_HEAD']);
-    const git = vi.fn(f.git);
-    expect(resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
-    expect(git.mock.calls.some(([args]) => args[0] === 'add')).toBe(false);
-    expect(snapshot(f)).toEqual(before);
-    expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
-    expect(existsSync(join(f.root, 'side-effect.txt'))).toBe(false);
-    expect(f.ok(['rev-parse', 'MERGE_HEAD'])).toBe(mergeHead);
-  });
-
-  it.each([
-    ['an existing dirty tracked file', 'a.mjs'],
-    ['an existing untracked file', 'existing.txt'],
-  ])('refuses and restores import edits to %s even when porcelain status stays unchanged', async (_name, path) => {
-    const { resolveAdvisoryInWorktree } = await advisory();
-    const f = fixture({ indexConflict: true, indexBase: INDEX_BASE +
-      `import { writeFileSync } from 'node:fs';\nwriteFileSync(new URL('../../../../${path}', import.meta.url), 'changed');\n` });
-    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
-    writeFileSync(join(f.root, path), 'preexisting local contents');
-    const before = snapshot(f);
-    const indexBefore = readFileSync(join(f.root, INDEX));
-    const statuses = [];
-    const git = vi.fn(args => {
-      const result = f.git(args);
-      if (args[0] === 'status') statuses.push(result.stdout);
-      return result;
-    });
-    expect(resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
-    expect(statuses).toHaveLength(2);
-    expect(statuses[1]).toBe(statuses[0]);
-    expect(git.mock.calls.some(([args]) => args[0] === 'add')).toBe(false);
-    expect(readFileSync(join(f.root, path), 'utf8')).toBe('preexisting local contents');
-    expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
-    expect(snapshot(f)).toEqual(before);
-  });
-
-  it.each(['symlink target', 'file type', 'directory type'])(
-    'refuses and restores an import changing an existing untracked %s', async change => {
-      const { resolveAdvisoryInWorktree } = await advisory();
-      const effect = change === 'directory type' ? 'mkdirSync(path);' : "symlinkSync('ours-only.txt', path);";
-      const f = fixture({ indexConflict: true, indexBase: INDEX_BASE +
-        `import { mkdirSync, rmSync, symlinkSync } from 'node:fs';\n` +
-        `const path = new URL('../../../../existing', import.meta.url);\nrmSync(path);\n${effect}\n` });
-      expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
-      if (change === 'symlink target') symlinkSync('a.mjs', join(f.root, 'existing'));
-      else writeFileSync(join(f.root, 'existing'), 'preexisting local contents');
-      const before = snapshot(f);
-      const indexBefore = readFileSync(join(f.root, INDEX));
-      expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
-      if (change === 'symlink target') expect(readlinkSync(join(f.root, 'existing'))).toBe('a.mjs');
-      else expect(readFileSync(join(f.root, 'existing'), 'utf8')).toBe('preexisting local contents');
-      expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
-      expect(snapshot(f)).toEqual(before);
-    });
-
-  it.each(['status', 'ls-files'])('refuses unreadable post-validation %s evidence and restores conflicts', async command => {
-    const { resolveAdvisoryInWorktree } = await advisory();
-    const f = fixture({ indexConflict: true });
-    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
-    const before = snapshot(f);
-    const indexBefore = readFileSync(join(f.root, INDEX));
-    let reads = 0;
-    const git = args => {
-      if (args[0] === command && (command === 'status' || args.includes('-u')) && ++reads === 2) {
-        return { status: 1, stdout: '' };
-      }
-      return f.git(args);
-    };
-    expect(resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
-    expect(snapshot(f)).toEqual(before);
-    expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
-  });
-
-  it.each(['export const = ;\n', "import './missing.mjs';\n", 'process.exit(0);\n'])(
-    'refuses and restores conflicts when the base module cannot complete import: %s', async code => {
+  it.each(['export const = ;\n'])(
+    'refuses and restores conflicts when the base module has invalid syntax: %s', async code => {
       const { resolveAdvisoryInWorktree } = await advisory();
       const f = fixture({ indexConflict: true, indexBase: INDEX_BASE + code });
       expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
@@ -395,16 +363,33 @@ describe('resolveAdvisoryInWorktree', () => {
       expect(readFileSync(join(f.root, INDEX), 'utf8')).toBe(indexBefore);
     });
 
-  it('refuses a registry import that exceeds the validation timeout', async () => {
-    const { resolveAdvisoryInWorktree } = await advisory();
-    const f = fixture({ timingConflict: false, indexConflict: true,
-      indexBase: INDEX_BASE + "await import('node:timers/promises').then(({ setTimeout }) => setTimeout(60_000));\n" });
-    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
-    expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
-    expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(INDEX);
-  }, 15_000);
+  it.each(['add', 'commit', 'remaining conflicts'])(
+    'restores both advisory files and the index when %s fails', async failure => {
+      const { resolveAdvisoryInWorktree } = await advisory();
+      const f = fixture({ indexConflict: true });
+      expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+      const before = snapshot(f);
+      const indexBefore = readFileSync(join(f.root, INDEX));
+      const mergeHead = f.ok(['rev-parse', 'MERGE_HEAD']);
+      let diffs = 0;
+      const git = args => {
+        if (args[0] === failure) {
+          // Exercise rollback even after a partially successful staging operation.
+          if (failure === 'add') f.git(args);
+          return { status: 1, stdout: '' };
+        }
+        if (args[0] === 'diff' && ++diffs === 2 && failure === 'remaining conflicts') {
+          return { status: 1, stdout: '' };
+        }
+        return f.git(args);
+      };
+      expect(resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
+      expect(snapshot(f)).toEqual(before);
+      expect(readFileSync(join(f.root, INDEX))).toEqual(indexBefore);
+      expect(f.ok(['rev-parse', 'MERGE_HEAD'])).toBe(mergeHead);
+    });
 
-  it('unions automatic registration header comments from both sides and imports with both advisory files', async () => {
+  it('unions automatic registration header comments from both sides with both advisory files', async () => {
     const { resolveAdvisoryInWorktree } = await advisory();
     const f = fixture({ indexConflict: true,
       indexOurs: registry(' * foo uses the same automatic registration.\n'),

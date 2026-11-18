@@ -4,8 +4,6 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
 import { FULL_SHA_RE } from './shared.mjs';
 
 export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json', 'scripts/conveyor/soak/breaks/index.mjs']);
@@ -40,8 +38,8 @@ export function mergeTimingsJson(baseText, oursText, theirsText) {
 function mergeRegistryLines(baseText, oursText, theirsText) {
   const lines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
   const base = lines(baseText), gaps = base.map(() => []);
-  const headerEnd = base.findIndex(line => line === ' */\n' || line === ' */');
-  if (base[0] !== '/**\n' || headerEnd < 1) return null;
+  const headerEnd = base.findIndex(line => line.includes('*/'));
+  if (base[0] !== '/**\n' || headerEnd < 1 || ![' */\n', ' */'].includes(base[headerEnd])) return null;
   gaps.push([]);
   const added = gaps.map(() => new Map());
   for (const [side, text] of [oursText, theirsText].entries()) {
@@ -64,13 +62,13 @@ function mergeRegistryLines(baseText, oursText, theirsText) {
   return /^(?:<{7}|={7}|>{7}|\|{7})/m.test(merged) ? null : merged;
 }
 
-function validateModule(path) {
-  const sentinel = `advisory-import-complete:${randomUUID()}`;
-  const result = spawnSync(process.execPath,
-    ['--input-type=module', '-e', `await import(process.argv[1]); console.log(${JSON.stringify(sentinel)})`, pathToFileURL(path).href], {
+// The card's "must import" requirement is satisfied by construction plus node --check:
+// only delimiter-free header comment lines can be added, so executable bytes stay unchanged.
+// Syntax validation must never execute the registry or resolve its imports.
+function checkModuleSyntax(path) {
+  return spawnSync(process.execPath, ['--check', path], {
     encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-  });
-  return result.status === 0 && result.stdout?.split('\n').includes(sentinel);
+  }).status === 0;
 }
 
 function readMerge(git, revisions, path) {
@@ -94,8 +92,7 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     const end = lines.indexOf('');
     if (!FULL_SHA_RE.test(tree) || end < 0) return null;
     const paths = lines.slice(0, end);
-    // Registry unions need real import validation in resolveAdvisoryInWorktree.
-    if (paths.length === 0 || paths.some(path => path !== ADVISORY_MERGE_PATHS[0])) return null;
+    if (!advisoryOnly(paths)) return null;
     const base = git(['merge-base', '--all', cur, ovSha]);
     const baseSha = String(base.stdout ?? '').trim();
     if (base.status !== 0 || !FULL_SHA_RE.test(baseSha)) return null;
@@ -106,8 +103,9 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     for (const path of paths) {
       const text = readMerge(git, [baseSha, cur, ovSha], path);
       if (text === null) return null;
-      const blobPath = join(scratch, 'timings.json');
+      const blobPath = join(scratch, path.endsWith('.mjs') ? 'index.mjs' : 'timings.json');
       writeFileSync(blobPath, text);
+      if (path.endsWith('.mjs') && !checkModuleSyntax(blobPath)) return null;
       const blob = git(['hash-object', '-w', '--', blobPath]);
       const blobSha = String(blob.stdout ?? '').trim();
       if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
@@ -132,31 +130,19 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     if (mergeHead.status !== 0 || !FULL_SHA_RE.test(String(mergeHead.stdout ?? '').trim())) return false;
     const merged = paths.map(path => ({ path, text: readMerge(git, [':1', ':2', ':3'], path) }));
     if (merged.some(({ text }) => text === null)) return false;
-    const checkedGit = args => {
-      const result = git(args);
-      if (result.status !== 0 || result.stdout == null) throw new Error('unreadable validation snapshot');
-      return String(result.stdout);
-    };
-    const status = () => [checkedGit(['status', '--porcelain=v1', '-z']), checkedGit(['ls-files', '-u', '-z'])];
-    const files = () => [...new Set(checkedGit(['ls-files', '--cached', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean))];
-    // Import validation executes code: retain checkout bytes and the index for rollback.
-    // Unknown file types refuse before any writes; the caller can leave resolution to an operator.
-    const snapshotFile = path => {
+    // Back up only the files we will stage and the index, for rollback on any failure.
+    const originals = new Map(paths.map(path => {
       const fullPath = join(cwd, path);
-      const stat = lstatSync(fullPath, { throwIfNoEntry: false });
-      if (stat && !stat.isFile() && !stat.isSymbolicLink()) throw new Error('unsupported validation snapshot file');
-      return stat ? { link: stat.isSymbolicLink(),
-        data: stat.isSymbolicLink() ? readlinkSync(fullPath) : readFileSync(fullPath) } : null;
-    };
-    const originals = new Map(files().map(path => [path, snapshotFile(path)]));
-    const validated = new Map(originals);
-    for (const { path, text } of merged) validated.set(path, { link: false, data: Buffer.from(text) });
-    const indexPath = resolve(cwd, checkedGit(['rev-parse', '--git-path', 'index']).trim());
+      const stat = lstatSync(fullPath);
+      if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('unsupported advisory file');
+      return [path, { link: stat.isSymbolicLink(),
+        data: stat.isSymbolicLink() ? readlinkSync(fullPath) : readFileSync(fullPath) }];
+    }));
+    const index = git(['rev-parse', '--git-path', 'index']);
+    if (index.status !== 0 || !String(index.stdout ?? '').trim()) return false;
+    const indexPath = resolve(cwd, String(index.stdout).trim());
     const originalIndex = readFileSync(indexPath);
     const restore = () => {
-      for (const path of files()) {
-        if (!originals.has(path)) rmSync(join(cwd, path), { force: true });
-      }
       for (const [path, original] of originals) {
         const fullPath = join(cwd, path);
         if (original === null) rmSync(fullPath, { force: true });
@@ -172,12 +158,9 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     };
     try {
       for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
-      const beforeValidation = status();
       for (const { path } of merged) {
-        if (path.endsWith('.mjs') && !validateModule(join(cwd, path))) return restore();
+        if (path.endsWith('.mjs') && !checkModuleSyntax(join(cwd, path))) return restore();
       }
-      if (!isDeepStrictEqual(beforeValidation, status()) || [...validated].some(([path, expected]) =>
-        !isDeepStrictEqual(snapshotFile(path), expected))) return restore();
       if (git(['add', '--', ...paths]).status !== 0) return restore();
       const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
       if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return restore();

@@ -141,7 +141,7 @@ const unchanged = f => {
 
 describe('overlay main sync', () => {
 
-  it('auto-resolves and imports an index.mjs-only conflict during main sync', async () => {
+  it('auto-resolves and syntax-checks an index.mjs-only conflict during main sync', async () => {
     const f = fixture({ advisoryIndex: true });
     expect(await job(f)).toMatchObject({ pushed: true });
     const text = ok(f.origin, ['show', `${ref}:scripts/conveyor/soak/breaks/index.mjs`]);
