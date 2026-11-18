@@ -587,7 +587,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
         .catch(e => e);
       expect(error).toBeInstanceOf(Error);
       expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
-      expect(error.telemetry).toMatchObject({ failureKind: 'provider-quota' });
+      expect(error.telemetry).toMatchObject({ failureKind: 'mixed-failure', quotaOnly: false,
+        otherFailures: [{ kind: 'process-failure', message: expect.any(String), redacted: true }] });
       expect(error.telemetry.failureText).toContain(result);
       expect(error.quota).toBe(true);
       expect(error.holdRow).toEqual({ provider: 'claude', status: 'quota-exhausted',
@@ -1519,7 +1520,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     } else {
       expect(error).toMatchObject({ quota: true,
         holdRow: { provider: 'claude', status: 'quota-exhausted', scoredAt: expect.any(String), quotaResetsAt: null },
-        telemetry: { failureKind: 'provider-quota', failureText: spendingFailures[1][1].result } });
+        telemetry: { failureKind: 'mixed-failure', quotaOnly: false, failureText: spendingFailures[1][1].result } });
     }
   };
 

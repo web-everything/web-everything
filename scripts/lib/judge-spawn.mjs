@@ -708,6 +708,18 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
   const fail = message => Object.assign(new Error(message), {
     unparseableStdout: true, verdictIntegrity: true,
   });
+  // Keep diagnostics bounded without allowing overflow to erase mixed-failure evidence.
+  // Excerpts are trusted descriptions: never persist arbitrary juror content here.
+  const otherFailures = [];
+  let otherFailuresOmitted = 0;
+  const recordFailure = (kind, message) => {
+    if (otherFailures.length < 20) otherFailures.push({ kind, message: message.slice(0, 200), redacted: true });
+    else otherFailuresOmitted += 1;
+  };
+  if (processFailure) recordFailure(processFailure instanceof JudgeTimeoutError ? 'timeout' : 'process-failure',
+    processFailure instanceof JudgeTimeoutError ? 'Juror process timed out or lacked a clean exit.' : `Juror process exited with code ${code}.`);
+  if (Buffer.byteLength(stdout) > 8 * 1024 * 1024) recordFailure('output-limit',
+    'Stdout exceeds 8MiB; inspect the full run manually; no verdict.');
   let malformed = false;
   let events;
   try { events = [JSON.parse(stdout)]; }
@@ -716,7 +728,10 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     for (const line of stdout.split(/\r?\n/)) {
       if (!line.trim()) continue;
       try { events.push(JSON.parse(line)); }
-      catch { malformed = true; }
+      catch {
+        malformed = true;
+        recordFailure('malformed-output', 'Malformed JSON line on stdout (content redacted); no verdict.');
+      }
     }
   }
   let quota;
@@ -726,6 +741,7 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
   let results = 0;
   for (const event of events) {
     if (!event || typeof event !== 'object' || Array.isArray(event)) {
+      recordFailure('invalid-event', 'Expected a JSON object (content redacted); no verdict.');
       failure ??= fail('judge-spawn: invalid JSON event: expected a JSON object (content redacted); no verdict.');
       continue;
     }
@@ -736,8 +752,10 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     if (bad) {
       const texts = [event.result, event.message, event.error, event.error?.message]
         .filter(text => typeof text === 'string');
+      let eventQuota = false;
       for (const text of texts) {
         const holdRow = quotaHoldRow({ provider: 'claude', error: text, now: exit.now ?? 0 });
+        if (holdRow) eventQuota = true;
         if (holdRow && !quota) quota = Object.assign(new Error(`judge-spawn: the juror failed: ${text}`), {
           quota: true, holdRow, telemetry: { failureKind: 'provider-quota', failureText: text.slice(0, 500) },
         });
@@ -749,19 +767,45 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
         || texts.some(text => /\bbudget (?:exhausted|exceeded)\b/i.test(text))) {
         spending ??= new JudgeBudgetError({ budget, costUsd: event.total_cost_usd,
           stopReason: event.stop_reason, result: text, stderr });
+        recordFailure('budget', 'Juror budget exhausted or exceeded (content redacted).');
       }
+      else if (!eventQuota) recordFailure('execution-error',
+        'Juror emitted an execution error or unsuccessful result (content redacted); no verdict.');
       failure ??= event.is_error
         ? new Error(text ? `judge-spawn: the juror failed: ${text}`
           : `judge-spawn: the juror failed with no result text. parsed: ${JSON.stringify({ ...event, structured_output: undefined }).slice(0, 600)}\n`
             + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`)
         : fail('judge-spawn: the juror emitted a JSON error event or unsuccessful result (content redacted); no verdict.');
     }
-    if (isResult) { results += 1; result ??= event; }
+    if (isResult) {
+      results += 1; result ??= event;
+      if (!bad) {
+        if (event.session_id !== sessionId) recordFailure('session-mismatch', 'Result session_id missing or mismatched; no verdict.');
+        try {
+          const validate = compileJurorSchema(schema);
+          const value = event.structured_output;
+          if (!value || typeof value !== 'object' || Array.isArray(value) || !validate(value) || !Object.keys(value).length) {
+            recordFailure('schema-violation', 'Structured output violates the schema (content redacted); no verdict.');
+          }
+        } catch { recordFailure('schema-compilation', 'Schema compilation failed; correct the schema before retrying; no verdict.'); }
+      }
+    }
     else if (results && !['system', 'rate_limit_event', 'rate_limit'].includes(event.type)) {
+      // Error events were already classified above; do not count a quota envelope twice.
+      if (!bad) recordFailure('event-order', 'Result is not the last meaningful event; no verdict.');
       failure ??= fail('judge-spawn: result is not the last meaningful event; no verdict.');
     }
   }
-  if (quota) throw quota;
+  if (quota) {
+    if (results > 1) recordFailure('result-count', 'Expected exactly one result event; no verdict.');
+    quota.telemetry = { ...quota.telemetry,
+      // reviewRunEvidence exempts only rows whose failureKind is provider-quota.
+      failureKind: otherFailures.length ? 'mixed-failure' : 'provider-quota',
+      quotaOnly: otherFailures.length === 0, otherFailures, otherFailuresOmitted,
+      ...(otherFailuresOmitted ? { otherFailuresNote: 'Diagnostics truncated; inspect the full run manually; no verdict.' } : {}),
+    };
+    throw quota;
+  }
   if (spending) throw spending;
   if (processFailure) throw processFailure;
   if (Buffer.byteLength(stdout) > 8 * 1024 * 1024) {

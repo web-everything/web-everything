@@ -50,6 +50,37 @@ const probes = [
 ];
 
 describe('acceptJurorStream audit probes', () => {
+  it.each([
+    ['quota alone', lines(quota), exit, []],
+    ['execution error then quota', lines(generic, quota), exit, ['execution-error']],
+    ['quota then execution error', lines(quota, generic), exit, ['execution-error']],
+    ['quota and nonzero exit', lines(quota), { ...exit, code: 1 }, ['process-failure']],
+    ['quota and timeout', lines(quota), { ...exit, timedOut: true }, ['timeout']],
+    ['quota and malformed line', lines(quota, '{SECRET_TOKEN'), exit, ['malformed-output']],
+    ['quota and invalid event', lines(quota, 'null'), exit, ['invalid-event']],
+    ['quota and budget', lines(quota, budget), exit, ['budget']],
+    ['quota and invalid successful result', lines(quota, { ...ok, structured_output: {} }), exit, ['schema-violation']],
+    ['quota and mismatched session', lines(quota, { ...ok, session_id: 'wrong' }), exit, ['session-mismatch']],
+  ])('retains quota precedence and counts concurrent failures: %s', (_name, stream, processExit, kinds) => {
+    let error;
+    try { run(stream, { exit: processExit }); } catch (caught) { error = caught; }
+    expect(error).toMatchObject({ quota: true, holdRow: { provider: 'claude', status: 'quota-exhausted' },
+      telemetry: { failureKind: kinds.length ? 'mixed-failure' : 'provider-quota', quotaOnly: kinds.length === 0 } });
+    expect(error.message).toContain('weekly limit');
+    expect(error.telemetry.otherFailures.map(row => row.kind)).toEqual(kinds);
+    for (const row of error.telemetry.otherFailures) {
+      expect(row).toMatchObject({ message: expect.any(String), redacted: true });
+      expect(row.message.length).toBeLessThanOrEqual(200);
+    }
+    expect(JSON.stringify(error.telemetry.otherFailures)).not.toContain('SECRET_TOKEN');
+  });
+  it('bounds concurrent failure telemetry and requires manual inspection of omitted evidence', () => {
+    let error;
+    try { run(lines(quota, ...Array(25).fill(generic))); } catch (caught) { error = caught; }
+    expect(error.telemetry).toMatchObject({ quotaOnly: false, failureKind: 'mixed-failure', otherFailuresOmitted: 5 });
+    expect(error.telemetry.otherFailures).toHaveLength(20);
+    expect(error.telemetry.otherFailuresNote).toContain('inspect the full run manually');
+  });
   it.each(probes)('fails closed: %s', (_name, stream, options, expected) => {
     expect(() => run(stream, options)).toThrow(expected);
     if (expected instanceof RegExp && /malformed JSON|invalid JSON event|session_id/.test(expected.source)) {
@@ -68,7 +99,8 @@ describe('acceptJurorStream audit probes', () => {
     let error;
     try { run(lines(budget, quota)); } catch (caught) { error = caught; }
     expect(error).toMatchObject({ quota: true, holdRow: { provider: 'claude', status: 'quota-exhausted',
-      scoredAt: new Date(exit.now).toISOString() }, telemetry: { failureKind: 'provider-quota' } });
+      scoredAt: new Date(exit.now).toISOString() }, telemetry: { failureKind: 'mixed-failure', quotaOnly: false,
+        otherFailures: [{ kind: 'budget', message: expect.any(String), redacted: true }] } });
   });
   it.each([
     lines('{"type":"error","message":"SECRET_TOKEN', ok),

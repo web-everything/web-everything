@@ -204,20 +204,25 @@ describe('incomplete quota evidence after the seat phase', () => {
     },
   );
 
-  it('preserves quota evidence from the judge parser through normalized run telemetry', () => {
+  it.each([
+    ['quota alone', '', 0, true],
+    ['execution error and quota', JSON.stringify({ type: 'error', message: 'execution failed' }) + '\n', 0, false],
+    ['malformed line and quota', '{broken\n', 0, false],
+    ['nonzero exit and quota', '', 1, false],
+  ])('preserves quota-only semantics through normalized run telemetry: %s', (_name, prefix, code, quotaOnly) => {
     let error;
     try {
-      acceptJurorStream(JSON.stringify({ is_error: true,
-        result: "You've hit your weekly limit · resets tomorrow" }), { sessionId: 's', schema: {}, exit: { code: 0, signal: null } });
+      acceptJurorStream(prefix + JSON.stringify({ is_error: true,
+        result: "You've hit your weekly limit · resets tomorrow" }), { sessionId: 's', schema: {}, exit: { code, signal: null } });
     } catch (caught) {
       error = caught;
     }
     expect(error).toBeInstanceOf(Error);
-    expect(error.telemetry).toMatchObject({ failureKind: 'provider-quota' });
+    expect(error.telemetry).toMatchObject({ failureKind: quotaOnly ? 'provider-quota' : 'mixed-failure', quotaOnly });
     const run = reviewRun();
     run.seatTimings = [failedSeat('judge')];
     run.telemetry = [normalizeJudgeTelemetry({ step: 'judge', telemetry: error.telemetry })];
-    expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly: true });
+    expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly });
   });
 });
 
