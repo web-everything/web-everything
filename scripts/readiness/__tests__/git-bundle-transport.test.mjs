@@ -330,7 +330,9 @@ describe('bundle scan public origin/main history exemptions', () => {
     const directory = join(root, 'public-bundle'); await fs.mkdir(directory);
     const plan = await planBundle({ cwd: lane, head, runnerBase: runnerMain, exec: observed, directory });
     expect(plan).toMatchObject({ mode: 'incremental', tip: head, base: runnerMain });
-    expect(calls.find(c => c.args.includes('rev-list')).args).toContain(`^${publicCommit}`);
+    const revisionCalls = calls.filter(c => c.args.includes('rev-list'));
+    expect(revisionCalls[0].args).not.toContain(`^${publicCommit}`);
+    expect(revisionCalls[1].args).toContain(`^${publicCommit}`);
     expect(calls.filter(c => c.args.includes('cat-file')).every(c => !String(c.input ?? '').includes(publicCommit))).toBe(true);
     const bundleArgs = calls.find(c => c.args.includes('create')).args;
     expect(bundleArgs).toContain(`^${runnerMain}`);
@@ -341,6 +343,66 @@ describe('bundle scan public origin/main history exemptions', () => {
     git(lane, 'update-ref', 'refs/remotes/origin/main', head);
     expect(await scan(head)).toBeNull();
   });
+  it.each(['symlink', 'gitlink', 'secret name', 'token name', 'empty tree name'])(
+    'refuses a %s in shipped public ancestry', async kind => {
+      if (kind === 'symlink') {
+        await fs.symlink('tracked.txt', join(lane, 'link'));
+        git(lane, 'add', 'link');
+      } else if (kind === 'gitlink') {
+        git(lane, 'update-index', '--add', '--cacheinfo', `160000,${tip},sub`);
+      } else if (kind === 'empty tree name') {
+        const empty = git(lane, 'mktree');
+        const tree = spawnSync('git', ['mktree'], { cwd: lane, encoding: 'utf8',
+          input: `040000 tree ${empty}\t${token}\n` });
+        expect(tree.status).toBe(0);
+        const head = git(lane, ...ident, 'commit-tree', tree.stdout.trim(), '-p', tip, '-m', 'public tree');
+        git(lane, 'update-ref', 'HEAD', head);
+      } else {
+        await put(kind === 'secret name' ? 'credentials.txt' : `${token}.txt`, 'safe\n');
+      }
+      if (kind === 'symlink' || kind === 'gitlink') {
+        git(lane, ...ident, 'commit', '-qm', 'public fixture');
+      }
+      const head = git(lane, 'rev-parse', 'HEAD');
+      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      const finding = kind === 'secret name' ? 'excluded-path'
+        : kind === 'token name' || kind === 'empty tree name' ? 'github-token' : kind;
+      expect(await scan(head)).toMatchObject({ finding });
+      expect(await scan(head, exec, null)).toMatchObject({ finding });
+    });
+  it.each(['commit count', 'path count', 'blob bytes'])(
+    'retains the %s bound for an entirely public range', async bound => {
+      const head = await put('public.txt', 'public fixture\n');
+      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      if (bound === 'path count') {
+        await put('another.txt', 'another fixture\n');
+        // A single public commit can carry more paths than the commit-count bound.
+        git(lane, 'reset', '--soft', runnerMain);
+        git(lane, ...ident, 'commit', '-qm', 'public paths');
+        git(lane, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+      }
+      await expect(scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec,
+        ...(bound === 'blob bytes' ? { maxTotalBytes: 1 } : { maxBlobs: bound === 'commit count' ? 0 : 1 }),
+      })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+    });
+  it.each(['revision list', 'path log'])(
+    'refuses incomplete non-public %s evidence', async kind => {
+      const head = await put('public.txt', 'safe\n');
+      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      let rawLogs = 0;
+      const injected = async call => {
+        if (call.args.includes('--raw')) rawLogs++;
+        if (kind === 'revision list'
+          ? call.args.includes(`^${head}`) && call.args.includes('rev-list')
+          : call.args.includes('--raw') && rawLogs === 2) {
+          return { code: 0 };
+        }
+        return exec(call);
+      };
+      // Use a non-empty content range so the raw-log read must actually run.
+      const local = await put('local.txt', 'safe local\n');
+      await expect(scan(local, injected)).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+    });
   it.each(shapes)('exempts exact historical %s without an allow-list', async (_name, path, text) => {
     await publishHistory(path, text);
     const oldLaneCommit = await put(path, text);
@@ -381,6 +443,15 @@ describe('bundle scan public origin/main history exemptions', () => {
     await publishHistory('aws.test.mjs', text);
     expect(await scan(await put('aws.test.mjs', text))).toMatchObject({ finding: 'aws-access-key' });
   });
+  it.each(['plain', 'utf16le', 'utf16be'])(
+    'does not let a public GitHub token hide an AWS access key (%s)', async encoding => {
+      const path = 'mixed.test.mjs';
+      const raw = `${token}\n${'AKIA' + 'ABCDEFGHIJKLMNOP'}\n`;
+      const text = encoding === 'plain' ? Buffer.from(raw) : Buffer.from(raw, 'utf16le');
+      if (encoding === 'utf16be') text.swap16();
+      await publishHistory(path, text);
+      expect(await scan(await put(path, text))).toMatchObject({ path, finding: 'github-token' });
+    });
   it('does not exempt excluded paths even when their exact blob is public', async () => {
     await publishHistory('credentials.txt', token);
     expect(await scan(await put('credentials.txt', token))).toMatchObject({ finding: 'excluded-path' });
@@ -700,13 +771,15 @@ describe('R593 merge-resolution blobs are scanned whatever the user diff config 
     const head = await commit(lane, { 'sub/ok.txt': 'ok\n', 'outside.txt': `key ${secret}\n` }, 'relative');
     expect(await scanBundleRange({ cwd: join(lane, 'sub'), head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'outside.txt', finding: 'github-token' });
   });
-  it('pins --diff-merges=separate on the raw log call (no reliance on user config)', async () => {
+  it('pins --diff-merges=separate on both raw log calls (no reliance on user config)', async () => {
     const seen = [];
     const spy = async (call) => { if (call.args.includes('--raw')) seen.push(call.args); return exec(call); };
     await scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec: spy });
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toEqual(expect.arrayContaining(['--diff-merges=separate', '--no-ext-diff', '--no-textconv']));
-    expect(seen[0]).not.toContain('-m');
+    expect(seen).toHaveLength(2);
+    for (const args of seen) {
+      expect(args).toEqual(expect.arrayContaining(['--diff-merges=separate', '--no-ext-diff', '--no-textconv']));
+      expect(args).not.toContain('-m');
+    }
   });
   it('refuses a repository whose history is cut by .git/info/grafts (bundle would still pack the cut-off objects)', async () => {
     await fs.writeFile(join(lane, '.git', 'info', 'grafts'), `${tip}\n`);

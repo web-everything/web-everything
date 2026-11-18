@@ -95,7 +95,7 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
     }
   }
   if (prerequisite === head) return { mode: 'none', tip: head, warnings: [] };
-  // Scan non-public commits in the bundled range, including later-deleted secrets. Publicness only
+  // Scan the bundled paths and non-public content, including later-deleted secrets. Publicness only
   // changes scanning: the bundle still contains the entire range required by the runner.
   const warnings = [];
   const hit = await scanBundleRange({ cwd, head, prerequisite, exec, warnings });
@@ -202,6 +202,15 @@ async function isPublicBlob({ git, base, label, sha }) {
   } catch { return false; }
 }
 const PUBLIC_CONTENT_FINDINGS = new Set(['github-token', 'private-key', 'pem-header']);
+function publicContentFindings(content, findings) {
+  const present = new Set(findings.filter(Boolean));
+  const swapped = Buffer.from(content.subarray(0, content.length - content.length % 2)).swap16();
+  for (const text of [content.toString('latin1'), content.toString('utf8'), content.toString('utf16le'), swapped.toString('utf16le')]) {
+    for (const [pattern, name] of secretText) if (pattern.test(text)) present.add(name);
+    if (KEY_BODY.test(text)) present.add(KEY_RULE);
+  }
+  return [...present];
+}
 /** True when every finding on this blob is listed for exactly this path and content hash. */
 function allowedFindings(allowed, label, content, findings) {
   const present = findings.filter(Boolean);
@@ -229,7 +238,7 @@ function allowedFindings(allowed, label, content, findings) {
 }
 
 /**
- * R559: scan non-public bundled commits' additions beyond the prerequisite tree.
+ * R559: scan all bundled paths and non-public content beyond the prerequisite tree.
  * Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
  * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
  */
@@ -242,7 +251,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
     const sha = bytes(resolved.stdout).toString('utf8').trim();
     if (resolved.code === 0 && REVISION.test(sha)) publicMain = sha;
   } catch { /* Unresolved public history: retain the original scan. */ }
-  const range = [prerequisite ? `${prerequisite}..${head}` : head, ...(publicMain ? [`^${publicMain}`] : [])];
+  const range = [prerequisite ? `${prerequisite}..${head}` : head];
+  const contentRange = [...range, ...(publicMain ? [`^${publicMain}`] : [])];
   // Grafts and shallow files cut history out of rev-list/log but NOT out of `git bundle create` (it still packs the cut-off
   // objects), so a repo carrying either cannot be scanned faithfully: refuse rather than scan a truncated view.
   const shallow = await git(['rev-parse', '--is-shallow-repository']);
@@ -268,27 +278,37 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   }
   // Enumerate the full bundled ancestry: a merged branch can add and delete a credential
   // before its merge, leaving no trace in the merge's first-parent diff.
-  const revs = await git(['rev-list', '--root', ...range]);
-  // Missing or unterminated output is unknown evidence, never an empty range (which would skip all scanning).
-  if (revs.code !== 0 || revs.stdout == null) throw bundleError('bundle-credential-scan-failed');
-  const revText = bytes(revs.stdout).toString('utf8');
-  if (revText && !revText.endsWith('\n')) throw bundleError('bundle-credential-scan-failed');
-  const commits = revText.split('\n').filter(Boolean);
-  if (commits.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
-  if (commits.some(sha => !REVISION.test(sha))) throw bundleError('bundle-credential-scan-failed');
+  const listCommits = async revisions => {
+    const revs = await git(['rev-list', '--root', ...revisions]);
+    // Missing or unterminated output is unknown evidence, never an empty range (which would skip all scanning).
+    if (revs.code !== 0 || revs.stdout == null) throw bundleError('bundle-credential-scan-failed');
+    const revText = bytes(revs.stdout).toString('utf8');
+    if (revText && !revText.endsWith('\n')) throw bundleError('bundle-credential-scan-failed');
+    const listed = revText.split('\n').filter(Boolean);
+    if (listed.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+    if (listed.some(sha => !REVISION.test(sha))) throw bundleError('bundle-credential-scan-failed');
+    return listed;
+  };
+  const commits = await listCommits(range);
+  const contentCommits = publicMain ? await listCommits(contentRange) : commits;
   // -t lists tree (directory) entries too: without it an EMPTY subtree entry (crafted with mktree) has no file below it
   // and never shows up, yet its name travels in the pack.
   // Keep the separate-diff default for full bundles. Incremental scans explicitly visit ALL
   // bundled commits without walking, diffing each merge against parent 1. Thus both side-branch
   // history and merge resolutions remain visible, independent of user config.
-  let log;
-  try {
-    log = !commits.length ? { code: 0, stdout: Buffer.alloc(0) }
-      : await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', ...(prerequisite ? ['--first-parent', '--diff-merges=first-parent', '--no-walk=unsorted'] : []), '--no-relative', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', ...(prerequisite ? commits : range)]);
-  } catch { throw bundleError('bundle-credential-scan-failed'); }
-  if (log.code !== 0 || log.stdout == null) throw bundleError('bundle-credential-scan-failed');
+  const readLog = async (commits, range) => {
+    let log;
+    try {
+      log = !commits.length ? { code: 0, stdout: Buffer.alloc(0) }
+        : await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', ...(prerequisite ? ['--first-parent', '--diff-merges=first-parent', '--no-walk=unsorted'] : []), '--no-relative', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', ...(prerequisite ? commits : range)]);
+    } catch { throw bundleError('bundle-credential-scan-failed'); }
+    if (log.code !== 0 || log.stdout == null) throw bundleError('bundle-credential-scan-failed');
+    return log;
+  };
+  const log = await readLog(commits, range);
+  const contentLog = publicMain ? await readLog(contentCommits, contentRange) : log;
   // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
-  const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', ...range]);
+  const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', ...contentRange]);
   if (messages.code !== 0 || messages.stdout == null) throw bundleError('bundle-credential-scan-failed');
   for (const message of splitNul(bytes(messages.stdout))) {
     // Same scanner as blobs (secret assignments included); a message is plain text.
@@ -300,8 +320,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   }
   // The formatted log above shows only author/committer/message. Extended headers (multiline gpgsig, mergetag, encoding, ...)
   // also travel in the pack, so scan the COMPLETE raw object of every commit in the range.
-  if (commits.length) {
-    const commitCheck = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], commits.join('\n') + '\n');
+  if (contentCommits.length) {
+    const commitCheck = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], contentCommits.join('\n') + '\n');
     if (commitCheck.code !== 0) throw bundleError('bundle-credential-scan-failed');
     const commitSizes = new Map(); let commitTotal = 0;
     for (const line of bytes(commitCheck.stdout).toString('utf8').split('\n')) {
@@ -310,7 +330,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
       if (type !== 'commit' || !Number.isSafeInteger(Number(size))) throw bundleError('bundle-credential-scan-failed');
       commitSizes.set(sha, Number(size)); commitTotal += Number(size);
     }
-    if (commitSizes.size !== commits.length || commitTotal > maxTotalBytes || [...commitSizes.values()].some(size => size > SCAN_BATCH_BYTES)) throw bundleError('bundle-credential-scan-too-large');
+    if (commitSizes.size !== contentCommits.length || commitTotal > maxTotalBytes || [...commitSizes.values()].some(size => size > SCAN_BATCH_BYTES)) throw bundleError('bundle-credential-scan-too-large');
     let group = [], groupBytes = 0;
     const flushCommits = async () => {
       if (!group.length) return null;
@@ -334,50 +354,55 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
       group = []; groupBytes = 0;
       return null;
     };
-    for (const sha of commits) {
+    for (const sha of contentCommits) {
       if (groupBytes + commitSizes.get(sha) + 64 > SCAN_BATCH_BYTES) { const hit = await flushCommits(); if (hit) return hit; }
       group.push(sha); groupBytes += commitSizes.get(sha) + 64; // + the 'sha type size' header line
     }
     const hit = await flushCommits(); if (hit) return hit;
   }
-  const tokens = splitNul(bytes(log.stdout));
   const excludedWarnings = [];
-  const blobs = new Map(); // sha -> Map(path key -> {label, path}): the policy scan is path-dependent, so EVERY path adding a blob is scanned
+  const blobs = new Map(); // sha -> paths; size guards cover public and non-public entries
   let pathCount = 0;
-  for (let i = 0; i < tokens.length; i++) {
-    const meta = tokens[i].toString('latin1');
-    if (!meta) continue; // only a bare separator between commits may be skipped; any other token must be a header or its path
-    // Fail closed: separate and first-parent merge diffs emit ":old new oldsha newsha status". A combined header ("::", several old
-    // modes/hashes) means the config-independent invocation was not honoured; never parse it as an ordinary diff.
-    // A token that is not a header (and was not consumed as a path below) is unknown output: refuse, never skip.
-    const fields = meta.split(' ');
-    if (!meta.startsWith(':') || meta.startsWith('::') || fields.length !== 5 || !/^[0-7]{6}$/.test(fields[0].slice(1)) || !/^[0-7]{6}$/.test(fields[1])
-      || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(fields[3]) || !/^[ADMT]$/.test(fields[4])) throw bundleError('bundle-credential-scan-failed');
-    const [, newMode, , newSha] = fields;
-    const path = tokens[++i];
-    if (!path) throw bundleError('bundle-credential-scan-failed');
-    // A mode-only change can turn public regular-file bytes into a prohibited symlink.
-    if (prerequisiteEntries.has(`${path.toString('latin1')}\0${newMode}\0${newSha}`)) continue;
-    const label = path.toString('utf8');
-    // Tree entries (file AND directory names) travel in the pack: a token in a name is a leak whatever the blob holds.
-    // Every path that adds an entry in the range is listed here, including ones a later commit deleted.
-    const pathFinding = credentialTextFinding(path.toString('latin1')) ?? credentialTextFinding(label);
-    if (pathFinding) return { path: 'tree-entry-name', finding: pathFinding }; // never echo the secret-bearing name
-    if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
-    let policy;
-    try { policy = classifyManifestPath(path); } catch { throw bundleError('bundle-credential-scan-failed'); }
-    // Judge names on the manifest's normalized view (NFKC, marks stripped, lower case), as main did: an accented
-    // Latin name (composed or decomposed) ships. Format characters (bidi overrides), which that view strips, block.
-    const dotFile = newMode !== '040000' && excludedDotFile(policy.names.at(-1));
-    if (policy.names.some(secretFileName) || policy.names.some(unsafeComponentName) || /\p{Cf}/u.test(label) || dotFile) return { path: label, finding: 'excluded-path' };
-    if (policy.excluded) excludedWarnings.push({ path: label, finding: 'excluded-path' });
-    // A directory entry carries no blob: its name was scanned and classified above, its files are read under their own paths.
-    if (newMode === '040000') continue;
-    const paths = blobs.get(newSha) ?? new Map();
-    blobs.set(newSha, paths);
-    const key = path.toString('latin1');
-    if (!paths.has(key)) { paths.set(key, { label, path }); pathCount++; }
-    if (blobs.size > maxBlobs || pathCount > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+  // Parse both logs through the same fail-closed path/mode guards. All blobs count
+  // toward size limits; only entries added by non-public commits get content scans.
+  for (const currentLog of log === contentLog ? [log] : [log, contentLog]) {
+    const tokens = splitNul(bytes(currentLog.stdout));
+    for (let i = 0; i < tokens.length; i++) {
+      const meta = tokens[i].toString('latin1');
+      if (!meta) continue; // only a bare separator between commits may be skipped; any other token must be a header or its path
+      // Fail closed: separate and first-parent merge diffs emit ":old new oldsha newsha status". A combined header ("::", several old
+      // modes/hashes) means the config-independent invocation was not honoured; never parse it as an ordinary diff.
+      // A token that is not a header (and was not consumed as a path below) is unknown output: refuse, never skip.
+      const fields = meta.split(' ');
+      if (!meta.startsWith(':') || meta.startsWith('::') || fields.length !== 5 || !/^[0-7]{6}$/.test(fields[0].slice(1)) || !/^[0-7]{6}$/.test(fields[1])
+        || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(fields[3]) || !/^[ADMT]$/.test(fields[4])) throw bundleError('bundle-credential-scan-failed');
+      const [, newMode, , newSha] = fields;
+      const path = tokens[++i];
+      if (!path) throw bundleError('bundle-credential-scan-failed');
+      // A mode-only change can turn public regular-file bytes into a prohibited symlink.
+      if (prerequisiteEntries.has(`${path.toString('latin1')}\0${newMode}\0${newSha}`)) continue;
+      const label = path.toString('utf8');
+      // Tree entries (file AND directory names) travel in the pack: a token in a name is a leak whatever the blob holds.
+      // Every path that adds an entry in the range is listed here, including ones a later commit deleted.
+      const pathFinding = credentialTextFinding(path.toString('latin1')) ?? credentialTextFinding(label);
+      if (pathFinding) return { path: 'tree-entry-name', finding: pathFinding }; // never echo the secret-bearing name
+      if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
+      let policy;
+      try { policy = classifyManifestPath(path); } catch { throw bundleError('bundle-credential-scan-failed'); }
+      // Judge names on the manifest's normalized view (NFKC, marks stripped, lower case), as main did: an accented
+      // Latin name (composed or decomposed) ships. Format characters (bidi overrides), which that view strips, block.
+      const dotFile = newMode !== '040000' && excludedDotFile(policy.names.at(-1));
+      if (policy.names.some(secretFileName) || policy.names.some(unsafeComponentName) || /\p{Cf}/u.test(label) || dotFile) return { path: label, finding: 'excluded-path' };
+      if (currentLog === log && policy.excluded) excludedWarnings.push({ path: label, finding: 'excluded-path' });
+      // A directory entry carries no blob: its name was scanned and classified above, its files are read under their own paths.
+      if (newMode === '040000') continue;
+      const paths = blobs.get(newSha) ?? new Map();
+      blobs.set(newSha, paths);
+      const key = path.toString('latin1');
+      if (!paths.has(key)) { paths.set(key, { label, path, scanContent: false }); pathCount++; }
+      if (currentLog === contentLog) paths.get(key).scanContent = true;
+      if (blobs.size > maxBlobs || pathCount > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+    }
   }
   const shas = [...blobs.keys()];
   if (!shas.length) { warnings.push(...excludedWarnings); return null; }
@@ -405,13 +430,14 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
       offset = newline + 1 + Number(size) + 1;
       const finding = credentialBufferFinding(content);
       // Apply both policy levels to every added blob, including excluded paths in history.
-      for (const { label, path } of blobs.get(sha).values()) {
+      for (const { label, path, scanContent } of blobs.get(sha).values()) {
+        if (!scanContent) continue;
         let policy = null;
         try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
         const hit = policy ?? finding;
         if (hit) {
           const publicContent = path.equals(Buffer.from(label))
-            && [policy, finding].filter(Boolean).every(f => PUBLIC_CONTENT_FINDINGS.has(f))
+            && publicContentFindings(content, [policy, finding]).every(f => PUBLIC_CONTENT_FINDINGS.has(f))
             && await isPublicBlob({ git, base: publicMain, label, sha });
           const reviewed = !publicContent && allowedFindings(allowed, label, content, [policy, finding])
             && await isPublicBlob({ git, base: prerequisite, label, sha });
@@ -425,6 +451,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
     return null;
   };
   for (const sha of shas) {
+    if (![...blobs.get(sha).values()].some(entry => entry.scanContent)) continue;
     if (batchBytes + sizes.get(sha) > SCAN_BATCH_BYTES) { const hit = await flush(); if (hit) return hit; }
     batch.push(sha); batchBytes += sizes.get(sha);
   }
