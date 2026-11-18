@@ -230,6 +230,7 @@ function rebaseDropManifestCore({
   const removed = run('git', ['rm', '--cached', '--ignore-unmatch', manifest], { env, cwd });
   if (strict && removed.status !== 0) return { action: 'error', reason: 'git rm --cached manifest failed; use existing fix dispatch or human review' };
   const rootEntries = run('git', ['ls-tree', '--name-only', parsed.tree], { env, cwd });
+  if (strict && rootEntries.status !== 0) return { action: 'error', reason: 'git ls-tree failed; use existing fix dispatch or human review' };
   const droppedEvidence = rootEntries.status === 0
     ? String(rootEntries.stdout || '').split('\n').filter(isFixEvidencePath) : [];
   if (droppedEvidence.length) {

@@ -6,7 +6,8 @@ import { Worker } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
 import { buildConflictRebaseCandidates, sweepMechanicalConflictRebases, createConflictRebaseLedger,
   resolveConflictRebaseSettings } from '../conflict-mechanical-rebase.mjs';
-import { STAND_DOWN_MARKER, buildConcurrentAuthorPauseComment } from '../stand-down.mjs';
+import { STAND_DOWN_MARKER, buildConcurrentAuthorPauseComment, buildLoadFlakeHoldComment,
+  buildLoadFlakeResolvedComment } from '../stand-down.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { readSettingsChecked } from '../../lib/settings-files.mjs';
 import { runTickAllRepos, buildCliDaemonEffects, runConflictRebaseAllRepos, resolveFixPassBudgets } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
@@ -44,6 +45,58 @@ describe('mechanical conflict rebase', () => {
       const result = sweepMechanicalConflictRebases(opts);
       expect(result.applied).toHaveLength(login === 'outsider' ? 0 : 1);
       expect(Object.keys(opts.ledger.read())).toHaveLength(login === 'outsider' ? 0 : 1);
+    }
+  });
+
+  it.each(['close-superseded', 'rearm-review', 'legacy-close', 'unknown'])(
+    'operator %s disposition refuses before ledger claim in apply and preview', disposition => {
+      let body = buildOperatorAnswer({ standDownId: stop.id, reason: disposition === 'legacy-close'
+        ? 'Close this PR as superseded.' : 'Follow the ruling', actor: 'chalbert', channel: 'test',
+        ...(['close-superseded', 'rearm-review'].includes(disposition) ? { disposition } : {}),
+      });
+      if (disposition === 'unknown') {
+        body = body.replace(/(<!-- conveyor-stand-down-answer-record:)([^ ]+)( -->)/, (_, lead, encoded, tail) =>
+          lead + Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(encoded, 'base64').toString()), disposition: 'future-hold' })).toString('base64') + tail);
+      }
+      for (const apply of [true, false]) {
+        const opts = fixture({ apply, readOpenPrs: () => [pr(1, { comments: [stop, trusted(body)] })] });
+        expect(sweepMechanicalConflictRebases(opts)).toMatchObject({ applied: [], dispatch: [],
+          refusals: [{ kind: 'conflict-rebase-held', why: expect.stringContaining(
+            disposition === 'unknown' ? 'unanswered stand-down' : 'operator disposition') }] });
+        expect(opts.ledger.read()).toEqual({});
+        expect(opts.run).not.toHaveBeenCalled();
+        expect(opts.refresh).not.toHaveBeenCalled();
+      }
+    });
+
+  it.each(['live', 'resolved', 'new-head'])('load-flake alternate-branch hold uses shared state: %s', state => {
+    const comments = [trusted(buildLoadFlakeHoldComment({ head: pr(1).headRefOid,
+      alt: 'lane/test-alt', altSha: nextSha }), { createdAt: '2026-11-18T12:00:00Z' })];
+    if (state === 'resolved') comments.push(trusted(buildLoadFlakeResolvedComment({ altSha: nextSha, result: 'pushed' }),
+      { createdAt: '2026-11-18T12:01:00Z' }));
+    for (const apply of [true, false]) {
+      const opts = fixture({ apply, readOpenPrs: () => [pr(1, { comments,
+        headRefOid: state === 'new-head' ? nextSha : pr(1).headRefOid })] });
+      const result = sweepMechanicalConflictRebases(opts);
+      if (state === 'live') {
+        expect(result).toMatchObject({ applied: [], dispatch: [], refusals: [
+          { kind: 'conflict-rebase-held', why: expect.stringContaining('alternate-branch verification') }] });
+        expect(opts.ledger.read()).toEqual({});
+        expect(opts.run).not.toHaveBeenCalled();
+        expect(opts.refresh).not.toHaveBeenCalled();
+      } else expect(apply ? result.applied : result.dispatch).toHaveLength(1);
+    }
+  });
+
+  it.each([undefined, null, '', 'invalid'])('pause timestamp %s fails closed before ledger claim', createdAt => {
+    for (const apply of [true, false]) {
+      const opts = fixture({ apply, now: () => Date.parse('2026-11-18T12:21:00Z'),
+        readOpenPrs: () => [pr(1, { comments: [trusted(buildConcurrentAuthorPauseComment({ head: pr(1).headRefOid }), { createdAt })] })] });
+      expect(sweepMechanicalConflictRebases(opts)).toMatchObject({ applied: [], dispatch: [], refusals: [
+        { kind: 'conflict-rebase-held', why: expect.stringContaining('operator must inspect') }] });
+      expect(opts.ledger.read()).toEqual({});
+      expect(opts.run).not.toHaveBeenCalled();
+      expect(opts.refresh).not.toHaveBeenCalled();
     }
   });
 

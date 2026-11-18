@@ -550,6 +550,18 @@ describe('fix evidence is drain-transient', () => {
 
 
 describe('strict mechanical rebase evidence (drain defaults preserved)', () => {
+  it.each([true, false])('failed ls-tree refuses commit/push only in strict mode (strict=%s)', strict => {
+    const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+      'ls-tree': { status: 1, stdout: '.fix-evidence.md\n', stderr: 'unreadable tree' },
+    });
+    const result = rebaseDropManifest({ laneRef: 'lane/unreadable-tree', run, strict });
+    expect(result.action).toBe(strict ? 'error' : 'rebased');
+    if (strict) expect(result.reason).toContain('human review');
+    expect(calls.some(c => c.args[0] === 'commit-tree')).toBe(!strict);
+    expect(calls.some(c => c.args[0] === 'push')).toBe(!strict);
+    if (strict) expect(existsSync(join(calls.find(c => c.env).env.GIT_INDEX_FILE, '..'))).toBe(false);
+  });
+
   it('overlapping strict calls have isolated indexes and remove both directories after success', () => {
     const paths = [];
     const runCall = (nested = false) => {

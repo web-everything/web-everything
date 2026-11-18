@@ -11,7 +11,9 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { countUnresolvedStandDowns, concurrentAuthorPauseState } from './reconcile-core.mjs';
-import { standDownHeadChangeAt } from './stand-down.mjs';
+import { standDownHeadChangeAt, concurrentAuthorPauses } from './stand-down.mjs';
+import { loadFlakeHoldState } from './load-flake-hold.mjs';
+import { answerDisposition, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 import { defaultReadOpenPrs, defaultReadMainTip, refreshOntoMain, defaultReadIsCrossRepository,
   sameRepoRefusal, reconcileAcceptanceAfterRebase, defaultPostRebaseComment } from './ci-red-recovery-watch.mjs';
@@ -108,7 +110,14 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
     const commentsReadable = Array.isArray(pr.comments) && pr.comments.length < LIST_COMMENTS_PAGE_SIZE
       && pr.comments.every(c => typeof c?.body === 'string' && typeof c?.author?.login === 'string');
     const pause = commentsReadable ? concurrentAuthorPauseState({ ...pr, now: now() }) : null;
+    const loadHold = commentsReadable ? loadFlakeHoldState({ ...pr, now: now() }) : null;
+    const disposition = commentsReadable ? answerDisposition(latestOperatorAnswer(pr.comments)) : null;
+    const invalidPauseTime = commentsReadable && concurrentAuthorPauses(pr.comments)
+      .some(p => !Number.isFinite(Date.parse(p.createdAt ?? '')));
     const why = !commentsReadable ? 'comments unreadable or possibly truncated; operator must inspect the full thread before rebasing'
+      : disposition != null ? `operator disposition ${disposition} does not authorize repair; follow the operator ruling`
+      : loadHold?.live ? `fix reserved on ${loadHold.hold.alt.branch}; wait for load-flake alternate-branch verification`
+      : invalidPauseTime ? 'concurrent author pause timestamp unreadable; operator must inspect the thread before rebasing'
       : countUnresolvedStandDowns(pr.comments, { headRefOid: pr.headRefOid, headChangedAt: standDownHeadChangeAt(pr) }) > 0
         ? 'unanswered stand-down; record an explicit operator answer with stand-down-answer.mjs'
         : pause?.held ? pause.why : null;
