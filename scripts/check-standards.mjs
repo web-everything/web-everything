@@ -27,7 +27,7 @@ import { relatedReportRefs } from './lib/related-report.cjs';
  *                         (we:scripts/lib/standards-sections.mjs) match no touched file is skipped and listed in
  *                         `summary.skippedSections` as `skipped (scoped: no input touched)`.
  */
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, statSync, lstatSync, readlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, resolve, isAbsolute, sep } from 'node:path';
@@ -129,6 +129,9 @@ import { committedFixEvidenceFindings } from './lib/transient-paths.mjs';
 import { localChangedSet } from './lib/verify-lane-gate.mjs';
 import { scanDiffBranchCoverage } from './lib/diff-branch-coverage.mjs';
 import { isHash } from './backlog/id.mjs';
+import { scanText as scanPrivacyText, loadAllowlist as loadPrivacyAllowlist, selectChangedFiles as privacyChangedFiles, introducedFindings as introducedPrivacyFindings } from './lib/privacy-terms.mjs';
+import { userInfo } from 'node:os';
+import { pinnedMergeBase as privacyMergeBase } from './readiness/test-selection.mjs';
 
 const require = createRequire(import.meta.url);
 // #4166 — cheap outgoing-edge resolution for the scoped backlog load below (a changed item's OWN
@@ -1565,6 +1568,60 @@ try {
 }
 
 mark("6f-i. PUBLISH-SEAM secret sweep on the committed corpus (#3015, under #2978 Fork 3)");
+
+// R971 privacy changed-file check: git-derived edits plus explicit files, never linked-file expansion.
+// R972: even prerequisite failures must remain blocking through partitionLocal under --local.
+let privacyFailureFile = LOCAL_FILES_LIST?.[0] ?? 'scripts/settings/privacy-terms-allowlist.json';
+try {
+  const changes = localChangedSet({ runGit: (args) => execFileSync('git', args, {
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+  }) });
+  // R972: unlike other scoped scanners, flags never narrow privacy's git-derived changed set.
+  // CI/no flags scans the merge-base + working-tree set; --files can only add paths to that set.
+  const files = privacyChangedFiles(changes, LOCAL_FILES_LIST);
+  privacyFailureFile = files[0] ?? privacyFailureFile;
+  // R972: prerequisites are mandatory even when the changed/scoped file selection is empty.
+  const allowlist = loadPrivacyAllowlist(readFileSync(join(ROOT, 'scripts/settings/privacy-terms-allowlist.json'), 'utf8'));
+  // R972: derive identity locally, and compare new categories with committed base text.
+  // A missing base/blob or failed identity read blocks; legacy values are never allowlisted.
+  const runGit = args => execFileSync('git', args, {
+    cwd: ROOT, encoding: args[0] === 'show' ? undefined : 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const base = privacyMergeBase({ runGit });
+  if (!base) throw new Error('Privacy baseline unavailable');
+  const operatorUsername = userInfo().username;
+  if (!operatorUsername) throw new Error('Privacy operator identity unavailable');
+  for (const file of files) {
+    privacyFailureFile = file;
+    // R984: a root dependency directory ignored by a literal rule can appear as an untracked symlink.
+    // Git check-ignore refuses directory paths through symlinks. Accept only this literal rule;
+    // any negation makes the evidence ambiguous, so scan instead. Tracked/explicit links always scan.
+    if (file === 'node_modules' && changes.untrackedFiles?.includes(file) && !LOCAL_FILES_LIST?.includes(file)
+      && lstatSync(join(ROOT, file)).isSymbolicLink()) {
+      const rules = readFileSync(join(ROOT, '.gitignore'), 'utf8').split('\n').map(rule => rule.replace(/\r$/, ''));
+      if (rules.some(rule => rule === 'node_modules/' || rule === '/node_modules/')
+        && !rules.some(rule => rule.startsWith('!'))) continue;
+    }
+    const baseline = runGit(['ls-tree', '--name-only', base, '--', file]).trim()
+      ? runGit(['show', `${base}:${file}`]) : '';
+    const options = { path: file, allowlist, operatorUsername };
+    // R972: a committed symlink contains its target text, never the destination's contents.
+    const filePath = join(ROOT, file);
+    const content = lstatSync(filePath).isSymbolicLink() ? readlinkSync(filePath, 'buffer') : readFileSync(filePath);
+    const hits = introducedPrivacyFindings(
+      scanPrivacyText(content, options), scanPrivacyText(baseline, options));
+    for (const hit of hits) {
+      err(`${file}:${hit.line} contains a private host term (${hit.pattern}); replace it with a neutral host description (R971).`,
+        { kind: 'privacy-terms', file });
+    }
+  }
+} catch (e) {
+  // Do not echo IO errors: they can contain a private path or identity.
+  err('R971/R972 privacy check failed. Repair changed-file evidence, baseline, identity or the allowlist and rerun standards.',
+    { kind: 'privacy-terms', file: privacyFailureFile });
+}
+// End R971 privacy changed-file check.
+
 // ── 6f-i-b. HARNESS-SCAFFOLDING leak sweep on the committed corpus (#3448) ─────────────────────────
 // PR #1803 committed a literal <system-reminder> block into a backlog item — copy-pasted from the
 // authoring agent's own context, not an external attack, undetected until human review. This re-walks
@@ -3232,9 +3289,12 @@ if (scopeSession) {
     if (mine === null) {
       scopeNote = `--scope="${scopeSession}" has no recorded claim baseline — running whole-repo-strict.`;
     } else {
-      const { blocking, external } = partitionFindings(errors, mine);
+      // R972: mandatory privacy errors never enter the scope demotion path, including --scope alone.
+      const privacyErrors = errors.filter(finding => finding.descriptor?.kind === 'privacy-terms');
+      const { blocking, external } = partitionFindings(
+        errors.filter(finding => finding.descriptor?.kind !== 'privacy-terms'), mine);
       externalErrors = external;
-      errors.length = 0; errors.push(...blocking); // only my-scope (+ unattributable) errors gate
+      errors.length = 0; errors.push(...blocking, ...privacyErrors);
       scopeNote = `--scope="${scopeSession}" — ${mine.size} owned file(s); ${external.length} external error(s) demoted to notes.`;
     }
   } catch (e) {
@@ -3266,12 +3326,17 @@ mark("Scope attribution (#952, ratified #949 Fork 3-A)");
 const filesArg = filesArgEarly;
 let localNote = null;
 let list = null;
+// R972 privacy findings are mandatory even for an empty --files set or failed scope evidence.
 if (filesArg || LOCAL_MODE) {
   list = LOCAL_FILES_LIST;
   const fileSet = EFFECTIVE_FILES ?? (list ? new Set(list) : null);
-  const { blocking, demoted } = partitionLocal(errors, { fileSet, local: LOCAL_MODE });
+  // --scope runs first: recover privacy findings it demoted before applying the local partition.
+  const privacyErrors = [...errors, ...externalErrors].filter(finding => finding.descriptor?.kind === 'privacy-terms');
+  externalErrors = externalErrors.filter(finding => finding.descriptor?.kind !== 'privacy-terms');
+  const { blocking, demoted } = partitionLocal(
+    errors.filter(finding => finding.descriptor?.kind !== 'privacy-terms'), { fileSet, local: LOCAL_MODE });
   externalErrors = [...externalErrors, ...demoted]; // demoted globals/other-file reds print as notes
-  errors.length = 0; errors.push(...blocking);
+  errors.length = 0; errors.push(...blocking, ...privacyErrors);
   const linkedCount = LINKED_FILES ? LINKED_FILES.size : 0;
   const scopeDesc = fileSet ? `${fileSet.size} file(s)${linkedCount ? ` (${list.length} changed + ${linkedCount} linked)` : ''}` : 'file-attributable findings only';
   localNote = `${LOCAL_MODE ? '--local ' : ''}${filesArg ? `--files=${list.join(',')} ` : ''}— scoped to ${scopeDesc}; ${demoted.length} finding(s) demoted to notes.`;

@@ -24,6 +24,8 @@
  * `from`-clause the same static scanner follows, which would defeat the split.
  */
 
+import { REPO_NAMES } from './repo-names.mjs';
+
 /** The constellation repos, keyed by internal repo KEY. `slug` is the gh `--repo` slug; `path` is the checkout
  *  (empty = the WE primary's own cwd); `dirs` are the directory basenames that checkout is known to occupy —
  *  WE answers to two (the laptop's `webeverything` and the clone-from-slug `web-everything`), which is why a
@@ -33,6 +35,11 @@ export const CONSTELLATION_REPOS = Object.freeze({
   we: { slug: 'web-everything/web-everything', slugTag: '', path: '', dirs: ['web-everything', 'webeverything'] },
   frontierui: { slug: 'frontier-ui/frontierui', slugTag: 'fui', path: '$HOME/workspace/frontierui', dirs: ['frontierui'] },
   'plateau-app': { slug: 'plateauapp/plateau-app', slugTag: 'pa', path: '$HOME/workspace/plateau-app', dirs: ['plateau-app'] },
+});
+
+// Registered but not swept; moves into CONSTELLATION_REPOS with the S2 capability filter.
+export const PENDING_REPOS = Object.freeze({
+  longshore: { slug: `${REPO_NAMES.longshore.owner}/${REPO_NAMES.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'] },
 });
 
 /**
