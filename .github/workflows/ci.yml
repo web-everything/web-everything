@@ -576,7 +576,8 @@ jobs:
   # failing must not hide a sibling shard's own result.
   soak-shard:
     needs: daemon-soak-scope
-    if: needs.daemon-soak-scope.outputs.run == 'true'
+    # R1068: shards run in the merge queue / on main / on dispatch, never on a pull_request push (~28k CI min/day).
+    if: needs.daemon-soak-scope.outputs.run == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
     # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
@@ -625,6 +626,14 @@ jobs:
     steps:
       - name: Gate on shard results
         run: |
+          # R1068: on a pull_request the soak is deferred to the merge queue (shards do not run there), so the
+          # required check succeeds at once. Every other event (merge_group, push, dispatch) falls through to the
+          # full gate below, which fails closed.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "soak deferred to merge queue (R1068)"
+            echo "### daemon-soak: soak deferred to merge queue (R1068)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # Fail CLOSED on the scope job itself: a crashed `daemon-soak-scope` leaves `outputs.run` empty, and an
           # empty value must never read as "no daemon code touched" (that would green the required check with the
           # soak never run). Only an explicit `run=false` from a SUCCESSFUL scope job skips the soak.
@@ -633,8 +642,8 @@ jobs:
             exit 1
           fi
           case "${{ needs.daemon-soak-scope.outputs.run }}" in
-            false) echo "No daemon code touched — soak not needed."; exit 0 ;;
             true) ;;
+            false) echo "Outside a pull_request the soak always runs, but scope said run=false — refusing to skip it."; exit 1 ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
           esac
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then
