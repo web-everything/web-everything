@@ -100,13 +100,15 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         finally { fs.rmSync(scratch, { recursive: true, force: true }); }
       }
     },
-    fileCard({ key, cardLine, expedite, needsYou }) {
+    fileCard({ key, cardLine: freshCardLine, expedite, needsYou }) {
       const read = path => {
         try { return fs.readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; return ''; }
       };
       const rows = read(indexPath).split('\n').filter(Boolean).map(l => JSON.parse(l));
       const prior = rows.findLast(r => r.key === key);
       const contents = read(cardsPath), lines = contents.split('\n');
+      // The card line carries a timestamp, so a re-run would differ: a key with a live card line keeps that line (one card per key).
+      const cardLine = (prior && lines.find(actual => cardHash(actual) === prior.cardLineHash)) || freshCardLine;
       const date = new Date().toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
       const cls = key.split('|').at(-1);
       const security = /^B[1-7]$/.test(cls);
