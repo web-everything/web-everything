@@ -48,7 +48,10 @@ export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead, rowsCo
     else if (row.conclusion.toLowerCase() !== 'success') reason = row.conclusion.toLowerCase() || 'malformed';
     return reason ? [{ name, reason }] : [];
   });
-  if (affected.length) return refuse(affected.some(row => row.name === 'review-gate')
-    ? 'required-review-gate-conflict' : 'required-checks-not-successful', affected);
+  if (affected.length) return {
+    ...refuse(affected.some(row => row.name === 'review-gate')
+      ? 'required-review-gate-conflict' : 'required-checks-not-successful', affected),
+    ...(affected.some(row => row.reason === 'wrong-head') ? { unknown: true } : {}),
+  };
   return { allowed: true, headSha, reason: 'required-checks-successful', affected: [] };
 }

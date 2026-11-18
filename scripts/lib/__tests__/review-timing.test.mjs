@@ -10,6 +10,17 @@ const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
+  it.each(['ci-green', 'fast-checks'])('verification marker cannot bypass wrong-head strict evidence under %s', startAfter => {
+    for (const requiredChecks of [['test'], ['integration']]) {
+      const input = { rowsComplete: true, rowsHead: head, headSha: head, requiredChecks, verifyGreen: true,
+        policy: { ...review, startAfter, startBeforeCi: true, fastChecks: requiredChecks } };
+      expect(reviewStartGate({ ...input, checks: [check('test')] }).allowed).toBe(true);
+      const checks = [check('test', 'success', { head_sha: 'other' })];
+      expect(reviewStartGate({ ...input, checks }))
+        .toEqual(reviewCiGate({ ...input, checks }));
+      expect(reviewStartGate({ ...input, checks }).allowed).toBe(false);
+    }
+  });
   it.each(['off', 'shadow', 'on'])('push refuses foreign-head aggregate implication under startEarly=%s', startEarly => {
     for (const aggregate of [check('test'), { context: 'test', state: 'success' }]) {
       const input = { rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['integration'],

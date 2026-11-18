@@ -4496,6 +4496,17 @@ describe('human clearance and complete evidence before review dispatch (live #55
   const prFor = branch => pr1563({ number: 5530, headRefOid: HEAD,
     labels: lbl(branch === 'relabelOwed' ? 'review:pending' : 'review:human'),
     comments: branch === 'convert-advisory' ? [accept, escalation] : [accept] });
+  it.each(['advisoryOwed', 'convert-advisory'])('refuses %s when required rows explicitly name another head despite complete hydration', branch => {
+    const complete = prFor(branch);
+    expect(planReconcile({ prs: [complete], agents: [], now: NOW }).dispatch[0]).toMatchObject(
+      branch === 'convert-advisory' ? { kind: 'convert-advisory' } : { kind: 'review' });
+    const pr = { ...complete, statusCheckRollup: complete.statusCheckRollup.map(row => ({ ...row, head_sha: OLD })) };
+    const result = planReconcile({ prs: [pr], agents: [], now: NOW });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+      ci: expect.objectContaining({ allowed: false, unknown: true,
+        affected: expect.arrayContaining([expect.objectContaining({ reason: 'wrong-head' })]) }) }));
+  });
   it.each(['advisoryOwed', 'convert-advisory'])('refuses %s with incomplete or wrong-head hydrated rows', branch => {
     const complete = prFor(branch);
     expect(planReconcile({ prs: [complete], agents: [], now: NOW }).dispatch[0]).toMatchObject(

@@ -768,6 +768,21 @@ describe('R272 fail-closed evidence across every row', () => {
 });
 
 describe('hydrated CI evidence for escalation retirement', () => {
+  it.each(['SUCCESS', 'FAILURE'])('foreign-head optional CodeQL %s cannot retire escalation', conclusion => {
+    const test = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: input.headSha };
+    const codeql = { name: 'CodeQL', status: 'COMPLETED', conclusion, head_sha: 'other' };
+    const evidence = { headSha: input.headSha, rowsHead: input.headSha, rowsComplete: true, requiredChecks: ['test'] };
+    expect(ciGreenForEscalation({ ...evidence, rollup: [test] })).toBe(true);
+    expect(ciGreenForEscalation({ ...evidence, rollup: [test, codeql] })).toBe(false);
+  });
+  it.each(['test', 'integration'])('a newer current-head aggregate cannot hide any foreign-head required or implying %s row', required => {
+    const evidence = { headSha: input.headSha, rowsHead: input.headSha, rowsComplete: true, requiredChecks: [required] };
+    const current = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: input.headSha, id: 2 };
+    expect(ciGreenForEscalation({ ...evidence, rollup: [current] })).toBe(true);
+    expect(ciGreenForEscalation({ ...evidence, rollup: [
+      { ...current, head_sha: 'other', id: 1 }, current,
+    ] })).toBe(false);
+  });
   it.each(['test', 'integration'])('foreign-head success cannot satisfy or imply required %s', required => {
     for (const aggregate of [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },

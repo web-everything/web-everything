@@ -79,10 +79,13 @@ export function ciGreenForEscalation({ rollup, requiredChecks, headSha, rowsHead
   // Aggregate hydration metadata cannot override a row explicitly bound to another head.
   const rows = Array.isArray(rollup) ? rollup : [];
   // A required (or implying) row bound to another head is unproven: never let a current-head row imply it away.
-  const { wrongHeads, needed } = reviewCiPrerequisites({ headSha, requiredChecks, checks: rows });
-  if (needed.some(name => wrongHeads.has(name))) return false;
-  const currentRows = rows.filter(row => row?.head_sha == null || row.head_sha === headSha);
-  const { red, pending, missing } = requiredCheckStates({ rollup: currentRows, requiredChecks });
+  // Check each row so a current-head rerun cannot hide foreign-head evidence of the same name.
+  const prerequisites = [...requiredChecks, CODEQL_CHECK_NAME];
+  if (rows.some(row => {
+    const { wrongHeads, needed } = reviewCiPrerequisites({ headSha, requiredChecks: prerequisites, checks: [row] });
+    return needed.some(name => wrongHeads.has(name));
+  })) return false;
+  const { red, pending, missing } = requiredCheckStates({ rollup: rows, requiredChecks });
   return !red.length && !pending.length && !missing.length;
 }
 

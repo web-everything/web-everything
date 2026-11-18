@@ -199,6 +199,8 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsHead, row
   }
   if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return pendingStart(strict());
   if (policy.startBeforeCi && verifyGreen === true && typeof headSha === 'string' && headSha.trim()) {
+    const gate = strict();
+    if (gate.affected.some(row => row.reason === 'wrong-head')) return gate;
     // An unknown required set must not let a red check ride past the marker: any healable red blocks, as in CI-green.
     if (ciRedOnHead({ headSha, checks, requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
       return { allowed: false, headSha, reason: 'ci-red', affected: [] };

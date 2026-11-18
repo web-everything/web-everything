@@ -64,6 +64,10 @@ describe('hydrated rollup evidence', () => {
 });
 
 describe('aggregate head binding before implication', () => {
+  it('marks wrong-head required evidence unknown so consumers cannot bypass the refusal', () => {
+    expect(gate([success('test'), { ...success('daemon-soak'), head_sha: 'other' }]))
+      .toMatchObject({ allowed: false, unknown: true, affected: [{ name: 'daemon-soak', reason: 'wrong-head' }] });
+  });
   it.each([
     { name: 'test', status: 'completed', conclusion: 'success' },
     { context: 'test', state: 'success' },
@@ -71,7 +75,7 @@ describe('aggregate head binding before implication', () => {
     const input = { headSha, rowsHead: headSha, rowsComplete: true, requiredChecks: ['integration'] };
     expect(reviewCiGate({ ...input, checks: [{ ...aggregate, head_sha: headSha }] }).allowed).toBe(true);
     const result = reviewCiGate({ ...input, checks: [{ ...aggregate, head_sha: 'other' }] });
-    expect(result).toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
+    expect(result).toMatchObject({ allowed: false, unknown: true, reason: 'required-checks-not-successful' });
     expect(result.affected).toContainEqual({ name: 'test', reason: 'wrong-head' });
     expect(result.affected).toContainEqual({ name: 'integration', reason: 'missing' });
   });
