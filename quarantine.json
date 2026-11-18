@@ -1,5 +1,14 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "brokenSha": "0a352384aeb4e89efbe57fbf54c2c7230bab7e00",
+      "owner": "xpbpgkz-daemon-jobs-runtime-forge-process-group",
+      "reason": "4 process-group tests pass local on main but fail on the Forge runner (waitFor timeout); card xpbpgkz; coordinator pre-authorised under R157",
+      "addedAt": 1795015780306,
+      "expiresAt": 1795037380306
+    }
+  ],
   "mode": "quarantine"
 }
