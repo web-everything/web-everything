@@ -36,7 +36,7 @@ export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = 
     process: { env: {}, cwd: () => '/caller', stderr: { write() {} } },
     Date, Set, Number, Math, basename: path => path.split('/').pop(), sep: '/',
     defaultSession: () => 'picker', ttlMsFromFlags: () => 60_000,
-    reapDeadLeasesInPool: () => sleep(reaperMs), parseScopeFlag: () => [],
+    reapDeadLeasesInPool: () => sleep(reaperMs), parseScopeFlag: () => [], isProseScopeFile: () => true,
     existingLanes: () => [1], resolveReal: value => value, ownLaneNumber: () => null,
     acquireDefaultWaitMs: waitMs, acquireDefaultWaitInvalid: false,
     ACQUIRE_POLL_MS: 1000, LIST_LOCK_ORPHAN_GRACE_MS: 1000,
@@ -61,7 +61,7 @@ export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = 
     log() {}, fail: message => { throw new Error(message); },
   };
   try {
-    await runInNewContext(`${extract('acquirableListCachedRaw')}\n${extract('acquirableListCached')}\nasync ${extract('cmdAcquire')}\ncmdAcquire(repo)`, context);
+    await runInNewContext(`${extract('acquirableListCachedRaw')}\n${extract('acquirableListCached')}\nasync ${extract('cmdAcquireReserved')}\nasync ${extract('cmdAcquire')}\ncmdAcquire(repo)`, context);
   } catch (error) {
     if (error !== claimed) report.error = error.message;
   }
