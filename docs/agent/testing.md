@@ -4682,6 +4682,9 @@ even on failure. `scripts/settings/urgent-sweep.json` controls the interval thro
 (`WE_URGENT_SWEEP_INTERVAL_MINUTES` is the environment override). Fixture, redirected and dry-run ticks
 skip host urgent loads. Errors are logged and recorded as probe errors without interrupting the tick.
 Keep cadence, persisted-stamp and fail-soft wiring regressions in `urgent-sweep-tick.test.mjs`.
+The lane-scan boundary guard also pins `runUrgentSweepTick` by module/export identity and exactly one
+health-watch invocation. Keep sweep IO in the tick module and register new reviewed tick entry points
+in both helper inventories without exempting them from the call-site guard.
 
 Absent registrations removed by another actor also require ancestry proof: settle only when HEAD
 excludes the urgent SHA or a freshly fetched `origin/main` contains it. Historical
