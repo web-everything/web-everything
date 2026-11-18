@@ -13,10 +13,10 @@ function fixture(t) {
   const root = mkdtempSync(join(process.env.TMPDIR, 'stuck-trace-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const events = [], calls = [];
-  const why = { owner: 'operator', waitingFor: 'human ruling', suggestedOp: 'unpark --preview',
+  const why = { head, owner: 'operator', waitingFor: 'human ruling', suggestedOp: 'unpark --preview',
     sections: ['state', 'checks', 'holds', 'daemons'].map((name, i) => ({ name,
       lines: [['OPEN labels: review:human'], ['unit: FAILURE', 'lint: PENDING'], ['build hold: exhausted'], ['fix: refused']][i] })) };
-  const trace = { likelyBlocker: 'waiting behind landing-holder #9', labels: ['review:human'],
+  const trace = { head, likelyBlocker: 'waiting behind landing-holder #9', labels: ['review:human'],
     ci: [{ name: 'lint', ageMinutes: 20 }], queue: { landingHolder: 9 }, conflicts: ['accepted + pending'],
     looping: [{ source: 'fix', count: 12 }], latest: { fix: 'refused #17', drain: 'behind #9' },
     latestAtET: { fix: '07:00 ET', drain: '06:59 ET' }, unavailable: ['review ledger'], incomplete: [] };
@@ -190,16 +190,30 @@ test('persistent read failure delivers only one INCOMPLETE note at the final att
   }
 });
 
+test('missing or invalid heads in either layer retry twice then emit INCOMPLETE', async t => {
+  for (const layer of ['why', 'trace']) for (const missing of [undefined, null, '', 'unknown-head', 17]) {
+    const f = fixture(t); enqueueStuckTrace(f.options);
+    f[layer].head = missing;
+    // A nested legacy head cannot substitute for the producer's top-level head.
+    if (layer === 'why') f.why.state = { head };
+    for (const attempt of [1, 2, 3]) {
+      await drainStuckTraces({ ...f.options, now: Date.parse(now) + (attempt - 1) * 600_000 });
+      assert.equal(queue(f)[key].state, attempt < 3 ? 'queued' : 'done');
+      assert.equal(f.events.length, attempt < 3 ? 0 : 1);
+    }
+    assert.match(f.events[0].detail.note, /INCOMPLETE/);
+  }
+});
+
 test('live head changes in either layer supersede queued SHAs without emitting; a new head re-arms', async t => {
   const next = 'b'.repeat(40);
-  for (const layer of ['trace', 'why', 'why-state']) {
+  for (const layer of ['trace', 'why']) {
     const f = fixture(t); enqueueStuckTrace(f.options);
     f.trace.head = head;
     const run = async args => {
       // Change evidence only when the queued entry is actually being drained.
       if (layer === 'trace') f.trace.head = next;
-      else if (layer === 'why') f.why.head = next;
-      else f.why.state = { head: next };
+      else f.why.head = next;
       return f.options.run(args);
     };
     await drainStuckTraces({ ...f.options, run });
@@ -207,6 +221,7 @@ test('live head changes in either layer supersede queued SHAs without emitting; 
     assert.equal(queue(f)[key].reason, 'superseded');
     assert.equal(f.events.length, 0);
     f.trace.head = next;
+    f.why.head = next;
     enqueueStuckTrace({ ...f.options, head: next });
     await drainStuckTraces(f.options);
     assert.equal(f.events.length, 1);

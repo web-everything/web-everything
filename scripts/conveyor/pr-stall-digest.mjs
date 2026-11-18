@@ -112,8 +112,9 @@ const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0,
  * @param {{now?:number, env?:object, feedPath?:string, stateDir:string, notify?:Function, enabled?:boolean}} o
  */
 export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true, alertBackoffMinutes, enqueue = enqueueStuckTrace, drain = drainStuckTraces,
-  traceStateDir = isUnderTest() ? join(stateDir ?? '.', 'stuck-traces') : join(handoffHome(), 'pr-merge-watch') } = {}) {
+  traceStateDir = join(handoffHome(), 'pr-merge-watch') } = {}) {
   const errors = [];
+  if (isUnderTest(env) || isUnderTest()) traceStateDir = stateDir ? join(stateDir, 'stuck-traces') : null;
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
   // Unknown policy is not an explicit disable: preserve open items, suppression and alert obligations until recovery.
   if (pass?.settingsUnreadable) return { lines: [], fresh: [], notified: false, errors, skipped: 'settings unreadable' };
@@ -121,7 +122,7 @@ export function publishStalledDigest(pass, { now = Date.now(), env = process.env
   if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
   const items = sortUnblockersFirst(pass.items.filter((i) => i.lane === 'operator').map(feedItem));
   // Enqueue every current operator head, including unchanged feed entries and failed delivery retries.
-  for (const item of items) {
+  for (const item of traceStateDir ? items : []) {
     try { enqueue({ repo: item.repo, pr: item.pr, head: item.head, kind: STALLED_KIND, stateDir: traceStateDir, now }); }
     catch { /* best effort; never affects the digest */ }
   }

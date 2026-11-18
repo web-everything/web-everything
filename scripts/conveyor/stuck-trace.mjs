@@ -166,9 +166,13 @@ async function traceStuckPr({ repo, pr, head, kind, attempts, run, emit, env }) 
       })]);
     } finally { clearTimeout(timer); }
     // A queued head can move while awaiting either operation; stale evidence emits nothing.
-    if (/^[a-f0-9]{40}$/i.test(head) && [trace?.head, why?.head, why?.state?.head].some(
-      live => typeof live === 'string' && /^[a-f0-9]{40}$/i.test(live) && live.toLowerCase() !== head.toLowerCase()))
-      return { posted: false, skipped: 'superseded' };
+    if (/^[a-f0-9]{40}$/i.test(head)) {
+      if ([trace?.head, why?.head].some(
+        live => typeof live === 'string' && /^[a-f0-9]{40}$/i.test(live) && live.toLowerCase() !== head.toLowerCase()))
+        return { posted: false, skipped: 'superseded' };
+      if (typeof why?.head !== 'string' || why.head.toLowerCase() !== head.toLowerCase()) why = null;
+      if (typeof trace?.head !== 'string' || trace.head.toLowerCase() !== head.toLowerCase()) trace = null;
+    }
     // Retry failed reads without delivering a note that would then be repeated.
     // On the final attempt, deliver one INCOMPLETE note even if a layer is missing.
     if ((why === null || trace === null) && attempts < 3) { report(); return { posted: false, skipped: 'incomplete' }; }
