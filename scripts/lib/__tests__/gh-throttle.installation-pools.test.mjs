@@ -17,7 +17,7 @@ import * as authCache from '../github-app-auth-env.mjs';
 import { defaultCachePath } from '../github-app-auth-env.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 import { ghInstallationPools, ghInstallationCap, ghSlotPool, ghHolderMeta, ghHolderPolicy, readGhSlotHolders, ghHoldersSummary, loadGhThrottleSettings } from '../gh-throttle-holders.mjs';
-import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE, ghPointsBudgetStatePath } from '../gh-throttle.mjs';
+import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE, ghPointsBudgetStatePath, ghWriteBudgetStatePath } from '../gh-throttle.mjs';
 
 
 let root;
@@ -282,7 +282,7 @@ console.log(result);`;
   // PR #7018 red team: the parent holds a shared slot while its shim-routed child resolves installation 101. The
   // child must not count its own parent against perCallerMax (the parent cannot release until the child returns).
   describe('a nested call moving to another pool counts its parent once against perCallerMax', () => {
-    const nestedRun = ({ perCallerMax, before = () => {}, parentEnv = {}, childBucket = '101', parentCap = 1 }) => {
+    const nestedRun = ({ perCallerMax, before = () => {}, parentEnv = {}, childBucket = '101', parentCap = 1, callArgs = args }) => {
       const env = { ...baseEnv(), ...parentEnv, GH_CALLER: 'review-pr.mjs', WE_GH_THROTTLE_PER_CALLER_MAX: String(perCallerMax) };
       const child = vi.fn(ok);
       let nested = null;
@@ -292,7 +292,7 @@ console.log(result);`;
           shimRouted: true, resolveSlotBucket: () => ({ bucket: childBucket }) }, spawn: child });
         return Buffer.from('[]');
       });
-      runGhSync(args, { env, throttle: { lockRoot: root, cap: parentCap, env, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000, execFileSync } });
+      runGhSync(callArgs, { env, throttle: { lockRoot: root, cap: parentCap, env, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000, execFileSync } });
       return { nested, child, execFileSync };
     };
     it('runs the child in installation 101 although the waiting shared parent is the caller\'s only holder', () => {
@@ -307,6 +307,12 @@ console.log(result);`;
       const { nested } = nestedRun({ perCallerMax: 0 });
       expect(nested).toMatchObject({ status: 0 });
       expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(1);
+    });
+    it('charges the pair\'s write budget ONCE for a nested write', () => {
+      const { nested, child } = nestedRun({ perCallerMax: 0, callArgs: ['pr', 'comment', '1', '--repo', 'example/repo', '--body', 'x'] });
+      expect(nested).toMatchObject({ status: 0 });
+      expect(child).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(readFileSync(ghWriteBudgetStatePath(root), 'utf8')).spent).toBe(1);
     });
     it('the reverse move (parent admitted to installation 101, child resolves shared) also counts the parent once', () => {
       const { nested, child } = nestedRun({ perCallerMax: 1, parentEnv: appEnv('101'), childBucket: null, parentCap: 20 });
