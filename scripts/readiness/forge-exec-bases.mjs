@@ -201,7 +201,7 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       const targetParts=parts.slice(0,-1).map(part=>part.toString('latin1'));
       let escaped=false;
       for(const part of target.toString('latin1').split('/')) {
-        if(part==='..'){if(!targetParts.length){escaped=true;break;}targetParts.pop();}
+        if(part==='..'){if(!targetParts.length){escaped=true;continue;}targetParts.pop();}
         else if(part&&part!=='.')targetParts.push(part);
       }
       if(escaped)continue;

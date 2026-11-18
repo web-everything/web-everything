@@ -85,6 +85,9 @@ describe('R593 bundle ingest on the runner', () => {
       ['nested/escaping', '../../agent-memory-src', false],
       ['newline', 'agent-memory-src\n/../agent-memory-src', false],
       ['nul', 'agent-memory-src\0/../agent-memory-src', false],
+      ['carriage-return', 'agent-memory-src\r/../agent-memory-src', false],
+      // No projected entry anywhere under or at the target: both alias checks pass vacuously.
+      ['dangling', 'nowhere', null],
       // An empty target resolves to the link's parent, so it must sit inside the projected directory.
       ['agent-memory-src/empty', '', false],
       ['no-alias', 'agent-memory-src', null],
