@@ -24,7 +24,7 @@ import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
-import { latestAdvisory, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
+import { parseAdvisories, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 /** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
@@ -632,19 +632,15 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   // and raised nothing. Without it (a lost write-back) the pause stays; onClean is honoured like any clean resume.
   const noFinding = why => {
     if (hold.kind !== 'same-head') return stay(why);
-    // parseAdvisories reads a missing outcome line as `accept`; here the outcome must be stated, so the newest advisory is
-    // taken from the trusted comments that state one. A newer advisory with no stated outcome then leaves an older accept
-    // as the latest, so also refuse when the newest advisory overall is not that stated accept.
+    // The newest advisory comment itself must carry exactly one outcome line, and it must be `accept`: parseAdvisories
+    // reads a missing outcome as `accept` and a body can embed extra outcome lines, so the comment text is checked here.
     const trusted = pr.comments.filter(isTrustedMarkerAuthor);
-    const stated = c => /^\*\*Advisory outcome:\*\*\s*`?accept`?(\s|$|`)/im.test(String(c?.body ?? ''));
-    const adv = latestAdvisory(trusted);
-    const newest = latestAdvisory(trusted.filter(stated));
-    if (!adv || !newest || adv.time !== newest.time || adv.head !== newest.head) return stay(`${why}, and no clean advisory accept names the full live head`);
-    // Only a clean `accept` that names the live head in full proves the review ran and raised nothing; any other outcome
-    // (pending-referral, none, changes, inconclusive) or a short-prefix head is unproven.
-    if (!advisoryCoversHead(adv, head) || adv.outcome !== ADVISORY_OUTCOMES.ACCEPT || String(adv.head).toLowerCase() !== head.toLowerCase()) {
-      return stay(`${why}, and no clean advisory accept names the full live head`);
-    }
+    const adv = parseAdvisories(trusted)[0];
+    const body = String(trusted[adv?.index]?.body ?? '');
+    const outcomes = [...body.matchAll(/^\*\*Advisory outcome:\*\*\s*`?([a-z-]+)`?/gim)].map(m => m[1].toLowerCase());
+    const clean = adv && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
+      && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
+    if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);
     if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);
     return { outcome: 'resume', head, findings: [], counts: {},
       why: `no referral finding exists on head ${head.slice(0, 9)}; no ruling is owed` };
