@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals, scanDrainTestTampering } from '../merge-ai-prs.mjs';
+import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals, readDrainNetDiffSignals, scanDrainTestTampering } from '../merge-ai-prs.mjs';
 import { requireScoredNetDiff } from '../pr-land.mjs';
 import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 
@@ -919,7 +919,7 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
   it('the drain\'s scoring loop reads the signal off this derivation, never assembling it inline', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
     const loop = src.slice(src.indexOf('for (const v of verdicts)'));
-    expect(loop).toMatch(/computeNetDiffSignals\(/);
+    expect(loop).toMatch(/readDrainNetDiffSignals\(\{ exec, headSha: v\.listedHeadSha,/);
     expect(loop.match(/diffHunks\s*[:=][^;\n]*\.text\b/)).toBeNull();
   });
 });
@@ -1054,5 +1054,75 @@ describe('mixed binary and readable test-removal evidence', () => {
       expect(shouldReparkForTestTampering({ tampered: gaming.tampered,
         netDiffScored: sig.netDiffText.scored && !sig.netDiffText.needsReview.length })).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('drain pinned-head signals', () => {
+  const head = 'a'.repeat(40), moved = 'b'.repeat(40), fork = 'c'.repeat(40);
+  // Faithful offline tree IO: the branch has moved to a clean commit; the PR
+  // head contains a deleted test. Unavailable heads throw rather than reading empty.
+  function fixture({ resolved = head, unavailable = false } = {}) {
+    const calls = [];
+    const exec = (cmd, args, opts) => {
+      const intent = scoringArgs(args);
+      const op = intent[0];
+      calls.push({ args: intent, opts });
+      if (op === 'fetch') throw new Error('offline');
+      if (op === 'rev-parse') {
+        const ref = intent.at(-1);
+        if (ref === `${head}^{commit}`) {
+          if (unavailable) throw new Error('missing PR head');
+          return resolved;
+        }
+        if (ref.includes('lane/x')) return moved;
+        throw new Error('unknown commit');
+      }
+      const target = intent.at(-1) === '--' ? intent.at(-2) : intent.at(-1);
+      if (op === 'merge-base') return fork;
+      const clean = target === moved || target === 'origin/lane/x' || target === 'lane/x';
+      if (op === 'diff') {
+        if (intent.includes('--numstat')) return clean ? '' : '0\t1\tguard.test.mjs\n';
+        if (intent.includes('--raw')) return clean ? '' : `:100644 000000 ${'1'.repeat(40)} ${'0'.repeat(40)} D\0guard.test.mjs\0`;
+        return clean ? '' : "diff --git a/guard.test.mjs b/guard.test.mjs\ndeleted file mode 100644\n--- a/guard.test.mjs\n+++ /dev/null\n@@ -1 +0,0 @@\n-it('guards the boundary', () => { expect(true).toBe(true); });\n";
+      }
+      throw new Error(`unexpected ${op}`);
+    };
+    return { exec, calls };
+  }
+  it('pins every probe to the matching PR SHA despite a moved clean branch and keeps the removal hold', () => {
+    const { exec, calls } = fixture();
+    const sig = readDrainNetDiffSignals({ exec, headSha: head, headRef: 'lane/x' });
+    expect(sig).toMatchObject({ scored: true, revSha: head, netDiffText: { scored: true, revSha: head } });
+    const gaming = scanDrainTestTampering(sig.netDiffText);
+    expect(gaming.tampered).toBe(true);
+    expect(shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: sig.netDiffText.scored })).toBe(true);
+    expect(calls.filter(c => c.args[0] === 'rev-parse')).toHaveLength(1);
+    for (const { args, opts } of calls.filter(c => ['merge-base', 'diff'].includes(c.args[0]))) {
+      expect(args).toContain(head);
+      expect(args.join(' ')).not.toContain('lane/x');
+      expect(opts.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+    }
+  });
+  it.each([{ resolved: moved }, { unavailable: true }])('moved/unresolvable head evidence is unscored and keeps the tamper hold: %j', options => {
+    const { exec } = fixture(options);
+    // The old branch read really is scored, clean evidence for the wrong SHA.
+    const stale = computeNetDiffSignals({ exec, rev: 'lane/x', pinRev: true });
+    expect(stale).toMatchObject({ scored: true, revSha: moved });
+    expect(scanDrainTestTampering(stale.netDiffText).tampered).toBe(false);
+    const sig = readDrainNetDiffSignals({ exec, headSha: head, headRef: 'lane/x' });
+    expect(sig.scored).toBe(false);
+    expect(sig.diffHunks).toBeNull();
+    expect(sig.netDiffText.scored).toBe(false);
+    const gaming = scanDrainTestTampering(sig.netDiffText);
+    expect(gaming.reasons.join(' ')).toMatch(/unscored.*human review/);
+    expect(shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: sig.netDiffText.scored,
+      humanClearedSha: head, headSha: head })).toBe(true);
+  });
+  it('missing PR head never resolves a mutable branch and retains unscored evidence', () => {
+    const { exec, calls } = fixture();
+    expect(readDrainNetDiffSignals({ exec, headRef: 'lane/x' })).toMatchObject({ scored: false,
+      netDiffText: { scored: false, reason: 'head-unbound' } });
+    expect(calls).toEqual([]);
   });
 });

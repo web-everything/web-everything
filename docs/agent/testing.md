@@ -4500,3 +4500,10 @@ the detector. `merge-ai-prs-drain-verdict-ledger.test.mjs` covers incomplete-rea
 `hardened-git-diff.test.mjs` pins the per-path opt-in and unchanged whole-read backstops.
 Pr-land refuses partial signals; review-pr-io invalidates paired evidence and advisory
 conversion retains the strict reader. Run these scoped regressions through heavy-admission.
+
+Drain net-diff scoring pins the listing's `headRefOid` before merge-base and every diff,
+and compares both signal and text `revSha` with that head. Branch names only fetch objects.
+`merge-ai-prs-net-diff-computation.test.mjs` covers a moved clean branch, a mismatched
+resolved SHA, an unavailable head, and a matching SHA containing test removals. Missing or
+mismatched identity invalidates text and hunks as well as scoring: file-list fallbacks and
+old human clearance keep the tamper hold. Repair the read or request human review.

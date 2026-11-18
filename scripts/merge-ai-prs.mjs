@@ -825,7 +825,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     try {
       const old = readNetDiffAtHead({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        headSha: evidence.acceptedSha, headRef: evidence.acceptedSha, netDiff,
+        headSha: evidence.acceptedSha, headRef: evidence.acceptedSha, netDiff, pinRev: true,
       });
       const fp = old.scored ? normalizeDiffFingerprint(old.text) : null;
       if (fp) { evidence.acceptedDiff = fp; evidence.acceptedDiffDerived = true; }
@@ -4092,7 +4092,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
     if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
     /* a real fetch failure degrades to whatever is locally cached — the diff attempts below still run */
   }
-  const candidates = [`${remote}/${rev}`, rev];
+  const candidates = pinRev && /^[0-9a-f]{40,64}$/i.test(rev) ? [rev] : [`${remote}/${rev}`, rev];
   for (let candidate of candidates) {
     // Pin BEFORE merge-base or any scoring probe. Once a candidate resolves, never
     // retry a mutable name if subsequent evidence fails.
@@ -4168,7 +4168,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
   return { ok: false, reason: 'ref-unresolved', requestedFor };
 }
 
-export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
+export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const empty = { changedFiles: [], diffLines: 0, scored: false, humanBasisFiles: [] };
   if (typeof exec !== 'function' || !rev) return empty;
   const baseRevOk = typeof baseRev === 'string' && /^[0-9a-f]{7,64}$/i.test(baseRev);
@@ -4178,7 +4178,8 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
   if (sharedBasis && !basisAnswersRequest(sharedBasis, { remote, base, rev })) return { ...empty, reason: 'basis-mismatch' };
   // #2890-review-fix finding 3 — reuse a basis the caller already resolved for this same ref (see
   // `resolveNetDiffBasis`); absent one, resolve our own exactly as before.
-  const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
+  const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
+  if (pinRev && basis.ok && !basis.revSha) return { ...empty, reason: 'basis-mismatch' };
   // #2952 — additive: `reason` distinguishes a fixable caller-side `exec`-contract violation ('exec-contract')
   // from a legitimately absent ref ('ref-unresolved'). Existing consumers that read only `scored` are untouched.
   if (!basis.ok) return { ...empty, reason: basis.reason };
@@ -4320,11 +4321,17 @@ export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = com
  * @returns {{changedFiles:string[], diffLines:number, humanBasisFiles:string[], cumulativeDiffLines:number,
  *   scored:boolean, netDiffText:{text:string,scored:boolean,reason?:string}, diffHunks:string|null}}
  */
-export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [] } = {}) {
-  const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
-  const net = computeNetDiffChangedFiles({ exec, remote, base, baseRev, rev, fetchExtraRefs, basis });
-  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis });
+export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], pinRev = false } = {}) {
+  // Keep ancestry probes as well as hardened diffs on the original objects.
+  if (pinRev && typeof exec === 'function') {
+    const run = exec;
+    exec = (cmd, args, opts) => run(cmd, args, { ...opts, env: { ...(opts?.env ?? process.env), GIT_NO_REPLACE_OBJECTS: '1' } });
+  }
+  const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
+  const net = computeNetDiffChangedFiles({ exec, remote, base, baseRev, rev, fetchExtraRefs, basis, pinRev });
+  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis, pinRev });
   return {
+    ...(basis.revSha ? { revSha: basis.revSha } : {}),
     changedFiles: net.changedFiles,
     diffLines: net.diffLines,
     humanBasisFiles: net.humanBasisFiles,
@@ -4343,6 +4350,17 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
     netDiffText,
     diffHunks: diffHunksFrom(netDiffText),
   };
+}
+
+/** Bind drain evidence to the PR head being decided on, never to its mutable name. */
+export function readDrainNetDiffSignals({ exec, headSha, headRef = null, baseRev = null } = {}) {
+  const validHead = typeof headSha === 'string' && /^[0-9a-f]{40}$/i.test(headSha);
+  const sig = computeNetDiffSignals({ exec, rev: validHead ? headSha : null, baseRev,
+    fetchExtraRefs: headRef ? [headRef] : [], pinRev: true });
+  if (validHead && sig.revSha === headSha && sig.netDiffText.revSha === headSha) return sig;
+  // Invalidate BOTH consumers: a file-list fallback must not revive clean tamper evidence.
+  return { ...sig, scored: false, diffHunks: null,
+    netDiffText: { text: '', base: null, rev: null, scored: false, reason: validHead ? 'head-mismatch' : 'head-unbound' } };
 }
 
 /** Keep readable tamper findings while refusing incomplete evidence as clearance. */
@@ -4385,11 +4403,12 @@ export function scanDrainTestTampering(netDiffText) {
  * @returns {{paths:string[], base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'}}
  */
 // Accept the same request-checked basis as text, including a basis pinned before resolution.
-export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
+export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const unscored = { paths: [], base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   if (sharedBasis && !basisAnswersRequest(sharedBasis, { remote, base, rev })) return { ...unscored, reason: 'basis-mismatch' };
-  const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
+  const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
+  if (pinRev && basis.ok && !basis.revSha) return { ...unscored, reason: 'basis-mismatch' };
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {
@@ -4397,7 +4416,7 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
     const paths = String(raw || '').split('\0').filter(Boolean);
     const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate]));
     verifyRenderedDiff(exec, diffBase, candidate, text, { paths });
-    return { paths, base: diffBase, rev: candidate, scored: true };
+    return { paths, base: diffBase, rev: candidate, scored: true, ...(pinRev ? { revSha: basis.revSha } : {}) };
   } catch (err) {
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
   }
@@ -6320,7 +6339,8 @@ async function runCli() {
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
         diffExec = exec;
-        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        const sig = readDrainNetDiffSignals({ exec, headSha: v.listedHeadSha,
+          headRef: v.headRef, baseRev: v.base });
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
         humanBasisFiles = sig.humanBasisFiles;
@@ -6485,7 +6505,7 @@ async function runCli() {
             const carried = carryHumanClearanceOnIdenticalDiff({
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
-              readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
+              readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef, pinRev: true }) : null),
               applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: candidateDryRun }),
             });
             humanClearedSha = carried.humanClearedSha;
