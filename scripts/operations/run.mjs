@@ -107,6 +107,8 @@ import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from '.
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
+import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from './update-branch.mjs';
+import { createUpdateBranchSinks } from './update-branch-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
 import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from './prototype-load.mjs';
 import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
@@ -602,6 +604,11 @@ export const OPERATIONS = Object.freeze({
   [MAINTENANCE_OP]: () => ({
     declaration: maintenanceOperation(),
     sinks: createMaintenanceSinks(),
+  }),
+  [UPDATE_BRANCH_OP]: () => ({
+    declaration: updateBranchOperation(),
+    sinks: createUpdateBranchSinks(),
+    finish: finishUpdateBranch,
   }),
   // free-scope — rules 21/26 of the operator handoff: are these files free of every open PR and every running
   // agent's declared scope? Read-only (no sinks). Register/release live in free-scope-cli.mjs.

@@ -238,6 +238,16 @@ async function readDeployState(path) {
   } catch { return null; }
   finally { try { await file?.close(); } catch { /* evidence unavailable */ } }
 }
+// 50 retained entries must stay inside parseTelemetry's 64 KiB budget.
+const FAILURE_TAIL_BYTES = 512;
+function failureTail(stderr) {
+  const lines=String(stderr).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g,'').replace(/\n$/,'').split('\n').slice(-20).join('\n');
+  const bytes=Buffer.from(lines);
+  let start=Math.max(0,bytes.length-FAILURE_TAIL_BYTES);
+  // Keep the newest bytes without cutting through a UTF-8 character.
+  while(start<bytes.length && (bytes[start]&0xc0)===0x80) start++;
+  return bytes.subarray(start).toString('utf8');
+}
 export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
@@ -255,7 +265,11 @@ export function parseTelemetry(text) {
     || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
       ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
-      || (exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET') && typeof r.prewarmed==='boolean'))
+      || exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET')
+      || exactKeys(r,'code,failureTail,runId,stageMs,startedAtET')
+      || exactKeys(r,'code,failureTail,prewarmed,runId,stageMs,startedAtET'))
+      || ('prewarmed' in r && typeof r.prewarmed!=='boolean')
+      || ('failureTail' in r && (typeof r.failureTail!=='string' || Buffer.byteLength(r.failureTail)>FAILURE_TAIL_BYTES || !r.code))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
       || !duration(r.stageMs.install) || !duration(r.stageMs.run) || !(r.code===null || (duration(r.code)&&r.code<=255))))
     throw new Error('Invalid telemetry schema');
@@ -1632,7 +1646,9 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const receipt=createRunReceipt(prepared,{resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code},tasks);
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       if (tasks.tasksNear) process.stderr.write('forge-exec-run: '+tasks.tasksNote+'\n');
-      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed});
+      // Receipts have a closed client schema; diagnostics live only in telemetry.
+      const failure=result.code!==0 && (phase==='install'||phase==='supervisor') ? {failureTail:failureTail(result.stderr)} : {};
+      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed,...failure});
       if(telemetryError)throw telemetryError;
       return result;
       },prepared);

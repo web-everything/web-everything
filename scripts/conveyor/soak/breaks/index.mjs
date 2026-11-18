@@ -46,6 +46,8 @@
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.
  * `live-changes-stale-accepted-phase.mjs` uses the same automatic registration.
  *
+ * `unchecked-draft-and-stale-accepted-status.mjs` uses the same automatic registration.
+ *
  * `daemon-load-overlay-stale-tracking-ref.mjs` uses the same automatic registration.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —

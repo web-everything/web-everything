@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lib/review-core.mjs", "we:scripts/lib/__tests__/review-core.test.mjs", "we:docs/agent/reviewer-expectations.md", "we:scripts/lib/__tests__/build-safeguards.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-16"
-preparedAgainstSha: "578083a15a2d401dab86a9a48f5c7fd3522e508c"
+preparedDate: "2026-11-17"
+preparedAgainstSha: "45534e48c50d6314690e581d285a284e62fd127f"
 tags: []
 ---
 
