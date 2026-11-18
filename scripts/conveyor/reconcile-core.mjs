@@ -553,7 +553,7 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
   if (!rows.length || rows.some(row =>
     ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())
     || String(row?.state).toLowerCase() === 'expected')) return null;
-  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
+  const gate = reviewStartGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr.statusCheckRollup, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
   // 'ci-not-registered' is the early-start gate's name for the same all-missing shape (startEarly shadow/on).
   if (gate.allowed || !['required-checks-not-successful', 'ci-not-registered'].includes(gate.reason) || !gate.affected.length
       || gate.affected.some(row => row.reason !== 'missing')) return null;
@@ -1499,10 +1499,17 @@ function refuseHumanClearedHead({ pr, refuse, withPhase, extra = {} }) {
   return true;
 }
 
+/** Preserve the planner read's head and provenance; never infer a complete snapshot. */
+function reviewTimingEvidence(pr) {
+  return { headSha: pr?.headRefOid, rowsHead: pr?.rowsHead,
+    rowsComplete: pr?.rowsComplete === undefined ? undefined : pr.rowsComplete === true && !pr.requiredCheckReadError,
+    rosterSource: ['live', 'cache'].includes(pr?.rosterSource) ? pr.rosterSource : undefined };
+}
+
 /** Optional diagnostics only; callers retain their existing refusal and dispatch decisions. */
 function earlyStartShadowFields(pr, requiredChecks) {
   return pr?.reviewTiming?.earlyStartShadow === true ? { earlyStartShadow: earlyStartShadow({
-    headSha: pr.headRefOid, checks: pr.statusCheckRollup, requiredChecks, verifyGreen: pr.verifyGreen,
+    ...reviewTimingEvidence(pr), checks: pr.statusCheckRollup, requiredChecks, verifyGreen: pr.verifyGreen,
     care: pr.careLevel, lines: pr.diffLines, files: pr.diffFiles, kinds: pr.kinds, policy: pr.reviewTiming,
   }) } : {};
 }
@@ -1555,13 +1562,13 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
     ? [latest] : [];
   const reviewers = bindAgents(pr, agents, repo).filter(isReviewerBinding);
   const reviewCanFinish = reviewDispatched || Boolean(assessLiveness(reviewers));
-  return fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,
+  return fixReadiness({ ...reviewTimingEvidence(pr), checks: pr.statusCheckRollup, findings,
     reviewPending: reviewCanFinish, requiredChecks });
 }
 
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
-  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
+  const ci = reviewStartGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
@@ -4089,9 +4096,11 @@ export function planReconcile({
     const facts = timingFacts(pr, { agents, repo, requiredChecks,
       reviewDispatched: dispatch.some(d => d.prNumber === entry.prNumber && d.kind === 'review') });
     const decision = joinedFixDecision({ ...facts, now, policy: fixTiming });
-    if (decision.action === 'wait') {
-      refusals.push({ ...entry, kind: 'fix-join-wait', deadline: decision.deadline,
-        why: 'waiting for the other CI/review input within fix.joinWaitMaxMin' });
+    const evidenceReason = ['pass', 'held', 'pending', 'fail'].includes(facts.reason) ? undefined : facts.reason;
+    if (evidenceReason || decision.action === 'wait') {
+      refusals.push({ ...entry, kind: 'fix-join-wait', deadline: decision.deadline, evidenceReason,
+        why: evidenceReason ? `waiting for readable head-pinned CI evidence: ${evidenceReason}`
+          : 'waiting for the other CI/review input within fix.joinWaitMaxMin' });
       continue;
     }
     if (decision.joined) {

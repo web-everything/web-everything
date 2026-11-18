@@ -1,4 +1,5 @@
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
+import * as reviewTiming from '../../lib/review-timing.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { planFixesFromReconcile, withPlannedContext } from '../reconcile-fix-dispatch.mjs';
 import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
@@ -12,6 +13,7 @@ const check = (name, conclusion = 'SUCCESS') => ({ name, status: conclusion ? 'C
 const finding = { author: { login: 'web-everything' }, createdAt: new Date(now - 60_000).toISOString(), body:
   `🔁 review — changes requested\n\nRecorded by juror via ${REVIEW_PR_CHANNEL}.\n\nRepair the unit failure.\n\n---\n\nNet basis: \`0000..${head}\` — 1 net changed file(s) vs current main\n\n_Recorded through ${REVIEW_PR_CHANNEL}._` };
 const pr = (over = {}) => ({ number: 7, state: 'OPEN', headRefOid: head, headRefName: 'lane/xabc-test',
+  rowsHead: head, rowsComplete: true, rosterSource: 'live',
   labels: labels('review:pending'), comments: [], files: [{ path: 'scripts/example.mjs' }], statusCheckRollup: [check('standards'), check('test-shard (1)'), check('test', null)], ...over });
 const plan = (row, extra = {}) => planReconcile({ prs: [row], requiredChecks: ['test'], now, ...extra });
 it('the production planner releases fast-check review while aggregate CI is pending', () => {
@@ -45,6 +47,31 @@ it('heals red CI immediately when review is refused and no reviewer is live', ()
   const result = plan(pr({ statusCheckRollup: [check('test', 'FAILURE')] }));
   expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
   expect(result.refusals.some(r => r.kind === 'fix-join-wait')).toBe(false);
+});
+it('a finished required failure promptly yields ciFailed and failure context while another required check runs', () => {
+  const readiness = vi.spyOn(reviewTiming, 'fixReadiness');
+  try {
+    const result = plan(pr({ labels: labels('review:changes'), comments: [finding],
+      statusCheckRollup: [check('test', 'FAILURE'), check('other', null)] }), { requiredChecks: ['test', 'other'] });
+    expect(readiness.mock.results.map(r => r.value)).toContainEqual(expect.objectContaining({ ciFailed: true,
+      ciFailures: [{ name: 'test', conclusion: 'FAILURE', detailsUrl: null }] }));
+    expect(result.dispatch).toHaveLength(1);
+    expect(result.dispatch[0]).toMatchObject({ kind: 'fix', joinedInputs: {
+      ciFailures: [{ name: 'test', conclusion: 'FAILURE', detailsUrl: null }], reviewFindings: [finding.body] } });
+  } finally { readiness.mockRestore(); }
+});
+it.each([
+  ['rows incomplete', { rowsComplete: false }, 'rows-incomplete'],
+  ['required check read failed', { requiredCheckReadError: 'read failed' }, 'rows-incomplete'],
+  ['missing provenance', { rowsHead: undefined, rowsComplete: undefined, rosterSource: undefined }, 'roster-unavailable'],
+  ['foreign snapshot', { rowsHead: 'b'.repeat(40) }, 'foreign-head'],
+  ['untrusted roster source', { rosterSource: 'guessed' }, 'roster-unavailable'],
+])('fails closed visibly on %s instead of dispatching a fix', (_name, provenance, reason) => {
+  const result = plan(pr({ labels: labels('review:changes'), comments: [finding],
+    statusCheckRollup: [check('test', 'FAILURE')], ...provenance }), { now: now + 60 * 60_000 });
+  expect(result.dispatch).toEqual([]);
+  expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+    evidenceReason: expect.stringContaining(reason), why: expect.stringContaining(reason) }));
 });
 it('caps waiting even when a reviewer is still live, while retaining fixer liveness protection', () => {
   const row = pr({ statusCheckRollup: [check('test', 'FAILURE')] });
@@ -114,11 +141,16 @@ it.each([
 });
 it('a reviewer set aside for a CI heal past the join cap releases only the heal, never a second review', () => {
   const reviewer = { name: 'review-7', pid: 123, pidAlive: true, state: 'working' };
-  for (const [requiredChecks, rollup] of [[['test'], [check('standards'), check('test-shard (1)'), check('test', 'FAILURE')]],
-    [null, [check('standards'), check('test-shard (1)'), check('CodeQL', 'FAILURE')]]]) {
-    const result = planReconcile({ prs: [pr({ statusCheckRollup: rollup })], requiredChecks, now: now + 15 * 60_000, agents: [reviewer] });
-    expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
-  }
+  const result = plan(pr({ statusCheckRollup: [check('standards'), check('test-shard (1)'), check('test', 'FAILURE')] }),
+    { now: now + 15 * 60_000, agents: [reviewer] });
+  expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+});
+it('an unknown required roster never releases a CI heal past the join cap', () => {
+  const row = pr({ statusCheckRollup: [check('standards'), check('test-shard (1)'), check('CodeQL', 'FAILURE')] });
+  const result = plan(row, { requiredChecks: null, now: now + 15 * 60_000 });
+  expect(result.dispatch).toEqual([]);
+  expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+    evidenceReason: expect.stringContaining('roster-unavailable') }));
 });
 
 it('starts review early only with verified head evidence and preserves the off path', () => {
