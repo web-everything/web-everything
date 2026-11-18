@@ -43,7 +43,7 @@ beforeEach(async () => {
 afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
 const ranges = [
-  ['reviewConcurrency.maxLiveReviewRounds', 1, 8],
+  ['reviewConcurrency.maxLiveReviewRounds', 1, 16],
   ['host.maxReviewDispatchPerTick', 1, 8],
   ['resourceGate.fixCap.floor', 1, 12],
   ['resourceGate.fixCap.ceiling', 1, 12],
