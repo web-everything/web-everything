@@ -10,6 +10,7 @@ import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-syn
 import * as gateCatchUp from '../../../scripts/lib/red-team-gate-catchup.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import * as hostSample from '../../../scripts/lib/host-sample.mjs';
+import * as operatorOverrideReader from '../../../scripts/lib/operator-override-reader.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
 
@@ -24,6 +25,8 @@ beforeEach(() => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '2');
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT', '10');
   vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
+  // Hermetic: the host's real operator overrides (e.g. redTeamQueue.minConcurrent) must not raise the pinned floor.
+  vi.spyOn(operatorOverrideReader, 'readOperatorOverrides').mockReturnValue({ readable: true, values: {} });
 });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
@@ -337,7 +340,7 @@ it('a throwing host check blocks recovery-only starts', () => {
   expect(recoveryDispatch).not.toHaveBeenCalled();
 });
 
-it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
+it.each([38, 5, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
     if (idle === 'throws') throw new Error('sample unavailable');
@@ -354,7 +357,7 @@ it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves
     });
     expect(hostSample.sampleHost).toHaveBeenCalledOnce();
     expect(recovery.mock.calls[0][0].capacity).toBe(capacity);
-    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 'throws' ? 1 : 2, budget: { left: 3 } });
+    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 38 ? 2 : 1, budget: { left: 3 } });
     expect(capacity.budget).toBe(budget);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
