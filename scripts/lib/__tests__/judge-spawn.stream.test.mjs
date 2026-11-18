@@ -5,7 +5,8 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { buildJudgeEnv, judgeSpawn, parseJudgeOutcome, JudgeTimeoutError, JudgeUnparseableError } from '../judge-spawn.mjs';
+import { inspect } from 'node:util';
+import { buildJudgeEnv, judgeSpawn, parseJudgeOutcome, JudgeTimeoutError, JudgeUnparseableError, JudgeBudgetError } from '../judge-spawn.mjs';
 import { normalizeJudgeTelemetry } from '../../operations/run-record.mjs';
 import { createDefaultJudge, unwrapJudgeOutcome } from '../../operations/cli-adapter.mjs';
 
@@ -15,7 +16,7 @@ const result = { type: 'result', session_id: 'session', structured_output: { ver
 const tool = (command) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command } }] } });
 const jsonl = (events) => events.map(e => JSON.stringify(e)).join('\n') + '\n';
 
-function fake(events, { hang = false, chunks, pid } = {}) {
+function fake(events, { hang = false, chunks, pid, stderr = 'diagnostic stderr' } = {}) {
   let options;
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -27,7 +28,7 @@ function fake(events, { hang = false, chunks, pid } = {}) {
     options = opts;
     queueMicrotask(() => {
       for (const chunk of chunks ?? [jsonl(events)]) child.stdout.write(chunk);
-      child.stderr.write('diagnostic stderr');
+      child.stderr.write(stderr);
       if (!hang) child.emit('close', 0, null);
     });
     return child;
@@ -104,7 +105,8 @@ describe('Claude stream diagnostics', () => {
     expect(error.lastEvents).toEqual([{ type: 'unrecognized' }]);
     expect(error.message).toContain(`stdout ${Buffer.byteLength(stdout)} bytes`);
     expect(error.message).toContain('last events: [{"type":"unrecognized"}]');
-    expect([error.message, JSON.stringify(error.lastEvents), JSON.stringify(error.telemetry),
+    expect([error.message, JSON.stringify(error), JSON.stringify(Object.keys(error).map(key => error[key])),
+      inspect(error, { showHidden: false, depth: null }), JSON.stringify(error.lastEvents), JSON.stringify(error.telemetry),
       JSON.stringify(error.failedAttempts), log.mock.calls.flat().join(' ')].join(' '))
       .not.toMatch(/SECRET_TOKEN|private-value/);
     expect(() => parseJudgeOutcome(stdout)).toThrow(/last events: \[{"type":"unrecognized"}\]/);
@@ -127,10 +129,53 @@ describe('Claude stream diagnostics', () => {
     expect(error.message.split('\n')[0]).toContain('last tool: Bash: git diff');
     expect(log.mock.calls.flat().join(' ')).toContain('last tool: Bash: git diff');
     expect(JSON.stringify(error.telemetry)).not.toMatch(/private-value|password|private-output/);
+    expect(JSON.stringify(error)).not.toMatch(/private-value|password|private-output/);
+    for (const key of Object.keys(error)) {
+      expect(inspect(error[key], { showHidden: false, depth: null })).not.toMatch(/private-value|password|private-output/);
+    }
+    expect(inspect(error, { showHidden: false, depth: null })).not.toMatch(/private-value|password|private-output/);
     expect(error.message).not.toMatch(/private-value|password|private-output/);
     expect(JSON.stringify(error.lastEvents).length).toBeLessThan(2000);
     if (!hang) expect(error.failedAttempts[0].lastEvents).toEqual(error.lastEvents);
     else expect(error.partialStderr).toBe('diagnostic stderr');
+  });
+
+  it.each([false, true])('redacts stderr before failure messages and enumerable telemetry (timeout=%s)', async hang => {
+    const secret = 'private-stderr-credential';
+    const stderr = `diagnostic SECRET_TOKEN=${secret}`;
+    const error = await judgeSpawn({ ...request, ...fake([tool('git status')], { hang, stderr }),
+      timeoutMs: 10, log: () => {} }).catch(e => e);
+    expect(error).toBeInstanceOf(hang ? JudgeTimeoutError : JudgeUnparseableError);
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(inspect(error, { showHidden: false, depth: null })).not.toContain(secret);
+    expect(error.telemetry.stderrTail).toContain('<redacted');
+    if (hang) {
+      expect(error.partialStderr).toBe(stderr);
+      expect(error.partialStdout).toContain('tool_use');
+      for (const key of ['partialStdout', 'partialStderr']) {
+        expect(Object.getOwnPropertyDescriptor(error, key).enumerable).toBe(false);
+      }
+    }
+  });
+
+  it('redacts constructor metadata and budget diagnostics without mutating caller evidence', () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+    const lastEvents = [{ type: 'assistant', tools: [secret] }];
+    const failedAttempts = [{ stderrTail: secret, lastEvents }];
+    const errors = [
+      new JudgeTimeoutError({ timeoutMs: 10, wallMs: 11, stdout: secret, stderr: secret,
+        sessionId: secret, lastEvents, lastToolCall: secret }),
+      new JudgeUnparseableError({ attempt: 1, attempts: 1, exitCode: 1, signal: secret,
+        stdout: secret, stderr: secret, sessionId: secret, failedAttempts, lastEvents, lastToolCall: secret, reason: secret }),
+      new JudgeBudgetError({ budget: 1, costUsd: 1, stopReason: secret, result: secret, stderr: secret }),
+    ];
+    for (const error of errors) {
+      expect(JSON.stringify(error)).not.toContain(secret);
+      for (const key of Object.keys(error)) expect(inspect(error[key], { depth: null })).not.toContain(secret);
+      expect(inspect(error, { showHidden: false, depth: null })).not.toContain(secret);
+    }
+    expect(lastEvents[0].tools).toEqual([secret]);
+    expect(failedAttempts[0].stderrTail).toBe(secret);
   });
 
   it('bounds oversized events, reports truncation, and keeps the next result usable', async () => {
@@ -148,13 +193,17 @@ describe('Claude stream diagnostics', () => {
   it('keeps bounded evidence through the graceful caller and the run-record whitelist', async () => {
     const lastEvents = [{ type: 'assistant', tools: ['Bash: git diff'] }];
     const error = new JudgeTimeoutError({ timeoutMs: 10, wallMs: 11, sessionId: 'session', lastEvents,
-      lastToolCall: 'Bash: git diff' });
+      lastToolCall: 'Bash: git diff', stdout: jsonl([tool('git diff private-tool-input')]),
+      stderr: 'SECRET_TOKEN=private-stderr-input' });
     const judge = createDefaultJudge({ provider: async () => { throw error; },
       checkProviderHold: async () => null, logGracefulOutcome: () => {} });
     const returned = await judge({ ...request, model: 'sonnet', effort: 'high', gracefulOnUnavailable: true });
     const row = normalizeJudgeTelemetry({ telemetry: unwrapJudgeOutcome(returned).telemetry });
     expect(row).toMatchObject({ sessionId: 'session', wallMs: 11, timedOut: true,
       lastEvents, lastToolCall: 'Bash: git diff' });
+    expect(JSON.stringify(row)).not.toMatch(/private-tool-input|private-stderr-input|tool_use/);
+    expect(row).not.toHaveProperty('partialStdout');
+    expect(row).not.toHaveProperty('partialStderr');
     const oversized = normalizeJudgeTelemetry({ telemetry: { lastToolCall: 'x'.repeat(1000),
       lastEvents: Array.from({ length: 80 }, () => ({ type: 'y'.repeat(1000), tools: ['z'.repeat(1000)], raw: 'secret' })) } });
     expect(oversized.lastEvents).toHaveLength(50);

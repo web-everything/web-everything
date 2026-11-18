@@ -299,10 +299,23 @@ function killJudgeGroup(child, fallback = true) {
   if (fallback) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
 }
 
+/** Copy diagnostic metadata, redacting strings before messages, excerpts or telemetry use them. */
+function redactJudgeMetadata(value) {
+  if (typeof value === 'string') return redactSpawnText(value);
+  if (Array.isArray(value)) return value.map(redactJudgeMetadata);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactJudgeMetadata(item)]));
+  }
+  return value;
+}
+
 /** Final unparseable output, with evidence from every failed attempt. */
 export class JudgeUnparseableError extends Error {
   constructor({ attempt, attempts, exitCode, signal, stdout, stderr, wallMs, sessionId, failedAttempts, lastEvents = [], lastToolCall = null, reason = null }) {
     stderr = redactSpawnText(String(stderr ?? ''));
+    ({ signal, sessionId, failedAttempts, lastEvents, lastToolCall, reason } = redactJudgeMetadata({
+      signal, sessionId, failedAttempts, lastEvents, lastToolCall, reason,
+    }));
     const bytes = Buffer.byteLength(String(stdout));
     const snippet = stderrSnippet(stderr);
     const tail = String(stderr).trim().slice(-600);
@@ -341,12 +354,14 @@ export class JudgeUnparseableError extends Error {
  */
 export class JudgeTimeoutError extends Error {
   constructor({ timeoutMs, wallMs, stdout = '', stderr = '', sessionId, lastEvents = [], lastToolCall = null }) {
+    const safeStderr = redactSpawnText(String(stderr));
+    ({ sessionId, lastEvents, lastToolCall } = redactJudgeMetadata({ sessionId, lastEvents, lastToolCall }));
     super(
       `judge-spawn: the juror exceeded ${timeoutMs}ms and was killed (ran ${wallMs}ms)${lastToolCall ? `; last tool: ${lastToolCall}` : ''}. `
       + 'Its output did not parse, so no partial verdict is available — but this is a BOUND being hit, not a '
       + `crash: see JUDGE_TIMEOUT_MS for what the bound was derived from.\n`
       + `stdout ${Buffer.byteLength(String(stdout))} bytes; last events: ${JSON.stringify(lastEvents).slice(0, 600)}\n`
-      + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`
+      + `stderr[-600..]: ${safeStderr.trim().slice(-600) || '<empty>'}`
       + (lastEvents.some(e => e.truncated) ? '\nStream diagnostics were truncated; rerun with a narrower mandate to inspect the step.' : ''),
     );
     this.name = 'JudgeTimeoutError';
@@ -357,9 +372,10 @@ export class JudgeTimeoutError extends Error {
     this.lastEvents = lastEvents;
     this.lastToolCall = lastToolCall;
     this.telemetry = { sessionId, wallMs, timedOut: true, lastEvents, lastToolCall,
-      stderrTail: String(stderr).trim().slice(-1000), failure: 'timeout' };
-    this.partialStdout = String(stdout);
-    this.partialStderr = String(stderr);
+      stderrTail: safeStderr.trim().slice(-1000), failure: 'timeout' };
+    // Raw streams are for explicit in-process recovery only, never serialization or normal inspection.
+    Object.defineProperty(this, 'partialStdout', { value: String(stdout), enumerable: false });
+    Object.defineProperty(this, 'partialStderr', { value: String(stderr), enumerable: false });
   }
 }
 
@@ -383,6 +399,9 @@ export class JudgeTimeoutError extends Error {
  */
 export class JudgeBudgetError extends Error {
   constructor({ budget, costUsd = 0, stopReason = '', result = '', stderr = '' }) {
+    stopReason = redactSpawnText(String(stopReason));
+    result = redactSpawnText(String(result));
+    stderr = redactSpawnText(String(stderr));
     super(
       `judge-spawn: the juror was KILLED BY ITS SPEND CEILING — it spent $${costUsd} against a `
       + `--max-budget-usd of $${budget}. This is a BOUND being hit, not a crash: the CLI reports it as `
@@ -821,7 +840,7 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       const evidence = streamEvidence();
       evidence.add(stdout);
       evidence.finish();
-      const tail = String(stderr).trim().slice(-600);
+      const tail = redactSpawnText(String(stderr)).trim().slice(-600);
       const err = new Error(
         `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
         `stdout ${Buffer.byteLength(String(stdout))} bytes; last events: ${JSON.stringify(evidence.lastEvents).slice(0, 600)}\n` +

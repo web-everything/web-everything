@@ -124,6 +124,13 @@ describe('normalizeJudgeTelemetry — a failed seat keeps its spawn evidence', (
     const row = normalizeJudgeTelemetry({ telemetry: { argv: ['--append-system-prompt', 'the mandate'], exitCode: 1 } });
     expect('argv' in row).toBe(false);
   });
+
+  it('drops raw streams from historical enumerable timeout telemetry', () => {
+    const historical = JSON.parse('{"timedOut":true,"wallMs":10,"partialStdout":"private-tool-input","partialStderr":"private-stderr-input","stdout":"private-tool-input","stderr":"private-stderr-input"}');
+    const row = normalizeJudgeTelemetry({ telemetry: historical });
+    expect(row).toEqual({ step: '', stepIndex: null, timedOut: true, wallMs: 10, usage: {} });
+    expect(JSON.stringify(row)).not.toMatch(/private-tool-input|private-stderr-input/);
+  });
 });
 
 describe('validateRunRecord — saved seat answers', () => {
