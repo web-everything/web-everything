@@ -90,7 +90,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
 }
 
 /** Unknown evidence retains every finding; card failures never clear an audit. */
-async function proveFindings(findings, base, head, deps) {
+async function proveFindings(findings, base, head, deps, observe = () => {}) {
   const extra = { modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [] };
   try {
     for (const name of ['reproOnBase', 'readBaseFile', 'readHeadFile', 'diffText', 'numstatText', 'baseRecheckMax', 'protectedPaths', 'fileCard', 'auditPolicy']) {
@@ -129,6 +129,7 @@ async function proveFindings(findings, base, head, deps) {
       written.set(key, receipt);
     }
     const classified = classifyPreExisting({ ...options, cardWritten: key => written.get(key) });
+    observe(classified);
     const blocking = findings.filter((_, i) => classified[i].blocking);
     for (const c of classified) if (c.blocking) deps.stderr(`Base proof blocked: ${c.reason}.\n`);
     extra.preExisting = classified.filter(c => !c.blocking).map(c => c.preExisting);
@@ -139,9 +140,25 @@ async function proveFindings(findings, base, head, deps) {
     });
     return { ...extra, findings: blocking, verdict: findings.length && !blocking.length ? 'NOT WEAKENED' : 'WEAKENED' };
   } catch {
+    observe(findings.map(() => ({ blocking: true, reason: 'incomplete proof; human review required' })));
     deps.stderr('Base proof incomplete or card write failed; findings block pending human review of the full diff.\n');
     return { ...extra, preExisting: [], findings, verdict: 'WEAKENED' };
   }
+}
+
+// Shadow evidence has no authority: suppress proof output and replace every persistence effect.
+async function shadowFindings(findings, base, head, deps) {
+  try {
+    if (deps.preExistingMode?.() !== 'block' || deps.preExistingShadow?.() !== true || typeof deps.shadowProof !== 'function') return;
+    let classified;
+    await proveFindings([...findings], base, head, { ...deps, stderr: () => {},
+      fileCard: ({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true,
+    }, rows => { classified = rows; });
+    await deps.shadowProof({ at: deps.now(), base, head, modelFindings: [...findings],
+      wouldExempt: classified.flatMap(c => c.blocking ? [] : [{ line: c.preExisting.line,
+        key: c.preExisting.key, class: c.preExisting.key.split('|').at(-1) }]),
+      wouldBlock: classified.flatMap((c, i) => c.blocking ? [{ line: findings[i], reason: c.reason }] : []), mode: 'block' });
+  } catch { /* Observational only, including settings/proof/log failures. */ }
 }
 
 /** Inject resolveSha, runCodex, appendRecord, now, stdout and stderr for hermetic execution. */
@@ -187,6 +204,7 @@ export async function main(argv, deps) {
       return 3;
     }
     deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[verdict, ...findings].join('\n')}\n`);
+    if (verdict === 'WEAKENED') await shadowFindings(findings, base, head, deps);
     return verdict === 'NOT WEAKENED' ? 0 : 1;
   } catch {
     (deps?.stderr ?? (text => process.stderr.write(text)))('UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n');

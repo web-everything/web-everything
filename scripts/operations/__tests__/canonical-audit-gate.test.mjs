@@ -15,7 +15,7 @@ const ref = 'lane/audit-gate';
 const green = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
 const weak = { ...green, verdict: 'WEAKENED', findings: ['missing guard'] };
 const waiver = { ref, sha, ruling: 'R123', findings: weak.findings };
-function fixture({ records = [green], auditText, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore } = {}) {
+function fixture({ records = [green], auditText, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore, exemptionIO = {} } = {}) {
   const reads = [], calls = [];
   const env = { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: '/fixture-prefs' };
   const enoent = () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; };
@@ -29,7 +29,7 @@ function fixture({ records = [green], auditText, tool = {}, writerSettings, targ
     if (path === auditAt) return auditText ?? records.map(r => JSON.stringify(r)).join('\n');
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   };
-  const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
+  const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint, ...exemptionIO,
     exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved) : resolved; } });
   return { result, reads, calls };
 }
@@ -216,6 +216,73 @@ describe('R1053 additive audit records', () => {
   const entry = { line: 'x.mjs:2 unsafe return', key: 'x.mjs|X|B2',
     base: { sha: base, path: 'x.mjs', line: 2, quote: 'return unsafe();' }, relation: 'SAME', cardHash: cardHash('x.mjs|X|B2') };
   const scoped = { ...green, modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [entry] };
+  const current = (audit = {}, cards = {}) => ({
+    settingsOptions: { platform: null, env: {}, fileRead: () => JSON.stringify({ audit: {
+      preExisting: { mode: 'prove' }, releaseStage: 'prerelease', cards: { requirePayBy: false }, ...audit } }) },
+    readCards: () => ({ cards: '- [R1053][needs-you] today ET: security pre-existing (B2) x.mjs|X|B2',
+      index: JSON.stringify({ key: entry.key, cardHash: entry.cardHash }), ...cards }),
+    readCard: () => 'mustPayBefore: 2099-01-01',
+  });
+  it.each(['block', 'allow'])('revokes proof passes when current mode is %s', mode => {
+    const result = fixture({ records: [scoped], exemptionIO: current({ preExisting: { mode } }) }).result;
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
+    expect(result.message).toContain('codex-audit --base=origin/main');
+  });
+  it.each(['E1', 'E2'])('revokes %s at prod', cls => {
+    const key = `x.mjs|X|${cls}`;
+    expect(fixture({ records: [{ ...scoped, preExisting: [{ ...entry, key, cardHash: cardHash(key) }] }],
+      exemptionIO: current({ releaseStage: 'prod' }) }).result.reason).toBe('canonical-audit-exemption-stale');
+  });
+  it.each(['expired', 'missing', 'malformed', 'unreadable'])('D2 rechecks persisted pay-by: %s', kind => {
+    const key = 'x.mjs|X|D2', debt = { ...entry, key, line: entry.line + ' backlog/debt.md', cardHash: cardHash(key) };
+    const io = current({ cards: { requirePayBy: true } }, { index: JSON.stringify({ key, cardHash: debt.cardHash }) });
+    io.readCard = path => { expect(path).toBe('backlog/debt.md');
+      if (kind === 'unreadable') throw Error('disk');
+      return { expired: 'mustPayBefore: 2020-01-01', missing: '', malformed: 'mustPayBefore: 2099-02-31' }[kind]; };
+    expect(fixture({ records: [{ ...scoped, preExisting: [debt] }], exemptionIO: io }).result.reason)
+      .toBe('canonical-audit-exemption-stale');
+  });
+  it.each(['settings', 'cards', 'index', 'needs-you'])('refuses unreadable or missing %s evidence', kind => {
+    const io = current();
+    if (kind === 'settings') io.settingsOptions.fileRead = () => { throw Error('disk'); };
+    if (kind === 'cards') io.readCards = () => { throw Error('disk'); };
+    if (kind === 'index') io.readCards = () => ({ cards: '', index: '{bad' });
+    if (kind === 'needs-you') io.readCards = () => ({ cards: '', index: JSON.stringify({ key: entry.key, cardHash: entry.cardHash }) });
+    expect(fixture({ records: [scoped], exemptionIO: io }).result.reason).toBe('canonical-audit-exemption-stale');
+  });
+  it('accepts a current indexed security exemption and leaves historical passes unaffected', () => {
+    expect(fixture({ records: [scoped], exemptionIO: current() }).result.ok).toBe(true);
+    expect(fixture({ records: [green], exemptionIO: { readCards: () => { throw Error('must not read'); } } }).result.ok).toBe(true);
+  });
+  it('reads settings beside the trusted gate, never from the target checkout', () => {
+    const io = current(), paths = [], read = io.settingsOptions.fileRead;
+    io.settingsOptions.fileRead = path => { paths.push(path); return read(path); };
+    expect(fixture({ records: [scoped], exemptionIO: io }).result.ok).toBe(true);
+    expect(paths).toHaveLength(1);
+    expect(paths[0]).toMatch(/scripts\/settings\/codex-audit\.json$/);
+    expect(paths[0]).not.toBe('/repo/scripts/settings/codex-audit.json');
+  });
+  it('accepts a held card line without an index row', () => {
+    const cards = `- [R1053] today ET: pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${base.slice(0, 10)}: ${entry.line}\n- [R1053][needs-you] today ET: security pre-existing (B2) ${entry.key}`;
+    expect(fixture({ records: [scoped], exemptionIO: current({}, { cards, index: '' }) }).result.ok).toBe(true);
+  });
+  it('requires the matching index hash and revalidates every exemption', () => {
+    const wrongHash = current({}, { index: JSON.stringify({ key: entry.key, cardHash: '0'.repeat(64) }) });
+    expect(fixture({ records: [scoped], exemptionIO: wrongHash }).result.reason).toBe('canonical-audit-exemption-stale');
+    const key = 'other.mjs|Y|B3';
+    const second = { ...entry, key, cardHash: cardHash(key) };
+    expect(fixture({ records: [{ ...scoped, preExisting: [entry, second] }], exemptionIO: current() }).result.reason)
+      .toBe('canonical-audit-exemption-stale');
+  });
+  it('D2 accepts current persisted pay-by and revokes it when the clock reaches the deadline', () => {
+    const key = 'x.mjs|X|D2', debt = { ...entry, key, line: entry.line + ' backlog/debt.md', cardHash: cardHash(key) };
+    const io = current({ cards: { requirePayBy: true } }, { index: JSON.stringify({ key, cardHash: debt.cardHash }) });
+    io.now = () => Date.parse('2098-12-31');
+    const records = [{ ...scoped, preExisting: [debt] }];
+    expect(fixture({ records, exemptionIO: io }).result.ok).toBe(true);
+    io.now = () => Date.parse('2099-01-01');
+    expect(fixture({ records, exemptionIO: io }).result.reason).toBe('canonical-audit-exemption-stale');
+  });
   it.each([
     { key: undefined }, { key: 2 }, { key: 'x.mjs|X|Z9' }, { key: 'x.mjs|X|B2|extra' }, { key: '|X|B2' },
     { base: undefined }, { base: { ...entry.base, sha: 'bad' } }, { base: { ...entry.base, sha: `${base}\n` } }, { base: { ...entry.base, path: '' } },
@@ -237,7 +304,7 @@ describe('R1053 additive audit records', () => {
     expect(fixture({ records: [green, { ...scoped, findingKeys }] }).result.message).toContain('malformed record');
   });
   it('a7 admits mixed old and new records', () => {
-    expect(fixture({ records: [green, scoped] }).result).toMatchObject({ ok: true, record: scoped });
+    expect(fixture({ records: [green, scoped], exemptionIO: current() }).result).toMatchObject({ ok: true, record: scoped });
   });
   it.each([null, {}, ['text'], [{ line: 2 }]])('refuses malformed preExisting %j', preExisting => {
     expect(fixture({ records: [green, { ...scoped, preExisting }] }).result.ok).toBe(false);

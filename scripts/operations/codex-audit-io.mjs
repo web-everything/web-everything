@@ -54,6 +54,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
   scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync,
   cardsPath = join(home, 'workspace/.operations/handoff/cards-to-file.md'),
   indexPath = join(home, 'workspace/.operations/coordination/pre-existing-findings.jsonl'),
+  shadowPath = join(home, 'workspace/.operations/coordination/pre-existing-shadow.jsonl'),
   settingsOptions = {},
   launcherPath = fileURLToPath(new NodeURL('../codex-direct-task.mjs', import.meta.url)) } = {}) {
   const run = (command, args, timeout, env) => {
@@ -66,7 +67,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (!settings) {
       settings = resolveAuditSettings({ fileRead: fs.readFileSync, ...settingsOptions,
         log: message => process.stderr.write(`${message}\n`) });
-      for (const name of ['preExistingMode', 'baseRecheckMax', 'releaseStage', 'requirePayBy', 'requireOnMain']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
+      for (const name of ['preExistingMode', 'preExistingShadow', 'baseRecheckMax', 'releaseStage', 'requirePayBy', 'requireOnMain']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
     }
     return settings;
   };
@@ -77,6 +78,11 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     },
     readCard: path => readCardFromMain(path, { run: spawnSync }),
     preExistingMode: () => auditSettings().value.preExistingMode,
+    preExistingShadow: () => auditSettings().value.preExistingShadow,
+    shadowProof(row) {
+      fs.mkdirSync(dirname(shadowPath), { recursive: true });
+      fs.appendFileSync(shadowPath, `${JSON.stringify(row)}\n`, { encoding: 'utf8', mode: 0o600 });
+    },
     baseRecheckMax: () => auditSettings().value.baseRecheckMax,
     protectedPaths: () => [...auditSettings().value.raceBlockPaths, ...auditSettings().value.guardFloorPaths],
     readBaseFile: (path, base) => run('git', ['show', `${base}:${path}`], 30_000),

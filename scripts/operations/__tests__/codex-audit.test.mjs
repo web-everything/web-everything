@@ -608,6 +608,58 @@ describe('R1053 prove mode', () => {
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
     return f;
   }
+  it.each(['success', 'proof error', 'append error', 'setting error'])('shadow keeps block output and record unchanged: %s', async kind => {
+    const normal = proof(); normal.deps.preExistingMode = () => 'block';
+    await main(ARGS, normal.deps);
+    const f = proof(); f.deps.preExistingMode = () => 'block';
+    f.deps.preExistingShadow = () => { if (kind === 'setting error') throw Error('settings'); return true; };
+    f.deps.shadowProof = vi.fn(row => { if (kind === 'append error') throw Error('disk'); });
+    if (kind === 'proof error') f.deps.reproOnBase = () => { throw Error('timeout'); };
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.output).toEqual(normal.output); expect(f.errors).toEqual(normal.errors); expect(f.records).toEqual(normal.records);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+    if (kind !== 'setting error') {
+      expect(f.deps.shadowProof).toHaveBeenCalledOnce();
+      const row = f.deps.shadowProof.mock.calls[0][0];
+      expect(row).toMatchObject({ at: AT, base: BASE, head: HEAD, modelFindings: [finding], mode: 'block' });
+      if (kind === 'proof error') expect(row.wouldBlock).toEqual([{ line: finding, reason: expect.stringContaining('human review') }]);
+      else expect(row.wouldExempt).toEqual([{ line: finding, key: 'x.mjs|X|B2', class: 'B2' }]);
+    }
+  });
+  it.each(['disabled', 'missing sink'])('shadow does no proof work when %s', async kind => {
+    const f = proof(); f.deps.preExistingMode = () => 'block';
+    f.deps.preExistingShadow = () => kind !== 'disabled';
+    if (kind === 'disabled') f.deps.shadowProof = vi.fn();
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.reproOnBase).not.toHaveBeenCalled();
+  });
+  it('persists the unchanged audit timestamp and output before shadow proof reads the clock', async () => {
+    const f = proof(); f.deps.preExistingMode = () => 'block'; f.deps.preExistingShadow = () => true;
+    let ticks = 0; f.deps.now = () => new Date(Date.parse(AT) + ticks++ * 1000).toISOString();
+    f.deps.shadowProof = vi.fn();
+    const repro = f.deps.reproOnBase;
+    f.deps.reproOnBase = (...args) => {
+      expect(f.records[0].at).toBe(AT); expect(f.output.join('')).toBe(`WEAKENED\n${finding}\n`);
+      return repro(...args);
+    };
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0].at).toBe(AT);
+  });
+  it('shadow records the real classifier reason for a changed line without filing', async () => {
+    const f = proof(); f.deps.preExistingMode = () => 'block'; f.deps.preExistingShadow = () => true;
+    f.deps.shadowProof = vi.fn();
+    f.deps.diffText = () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -2 +2 @@\n-old\n+unsafe\n';
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.shadowProof.mock.calls[0][0]).toMatchObject({ wouldExempt: [],
+      wouldBlock: [{ line: finding, reason: expect.stringContaining('head line changed') }] });
+    expect(f.deps.fileCard).not.toHaveBeenCalled(); expect(f.errors).toEqual([]);
+  });
+  it.each(['prove', 'clear'])('shadow never runs for %s audits', async kind => {
+    const f = proof(); f.deps.preExistingShadow = () => true; f.deps.shadowProof = vi.fn();
+    if (kind === 'clear') { f.deps.preExistingMode = () => 'block'; f.deps.runCodex = () => 'NOT WEAKENED'; }
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.shadowProof).not.toHaveBeenCalled();
+  });
   it.each(['E1', 'E2'])('production policy blocks %s before filing', async cls => {
     const f = proof(reply(cls));
     f.deps.auditPolicy = () => ({ releaseStage: 'prod', requirePayBy: false, requireOnMain: true });

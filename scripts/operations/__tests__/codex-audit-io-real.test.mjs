@@ -6,6 +6,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
+import { cardLine, classifyPreExisting, parseReproAnswer, parseDiffChangedLines } from '../audit-base-repro.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 describe('codex-audit real IO', () => {
@@ -61,6 +62,41 @@ describe('codex-audit real IO', () => {
 
 
 describe('R1053 base reproduction IO', () => {
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s persists both lines once and dropped needs-you blocks classification', async cls => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const deps = createAuditDeps({ cwd: root, cardsPath, indexPath });
+      const key = `x.mjs|X|${cls}`, text = 'x.mjs:2 unsafe return';
+      const card = { key, cardLine: cardLine({ date: 'today', cls, path: 'x.mjs', symbol: 'X', sha10: 'a'.repeat(10), text }), expedite: true, needsYou: true };
+      deps.fileCard(card);
+      const first = readFileSync(cardsPath, 'utf8'), index = readFileSync(indexPath, 'utf8');
+      expect(first.split('\n').filter(Boolean)).toHaveLength(2);
+      expect(first).toContain(`security pre-existing (${cls}) ${key}`);
+      deps.fileCard(card);
+      expect(readFileSync(cardsPath, 'utf8')).toBe(first);
+      expect(readFileSync(indexPath, 'utf8')).toBe(index);
+      writeFileSync(cardsPath, first.split('\n').filter(l => !l.includes('[needs-you]')).join('\n'));
+      const source = 'function X() {\n  return unsafeValue;\n}';
+      const result = classifyPreExisting({ findings: [{ text, sourceText: source }],
+        answers: parseReproAnswer(`#1 REPRODUCES SAME CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`, 1),
+        baseSha: 'a'.repeat(40), headSha: 'b'.repeat(40), readBaseFile: () => source,
+        changedLines: parseDiffChangedLines('diff --git a/y.mjs b/y.mjs\n--- a/y.mjs\n+++ b/y.mjs\n@@ -1 +1 @@\n-old\n+new\n', '1\t1\ty.mjs\n'), recheckMax: 6, protectedPaths: [],
+        auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
+        cardWritten: () => ({ written: true, expedite: true, needsYou: readFileSync(cardsPath, 'utf8').includes('[needs-you]') }) });
+      expect(result[0].blocking).toBe(true);
+      expect(result[0].reason).toContain('needs-you');
+    });
+  });
+  it('shadow adapter appends one JSON line to its injected path without touching cards or index', async () => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const shadowPath = join(tmp, 'shadow', 'proof.jsonl'), cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const deps = createAuditDeps({ cwd: root, shadowPath, cardsPath, indexPath });
+      const row = { at: 'now', base: 'a', head: 'b', mode: 'block', modelFindings: [], wouldExempt: [], wouldBlock: [] };
+      deps.shadowProof(row);
+      expect(readFileSync(shadowPath, 'utf8')).toBe(JSON.stringify(row) + '\n');
+      expect(existsSync(cardsPath)).toBe(false); expect(existsSync(indexPath)).toBe(false);
+    });
+  });
   it.each(['card', 'needs-you'])('repairs missing %s text despite a matching index and deduplicates the repair', async missing => {
     await withRealRepo(async ({ root, tmp }) => {
       const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
