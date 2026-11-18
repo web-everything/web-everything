@@ -673,7 +673,10 @@ export function runReviewTick({
   const recoverRedTeam = (recoveryStarts) => {
     if (paused || typeof redTeamOnSkip !== 'function') return;
     // Recovery starts need only one lane; ordinary rounds reserve a companion lane too.
-    const rawLanes = recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo });
+    // A failed recovery-only read must not abort the tick (it runs before ordinary dispatch): read it as 0 lanes.
+    let rawLanes = 0;
+    try { rawLanes = recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo }); }
+    catch (e) { log(`review-daemon: ${repo} recovery lane read failed (${String(e?.message ?? e).split('\n')[0]}); recovery gets 0 lanes this tick`); }
     const rawAcquirable = Math.max(0, (Array.isArray(rawLanes) ? rawLanes.length : Number(rawLanes)) || 0);
     const recoveryLanes = Math.max(0, rawAcquirable - occupiedLanes);
     let taken = 0;
