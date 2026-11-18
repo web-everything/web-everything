@@ -19,7 +19,7 @@ const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const PROVIDERS = ['codex', 'gemini', 'none'];
 const asArray = (value) => value == null ? [] : Array.isArray(value) ? value : [value];
 const compact = (values) => values.length === 1 ? values[0] : values.length ? values : null;
-const blocks = (entry) => Array.isArray(entry?.message?.content) ? entry.message.content.filter(Boolean) : [];
+export const blocks = (entry) => Array.isArray(entry?.message?.content) ? entry.message.content.filter(Boolean) : [];
 
 /** Bound classification labels, including the visible truncation marker; malformed labels are absent. */
 export function capText(value, maxChars) {
@@ -46,7 +46,7 @@ export function summarizeCommand(argv) {
 }
 
 /** Stream even very large transcripts. Malformed rows are observable, not fatal. */
-async function* entries(file, diagnostics) {
+export async function* entries(file, diagnostics) {
   const input = createReadStream(file, { encoding: 'utf8' });
   const lines = createInterface({ input, crlfDelay: Infinity });
   let lineNumber = 0;
