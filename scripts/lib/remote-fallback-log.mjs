@@ -12,9 +12,11 @@ const MAX_BYTES = 512 * 1024;
 const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
 
 export const ADVISORY_REASONS = new Set(['credential-warn']);
-/** R830/R823: a run that is local by design (flag, container, policy, threshold) logs `local-*`. It is a reason, not a
- *  failed remote attempt, so it never counts as a real fallback cause. */
-export const isLocalByDesignReason = reason => typeof reason === 'string' && reason.startsWith('local-');
+/** R830/R823: the exact reasons heavy-admission logs for a run that is local by design. Each is a reason, not a failed
+ *  remote attempt. Any other reason, including an unknown `local-*`, stays a real fallback cause. */
+export const LOCAL_BY_DESIGN_REASONS = new Set(['local-flag', 'local-container', 'local-admission-held', 'local-admission-off',
+  'local-admission-no-pool', 'local-remote-disabled', 'local-below-threshold', 'local-load-unreadable', 'local-by-policy', 'local-held-or-unrouted']);
+export const isLocalByDesignReason = reason => LOCAL_BY_DESIGN_REASONS.has(reason);
 
 /** Pure aggregation. Unknown reasons remain real; ties keep the first encountered cause. */
 export function summarize(rows) {

@@ -129,8 +129,9 @@ describe('verify-lane local-slot paths', () => {
 describe('R830/R823 local-by-design reasons', () => {
   it('are advisory and never displace the top real fallback cause', async () => {
     const { summarize } = await import('../remote-fallback-log.mjs');
-    const out = summarize([{ reason: 'local-flag' }, { reason: 'local-flag' }, { reason: 'remote-slot-unreadable' }]);
-    expect(out.topReal).toEqual({ reason: 'remote-slot-unreadable', count: 1 });
+    const out = summarize([{ reason: 'local-unrecognized-failure' }, { reason: 'local-flag' }, { reason: 'local-flag' }, { reason: 'remote-slot-unreadable' }]);
+    expect(out.topReal).toEqual({ reason: 'local-unrecognized-failure', count: 1 });
     expect(out.advisory).toBe(2);
+    expect(out.byReason).toMatchObject({ 'local-unrecognized-failure': 1 });
   });
 });
