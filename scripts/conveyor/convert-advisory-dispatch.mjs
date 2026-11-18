@@ -210,9 +210,8 @@ export function buildTargetedCheckInput({ acceptComment, escalation, evidence } 
  * so a caller never mistakes "could not fetch" for "the file has no changes".
  *
  * MULTI-REPO (PR #2781 review): the review daemon walks EVERY watched repo from its own WE checkout, so the local
- * `git` only holds WE's objects. When `repo` is given and is NOT this checkout's own `origin`, the diff is read
- * from THAT repo via `gh pr diff <prNumber> --repo <repo>` and filtered to the named paths — never a local `git`
- * that cannot have the commit. A foreign repo with no `prNumber` is `scored:false` (`repo-not-local`).
+ * `git` only holds WE's objects. A foreign `repo` requires a subject checkout for independent raw-oid
+ * verification; otherwise it is unscored, never a local `git` read that cannot have the commit. A foreign repo with no `prNumber` is `scored:false` (`repo-not-local`).
  * @param {{exec?:Function, remote?:string, base?:string, rev:string, paths:string[], repo?:string,
  *   prNumber?:number}} o
  * @returns {{text:string, scored:boolean, reason?:string}}
@@ -227,16 +226,9 @@ export function fetchTestGamingDiffEvidence({
     if (!Number.isInteger(Number(prNumber)) || Number(prNumber) <= 0) {
       return { text: '', scored: false, reason: 'repo-not-local' };
     }
-    try {
-      const full = String(exec('gh', ['pr', 'diff', String(prNumber), '--repo', repo], {
-        // A whole-PR diff easily passes Node's 1 MB default buffer; anything GitHub itself refuses (HTTP 406 on
-        // a huge diff) still fails closed below → `inconclusive`.
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), maxBuffer: 64 * 1024 * 1024,
-      }) || '');
-      return { text: filterDiffToPaths(full, paths), scored: true, rev };
-    } catch {
-      return { text: '', scored: false, reason: 'gh-diff-failed' };
-    }
+    // A remote patch alone cannot establish completeness against blob oids.
+    // Read in the subject checkout, or request human review of the full diff.
+    return { text: '', scored: false, reason: 'raw-evidence-unavailable' };
   }
   const basis = resolveNetDiffBasis({ exec, remote, base, rev, pinRev: true });
   if (!basis.ok) return { text: '', scored: false, reason: basis.reason };

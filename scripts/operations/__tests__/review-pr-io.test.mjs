@@ -3493,7 +3493,25 @@ describe('#5135 latest fix range', () => {
   const comment = head => ({ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` });
   const priorHead = 'a'.repeat(40);
   const head = 'b'.repeat(40);
-  const read = (exec, comments = [comment(priorHead)], current = head) => readLatestFixRange({ exec, comments, head: current });
+  const read = (exec, comments = [comment(priorHead)], current = head) => {
+    let patch = '';
+    const withRaw = (cmd, args, opts) => {
+      if (args.includes('--raw')) {
+        return patch.split(/(?:^|\n)diff --git /).slice(1).map(section => {
+          const header = section.split('\n')[0];
+          const plain = /^a\/(.*) b\/\1$/.exec(header);
+          const quoted = /^"a\/(.*)" "b\/\1"$/.exec(header);
+          const path = plain?.[1] ?? (quoted ? JSON.parse('"' + quoted[1] + '"') : 'invalid');
+          const oid = section.includes('old mode') ? '1' : '2';
+          return `:100644 100644 ${'1'.repeat(40)} ${oid.repeat(40)} M\0${path}\0`;
+        }).join('');
+      }
+      const out = exec(cmd, args, opts);
+      if (args.includes('diff')) patch = String(out);
+      return out;
+    };
+    return readLatestFixRange({ exec: withRaw, comments, head: current });
+  };
   it('does not diff without a trusted prior head', () => {
     const exec = () => { throw new Error('must not run'); };
     expect(read(exec, [])).toEqual({ priorHead: null });
@@ -3525,28 +3543,27 @@ describe('#5135 latest fix range', () => {
     expect(result.priorHead).toBe(priorHead);
     expect(calls[0]).toContain(priorHead);
   });
-  it('parses inserted and deleted lines, deleted and binary files, and mode changes', () => {
+  it('parses inserted and deleted lines, deleted files, and mode changes', () => {
     const diff = [
       'diff --git a/a.js b/a.js', '--- a/a.js', '+++ b/a.js',
       '@@ -0,0 +1,2 @@', '+one', '+two', '@@ -10,2 +12,0 @@', '-old', '-old',
       '@@ -20 +21 @@', '-old', '+new',
       'diff --git a/old.js b/old.js', '--- a/old.js', '+++ /dev/null', '@@ -1 +0,0 @@', '-old',
-      'diff --git a/pic.png b/pic.png', 'Binary files a/pic.png and b/pic.png differ',
       'diff --git a/run.sh b/run.sh', 'old mode 100644', 'new mode 100755',
     ].join('\n');
-    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'a.js': [1, 2, 12, 13, 21], 'old.js': null, 'pic.png': null, 'run.sh': [] } });
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'a.js': [1, 2, 12, 13, 21], 'old.js': null, 'run.sh': [] } });
   });
   it('keys a headers-only section by its real path when the path itself contains " b/"', () => {
     const diff = [
-      'diff --git a/assets/a b/icon.png b/assets/a b/icon.png', 'Binary files a/assets/a b/icon.png and b/assets/a b/icon.png differ',
+      'diff --git a/assets/a b/icon.png b/assets/a b/icon.png', 'old mode 100644', 'new mode 100755',
       'diff --git a/run b/x.sh b/run b/x.sh', 'old mode 100644', 'new mode 100755',
-      'diff --git "a/q b/\\"z\\".png" "b/q b/\\"z\\".png"', 'Binary files differ',
+      'diff --git "a/q b/\\"z\\".png" "b/q b/\\"z\\".png"', 'old mode 100644', 'new mode 100755',
     ].join('\n');
-    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'assets/a b/icon.png': null, 'run b/x.sh': [], 'q b/"z".png': null } });
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'assets/a b/icon.png': [], 'run b/x.sh': [], 'q b/"z".png': [] } });
   });
   it('refuses a headers-only section whose two sides do not name the same path', () => {
     const diff = ['diff --git a/one b/two', 'old mode 100644', 'new mode 100755'].join('\n');
-    expect(read(() => diff)).toEqual({ priorHead, head, error: 'diff-unparseable' });
+    expect(read(() => diff)).toEqual({ priorHead, head, error: 'git-diff-failed' });
   });
   it('splits file sections only at a real LF line start, so CR / U+2028 / U+2029 / NEL in an added line cannot forge one', () => {
     for (const breaker of ['\r', ' ', ' ', '\u0085', '\v', '\f']) {
@@ -3567,7 +3584,7 @@ describe('#5135 latest fix range', () => {
   });
   it('keeps failures explicit', () => {
     expect(read(() => { throw new Error('missing commit'); })).toEqual({ priorHead, head, error: 'git-diff-failed' });
-    expect(read(() => 'garbage')).toEqual({ priorHead, head, error: 'diff-unparseable' });
+    expect(read(() => 'garbage')).toEqual({ priorHead, head, error: 'git-diff-failed' });
   });
 });
 
@@ -3813,7 +3830,10 @@ describe('held item 177: readPr judges a stacked top against its stack base', ()
   const STACK_DIFF = 'diff --git a/own.mjs b/own.mjs\n--- a/own.mjs\n+++ b/own.mjs\n@@ -1 +1 @@\n-old\n+new\n';
   const view = () => ({ number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [], comments: [] });
   // The main-basis diff is whatever the git stub prints; empty here, so a stack read is distinguishable from it.
-  const exec = (_file, args) => (args[0] === 'rev-parse' ? HEAD : args[0] === 'merge-base' ? 'e'.repeat(40) : '');
+  const exec = (_file, args) => {
+    if (args.includes('--raw') && args.includes(TREE)) return `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0own.mjs\0`;
+    return args[0] === 'rev-parse' ? HEAD : args[0] === 'merge-base' ? 'e'.repeat(40) : '';
+  };
   const stack = (over = {}) => ({ pr: 4624, ref: 'lane/red-main-contain', head: 'c'.repeat(40), contained: 'd'.repeat(40), tree: TREE, topHead: HEAD, ...over });
   const read = (over = {}) => {
     const calls = { stack: [], text: [], files: [] };

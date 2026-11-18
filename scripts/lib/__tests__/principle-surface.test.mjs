@@ -414,9 +414,10 @@ describe('the assumptions the content triggers rest on — what is pinned (produ
     const { computeNetDiffText } = await import('../../merge-ai-prs.mjs');
     const calls = [];
     const exec = (cmd, args) => {
-      args = args[0]?.startsWith('--attr-source=') ? args.slice(5) : args;
+      args = args[0]?.startsWith('--attr-source=') ? args.slice(args.findIndex(a => a === 'diff' || a === 'log')) : args;
       calls.push(args);
-      if (args[0] === 'diff' && !args.includes('--numstat')) return 'diff --git a/x b/x\n';
+      if (args.includes('--raw')) return `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0x\0`;
+      if (args[0] === 'diff' && !args.includes('--numstat')) return 'diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n';
       if (args[0] === 'diff') return '1\t0\tx\n';
       if (args[0] === 'log') return '';
       return '';

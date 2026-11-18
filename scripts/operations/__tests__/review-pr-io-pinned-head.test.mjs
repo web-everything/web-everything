@@ -173,6 +173,43 @@ describe('review read pins real Git evidence before merge-base', () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  it('retains hunks with repo-local core.bigFileThreshold=1 (legacy helper loses them)', () => {
+    git('config', 'core.bigFileThreshold', '1');
+    const legacy = execFileSync('git', ['--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904',
+      '-c', 'core.attributesFile=/dev/null', '-c', 'diff.external=', 'diff', '--no-ext-diff',
+      '--no-textconv', '--no-renames', '--no-color', base, executable], { cwd: root, encoding: 'utf8' });
+    expect(legacy).toContain('Binary files');
+    expect(legacy).not.toContain('@@');
+    const { result } = read();
+    expect(result.net.scored).toBe(true);
+    expect(result.diff.text).toContain('+console.log("security relevant");');
+  });
+
+  it.each([
+    ['diff.algorithm', 'histogram'], ['diff.renames', 'copies'], ['diff.noprefix', 'true'],
+    ['diff.context', '0'], ['diff.interHunkContext', '99'], ['diff.mnemonicPrefix', 'true'],
+    ['diff.srcPrefix', 'old/'], ['diff.dstPrefix', 'new/'], ['diff.relative', 'true'],
+    ['core.quotePath', 'true'],
+  ])('pins repo-local %s rendering to the scorer defaults', (key, value) => {
+    const before = read().result;
+    expect(before.diff.scored).toBe(true);
+    git('config', key, value);
+    const after = read().result;
+    expect(after.diff.scored).toBe(true);
+    expect(after.diff.text).toBe(before.diff.text);
+    expect(after.net.paths).toEqual(before.net.paths);
+  });
+
+  it('refuses an empty successful renderer when raw oids changed', () => {
+    const exec = (cmd, args, opts) => {
+      if (args[0] === 'fetch') throw new Error('offline fixture');
+      if (args.includes('diff') && !args.some(a => ['--raw', '--numstat', '--name-only'].includes(a))) return '';
+      return execFileSync(cmd, args, { ...opts, cwd: root });
+    };
+    expect(computeNetDiffText({ exec, rev: 'lane/security' })).toMatchObject({ scored: false, text: '' });
+    expect(computeNetDiffPaths({ exec, rev: 'lane/security' })).toMatchObject({ scored: false, paths: [] });
+  });
+
   // origin/main allowed one half to remain scored when the other command threw.
   it.each(['text', 'paths', 'numstat'])('invalidates both halves when %s fails', failed => {
     const { result } = read(args => {

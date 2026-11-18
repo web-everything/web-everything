@@ -1,4 +1,4 @@
-import { hardenedGitDiff } from '../lib/hardened-git-diff.mjs';
+import { hardenedGitDiff, verifyRenderedDiff } from '../lib/hardened-git-diff.mjs';
 /**
  * @file scripts/conveyor/review-stack-base.mjs — stack-aware review (held item 177).
  *
@@ -336,7 +336,10 @@ export function stackBaseTree({ contained, topHead, root = ROOT, run = gitRun(ro
 
 /** The top's own changed paths against the stack base tree. Throws on a failed read (the scorer invalidates the paired evidence). */
 export function stackNetFiles({ tree, topHead, root = ROOT, run = gitRun(root) }) {
-  return hardenedGitDiff((_cmd, args, opts) => run(args, opts), ['diff', '--name-only', '--end-of-options', tree, topHead]).split('\n').filter(Boolean);
+  const exec = (_cmd, args, opts) => run(args, opts);
+  const paths = String(hardenedGitDiff(exec, ['diff', '--name-only', '-z', '--end-of-options', tree, topHead])).split('\0').filter(Boolean);
+  const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', tree, topHead]));
+  return verifyRenderedDiff(exec, tree, topHead, text, { paths });
 }
 
 /**

@@ -16,7 +16,25 @@ import { scoreEscalation, diffHunksFrom } from '../lib/review-escalation.mjs';
 
 // Intent fixtures normalize only the shared global prefix. Real-Git policy tests
 // assert the full command/environment separately; keep diff flags for argv assertions.
-const scoringArgs = args => args[0]?.startsWith('--attr-source=') ? args.slice(5) : args;
+const scoringArgs = args => args[0]?.startsWith('--attr-source=') ? args.slice(args.findIndex(a => a === 'diff' || a === 'log')) : args;
+
+
+const rawRecords = paths => paths.map(path => `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0${path}\0`).join('');
+const patch = paths => paths.map(path => `diff --git a/${path} b/${path}\n@@ -1 +1 @@\n-old\n+new\n`).join('');
+// These are tree intent fixtures, not renderer-failure tests. Supply explicit raw
+// evidence and a complete default patch for numstat-only fixtures. Explicit throws
+// and explicit empty patches remain untouched and must still fail closed.
+function evidenceScript(input) {
+  const script = { ...input };
+  for (const [key, value] of Object.entries(input)) {
+    if (!key.startsWith('git diff --numstat ') || !('stdout' in value)) continue;
+    const refs = key.slice('git diff --numstat '.length);
+    const paths = value.stdout.trim().split('\n').filter(Boolean).map(row => row.split('\t').slice(2).join('\t'));
+    script[`git diff --raw --no-abbrev -z --ignore-submodules=none ${refs} --`] = { stdout: rawRecords(paths) };
+    script[`git diff ${refs}`] ??= { stdout: patch(paths) };
+  }
+  return script;
+}
 
 describe('parseNumstat (#1821 — net two-dot diff for the review-escalation backstop)', () => {
   it('parses `<added>\\t<deleted>\\t<path>` lines into changedFiles + total diffLines', () => {
@@ -46,6 +64,7 @@ describe('parseNumstat (#1821 — net two-dot diff for the review-escalation bac
 
 describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer + drain)', () => {
   const fakeExec = (script = {}) => {
+    script = evidenceScript(script);
     const calls = [];
     const exec = (cmd, args, opts) => {
       args = scoringArgs(args);
@@ -54,7 +73,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--text', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -81,7 +100,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
     const { exec, calls } = fakeExec({
       'git diff --numstat origin/main origin/lane/x': { stdout: '1\t0\tREADME.md\n' },
       'git diff --numstat a1b2c3d4e5f6 origin/lane/x': { stdout: '1\t0\tREADME.md\n' },
-      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n' },
+      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n' },
     });
     computeNetDiffChangedFiles({ exec, rev: 'lane/x', baseRev: 'a1b2c3d4e5f6', fetchExtraRefs: ['lane/x'] });
     computeNetDiffText({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
@@ -485,6 +504,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
 
 describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basis as the score)', () => {
   const fakeExec = (script = {}) => {
+    script = evidenceScript(script);
     const calls = [];
     const exec = (cmd, args, opts) => {
       args = scoringArgs(args);
@@ -493,7 +513,7 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--text', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -512,7 +532,7 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
   it('shares the #2373/#2404 base resolution: force-fetches the base with an EXPLICIT refspec, then diffs two trees (never checks out the PR branch)', () => {
     const { exec, calls } = fakeExec({
       'git diff --numstat origin/main deadbeef': { stdout: '1\t0\tREADME.md\n' }, // the shared basis probe
-      'git diff origin/main deadbeef': { stdout: 'diff --git a/README.md b/README.md\n@@ text @@\n' },
+      'git diff origin/main deadbeef': { stdout: 'diff --git a/README.md b/README.md\n@@ -1 +1 @@\n' },
     });
     const r = computeNetDiffText({ exec, rev: 'deadbeef' });
     expect(r.scored).toBe(true);
@@ -529,7 +549,7 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
     const { exec, calls } = fakeExec({
       'git merge-base origin/main origin/lane/x': { stdout: 'forkpoint1234\n' },
       'git diff --numstat forkpoint1234 origin/lane/x': { stdout: '2\t0\tbacklog/2450-x.md\n' },
-      'git diff forkpoint1234 origin/lane/x': { stdout: 'diff --git a/backlog/2450-x.md b/backlog/2450-x.md\n' },
+      'git diff forkpoint1234 origin/lane/x': { stdout: 'diff --git a/backlog/2450-x.md b/backlog/2450-x.md\n@@ -1 +1 @@\n-old\n+new\n' },
     });
     const r = computeNetDiffText({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(r).toMatchObject({ base: 'forkpoint1234', rev: 'origin/lane/x', scored: true });
@@ -585,10 +605,11 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
 // true by construction.
 describe('resolveNetDiffBasis shared across both helpers (#2890-review-fix finding 3 — ONE fetch, one probe)', () => {
   const fakeExec = (script = {}) => {
+    script = evidenceScript(script);
     const calls = [];
     const exec = (cmd, args, opts) => {
       args = scoringArgs(args);
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--text', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -618,7 +639,7 @@ describe('resolveNetDiffBasis shared across both helpers (#2890-review-fix findi
     expect(calls.filter((c) => c.args[0] === 'fetch').length).toBe(1);
     expect(calls.filter((c) => c.args[0] === 'merge-base').length).toBe(1);
     expect(calls.filter((c) => c.key.startsWith('git diff --numstat')).length).toBe(1);
-    expect(calls.length).toBe(4); // fetch + merge-base + numstat probe + the text diff
+    expect(calls.length).toBe(5); // fetch + merge-base + numstat probe + text + raw backstop
   });
 
   it('the UNSHARED path costs strictly more — the measurement the review made, pinned', () => {
@@ -659,10 +680,11 @@ describe('resolveNetDiffBasis shared across both helpers (#2890-review-fix findi
 // exported and `basis` is a documented public option on two exported helpers.
 describe('#2890-review-r2 finding 1 — a basis resolved for a DIFFERENT request is REFUSED, never answered', () => {
   const fakeExec = (script = {}) => {
+    script = evidenceScript(script);
     const calls = [];
     const exec = (cmd, args, opts) => {
       args = scoringArgs(args);
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--text', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -760,10 +782,11 @@ describe('#2890-review-r2 finding 1 — a basis resolved for a DIFFERENT request
 // spelling. The assembly is now ONE exported function, so these are behaviour, not spelling.
 describe('computeNetDiffSignals — the ONE net-diff derivation both call sites use (#2890-review-r2 finding 3)', () => {
   const fakeExec = (script = {}) => {
+    script = evidenceScript(script);
     const calls = [];
     const exec = (cmd, args, opts) => {
       args = scoringArgs(args);
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--text', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -784,14 +807,14 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
     'git diff forkpoint origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-a\n+b\n' },
   };
 
-  it('costs ONE fetch, ONE merge-base, ONE numstat probe and ONE text diff — the shared basis, pinned by cost', () => {
+  it('costs ONE fetch, ONE merge-base, ONE numstat probe and ONE text diff plus ONE raw backstop — the shared basis, pinned by cost', () => {
     const { exec, calls } = fakeExec(script);
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.scored).toBe(true);
     expect(calls.filter((c) => c.args[0] === 'fetch').length).toBe(1);
     expect(calls.filter((c) => c.args[0] === 'merge-base').length).toBe(1);
     expect(calls.filter((c) => c.key.startsWith('git diff --numstat')).length).toBe(1);
-    expect(calls.length).toBe(4);
+    expect(calls.length).toBe(5);
   });
 
   it('returns the changed-file shape, the cumulative human basis, the text object AND the mapped hunks', () => {
@@ -804,20 +827,20 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
     expect(sig.diffHunks).toBe(sig.netDiffText.text);
   });
 
-  it('THE regression, as behaviour: a FAILED text diff yields diffHunks null while changedFiles still populates', () => {
+  it('a FAILED text diff leaves the whole signal unscored while retaining fallback escalation paths', () => {
     // This is round 1's blocker in the shape it actually reaches a detector — a real file list beside a content
     // signal that must say "I could not look", not "there was nothing to see".
     const { exec } = fakeExec({ ...script, 'git diff forkpoint origin/lane/x': { throw: 'diff exploded' } });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.changedFiles).toEqual(['README.md']);
-    expect(sig.scored).toBe(true);
+    expect(sig.scored).toBe(false);
     expect(sig.diffHunks).toBeNull();
     expect(sig.diffHunks).not.toBe('');
     expect(scoreEscalation({ ...sig }).diffHunks).toBeNull();
   });
 
   it('a genuinely EMPTY but computed diff still comes through as \'\' — the other half of the contract', () => {
-    const { exec } = fakeExec({ ...script, 'git diff forkpoint origin/lane/x': { stdout: '' } });
+    const { exec } = fakeExec({ ...script, 'git diff --numstat forkpoint origin/lane/x': { stdout: '' }, 'git diff forkpoint origin/lane/x': { stdout: '' } });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.diffHunks).toBe('');
     expect(sig.diffHunks).not.toBeNull();
@@ -836,6 +859,7 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
       'git rev-parse abc1234': { stdout: 'abc1234\n' },
       'git rev-parse origin/lane/x': { stdout: 'headsha\n' },
       'git diff --numstat forkpoint origin/lane/x': { stdout: '3\t1\tREADME.md\n1\t0\tdocs/agent/platform-decisions.md\n' },
+      'git diff forkpoint origin/lane/x': { stdout: patch(['README.md', 'docs/agent/platform-decisions.md']) },
       'git diff --numstat abc1234 origin/lane/x': { stdout: '3\t1\tREADME.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', baseRev: 'abc1234', fetchExtraRefs: ['lane/x'] });
@@ -901,7 +925,7 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
     expect(textDiff).toContain('--no-ext-diff');
     expect(textDiff.indexOf('--no-ext-diff')).toBeLessThan(textDiff.indexOf('--end-of-options'));
   });
-  it('but NOT --text: a whole-PR diff must not force binary assets into the reviewer-facing text', () => {
+  it('forces --text so repository binary thresholds cannot suppress hunks', () => {
     const calls = [];
     const exec = (cmd, args) => {
       args = scoringArgs(args);
@@ -910,16 +934,17 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
       return 'diff\n';
     };
     computeNetDiffText({ exec, rev: 'deadbeef' });
-    expect(calls.find((a) => a[0] === 'diff' && !a.includes('--numstat'))).not.toContain('--text');
+    expect(calls.find((a) => a[0] === 'diff' && !a.includes('--numstat'))).toContain('--text');
   });
 });
 
 describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain paths, SAME basis as the score/text)', () => {
   const fakeExec = (script = {}) => {
+    script = evidenceScript(script);
     const calls = [];
     const exec = (cmd, args, opts) => {
       args = scoringArgs(args);
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--text', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);

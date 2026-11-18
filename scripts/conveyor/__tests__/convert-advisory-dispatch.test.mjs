@@ -29,8 +29,8 @@ const d = { prNumber: 2766, headSha: HEAD, reviewedSha: HEAD, acceptComment, esc
 /** A fake `fetchEvidence` that stands in for a real `git diff` — every `dispatchConvertAdvisory` test below
  *  passes one explicitly so the suite is hermetic (#xconv1-evidence: the module's own default shells real
  *  `git`, exactly like `provider`'s own default shells real `gh`). */
-const FAKE_DIFF = '--- a/scripts/operations/__tests__/review-loop-cli.test.mjs\n'
-  + "+++ b/scripts/operations/__tests__/review-loop-cli.test.mjs\n-it('old case', () => {});\n+it('new case', () => {});\n";
+const FAKE_DIFF = 'diff --git a/scripts/operations/__tests__/review-loop-cli.test.mjs b/scripts/operations/__tests__/review-loop-cli.test.mjs\n--- a/scripts/operations/__tests__/review-loop-cli.test.mjs\n'
+  + "+++ b/scripts/operations/__tests__/review-loop-cli.test.mjs\n@@ -1 +1 @@\n-it('old case', () => {});\n+it('new case', () => {});\n";
 function fakeAvailableEvidence() {
   return vi.fn(async () => ({ text: FAKE_DIFF, scored: true }));
 }
@@ -124,6 +124,7 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args[0] === 'fetch') return '';
       if (args.includes('rev-parse')) return `${HEAD}\n`;
       if (args.includes('merge-base')) return 'd'.repeat(40);
+      if (args.includes('--raw')) return `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0scripts/operations/__tests__/review-loop-cli.test.mjs\0`;
       if (args.includes('diff')) return FAKE_DIFF;
       return '';
     };
@@ -136,7 +137,7 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args[0] === 'fetch') return '';
       throw new Error('fatal: bad revision');
     };
-    expect(fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['x.test.mjs'] }).scored).toBe(false);
+    expect(fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] }).scored).toBe(false);
   });
 
   it('resolveTargetedCheckEvidence: not required for an unknown escalation kind', async () => {
@@ -147,7 +148,7 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
     expect(result).toEqual({ required: false, available: false, text: '' });
     expect(fetchEvidence).not.toHaveBeenCalled();
   });
-  it('fetchTestGamingDiffEvidence: a repo that is NOT this checkout\'s origin is read via `gh pr diff` for THAT repo, filtered to the named paths — never the daemon\'s own git (PR #2781 review)', () => {
+  it('fetchTestGamingDiffEvidence: a foreign repo stays unscored without independent raw oid evidence', () => {
     const calls = [];
     const ghDiff = 'diff --git a/src/other.mjs b/src/other.mjs\n--- a/src/other.mjs\n+++ b/src/other.mjs\n-x\n+y\n'
       + FAKE_DIFF.replace(/^/, 'diff --git a/scripts/operations/__tests__/review-loop-cli.test.mjs b/scripts/operations/__tests__/review-loop-cli.test.mjs\n');
@@ -161,10 +162,8 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       exec, repo: 'frontier-ui/frontierui', prNumber: 77, rev: HEAD,
       paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'],
     });
-    expect(result.scored).toBe(true);
-    expect(result.text).toContain("-it('old case'");
-    expect(result.text).not.toContain('src/other.mjs');
-    expect(calls).toContain('gh pr diff 77 --repo frontier-ui/frontierui');
+    expect(result).toMatchObject({ scored: false, text: '', reason: 'raw-evidence-unavailable' });
+    expect(calls.some(c => c.startsWith('gh '))).toBe(false);
     expect(calls.some((c) => c.startsWith('git fetch') || c.startsWith('git diff'))).toBe(false);
   });
   it('fetchTestGamingDiffEvidence: a foreign repo with no PR number is scored:false (never a local-git guess)', () => {
@@ -181,10 +180,11 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args[0] === 'fetch') return '';
       if (args.includes('rev-parse')) return `${HEAD}\n`;
       if (args.includes('merge-base')) return 'd'.repeat(40);
+      if (args.includes('--raw')) return `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0scripts/operations/__tests__/review-loop-cli.test.mjs\0`;
       if (args.includes('diff')) return FAKE_DIFF;
       throw new Error(`unexpected ${cmd}`);
     };
-    expect(fetchTestGamingDiffEvidence({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['x.test.mjs'] }))
+    expect(fetchTestGamingDiffEvidence({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] }))
       .toMatchObject({ scored: true, text: FAKE_DIFF });
   });
   it('resolveTargetedCheckEvidence: heal-mutual-exclusivity REQUIRES the PR comment history and hands it to the judge (PR #2781 review)', async () => {

@@ -4468,3 +4468,12 @@ origin/main already used `--no-ext-diff` on text, but lacked environment removal
 and the shared hardening on numstat/path reads. Do not describe those existing
 text guards as a newly reproduced vulnerability. Bounded-output, stack, latest-fix
 and delta failures have named negative tests requiring a wholly unscored result.
+
+Scorer rendering ignores inherited Git config and pins repository-local diff defaults,
+including `core.bigFileThreshold`, while forcing text. An independent NUL-delimited
+raw oid diff must match the listed paths and rendered sections; each changed blob
+needs a hunk. Mode-only sections are allowed; symlinks need hunks and changed
+submodules require human review. Empty renderers, binary summaries, unreadable raw
+evidence and output bounds leave the whole result unscored: repair and rerun or
+request human review of the full diff. Pin these cases with real Git and an empty
+renderer stub in `review-pr-io-pinned-head.test.mjs` and `hardened-git-diff.test.mjs`.

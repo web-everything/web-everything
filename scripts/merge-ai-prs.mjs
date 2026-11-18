@@ -143,7 +143,7 @@ import {
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
-import { hardenedGitDiff } from './lib/hardened-git-diff.mjs';
+import { hardenedGitDiff, verifyRenderedDiff } from './lib/hardened-git-diff.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
@@ -4264,9 +4264,6 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // git's own diff output wholesale: verified, a one-line external driver made this return
     // `{text:'HIJACKED — no hunks here\n', scored:true}`. That text now feeds `diffHunks`, the anti-test-gaming
     // scan and the reviewer panel, none of which may read a user-configurable RENDERING of the diff.
-    // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
-    // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
-    // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
     const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
@@ -4339,7 +4336,7 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
     // whether it is the PR's own file set at all. `false` ONLY for the un-narrowed base-tip fallback.
     basisKind: basis.ok ? basis.basisKind : null,
     basisNarrowed: basis.ok ? basis.basisNarrowed !== false : false,
-    scored: net.scored,
+    scored: net.scored && netDiffText.scored,
     netDiffText,
     diffHunks: diffHunksFrom(netDiffText),
   };
@@ -4384,6 +4381,8 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
   try {
     const raw = hardenedGitDiff(exec, ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const paths = String(raw || '').split('\0').filter(Boolean);
+    const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate]));
+    verifyRenderedDiff(exec, diffBase, candidate, text, { paths });
     return { paths, base: diffBase, rev: candidate, scored: true };
   } catch (err) {
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };

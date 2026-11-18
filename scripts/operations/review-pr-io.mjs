@@ -1,4 +1,4 @@
-import { hardenedGitDiff } from '../lib/hardened-git-diff.mjs';
+import { hardenedGitDiff, verifyRenderedDiff } from '../lib/hardened-git-diff.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
@@ -441,6 +441,7 @@ export function readPr({
         const paths = stackDiffRead.files({ tree: stack.tree, topHead: revSha, root: cwd });
         const fingerprint = fingerprintOf(text);
         if (Array.isArray(paths) && fingerprint) {
+          verifyRenderedDiff(gitExec, stack.tree, revSha, text, { paths });
           netText = { text, base: stack.tree, rev: netText.rev ?? netPaths.rev, scored: true };
           netPaths = { ...netPaths, paths, base: stack.tree, scored: true };
           stackBase = { pr: stack.pr, ref: stack.ref, head: stack.head, contained: stack.contained, tree: stack.tree, fingerprint };
