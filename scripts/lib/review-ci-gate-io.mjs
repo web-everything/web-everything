@@ -133,7 +133,9 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
             || annotation.headSha.toLowerCase() !== headSha.toLowerCase()
             || !Array.isArray(annotation.holdIds) || !annotation.holdIds.length) return false;
           if (annotation === row.mergeGateReviewHold)
-            return annotation.holdIds.every(id => HUMAN_REVIEW_HOLD_GATES.includes(id));
+            // Same bar as humanReviewOnlyHold: only actual review holds excuse, never an incidental one alone.
+            return annotation.holdIds.every(id => HUMAN_REVIEW_HOLD_GATES.includes(id))
+              && annotation.holdIds.some(id => id === 'review-hold-labels' || id === 'review-acceptance');
           return ['candidacy', 'stale-freeze', 'candidacy+stale-freeze'].includes(annotation.kind)
             && Array.isArray(annotation.holds) && annotation.holds.length === annotation.holdIds.length
             && annotation.holds.every((hold, i) => hold?.status === 'hold' && hold.id === annotation.holdIds[i]

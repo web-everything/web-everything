@@ -351,6 +351,12 @@ describe('fresh review CI merge-gate holds', () => {
       readChecks: () => [annotated, { context: 'legacy', state: 'success' }] }))
       .toMatchObject({ allowed: true, requiredChecks: ['legacy'], checks: [annotated, { context: 'legacy', state: 'success' }] });
   });
+  it('refuses a bound annotation whose only hold is an incidental one (test-gaming without a review hold)', () => {
+    const annotated = { ...rest, mergeGateReviewHold: { holdIds: ['test-gaming'], headSha: sha, jobId: 123 } };
+    expect(gate({ readMergeGateVerdict: () => ({ error: 'unavailable' }),
+      readChecks: () => [annotated, { context: 'legacy', state: 'success' }] }))
+      .toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }] });
+  });
   it.each([{ headSha: 'b'.repeat(40) }, { jobId: 456 }])('refuses an annotation bound to another head or job: %j', mismatch => {
     const annotated = { ...rest, mergeGateHoldExcused: {
       kind: 'candidacy', holds: [{ id: 'review-acceptance', status: 'hold' }],
