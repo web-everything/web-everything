@@ -1044,9 +1044,10 @@ describe('merge-queue same-head failure admission', () => {
         f.mainError = true;
         const result = f.guard();
         expect(result.hold).toBe(count > 10);
-        if (count > 10) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
-        else expect(result.line).toContain('cancelled/regroup retry 1/2');
-        expect(f.mainReads).toBeUndefined();
+        // A purely cancelled set above the cap falls back to the existing main-green path (which reads main).
+        if (count > 10 && aggregate) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
+        else if (count <= 10) expect(result.line).toContain('cancelled/regroup retry 1/2');
+        if (!(count > 10 && !aggregate)) expect(f.mainReads).toBeUndefined();
         expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
       });
     });
