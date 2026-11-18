@@ -4536,6 +4536,14 @@ when it stays blocked. Replay two new planner skips per tick alongside four bloc
 heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
 new arrivals must never overtake heads already waiting in the rotation.
 
+The queue regression and `red-team-queue-stale-eviction` soak break replay live-state
+maintenance across restarts. Terminal PRs are evicted even when stale planner candidates
+still list them. Changed live heads are re-keyed in place with attempts and blocks reset;
+unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
+runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
+Planner skips retain the existing bounded, fair probe rotation.
+Run the soak `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
+
 ## Timeout evidence synchronous worker pool
 
 `timeout-evidence-pool.mjs` runs the unchanged collector once per red PR per pass,
