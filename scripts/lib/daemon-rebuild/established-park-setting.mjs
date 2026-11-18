@@ -10,7 +10,10 @@ const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '../daemon-rebuil
 /** Zero disables escalation from an established-overlay hold to a parked registration. */
 export function resolveEstablishedOverlayParkMinutes(env = process.env, { settingsPath = SETTINGS } = {}) {
   let tool;
-  try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlay; } catch { /* standard */ }
+  try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlay; } catch (e) {
+    // A missing file is the standard default; an unreadable or malformed one may have held a disabling 0, so fail closed.
+    if (e?.code !== 'ENOENT') return { value: 0, source: 'settings-unreadable (fail-closed: parking disabled)' };
+  }
   const raw = env.WE_DAEMON_ESTABLISHED_OVERLAY_PARK_MINUTES;
   const r = cascadePolicy('overlay', tool, { env,
     platform: platformPreference('overlay', { env }) ?? {},
