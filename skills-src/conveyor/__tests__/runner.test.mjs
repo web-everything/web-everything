@@ -704,7 +704,9 @@ describe('one open-PR snapshot per mechanical tick', () => {
     try {
       const run = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync) });
       for (let i = 0; i < ticks; i++) await run({ out: {} });
-      for (const snapshot of snapshots) expect(snapshot).toEqual(fixture);
+      // A listing without head-bound connection metadata carries explicit unknown CI evidence.
+      const expected = fixture.map(pr => ({ ...pr, rowsHead: null, rowsComplete: false }));
+      for (const snapshot of snapshots) expect(snapshot).toEqual(expected);
       return { calls, files, warnings: stderr.mock.calls.map(([line]) => line) };
     } finally {
       stderr.mockRestore();
