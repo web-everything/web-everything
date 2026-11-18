@@ -1731,10 +1731,18 @@ describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the clas
     const lines = stderr.split('\n');
     const usageAt = lines.findIndex(l => /^(?:\d{4}-\d\d-\d\dT\S+Z )?usage: build-dispatch-daemon\.mjs/.test(l));
     expect(usageAt).toBeGreaterThanOrEqual(0);
-    // Known host noise only: policy-cascade log lines, the operator-override reader's own store diagnostics (the
-    // host-wide store path cannot be redirected from a test) and Node deprecation warnings; any other line fails.
-    expect(lines.slice(0, usageAt).every(l => l.startsWith('policy-cascade ·') || l.startsWith('operator-override: ')
-      || /^\(node:\d+\) \[DEP\d+\] DeprecationWarning: /.test(l) || l.startsWith('(Use `node --trace-deprecation'))).toBe(true);
+    // Only policy provenance and the observed Node warning may precede usage. Every operator-override
+    // diagnostic means degraded policy/store reads and must fail, even when the daemon reaches usage.
+    const expectedStartupLine = l => l.startsWith('policy-cascade ·')
+      || /^\(node:\d+\) \[DEP0040\] DeprecationWarning: The `punycode` module is deprecated\. Please use a userland alternative instead\.$/.test(l)
+      || l === '(Use `node --trace-deprecation ...` to show where the warning was created)';
+    expect(lines.slice(0, usageAt).every(expectedStartupLine)).toBe(true);
+    expect([
+      'operator-override: operator-db-invalid host.maxReviewDispatchPerTick (invalid type or outside hard range); repair the store before using this policy',
+      'operator-override: operator-db-unreadable store (permission denied); using code value',
+      'operator-override: operator-db-unreadable store path (unavailable); using code value',
+      'operator-override: operator-db-unreadable host.maxReviewDispatchPerTick; using finite stricter value 2',
+    ].some(expectedStartupLine)).toBe(false);
     expect(status).toBe(2);
   });
 });

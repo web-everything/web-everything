@@ -3,13 +3,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
-import b from './gh-log-escape-sequences-block-ci-heal.mjs';
+import b, { runUnattributedBuilderRecovery } from './gh-log-escape-sequences-block-ci-heal.mjs';
 import { defineBreakTest } from '../define-break-test.mjs';
 import { breakById } from './index.mjs';
 import { restoreAtParent } from '../red-green.mjs';
 
 const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 defineBreakTest(b);
+
+it('reports unattributed builder evidence without dispatch, reservation or retry-state writes (R1035)', async () => {
+  const report = await runUnattributedBuilderRecovery();
+  expect(report.violations).toEqual([]);
+}, 60_000);
 
 it('discovers the break and requires the fix on this tree', () => {
   expect(breakById(b.id)).toBe(b);
@@ -49,6 +54,8 @@ it('reports violations against the pre-fix readers restored by the soak harness'
       }
     }
     symlinkSync(join(ROOT, 'node_modules'), join(root, 'node_modules'));
+    // This replay reverses the CI-heal transport only; builder recovery uses the current repaired tree.
+    symlinkSync(join(ROOT, 'skills-src'), join(root, 'skills-src'));
     restoreAtParent(root, [firstFix], paths, ROOT);
     expect(b.fixPresent(root)).toBe(false);
     vi.stubEnv('SOAK_TREE_ROOT', root);

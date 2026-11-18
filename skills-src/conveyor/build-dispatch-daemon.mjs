@@ -2555,7 +2555,7 @@ function lastDraftAuthorActivity(candidate) {
 }
 
 /** Attribute a diagnostic without filtering the whole log used by the CI-heal context pack.
- * Missing/ambiguous step ownership leaves the check's published diagnostic as the fallback. */
+ * Missing/ambiguous step ownership returns no evidence; published summaries cannot establish attribution. */
 function firstFailedStepError(job, log) {
   if (!Array.isArray(job?.steps) || !job.steps.some(step => step?.conclusion === 'failure')) return '';
   const intervals = job.steps.filter(step => step?.conclusion !== 'skipped').map(step => ({
@@ -2643,6 +2643,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     ...(io.isPidAlive ? { isPidAlive: io.isPidAlive } : {}),
   }).runs[0].live;
   const candidates = [];
+  const unattributed = [];
   const repo = CONSTELLATION_REPOS.we.slug;
   const api = io.api ?? (path => ghRestGetJson(`repos/${repo}/${path}`).json);
   const paged = io.paged ?? ghRestGetPaged;
@@ -2689,12 +2690,12 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     const failed = effectiveChecks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
     if (!failed) continue;
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
-    let firstError = annotations.find(a => a.annotation_level === 'failure')?.message
-      || failed.output?.summary || failed.output?.text || 'No error detail published by the check.';
+    let firstError = annotations.find(a => a?.annotation_level === 'failure'
+      && typeof a.message === 'string' && a.message.trim())?.message.trim() ?? '';
     // A whole job log contains passing-step errors too. Diagnose only attributable failed-step
     // evidence; the existing CI-heal context pack stages the whole log separately for the fixer.
     const job = /\/job\/(\d+)/.exec(failed.details_url ?? '')?.[1];
-    if (job && !annotations.some(a => a.annotation_level === 'failure')) {
+    if (job && !firstError) {
       const result = readCiJobLog({ repo, jobId: job,
         // Forward the helper's exec options: without its maxBuffer a log over Node's 1 MiB default is ENOBUFS.
         exec: (_command, args, opts) => gh(args, opts) });
@@ -2702,7 +2703,11 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       // published "No error detail" and keep dispatching repair on evidence that could not be read.
       if (!result.ok) throw new Error(`job ${job} log unreadable (${result.reason}): ${result.detail ?? ''}`);
       // Step metadata that cannot be read aborts for the same reason: no attributable failed step, no repair.
-      firstError = firstFailedStepError(api(`actions/jobs/${job}`), result.text) || firstError;
+      firstError = firstFailedStepError(api(`actions/jobs/${job}`), result.text);
+    }
+    if (!firstError) {
+      unattributed.push({ pr: pr.number, num, action: 'unattributed', reason: 'no-attributable-failure-evidence' });
+      continue;
     }
     candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
       scope: (pr.files ?? []).map(f => `we:${f.path}`), isDraft: true, builderAuthored: true,
@@ -2712,7 +2717,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
   const path = pr => join(dir, `${pr}.json`);
   const route = c => ({ num: c.num, route: `red-draft-${c.pr}` });
   let lanes;
-  return recoverBuilderDrafts({ candidates, allowResume, dryRun, staleMinutes, effects: {
+  const recovered = await recoverBuilderDrafts({ candidates, allowResume, dryRun, staleMinutes, effects: {
     readState: pr => existsSync(path(pr)) ? JSON.parse(readFileSync(path(pr), 'utf8')) : null,
     writeState: (pr, state) => {
       mkdirSync(dir, { recursive: true });
@@ -2736,6 +2741,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       gh(['pr', 'edit', String(c.pr), '--repo', repo, '--add-label', 'blocked:needs-human']);
     },
   } });
+  return [...unattributed, ...recovered];
 }
 
 /** Real IO adapters; exported for isolated tests against a temporary coordination root. */

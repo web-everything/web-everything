@@ -1,7 +1,52 @@
 /** Live #6911: gh 2.104 refuses escape-coded job logs; unreadable evidence must retain a bounded repair owner. */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+/** R1035 send-back on #7028: unknown step ownership must not spend a builder repair attempt. */
+export async function runUnattributedBuilderRecovery() {
+  const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
+  const { cliRecoverBuilderDrafts } = await import(pathToFileURL(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs')).href);
+  const stateRoot = mkdtempSync(join(tmpdir(), 'builder-unattributed-soak-'));
+  const repo = 'web-everything/web-everything', ref = 'lane/4502-delivery';
+  const effects = [], violations = [];
+  const io = {
+    stateRoot,
+    store: { list: () => ['dispatch-lane-soak'], read: () => ({ effects: [{
+      type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', status: 'applied',
+      payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 },
+    }] }) },
+    isPidAlive: () => false, listAgents: () => [], mergeGateSetting: 'off',
+    api: path => {
+      if (path.startsWith('pulls/')) return { draft: true, state: 'open', head: { ref, sha: 'abc', repo: { full_name: repo } } };
+      if (path === 'commits/abc') return { commit: { committer: { date: '2026-09-30T01:00:00Z' } } };
+      if (path === 'actions/jobs/456') return {}; // API read succeeds, attribution metadata is absent.
+      if (path.startsWith('commits/abc/check-runs?')) return { check_runs: [{ id: 2, name: 'test', conclusion: 'failure',
+        output: { summary: 'No error detail published by the check.' },
+        details_url: `https://github.com/${repo}/actions/runs/123/job/456` }] };
+      throw new Error(`unexpected endpoint: ${path}`);
+    },
+    paged: () => [],
+    gh: args => {
+      if (args[0] === 'api') return '2026-09-30T01:00:01Z FAIL passing-step-fixture.test.mjs';
+      effects.push(args[0]);
+    },
+    freeLanes: () => { effects.push('freeLanes'); return [8]; },
+    reserve: () => { effects.push('reserve'); return { ok: true }; },
+    release: () => effects.push('release'),
+    dispatch: async () => { effects.push('dispatch'); return { agentId: 'pid:321' }; },
+  };
+  try {
+    const result = await cliRecoverBuilderDrafts({ allowResume: true,
+      rawOpenPrs: [{ repo: 'we', prs: [{ number: 3033, isDraft: true, headRefName: ref }] }] }, io);
+    if (result.length !== 1 || result[0].action !== 'unattributed'
+      || result[0].reason !== 'no-attributable-failure-evidence') violations.push(`expected unattributed: ${JSON.stringify(result)}`);
+    if (effects.length) violations.push(`unattributed evidence caused effects: ${effects.join(', ')}`);
+    if (readdirSync(stateRoot).length) violations.push('unattributed evidence wrote repair state');
+    return { violations, result, effects };
+  } finally { rmSync(stateRoot, { recursive: true, force: true }); }
+}
 
 export default {
   id: 'gh-log-escape-sequences-block-ci-heal',
@@ -74,7 +119,9 @@ export default {
     if (reads.filter(({ args }) => args.at(-1).endsWith('/logs')).length !== 1 || pauses.length) {
       violations.push('escape-sequence refusal did not make exactly one log read without timeout retries');
     }
-    return { violations, evidence, plan, reads, pauses };
+    const builderRecovery = await runUnattributedBuilderRecovery();
+    violations.push(...builderRecovery.violations);
+    return { violations, evidence, plan, reads, pauses, builderRecovery };
   },
   judge(report) { return report.violations; },
 };
