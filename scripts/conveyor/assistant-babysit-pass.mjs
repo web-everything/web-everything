@@ -1,10 +1,11 @@
-/** Local observer: report-only, no actions, no GitHub writes. Uses only builtins and its new pure rules sibling. */
+/** Local observer: shadow-only, no action execution or GitHub writes. */
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { classifyPr, nextActor } from './assistant-babysit-rules.mjs';
+import { actionKey, decideActions } from './assistant-babysit-actions.mjs';
+import { classifyPr, nextActor, human } from './assistant-babysit-rules.mjs';
 
 const DEFAULT_REPOS = ['web-everything/web-everything', 'plateauapp/plateau-app'];
 export const DEFAULT_CLAIM_TTL_MIN = 10; // matches the dispatch claim store default lease
@@ -71,7 +72,7 @@ const cell = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').rep
 export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau/assistant'), nowMs = Date.now(),
   exec = execFileSync, io = fs, env = process.env,
   coordDir = env.WE_COORDINATION_ROOT || join(homedir(), 'workspace/.operations/coordination'),
-  whyCli, maxDetail = 25 } = {}) {
+  whyCli, maxDetail = 25, stderr = (line) => process.stderr.write(line) } = {}) {
   if (!Number.isInteger(maxDetail) || maxDetail < 0) throw new Error('max-detail must be a nonnegative integer');
   io.mkdirSync(outDir, { recursive: true });
   const state = readJson(io, join(outDir, 'state.json'), { events: {}, heads: {}, lastReported: {} });
@@ -84,11 +85,19 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   state.heads ??= {};
   state.lastReported ??= {};
   state.lastDetailAt ??= {};
+  state.actions ??= {};
+  state.escalations ??= {};
+  let mode;
+  try { mode = readJson(io, join(outDir, 'settings.json'), { mode: 'shadow' })?.mode; }
+  catch { mode = 'off'; }
+  if (mode === 'act') { stderr('act mode not built; shadow only\n'); mode = 'shadow'; }
+  if (!['shadow', 'off'].includes(mode)) mode = 'off';
+  const decisions = [];
   const { claims, badClaims } = loadClaims(io, coordDir);
   const whyPath = whyCli === undefined ? findWhy(io) : whyCli;
   const gh = (args) => exec('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { ...env, GH_CALLER: 'wev-assistant' } });
   const at = new Date(nowMs).toISOString();
-  const summary = { type: 'tick', at, repos, open: 0, owing: 0, reports: 0, badClaims: badClaims.length, skipped: 0, truncated: false, repoSummaries: [] };
+  const summary = { type: 'tick', at, repos, open: 0, owing: 0, reports: 0, wouldAct: 0, escalated: 0, badClaims: badClaims.length, skipped: 0, truncated: false, repoSummaries: [] };
   // Named local evidence problems do not depend on the PR list or detail budget.
   const badByPr = new Map();
   for (const claim of badClaims) {
@@ -102,7 +111,7 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   const candidates = [];
   let detailed = 0;
   for (const repo of repos) {
-    const prs = JSON.parse(gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,labels,isDraft,mergeable,headRefOid,updatedAt,statusCheckRollup']));
+    const prs = JSON.parse(gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,updatedAt,statusCheckRollup']));
     if (!Array.isArray(prs)) throw new Error('Incomplete PR list evidence');
     const truncated = prs.length >= PR_LIST_LIMIT;
     summary.repoSummaries.push({ repo, open: prs.length, truncated });
@@ -114,12 +123,15 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
         || !/^[a-f0-9]+$/i.test(pr.headRefOid ?? '')) throw new Error('Incomplete PR evidence');
       const labels = pr.labels.map((label) => typeof label === 'string' ? label : label.name);
       if (labels.some((label) => typeof label !== 'string')) throw new Error('Incomplete label evidence');
-      const snapshot = { repo, number: pr.number, labels, isDraft: pr.isDraft, mergeable: pr.mergeable,
-        headSha: pr.headRefOid, nowMs, ciFailing: pr.statusCheckRollup.some((check) => ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR'].includes(String(check.conclusion || check.state).toUpperCase())),
+      const failedChecks = pr.statusCheckRollup.filter((check) => ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR', 'STARTUP_FAILURE'].includes(String(check.conclusion || check.state).toUpperCase()))
+        .map((check) => ({ name: check.name ?? check.context, conclusion: String(check.conclusion || check.state).toUpperCase(),
+          runId: /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(check.detailsUrl ?? '')?.[1] ?? null }));
+      const snapshot = { repo, number: pr.number, labels, isDraft: pr.isDraft, mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus, failedChecks,
+        headSha: pr.headRefOid, nowMs, ciFailing: failedChecks.length > 0,
         claims: claims.filter((claim) => claim.pr === pr.number && matchesRepo(claim, repo)) };
       const { owed } = classifyPr(snapshot);
       if (owed.length) summary.owing++;
-      const needsDetail = owed.length || labels.includes('ready-to-merge') || snapshot.claims.length
+      const needsDetail = owed.length || snapshot.ciFailing || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l)) || snapshot.mergeStateStatus === 'BEHIND' || labels.includes('ready-to-merge') || snapshot.claims.length
         || labels.some((label) => ['status:fixing', 'review-status:fixing'].includes(label));
       if (needsDetail) {
         const detailKey = JSON.stringify([repo, pr.number]);
@@ -148,13 +160,15 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
     snapshot.labelChangedAtMs = state.events[key];
     snapshot.headChangedAtMs = state.heads[snapshot.headSha];
     const current = classifyPr(snapshot).reports;
-    if (current.length && whyPath && io.existsSync(whyPath)) {
+    let explanation = {};
+    if ((current.length || snapshot.ciFailing || (human(snapshot.labels) && classifyPr(snapshot).owed.length)) && whyPath && io.existsSync(whyPath)) {
       try {
         const why = JSON.parse(exec('node', [whyPath, 'why', `--pr=${snapshot.number}`, `--repo=${repo}`, '--json'], { encoding: 'utf8', timeout: 90000, maxBuffer: 32 * 1024 * 1024, env }));
         const verdict = why.verdict;
         const daemons = (verdict?.sections ?? why.sections)?.find((section) => section.name === 'daemons')?.lines ?? why.daemons;
         const lines = typeof daemons === 'string' ? daemons.split('\n') : Array.isArray(daemons) ? daemons : [];
         const fixLogLine = lines.find((line) => typeof line === 'string' && /^fix:/.test(line));
+        explanation = { ...(verdict ?? why), fixLogLine };
         for (const report of current) {
           if (verdict?.owner) report.owner = nextActor(snapshot, verdict);
           if (verdict?.waitingFor !== undefined) report.waitingFor = verdict.waitingFor;
@@ -162,9 +176,31 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
         }
       } catch { /* Optional local explanation cannot invalidate observed reports. */ }
     }
+    if (mode === 'shadow') {
+      const minutes = (nowMs - Math.max(snapshot.headChangedAtMs, snapshot.labelChangedAtMs ?? -Infinity)) / 60000;
+      for (const report of current.length ? current : [null]) {
+        const result = decideActions(snapshot, report, { why: explanation, minutes, settings: { mode }, done: state.actions });
+        for (const action of result.actions) {
+          state.actions[actionKey(action)] = nowMs;
+          decisions.push({ type: 'would-act', at, mode: 'shadow', action: action.type, repo, pr: snapshot.number,
+            head: snapshot.headSha, argv: action.argv, reason: action.reason });
+          summary.wouldAct++;
+        }
+        for (const escalation of result.escalations) {
+          const key = JSON.stringify([repo, snapshot.number, snapshot.headSha, report.rule]);
+          if (Number.isFinite(state.escalations[key]) && nowMs - state.escalations[key] < 60 * 60000) continue;
+          state.escalations[key] = nowMs;
+          decisions.push({ ...escalation, at, rule: report.rule });
+          summary.escalated++;
+        }
+      }
+    }
     reports.push(...current);
     state.lastDetailAt[detailKey] = nowMs;
   }
+  // Persist decisions before any append: a crash may lose a line, never duplicate it.
+  io.writeFileSync(join(outDir, 'state.json'), JSON.stringify(state, null, 2));
+  if (decisions.length) io.appendFileSync(join(outDir, 'actions.jsonl'), `${decisions.map((decision) => JSON.stringify(decision)).join('\n')}\n`);
   summary.reports = reports.length;
   const lines = [];
   for (const report of reports) {
@@ -178,7 +214,7 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   const rows = reports.slice(0, 50).map((r) => `| ${[`${r.repo}#${r.pr}`, r.rule, r.minutes === null ? '' : Math.floor(r.minutes), r.owner, r.reason, r.fixLogLine].map(cell).join(' | ')} |`);
   const truncation = summary.truncated ? ' — TRUNCATED: some open PRs not seen' : '';
   const problems = badClaims.length ? `\n\nMalformed claims (up to 10 shown; inspect claim files):\n${badClaims.slice(0, 10).map((claim) => `- ${cell(claim.path)}: ${cell(claim.problem)}`).join('\n')}` : '';
-  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}${truncation}\n\nOpen: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; badClaims: ${summary.badClaims}; skipped: ${summary.skipped}.${problems}\n\nSkipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.${summary.truncated ? '\n\nTruncated repositories need operator inspection of the full open PR list: ' + summary.repoSummaries.filter((r) => r.truncated).map((r) => cell(r.repo)).join(', ') + '.' : ''}\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n`);
+  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}${truncation}\n\nOpen: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; badClaims: ${summary.badClaims}; skipped: ${summary.skipped}.${problems}\n\nSkipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.${summary.truncated ? '\n\nTruncated repositories need operator inspection of the full open PR list: ' + summary.repoSummaries.filter((r) => r.truncated).map((r) => cell(r.repo)).join(', ') + '.' : ''}\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n\n## Would act (shadow)\n\nUp to 30 new decisions; inspect actions.jsonl for the full log.\n${decisions.slice(0, 30).map((d) => `- ${cell(d.repo)}#${d.pr}: ${cell(d.action ?? d.type)} — ${cell(d.reason)}`).join('\n')}\n`);
   io.writeFileSync(join(outDir, 'state.json'), JSON.stringify(state, null, 2));
   return { summary, reports, badClaims };
 }

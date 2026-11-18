@@ -22,7 +22,7 @@ describe('owed kinds', () => {
 
   it('exports stable kinds and thresholds', () => {
     expect(OWED_KINDS).toEqual(['review-changes', 'red-team-blocked', 'ci-red', 'conflicting', 'sent-back']);
-    expect(DEFAULTS).toEqual({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 45, readySettleMin: 15 });
+    expect(DEFAULTS).toEqual({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 90, readySettleMin: 15, humanWaitMin: 60, gateRedStalledMin: 30 });
   });
   it('accumulates kinds and drafts owe nothing', () => {
     const patch = { labels: ['review:changes', 'red-team:blocked', 'status:ci-red', 'status:sent-back-review'], ciFailing: true, mergeable: 'CONFLICTING' };
@@ -36,6 +36,20 @@ describe('report rules and boundaries', () => {
   it.each([
     ['bad-claim', { badClaims: [{ path: 'bad/lock.json', problem: 'Invalid ttlMinutes' }] }, true],
     ['bad-claim', { badClaims: [] }, false],
+    ['human-wait', { labels: ['review:human', 'review:changes'], headChangedAtMs: nowMs - 60 * 60000 }, true],
+    ['human-wait', { labels: ['review:human', 'review:changes'], headChangedAtMs: nowMs - 60 * 60000 + 1 }, false],
+    ['human-wait', { labels: ['status:stood-down'] }, true],
+    ['human-wait', { labels: ['review-status:stood-down'] }, true],
+    ['human-wait', { labels: ['review:human'] }, false],
+    ['human-wait', { labels: ['review:human', 'review:changes'], isDraft: true }, false],
+    ['gate-red-stalled', { ciFailing: true, headChangedAtMs: nowMs - 30 * 60000 }, true],
+    ['gate-red-stalled', { ciFailing: true, headChangedAtMs: nowMs - 30 * 60000 + 1 }, false],
+    ['gate-red-stalled', { ciFailing: true, isDraft: true }, true],
+    ['gate-red-stalled', { ciFailing: true, labels: ['ready-to-merge'] }, true],
+    ['gate-red-stalled', { ciFailing: true, labels: ['review:changes'] }, false],
+    ['gate-red-stalled', { ciFailing: true, claims: [claim] }, false],
+    ['gate-red-stalled', { ciFailing: true, claims: [{ ...claim, kind: 'ci-heal' }] }, false],
+    ['gate-red-stalled', { ciFailing: true, headChangedAtMs: undefined, labelChangedAtMs: undefined }, false],
     ['no-worker', { labels: ['review:changes'], headChangedAtMs: nowMs - 20 * 60000 }, true],
     ['no-worker', { labels: ['review:changes'], labelChangedAtMs: nowMs - 20 * 60000 + 1 }, false],
     ['no-worker', { labels: ['review:changes'], headChangedAtMs: undefined, labelChangedAtMs: undefined }, false],
@@ -63,8 +77,8 @@ describe('report rules and boundaries', () => {
     ['stale-claim', { claims: [claim], headChangedAtMs: 1 }, true],
     ['stale-claim', { claims: [claim], headSha: 'def' }, true],
     ['stale-claim', { claims: [{ kind: 'fix' }], headSha: undefined, headChangedAtMs: undefined }, false],
-    ['ready-stalled', { labels: ['ready-to-merge'], headChangedAtMs: nowMs - 45 * 60000 }, true],
-    ['ready-stalled', { labels: ['ready-to-merge'], headChangedAtMs: nowMs - 45 * 60000 + 1 }, false],
+    ['ready-stalled', { labels: ['ready-to-merge'], headChangedAtMs: nowMs - 90 * 60000 }, true],
+    ['ready-stalled', { labels: ['ready-to-merge'], headChangedAtMs: nowMs - 90 * 60000 + 1 }, false],
     ['ready-stalled', { labels: ['ready-to-merge'], headChangedAtMs: undefined, labelChangedAtMs: undefined }, false],
     ['ready-stalled', { labels: ['ready-to-merge', 'review:pending'] }, false],
     ['ready-stalled', { labels: ['ready-to-merge', 'status:ci-red'] }, true],

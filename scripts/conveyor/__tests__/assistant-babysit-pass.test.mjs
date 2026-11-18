@@ -73,7 +73,7 @@ describe('report-only tick', () => {
       }
       expect(options).toMatchObject({ timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { GH_CALLER: 'wev-assistant', FIXTURE: 'yes' } });
     }
-    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '500', '--json', 'number,labels,isDraft,mergeable,headRefOid,updatedAt,statusCheckRollup']);
+    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '500', '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,updatedAt,statusCheckRollup']);
     expect(w.calls.at(-1)).toMatchObject({ command: 'node', args: ['why.mjs', 'why', '--pr=1', '--repo=web-everything/web-everything', '--json'], options: { timeout: 90000 } });
   });
 
@@ -391,5 +391,124 @@ describe('report-only tick', () => {
     expect(() => w.tick(options)).toThrow();
     expect(w.files.has(join('output', 'digest.md'))).toBe(false);
     expect(w.files.has(join('output', 'reports.jsonl'))).toBe(false);
+  });
+});
+
+
+describe('shadow action log', () => {
+  it('reads why for human-owned owed work before the report threshold', () => {
+    const w = fixture();
+    w.prs[0].labels.push({ name: 'review:human' });
+    w.commitDate = '2026-01-01T11:59:00Z';
+    expect(w.tick().reports).toEqual([]);
+    expect(w.calls.some((c) => c.command === 'node')).toBe(true);
+  });
+  it('uses why suggestedOp for rearm without a matching log line', () => {
+    const w = fixture();
+    w.why.verdict.suggestedOp = 'rearm';
+    expect(w.tick().summary.wouldAct).toBe(1);
+  });
+  const actionLog = (w) => (w.files.get(join('output', 'actions.jsonl')) ?? '').trim().split('\n').filter(Boolean).map(JSON.parse);
+  const rearming = () => {
+    const w = fixture();
+    w.why.verdict.sections[0].lines = ['fix: refused at cap'];
+    return w;
+  };
+  it('logs would-act once per head, migrates old state, and logs again for a new head', () => {
+    const w = rearming();
+    expect(w.tick().summary).toMatchObject({ wouldAct: 1, escalated: 0 });
+    expect(w.tick().summary).toMatchObject({ wouldAct: 0, escalated: 0 });
+    expect(actionLog(w)).toEqual([expect.objectContaining({ type: 'would-act', mode: 'shadow', action: 'rearm', head: 'abc',
+      argv: ['node', 'scripts/operations/run.mjs', 'rearm', '--pr=1', '--repo=web-everything/web-everything'] })]);
+    w.prs[0].headRefOid = 'def';
+    expect(w.tick().summary.wouldAct).toBe(1);
+    expect(actionLog(w).map((line) => line.head)).toEqual(['abc', 'def']);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('## Would act (shadow)');
+    expect(w.log().at(-1).wouldAct).toBe(1);
+  });
+  it.each(['off', 'unknown', null, '{'])('settings %j disable decisions while reports continue', (mode) => {
+    const w = rearming();
+    w.files.set(join('output', 'settings.json'), mode === '{' ? mode : JSON.stringify({ mode }));
+    expect(w.tick().summary).toMatchObject({ reports: 1, wouldAct: 0, escalated: 0 });
+    expect(actionLog(w)).toEqual([]);
+  });
+  it('unreadable settings fail closed', () => {
+    const w = rearming();
+    const read = w.io.readFileSync;
+    w.io.readFileSync = (path, ...args) => { if (path.endsWith('settings.json')) throw new Error('denied'); return read(path, ...args); };
+    expect(w.tick().summary.wouldAct).toBe(0);
+  });
+  it('act is shadow with one stderr line and no executed write commands', () => {
+    const w = rearming();
+    w.files.set(join('output', 'settings.json'), JSON.stringify({ mode: 'act' }));
+    w.prs[0].mergeStateStatus = 'BEHIND';
+    w.prs[0].statusCheckRollup = [{ name: 'checks', conclusion: 'TIMED_OUT', detailsUrl: 'https://github.com/org/repo/actions/runs/42/job/1' }];
+    const stderr = [];
+    expect(w.tick({ stderr: (line) => stderr.push(line) }).summary.wouldAct).toBe(3);
+    expect(stderr).toEqual(['act mode not built; shadow only\n']);
+    expect(actionLog(w).every((line) => line.mode === 'shadow')).toBe(true);
+    for (const { command, args } of w.calls) {
+      expect(args).not.toContain('PUT');
+      expect(args).not.toContain('rerun');
+      expect(args).not.toContain('rearm');
+      expect(args).not.toContain('merge');
+      expect(command === 'node' ? args[1] === 'why' : command === 'gh' && (args[0] === 'api' || args.slice(0, 2).join(' ') === 'pr list')).toBe(true);
+    }
+  });
+  it('persists keys before append so an interrupted append cannot double-log', () => {
+    const w = rearming();
+    const append = w.io.appendFileSync;
+    w.io.appendFileSync = (path, data) => {
+      if (path.endsWith('actions.jsonl')) {
+        expect(Object.keys(JSON.parse(w.files.get(join('output', 'state.json'))).actions)).toHaveLength(1);
+        throw new Error('interrupted');
+      }
+      append(path, data);
+    };
+    expect(() => w.tick()).toThrow('interrupted');
+    w.io.appendFileSync = append;
+    expect(w.tick().summary).toMatchObject({ wouldAct: 0, escalated: 0 });
+    expect(actionLog(w)).toEqual([]);
+  });
+  it('escalates with exact log, dedupes for 60 minutes, and keys by head and rule', () => {
+    const w = fixture();
+    w.why.verdict.sections[0].lines = ['fix: waiting | operator'];
+    expect(w.tick().summary.escalated).toBe(1);
+    expect(w.tick({ nowMs: nowMs + 60 * 60000 - 1 }).summary.escalated).toBe(0);
+    expect(w.tick({ nowMs: nowMs + 60 * 60000 }).summary.escalated).toBe(1);
+    expect(actionLog(w)[0]).toMatchObject({ type: 'escalate', rule: 'no-worker', logLine: 'fix: waiting | operator' });
+    w.prs[0].headRefOid = 'def';
+    expect(w.tick().summary.escalated).toBe(1);
+    w.prs[0].labels = [{ name: 'review:human' }, { name: 'review:changes' }];
+    expect(w.tick().summary.escalated).toBe(1);
+    expect(actionLog(w).at(-1).rule).toBe('human-wait');
+  });
+  it.each([
+    [[], true, false, 'gate-red-stalled'],
+    [[{ name: 'review:human' }, { name: 'review:changes' }], false, false, 'human-wait'],
+    [[{ name: 'status:stood-down' }], false, false, 'human-wait'],
+    [[], true, true, 'gate-red-stalled'],
+  ])('reads details and why for additional candidate %j', (labels, ciFailing, isDraft, rule) => {
+    const w = fixture();
+    Object.assign(w.prs[0], { labels, isDraft, statusCheckRollup: ciFailing ? [{ conclusion: 'FAILURE' }] : [] });
+    expect(w.tick().reports.some((r) => r.rule === rule)).toBe(true);
+    expect(w.calls.filter((c) => c.args[0] === 'api')).toHaveLength(2);
+    expect(w.calls.some((c) => c.command === 'node')).toBe(true);
+  });
+  it.each(['https://github.com/org/repo/actions/runs/42', 'https://github.com/org/repo/actions/runs/42?check=1', 'unparseable'])('parses run evidence from %s', (detailsUrl) => {
+    const w = fixture();
+    w.prs[0].labels = [];
+    w.prs[0].statusCheckRollup = [{ name: 'infra', conclusion: 'STARTUP_FAILURE', detailsUrl }];
+    w.tick();
+    expect(actionLog(w)[0].type).toBe(detailsUrl === 'unparseable' ? 'escalate' : 'would-act');
+  });
+  it('bounds digest decisions to 30 and points to the complete log', () => {
+    const w = rearming();
+    w.prs = Array.from({ length: 31 }, (_, index) => ({ ...w.prs[0], number: index + 1 }));
+    expect(w.tick({ maxDetail: 31 }).summary.wouldAct).toBe(31);
+    const section = w.files.get(join('output', 'digest.md')).split('## Would act (shadow)')[1];
+    expect(section.split('\n').filter((line) => line.startsWith('- '))).toHaveLength(30);
+    expect(section).toContain('inspect actions.jsonl for the full log');
+    expect(actionLog(w)).toHaveLength(31);
   });
 });
