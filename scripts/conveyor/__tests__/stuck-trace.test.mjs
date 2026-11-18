@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { enqueueStuckTrace, drainStuckTraces, TRACE_TRIGGERS } from '../stuck-trace.mjs';
@@ -362,6 +362,34 @@ test('digest enqueues every unchanged operator head and drains detached after al
   publishStalledDigest(pass, { ...options, env: { WE_UNDER_TEST: '1' } });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(order.filter(x => x === 'drain').length, 2);
+});
+
+test('digest rejects queue feed collisions without creating or corrupting the queue, and rejected feeds leave trace state untouched', async t => {
+  const f = fixture(t), traceStateDir = join(f.root, 'traces');
+  const queuePath = join(traceStateDir, 'stuck-trace-queue.json');
+  const stateDir = join(f.root, 'digest');
+  let enqueues = 0, drains = 0;
+  const options = { stateDir, traceStateDir, env: {}, now: Date.parse(now),
+    notify: () => ({ ok: true }),
+    enqueue: args => { enqueues++; enqueueStuckTrace(args); },
+    drain: () => { drains++; } };
+  const pass = { items: [{ repo, pr: 17, head, lane: 'operator', state: 'queue-wait' }], incomplete: false };
+  publishStalledDigest(pass, { ...options, feedPath: queuePath });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(existsSync(traceStateDir), false);
+  publishStalledDigest(pass, { ...options, feedPath: join(stateDir, 'digest.lock') });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(existsSync(traceStateDir), false);
+  enqueueStuckTrace({ ...f.options, stateDir: traceStateDir });
+  const before = readFileSync(queuePath, 'utf8'), files = readdirSync(traceStateDir);
+  for (const feedPath of [queuePath, `${queuePath}.lock`, join(queuePath, 'feed.jsonl')]) {
+    publishStalledDigest(pass, { ...options, feedPath });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(readFileSync(queuePath, 'utf8'), before);
+    assert.deepEqual(readdirSync(traceStateDir), files);
+  }
+  assert.equal(enqueues, 0);
+  assert.equal(drains, 0);
 });
 
 test('empty digest passes drain watcher-enqueued entries, two per pass, even with no feed writes', async t => {

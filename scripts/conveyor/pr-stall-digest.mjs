@@ -121,15 +121,25 @@ export function publishStalledDigest(pass, { now = Date.now(), env = process.env
   if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors, now });
   if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
   const items = sortUnblockersFirst(pass.items.filter((i) => i.lane === 'operator').map(feedItem));
+  // Validate before either queue operation: rejected feeds must leave trace state untouched.
+  try {
+    const path = checkedDigestFeedPath(feedPath, env, stateDir);
+    if (traceStateDir) {
+      const fold = file => canonicalPath(file).normalize('NFC').toLowerCase();
+      const reserved = ['stuck-trace-queue.json', 'stuck-trace-queue.json.lock'].map(name => fold(join(traceStateDir, name)));
+      const sidecars = Object.values(sidecarsOf(path));
+      if ([path, ...sidecars, ...sidecars.map(file => `${file}.lock`)].some(file => {
+        const target = fold(file);
+        return reserved.some(root => target === root || target.startsWith(`${root}${sep}`));
+      })) throw new Error('feed path is reserved for stuck trace state');
+    }
+  } catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
   // Enqueue every current operator head, including unchanged feed entries and failed delivery retries.
   for (const item of traceStateDir ? items : []) {
     try { enqueue({ repo: item.repo, pr: item.pr, head: item.head, kind: STALLED_KIND, stateDir: traceStateDir, now }); }
     catch { /* best effort; never affects the digest */ }
   }
   try {
-  // A feed configured as digest.lock may already contain events. Reject it before lock recovery can reclaim it.
-  try { checkedDigestFeedPath(feedPath, env, stateDir); }
-  catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
   // One delivery at a time: selection, sending and confirmation run under one lock, so two overlapping passes can never
   // both send the same owed alert. If the lock cannot be taken, every item is alerted (a repeat, never a drop).
   // Use the watcher's queue directory so the two daemons cannot trace the same head twice.
