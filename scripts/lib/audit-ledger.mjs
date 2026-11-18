@@ -68,15 +68,18 @@ export function evaluateAudit(ledgerText, options = {}) {
   const related = e => lower(e.r.head) === lower(head) || carriesAcross(e.fp, liveFp);
   // Records sealed under a later reseal can still block, but their passes are never trusted again.
   const ownAny = entries.some(e => e.accepted && lower(e.r.head) === lower(head) && (e.r.verdict === 'WEAKENED' || e.r.verdict === 'NOT WEAKENED'));
-  const passes = entries.filter(e => e.accepted && e.trusted && !e.sealed && validSha(e.r.head) && validSha(e.r.base)
-    && e.r.base !== e.r.head && e.r.verdict === 'NOT WEAKENED' && carriesAcross(e.fp, e.fp)
+  // Rule 0: ONE validity gate for every record that can authorize a load (pass or waived WEAKENED).
+  const valid = e => e.accepted && validSha(e.r.head) && validSha(e.r.base) && e.r.base !== e.r.head && carriesAcross(e.fp, e.fp)
     && typeof e.r.at === 'string' && Number.isFinite(Date.parse(e.r.at)) && Date.parse(e.r.at) <= now + 300000
-    && legacyFindAudit([e.r], { head: e.r.head, base: e.r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === e.r);
+    && legacyFindAudit([e.r], { head: e.r.head, base: e.r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === e.r;
+  const passes = entries.filter(e => valid(e) && e.trusted && !e.sealed && e.r.verdict === 'NOT WEAKENED');
   const gate = options.ruledWeakened;
   const waivers = options.waivers ?? (gate?.ruledWeakened ? [{ ...gate.ruledWeakened, sha: gate.record.sha, fingerprint: gate.record.fingerprint }] : []);
-  const waived = e => e.trusted && waivers.some(w => (w.auditId ? w.auditId === e.r.id : e.legacy && !e.r.id)
-    && validSha(w.sha) && (lower(w.sha) === lower(head) && related(e) || lower(w.sha) === lower(e.r.head) && related(e)
-      || carriesAcross(w.fingerprint, liveFp) && carriesAcross(e.fp, liveFp))
+  // A waiver only turns a block into a pass for a record that already passed the gate, and never crosses heads:
+  // it names the record's own head, or the live head with a fingerprint binding the carried record.
+  const waived = e => e.trusted && valid(e) && waivers.some(w => (w.auditId ? w.auditId === e.r.id : e.legacy && !e.r.id)
+    && validSha(w.sha) && related(e) && (lower(w.sha) === lower(e.r.head)
+      || lower(w.sha) === lower(head) && carriesAcross(w.fingerprint, e.fp) && carriesAcross(e.fp, liveFp))
     && Array.isArray(e.r.findings) && JSON.stringify(w.findings) === JSON.stringify(e.r.findings) && covered(e.r.base));
   for (const e of entries.filter(e => e.accepted && e.r.verdict === 'WEAKENED')) {
     const own = lower(e.r.head) === lower(head);
@@ -87,8 +90,7 @@ export function evaluateAudit(ledgerText, options = {}) {
       && (own ? lower(p.r.head) === lower(head) && lower(p.r.base) === lower(e.r.base) : lower(p.r.head) === lower(head) && covered(p.r.base)));
     if (!cleared && !waived(e)) return { ...fail('weakened'), ...(lookup ? { record: e.r } : {}) };
   }
-  const authorized = entries.filter(e => e.r.verdict === 'WEAKENED' && validSha(e.r.head) && validSha(e.r.base)
-    && e.r.base !== e.r.head && carriesAcross(e.fp, e.fp) && waived(e));
+  const authorized = entries.filter(e => e.r.verdict === 'WEAKENED' && waived(e));
   const pass = [...passes, ...authorized].filter(e => related(e) && (!ownAny || lower(e.r.head) === lower(head)) && e.r.questionHash === questionHash
     && (base === undefined || lower(e.r.base) === lower(base)) && covered(e.r.base)).sort((a, b) => b.order - a.order)[0];
   return pass ? { ok: true, record: pass.r } : fail(broken ? 'chain-break' : 'no-record');
