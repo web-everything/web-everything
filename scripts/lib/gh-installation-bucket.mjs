@@ -21,6 +21,42 @@ export function ghInstallationForEntry(entry, owner, env, lookupOwner) {
     : lookupOwner(owner, env);
 }
 
+/** Shared token/cache selection. Admission refuses competing refreshable installations.
+ * Imported helpers are explicit dependencies so the shim can embed this function with toString(). */
+export function resolveGhInstallation({ env, caller, callerRoles, roles, cachePath, owner, readFresh, conservative = false, roleForCaller, installationForOwner, installationCachePath }) {
+  const role = String(env.WE_GITHUB_APP_ROLE || '').trim().toLowerCase()
+    || roleForCaller(env.GH_CALLER || caller, callerRoles) || 'worker';
+  const misses = Object.keys(roles).length && role !== 'legacy' && !roles[role] ? [role + ': unconfigured'] : [];
+  const possible = new Set();
+  for (const [name, entry] of ghInstallationChain(role, roles, cachePath)) {
+    const id = owner ? ghInstallationForEntry(entry, owner, env, installationForOwner) : null;
+    if (owner && !id) {
+      misses.push(name + ': no installation for owner ' + owner);
+      continue;
+    }
+    if (conservative) {
+      if (!/^\d+$/.test(String(id ?? ''))) continue;
+      possible.add(String(id));
+      if (possible.size > 1) return { role, misses, reason: 'ambiguous' };
+    }
+    let used = owner ? installationCachePath(entry.cachePath, id) : entry.cachePath;
+    let cached = readFresh(used);
+    if (!cached && owner && !entry.installations) {
+      const legacy = readFresh(cachePath);
+      if (legacy && (legacy.installationId == null || String(legacy.installationId) === String(id))) {
+        cached = legacy;
+        used = cachePath;
+      }
+    }
+    if (cached) {
+      if (conservative && cached.installationId != null && String(cached.installationId) !== String(id)) return { role, misses, reason: 'ambiguous' };
+      return { role, name, cached, used, installationId: id, misses, reason: 'shim-cache' };
+    }
+    misses.push(name + ': no fresh token cached');
+  }
+  return { role, misses, reason: 'unresolved' };
+}
+
 function readFreshCache(path) {
   try {
     const c = JSON.parse(readFileSync(path, 'utf8'));
@@ -51,23 +87,6 @@ export function resolveGhSlotBucket({ identity, env = {}, args = [], caller, cwd
     } catch { /* An unavailable origin leaves the call in the shared pool. */ }
   }
   if (!owner) return { bucket: null, reason: 'no-owner' };
-  const role = String(env.WE_GITHUB_APP_ROLE || '').trim().toLowerCase() || roleForCaller(caller, delivery.callerRoles) || 'worker';
-  const possible = new Set();
-  for (const [, entry] of ghInstallationChain(role, roles, cachePath)) {
-    const id = ghInstallationForEntry(entry, owner, env, installationForOwner);
-    if (!/^\d+$/.test(String(id ?? ''))) continue;
-    possible.add(String(id));
-    if (possible.size > 1) return { bucket: null, reason: 'ambiguous' };
-    let fresh = readFresh(installationCachePath(entry.cachePath, id));
-    if (!fresh && !entry.installations) {
-      const legacy = readFresh(cachePath);
-      if (legacy && (legacy.installationId == null || String(legacy.installationId) === String(id))) fresh = legacy;
-    }
-    if (fresh) {
-      // A stale/mismatched cache must not direct concurrency into another installation's pool.
-      if (fresh.installationId != null && String(fresh.installationId) !== String(id)) return { bucket: null, reason: 'ambiguous' };
-      return { bucket: String(id), reason: 'shim-cache' };
-    }
-  }
-  return { bucket: null, reason: 'unresolved' };
+  const selected = resolveGhInstallation({ env, caller, callerRoles: delivery.callerRoles, roles, cachePath, owner, readFresh, conservative: true, roleForCaller, installationForOwner, installationCachePath });
+  return { bucket: selected.cached ? String(selected.installationId) : null, reason: selected.reason };
 }

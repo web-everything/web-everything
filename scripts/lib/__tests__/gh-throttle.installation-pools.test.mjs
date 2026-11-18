@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { URL as NodeURL } from 'node:url';
+import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 import { slotPath } from '../../readiness/heavy-admission.mjs';
@@ -16,7 +16,7 @@ import { installationCachePath } from '../github-app-installations.mjs';
 import * as authCache from '../github-app-auth-env.mjs';
 import { defaultCachePath } from '../github-app-auth-env.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
-import { ghInstallationCap, ghSlotPool, ghHolderMeta, ghHolderPolicy, readGhSlotHolders, ghHoldersSummary, loadGhThrottleSettings } from '../gh-throttle-holders.mjs';
+import { ghInstallationPools, ghInstallationCap, ghSlotPool, ghHolderMeta, ghHolderPolicy, readGhSlotHolders, ghHoldersSummary, loadGhThrottleSettings } from '../gh-throttle-holders.mjs';
 import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE } from '../gh-throttle.mjs';
 
 
@@ -190,6 +190,54 @@ console.log(result);`;
     expect(actual.trim()).toBe(bucket);
     expect(bucket).toBe(expected);
   });
+  it.each(['sync', 'cli'])('prefers GH_CALLER over a conflicting throttle caller for %s admission', mode => {
+    delivery.readDeliveryIdentity.mockReturnValue({ roles: {
+      reviewer: { appId: '1', installations: { example: '202' } },
+      worker: { appId: '2', installations: { example: '101' } },
+    }, callerRoles: { 'review-pr.mjs': 'reviewer' } });
+    expect(acquire('202', 'reviewer-first').ok).toBe(true);
+    expect(acquire('202', 'reviewer-second').ok).toBe(true);
+    const execute = vi.fn(ok);
+    const extra = { cap: 20, caller: 'custom-read', shimRouted: true,
+      resolveSlotBucket: input => resolveGhSlotBucket({ ...input, readFresh: path => ({ installationId: path.includes('.202.') ? '202' : '101' }) }) };
+    const env = { GH_CALLER: 'review-pr.mjs' };
+    if (mode === 'sync') expect(() => invoke(mode, env, execute, extra)).toThrow(/no gh slot/);
+    else expect(invoke(mode, env, execute, extra)).toMatchObject({ status: 1, throttled: true });
+    expect(execute).not.toHaveBeenCalled();
+    expect(rows('calls.jsonl').find(r => r.outcome === 'slot_throttled').bucket).toBe('202');
+  });
+  it('admits a generated shim cached reviewer token to its installation while shared is full', () => {
+    expect(acquire(null, 'shared-holder').ok).toBe(true);
+    const cachePath = defaultCachePath();
+    const reviewer = { cachePath: join(root, 'reviewer.json'), installations: { example: '202' } };
+    writeFileSync(installationCachePath(reviewer.cachePath, '202'), JSON.stringify({
+      v: 2, token: 'ghs_fixture_202', installationId: '202', expiresAt: new Date(Date.now() + 3600000).toISOString(),
+    }));
+    const executable = join(root, 'fixture-executable');
+    writeFileSync(executable, `#!${process.execPath}\nconsole.log('executed');\n`);
+    chmodSync(executable, 0o755);
+    const shim = join(root, 'shim.cjs');
+    // Bind the generated shim to THIS checkout's throttle (not the host's control clone), so the test exercises this code.
+    const priorControl = process.env.WE_CONTROL_CLONE;
+    process.env.WE_CONTROL_CLONE = fileURLToPath(new NodeURL('../../..', import.meta.url));
+    try {
+      writeFileSync(shim, renderGhShimScript({ realGhPath: executable, cachePath,
+        roleTable: { reviewer }, callerRoles: { 'review-pr.mjs': 'reviewer' } }));
+    } finally { if (priorControl === undefined) delete process.env.WE_CONTROL_CLONE; else process.env.WE_CONTROL_CLONE = priorControl; }
+    const env = { PATH: process.env.PATH, HOME: root, ...baseEnv(), GH_CALLER: 'review-pr.mjs',
+      WE_GITHUB_APP_INSTALLATIONS: '{"example":"202"}', WE_GH_THROTTLE_LOCK_ROOT: root,
+      WE_GH_THROTTLE_CAP: '20', WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1', WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS: '0' };
+    const actual = execFileSync(process.execPath, [shim, ...args], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+    expect(actual.trim()).toBe('executed');
+    expect(rows('calls.jsonl').find(r => r.outcome === 'call')).toMatchObject({ id: 'app-installation-202' });
+    expect(rows('calls.jsonl').some(r => r.outcome === 'slot_throttled')).toBe(false);
+    // Charged to the reviewer installation's pool (not skipped): once that pool is full, the same call is throttled.
+    expect(acquire('202', 'one').ok).toBe(true);
+    expect(acquire('202', 'two').ok).toBe(true);
+    const full = spawnSync(process.execPath, [shim, ...args], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+    expect(full.status).not.toBe(0);
+    expect(readGhSlotHolders({ lockRoot: root, cap: 1, includeInstallations: false })).toHaveLength(1);
+  });
   it('fails closed on absent caches and unknown owners', () => {
     expect(resolveGhSlotBucket({ identity: 'default', args, readFresh: () => null }).bucket).toBeNull();
     expect(resolveGhSlotBucket({ identity: 'default', args, env: { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' }, readFresh: () => null })).toEqual({ bucket: null, reason: 'unresolved' });
@@ -197,6 +245,12 @@ console.log(result);`;
 });
 
 describe('per-installation semaphore', () => {
+  it('enumerates only numeric installation directories as pools', () => {
+    mkdirSync(join(root, 'installations', '202'), { recursive: true });
+    mkdirSync(join(root, 'installations', 'foo'));
+    writeFileSync(join(root, 'installations', '101.json'), '{}');
+    expect(ghInstallationPools(root)).toEqual(['202']);
+  });
   it('caps more callers than capacity independently in two simultaneously held buckets', () => {
     for (const bucket of ['101', '202']) {
       expect(acquire(bucket, `${bucket}-first`).ok).toBe(true);

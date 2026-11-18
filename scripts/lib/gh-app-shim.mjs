@@ -94,7 +94,7 @@ import {
 import { readGhAuthPolicy, isDaemonCaller } from './github-auth-policy.mjs';
 import { readSettings, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { primaryCheckout } from '../bootstrap-session.mjs';
-import { ghInstallationChain, ghInstallationForEntry } from './gh-installation-bucket.mjs';
+import { ghInstallationChain, ghInstallationForEntry, resolveGhInstallation } from './gh-installation-bucket.mjs';
 import { DEFAULT_CALLER_ROLES, roleForCaller, readDeliveryIdentity, shimRoleTable, ROLE_ENV } from './github-app-identity.mjs';
 import { controlClonePath } from './automation-home.mjs';
 import { stripGhDebug, rateLimitRecords, ghAuthIdentity } from './gh-throttle.mjs';
@@ -526,6 +526,7 @@ ${installationMap.toString()}
 ${installationForOwner.toString()}
 ${ghInstallationForEntry.toString()}
 ${ghInstallationChain.toString()}
+${resolveGhInstallation.toString()}
 ${ownerOfSlug.toString()}
 ${ownerFromRemoteUrl.toString()}
 ${ownerFromGhArgv.toString()}
@@ -759,51 +760,26 @@ function targetOwner(argv, env) {
     return r.status === 0 ? ownerFromRemoteUrl(String(r.stdout || '').trim()) : null;
   } catch { return null; }
 }
-// One App's fresh token for \`owner\`: \`entry.installations\` null = today's App (owner map + legacy single cache).
-function tokenFrom(entry, owner) {
-  if (!owner) {
-    const c = readFreshCache(entry.cachePath);
-    return c ? { cached: c, used: entry.cachePath } : { miss: 'no fresh token cached' };
-  }
-  const id = ghInstallationForEntry(entry, owner, process.env, installationForOwner);
-  if (!id) return { miss: 'no installation for owner ' + owner, noInstallation: true };
-  const path = installationCachePath(entry.cachePath, id);
-  const c = readFreshCache(path);
-  if (c) return { cached: c, used: path };
-  if (!entry.installations) {
-    // Not minted yet for this owner: the legacy single cache still serves it when it holds THIS installation.
-    const legacy = readFreshCache(CACHE_PATH);
-    if (legacy && (legacy.installationId == null || String(legacy.installationId) === String(id))) return { cached: legacy, used: CACHE_PATH };
-  }
-  return { miss: 'no fresh token cached' };
-}
 function requestedRole(env) {
   const r = String(env.WE_GITHUB_APP_ROLE || '').trim().toLowerCase();
   return r || roleForCaller(CALLER, CALLER_ROLES) || 'worker';
 }
 function freshCachedToken() {
   const owner = targetOwner(process.argv.slice(2), process.env);
-  const role = requestedRole(process.env);
+  const selected = resolveGhInstallation({ env: process.env, caller: CALLER, callerRoles: CALLER_ROLES,
+    roles: ROLE_IDENTITIES, cachePath: CACHE_PATH, owner, readFresh: readFreshCache, roleForCaller, installationForOwner, installationCachePath });
+  const { role, misses } = selected;
   const loud = Object.keys(ROLE_IDENTITIES).length > 0;
-  // \`legacy\` names today's App itself (the WE App, WE_APP_ID): a caller that must author as it (the red-team check
-  // writer, #6535) gets it or nothing, never a role App standing in.
-  const legacyOnly = role === 'legacy';
-  const chain = ghInstallationChain(role, ROLE_IDENTITIES, CACHE_PATH);
-  const misses = loud && !legacyOnly && !ROLE_IDENTITIES[role] ? [role + ': unconfigured'] : [];
-  for (const [name, entry] of chain) {
-    const r = tokenFrom(entry, owner);
-    if (r.cached) {
-      if (loud && name !== role) {
-        process.stderr.write('gh-shim: GitHub App role "' + role + '" unavailable (' + misses.join('; ') + ') - using the ' + name + ' App for this call\\n');
-      }
-      usedCachePath = r.used;
-      cachedInstallationId = r.cached.installationId ?? null;
-      return r.cached.token;
+  if (selected.cached) {
+    if (loud && selected.name !== role) {
+      process.stderr.write('gh-shim: GitHub App role "' + role + '" unavailable (' + misses.join('; ') + ') - using the ' + selected.name + ' App for this call\\n');
     }
-    if (!DAEMON && name === 'legacy' && r.noInstallation) {
-      process.stderr.write('gh-shim: no GitHub App installation is configured for owner "' + owner + '" - using personal auth for this call\\n');
-    }
-    misses.push(name + ': ' + r.miss);
+    usedCachePath = selected.used;
+    cachedInstallationId = selected.cached.installationId ?? null;
+    return selected.cached.token;
+  }
+  if (!DAEMON && misses.some(miss => miss.startsWith('legacy: no installation for owner '))) {
+    process.stderr.write('gh-shim: no GitHub App installation is configured for owner "' + owner + '" - using personal auth for this call\\n');
   }
   tokenMisses = misses;
   if (!DAEMON && loud) process.stderr.write('gh-shim: no App token for role "' + role + '" (' + misses.join('; ') + ') - using personal auth for this call\\n');
@@ -1127,7 +1103,9 @@ process.stderr.on('error', () => {});
 if (!token) {
   await runInherited(process.env, unsupportedHost ? 'unsupported GitHub host (' + unsupportedHost + ')' : undefined);
 } else {
-  const withToken = await runThrottled(appTokenArgv(process.argv.slice(2)), Object.assign({}, process.env, { GH_TOKEN: token }));
+  const withToken = await runThrottled(appTokenArgv(process.argv.slice(2)), Object.assign({}, process.env, { GH_TOKEN: token,
+    WE_GH_AUTH_INSTALLATION: cachedInstallationId == null ? '' : String(cachedInstallationId),
+    WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(token).digest('hex') }));
   if (withToken.error) {
     process.stderr.write(String(withToken.error.message || withToken.error) + '\\n');
     process.exitCode = 1;

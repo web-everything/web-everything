@@ -1013,7 +1013,7 @@ process.exitCode = ${mode === 'failure' ? 7 : 0};
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({
           transport: 'shim-fallback', fallbackReason: mode === 'import' ? 'missing-import' : 'missing-entry',
-          caller: 'disposable-probe', id: 'app', installationId: '12345', authSource: 'app-cache', resource: 'graphql',
+          caller: 'disposable-probe', id: 'app-installation-12345', installationId: '12345', authSource: 'app-cache', resource: 'graphql',
           cost: mode === 'unknown' ? null : 3, costSource: mode === 'unknown' ? 'unknown' : 'response',
         });
         if (mode === 'nested') {
