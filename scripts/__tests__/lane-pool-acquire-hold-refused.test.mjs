@@ -105,6 +105,18 @@ describe('lane-pool acquire after lane-hold reset refusal', () => {
     expect(events().filter((e) => e.kind === 'scan')).toHaveLength(1);
   }, 60_000);
 
+  it('grows after a candidate fails provisioning and never retries that candidate across polls', () => {
+    provision(1);
+    writeFileSync(join(lane(1), '.git', 'index.lock'), 'blocked\n');
+    const result = acquire(2200, ['--cache-ttl-ms=0', '--growth-max-new=1', '--hard-max=2']);
+    expect(result.code, result.err).toBe(0);
+    expect(JSON.parse(result.out).lane).toBe(2);
+    expect(result.err.match(/lane-1 claimed but failed to provision/g)).toHaveLength(1);
+    expect(existsSync(lease(1))).toBe(false);
+    expect(existsSync(lease(2))).toBe(true);
+    expect(readFileSync(join(lane(1), '.git', 'index.lock'), 'utf8')).toBe('blocked\n');
+  }, 60_000);
+
   it.each(['1', ''])('prints __SCAN_LOCK_HELD_MS__ only with LANE_POOL_ACQUIRE_DEBUG=1 (value=%j)', (debug) => {
     provision(1);
     const result = acquire(0, ['--cache-ttl-ms=0'], { LANE_POOL_ACQUIRE_DEBUG: debug });

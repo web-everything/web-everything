@@ -4567,3 +4567,13 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Lane lease heartbeats
+
+Use `lane-lease-heartbeat.mjs` for best-effort atomic renewal from any lane subdirectory.
+Heartbeat owners must keep the event loop available while children run and stop in `finally`;
+synchronous child execution prevents interval renewals. The Codex child runner covers detached
+jobs too. Inject `readAgents`/`readCwds` into liveness fixtures; never probe host processes in unit tests.
+Acquire preserves its historical fail-open takeover on unreadable cwd evidence; explicit reclaim
+remains fail-closed. Observed live occupants journal `reclaim-refused-live-process`.
+Provisioning failures stay excluded across acquire poll rounds and allow bounded pool growth.

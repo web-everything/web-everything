@@ -147,7 +147,7 @@
 import '../lib/tools-root-guard.mjs';
 import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
-import { execSync, execFile, spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -159,6 +159,7 @@ import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
+import { startLaneLeaseHeartbeat } from '../lib/lane-lease-heartbeat.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor, ENTRYLESS_LOCK_DIR_GRACE_MS } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
@@ -2915,7 +2916,7 @@ export function poolRootOf(lockRoot) {
 // two will need reconciling, likely a straightforward union, whenever that branch merges).
 //
 // The `exec` seam is exactly what makes the #3621 heavy-command-pool container POC possible: by default it
-// runs `command` on the HOST (`execSync`, unchanged behaviour), but a caller can inject
+// runs `command` on the HOST asynchronously, but a caller can inject
 // `scripts/lib/container-exec.mjs#execContainerized` instead — same acquire/execute/release sequencing, the
 // command now runs inside a real, CPU/memory-capped Apple `container` instance. See that module's own header
 // for exactly what is (and is not yet) proven to work this way.
@@ -2934,7 +2935,7 @@ export function poolRootOf(lockRoot) {
  * @param {number} [opts.leaseMinutes]
  * @param {string} opts.command            the shell command to run (already shell-quoted by the CLI)
  * @param {string} [opts.cwd]              defaults to process.cwd()
- * @param {(cmd:string, opts:object)=>void} [opts.exec]  defaults to `execSync` — injectable; #3621's
+ * @param {(cmd:string, opts:object)=>void} [opts.exec]  defaults to an awaitable shell spawn — injectable; #3621's
  *   container POC passes `container-exec.mjs#execContainerized` here instead
  * @param {(msg:string)=>void} [opts.log]  defaults to `process.stderr.write` — injectable for tests
  * @param {object} [opts.env]              defaults to `process.env` — injectable for tests
@@ -2950,7 +2951,13 @@ function childExitCode(e) {
   return Number.isInteger(n) ? 128 + n : 1;
 }
 
-const defaultExec = (cmd, o) => execSync(cmd, o);
+// Await the shell so lane heartbeat timers can run throughout the command.
+const defaultExec = (cmd, opts) => new Promise((resolveRun, rejectRun) => {
+  const child = spawn('/bin/sh', ['-c', cmd], opts);
+  child.on('error', rejectRun);
+  child.on('close', (status, signal) => status === 0 ? resolveRun()
+    : rejectRun(Object.assign(new Error('Command failed'), { status, signal })));
+});
 
 /**
  * Run `command` under a hard run ceiling that kills its WHOLE process group (the shell plus vitest and its workers), so a
@@ -2996,21 +3003,23 @@ export async function runUnderAdmission({
   kind = null, command, cwd = process.cwd(), exec = defaultExec, log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
-  runCeilingMs = 0,
+  runCeilingMs = 0, startHeartbeat = startLaneLeaseHeartbeat,
 }) {
   if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
   if (bypass) {
     let exitCode = 0;
+    const heartbeat = startHeartbeat({ cwd });
     try {
       const bypassOpts = { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv };
       if (runCeilingMs > 0) await execWithRunCeiling(command, bypassOpts, runCeilingMs, exec);
-      else exec(command, bypassOpts);
+      else await exec(command, bypassOpts);
     } catch (e) {
       exitCode = childExitCode(e);
       if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: run exceeded ${runCeilingMs}ms and was stopped.\n`); }
     }
+    finally { heartbeat.stop(); }
     return { exitCode, admission: { ok: false, slot: null, timedOut: false, waitedMs: 0, bypassed: bypass } };
   }
   mkdirSync(lockRoot, { recursive: true });
@@ -3027,18 +3036,20 @@ export async function runUnderAdmission({
   }
   let exitCode = 0;
   let execOptsTimeout = 0;
+  const heartbeat = startHeartbeat({ cwd });
   try {
     // x1ds37v — a single-test debug run (`files`) is bounded to fit under the 10-minute Bash cap.
     const execOpts = { cwd, stdio: 'inherit', env: childEnv };
     if (runKind === 'files') execOpts.timeout = resolveFastRunTimeoutMs(env);
     // The caller's RUN ceiling starts at slot grant (queue wait is already over), unlike an exec timeout around the wrapper.
     execOptsTimeout = execOpts.timeout ?? 0;
-    if (runCeilingMs > 0) { execOptsTimeout = runCeilingMs; await execWithRunCeiling(command, execOpts, runCeilingMs, exec); }
-    else exec(command, execOpts);
+    if (runCeilingMs > 0 || execOpts.timeout > 0) { execOptsTimeout = runCeilingMs || execOpts.timeout; await execWithRunCeiling(command, execOpts, execOptsTimeout, exec); }
+    else await exec(command, execOpts);
   } catch (e) {
     exitCode = childExitCode(e);
     if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: run exceeded ${execOptsTimeout}ms and was stopped.\n`); }
   } finally {
+    heartbeat.stop();
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
   }
   return { exitCode, admission };

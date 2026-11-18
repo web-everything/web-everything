@@ -177,6 +177,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // import" shape `we:scripts/operations/operator-queue.mjs`'s own header warns about (that warning is about
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
+import { staleTakeoverHasLiveProcesses, journalLiveProcessRefusal } from './lib/lane-lease-liveness.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
 import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane, salvageRefName } from './lib/lane-pool-salvage-push.mjs';
 import {
@@ -1958,7 +1959,7 @@ function cmdRefresh(repo) {
 // An explicit lane request may opt into idempotent re-acquire of its own lease, preserving the holder slug.
 // Auto-pick must reject EVERY live lease: stale candidate lists can include a lane just leased by the same
 // dispatcher/session, and another auto-acquire means another allocation, not a refresh of that prior hold.
-function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {}) {
+function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false, readCwds } = {}) {
   // #2367 — stamp a DURABLE session identity (`CLAUDE_CODE_SESSION_ID`, exposed to this subprocess) so a later
   // guard can tell "my own lease" from another live session's AUTHORITATIVELY — it is stable across a session's
   // separate Bash-tool calls yet distinct between concurrent sessions, and does NOT false-match two independent
@@ -2035,6 +2036,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
   if (isLeaseStale(existing, nowMs, ttlMs)) {
     // xbdixjc — a stale lease over a lane the hold rule protects is not taken over (its fixer will resume there).
     if (laneHoldRefuses(dir, 'take-over')) return null;
+    if (staleTakeoverHasLiveProcesses(dir, { readCwds, journal: journalLaneEvent })) return null;
     // #x96v5hl — was `rmSync(file, {force:true})` then a `wx` create: unconditional unlink-then-create, which let
     // TWO concurrent stale-reclaimers both "win". Both see the same stale `existing`, both `rmSync` (always
     // succeeds, no matter what's currently there), then both `wx`-create — but `rmSync` doesn't check WHAT it is
@@ -2630,6 +2632,7 @@ async function cmdAcquire(repo) {
       ? acquireDefaultWaitMs
       : Number.isFinite(Number(flags['wait-ms'])) ? Math.max(0, Number(flags['wait-ms'])) : 0;
     const excluded = new Set();
+    const failedLanes = new Set(); // provisioning failures stay excluded for this entire call
     const holdRefused = new Set(); // parked lanes stay excluded across poll rounds
     let sawNonHoldProvisionFailure = false; // any provision failure that is NOT a lane-hold refusal
     // The caller's OWN lane, if they are standing in one. Auto-pick skips it: acquiring resets the lane to
@@ -2673,11 +2676,7 @@ async function cmdAcquire(repo) {
     // (never fail-safe-GROW) rationale below — an unanswered lock is no more evidence of a starved pool than an
     // unfinished scan is.
     let sawLockContention = false;
-    // #3407 — a candidate excluded because it FAILED TO PROVISION (below) is a different fact from "the scan
-    // found nothing" or "every lane is genuinely held/dirty": growth-on-empty exists for the latter two, never
-    // as a rescue for the former (that would silently widen this fix's own scope into the SEPARATE
-    // growth-on-empty design, unreviewed here). Sticky for the rest of THIS call once any provisioning failure
-    // occurs, mirroring `sawScanTimeout`'s own fail-SAFE-STOP-never-fail-safe-GROW rationale just above.
+    // Keep failure diagnostics separate from the bounded growth decision.
     let sawProvisionFailure = false;
     // #xj4tewd — a wall-clock-only proof of "no poll happened" is flaky on a busy runner: plain process/git
     // overhead alone (no polling at all) can exceed one `ACQUIRE_POLL_MS` interval under load (live-caught:
@@ -2790,7 +2789,7 @@ async function cmdAcquire(repo) {
       }
       const pickable = candidateDirs
         .map((d) => Number(basename(d).slice(5)))
-        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
+        .filter((n) => !excluded.has(n) && !failedLanes.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
         .sort((a, b) => a - b);
       for (const pick of pickable) {
         if (retryingCandidates) {
@@ -2844,6 +2843,7 @@ async function cmdAcquire(repo) {
           restoreLeaseAfterRefusedClaim(laneDir(repo, pick), null);
           excluded.add(pick);
           holderSlug = null;
+          failedLanes.add(pick);
           sawProvisionFailure = true;
           continue;
         }
@@ -2872,7 +2872,7 @@ async function cmdAcquire(repo) {
       // either), and a fresh, dedicated, ONE-TIME live remote-reachability probe taken only here (never on the
       // hot scan path above) — a network/remote outage must never be misread as "genuinely starved, so clone
       // more".
-      if (!grownOnce && !sawScanTimeout && !sawLockContention && !sawProvisionFailure) {
+      if (!grownOnce && !sawScanTimeout && !sawLockContention) {
         grownOnce = true;
         // Probe the exact URL growth will clone from (`provisionLane` → `repo.originUrl`, resolved against the
         // same process cwd the clone uses) — never from inside an existing lane: a vanished/corrupted `lanes[0]`
@@ -5323,7 +5323,10 @@ function cmdReclaim(repo) {
     if (gate.eligible) return false;
     if (underHold) takeMarkerIf(dir, (moved) => moved?.session === ownSession, n);
     log(`  lane-${n}: KEPT (not reset) — ${gate.reason}${underHold ? ' (re-checked under the hold)' : ''}`);
-    if (!dryRun) journalReclaimRefusal(dir, repo, `kept — owner not proven gone: ${gate.reason}`);
+    if (!dryRun) {
+      journalLiveProcessRefusal(dir, gate.livePids, journalLaneEvent);
+      journalReclaimRefusal(dir, repo, `kept — owner not proven gone: ${gate.reason}`);
+    }
     if (flags.json) {
       process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, kept: true, keptReason: gate.reason, ...extra }, null, 2)}\n`);
     }
@@ -5455,7 +5458,9 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
   // before this fix (only this salvage path checked liveness at all).
   const gate = (ignoreLeaseSession) => {
     const last = lastLaneHistoryEntry(readLaneHistory(dir)) || {};
-    return { ...laneLivenessGate({ dir, ignoreLeaseSession }), last };
+    const result = laneLivenessGate({ dir, ignoreLeaseSession });
+    if (!dryRun && !result.eligible) journalLiveProcessRefusal(dir, result.livePids, journalLaneEvent);
+    return { ...result, last };
   };
   const g = gate();
   if (!g.eligible) {
