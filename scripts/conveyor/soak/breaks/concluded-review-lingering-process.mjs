@@ -14,6 +14,7 @@ export default {
   fixPresent() { return true; },
   async run({ sourceRoot = ROOT, log } = {}) {
     const { tagReviewStatus } = await import(pathToFileURL(join(sourceRoot, PATH)).href);
+    const { parseRedTeamComment, redTeamResultId } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/red-team-gate.mjs')).href);
     const violations = [];
     const check = (ok, name) => {
       if (!ok) violations.push(name);
@@ -23,20 +24,28 @@ export default {
     const headRefOid = 'a'.repeat(40);
     const now = Date.now();
     const advisory = { author: { login: 'chalbert' }, createdAt: new Date(now - 180_000).toISOString(),
-      body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->` };
+      body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->\n\nRed team not required on this head: not owed (stored review)` };
     const gate = { author: advisory.author,
-      body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` };
+      body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=no-send-back -->` };
     const comments = [gate, advisory];
-    for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}] of [
+    const newer = { ...advisory, createdAt: new Date(now - 150_000).toISOString(),
+      body: `${advisory.body.split('\n')[0]}\n1. [not confirmed] (edge-case, degraded) \`scripts/x.mjs:1\` — newer result\nAdvisory only: red team · recorded verdict \`accept\`.` };
+    const olderGate = { ...gate, body: gate.body.replace('outcome=no-send-back',
+      `outcome=card-queued result=${redTeamResultId(parseRedTeamComment(advisory.body))}`) };
+    for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}, standalone = false] of [
       [accepted, null, 'ready-to-merge'],
+      [accepted, 'reviewing', 'red-team', {}, {}, true],
+      [accepted, 'reviewing', 'red-team', { comments: [newer, olderGate, advisory] }],
+      [accepted, 'reviewing', 'red-team', { comments: [...comments,
+        { ...advisory, createdAt: newer.createdAt, body: advisory.body.split('\n')[0] }] }],
       [accepted, null, 'ready-to-merge', { comments: [
-        { ...gate, body: gate.body.replace('outcome=clear', 'outcome=card-queued') }, advisory] }],
-      ...[gate, advisory].flatMap(target => [
-        [accepted, 'reviewing', 'red-team', { comments: comments.map(c => c === target ? { ...c, body: `quoted\n${c.body}` } : c) }],
-        [accepted, 'reviewing', 'red-team', { comments: comments.map(c => c === target ? { ...c, body: c.body.replace('pr=7099', 'pr=7105') } : c) }],
-      ]),
-      ...['sent-back', 'round-cap'].map(outcome => [accepted, 'reviewing', 'red-team',
-        { comments: [...comments, { ...gate, body: gate.body.replace('outcome=clear', `outcome=${outcome}`) }] }]),
+        { ...gate, body: gate.body.replace('outcome=no-send-back', 'outcome=card-queued') }, advisory] }],
+      [accepted, null, 'ready-to-merge', { comments: [advisory] }],
+      [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, body: advisory.body.split('\n')[0] }] }],
+      [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, body: `quoted\n${advisory.body}` }] }],
+      [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, body: advisory.body.replace('pr=7099', 'pr=7105') }] }],
+      ...['sent-back', 'round-cap', 'unknown', 'clear'].map(outcome => [accepted, 'reviewing', 'red-team',
+        { comments: [...comments, { ...gate, body: gate.body.replace('outcome=no-send-back', `outcome=${outcome}`) }] }]),
       [accepted, 'reviewing', 'red-team', {}, { startedAt: now - 150_000 }],
       [accepted, 'reviewing', 'red-team', {}, { startedAt: undefined, updatedAt: now - 600_000 }],
       [accepted, 'reviewing', 'red-team', { comments: [gate, { ...advisory, createdAt: undefined }] }],
@@ -63,12 +72,14 @@ export default {
           if (add && !labels.includes(add)) labels.push(add);
         },
       };
+      const snapshot = { number: 7099, state: 'OPEN', isDraft: false, baseRefName: 'main',
+        headRefOid, mergeable: 'MERGEABLE', comments,
+        statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...prFields };
+      provider.readPrState = () => snapshot;
       const result = tagReviewStatus({ pr: 7099, repo: 'we', provider,
         agents: [{ name: 'review-7099', state: 'working', pid: 7099,
           startedAt: now - 600_000, ...agentFields }],
-        prState: { number: 7099, state: 'OPEN', isDraft: false, baseRefName: 'main',
-          headRefOid, mergeable: 'MERGEABLE', comments,
-          statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...prFields },
+        ...(standalone ? {} : { prState: snapshot }),
         readFixClaim: () => null, planRows: [], requiredChecks: ['test'],
         prStatusSettings: { acceptedRedTeamStatus: 'red-team' }, signalFix: () => {},
       });

@@ -28,7 +28,7 @@
  */
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 import { trustedAdvisoryComments } from '../lib/advisory-labels.mjs';
-import { parseRedTeamGateMarker, gateOutcomesForHead } from '../lib/red-team-gate.mjs';
+import { parseRedTeamGateMarker, gateOutcomesForHead, parseRedTeamComment, isPublishableRedTeamResult, redTeamResultId } from '../lib/red-team-gate.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -112,15 +112,20 @@ export function reviewConcluded(labels, subject, pr = subject?.number) {
       'red-team:pending', 'red-team:blocked', 'review-status:draft-withdrawn'].includes(name))) return false;
   const comments = trustedAdvisoryComments(subject?.comments);
   const outcomes = gateOutcomesForHead(comments, pr, head);
-  if (outcomes.has('sent-back') || outcomes.has('round-cap') || !comments.some(comment => {
+  if ([...outcomes].some(outcome => !['card-queued', 'no-send-back'].includes(outcome))) return false;
+  const advisories = comments.map(comment => ({ comment, parsed: parseRedTeamComment(comment.body) }))
+    .filter(({ parsed }) => parsed?.pr === Number(pr) && parsed.rev === head.toLowerCase());
+  // Unknown chronology cannot establish which result is newest. Equal times retain thread order.
+  if (advisories.some(({ comment }) => !Number.isFinite(timestampMs(comment.createdAt)))) return false;
+  const advisory = advisories.sort((a, b) => timestampMs(a.comment.createdAt) - timestampMs(b.comment.createdAt)).at(-1);
+  if (!isPublishableRedTeamResult(advisory?.parsed)) return false;
+  const resultId = redTeamResultId(advisory.parsed);
+  if (comments.some(comment => {
     const marker = parseRedTeamGateMarker(comment.body);
-    return marker?.pr === Number(pr) && marker.rev === head.toLowerCase() && outcomes.has(marker.outcome);
+    return marker?.pr === Number(pr) && marker.rev === head.toLowerCase()
+      && marker.result && marker.result !== resultId;
   })) return false;
-  const advisory = comments.findLast(comment => {
-    const marker = /^<!-- we:red-team-advisory pr=(\d+) rev=([a-f0-9]{40}) -->/i.exec(comment.body ?? '');
-    return marker && Number(marker[1]) === Number(pr) && marker[2].toLowerCase() === head.toLowerCase();
-  });
-  return advisory ? { createdAt: advisory.createdAt } : false;
+  return { createdAt: advisory.comment.createdAt };
 }
 
 // Only a verdict posted after this row began can conclude it. Missing timestamps
@@ -309,13 +314,13 @@ export function tagReviewStatus({
   const agents = suppliedAgents ?? listAgents();
   let fixClaim = null;
   try { fixClaim = readFixClaim({ repo: repoKey, pr: Number(pr) }); } catch { fixClaim = null; }
-  // Reuse the daemon snapshot; standalone CLI calls read the same head and comments fresh.
+  // Only the supplied daemon snapshot guarantees complete comments; the standalone read is unpaginated.
   // A failed read throws before any label write, preserving an existing human signal.
   const subject = prState ?? provider.readPrState?.(repo, pr);
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
-    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: reviewConcluded(currentLabels, subject, pr) });
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: prState != null && reviewConcluded(currentLabels, subject, pr) });
   const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
     add: null,
     remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)

@@ -4658,3 +4658,10 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Concluded review evidence
+
+`review-status-tag` may retire a lingering review only from a supplied daemon PR snapshot.
+The standalone provider read does not guarantee complete comments. Keep the unknown-gate,
+incomplete-newest-advisory, stale-result-id and standalone cases in
+`review-status-tag.test.mjs` and the `concluded-review-lingering-process` soak break.

@@ -4,6 +4,7 @@
  * one IO test over injected fakes — no `claude`/`gh` process anywhere in this file.
  */
 import { describe, it, expect } from 'vitest';
+import { parseRedTeamComment, redTeamResultId } from '../../lib/red-team-gate.mjs';
 
 import { reviewConcluded, deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus as tagReviewStatusIo, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
 const tagReviewStatus = (options) => tagReviewStatusIo({
@@ -552,8 +553,8 @@ describe('concluded head review with a lingering process', () => {
   const headRefOid = 'ad05aa50' + 'a'.repeat(32);
   const now = Date.parse('2026-11-18T12:00:00Z');
   const comment = { author: { login: 'chalbert' }, createdAt: now - 180_000,
-    body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->` };
-  const gate = { author: comment.author, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` };
+    body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->\n\nRed team not required on this head: not owed (stored review)` };
+  const gate = { author: comment.author, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=no-send-back -->` };
   const subject = { number: 7099, headRefOid, comments: [gate, comment] };
   const row = { name: 'review-7099', state: 'working', pid: 12345, startedAt: now - 600_000 };
   const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
@@ -607,32 +608,61 @@ describe('concluded head review with a lingering process', () => {
     expect(derive({ startedAt: undefined, updatedAt: now - 600_000 })?.state).toBe('reviewing');
     expect(derive({ updatedAt: now })).toBeNull();
   });
-  it.each(['sent-back', 'round-cap'])('keeps reviewing on the head gate outcome %s despite a clear gate', outcome => {
+  it.each(['sent-back', 'round-cap', 'unknown', 'clear', 'future-outcome'])('keeps reviewing on the head gate outcome %s despite a clear gate', outcome => {
     const evidence = reviewConcluded(accepted, { ...subject, comments: [gate, comment,
-      { ...gate, body: gate.body.replace('outcome=clear', `outcome=${outcome}`) }] });
+      { ...gate, body: gate.body.replace('outcome=no-send-back', `outcome=${outcome}`) }] });
     expect(evidence).toBe(false);
     expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
   });
   it('allows card-queued gate evidence', () => {
     expect(reviewConcluded(accepted, { ...subject, comments: [
-      { ...gate, body: gate.body.replace('outcome=clear', 'outcome=card-queued') }, comment,
+      { ...gate, body: gate.body.replace('outcome=no-send-back', 'outcome=card-queued') }, comment,
     ] })).toEqual({ createdAt: comment.createdAt });
   });
-  it.each(['> ', 'quoted\n', '```\n'])('keeps reviewing when advisory or gate markers are embedded behind %j', prefix => {
-    for (const target of [gate, comment]) {
-      const evidence = reviewConcluded(accepted, { ...subject, comments: [gate, comment].map(c =>
-        c === target ? { ...c, body: prefix + c.body } : c) });
-      expect(evidence).toBe(false);
-      expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
-    }
+  it.each(['> ', 'quoted\n', '```\n'])('keeps reviewing when advisory markers are embedded behind %j', prefix => {
+    const evidence = reviewConcluded(accepted, { ...subject, comments: [gate, { ...comment, body: prefix + comment.body }] });
+    expect(evidence).toBe(false);
+    expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
   });
-  it('keeps reviewing on wrong PR markers or missing PR context', () => {
-    for (const target of [gate, comment]) {
-      expect(reviewConcluded(accepted, { ...subject, comments: [gate, comment].map(c =>
-        c === target ? { ...c, body: c.body.replace('pr=7099', 'pr=7105') } : c) })).toBe(false);
-    }
+  it('keeps reviewing on a wrong PR advisory marker or missing PR context', () => {
+    expect(reviewConcluded(accepted, { ...subject, comments: [gate,
+      { ...comment, body: comment.body.replace('pr=7099', 'pr=7105') }] })).toBe(false);
     expect(reviewConcluded(accepted, { ...subject, number: undefined })).toBe(false);
     expect(reviewConcluded(accepted, subject, 7105)).toBe(false);
+  });
+  it('ignores embedded and other-PR gates when complete advisory evidence needs no gate', () => {
+    for (const body of [`quoted\n${gate.body}`, gate.body.replace('pr=7099', 'pr=7105')]) {
+      expect(reviewConcluded(accepted, { ...subject, comments: [{ ...gate, body }, comment] }))
+        .toEqual({ createdAt: comment.createdAt });
+    }
+  });
+  it('allows complete advisory evidence without any gate record', () => {
+    expect(reviewConcluded(accepted, { ...subject, comments: [comment] })).toEqual({ createdAt: comment.createdAt });
+  });
+  it('keeps reviewing on incomplete advisory evidence, including a newest incomplete result', () => {
+    const incomplete = { ...comment, createdAt: now - 150_000, body: comment.body.split('\n')[0] };
+    for (const comments of [[gate, incomplete], [gate, comment, incomplete]]) {
+      expect(reviewConcluded(accepted, { ...subject, comments })).toBe(false);
+    }
+  });
+  it('keeps reviewing when an older card-queued result differs from the newest trusted advisory', () => {
+    const newer = { ...comment, createdAt: now - 150_000,
+      body: `${comment.body.split('\n')[0]}\n1. [not confirmed] (edge-case, degraded) \`scripts/x.mjs:1\` — newer result\nAdvisory only: red team · recorded verdict \`accept\`.` };
+    const resultGate = { ...gate, body: gate.body.replace('outcome=no-send-back',
+      `outcome=card-queued result=${redTeamResultId(parseRedTeamComment(comment.body))}`) };
+    // Thread order in the array cannot make the older result the newest.
+    expect(reviewConcluded(accepted, { ...subject, comments: [newer, resultGate, comment] })).toBe(false);
+    const matching = { ...resultGate, body: resultGate.body.replace(
+      redTeamResultId(parseRedTeamComment(comment.body)), redTeamResultId(parseRedTeamComment(newer.body))) };
+    expect(reviewConcluded(accepted, { ...subject, comments: [newer, matching, comment] })).toEqual({ createdAt: newer.createdAt });
+  });
+  it('standalone calls keep reviewing without a supplied complete daemon snapshot; supplied snapshots clear', () => {
+    for (const supplied of [false, true]) {
+      const result = tagReviewStatus({ pr: 7099, repo: 'we', agents: [row],
+        ...(supplied ? { prState: subject } : {}), currentLabels: [...accepted, 'review-status:reviewing'],
+        readFixClaim: () => null, provider: { readPrState: () => subject, ensureLabel: () => {}, setLabels: () => {} } });
+      expect(result.label).toBe(supplied ? null : 'review-status:reviewing');
+    }
   });
   it('keeps live fix claims, fix sessions, CI healing and draft states', () => {
     expect(derive({}, { fixClaim: {} })).toEqual({ role: 'fix', state: 'fixing' });
