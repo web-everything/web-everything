@@ -406,12 +406,13 @@ describe('stored-review not-owed rule (R730)', () => {
 
 
 describe('live red-team alert suppression', () => {
-  it.each(['marker', 'label', 'check', 'stale head'])('settles %s without publishing or retrying', kind => {
+  const clearResult = rev => `${redTeamMarker(pr, rev)}\nAdvisory only: red team · recorded verdict \`accept\`.\nThe red team tried to break this change and reported nothing.`;
+  it.each(['completed result', 'check', 'stale head'])('settles %s without publishing or retrying', kind => {
     const f = fixture();
     const provider = { readPrState: vi.fn(() => ({ headRefOid: kind === 'stale head' ? 'b'.repeat(40) : head,
-      labels: kind === 'label' ? [{ name: 'red-team:clear' }] : [] })) };
+      labels: [] })) };
     f.io.readLiveRedTeam = createLiveRedTeamReader({ provider,
-      readComments: () => kind === 'marker' ? [{ body: redTeamMarker(pr, head), author: { login: 'web-everything' } }] : [],
+      readComments: () => kind === 'completed result' ? [{ body: clearResult(head), author: { login: 'web-everything' } }] : [],
       readCheckFact: () => ({ ok: kind === 'check' }) });
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
@@ -420,14 +421,19 @@ describe('live red-team alert suppression', () => {
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
   });
-  it.each(['not clear', 'throws', 'missing', 'unreadable head', 'forged marker', 'old marker'])
+  it.each(['not clear', 'throws', 'missing', 'unreadable head', 'forged marker', 'old marker',
+    'stale clear label', 'bare marker', 'malformed result', 'old result'])
   ('fails closed and publishes when live evidence is %s', kind => {
     const f = fixture();
     if (kind === 'throws') f.io.readLiveRedTeam = () => { throw Error('offline'); };
     else if (kind !== 'missing') f.io.readLiveRedTeam = createLiveRedTeamReader({
-      provider: { readPrState: () => ({ headRefOid: kind === 'unreadable head' ? null : head, labels: [] }) },
-      readComments: () => [{ body: redTeamMarker(pr, kind === 'old marker' ? 'b'.repeat(40) : head),
-        author: { login: kind === 'forged marker' ? 'attacker' : 'web-everything' } }].filter(() => kind.endsWith('marker')),
+      provider: { readPrState: () => ({ headRefOid: kind === 'unreadable head' ? null : head,
+        labels: kind === 'stale clear label' ? [{ name: 'red-team:clear' }] : [] }) },
+      readComments: () => [{ body: kind === 'old result' ? clearResult('b'.repeat(40))
+        : kind === 'malformed result' ? `${clearResult(head)}\n  1. [confirmed] malformed finding`
+          : redTeamMarker(pr, kind === 'old marker' ? 'b'.repeat(40) : head),
+        author: { login: kind === 'forged marker' ? 'attacker' : 'web-everything' } }]
+        .filter(() => kind.endsWith('marker') || kind.endsWith('result')),
       readCheckFact: () => ({ ok: false }) });
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);

@@ -9,7 +9,7 @@ import { VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
 import { redTeamOwedFor } from './review-red-team-policy.mjs';
-import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
+import { isPublishableRedTeamResult, redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
@@ -93,10 +93,8 @@ export function createLiveRedTeamReader({ provider, readComments, env = process.
     if (!isRealHead(live?.headRefOid)) throw Error('live PR head unreadable');
     if (!isRealHead(head)) return { clear: false };
     if (live.headRefOid.toLowerCase() !== head.toLowerCase()) return { clear: true };
-    if (live.labels?.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:clear'))
-      return { clear: true };
     const result = redTeamForHead(readComments({ repo, pr }), pr, head);
-    if (result?.findings?.length === 0) return { clear: true };
+    if (result?.findings?.length === 0 && isPublishableRedTeamResult(result)) return { clear: true };
     return { clear: readCheckFact({ repo, pr, headSha: head })?.ok === true };
   };
 }

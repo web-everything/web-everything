@@ -74,12 +74,13 @@ export const INFO_NOTE_COMMENT_MARKER = 'ℹ️ conveyor — note';
  *     minting a new episode; only a FRESH wait (a new `since`, meaning the old one was resolved first) is new.
  *   - anything else: keyed on the note's own `text`, the only stable field a shape this module does not know
  *     about is guaranteed to carry — never silently drops an unrecognised note kind.
- * @param {{kind?:string, prNumber?:(number|null), attempts?:number, cap?:number, capKind?:string,
+ * A note carrying `head` also keys on that head, so successor-head exhaustion is a new episode.
+ * @param {{kind?:string, prNumber?:(number|null), head?:string, attempts?:number, cap?:number, capKind?:string,
  *   sessionId?:string, pid?:number, since?:string, startedAt?:string, text?:string}} note
  * @returns {string}
  */
 export function noteEpisodeKey(note) {
-  const pr = note?.prNumber ?? 'unknown';
+  const pr = `${note?.prNumber ?? 'unknown'}${note?.head && note.kind !== 'ruling-dispute' ? `:${note.head}` : ''}`;
   if (note?.kind === 'ci-heal-exhausted') return `ci-heal-exhausted:${pr}:${note.attempts}/${note.cap}`;
   if (note?.kind === 'awaiting-permission') {
     return `awaiting-permission:${pr}:${note.sessionId ?? note.pid ?? 'unknown-session'}`;

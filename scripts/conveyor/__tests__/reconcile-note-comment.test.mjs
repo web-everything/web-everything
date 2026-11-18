@@ -13,6 +13,15 @@ import {
 } from '../reconcile-note-comment.mjs';
 
 describe('noteEpisodeKey', () => {
+  it.each(['owed-ci-rerun-spent', 'ci-heal-exhausted', 'something-new', 'ruling-dispute'])
+  ('%s: identical text on a successor head starts a new comment episode', kind => {
+    const first = { kind, prNumber: 7, head: 'a'.repeat(40), attempts: 3, cap: 3, text: 'attempts exhausted' };
+    const second = { ...first, head: 'b'.repeat(40) };
+    expect(noteEpisodeKey(first)).not.toBe(noteEpisodeKey(second));
+    const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+    expect(planNoteComment(first, comments, { mode: 'all' }).alreadyPosted).toBe(true);
+    expect(planNoteComment(second, comments, { mode: 'all' }).alreadyPosted).toBe(false);
+  });
   it('ci-heal-exhausted: keyed on the attempt/cap pair', () => {
     expect(noteEpisodeKey({ kind: 'ci-heal-exhausted', prNumber: 2636, attempts: 2, cap: 3 })).toBe('ci-heal-exhausted:2636:2/3');
   });
