@@ -274,7 +274,7 @@ describe('Argon probation builds', () => {
   });
 
   it.each(['gemini-9-unvetted', '--x', 'gemini-4; id', 'claude-opus-5-5', null, false,
-    { toString: null }, ['gemini-4-argon-high'], [], 42,
+    { toString: null }, ['gemini-4-carbon-high'], [], 42,
   ].map(model => ({ model })))('skips an invalid injected Argon model: $model', ({ model }) => {
     const result = selectProvider(task, context({ argonSettings: { value: { enabled: true, model }, sources: {} } }));
     expect(result.probationWorker?.id).toBe('codex');
@@ -285,10 +285,10 @@ describe('Argon probation builds', () => {
     const malformed = { toString: null };
     const settings = { value: { enabled: malformed, model: malformed }, sources: { enabled: malformed, model: malformed } };
     expect(selectProvider(task, context({ argonSettings: settings })).probationWorker?.id).toBe('codex');
-    expect(selectProvider(task, context({ argonSettings: { ...settings, value: { enabled: true, model: 'gemini-4-argon-high' } } })).probationWorker?.id).toBe('antigravity-argon');
+    expect(selectProvider(task, context({ argonSettings: { ...settings, value: { enabled: true, model: 'gemini-4-carbon-high' } } })).probationWorker?.id).toBe('antigravity-argon');
   });
 
-  it.each([{}, { value: null }, { value: { enabled: true } }, { value: { enabled: true, model: 'gemini-4-argon-high' }, sources: null }])('handles partial injected settings: %j', (argonSettings) => {
+  it.each([{}, { value: null }, { value: { enabled: true } }, { value: { enabled: true, model: 'gemini-4-carbon-high' }, sources: null }])('handles partial injected settings: %j', (argonSettings) => {
     const result = selectProvider(task, context({ argonSettings }));
     expect(result.probationWorker?.id).toBe(argonSettings.value?.model ? 'antigravity-argon' : 'codex');
   });
@@ -297,7 +297,7 @@ describe('Argon probation builds', () => {
     expect(PROBATION_WORKERS['antigravity-argon']).toMatchObject({ simpleOnly: false });
     expect(selectProvider(task, context())).toMatchObject({
       recommendation: 'claude', probationWorker: {
-        id: 'antigravity-argon', provider: 'antigravity', model: 'gemini-4-argon-high',
+        id: 'antigravity-argon', provider: 'antigravity', model: 'gemini-4-carbon-high',
         executor: 'antigravity', launcher: 'scripts/gemini-direct-task.mjs', checker: 'codex',
         supervision: 'full', review: 'full', runRating: 'required',
       },
@@ -311,7 +311,7 @@ describe('Argon probation builds', () => {
   });
 
   it('skips Argon when build.argon.enabled is off and records its source', () => {
-    const res = selectProvider(task, context({ argonSettings: { value: { enabled: false, model: 'gemini-4-argon-high' }, sources: { enabled: 'tool', model: 'standard' } } }));
+    const res = selectProvider(task, context({ argonSettings: { value: { enabled: false, model: 'gemini-4-carbon-high' }, sources: { enabled: 'tool', model: 'standard' } } }));
     expect(res.probationWorker?.id).toBe('codex');
     expect(res.auditTrail).toContainEqual(expect.objectContaining({ criterion: 'probation-candidate:antigravity-argon', result: 'disabled', dataConsulted: expect.stringContaining('tool') }));
   });
@@ -321,7 +321,7 @@ describe('Argon probation builds', () => {
     { criticalWork: undefined },
     { criticalMisses: undefined },
     { filesTouched: ['docs/agent/platform-decisions.md'] },
-    { criticalMisses: [{ provider: 'antigravity', model: 'gemini-4-argon-high', taskType: task.taskType }] },
+    { criticalMisses: [{ provider: 'antigravity', model: 'gemini-4-carbon-high', taskType: task.taskType }] },
   ])('retains the critical, statute and exact-triple vetoes: %j', (extra) => {
     expect(selectProvider(task, context(extra)).probationWorker?.id).not.toBe('antigravity-argon');
   });
@@ -340,15 +340,15 @@ describe('build.argon settings cascade', () => {
     }
     for (const model of BUILD_ARGON_MODELS) {
       expect(resolveBuildArgonModel(model)).toBe(model);
-      expect(model).toBe('gemini-4-argon-high');
     }
+    expect(BUILD_ARGON_MODELS).toEqual(['gemini-4-argon-high', 'gemini-4-carbon-high']);
   });
   it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'])('rejects non-simple model overrides through settings and injection: %s', (model) => {
     for (const settings of [
       { read: () => ({ build: { argon: { model } } }), platform: {} },
       { read: () => ({}), platform: { argon: { model } } },
     ]) {
-      expect(readBuildArgonSettings({ ...settings, env: {} }).value.model).toBe('gemini-4-argon-high');
+      expect(readBuildArgonSettings({ ...settings, env: {} }).value.model).toBe('gemini-4-carbon-high');
     }
     const picked = selectProbationWorker({ taskType: 'build-new-feature', simple: false,
       argonSettings: { value: { enabled: true, model }, sources: {} },
@@ -369,40 +369,40 @@ describe('build.argon settings cascade', () => {
   it('defaults enabled and logs standard sources', () => {
     const messages = [];
     const result = readBuildArgonSettings({ read: () => ({}), platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log: message => messages.push(message) });
-    expect(result).toEqual({ value: { enabled: true, model: 'gemini-4-argon-high' }, sources: { enabled: 'standard', model: 'standard' } });
+    expect(result).toEqual({ value: { enabled: true, model: 'gemini-4-carbon-high' }, sources: { enabled: 'standard', model: 'standard' } });
     expect(messages.join(' ')).toContain('argon.enabled=true (standard)');
   });
 
   it('resolves platform and tool independently per leaf, including the model used for routing', () => {
     const result = readBuildArgonSettings({
-      read: () => ({ build: { argon: { model: 'gemini-4-argon-high' } } }),
-      platform: { argon: { enabled: false, model: 'gemini-4-argon-high' } }, env: {},
+      read: () => ({ build: { argon: { model: 'gemini-4-carbon-high' } } }),
+      platform: { argon: { enabled: false, model: 'gemini-4-carbon-high' } }, env: {},
     });
-    expect(result).toEqual({ value: { enabled: false, model: 'gemini-4-argon-high' }, sources: { enabled: 'platform', model: 'tool' } });
+    expect(result).toEqual({ value: { enabled: false, model: 'gemini-4-carbon-high' }, sources: { enabled: 'platform', model: 'tool' } });
     const enabled = { ...result, value: { ...result.value, enabled: true } };
     expect(selectProbationWorker({ taskType: 'build-new-feature', argonSettings: enabled,
       scorecards: [row({ provider: 'codex', model: CODEX_MODEL, taskType: 'build-new-feature' })],
-    }).worker.model).toBe('gemini-4-argon-high');
+    }).worker.model).toBe('gemini-4-carbon-high');
   });
 
   it.each([
     'gemini-9-unvetted', '--x', 'gemini-4; id', 'claude-opus-5-5',
-    'gemini-4-argon-high\n', 'gemini-4-argon-high\r', 'gemini-4-argon-high\u2028',
-    'gemini-4-argon-high`id`', 'gemini-4-argon-high"', "gemini-4-argon-high'",
+    'gemini-4-carbon-high\n', 'gemini-4-carbon-high\r', 'gemini-4-carbon-high\u2028',
+    'gemini-4-carbon-high`id`', 'gemini-4-carbon-high"', "gemini-4-carbon-high'",
     'gemini-../4', 'ｇｅｍｉｎｉ-4-argon-high', 'gemini-4-argon-\u200bhigh',
-    'gemini-4-argon-high' + '--x',
+    'gemini-4-carbon-high' + '--x',
   ])('ignores off-catalogue or malformed strings at both cascade layers: %j', (model) => {
-    const fallback = { enabled: true, model: 'gemini-4-argon-high' };
+    const fallback = { enabled: true, model: 'gemini-4-carbon-high' };
     const tool = readBuildArgonSettings({ read: () => ({ build: { argon: { model } } }), platform: { argon: fallback }, env: {} });
     expect(tool.value.model).toBe(fallback.model);
     expect(tool.sources.model).toBe('platform');
     const platform = readBuildArgonSettings({ read: () => ({}), platform: { argon: { model } }, env: {} });
-    expect(platform.value.model).toBe('gemini-4-argon-high');
+    expect(platform.value.model).toBe('gemini-4-carbon-high');
     expect(platform.sources.model).toBe('standard');
   });
 
   it('ignores invalid tool leaves and tolerates unreadable tool settings', () => {
-    const platform = { argon: { enabled: false, model: 'gemini-4-argon-high' } };
+    const platform = { argon: { enabled: false, model: 'gemini-4-carbon-high' } };
     for (const read of [() => ({ build: { argon: { enabled: 'true', model: false } } }), () => { throw new Error('unreadable'); }]) {
       expect(readBuildArgonSettings({ read, platform, env: {} }).sources).toEqual({ enabled: 'platform', model: 'platform' });
     }
