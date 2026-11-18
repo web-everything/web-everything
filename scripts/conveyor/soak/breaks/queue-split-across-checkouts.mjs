@@ -30,6 +30,7 @@ const MODULE_FILES = [
   'scripts/lib/daemon-clone-layout.mjs', // card 89 S1 — logical clone identity, imported by automation-home + daemon-last-good
   'scripts/lib/daemon-last-good.mjs',
   'scripts/lib/constellation-repos.mjs',
+  'scripts/lib/repo-names.mjs', // R945 — constellation-repos' repo-name setting import
 ];
 
 function makeCheckout(sourceRoot, dir) {

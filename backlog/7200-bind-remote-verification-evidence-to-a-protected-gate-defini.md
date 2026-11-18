@@ -3,7 +3,7 @@ bornAs: x5eummi
 kind: story
 size: 3
 status: open
-humanGate: { kind: setup, what: "Mac Studio self-hosted runner (R112); resume remote verify once it is up" }
+humanGate: { kind: setup, what: "remote runner (R112); resume remote verify once it is up" }
 scope: ["we:.github/workflows/remote-verify.yml", "we:scripts/lib/remote-verify.mjs", "we:scripts/verify-lane.mjs", "we:scripts/__tests__/remote-verify.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
@@ -38,4 +38,4 @@ This intentionally refuses **all content-changing lane commits**, including legi
 6. **State over time** — Recheck retries and base changes; handle legitimate definition updates explicitly instead of trusting a stale comparison.
 7. **Who wrote it** — A lane can modify its own workflow and scripts. Trust must come from protected execution or a protected land-time policy outside that lane.
 
-Parked under operator ruling R112 (2026-10-25): resumes with the Mac Studio self-hosted runner. Code kept on branches lane/remote-verify-runner@25c401156c80c86be03d0f10880bde65e6846a47 and lane/remote-test-client@b46b3a004b209c4212a28b0d2f78a48a81a01af1 (PRs #5878, #5881 closed).
+Parked under operator ruling R112 (2026-10-25): resumes with the remote runner. Code kept on branches lane/remote-verify-runner@25c401156c80c86be03d0f10880bde65e6846a47 and lane/remote-test-client@b46b3a004b209c4212a28b0d2f78a48a81a01af1 (PRs #5878, #5881 closed).

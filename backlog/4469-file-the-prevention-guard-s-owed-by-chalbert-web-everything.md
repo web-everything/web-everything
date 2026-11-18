@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/build-dispatch-mutation-check.mjs", "we:scripts/conveyor/__tests__/build-dispatch-mutation-check.test.mjs", "we:scripts/conveyor/__tests__/build-dispatch-policy.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-14"
-preparedAgainstSha: "308b7213023446e7cf6e4e8146a99f6fe922da77"
+preparedDate: "2026-11-18"
+preparedAgainstSha: "1565355003eab180fd9513c8d8f88987e6212e43"
 tags: []
 ---
 
@@ -90,3 +90,4 @@ Consider additional independently justified mutation targets and wider CI integr
 - Corrected scope: add the focused gate plus its matching unit test, and extend the existing policy test with named witnesses. The production policy module is read/mutated in scratch only, so it is not in the edit touch set. Retain size 3: approximately 120 changed lines for the gate, 110 for gate tests and 25 for policy witnesses (255 total across three files). This is a story; no estimatedLoc field is added.
 - No runtime tests were run during this card-only preparation. All cited behavior above is source evidence; actual mutation proof is explicitly owed by the build.
 - Re-verified (2026-11-06, 11-10, 11-14; latest origin/main 432c945266): `busy = running.length` still at `we:scripts/conveyor/build-dispatch-policy.mjs:254`, gate file still absent, policy, its test and guard-1c precedent unchanged since the prior stamp. Design/MVP/Acceptance stand; stamp refreshed.
+- Re-verified (2026-11-18, origin/main 1565355003): `busy = running.length` still at `we:scripts/conveyor/build-dispatch-policy.mjs:254`, gate file still absent. Design/MVP/Acceptance stand; stamp refreshed.

@@ -2,7 +2,7 @@ import { pidIdentity } from './pid-alive.mjs';
 /**
  * @file scripts/lib/dispatch-throttle.mjs
  * @description Declared dispatch-throttle settings + the two DEFER-ONLY launch gates (live incident 2026-10-06:
- *   4 fixers + a build + agent builds drove host load to ~36 on 12 cores). Both gates only refuse NEW launches
+ *   4 fixers + a build + agent builds drove host load to ~36 against the host core count). Both gates only refuse NEW launches
  *   with a logged reason; they never interrupt running work and never weaken a safety check.
  *
  * SETTINGS live in `we:scripts/dispatch-settings.json` (declared), each overridable by an env var (a launchd

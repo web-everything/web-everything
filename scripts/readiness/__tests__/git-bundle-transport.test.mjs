@@ -572,7 +572,7 @@ describe('R593 raw commit object scan (R559)', () => {
     if (r.status !== 0) throw new Error(r.stderr);
     return r.stdout.trim();
   };
-  const sig = (comment) => `gpgsig -----${'BEGIN'} PGP SIGNATURE-----\n Comment: ${comment}\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n`;
+  const sig = (comment) => `gpgsig ${'-----' + 'BEGIN'} PGP SIGNATURE-----\n Comment: ${comment}\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n`;
   it('flags a token hidden in a multiline gpgsig header (empty child commit)', async () => {
     const head = rawCommit(sig('ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'));
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'commit-object', finding: 'github-token' });
