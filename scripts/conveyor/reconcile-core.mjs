@@ -2625,6 +2625,12 @@ export function planReconcile({
         standDowns: stoodDown,
         why: `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,
       });
+      // Use the shared operator-note publisher: its trusted episode marker posts once,
+      // while the refusal continues to hold until an explicit answer. Count all historical
+      // stand-downs so a later question on the same head starts a new episode.
+      notes.push({ kind: 'stood-down', prNumber,
+        text: `PR #${prNumber}: needs your decision — unanswered stand-down on head ${pr.headRefOid ?? 'unknown'}`
+          + ` (question ${standDownComments(pr.comments).length}). Record an explicit operator answer with stand-down-answer.mjs.` });
       continue;
     }
 
@@ -2790,7 +2796,9 @@ export function planReconcile({
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
     const phase = classifyPr({
-      state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
+      // The planner accepts strings and GraphQL label objects; the board classifier
+      // accepts objects only. Never let a live send-back disappear behind an older accept.
+      state: pr?.state, labels: labelNames(pr?.labels).map(name => ({ name })), mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
     }, requiredChecks);
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
@@ -3978,7 +3986,8 @@ export function planReconcile({
     // floor below, which a PR can independently have already exhausted on real review negotiation (CONFIRMED
     // LIVE: `web-everything/web-everything#2549`, `review-round:5` against the shared cap of 5, zero conflict-fix
     // rounds ever run). See that constant's own docblock for the full incident.
-    const isConflictBounce = phase === 'bounced' && withPhase.labels.includes(CONFLICT_LABEL);
+    const isConflictBounce = phase === 'bounced' && (withPhase.labels.includes(CONFLICT_LABEL)
+      || String(pr?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY');
     if (isConflictBounce) {
       // #2787-live-incident — `currentRef` is `defaultBranch` (this population is, by definition, a main-base
       // conflict); `mainSha` is `origin/<defaultBranch>`'s own current tip, when the IO shell supplied one (see

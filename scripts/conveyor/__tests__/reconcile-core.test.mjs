@@ -63,6 +63,7 @@ import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { planNoteComment } from '../reconcile-note-comment.mjs';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
@@ -99,6 +100,35 @@ const pr1563 = (over = {}) => ({
   statusCheckRollup: greenRollup,
   comments: [finding()],
   ...over,
+});
+
+describe('live send-back supersedes stale accepted phase and verdict', () => {
+  const oldHead = 'a'.repeat(40), head = 'b'.repeat(40);
+  const accepted = { author: AUTOMATION, createdAt: '2026-08-26T15:00:00Z', body: buildReviewedShaMarker(oldHead) };
+  const sentBack = { ...finding(), createdAt: '2026-08-26T16:00:00Z' };
+  it.each([
+    ['review:changes', { name: 'ready-to-merge' }],
+    ['review:changes', { name: 'review:accepted' }],
+    ['review:changes', { name: 'review:human' }],
+  ])('uses the live changes label despite stale acceptance: %j', (...labels) => {
+    const plan = planReconcile({ prs: [pr1563({ labels, headRefOid: head, comments: [accepted, sentBack] })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', headRefOid: head }]);
+    expect(plan.refusals).toEqual([]);
+  });
+  it.each(['label', 'merge-state'])('repairs a same-head conflict after acceptance using %s evidence', evidence => {
+    const plan = planReconcile({ prs: [pr1563({
+      labels: ['review:changes', { name: 'review:pending' }, ...(evidence === 'label' ? ['merge-status:conflicting'] : [])],
+      headRefOid: head, mergeStateStatus: evidence === 'merge-state' ? 'DIRTY' : 'CLEAN',
+      comments: [{ ...accepted, body: buildReviewedShaMarker(head) }, sentBack],
+    })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', isConflict: true }]);
+    expect(plan.refusals).toEqual([]);
+  });
+  it('keeps the no-findings guard for a send-back without conflict evidence', () => {
+    const plan = planReconcile({ prs: [pr1563({ labels: ['review:changes'], comments: [] })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals[0].kind).toBe('no-findings');
+  });
 });
 
 /** The four PRs actually open at 17:34Z, with the labels and comment counts measured then. */
@@ -214,6 +244,22 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(plan.refusals[0].kind).toBe('stood-down');
     expect(plan.refusals[0].prNumber).toBe(1563);
     expect(plan.refusals[0].standDowns).toBe(1);
+  });
+
+  it('escalates an unanswered stand-down once through trusted operator-note markers', () => {
+    const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
+    const first = run(stoodDown);
+    expect(first.notes).toMatchObject([{ kind: 'stood-down', prNumber: 1563 }]);
+    const note = first.notes[0];
+    const publication = planNoteComment(note, stoodDown.comments);
+    expect(publication.alreadyPosted).toBe(false);
+    expect(publication.body).toContain('needs your decision');
+    const comments = [...stoodDown.comments, { author: AUTOMATION, body: publication.body }];
+    const next = run({ ...stoodDown, comments });
+    expect(next.dispatch).toEqual([]);
+    expect(next.refusals[0].kind).toBe('stood-down');
+    expect(planNoteComment(next.notes[0], comments).alreadyPosted).toBe(true);
+    expect(planNoteComment(note, [...stoodDown.comments, { author: { login: 'stranger' }, body: publication.body }]).alreadyPosted).toBe(false);
   });
 
   it('TERMINAL — a week later the answer is byte-identical: no decay, no clock', () => {
