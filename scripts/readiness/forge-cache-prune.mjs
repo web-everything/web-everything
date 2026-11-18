@@ -237,7 +237,7 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         && final.mtimeMs <= now && records.every(r => r.mtimeMs <= final.mtimeMs)
         && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS;
       if (lock === undefined && !leaked) throw new Error('Invalid reserved lock evidence');
-      let latestKnown = false;
+      let latestKnown = false, unresolvedProfile = false;
       // The newest present phase decides even when it carries no profile fields:
       // an older known profile cannot narrow protection for a later unknown one.
       const phaseRank = {prepared: 0, running: 1, receipt: 2};
@@ -264,13 +264,17 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
         if (leaked) continue;
         if (profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
+        // Digest-bearing evidence must resolve even when a newer record is known.
+        if (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined)) {
+          unresolvedProfile = true;
+        }
         // The newest record decides: an older known profile must not mask a later unknown one.
         if (evidence === latest) latestKnown = profileKnown;
       }
       if (leaked) continue;
       // A legacy writer can change profiles without taking a lease. Missing
       // profile evidence is likewise safe only at the whole-lock boundary.
-      if (writerGuard !== 1 || !latestKnown) locks.add(lock);
+      if (writerGuard !== 1 || !latestKnown || unresolvedProfile) locks.add(lock);
     }
     return {complete: true, profiles, locks};
   } catch (error) {
