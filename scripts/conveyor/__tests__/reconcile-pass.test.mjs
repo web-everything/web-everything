@@ -588,6 +588,13 @@ describe('enrichPrsWithConflictDisposition', () => {
       expect(enrichPrsWithConflictDisposition([pr], { mainSha: base, defaultBranch: 'trunk', compute: () => evidence('clean') })[0].conflictDisposition).toBe('clean');
     });
 
+  it('never trusts a supplied conflictDisposition on unprobed rows', async () => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const supplied = dirty({ conflictDisposition: 'clean' }), stacked = dirty({ baseRefName: 'lane/base', conflictDisposition: 'clean' });
+    const out = enrichPrsWithConflictDisposition([supplied, stacked], { mainSha: base, compute: vi.fn(), max: 0 });
+    expect(out.map(row => row.conflictDisposition)).toEqual([null, null]);
+  });
+
   it('leaves stacked-base, non-conflicting and closed PR rows unchanged', async () => {
     const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
     const prs = [dirty({ baseRefName: 'lane/base' }), dirty({ mergeStateStatus: 'CLEAN' }), dirty({ state: 'CLOSED' }), dirty({ state: 'MERGED' })];

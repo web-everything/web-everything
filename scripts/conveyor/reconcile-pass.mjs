@@ -1391,8 +1391,10 @@ export function enrichPrsWithConflictDisposition(prs, { compute = gitMergeTreePa
   defaultBranch = 'main', mainSha = defaultResolveMainSha(defaultBranch), max = CONFLICT_DISPOSITION_MAX_PER_PASS } = {}) {
   let remaining = Number.isInteger(max) && max > 0 ? max : 0;
   return prs.map(pr => {
+    // Supplied/stale evidence is never trusted: only a probe made this pass may set the field.
+    const stripped = Object.hasOwn(pr, 'conflictDisposition') ? { ...pr, conflictDisposition: null } : pr;
     if (!remaining || (pr.state != null && pr.state !== 'OPEN') || pr.baseRefName !== defaultBranch
-      || !(pr.mergeable === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY' || hasLabel(pr.labels, 'merge-status:conflicting'))) return pr;
+      || !(pr.mergeable === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY' || hasLabel(pr.labels, 'merge-status:conflicting'))) return stripped;
     remaining--;
     let conflictDisposition = null;
     try {
