@@ -78,7 +78,8 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
     // A self-reported time more than FUTURE_SKEW_MS ahead of now is untrustworthy: unusable (and, for a current-question
     // record, still blocks the prior fallback above). Among usable records the LATER-WRITTEN (ledger order) one wins, never
     // the later self-reported timestamp, so a forged far-future pass cannot outrank a subsequently appended WEAKENED.
-    if (Date.parse(record.at) > now + FUTURE_SKEW_MS) continue;
+    // A future-dated WEAKENED still counts (fail closed): only a future-dated pass is distrusted.
+    if (record.verdict === 'NOT WEAKENED' && Date.parse(record.at) > now + FUTURE_SKEW_MS) continue;
     if (isCurrent) latest = record;
     else prior = record;
   }

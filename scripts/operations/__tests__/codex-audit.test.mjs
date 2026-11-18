@@ -538,6 +538,12 @@ describe('findAudit ordering and clock trust (#7011)', () => {
     expect(find([pass])).toBeNull();
   });
 
+  it('a future-dated WEAKENED still blocks an older pass (fail closed)', () => {
+    const pass = rec('NOT WEAKENED', '2026-11-17T11:00:00Z');
+    const weak = rec('WEAKENED', '2099-01-01T00:00:00Z');
+    expect(find([pass, weak])).toBe(weak);
+  });
+
   it('tolerates up to 5 minutes of clock skew but not more', () => {
     expect(find([rec('NOT WEAKENED', '2026-11-17T12:04:00Z')])).not.toBeNull();
     expect(find([rec('NOT WEAKENED', '2026-11-17T12:06:00Z')])).toBeNull();
