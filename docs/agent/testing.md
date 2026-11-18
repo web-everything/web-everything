@@ -4662,7 +4662,7 @@ receipts require fresh verification. Child environments are allowlisted and the 
 only after the suite pipeline stops. `urgent-sweep` is one bounded pass (32 loads, 100 checks per SHA);
 the orchestrator schedules it. Its durable settlement ledger prevents repeat handling and stores a
 `sweep-cursor` before each batch so pending or unreadable loads cannot starve later entries.
-Cursor records never settle a load; older ledgers without a cursor start at the beginning. Required CI
-failures remove the recorded clone/ref with a tip guard and open a NEEDS-YOU escalation through
+Cursor records never settle a load; older ledgers without a cursor start at the beginning. Completed
+failures in any check-run on the SHA, regardless of job or app, remove the recorded clone/ref with a tip guard and open a NEEDS-YOU escalation through
 `land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
 require operator repair or manual unloading. Keep these paths in `urgent-sweep.test.mjs`.

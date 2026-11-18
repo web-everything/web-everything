@@ -41,7 +41,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       return JSON.parse(result.stdout);
     },
     remove: r => remove({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
-      reason: `urgent-sweep: required CI failed for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
+      reason: `urgent-sweep: CI failed for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
     escalate: packet => writeEscalationPacket(packet, { dir: join(home, 'workspace/.operations/escalations'), fs: io }),
   };
@@ -83,12 +83,12 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
         const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
           && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
-        if (checks.some(c => c.status === 'completed' && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(c.conclusion))) {
+        if (data.check_runs.some(c => c.status === 'completed' && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(c.conclusion))) {
           const removal = await deps.remove(r);
           if (!removal || removal.refused || (removal.removed !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };
           await deps.event(event);
-          await escalate(id, r.ref, `Unloaded ${r.sha}: required CI failed. Inspect and repair before reloading.`);
+          await escalate(id, r.ref, `Unloaded ${r.sha}: CI failed. Inspect and repair before reloading.`);
           await deps.settle({ ...event, status: 'settled-unloaded' });
           results.push({ id, status: 'settled-unloaded' });
         } else if (required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))

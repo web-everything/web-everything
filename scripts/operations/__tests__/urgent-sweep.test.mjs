@@ -29,6 +29,15 @@ describe('urgent CI sweep', () => {
     const f = fixture(); await f.run(); await f.run();
     expect(f.settlements()[0].status).toBe('settled-green'); expect(f.d.checks).toHaveBeenCalledTimes(1); expect(f.d.remove).not.toHaveBeenCalled();
   });
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('unloads and raises NEEDS-YOU for completed smoke %s from any app', async conclusion => {
+    for (const appId of [15368, 1]) {
+      const f = fixture([...required.map(n => check(n)), check('smoke', conclusion, { app: { id: appId } })]);
+      expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+      expect(f.d.remove).toHaveBeenCalledWith(load);
+      expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded' })]);
+      expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
+    }
+  });
   it('unloads and raises NEEDS-YOU when required CI fails after required green with another run pending', async () => {
     const f = fixture([...required.map(n => check(n)), check('smoke', null, { status: 'in_progress' })]);
     expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
@@ -50,8 +59,7 @@ describe('urgent CI sweep', () => {
     ['unrelated running check', [...required.map(n => check(n)), check('smoke', null, { status: 'in_progress' })]],
     ['missing required checks', [check('test')]],
     ['pending', [check('test', null, { status: 'queued' })]],
-    ['unrelated failure', [check('smoke', 'failure')]],
-    ['foreign app', [check('test', 'failure', { app: { id: 1 } })]],
+    ['foreign app success cannot satisfy required test', [check('test', 'success', { app: { id: 1 } })]],
     ['one shard pending', [check('test-shard (1)'), check('test-shard (2)', null, { status: 'in_progress' }), check('changes'), check('test')]],
   ])('leaves %s unsettled', async (_, rows) => {
     const f = fixture(rows); expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
