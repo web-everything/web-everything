@@ -6,7 +6,7 @@ import { it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decideRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmission } from '../runtime-admission.mjs';
+import { decideRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmission, setRuntimeAdmissionCards, withRuntimeAdmissionTick } from '../runtime-admission.mjs';
 import { readBuildPrioritySettings } from '../build-queue.mjs';
 import { routeHeldItems } from '../../conveyor/build-dispatch-hold-router.mjs';
 
@@ -61,7 +61,7 @@ it.each([only([]), { held: true }])('hold routing admits no work or reservations
 it('records unique refusals on the row and logs once per tick', async () => {
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
   try {
-    const result = await withRuntimeAdmission(() => only([]), async () => {
+    const result = await withRuntimeAdmissionTick(() => only([]), async () => {
       assertRuntimeAdmitted({ num: 12 }, 'build');
       assertRuntimeAdmitted({ num: 12 }, 'build');
       assertRuntimeAdmitted({ num: 12 }, 'prepare');
@@ -75,7 +75,7 @@ it('records unique refusals on the row and logs once per tick', async () => {
 it.each([only([]), { held: true }, only(['13'])])('infra recovery refuses before exec and reports the retained card with %j', async settings => {
   const exec = vi.fn();
   const stored = [{ num: '12', ref: 'lane/12' }];
-  const report = await withRuntimeAdmission(() => settings, async () => cliRetryInfraBlocked({ exec, readEntries: () => stored }));
+  const report = await withRuntimeAdmissionTick(() => settings, async () => cliRetryInfraBlocked({ exec, readEntries: () => stored }));
   expect(exec).not.toHaveBeenCalled();
   expect(report.failed).toEqual([{ num: '12', refused: true, reason: settings.held ? 'runtime-malformed' : 'runtime-only' }]);
   expect(report.runtimeRefused).toHaveLength(1);
@@ -84,10 +84,10 @@ it.each([only([]), { held: true }, only(['13'])])('infra recovery refuses before
 it('infra recovery refuses an unchecked group and scopes admitted retries to one card', async () => {
   const exec = vi.fn(() => JSON.stringify({ retried: ['12'] }));
   const entry = { num: '12', groupMembers: ['13'] };
-  const refused = await withRuntimeAdmission(() => only(['12']), async () => cliRetryInfraBlocked({ exec, readEntries: () => [entry] }));
+  const refused = await withRuntimeAdmissionTick(() => only(['12']), async () => cliRetryInfraBlocked({ exec, readEntries: () => [entry] }));
   expect(exec).not.toHaveBeenCalled();
   expect(refused.failed[0]).toMatchObject({ num: '12', refused: true });
-  await withRuntimeAdmission(() => only(['12', '13']), async () => cliRetryInfraBlocked({ exec, readEntries: () => [entry] }));
+  await withRuntimeAdmissionTick(() => only(['12', '13']), async () => cliRetryInfraBlocked({ exec, readEntries: () => [entry] }));
   expect(exec).toHaveBeenCalledTimes(1);
   expect(exec.mock.calls[0][1].slice(-2)).toEqual(['retry', '--num=12']);
 });
@@ -124,7 +124,7 @@ it('unknown prepare diagnostics still file once under an empty runtime allowlist
   try {
     const effects = cliEffects();
     const input = { num: '12', attempt: 'one', stage: 'stamp', evidence: { error: 'unrecognized failure' } };
-    const report = await withRuntimeAdmission(() => only([]), async () => effects.recordPrepareFailure(input));
+    const report = await withRuntimeAdmissionTick(() => only([]), async () => effects.recordPrepareFailure(input));
     expect(report.prevention.status).toBe('queued');
     expect(file).toHaveBeenCalledTimes(1);
     expect(file.mock.calls[0][0].num).toBeUndefined();
@@ -135,7 +135,7 @@ it('unknown prepare diagnostics still file once under an empty runtime allowlist
 
 it('direct delivery ports refuse an empty allowlist before providers, agents or lane acquisition', async () => {
   const effect = vi.fn();
-  await withRuntimeAdmission(() => only([]), async () => {
+  await withRuntimeAdmissionTick(() => only([]), async () => {
     const card = { num: '12', launchKind: 'build', lane: 1, sessionSlug: 'conveyor-12' };
     for (const launch of [
       () => routeDispatchProvider(card, { agent: effect }),
@@ -152,7 +152,7 @@ it('a damaged historical infra identity is retained and a healthy following entr
   const entries = [{ num: '12', builderContext: '{' }, { num: '13' }];
   const before = structuredClone(entries);
   const exec = vi.fn(() => JSON.stringify({ retried: ['13'] }));
-  const result = await withRuntimeAdmission(() => only(['12', '13']), async () =>
+  const result = await withRuntimeAdmissionTick(() => only(['12', '13']), async () =>
     cliRetryInfraBlocked({ exec, readEntries: () => entries }));
   expect(result.failed).toEqual([{ num: '12', refused: true, reason: 'unproven infra recovery identity',
     detail: 'Entry retained; repair its original dispatch context before retrying.' }]);
@@ -160,4 +160,70 @@ it('a damaged historical infra identity is retained and a healthy following entr
   expect(exec).toHaveBeenCalledTimes(1);
   expect(exec.mock.calls[0][1].slice(-2)).toEqual(['retry', '--num=13']);
   expect(entries).toEqual(before);
+});
+
+it('launch admission reads once for the whole group and never partially launches', () => {
+  const effect = vi.fn(() => 'launched');
+  const readSettings = vi.fn(() => only(['12']));
+  const result = withRuntimeAdmission({ num: 12, groupMembers: [12, 13] }, 'draft-recovery', effect, { readSettings });
+  expect(result).toMatchObject({ outcome: 'runtime-refused', runtimeRefused: [{ num: '13', kind: 'draft-recovery', reason: 'runtime-only' }] });
+  expect(readSettings).toHaveBeenCalledTimes(1);
+  expect(effect).not.toHaveBeenCalled();
+  expect(withRuntimeAdmission({ num: 12, groupMembers: [12, 13] }, 'draft-recovery', effect, { readSettings: () => only(['12', '13']) })).toBe('launched');
+  expect(effect).toHaveBeenCalledTimes(1);
+});
+it.each([null, {}, '13', [null], [undefined], ['']].map(groupMembers => [groupMembers]))('malformed group %j refuses with operator-repair evidence', groupMembers => {
+  const effect = vi.fn();
+  expect(withRuntimeAdmission({ num: 12, groupMembers }, 'build', effect, { readSettings: () => ({ mode: 'lift' }) }))
+    .toMatchObject({ outcome: 'runtime-refused', reason: 'runtime-malformed' });
+  expect(effect).not.toHaveBeenCalled();
+});
+it('infra publish rechecks after git reads revoke the whole allowlist', () => {
+  const sha = 'a'.repeat(40);
+  let settings = only(['12', '13']);
+  const exec = vi.fn((command) => {
+    if (command === 'git') { settings = only([]); return sha; }
+    throw new Error('pr-land must never launch');
+  });
+  const result = resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12', sha }, { exec, readSettings: () => settings });
+  expect(result).toMatchObject({ outcome: 'runtime-refused', ok: false, refused: true });
+  expect(exec).toHaveBeenCalledTimes(2);
+  expect(exec.mock.calls.every(([command]) => command === 'git')).toBe(true);
+});
+
+it('nested launch re-reads the injected reader after intermediate work revokes admission', () => {
+  let settings = only(['12', '13']);
+  const effect = vi.fn();
+  const result = withRuntimeAdmission({ num: 12, groupMembers: [13] }, 'build', () => {
+    settings = only(['12']);
+    return withRuntimeAdmission({ num: 12, groupMembers: [13] }, 'build', effect);
+  }, { readSettings: () => settings });
+  expect(result).toMatchObject({ outcome: 'runtime-refused' });
+  expect(effect).not.toHaveBeenCalled();
+});
+
+it('refuses a caller that omits known persisted group membership', async () => {
+  const effect = vi.fn();
+  await withRuntimeAdmissionTick(() => ({ mode: 'lift' }), async () => {
+    setRuntimeAdmissionCards([{ num: '12', groupMembers: ['13'] }]);
+    expect(withRuntimeAdmission({ num: '12' }, 'build', effect)).toMatchObject({ outcome: 'runtime-refused', reason: 'runtime-malformed' });
+    expect(effect).not.toHaveBeenCalled();
+    return {};
+  });
+});
+
+it('batch launch preserves each persisted group and invokes an admitted batch once', () => {
+  const cards = [{ num: '12', groupMembers: ['13'] }, { num: '14' }];
+  const effect = vi.fn(() => 'launched');
+  expect(withRuntimeAdmission(cards, 'route', effect, { readSettings: () => only(['12', '14']) }))
+    .toMatchObject({ outcome: 'runtime-refused' });
+  expect(effect).not.toHaveBeenCalled();
+  expect(withRuntimeAdmission(cards, 'route', effect, { readSettings: () => only(['12', '13', '14']) })).toBe('launched');
+  expect(effect).toHaveBeenCalledTimes(1);
+});
+it.each([[], 'bad settings', Promise.resolve({})].map(settings => [settings]))('non-object or async settings fail closed: %j', settings => {
+  const effect = vi.fn();
+  expect(withRuntimeAdmission({ num: 12 }, 'build', effect, { readSettings: () => settings }))
+    .toMatchObject({ outcome: 'runtime-refused', reason: 'runtime-malformed' });
+  expect(effect).not.toHaveBeenCalled();
 });

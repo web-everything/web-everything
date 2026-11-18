@@ -37,7 +37,7 @@ import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mj
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings, decideRuntimeAdmission } from '../../scripts/lib/build-queue.mjs';
 import { readInfraStore, resolveInfraStorePath, infraRecoveryCard } from '../../scripts/conveyor/infra-blocked.mjs';
-import { assertRuntimeAdmitted, withRuntimeAdmission, setRuntimeAdmissionCards } from '../../scripts/lib/runtime-admission.mjs';
+import { withRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmissionTick, setRuntimeAdmissionCards } from '../../scripts/lib/runtime-admission.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
@@ -317,7 +317,7 @@ export function deriveDispatchedByBuilder(runStoreRows = [], settledRows = []) {
  */
 export async function runBuildDispatchTick(options) {
   const timer = options.timer ?? createPhaseTimer();
-  try { return await withRuntimeAdmission(options.effects?.readRuntimeSettings, () => runTimedBuildDispatchTick({ ...options, timer })); }
+  try { return await withRuntimeAdmissionTick(options.effects?.readRuntimeSettings, () => runTimedBuildDispatchTick({ ...options, timer })); }
   catch (error) { error.timings = timer.snapshot(); throw error; }
 }
 
@@ -690,7 +690,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const withheld = holdRouting.filter((h) => !allowed.includes(h))
       .map((h) => ({ num: h.num, route: h.route, action: 'withheld-frozen', reason: freeze.reasons.join('; ') }));
     try {
-      const routed = await effects.routeHeldItems(allowed.filter(card => assertRuntimeAdmitted(card, 'route').admitted));
+      const cards = allowed.filter(card => assertRuntimeAdmitted(card, 'route').admitted);
+      const routed = await withRuntimeAdmission(cards, 'route', () => effects.routeHeldItems(cards));
       holdRoutingResult = [...(Array.isArray(routed) ? routed : []), ...withheld];
     }
     catch (e) { holdRoutingResult = { error: String(e?.message || e).split('\n')[0] }; }
@@ -1016,8 +1017,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         let res;
         if (!assertRuntimeAdmitted(pick, 'build').admitted) { releaseMembers(); effects.releaseClaim({ num: pick.num }); continue; }
         if (groupMembers.some(num => !assertRuntimeAdmitted({ num }, 'build').admitted)) { releaseMembers(); effects.releaseClaim({ num: pick.num }); continue; }
-        try { res = await effects.dispatch({ num: pick.num, ...(groupMembers.length ? { groupMembers: [...groupMembers] } : {}), bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
+        try { res = await withRuntimeAdmission({ ...pick, groupMembers }, 'build', () => effects.dispatch({ num: pick.num, ...(groupMembers.length ? { groupMembers: [...groupMembers] } : {}), bookkeeping, tick: out, tickBookkeeping, tickAt })); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
         if (res?.pending) startedThisTick += 1;
+        if (res?.outcome === 'runtime-refused') {
+          claimed = false; effects.releaseClaim({ num: pick.num }); releaseMembers(); continue;
+        }
         if (res?.dispatching) {
           claimed = false;
           launchedThisTick.push({ num: normNum(pick.num), kind: 'build', scope: [...new Set([...pick.scope, ...groupMembers.flatMap(num => scopeByNum.get(num) || [])])] });
@@ -1131,7 +1135,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     prepareBusy.delete(num);
     if (live && prepareEnabled && !plan.freeze.frozen) {
       try {
-        const result = await effects.stampPrepare({ num, status });
+        const row = groupRowsByNum.get(num);
+        const card = { num, ...(row?.groupMembers !== undefined ? { groupMembers: row.groupMembers } : {}) };
+        const result = await withRuntimeAdmission(card, 'prepare-stamp', () => effects.stampPrepare({ ...card, status }));
         prepare.stamping.push({ num, ...result });
       } catch (e) {
         await failPrepare(num, 'stamp', String(e?.message || e), {}, e.prepareAttempt ?? new Date().toISOString());
@@ -1511,7 +1517,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         }
         if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'prepare-item').admitted)) { releasePrepareMembers(); effects.releasePrepareClaim({ num }); continue; }
         let res;
-        try { res = await effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', lightRevalidate: lightRevalidateCandidate(num), prepareFallback: fallback, batchExternalCap: policy.maxConcurrentExternalBuilds, tick: out, tickBookkeeping, tickAt }); }
+        try { res = await withRuntimeAdmission({ num, bornAs: cardBornAs, groupMembers }, 'prepare-item', () => effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', lightRevalidate: lightRevalidateCandidate(num), prepareFallback: fallback, batchExternalCap: policy.maxConcurrentExternalBuilds, tick: out, tickBookkeeping, tickAt })); }
         catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
         if (res?.pending) startedThisTick += 1;
         prepareClaimed = false;
@@ -1527,6 +1533,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         } else {
           releasePrepareMembers();
           effects.releasePrepareClaim({ num });
+          if (res?.outcome === 'runtime-refused') continue;
           await failPrepare(num, res?.refused ? 'dispatch-refused' : 'dispatch', res?.reason ?? 'not dispatched', res?.evidence ?? {}, res?.attempt ?? new Date().toISOString());
         }
       } catch (e) {
@@ -1979,7 +1986,8 @@ export function cliDispatch(args, { exec = execFileSync } = {}) {
   const base = launchBase();
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
-    const text = exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, cwd: REPO_ROOT, env });
+    const text = withRuntimeAdmission(args, args.launchKind ?? 'build', () => exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, cwd: REPO_ROOT, env }));
+    if (text?.outcome === 'runtime-refused') return text;
     return { ...readDispatchOutcome(text), base };
   } catch (e) {
     if (e?.stdout) {
@@ -2012,7 +2020,9 @@ export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot(),
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
-    const record = startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', base: readBase(), argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) });
+    const base = readBase();
+    const record = withRuntimeAdmission(args, args.launchKind ?? 'build', () => startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', base, argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) }));
+    if (record?.outcome === 'runtime-refused') { rmSync(dir, { recursive: true, force: true }); return record; }
     return { dispatching: true, pending: true, lane: null, sessionSlug: null, attempt: record.attempt };
   } catch (e) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -2172,11 +2182,12 @@ export function cliRetryInfraBlocked({
       const remainingMs = Math.floor(deadline - now());
       if (remainingMs <= 0) return deferRemaining(index);
       // Scope the child to this admitted identity; an unrestricted retry can publish other cards' PRs.
-      const text = exec('node', [join(SCRIPTS, 'conveyor', 'infra-blocked.mjs'), 'retry', `--num=${entry.num}`], {
+      const text = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', [join(SCRIPTS, 'conveyor', 'infra-blocked.mjs'), 'retry', `--num=${entry.num}`], {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, cwd: REPO_ROOT,
         timeout: remainingMs, killSignal: 'SIGTERM',
         env: childEnv,
-      });
+      }));
+      if (text?.outcome === 'runtime-refused') { result.failed.push({ num: entry.num, refused: true, reason: text.reason }); continue; }
       const pass = JSON.parse(text || '{}');
       // Only collections participate in aggregation; error/deadline metadata stays separate.
       for (const key of ['retried', 'resumed', 'surfaced', 'waiting', 'failed', 'rearmed']) result[key].push(...(pass[key] ?? []));
@@ -2210,7 +2221,7 @@ export async function cliSpawnHoldLand(entry) {
   if (entry.commit) argv.push(`--commit=${entry.commit}`);
   if (entry.reason) argv.push(`--reason=${entry.reason}`);
   const logPath = deliveryDispatchLogPath(`hold-route-${entry.num}`, REPO_ROOT);
-  return defaultSpawnDetached(argv, { cwd: REPO_ROOT, logPath });
+  return withRuntimeAdmission(entry, 'route', () => defaultSpawnDetached(argv, { cwd: REPO_ROOT, logPath }));
 }
 
 /** #4465 — the real IO wiring for `runBuildDispatchTick`'s `effects.routeHeldItems`: dedup via
@@ -2573,7 +2584,7 @@ export function cliReadStampFailure(num, root = REPO_ROOT) {
 }
 
 /** Detached lane-bound recovery: never run the gate/PR wait inside a daemon tick. */
-export async function cliStampPrepare({ num }, {
+export async function cliStampPrepare(card, {
   reserve = reserveHoldRoute, release = releaseHoldRoute,
   readFailure = cliReadStampFailure,
   markStarting = num => {
@@ -2584,6 +2595,7 @@ export async function cliStampPrepare({ num }, {
   releases = () => readPrepareReleases(join(SCRIPTS, 'conveyor', 'prepare-failure-releases.json'), REPO_ROOT),
   failures = () => Object.values(readFailureState().failures),
 } = {}) {
+  const { num } = card;
   // Finite on purpose: JSON has no Infinity (it serializes to null, which reads back as an already-expired
   // lease), and a worker killed before it writes a terminal record must not strand the item forever.
   const entry = { num, route: 'prepare-stamp', leaseMinutes: STAMP_RECOVERY_LEASE_MINUTES };
@@ -2602,9 +2614,10 @@ export async function cliStampPrepare({ num }, {
     if (!admission.admitted) { release(entry); return { spawned: false, reason: admission.reason }; }
     markStarting(num);
     const { defaultSpawnDetached, deliveryDispatchLogPath } = await import('../../scripts/operations/detached-dispatch.mjs');
-    const result = defaultSpawnDetached([
+    const result = withRuntimeAdmission(card, 'prepare-stamp', () => defaultSpawnDetached([
       join(SCRIPTS, 'operations', 'prepare-stamp-land.mjs'), `--num=${num}`,
-    ], { cwd: REPO_ROOT, logPath: deliveryDispatchLogPath(`prepare-stamp-${num}`, REPO_ROOT) });
+    ], { cwd: REPO_ROOT, logPath: deliveryDispatchLogPath(`prepare-stamp-${num}`, REPO_ROOT) }));
+    if (result?.outcome === 'runtime-refused') { release(entry); return result; }
     // The shared spawner returns ChildProcess, not a dispatch verdict. Wait for actual spawn/error.
     if (typeof result?.once === 'function') {
       await new Promise((resolveSpawn, reject) => { result.once('spawn', resolveSpawn); result.once('error', reject); });
@@ -2665,7 +2678,7 @@ export async function recoverBuilderDrafts({
             effects.writeState(c.pr, state); // no attempt was launched
             continue;
           }
-          const out = await effects.dispatch(c);
+          const out = await withRuntimeAdmission(c, 'draft-recovery', () => effects.dispatch(c));
           if (out?.held) {
             effects.writeState(c.pr, state); // no attempt was launched
             results.push({ pr: c.pr, action: 'held', reason: out.reason });
@@ -2750,7 +2763,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       const log = String(gh(['run', 'view', '--repo', repo, '--job', job, '--log-failed']));
       firstError = log.split('\n').find(line => /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) || firstError;
     }
-    candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
+    candidates.push({ pr: pr.number, num, itemNum: num, bornAs: row.entry.payload.bornAs, groupMembers: row.entry.payload.groupMembers, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
       scope: (pr.files ?? []).map(f => `we:${f.path}`), isDraft: true, builderAuthored: true,
       authorLive: false, ...activity, failure: { name: failed.name, firstError: firstError.split('\n').find(Boolean)?.slice(0, 2000) } });
   }
@@ -2776,7 +2789,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       if (!lane) return { held: true, reason: 'no-lane' };
       // The builder invokes the existing PR repair primitive directly. Its brief acquires the PR's
       // own ref and pushes back there; it never creates a second delivery PR or clears human review.
-      return (io.dispatch ?? dispatchCiHeal)({ ...c, lane, reason: 'red-ci' });
+      return withRuntimeAdmission(c, 'draft-recovery', () => (io.dispatch ?? dispatchCiHeal)({ ...c, lane, reason: 'red-ci' }));
     },
     escalate: async (c, body) => {
       // Comment first: a failed label write retries the evidence rather than silently marking done.

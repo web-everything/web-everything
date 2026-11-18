@@ -3,12 +3,13 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createTickReader, createDispatchSinks, defaultSpawnAgent, defaultClaudeProvider, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
+import { createTickReader, createDispatchSinks, routeDispatchProvider, defaultSpawnAgent, defaultClaudeProvider, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { applyPendingEffects, inFlightEntries } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
+import { withRuntimeAdmissionTick } from '../../lib/runtime-admission.mjs';
 
 describe('the tick reader handoff', () => {
   const at = '2026-10-06T12:00:00.000Z';
@@ -214,7 +215,8 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
         .map(num => ({ num, kind: num === '12' ? launchKind : kind,
           reason: ids === null ? 'runtime-malformed' : 'runtime-only' }));
       expect(result.error).toMatchObject({ notApplied: true, outcome: 'runtime-refused', runtimeRefused: refused });
-      expect(readRuntimeSettings).toHaveBeenCalledTimes(4);
+      // Early preflight reads each card; the launch boundary reads one group snapshot.
+      expect(readRuntimeSettings).toHaveBeenCalledTimes(3);
       expect(provider).not.toHaveBeenCalled();
       expect(releaseLane).toHaveBeenCalledTimes(1);
       expect(releaseLane).toHaveBeenCalledWith(reservation);
@@ -228,7 +230,8 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
       const readRuntimeSettings = vi.fn(() => ({ mode: 'only', only: true, ids: ['12', '13'] }));
       const provider = vi.fn(async request => {
         expect(reserved).toBe(true);
-        expect(readRuntimeSettings).toHaveBeenCalledTimes(4);
+        // Early preflight reads each card; the launch boundary reads one group snapshot.
+        expect(readRuntimeSettings).toHaveBeenCalledTimes(3);
         expect(request).toMatchObject({ num: '12', launchKind, groupMembers: ['13'] });
         return 'pid:123';
       });
@@ -241,10 +244,19 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
       expect(releaseLane).not.toHaveBeenCalled();
     });
   });
+  it('repairs a fully admitted grouped PR through the default Claude CI-heal provider', async () => {
+    const spawnAgent = vi.fn(() => 'backgrounded · healed-group · n');
+    const sinks = baseSinks({ readRuntimeSettings: () => ({ mode: 'only', only: true, ids: ['12', '13'] }),
+      reserveLane: () => ({}), provider: request => defaultClaudeProvider(request, { wrapKind: () => false, spawnAgent }),
+    });
+    await sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind: 'ci-heal', groupMembers: ['13'] });
+    expect(spawnAgent).toHaveBeenCalledTimes(1);
+    expect(spawnAgent.mock.calls[0][2]).toMatchObject({ num: '12', groupMembers: ['13'], launchKind: 'ci-heal' });
+  });
   it('passes the sink settings reader and card identity into the default raw spawn', async () => {
     const readRuntimeSettings = vi.fn(() => ({ mode: 'only', only: true, ids: ['12'] }));
     const exec = vi.fn(() => {
-      expect(readRuntimeSettings).toHaveBeenCalledTimes(3);
+      expect(readRuntimeSettings).toHaveBeenCalledTimes(10);
       return 'backgrounded · handle-12 · n';
     });
     const sinks = baseSinks({ exec, modes: { build: 'agent' }, readRuntimeSettings,
@@ -291,7 +303,7 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
       const result = await applyPendingEffects(run, { sinks, store });
       expect(grantTrust).toHaveBeenCalledTimes(1);
       expect(grantTrust).toHaveBeenCalledWith('/tmp/scratch');
-      expect(readRuntimeSettings).toHaveBeenCalledTimes(8);
+      expect(readRuntimeSettings).toHaveBeenCalledTimes(5);
       const admitted = nextIds?.length === 2;
       expect(exec).toHaveBeenCalledTimes(admitted ? 2 : 1);
       if (admitted) {
@@ -451,5 +463,44 @@ describe('PR #5729 — daemon dispatch fails closed without the gh refusal shim'
     });
     expect(r.ok).toBe(true);
     expect(spawnDetached.mock.calls[0][1].settingsEnv).toBeNull();
+  });
+});
+
+
+describe('runtime admission across routing-policy retries', () => {
+  it.each([
+    { revoke: false, guarantee: 'definite primary refusal launches the admitted fallback using the inherited reader' },
+    { revoke: true, guarantee: 'definite primary refusal cannot launch a fallback after admission is revoked' },
+  ])('$guarantee', async ({ revoke }) => {
+    let ids = ['12'];
+    const events = [];
+    const readSettings = vi.fn(() => { events.push('read'); return { mode: 'only', only: true, ids }; });
+    const primary = vi.fn(() => {
+      events.push('primary');
+      if (revoke) ids = [];
+      throw Object.assign(new Error('primary definitely did not launch'), { notApplied: true });
+    });
+    const fallback = vi.fn(() => { events.push('fallback'); return 'fallback-handle'; });
+    const request = { num: '12', launchKind: 'build', groupMembers: [], policyRoute: {
+      provider: 'codex', model: 'primary-model', fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5' }],
+    } };
+    await withRuntimeAdmissionTick(readSettings, async () => {
+      const launch = () => routeDispatchProvider(request, {
+        registry: { build: { runScript: 'worker.mjs', provider: primary } },
+        scriptExists: () => true, providerAvailable: () => true, agent: fallback,
+      });
+      if (revoke) {
+        expect(launch).toThrow(/runtime admission refused/);
+        expect(fallback).not.toHaveBeenCalled();
+        expect(events.slice(-2)).toEqual(['primary', 'read']);
+      } else {
+        expect(launch()).toBe('fallback-handle');
+        expect(fallback).toHaveBeenCalledTimes(1);
+        expect(fallback).toHaveBeenCalledWith(expect.objectContaining({ num: '12', policyRoute: expect.objectContaining({ provider: 'claude' }) }));
+        expect(events.slice(-2)).toEqual(['read', 'fallback']);
+      }
+      expect(primary).toHaveBeenCalledTimes(1);
+      return {};
+    });
   });
 });

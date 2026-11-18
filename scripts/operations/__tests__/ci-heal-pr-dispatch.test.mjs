@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+import { withRuntimeAdmissionTick } from '../../lib/runtime-admission.mjs';
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { briefPath, REPO_ROOT } from '../dispatch-lane-io.mjs';
 import { dispatchCiHeal, runReconcileCiHealDispatch, resetCiHealFlushDeadlineState, orderCiHealEntriesOldestFirst, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
@@ -161,6 +162,24 @@ const recordingSink = (answer = { handle: 'agent-1' }) => {
 };
 
 describe('dispatchCiHeal (#3852)', () => {
+  it.each([{ ids: ['12'], admitted: false }, { ids: ['12', '13'], admitted: true }])('admits the complete persisted CI-heal group: $ids', async ({ ids, admitted }) => {
+    const { calls, sinks } = recordingSink();
+    const releaseClaim = vi.fn();
+    const result = await withRuntimeAdmissionTick(() => ({ mode: 'only', only: true, ids }), () => dispatchCiHeal({
+      ...PLANNED, itemNum: '12', groupMembers: ['12', '13'],
+    }, { readBrief: () => TEMPLATE, sinks, readFixClaim: () => null, pollAttempts: () => [],
+      acquireClaim: () => ({ ok: true }), releaseClaim, routeHeal: () => null }));
+    if (admitted) {
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ num: '12', groupMembers: ['12', '13'] });
+      expect(result.agentId).toBe('agent-1');
+      expect(releaseClaim).not.toHaveBeenCalled();
+    } else {
+      expect(calls).toEqual([]);
+      expect(result).toMatchObject({ outcome: 'runtime-refused', held: true });
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+    }
+  });
   it('fills the brief with the PR, lane, scope, ref and reason tokens', async () => {
     const { calls, sinks } = recordingSink();
     await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });

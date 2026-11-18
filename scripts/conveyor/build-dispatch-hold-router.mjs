@@ -43,7 +43,7 @@ import { randomUUID } from 'node:crypto';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { reserve, releaseLockDir, readLockEntry } from '../readiness/file-locks.mjs';
 import { normNum } from './queue-store.mjs';
-import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
+import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { DEFAULT_BUILD_DISPATCH_HOLD_MINUTES } from './build-dispatch-claim.mjs';
 
 // ── pure ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -85,7 +85,8 @@ export function planHoldRouting(holds) {
       const num = normNum(h?.num);
       if (!isValidHoldNum(num)) return null;
       const { route, commit } = classifyHoldReason(h?.reason);
-      return { num, route, commit, reason: h?.reason ?? null };
+      return { num, route, commit, reason: h?.reason ?? null,
+        ...(h.groupMembers !== undefined ? { groupMembers: h.groupMembers } : {}) };
     })
     .filter(Boolean);
 }
@@ -249,7 +250,7 @@ export async function routeHeldItems({
     }
     // (a)/(b) — land a card edit through a lane PR.
     try {
-      const result = await spawnLand(entry);
+      const result = await withRuntimeAdmission(entry, 'route', () => spawnLand(entry), { readSettings });
       if (result?.spawned === false) {
         try { releaseRoute({ num: entry.num, route: entry.route }); } catch { /* best-effort — the TTL still bounds it */ }
         outcomes.push({ num: entry.num, route: entry.route, action: 'not-spawned',

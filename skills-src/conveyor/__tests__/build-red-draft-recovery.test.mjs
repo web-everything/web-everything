@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recoverBuilderDrafts, runBuildDispatchTick, cliRecoverBuilderDrafts } from '../build-dispatch-daemon.mjs';
 import { MAX_RESUME_ATTEMPTS } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
-import { withRuntimeAdmission } from '../../../scripts/lib/runtime-admission.mjs';
+import { withRuntimeAdmissionTick } from '../../../scripts/lib/runtime-admission.mjs';
 
 const nowMs = Date.parse('2026-09-30T12:00:00Z');
 const candidate = {
@@ -101,7 +101,7 @@ describe('abandoned builder draft recovery', () => {
       settings = { mode: 'only', only: true, ids: [] };
       return { ok: true };
     });
-    const result = await withRuntimeAdmission(readSettings, () => f.run());
+    const result = await withRuntimeAdmissionTick(readSettings, () => f.run());
     expect(readSettings).toHaveBeenCalledTimes(2);
     expect(f.effects.reserve).toHaveBeenCalledWith(candidate);
     expect(f.effects.writeState.mock.calls).toEqual([
@@ -197,6 +197,36 @@ describe('abandoned builder draft recovery', () => {
       if (kind === 'stale-freeze') expect(io.readFreeze).toHaveBeenCalledOnce();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
+  it.each([
+    { ids: ['12'], groupMembers: ['12', '13'], admitted: false },
+    { ids: ['12', '13'], groupMembers: ['12', '13'], admitted: true },
+    { ids: ['12', '13'], groupMembers: null, admitted: false },
+  ])('draft recovery preserves persisted group $groupMembers under allowlist $ids', async ({ ids, groupMembers, admitted }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'builder-group-'));
+    const dispatch = vi.fn(async () => ({ agentId: 'pid:321' }));
+    const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', status: 'applied',
+      payload: { launchKind: 'build', num: '12', groupMembers }, result: { pr: 3033 } };
+    const io = {
+      stateRoot: dir, store: { list: () => ['dispatch-lane-group'], read: () => ({ effects: [row] }) },
+      isPidAlive: () => false, listAgents: () => [],
+      api: path => path.startsWith('pulls/')
+        ? { draft: true, state: 'open', head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
+        : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+        : { check_runs: [{ id: 2, name: 'test', conclusion: 'failure', output: { summary: 'red' } }] },
+      paged: () => [], freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(), dispatch,
+      gh: vi.fn(), mergeGateSetting: 'off',
+    };
+    try {
+      await withRuntimeAdmissionTick(() => ({ mode: 'only', only: true, ids }), () => cliRecoverBuilderDrafts({
+        rawOpenPrs: [{ repo: 'we', prs: [{ number: 3033, isDraft: true, headRefName: candidate.laneRef }] }], allowResume: true,
+      }, io));
+      if (!admitted) expect(dispatch).not.toHaveBeenCalled();
+      else {
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '12', groupMembers: ['12', '13'] }));
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('wires REST check evidence, same-branch dispatch, durable retries and the needs-human label', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,

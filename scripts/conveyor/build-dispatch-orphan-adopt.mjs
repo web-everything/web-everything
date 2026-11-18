@@ -80,7 +80,7 @@ import { readBuildDelivery } from './build-delivery-evidence.mjs';
 import { recordBuildFailure, clearBuildFailure, dispatchAttemptKey, claimAttemptKeys } from './build-dispatch-failures.mjs';
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
-import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
+import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
 // Through the REGISTRY, never `dispatch-providers/build.mjs` directly: `detached-dispatch.mjs` imports the
 // registry, which imports `build.mjs` — entering that cycle at `build.mjs` (or at `detached-dispatch.mjs` first)
@@ -480,7 +480,9 @@ export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = nul
     ...(groupMembers.length ? [`--group-members=${groupMembers.join(',')}`] : []),
   ];
   beforeSpawn();
-  const child = spawnDetached(argv, { cwd: REPO_ROOT, logPath: logPathFor(sessionSlug) });
+  const logPath = logPathFor(sessionSlug);
+  const child = withRuntimeAdmission({ num, bornAs, groupMembers }, 'resume', () => spawnDetached(argv, { cwd: REPO_ROOT, logPath }), { readSettings });
+  if (child?.outcome === 'runtime-refused') { child.runtimeRefused.forEach(onRefused); return null; }
   const pid = Number(child?.pid);
   if (!Number.isInteger(pid) || pid <= 0) {
     throw new Error(`build-dispatch-orphan-adopt: resume spawn for #${num} reported no pid — whether it is running cannot be told from here`);
@@ -623,9 +625,9 @@ export async function adoptOrphanedBuildClaims({
             bornAs: payload.bornAs,
             runId: row.runId, effectKey: row.entry?.key, groupMembers,
           };
-          pid = spawnResume ? spawnResume(request)
-            : spawnResumeDelivery(request, { readSettings, beforeSpawn, onRefused: refusal => runtimeRefused.push(refusal) });
-          if (pid === null && !spawnResume) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn', ...(runtimeRefused.length ? { runtimeRefused } : {}) }); continue; }
+          pid = spawnResume ? withRuntimeAdmission(request, 'resume', () => spawnResume(request), { readSettings })
+            : withRuntimeAdmission(request, 'resume', () => spawnResumeDelivery(request, { readSettings, beforeSpawn, onRefused: refusal => runtimeRefused.push(refusal) }), { readSettings });
+          if (pid?.outcome === 'runtime-refused' || (pid === null && !spawnResume)) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn', ...(runtimeRefused.length ? { runtimeRefused } : {}) }); continue; }
           if (!Number.isInteger(pid) || pid <= 0) throw new Error(`resume spawn for #${num} reported no pid`);
         } catch (e) {
           // Known NOT running — record it so the next pass counts this attempt dead at once, not after a TTL.

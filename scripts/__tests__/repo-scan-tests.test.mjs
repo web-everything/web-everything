@@ -156,7 +156,7 @@ describe('#3887 regression: a NEW file with a repo literal is caught by the veri
   const rel = 'scripts/lib/__verify-scan-regression-3887.mjs';
   // The violating file lives ONLY in a throwaway tree (VERIFY_SCAN_ROOT): written into the live scripts/lib it would be
   // visible, for the whole child vitest run, to any other worker scanning the real tree in parallel (PR #3890 review).
-  const run = (scanDir) => spawnSync('npx', ['vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], {
+  const run = (scanDir) => spawnSync(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=60000', '--', 'npx', 'vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], {
     cwd: root, encoding: 'utf8',
     env: { ...process.env, [SCAN_FILES_ENV]: JSON.stringify([rel]), [SCAN_ROOT_ENV]: scanDir },
   });

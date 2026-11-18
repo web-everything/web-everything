@@ -40,7 +40,7 @@
  */
 
 import { producerBuildContext } from '../operations/build-pr-authorship.mjs';
-import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
+import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, statSync, unlinkSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
@@ -728,6 +728,7 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
   if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery', { readSettings }).admitted)) {
     return { ok: false, refused: true, reason: 'runtime admission refused group', detail: 'runtime admission refused group' };
   }
+  const readResumeGit = (args, options) => exec('git', args, options);
   const ref = entry?.ref;
   const base = entry?.base || 'main';
   if (!ref) return { ok: false, detail: 'no resumable ref recorded' };
@@ -740,7 +741,7 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
   // The ref is already on origin (it was pushed before the open failed). Fetch its objects so pr-land's push of
   // <sha>:<ref> is a local no-op and the create has a head to point at.
   // #x5n4zn3 — was bare (no timeout): a real network fetch.
-  try { exec('git', ['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
+  try { readResumeGit(['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
   catch (e) {
     // An OUTAGE during the fetch is an infra failure (the attempt/backoff budget), never a refusal — otherwise
     // the tip check below would read "no ref" and burn the refusal budget under a misleading `bad-ref`. Any
@@ -750,7 +751,7 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
   }
   // PR #2899 review — pin the resume to the RECORDED (verified) sha, and refuse if the ref moved since.
   let tipSha = null;
-  try { tipSha = exec('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
+  try { tipSha = readResumeGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
   catch { tipSha = null; }
   const pin = resumeShaDecision({ recordedSha: entry.sha, tipSha, ref });
   if (!pin.ok) return { ok: false, refused: true, reason: pin.reason, detail: pin.detail };
@@ -790,7 +791,9 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
     // #x5n4zn3 — was bare (no timeout). `pr-land.mjs --label-on-green` has its OWN internal wait-for-green
     // deadline (`--timeout-min`, default 15 min) — this outer bound must exceed that, with margin for gh/push
     // overhead, or it would kill a wait pr-land itself would have given up on cleanly moments later.
-    const res = parse(exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }));
+    const launched = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }), { readSettings });
+    if (launched?.outcome === 'runtime-refused') return launched;
+    const res = parse(launched);
     return { ok: true, prNumber: res.pr ?? null, detail: res.detail || 'resume-opened' };
   } catch (e) {
     const res = parse(e.stdout);

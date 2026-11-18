@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
-import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
+import { withRuntimeAdmissionTick } from '../../lib/runtime-admission.mjs';
 import { recordBuildFailure, listBuildBackoffs, dispatchAttemptKey } from '../build-dispatch-failures.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
@@ -408,7 +408,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     const releaseResumeMarker = vi.fn(({ num }) => releaseBuildDispatchResume({ num, lockRoot: resumeRoot }));
     const markResume = vi.fn(o => markBuildDispatchResume({ ...o, lockRoot: resumeRoot }));
     const readSettings = vi.fn().mockReturnValueOnce({ mode: 'lift', ids: [] }).mockReturnValue({ mode: 'only', only: true, ids: [] });
-    const { results: result } = await withRuntimeAdmission(() => ({ mode: 'only', only: true, ids: [] }), async () => ({ results: await adoptFixtureClaims({
+    const { results: result } = await withRuntimeAdmissionTick(() => ({ mode: 'only', only: true, ids: [] }), async () => ({ results: await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }), isPidAlive: () => false,
       findRow: () => buildRow({ num: '4131', handle: 'pid:74142' }),
       readResumeMarker: () => readBuildDispatchResume({ num: '4131', lockRoot: resumeRoot }),

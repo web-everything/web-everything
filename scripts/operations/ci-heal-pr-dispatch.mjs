@@ -1,3 +1,4 @@
+import { withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file ci-heal-pr-dispatch.mjs
@@ -311,15 +312,15 @@ export async function dispatchCiHeal(planned, {
     }
     if (route?.outcome === 'refused') { releaseOurClaim(); return { held: true, reason: route.refusal }; }
     const briefOnly = reason === 'codeql' || !!planned.owedMainRule;
-    const out = await sinks[DISPATCH_EFFECT]({
+    const out = await withRuntimeAdmission({ ...planned, num: planned.itemNum ?? planned.num }, 'ci-heal', () => sinks[DISPATCH_EFFECT]({
       launchKind: 'ci-heal', prompt: renderNoPromptCommandRules(withOwedMainRuleSection(withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), planned), 'ci-heal'), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
-      headRefOid: planned.headRefOid, claimOwner, claimRoot,
+      headRefOid: planned.headRefOid, claimOwner, claimRoot, groupMembers: planned.groupMembers,
       // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry; so does
       // a heal that must keep drain-assigned card numbers (PR #5082).
       // The sink falls back to `routing.probationWorker` when this is null, so a suppressed pick is cleared on both.
       pr: planned.pr, reason, repo, probationWorker: briefOnly ? null : (route?.probationWorker ?? null),
       routing: stronger ? { policyRoute: stronger.policyRoute } : (briefOnly && route ? { ...route, probationWorker: null } : route),
-    });
+    }));
     if (out?.held) {
       // #x0jphk5 — the SINK's own (separate, unrelated) guard refused it: nothing was spawned under OUR claim
       // either, so release it rather than leaving it to expire on the TTL.
