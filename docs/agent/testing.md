@@ -4619,7 +4619,13 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 
 `claude-tokens-per-pr.test.mjs` pins repository-scoped Codex ledger attribution,
 including a foreign repository with the same PR number through the file reader.
-Normalize ledger identities with `usageRepoSlug`; unscoped rows remain unattributed.
+Compare hosted ledger identities with the full PR repository host and slug; hostless
+identities must match the exact owner/repo slug. Unscoped rows remain unattributed.
 Missing Codex counters remain null across aggregation. Claude incomplete-usage
 counts apply after message-ID deduplication and include unattributed sessions.
 Exercise absent/null counters separately from invalid negative/non-finite values.
+Absent/null usage objects also count as incomplete after deduplication. Exercise the
+default PR reader through its injected GitHub runner: its raw 2,000-row cap must be
+checked against the oldest merge before filtering. Only injected listing readers
+use the separate 500-row cap after window filtering; refusals tell operators to
+shorten the window or supply a smaller complete window-filtered reader.

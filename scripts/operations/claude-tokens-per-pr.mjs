@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { entries, blocks } from './agent-usage-report.mjs';
 import { PROJECTS_DIR, flattenToolResultText, stripControlSequences } from '../../skills-src/inspect-agent-health/agent-health.mjs';
-import { codexUsageLedgerPath, usageRepoSlug } from '../lib/codex-usage-ledger.mjs';
+import { codexUsageLedgerPath } from '../lib/codex-usage-ledger.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 
 // Lane clones and the primary checkout of this repository share one PR namespace.
@@ -28,11 +28,25 @@ function add(target, source, preserveUnknown = false) {
 // A slug must occupy a complete component; "fix" must not match "prefix".
 const branchMatches = (head, branch) => Boolean(branch) && new RegExp(`(?:^|[/._-])${branch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/._-])`).test(head);
 
+function codexRepoMatches(value, repository) {
+  if (typeof value !== 'string' || !repository) return false;
+  const slug = /^[\w-][\w.-]*\/[\w-][\w.-]*$/;
+  const expected = repository.toLowerCase();
+  // Hostless ledger identities must be exact slugs, never aliases or remote URLs.
+  if (slug.test(value)) return value.toLowerCase() === expected.split('/').slice(1).join('/');
+  try {
+    const scp = /^(?:[^/@:\s]+@)?([\w.-]+):([^\s]+)$/.exec(value);
+    const url = new URL(value.includes('://') ? value : scp ? `ssh://${scp[1]}/${scp[2]}` : `https://${value}`);
+    const path = url.pathname.slice(1).replace(/\.git$/i, '');
+    return ['https:', 'http:', 'ssh:', 'git:'].includes(url.protocol) && slug.test(path)
+      && `${url.host}/${path}`.toLowerCase() === expected;
+  } catch { return false; }
+}
+
 export function attributeSessions({ sessions, prs, codexRows = [], repository }) {
   const perPr = prs.map(pr => ({ pr: pr.number, branch: pr.headRefName, sessions: 0, claude: claudeZero(), codex: null, agy: null }));
   const byNumber = new Map(perPr.map(row => [row.pr, row]));
   const unattributed = [], claude = claudeZero();
-  const repoSlug = usageRepoSlug(repository ? `https://${repository}` : null);
   let codexUnattributedRows = 0, incompleteUsageMessages = 0;
   for (const session of sessions) {
     add(claude, session.tokens);
@@ -47,7 +61,7 @@ export function attributeSessions({ sessions, prs, codexRows = [], repository })
   }
   for (const row of codexRows) {
     const target = byNumber.get(Number(row.pr));
-    if (!target || !repoSlug || usageRepoSlug(row.repo)?.toLowerCase() !== repoSlug.toLowerCase()) { codexUnattributedRows++; continue; }
+    if (!target || !codexRepoMatches(row.repo, repository)) { codexUnattributedRows++; continue; }
     target.codex ??= codexZero();
     add(target.codex, row.tokens, true);
   }
@@ -79,8 +93,8 @@ export async function readSession(file, { repository = null, projectRepository =
   for await (const { entry } of entries(file, diagnostics)) {
     const localCwd = typeof entry.cwd === 'string' && (resolve(entry.cwd) === cwd || resolve(entry.cwd).startsWith(`${cwd}${sep}`) || POOL_CWD.test(resolve(entry.cwd)));
     const scope = entry.cwd ? (localCwd ? repository : null) : projectRepository;
-    if (entry.type === 'assistant' && entry.message?.usage) {
-      messages.set(entry.message.id ?? Symbol(anonymous++), entry.message.usage);
+    if (entry.type === 'assistant') {
+      messages.set(entry.message?.id ?? Symbol(anonymous++), entry.message?.usage);
     }
     for (const text of evidence(entry)) for (const line of text.split(/\r?\n/)) {
       const urls = [...line.matchAll(/https?:\/\/[^\s<>"']+\/pull\/\d+\b/gi)];
@@ -101,8 +115,8 @@ export async function readSession(file, { repository = null, projectRepository =
   if (diagnostics.corrupt) throw new Error(`Incomplete transcript ${file}: ${diagnostics.corrupt} malformed rows; repair the file and retry`);
   session.incompleteUsageMessages = 0;
   for (const usage of messages.values()) if (add(session.tokens, {
-    input: usage.input_tokens, cacheCreation: usage.cache_creation_input_tokens,
-    cacheRead: usage.cache_read_input_tokens, output: usage.output_tokens,
+    input: usage?.input_tokens, cacheCreation: usage?.cache_creation_input_tokens,
+    cacheRead: usage?.cache_read_input_tokens, output: usage?.output_tokens,
   })) session.incompleteUsageMessages++;
   // The public session shape carries the four source counters; total is derived by attribution.
   delete session.tokens.total;
@@ -129,13 +143,14 @@ export async function readSessions({ projectsDir = PROJECTS_DIR, since, now, rep
   return sessions;
 }
 
-export function listMergedPrs({ since = 0 } = {}) {
+export function listMergedPrs({ since = 0, gh = runGhSync } = {}) {
   const limit = 2000;
-  const prs = JSON.parse(runGhSync(['pr', 'list', '--state', 'merged', '--limit', String(limit), '--json', 'number,headRefName,mergedAt,url'], {
+  const prs = JSON.parse(gh(['pr', 'list', '--state', 'merged', '--limit', String(limit), '--json', 'number,headRefName,mergedAt,url'], {
     encoding: 'utf8', timeout: 120000, maxBuffer: 32 * 1024 * 1024,
   }));
   if (!Array.isArray(prs)) throw new Error('Invalid merged PR response');
   const times = prs.map(pr => Date.parse(pr.mergedAt));
+  if (times.some(time => !Number.isFinite(time))) throw new Error('Invalid merged PR evidence');
   if (prs.length >= limit && Math.min(...times) >= since) throw new Error('Merged PR window exceeds the gh listing limit; shorten --days');
   return prs.filter((pr, i) => times[i] >= since);
 }
@@ -154,22 +169,22 @@ export async function readCodexRows({ env = process.env, since, now }) {
 }
 
 export async function readReport({ days = 7, now = Date.now(), projectsDir = PROJECTS_DIR, env = process.env,
-  listMergedPrs: list = listMergedPrs, repository, cwd = process.cwd() } = {}) {
+  listMergedPrs: list = listMergedPrs, gh = runGhSync, repository, cwd = process.cwd() } = {}) {
   if (!Number.isFinite(days) || days <= 0 || !Number.isFinite(now)) throw new Error('--days must be a positive finite number');
   const since = now - days * 86400000;
-  const listed = await list({ since });
+  const listed = await list({ since, gh });
   if (!Array.isArray(listed) || listed.some(pr => !Number.isInteger(pr.number) || typeof pr.headRefName !== 'string' || !Number.isFinite(Date.parse(pr.mergedAt)))) {
     throw new Error('Invalid merged PR evidence');
   }
-  // A capped, unfiltered listing cannot establish completeness, regardless of merge dates.
-  if (listed.length >= 500) {
+  const prs = listed.filter(pr => Date.parse(pr.mergedAt) >= since && Date.parse(pr.mergedAt) <= now);
+  // The default reader checks its raw cap; injected readers have a conservative window cap.
+  if (list !== listMergedPrs && prs.length >= 500) {
     throw new Error('Merged PR limit reached; supply a complete window-filtered listMergedPrs reader with fewer than 500 results');
   }
   repository ??= prRepository(listed[0]?.url);
   if (listed.length && (!repository || listed.some(pr => pr.url && prRepository(pr.url) !== repository))) {
     throw new Error('Unknown or mixed PR repository; supply repository identity and a repository-scoped listMergedPrs reader');
   }
-  const prs = listed.filter(pr => Date.parse(pr.mergedAt) >= since && Date.parse(pr.mergedAt) <= now);
   const sessions = await readSessions({ projectsDir, since, now, repository, cwd });
   const codexRows = await readCodexRows({ env, since, now });
   return attributeSessions({ sessions, prs, codexRows, repository });

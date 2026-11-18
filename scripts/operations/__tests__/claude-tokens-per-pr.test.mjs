@@ -90,6 +90,21 @@ describe('whole-session attribution', () => {
     assert.deepEqual(report.perPr[1].codex, { input: null, cached: null, output: null, reasoning: null });
     assert.match(formatReport(report), /unknown in \/ unknown cached/);
   });
+  it('rejects the foreign.example probe while accepting exact hosted and hostless identities', () => {
+    const row = { pr: 10, tokens: { input: 1, cached: 2, output: 3, reasoning: 4 } };
+    const report = attributeSessions({ sessions: [], prs, repository, codexRows: [
+      ...['https://foreign.example/a/b', 'git@foreign.example:a/b.git', 'foreign.example/a/b',
+        'b', 'a/b.git', 'a/b/extra', 'prefix/a/b'].map(repo => ({ ...row, repo })),
+      ...['a/b', 'https://github.com/A/B.git', 'git@github.com:a/b.git', 'github.com/a/b'].map(repo => ({ ...row, repo })),
+    ] });
+    assert.deepEqual(report.perPr[0].codex, { input: 4, cached: 8, output: 12, reasoning: 16 });
+    assert.equal(report.totals.codexUnattributedRows, 7);
+    const enterprise = attributeSessions({ sessions: [], prs, repository: 'foreign.example/a/b', codexRows: [
+      { ...row, repo: 'a/b' }, { ...row, repo: 'https://github.com/a/b' },
+    ] });
+    assert.deepEqual(enterprise.perPr[0].codex, row.tokens);
+    assert.equal(enterprise.totals.codexUnattributedRows, 1);
+  });
   it.each([-1, NaN, Infinity, -Infinity])('rejects invalid credited Codex counters: %s', value => {
     assert.throws(() => attributeSessions({ sessions: [], prs, repository, codexRows: [
       { repo: 'a/b', pr: 10, tokens: { input: value } },
@@ -155,6 +170,26 @@ describe('transcript evidence', () => {
   it.each([-1, NaN, Infinity, -Infinity])('rejects invalid Claude counters: %s', value => {
     assert.throws(() => attributeSessions({ sessions: [{ ...sessions[0], tokens: { input: value } }], prs }), /Invalid token count/);
   });
+  it('flags absent and null usage after last-message-ID dedupe, retaining anonymous messages', async () => {
+    const complete = { input_tokens: 1, cache_creation_input_tokens: 2, cache_read_input_tokens: 3, output_tokens: 4 };
+    const file = transcript('missing-usage', [
+      assistant('absent', undefined, [text('Created PR #10')]), assistant('absent', undefined),
+      assistant('null', null), assistant('null', null),
+      assistant('repaired', null), assistant('repaired', complete),
+      assistant('lost', complete), assistant('lost', null),
+      assistant(undefined, undefined), assistant(undefined, null),
+      { type: 'user', message: { id: 'user' } },
+    ]);
+    const session = await readSession(file);
+    assert.equal(session.incompleteUsageMessages, 5);
+    assert.deepEqual(session.tokens, tokens(1, 2, 3, 4));
+    transcript('missing-unattributed', [assistant('missing', undefined)]);
+    const report = await readReport({ now, cwd, projectsDir: projects, env: { WE_CODEX_USAGE_LEDGER: ledger }, listMergedPrs: async () => prs });
+    assert.equal(report.totals.incompleteUsageMessages, 6);
+    assert.equal(report.perPr[0].claude.total, 10);
+    assert.equal(report.unattributed.length, 1);
+    assert.match(formatReport(report), /Incomplete Claude usage messages: 6/);
+  });
   it('rejects malformed transcript rows rather than silently understating tokens', async () => {
     const file = transcript('broken', []);
     writeFileSync(file, '{broken\n');
@@ -211,6 +246,7 @@ describe('windowed report and CLI', () => {
     jsonl(ledger, [
       { at: mergedAt, repo: 'a/b', pr: 10, tokens: { input: 20 } },
       { at: mergedAt, repo: 'other/repo', pr: 10, tokens: { input: 999 } },
+      { at: mergedAt, repo: 'https://foreign.example/a/b', pr: 10, tokens: { input: 999 } },
       { at: '2026-01-01T00:00:00Z', pr: 10, tokens: { input: 999 } },
       { at: '2027-01-01T00:00:00Z', pr: 10, tokens: { input: 999 } },
     ]);
@@ -220,7 +256,7 @@ describe('windowed report and CLI', () => {
     assert.equal(report.perPr[0].claude.total, 20);
     assert.equal(report.perPr[0].codex.input, 20);
     assert.equal(report.perPr[0].codex.cached, null);
-    assert.equal(report.totals.codexUnattributedRows, 1);
+    assert.equal(report.totals.codexUnattributedRows, 2);
     assert.equal(report.totals.incompleteUsageMessages, 2);
     assert.equal(report.totals.mergedPrs, 2);
   });
@@ -236,10 +272,33 @@ describe('windowed report and CLI', () => {
     await assert.rejects(readReport({ ...options(), listMergedPrs: async () => Array.from({ length: 500 }, (_, i) => ({ ...prs[0], number: i + 1 })) }), /complete window-filtered listMergedPrs reader/);
     await assert.rejects(readReport({ ...options(), days: 0 }), /positive finite/);
   });
-  it('rejects a saturated mixed-date PR list even when an older merge falls outside the window', async () => {
+  it('applies the injected reader cap after window filtering', async () => {
     const mixed = Array.from({ length: 500 }, (_, i) => ({ ...prs[0], number: i + 1,
       mergedAt: i === 499 ? '2026-01-01T00:00:00Z' : mergedAt }));
-    await assert.rejects(readReport({ ...options(), listMergedPrs: async () => mixed }), /Merged PR limit reached; supply a complete window-filtered listMergedPrs reader/);
+    assert.equal((await readReport({ ...options(), listMergedPrs: async () => mixed })).totals.mergedPrs, 499);
+    await assert.rejects(readReport({ ...options(), listMergedPrs: async () => [...mixed, prs[1]] }), /Merged PR limit reached; supply a complete window-filtered listMergedPrs reader/);
+  });
+  it('rejects a saturated default gh reader before future-date filtering can hide its cap', async () => {
+    const listed = Array.from({ length: 2000 }, (_, i) => ({ ...prs[0], number: i + 1,
+      mergedAt: i === 1000 ? '2026-11-11T12:00:00Z' : '2027-01-01T00:00:00Z' }));
+    const gh = vi.fn(() => JSON.stringify(listed));
+    await assert.rejects(readReport({ ...options(), listMergedPrs: undefined, gh }), /gh listing limit; shorten --days/);
+    assert.equal(gh.mock.calls.length, 1);
+    assert.deepEqual(gh.mock.calls[0][0], ['pr', 'list', '--state', 'merged', '--limit', '2000', '--json', 'number,headRefName,mergedAt,url']);
+    assert.equal(gh.mock.calls[0][1].maxBuffer, 32 * 1024 * 1024);
+  });
+  it('allows 500+ default-reader results when the raw cap is not saturated inside the window', async () => {
+    const listed = Array.from({ length: 1999 }, (_, i) => ({ ...prs[0], number: i + 1 }));
+    const gh = () => JSON.stringify(listed);
+    assert.equal((await readReport({ ...options(), listMergedPrs: undefined, gh })).totals.mergedPrs, 1999);
+    // Oldest merge is deliberately in the middle: the cap must examine every date.
+    listed[1000].mergedAt = '2026-01-01T00:00:00Z';
+    listed.push({ ...prs[1], number: 2000 });
+    assert.equal((await readReport({ ...options(), listMergedPrs: undefined, gh })).totals.mergedPrs, 1999);
+  });
+  it('refuses invalid default-reader merge dates before they can be filtered away', async () => {
+    await assert.rejects(readReport({ ...options(), listMergedPrs: undefined,
+      gh: () => JSON.stringify([{ ...prs[0], mergedAt: null }]) }), /Invalid merged PR evidence/);
   });
   it('writes baseline JSON and prints JSON or a short control-safe table', async () => {
     const output = [], out = join(temp, 'baseline.json');
