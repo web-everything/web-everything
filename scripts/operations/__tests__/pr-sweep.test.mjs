@@ -628,63 +628,41 @@ describe('humanReviewHold: the gate behind "your review" (#5768)', () => {
 
 
 describe('head-bound escalation notes', () => {
-  const green = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { context: 'lint', state: 'SUCCESS' }, { name: 'build', conclusion: 'NEUTRAL' }];
-  const red = [{ status: 'COMPLETED', conclusion: 'FAILURE' }];
+  const green = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { context: 'lint', state: 'SUCCESS' }];
   const note = (extra = {}) => c('web-everything', '2026-10-21T06:00:00Z', buildNoteComment({
-    kind: 'owed-ci-rerun-spent', prNumber: 5485, head: HEAD, failingRequiredChecks: ['test', 'lint', 'build'], text: 'reruns spent', ...extra }));
-  it.each(['green checks', 'new head'])
-  ('a later CI note recovered by %s preserves an earlier unanswered same-head dispute', recovery => {
+    kind: 'owed-ci-rerun-spent', prNumber: 5485, head: HEAD, text: 'reruns spent', ...extra }));
+  it('a newer head-resolved note preserves an earlier unanswered same-head dispute', () => {
     const dispute = c('web-everything', '2026-10-21T05:00:00Z',
       `🔔 conveyor — needs your decision\n\nneeds your decision: disagree about a ruling\n<!-- conveyor-note-head: ${HEAD} -->`);
-    const recovered = note(recovery === 'new head' ? { head: 'b'.repeat(40) } : {});
-    expect(needsDecisionOpen([dispute, recovered], { liveHead: HEAD, statusCheckRollup: green }))
+    expect(needsDecisionOpen([dispute, note({ head: 'b'.repeat(40) })], { liveHead: HEAD }))
       .toMatchObject({ at: Date.parse(dispute.createdAt), dispute: true });
   });
-  it('producer embeds the head marker', () => {
-    expect(note().body).toContain(`<!-- conveyor-note-head: ${HEAD} -->`);
+  it('resolves the owed-ci-rerun-spent card repro: note on head A with live head B', () => {
+    const liveHead = 'b'.repeat(40);
+    expect(needsDecisionOpen([note()], { liveHead })).toBeNull();
+    expect(row(sweep([mkPr({ comments: [note()], headRefOid: liveHead })]), 5485).waitingOn)
+      .not.toBe('needs-decision:note');
   });
-  it('resolves head A note on live head B with green checks', () => {
-    expect(needsDecisionOpen([note()], { liveHead: 'b'.repeat(40), statusCheckRollup: green })).toBeNull();
+  it('an all-green rollup on the same head does not close the note', () => {
+    expect(needsDecisionOpen([note()], { liveHead: HEAD })).not.toBeNull();
+    expect(row(sweep([mkPr({ comments: [note()], statusCheckRollup: green })]), 5485).waitingOn)
+      .toBe('needs-decision:note');
   });
-  it('resolves stale heads even while the new head is red', () => {
-    expect(needsDecisionOpen([note()], { liveHead: 'b'.repeat(40), statusCheckRollup: red })).toBeNull();
+  it('a persisted checks marker cannot close a same-head note with all-green CI', () => {
+    const persisted = note();
+    persisted.body += '\n<!-- conveyor-note-checks: test,lint -->';
+    expect(row(sweep([mkPr({ comments: [persisted], statusCheckRollup: green })]), 5485).waitingOn)
+      .toBe('needs-decision:note');
   });
-  it('same head still red remains open', () => {
-    expect(needsDecisionOpen([note()], { liveHead: HEAD, statusCheckRollup: red })).not.toBeNull();
+  it('legacy note without a head marker stays open on a successor', () => {
+    expect(needsDecisionOpen([note({ head: undefined })], { liveHead: 'b'.repeat(40) })).not.toBeNull();
   });
-  it('same head named checks success or neutral resolves, including at the sweep call site', () => {
-    expect(needsDecisionOpen([note()], { liveHead: HEAD, statusCheckRollup: green })).toBeNull();
-    expect(row(sweep([mkPr({ comments: [note()], statusCheckRollup: green })]), 5485).waitingOn).not.toBe('needs-decision:note');
+  it.each([undefined, null, 'unknown', 'b'.repeat(39), 'g'.repeat(40), 'b'.repeat(41)])
+  ('an unknown or invalid live head cannot close the note: %s', liveHead => {
+    expect(needsDecisionOpen([note()], { liveHead })).not.toBeNull();
   });
-  it.each([null, undefined, [], [{}], [{ conclusion: 'SUCCESS' }, {}], [{ status: 'IN_PROGRESS' }]])
-  ('unreadable or incomplete rollup retains the alert: %j', statusCheckRollup => {
-    expect(needsDecisionOpen([note()], { liveHead: HEAD, statusCheckRollup })).not.toBeNull();
-  });
-  it('legacy note without head marker stays open on a green successor', () => {
-    expect(needsDecisionOpen([note({ head: undefined })], { liveHead: 'b'.repeat(40), statusCheckRollup: green })).not.toBeNull();
-  });
-  it('unknown live head stays open even with green checks', () => {
-    expect(needsDecisionOpen([note()], { statusCheckRollup: green })).not.toBeNull();
-    expect(needsDecisionOpen([note()], { liveHead: 'unknown', statusCheckRollup: green })).not.toBeNull();
-  });
-  it('named check absent from a green rollup stays open', () => {
-    expect(needsDecisionOpen([note()], { liveHead: HEAD, statusCheckRollup: green.slice(0, 2) })).not.toBeNull();
-  });
-  it('matches URI-encoded check names against the live names', () => {
-    expect(needsDecisionOpen([note({ failingRequiredChecks: ['test / unit', 'lint,build'] })], {
-      liveHead: HEAD, statusCheckRollup: [{ name: 'test / unit', conclusion: 'SUCCESS' },
-        { name: 'lint,build', conclusion: 'NEUTRAL' }],
-    })).toBeNull();
-  });
-  it('legacy note without checks marker stays open on same-head green checks', () => {
-    expect(needsDecisionOpen([note({ failingRequiredChecks: undefined })], { liveHead: HEAD, statusCheckRollup: green })).not.toBeNull();
-  });
-  it('malformed checks marker stays open', () => {
-    const malformed = note();
-    malformed.body = malformed.body.replace('test,lint,build', '%ZZ');
-    expect(needsDecisionOpen([malformed], { liveHead: HEAD, statusCheckRollup: green })).not.toBeNull();
-  });
-  it('other note kinds remain open on same-head green checks', () => {
-    expect(needsDecisionOpen([note({ kind: 'ci-heal-exhausted' })], { liveHead: HEAD, statusCheckRollup: green })).not.toBeNull();
+  it('compares valid head markers without case sensitivity', () => {
+    expect(needsDecisionOpen([note({ head: HEAD.toUpperCase() })], { liveHead: HEAD })).not.toBeNull();
+    expect(needsDecisionOpen([note()], { liveHead: 'B'.repeat(40) })).toBeNull();
   });
 });

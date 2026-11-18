@@ -127,7 +127,7 @@ export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardRea
  * `dispute` is true only for the fixer/reviewer ruling disagreement; other notes (permission block, exhausted
  * repairs, infrastructure) share the headline and need a different answer. PURE.
  */
-export function needsDecisionOpen(comments, { headCommittedAt = null, liveHead = null, statusCheckRollup = null } = {}) {
+export function needsDecisionOpen(comments, { headCommittedAt = null, liveHead = null } = {}) {
   const list = sorted(comments);
   const pushed = t(headCommittedAt);
   for (const e of [...list].reverse()) {
@@ -143,21 +143,8 @@ export function needsDecisionOpen(comments, { headCommittedAt = null, liveHead =
     for (const e of list) if (e.at !== null && e.at > note.at && isOperatorAuthored(e.c)) return null;
     const body = bodyOf(note.c);
     const noteHead = /^<!-- conveyor-note-head: ([a-f0-9]{40}) -->$/im.exec(body)?.[1];
-    if (noteHead && typeof liveHead === 'string' && /^[a-f0-9]{40}$/i.test(liveHead)) {
-      if (noteHead.toLowerCase() !== liveHead.toLowerCase()) continue;
-      let checks = [];
-      try {
-        const marker = /^<!-- conveyor-note-checks: (\S+) -->$/m.exec(body)?.[1];
-        if (marker) checks = marker.split(',').map(decodeURIComponent);
-      } catch { /* Malformed check names cannot prove recovery. */ }
-      if (/^needs your decision:\s*owed-ci-rerun-spent\s*$/im.test(body)
-        && Array.isArray(statusCheckRollup) && statusCheckRollup.length > 0
-        && checks.length > 0 && checks.every(name => name.trim()
-          && statusCheckRollup.some(check => (check?.name ?? check?.context) === name
-            && ['SUCCESS', 'NEUTRAL'].includes(String(check?.conclusion ?? check?.state ?? '').toUpperCase())))
-        && statusCheckRollup.every(check => ['SUCCESS', 'NEUTRAL'].includes(
-          String(check?.conclusion ?? check?.state ?? '').toUpperCase()))) continue;
-    }
+    if (noteHead && typeof liveHead === 'string' && /^[a-f0-9]{40}$/i.test(liveHead)
+      && noteHead.toLowerCase() !== liveHead.toLowerCase()) continue;
     return { at: note.at, dispute: /disagree about a ruling|operator ruled .* came back/i.test(body),
       text: body.split('\n').filter(Boolean).slice(1, 3).join(' ').slice(0, 200) };
   }
@@ -295,8 +282,7 @@ export function deriveWaitingOn(pr, ctx) {
   if (rt) return done('ruling-needed:red-team-round-cap', 'operator', rt.since ?? null,
     `red team round cap reached with ${rt.findings.length} unresolved finding(s)`, actions.redTeamRuling, ['we:red-team-gate outcome=round-cap']);
 
-  const decision = needsDecisionOpen(pr.comments, { headCommittedAt: pushedAt, liveHead: pr.headRefOid,
-    statusCheckRollup: pr.statusCheckRollup });
+  const decision = needsDecisionOpen(pr.comments, { headCommittedAt: pushedAt, liveHead: pr.headRefOid });
   if (decision) return done(decision.dispute ? 'ruling-needed:dispute' : 'needs-decision:note', 'operator', decision.at,
     decision.dispute ? `fixer and reviewer disagree; a person must decide (${decision.text})` : `an escalation note awaits your answer (${decision.text})`,
     decision.dispute ? actions.referralRuling : actions.answerNote, ['needs-your-decision note']);
