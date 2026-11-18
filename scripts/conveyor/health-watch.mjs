@@ -431,19 +431,34 @@ export function daemonNameForLabel(label) {
  * (every resident daemon that is not a `pass-daemon.mjs` watcher), which the smell already treats as "use the
  * generic default".
  */
-export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000 } = {}) {
+export function probeLeasePid(pid, { exec = execFileSync, timeoutMs = 5000 } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  try {
+    const output = String(exec('ps', ['-o', 'pid=', '-p', String(pid)],
+      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] })).trim();
+    return output === String(pid) ? true : null;
+  } catch (e) { return e?.status === 1 ? false : null; }
+}
+
+export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000,
+  leasePidAlive = pid => probeLeasePid(pid, { timeoutMs }),
+} = {}) {
   const exec = (cmd, args, opts = {}) => execFileSync(cmd, args, { ...opts, timeout: timeoutMs });
   const read = assess(collect({ exec }));
   return read.daemons.filter((d) => d.readable !== false).map((d) => {
     const ms = (v) => (v == null ? null : typeof v === 'number' ? v : Date.parse(v) || null);
     const entry = d.lease?.entry ?? null;
+    const outsideLaunchd = !d.running && Number.isSafeInteger(entry?.pid) && entry.pid > 1
+      ? leasePidAlive(entry.pid) : false;
     const activity = [ms(d.tick?.lastActivityAt), ms(d.tick?.at), ms(d.tick?.logMtimeMs)].filter(Number.isFinite);
     const log = daemonNameForLabel(d.name);
     return {
       log,
       role: d.kind ?? null,
       pid: entry?.pid ?? null,
-      pidAlive: !!d.running,
+      pidAlive: !!d.running || outsideLaunchd === true,
+      // Launchd absence does not prove that the process holding the daemon lease is dead.
+      outsideLaunchd,
       heartbeatAt: ms(entry?.heartbeatAt),
       lastActivityAt: activity.length ? Math.max(...activity) : null,
       daemonState: d.state,

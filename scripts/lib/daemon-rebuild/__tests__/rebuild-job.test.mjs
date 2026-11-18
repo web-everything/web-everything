@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadRebuildAsJobSettings, rebuildJobInterval, rebuildCloneAsJob, REBUILD_JOB_KIND } from '../rebuild-job.mjs';
 import { createJobStore, enqueueJob } from '../../daemon-jobs-runtime.mjs';
+import { writeReadyCandidate, readReadyCandidate } from '../state.mjs';
 import { markSucceeded } from '../../daemon-jobs.mjs';
 
 let root;
@@ -78,3 +79,26 @@ it.each([[20, 1100, 'rebuild-job-spaced', 100], [0, 1100, 'rebuild-job-started',
     expect(store.list().records).toHaveLength(reason === 'rebuild-job-spaced' ? 1 : 2);
   },
 );
+
+it.each(['before-reattach', 'during-reattach'])('never starts or restarts a job with ready evidence %s', async phase => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  mkdirSync(join(root, 'jobs'));
+  const store = createJobStore(join(root, 'jobs'));
+  const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root } });
+  const ready = { kind: 'candidate', prevHead: 'old', tree: 'tree', passedAt: new Date().toISOString(),
+    adopt: { finalSha: 'ready', applied: [] } };
+  const publish = () => writeReadyCandidate(root, ready, env);
+  if (phase === 'before-reattach') publish();
+  const reattach = vi.fn(async () => {
+    publish();
+    store.update(old.id, r => markSucceeded(r, { at: new Date().toISOString() }));
+  });
+  const adopt = vi.fn(async () => ({ reason: 'needs-build' }));
+  const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, codeSha: 'a'.repeat(40),
+    log: { error() {} }, evict: () => ({}) });
+  expect(result.reason).toBe('ready-pending');
+  expect(readReadyCandidate(root, env)?.adopt.finalSha).toBe('ready');
+  expect(store.list().records).toHaveLength(1);
+  expect(reattach).toHaveBeenCalledTimes(phase === 'before-reattach' ? 0 : 1);
+  expect(adopt).toHaveBeenCalledTimes(1);
+});

@@ -6,7 +6,7 @@
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
@@ -18,7 +18,7 @@ import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
-  ACTIVE_BUILD_TOKENS,
+  ACTIVE_BUILD_TOKENS, processStartMs,
 } from './lease.mjs';
 import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
@@ -64,6 +64,17 @@ export function defaultSpawnerOwners({ pid = process.ppid, host = hostname(), ex
     } catch { break; }
   }
   return owners;
+}
+
+/** A durable job may outlive its launcher. Bind its exclusion to clone, host, pid AND process session. */
+export function targetDaemonReader(raw, root, startTimeOf = processStartMs, host = hostname()) {
+  try {
+    const r = JSON.parse(raw);
+    if (typeof r.root !== 'string' || resolve(r.root) !== resolve(root)
+      || !Number.isSafeInteger(r.pid) || r.pid <= 1 || r.owner !== `${host}:${r.pid}`
+      || !Number.isFinite(r.startedMs) || startTimeOf(r.pid) !== r.startedMs) return [];
+    return [r.owner];
+  } catch { return []; } // Unknown session: retain the reader and let the next tick/operator retry.
 }
 
 function trustedIgnoreOwners(raw, spawnerOwners, log) {
@@ -176,7 +187,7 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners,
+  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -225,8 +236,11 @@ async function rebuildCloneInternal({
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
     // Only the ready-only job has prepare guards that make excluding its spawner safe.
-    // The env value is honoured only for this process's actual spawner or an ancestor; anything else is dropped.
-    ...(readyOnly ? { ignoreOwners: trustedIgnoreOwners(env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS, spawnerOwners, log) } : {}),
+    // Exclude ancestors or a persisted target whose clone, host and process session still match.
+    ...(readyOnly ? { ignoreOwners: [
+      ...trustedIgnoreOwners(env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS, spawnerOwners, log),
+      ...targetDaemonReader(env?.WE_DAEMON_REBUILD_READER, root, readerStartTimeOf),
+    ] } : {}),
     now,
     waitMs,
     onBlocked: ({ blockers, waitMs: w }) => log.error?.(
