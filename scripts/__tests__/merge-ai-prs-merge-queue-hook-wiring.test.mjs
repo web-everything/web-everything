@@ -31,7 +31,7 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   const query = a.find(v => v.startsWith('query=')) || '';
   if (query.includes('comments{totalCount}')) {
     const p = prs.find(p => 'n=' + p.number === a.find(v => v.startsWith('n=')));
-    if (!p || !['owner=web-everything', 'owner=longshoreai'].some(v => a.includes(v)) || !['name=web-everything', 'name=longshore'].some(v => a.includes(v))) process.exit(1);
+    if (!p || !(a.includes('owner=web-everything') && a.includes('name=web-everything'))) process.exit(1);
     out({ data: { repository: { pullRequest: { comments: { totalCount: p.comments.length } } } } });
   }
   out(openPrPageFixture(prs.filter(p => !landed(p.number)), query));
