@@ -56,7 +56,7 @@ describe('capabilities admit dispatch only', () => {
     'repos.flatMap(repo => repo.capabilities?.fix ? [repo] : [])',
   ])('detects a capability roster regression: %s', source => expect(rosterFilters(source)).toHaveLength(1));
 
-  it.skipIf(scope !== null && !scope.has('scripts/merge-ai-prs.mjs'))('allows lander admission only at enqueue and before branch preparation, leaving lifecycle paths unguarded', () => {
+  it.skipIf(scope !== null && !scope.has('scripts/merge-ai-prs.mjs'))('keeps lander admissions at write boundaries, with no roster filtering', () => {
     const source = readFileSync(resolve(root, 'scripts/merge-ai-prs.mjs'), 'utf8');
     const file = ts.createSourceFile('merge-ai-prs.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const sites = [];
@@ -64,26 +64,15 @@ describe('capabilities admit dispatch only', () => {
       if (ts.isCallExpression(node) && node.expression.getText(file) === 'assertCapability') {
         let owner = node.parent;
         while (owner && !ts.isFunctionDeclaration(owner) && !ts.isArrowFunction(owner)) owner = owner.parent;
-        // The pre-preparation guard belongs to the candidate runner, immediately before preparation.
-        if (owner && ts.isArrowFunction(owner) && ts.isPropertyAssignment(owner.parent)
-          && owner.parent.name.getText(file) === 'run'
-          && ts.isCallExpression(owner.parent.parent.parent)
-          && owner.parent.parent.parent.expression.getText(file) === 'runEnqueueCandidates') {
-          const statement = node.parent.parent.parent;
-          const statements = [...statement.parent.statements];
-          const following = statements[statements.indexOf(statement) + 2];
-          sites.push(ts.isIfStatement(following)
-            && following.expression.getText(file).startsWith('shouldPrepareBranchBeforeEnqueue(')
-            ? 'branchPreparation' : 'unapproved');
-        } else if (owner && ts.isFunctionDeclaration(owner)) sites.push(owner.name?.text);
-        else if (owner && ts.isArrowFunction(owner) && ts.isCallExpression(owner.parent)
-          && owner.parent.expression.getText(file) === 'withLandWriteLock'
-          && ts.isVariableDeclaration(owner.parent.parent)) sites.push(owner.parent.parent.name.getText(file));
+        if (ts.isFunctionDeclaration(owner)) sites.push(owner.name.text);
+        else if (ts.isVariableDeclaration(owner.parent)) sites.push(owner.parent.name.getText(file));
+        else if (ts.isPropertyAssignment(owner.parent)) sites.push(owner.parent.name.getText(file));
         else sites.push('unapproved');
       }
       ts.forEachChild(node, visit);
     }
     visit(file);
-    expect(sites).toEqual(['enqueueWithSameHeadGuard', 'branchPreparation']);
+    expect(sites).toEqual(['enqueueWithSameHeadGuard', 'announceAndRetargetBeforeLand',
+      'sweepOnce', 'sweepOnce', 'refreshApprovedHead', 'sweepOnce', 'prepare', 'form', 'run', 'sweepOnce']);
   });
 });

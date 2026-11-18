@@ -709,6 +709,8 @@ export function runReviewTick({
   if (typeof refreshScopeBloat === 'function') {
     for (const row of plan.refusals ?? []) {
       if (row.kind !== 'scope-bloat' || !row.scopeBloat?.stale || row.scopeBloat.refresh || !row.headRefName || !row.headRefOid) continue;
+      const refusal = assertCapability(repo, 'review', { resolveProfile });
+      if (refusal) { failed.push({ prNumber: row.prNumber, error: refusal.why }); continue; }
       // A refresh that THROWS is normalized into a failed result and goes down the same path as one that returns: it is
       // remembered in this process AND gets the durable per-head marker, because the fix daemon (another process) reads
       // only the thread and would otherwise wait forever on a refresh it cannot see was tried.
@@ -1140,7 +1142,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
  */
 export async function runConvertAdvisoryTick({
   reconcile = runReconcilePass, convertAdvisory = dispatchConvertAdvisory, repo = WE_SLUG,
-  readPrs = null, readAgents = null, dryRun = false, plans = null,
+  readPrs = null, readAgents = null, dryRun = false, plans = null, resolveProfile = repoProfile,
 } = {}) {
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let plan;
@@ -1171,6 +1173,8 @@ export async function runConvertAdvisoryTick({
   for (const d of entries) {
     // One bad entry never aborts the rest — the SAME per-PR isolation `runReviewTick`'s own dispatch loop uses.
     try {
+      const refusal = assertCapability(repo, 'review', { resolveProfile });
+      if (refusal) { skipped.push({ prNumber: d.prNumber, reason: refusal.why }); continue; }
       const pr = prsByNumber.get(Number(d.prNumber));
       const result = await convertAdvisory(d, {
         repo, comments: pr?.comments ?? null, labels: pr?.labels ?? null, dryRun,
@@ -1254,13 +1258,17 @@ export async function runConvertAdvisoryTickAllRepos({
  */
 export async function runPrepReviewStage({
   repo = WE_SLUG, readPrs = defaultReadPrs, tick = runPrepReviewTick, env = process.env,
-  root = resolve(fileURLToPath(import.meta.url), '..', '..', '..'), makeDeps = makePrepReviewDeps,
+  root = resolve(fileURLToPath(import.meta.url), '..', '..', '..'), makeDeps = makePrepReviewDeps, resolveProfile = repoProfile,
 } = {}) {
   const mode = resolvePrepReviewMode(env);
   // `off` still runs the tick: it reviews nothing, but it removes a stale `review:prep` from a PR that has grown past its
   // card, which would otherwise hide the normal review from every `review:*` consumer.
   try {
-    return await tick({ repo, readPrs, deps: makeDeps({ root, env }) });
+    const refusal = assertCapability(repo, 'review', { resolveProfile });
+    const deps = makeDeps({ root, env });
+    // Off suppresses judging/publication but preserves stale-label and stage-hold cleanup.
+    const result = await tick({ repo, readPrs, deps: refusal ? { ...deps, mode: 'off' } : deps });
+    return refusal ? { ...result, capabilityRefusal: refusal } : result;
   } catch (e) {
     return { mode, reviewed: [], skipped: [], failed: [], readError: String((e && e.message) || e).split('\n')[0] };
   }
@@ -2039,6 +2047,7 @@ export function buildCliDaemonEffects({
       }
       const pr = result.prepReview;
       if (pr) {
+        if (pr.capabilityRefusal) log.error(`review-daemon: prep-review held — ${pr.capabilityRefusal.why}`);
         for (const r of (pr.reviewed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${r.prNumber} prep-review (${pr.mode}) ${r.outcome}${r.findings?.length ? `: ${r.findings.join(',')}` : ''}${r.addLabels?.length ? `; labelled ${r.addLabels.join(',')}` : ''}`);
         for (const f of (pr.failed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${f.prNumber ?? '?'} prep-review failed (non-fatal): ${f.error}`);
         for (const x of (pr.stripped ?? [])) log.error(`review-daemon: ${WE_SLUG}#${x.prNumber} prep-review: removed a stale review:prep (the PR now carries more than the card)`);

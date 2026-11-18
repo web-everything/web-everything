@@ -498,14 +498,6 @@ export async function runReconcileCiHealDispatch({
   // knows nothing about — and replace only its own `ci-heal` rows with what THIS pass just computed.
   const otherRows = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action !== 'ci-heal');
 
-  if (assertCapability(repoKey, 'ciHeal', { resolveProfile: () => profile })) {
-    const refusals = (reconciled.dispatch ?? []).filter((entry) => ['ci-heal', 'ci-timeout-rerun'].includes(entry.kind)).map((entry) => ({
-      kind: 'unsupported-repo', repo: repoKey, prNumber: entry.prNumber, action: 'ci-heal',
-      why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
-    }));
-    recordUnsupported({ repo: repoKey, rows: [...otherRows, ...refusals], path: unsupportedPath });
-    return { handled: refusals.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
-  }
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
     try {
@@ -526,6 +518,14 @@ export async function runReconcileCiHealDispatch({
     refusals: timeoutResults.filter((r) => r.status !== 'requested'), timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush,
   };
+  if (assertCapability(repoKey, 'ciHeal', { resolveProfile: () => profile })) {
+    const refusals = (reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal').map((entry) => ({
+      kind: 'unsupported-repo', repo: repoKey, prNumber: entry.prNumber, action: 'ci-heal',
+      why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
+    }));
+    recordUnsupported({ repo: repoKey, rows: [...otherRows, ...refusals], path: unsupportedPath });
+    return { handled: refusals.length, deferred: [], nextCursor: null, dispatched: timeoutResults.filter(r => r.status === 'requested'), refusals: [...refusals, ...timeoutResults.filter(r => r.status !== 'requested')], timeoutFollowups, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
+  }
   // `ci-heal` IS supported here — clear any stale `ci-heal` unsupported rows, preserving `fix`/`review` rows.
   recordUnsupported({ repo: repoKey, rows: otherRows, path: unsupportedPath });
 

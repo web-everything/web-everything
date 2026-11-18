@@ -3255,3 +3255,32 @@ it('capability-off refuses ordinary and recovery review starts while hold reconc
   expect(redTeamOnSkip).not.toHaveBeenCalled();
   expect(holdReconcile).toHaveBeenCalledOnce();
 });
+
+
+it('capability-off scope-bloat recovery never refreshes/pushes, records an attempt or publishes a marker', () => {
+  const push = vi.fn(), rerun = vi.fn();
+  const refreshScopeBloat = vi.fn(() => { push(); rerun(); return {ok: true}; });
+  const recordScopeBloatRefresh = vi.fn(), postRefreshMarker = vi.fn(), holdReconcile = vi.fn(() => []);
+  const out = runReviewTick({ repo: 'web-everything/web-everything',
+    resolveProfile: () => ({capabilities: {review: false}}),
+    reconcile: () => ({dispatch: [], refusals: [{kind: 'scope-bloat', prNumber: 89,
+      scopeBloat: {stale: true}, headRefName: 'lane/x', headRefOid: 'a'.repeat(40)}]}),
+    refreshScopeBloat, recordScopeBloatRefresh, postRefreshMarker, holdReconcile,
+    tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+  });
+  expect(out.failed).toContainEqual({prNumber: 89, error: expect.stringContaining('capability unavailable')});
+  for (const effect of [refreshScopeBloat, push, rerun, recordScopeBloatRefresh, postRefreshMarker]) expect(effect).not.toHaveBeenCalled();
+  expect(holdReconcile).toHaveBeenCalledOnce();
+});
+
+it.each([false, true])('capability-off convert-advisory refuses judge and publication (dryRun=%s)', async dryRun => {
+  const judge = vi.fn(), publish = vi.fn();
+  const convertAdvisory = vi.fn(async () => { judge(); publish(); return {posted: true}; });
+  const reconcile = vi.fn(() => ({dispatch: [{kind: 'convert-advisory', prNumber: 90}], refusals: []}));
+  const out = await runConvertAdvisoryTick({repo: 'web-everything/web-everything', dryRun,
+    resolveProfile: () => ({capabilities: {review: false}}), reconcile, convertAdvisory});
+  expect(out.skipped).toEqual([{prNumber: 90, reason: expect.stringContaining('capability unavailable')}]);
+  expect(out.convertAdvisoriesOwed).toBe(1);
+  expect(reconcile).toHaveBeenCalledOnce();
+  for (const effect of [convertAdvisory, judge, publish]) expect(effect).not.toHaveBeenCalled();
+});

@@ -327,7 +327,7 @@ describe('dispatchCiHeal (#3852)', () => {
 // composition (read the reconcile plan → capability-gate → lane → dispatch), same durable `unsupported-repo`
 // ledger, one dispatch kind over.
 describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo slice 7)', () => {
-  it.each([false, true])('ciHeal:false refuses timeout reruns and fixers before any start (timeout-only=%s)', async (timeoutOnly) => {
+  it.each([false, true])('ciHeal:false refuses fixers while timeout reruns and lifecycle flushes survive (timeout-only=%s)', async (timeoutOnly) => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusals-'));
     const unsupportedPath = join(dir, 'rows.json');
     const calls = [];
@@ -352,12 +352,12 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
         checkStaleness: FRESH,
       };
       const result = await runReconcileCiHealDispatch(options);
-      expect(result.dispatched).toEqual([]);
-      expect(result.refusals).toEqual((timeoutOnly ? [52] : [50, 52]).map(prNumber => ({
+      expect(result.dispatched).toEqual([{status: 'requested', kind: 'ci-timeout-rerun', pr: 52}]);
+      expect(result.refusals).toEqual((timeoutOnly ? [] : [50]).map(prNumber => ({
         kind: 'unsupported-repo', repo: 'plateau-app', prNumber, action: 'ci-heal', why: expect.any(String),
       })));
-      expect(calls).toEqual(['flush', 'timeouts']); // Lifecycle publication survives dispatch refusal.
-      expect(readUnsupported({ path: unsupportedPath })).toHaveLength(timeoutOnly ? 1 : 2);
+      expect(calls).toEqual(['flush', 'timeouts', 'rerun']); // Timeout recovery is lifecycle work.
+      expect(readUnsupported({ path: unsupportedPath })).toHaveLength(timeoutOnly ? 0 : 1);
       await expect(runReconcileCiHealDispatch({ repo: 'unknown/repo' })).rejects.toThrow(/not a constellation repo/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
