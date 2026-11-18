@@ -944,7 +944,8 @@ const malformedReviewStartBudgets = new Set();
 export function sharedHostBudget(hostAdmission, log = console.error) {
   let verdict = null;
   let left = 0;
-  return () => {
+  let spentTotal = 0;
+  const shared = () => {
     if (!verdict) {
       try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
       catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
@@ -964,8 +965,12 @@ export function sharedHostBudget(hostAdmission, log = console.error) {
       verdict = { ...verdict, maxPerTick: budget };
       left = verdict.admitted ? budget : 0;
     }
-    return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
+    return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { const before = left; left = Math.max(0, left - n); spentTotal += before - left; } };
   };
+  // Seats spent so far through ANY path (dispatch, failed dispatch, red-team recovery): the rotation reads this
+  // per repo instead of trusting `dispatched`, which misses seats a failed or recovery start still consumed.
+  shared.spent = () => spentTotal;
+  return shared;
 }
 
 // Round-robin cursor for first access to the shared review seats. It moves only when a tick actually handed out
@@ -994,19 +999,31 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   const start = repos.length && Number.isSafeInteger(startIndex)
     ? ((startIndex % repos.length) + repos.length) % repos.length : 0;
   const orderedRepos = [...repos.slice(start), ...repos.slice(0, start)];
+  const seatTakers = new Set();
   const rotatedResults = forEachRepo(orderedRepos, (repo) => {
     const started = Date.now();
+    const spentBefore = tickOpts.hostAdmission?.spent?.() ?? 0;
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
-    finally { perRepoMs[repo] = Date.now() - started; }
+    finally {
+      perRepoMs[repo] = Date.now() - started;
+      if ((tickOpts.hostAdmission?.spent?.() ?? 0) > spentBefore) seatTakers.add(repo);
+    }
   });
   // Preserve the public result (and aggregate) order even when execution starts at another repo.
   const split = repos.length - start;
   const perRepo = [...rotatedResults.slice(split), ...rotatedResults.slice(0, split)];
-  // Advance the default rotation past the last repo (in execution order) that actually took a seat; leave it
-  // untouched when nobody dispatched, and never move it for an injected `startIndex`.
+  // Advance the default rotation past the last repo (in execution order) that actually took a seat — a seat
+  // spent from the shared host budget (dispatch, failed dispatch, red-team recovery, or a tick that threw after
+  // spending) or a reported dispatch; leave it untouched when nobody did, and never move it for an injected
+  // `startIndex`. Over-counting is safe (the repo just goes last); missing a spender would pin it first.
   if (!pinnedStart && repos.length) {
     let lastServed = -1;
-    rotatedResults.forEach((entry, i) => { if ((entry?.result?.dispatched?.length ?? 0) > 0) lastServed = i; });
+    rotatedResults.forEach((entry, i) => {
+      const r = entry?.result;
+      // `failed` is deliberately NOT a signal: it also lists non-seat failures (pause notice, scope-bloat) that
+      // happen on ticks with no free seat and must not spend a repo's turn.
+      if (seatTakers.has(orderedRepos[i]) || (r?.dispatched?.length ?? 0) > 0) lastServed = i;
+    });
     if (lastServed >= 0) reviewRepoRotation = (start + lastServed + 1) % repos.length;
   }
   const dispatched = [];

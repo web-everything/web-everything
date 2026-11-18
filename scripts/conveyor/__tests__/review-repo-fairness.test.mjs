@@ -68,6 +68,37 @@ describe('shared review seats across repos', () => {
     expect(next.dispatched.map(d => d.repo)).toEqual([repos[0]]);
   });
 
+  it('moves past a repo whose seat was spent without a dispatch (failed start, recovery, throw after take)', async () => {
+    const runAll = await fresh();
+    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const first = [];
+    // Each repo spends the one seat but reports no dispatch: the turn must still pass to the next repo.
+    for (let i = 0; i < 3; i++) {
+      runAll({ repos: three, log() {}, hostAdmission: () => ({ admitted: true, maxPerTick: 1 }),
+        tick({ repo, hostAdmission }) {
+          const b = hostAdmission();
+          if (b.maxPerTick > 0) {
+            first.push(repo); b.take(1);
+            if (repo === three[2]) throw new Error('boom after take');
+          }
+          return { reviewsOwed: 1, dispatched: [], failed: [{ prNumber: 1, error: 'x' }], refusals: 0 };
+        } });
+    }
+    expect(first).toEqual(three);
+  });
+
+  it('a non-seat failure on a tick with no free seat does not spend the repo turn', async () => {
+    const runAll = await fresh();
+    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const noSeat = { repos: three, log() {}, hostAdmission: () => ({ admitted: true, maxPerTick: 0 }),
+      tick: () => ({ reviewsOwed: 1, dispatched: [], failed: [{ prNumber: 1, error: 'pause notice: x' }], refusals: 0 }) };
+    runAll(noSeat); runAll(noSeat);
+    const order = [];
+    runAll({ repos: three, log() {}, hostAdmission: () => ({ admitted: true, maxPerTick: 1 }),
+      tick({ repo, hostAdmission }) { order.push(repo); hostAdmission().take(1); return { reviewsOwed: 1, dispatched: [{ prNumber: 1 }], failed: [], refusals: 0 }; } });
+    expect(order[0]).toBe(three[0]);
+  });
+
   it.each([0, 1])('reports all eight occupied seats and the earlier dispatch for startIndex=%i', startIndex => {
     const shared = budget();
     const result = runReviewTickAllRepos({ ...options(), startIndex, liveReviewBudget: shared });
