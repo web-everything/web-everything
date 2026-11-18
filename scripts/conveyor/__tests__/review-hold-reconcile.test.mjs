@@ -1,6 +1,9 @@
 /** @file The review-hold reconcile sweep (#x01u7az) — drops a stray review:pending beside a live review:human,
  *  and a stray advisory:* left behind once review:human is gone. No `gh`. */
 import { readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { publishAttention, replay, diffFeed, REPORT_KINDS, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -893,5 +896,74 @@ describe('createLiveHoldReaders — the pre-write re-read is never memoized', ()
       expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
     }
     expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
+  });
+});
+
+
+describe('author-stamp operator attention', () => {
+  const detail = { action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually',
+    contentRefusal: true, snapshotId: '2026-11-01T12:00:00Z by operator', offender: '<details>' };
+  const run = (headSha, publishNeedsYou, overrides = {}) => sweepFixture({ repo: 'o/n', provider: provider(),
+    listPrs: () => [], restoreStamps: () => [{ num: 6989, headSha, action: 'refuse', detail }],
+    publishNeedsYou, log: () => {}, ...overrides });
+
+  it('publishes once per PR/head across fresh sweeps using persisted feed open keys; a new head reports again', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'author-stamp-feed-'));
+    const path = join(dir, 'events.jsonl');
+    const logs = [];
+    try {
+      const publish = item => publishAttention(item, { path });
+      const first = 'a'.repeat(40), next = 'b'.repeat(40);
+      run(first, publish);
+      run(first, item => publishAttention(item, { path }), { log: line => logs.push(line) });
+      expect(replay({ path })).toHaveLength(1);
+      expect(logs).toEqual(['  PR #6989: author stamp already reported']);
+      // Ordinary report polling must not clear the event-only refusal key.
+      const state = JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8'));
+      expect(diffFeed(state.openKeys, [], Date.now(), { clearKinds: REPORT_KINDS }).lines).toEqual([]);
+      run(next, publish);
+      const events = replay({ path });
+      expect(events.map(e => e.key)).toEqual([`author-stamp:6989:${first}`, `author-stamp:6989:${next}`]);
+      expect(events[0]).toMatchObject({ pr: 6989, head: first, kind: 'author-stamp',
+        snapshotId: detail.snapshotId, offender: detail.offender });
+      for (const text of ['PR #6989', first, detail.snapshotId, detail.offender, 'Inspect that edit in the PR history', 'do not hand-edit the stamp without verifying author provenance']) {
+        expect(events[0].pick).toContain(text);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['unreadable edit history', 'restore failed: API error; retry after evidence is readable',
+    'live PR changed before write; retry from fresh evidence'])('never publishes retryable refusal: %s', reason => {
+    const publish = vi.fn();
+    run('a'.repeat(40), publish, { restoreStamps: () => [{ num: 6989, action: 'refuse', detail: { reason } }] });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('a failing publisher does not hide later refusals; each logs its plain refusal', () => {
+    const logs = [];
+    const results = sweepFixture({ repo: 'o/n', provider: provider(), listPrs: () => [],
+      restoreStamps: () => [{ num: 1, headSha: 'a'.repeat(40), action: 'refuse', detail },
+        { num: 2, headSha: 'b'.repeat(40), action: 'refuse', detail }],
+      publishNeedsYou: () => { throw new Error('feed unavailable'); }, log: line => logs.push(line) });
+    expect(results.filter(r => r.stampRestore === 'refuse').map(r => r.num)).toEqual([1, 2]);
+    expect(logs.filter(l => l.includes('publish failed'))).toHaveLength(2);
+    expect(logs.filter(l => l.includes('author stamp refuse'))).toHaveLength(2);
+  });
+
+  it('does not publish during dry run or when the head is unreadable', () => {
+    const publish = vi.fn();
+    run('a'.repeat(40), publish, { dryRun: true });
+    const log = vi.fn();
+    run(undefined, publish, { log });
+    expect(publish).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('publish failed: missing head sha'));
+  });
+
+  it('retries publication after a failed feed write rather than marking it reported', () => {
+    const publish = vi.fn().mockImplementationOnce(() => { throw new Error('feed write failed'); })
+      .mockReturnValue({ lines: ['NEEDS-YOU'] });
+    run('a'.repeat(40), publish);
+    run('a'.repeat(40), publish);
+    expect(publish).toHaveBeenCalledTimes(2);
   });
 });
