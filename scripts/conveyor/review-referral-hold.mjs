@@ -637,7 +637,10 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     const trusted = pr.comments.filter(isTrustedMarkerAuthor);
     const adv = parseAdvisories(trusted)[0];
     const body = String(trusted[adv?.index]?.body ?? '');
-    const outcomes = [...body.matchAll(/^\*\*Advisory outcome:\*\*\s*`?([a-z-]+)`?/gim)].map(m => m[1].toLowerCase());
+    // Every line that mentions an advisory outcome counts (a duplicate or malformed one keeps the hold), and the single
+    // one must be a well-formed explicit accept.
+    const outcomes = body.split(/\r?\n/).filter(l => /advisory\s+outcome/i.test(l))
+      .map(l => (/^\*\*Advisory outcome:\*\* `accept`(?:\s.*)?$/.test(l) ? 'accept' : 'malformed'));
     // parseAdvisories skips a comment missing a Verdict or Net basis line, so a newer malformed advisory note must not be
     // passed over: the newest advisory-note comment on the thread has to be the parsed one.
     const notes = trusted.map((c, i) => ({ i, at: Date.parse(c?.createdAt) || 0, note: String(c?.body ?? '').includes('ADVISORY REVIEW, NOT A RECORDED VERDICT') }))
