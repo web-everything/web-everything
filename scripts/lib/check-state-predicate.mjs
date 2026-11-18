@@ -228,7 +228,7 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
   // The review-gate has no verdict of its own: its failure is review-owned only when a merge-gate run on this very
   // head carries a job-bound human-review hold (that run is already 'held' above). An unannotated failure stays 'fail'.
   for (const r of classified) {
-    if (r.name === 'review-gate' && r.state === 'fail' && r.rowHead
+    if (r.name === 'review-gate' && r.state === 'fail' && r.rowHead && normalize(r.row?.conclusion) === 'failure'
       && classified.some(m => m.name === 'merge-gate' && m.state === 'held' && m.rowHead === r.rowHead)) r.state = 'held';
   }
   // A nameless row cannot safely be assigned to an advisory check.

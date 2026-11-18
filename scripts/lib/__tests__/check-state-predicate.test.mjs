@@ -771,6 +771,8 @@ describe('required check evidence contract (PR1 acceptance)', () => {
       { requiredNames: ['review-gate'], holds: [{ jobId: 8, headSha: head, holdIds: ['review-acceptance'] }] }).state).toBe('fail');
     expect(resolve([row('review-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/9' })],
       { requiredNames: ['review-gate'], holds: [{ jobId: 9, headSha: head, holdIds: ['review-acceptance'] }] }).state).toBe('held');
+    // Only an actual failure conclusion can be review-owned: a skipped/neutral-class failure is never held.
+    expect(resolve([failed, row('review-gate', 'timed_out')], { requiredNames: ['merge-gate', 'review-gate'], holds: [bound] }).state).not.toBe('held');
     // A merge-gate run bound to a human-review hold on this head also proves the review-gate failure is review-owned.
     expect(resolve([failed, row('review-gate', 'failure')], { requiredNames: ['merge-gate', 'review-gate'], holds: [bound] }).state).toBe('held');
   });
