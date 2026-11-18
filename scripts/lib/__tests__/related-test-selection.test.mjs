@@ -334,4 +334,10 @@ describe('CI static edge policy', () => {
         .toMatchObject({ oldMissed: ['edge.test.mjs'], newMissed: [] });
     } finally { vi.unstubAllEnvs(); }
   });
+
+  it('a line comment containing `from /*` cannot swallow later real imports', () => {
+    const files = { 'a.mjs': '', 'b.mjs': '', 'src.mjs': "// from /*\nimport './a.mjs';\n// */\nimport './b.mjs';" };
+    expect(graph(files).get('a.mjs')?.has('src.mjs')).toBe(true);
+    expect(graph(files).get('b.mjs')?.has('src.mjs')).toBe(true);
+  });
 });

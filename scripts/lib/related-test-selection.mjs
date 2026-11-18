@@ -61,7 +61,7 @@ function repoAliases() {
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
 // Block comments are valid token separators, including around call parentheses.
-const SPECIFIER_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/)*`;
+const SPECIFIER_GAP = String.raw`(?:\s|/\*[^\n]*?\*/)*`; // single-line block comments only: a `// from /*` line comment must not reach a later `*/`
 const SPECIFIER_RE = new RegExp([
   String.raw`\bfrom${SPECIFIER_GAP}['"]([^'"\n]+)['"]`,
   String.raw`\bimport${SPECIFIER_GAP}\(${SPECIFIER_GAP}['"]([^'"\n]+)['"]${SPECIFIER_GAP}\)`,
