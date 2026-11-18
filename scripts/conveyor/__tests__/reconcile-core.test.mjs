@@ -3757,12 +3757,27 @@ describe('strict review hold and promotion evidence (PR2c)', () => {
     prs: [pr1563({ labels: lbl('review:pending'), comments: [], statusCheckRollup, ...over })],
     requiredChecks, agents: [], now: NOW, advisoryReviewOnHumanHandoff: 'on',
   });
+  it('incomplete evidence with a failed review-gate cannot start review or promote', () => {
+    const pr = pr1563({ labels: lbl('review:pending'), comments: [], rowsComplete: false,
+      statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] });
+    expect(reviewHoldOnlyRed(pr, ['review-gate'])).toBe(false);
+    expect(reviewHoldGatesOnlyRed(pr, ['review-gate'])).toBe(false);
+    const result = planReconcile({ prs: [pr], requiredChecks: ['review-gate'], agents: [], now: NOW,
+      reviewTiming: { startAfter: 'ci-green' } });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+      evidenceReason: expect.stringContaining('rows-incomplete') }));
+    const draft = planReconcile({ prs: [{ ...pr, isDraft: true }], requiredChecks: ['review-gate'], agents: [], now: NOW });
+    expect(draft.dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+    expect(draft.refusals).toContainEqual(expect.objectContaining({ kind: 'draft', why: expect.stringContaining('rows-incomplete') }));
+  });
   const invalidHolds = [
     ['mismatched jobId', { ...hold, jobId: 8 }],
     ['foreign headSha', { ...hold, headSha: 'f'.repeat(40) }],
     ['non-human holdId', { ...hold, holdIds: ['codeql'] }],
     ['empty holdIds', { ...hold, holdIds: [] }],
     ['legacy truthy annotation', true],
+    ['empty annotation', {}],
   ];
   for (const reverse of [false, true]) {
     const ordered = input => reverse ? [...input].reverse() : input;

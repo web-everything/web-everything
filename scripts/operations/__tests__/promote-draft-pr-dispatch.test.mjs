@@ -596,6 +596,7 @@ describe('PR2c fresh promotion evidence', () => {
       : rows.map(row => JSON.stringify(row)).join('\n'));
     const readHeadCheckState = args => defaultReadHeadCheckState({ ...args, runGh,
       getRequiredChecks: () => ({ checks: ['test', 'merge-gate'], source }), mergeGateSetting: { value: 'off' },
+      readPrLabels: () => [],
     });
     const ready = vi.fn();
     const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,

@@ -5,8 +5,7 @@ import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
-import { excuseMergeGateRows, isCandidacyHold, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
-import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
+import { boundMergeGateReviewHold, excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 
@@ -122,27 +121,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     // Review work must not deadlock its own review. Recheck the annotation against
     // THIS Actions job and head; the strict check-state contract still sees a failure.
     const mergeRows = checks.filter(row => row?.name === 'merge-gate');
-    const boundReviewHold = row => {
-      const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)(?:[/?#]|$)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1]);
-      return excusalEnabled && (row.head_sha === undefined || row.head_sha?.toLowerCase() === headSha.toLowerCase())
-        && Array.isArray(labels) && labels.every(label => typeof (typeof label === 'string' ? label : label?.name) === 'string')
-        && !labels.some(label => (typeof label === 'string' ? label : label.name) === 'ready-to-merge')
-        && Number.isSafeInteger(jobId) && jobId > 0
-        && [row.mergeGateHoldExcused, row.mergeGateReviewHold].some(annotation => {
-          if (annotation?.jobId !== jobId || typeof annotation.headSha !== 'string'
-            || annotation.headSha.toLowerCase() !== headSha.toLowerCase()
-            || !Array.isArray(annotation.holdIds) || !annotation.holdIds.length) return false;
-          if (annotation === row.mergeGateReviewHold)
-            // Same bar as humanReviewOnlyHold: only actual review holds excuse, never an incidental one alone.
-            return annotation.holdIds.every(id => HUMAN_REVIEW_HOLD_GATES.includes(id))
-              && annotation.holdIds.some(id => id === 'review-hold-labels' || id === 'review-acceptance');
-          return ['candidacy', 'stale-freeze', 'candidacy+stale-freeze'].includes(annotation.kind)
-            && Array.isArray(annotation.holds) && annotation.holds.length === annotation.holdIds.length
-            && annotation.holds.every((hold, i) => hold?.status === 'hold' && hold.id === annotation.holdIds[i]
-              && (isCandidacyHold(hold) || (hold.id === 'red-main-freeze' && annotation.kind.includes('stale-freeze'))));
-        });
-    };
-    if (mergeRows.length && mergeRows.every(boundReviewHold) && Array.isArray(requiredChecks))
+    if (mergeRows.length && mergeRows.every(row => excusalEnabled && boundMergeGateReviewHold(row, { headSha, labels })) && Array.isArray(requiredChecks))
       requiredChecks = requiredChecks.filter(name => name !== 'merge-gate');
     // A discovery fault or untrusted/empty set cannot excuse healable red in push mode.
     if (policy.startAfter === 'push' && ciRedOnHead({ headSha, checks,

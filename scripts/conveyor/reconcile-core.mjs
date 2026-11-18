@@ -127,7 +127,7 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 });
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
-import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
+import { resolveReviewRequiredChecks } from '../lib/merge-gate-hold-class.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
@@ -512,7 +512,7 @@ export function splitFailingChecks(rollup, requiredChecks) {
 /** Strict check evidence for this PR's actual read, including its roster provenance. */
 function requiredCheckEvidence(pr, requiredChecks) {
   const { headSha, ...evidence } = reviewTimingEvidence(pr);
-  return resolveRequiredChecks({ ...evidence, head: headSha, rowsHead: evidence.rowsHead ?? null,
+  return resolveReviewRequiredChecks({ labels: pr?.labels, ...evidence, head: headSha, rowsHead: evidence.rowsHead ?? null,
     rows: pr?.statusCheckRollup, requiredNames: requiredChecks });
 }
 
@@ -1566,8 +1566,15 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
 
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
-  const ci = reviewStartGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
-  const allowed = ci.allowed || reviewHoldOnlyRed(pr, requiredChecks);
+  let ci = reviewStartGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
+  const resolved = requiredCheckEvidence(pr, requiredChecks);
+  // A permissive timing policy cannot bypass a refused merge-hold annotation.
+  const annotated = pr?.statusCheckRollup?.some(row => row?.name === 'merge-gate'
+    && (row.mergeGateReviewHold || row.mergeGateHoldExcused));
+  if (ci.allowed && annotated && ['unknown', 'fail'].includes(resolved.state)) {
+    ci = { ...ci, allowed: false, reason: `unverified-review-hold: ${resolved.reasons.join(', ')}` };
+  }
+  const allowed = ci.allowed || resolved.state === 'held';
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2855,7 +2862,12 @@ export function planReconcile({
     // of those are the existing branches below, unmodified. Only {@link dispatchReviewRow}'s own gate (not this
     // one) keeps a review from firing for either of those two cases.
     // xu1nixv — the red-main fix PR is promoted at once (it must not sit as a draft while main is red).
-    if (pr?.isDraft && (['pass', 'held'].includes(requiredCheckEvidence(pr, requiredChecks).state) || mainFixPriority)) {
+    const promotionEvidence = pr?.isDraft ? requiredCheckEvidence(pr, requiredChecks) : null;
+    if (pr?.isDraft && promotionEvidence.state === 'unknown') {
+      refuse('draft', { ...withPhase, ...earlyStartShadowFields(pr, requiredChecks), why: `draft checks cannot be verified: ${promotionEvidence.reasons.join(', ')} — refresh complete head-bound checks and the required roster before promotion` });
+      continue;
+    }
+    if (pr?.isDraft && (['pass', 'held'].includes(promotionEvidence.state) || mainFixPriority)) {
       if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
         continue;

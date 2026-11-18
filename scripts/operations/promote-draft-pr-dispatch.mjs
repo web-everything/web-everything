@@ -70,7 +70,7 @@ import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
-import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
+import { resolveReviewRequiredChecks } from '../lib/merge-gate-hold-class.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
@@ -125,11 +125,12 @@ export function defaultReadHeadCheckState({
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-status-checks', repo: repoSlug },
   });
   let rows = [...parseJsonLines(raw), ...parseJsonLines(statuses)];
+  let labels;
   try {
     if (rows.some(row => row?.name === 'merge-gate' && String(row.conclusion).toLowerCase() === 'failure')) {
       const setting = mergeGateSetting ?? loadMergeGateHoldSetting();
+      labels = readPrLabels({ repoSlug, prNumber, runGh });
       if (setting.value === 'on') {
-        const labels = readPrLabels({ repoSlug, prNumber, runGh });
         // Annotate each row independently: legacy excusal on the whole rollup can discard failures.
         rows = rows.map(row => {
           if (row?.name !== 'merge-gate') return row;
@@ -138,10 +139,7 @@ export function defaultReadHeadCheckState({
             freeze: () => readFreeze(),
           }).rows[0];
           if (annotated === row) return row;
-          const hold = annotated.mergeGateReviewHold ?? annotated.mergeGateHoldExcused;
-          // A replacement proves the job verdict matched this PR/head. Keep the original conclusion;
-          // only the strict resolver may excuse its human hold, bound to the row's Actions URL.
-          return { ...row, mergeGateReviewHold: hold };
+          return { ...annotated, conclusion: row.conclusion };
         });
       }
     }
@@ -151,9 +149,13 @@ export function defaultReadHeadCheckState({
     ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
     : requiredChecks;
   // --paginate exhausts the SHA-addressed endpoint or throws; never stamp a PR's later head.
-  const result = resolveRequiredChecks({ rows, head: sha, rowsHead: sha,
+  const result = resolveReviewRequiredChecks({ labels, rows, head: sha, rowsHead: sha,
     rowsComplete: typeof raw === 'string' && typeof statuses === 'string', requiredNames: promotionChecks, rosterSource: roster?.source });
-  const state = { pass: 'green', held: 'red', fail: 'red', pending: 'pending', unknown: 'unchecked' }[result.state];
+  // Compatibility candidacy excusal remains green; retained human review holds stay red.
+  const candidacyOnly = result.state === 'held' && Object.entries(result.perName).every(([name, value]) =>
+    value.state === 'pass' || (name === 'merge-gate' && value.rows.every(row => row.mergeGateHoldExcused)));
+  const state = candidacyOnly ? 'green'
+    : { pass: 'green', held: 'red', fail: 'red', pending: 'pending', unknown: 'unchecked' }[result.state];
   return { state, why: result.reasons.join(', ') || `required checks: ${result.state}`,
     evidence: result, reviewHoldOnly: result.state === 'held' };
 }

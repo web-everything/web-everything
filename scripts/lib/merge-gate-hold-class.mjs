@@ -4,6 +4,7 @@
  * The strict parser mirrors #5013's parsePrResultTable: merge the two when #5013 lands.
  * Deliberately does not import merge-gate-ci or the drain's runtime graph.
  */
+import { resolveRequiredChecks } from './check-state-predicate.mjs';
 import { readFileSync } from 'node:fs';
 import { HUMAN_REVIEW_HOLD_GATES, humanReviewOnlyHold } from './merge-gate-verdict.mjs';
 import { GATE_IDS } from './merge-gate-inventory.mjs';
@@ -12,6 +13,54 @@ import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+
+/** Review-start/promotion excusal, bound to this Actions job, head and current labels. */
+export function boundMergeGateReviewHold(row, { headSha, labels } = {}) {
+  if (!row || (row.head_sha !== undefined && typeof row.head_sha !== 'string')) return false;
+  const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)(?:[/?#]|$)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1]);
+  return typeof headSha === 'string' && headSha.length > 0 && (row.head_sha === undefined || row.head_sha?.toLowerCase() === headSha.toLowerCase())
+    && Array.isArray(labels) && labels.every(label => typeof (typeof label === 'string' ? label : label?.name) === 'string')
+    && !labels.some(label => (typeof label === 'string' ? label : label.name) === 'ready-to-merge')
+    && Number.isSafeInteger(jobId) && jobId > 0
+    && [row.mergeGateHoldExcused, row.mergeGateReviewHold].some(annotation => {
+      if (annotation?.jobId !== jobId || typeof annotation.headSha !== 'string'
+        || annotation.headSha.toLowerCase() !== headSha.toLowerCase()
+        || !Array.isArray(annotation.holdIds) || !annotation.holdIds.length) return false;
+      if (annotation === row.mergeGateReviewHold)
+        // Same bar as humanReviewOnlyHold: only actual review holds excuse, never an incidental one alone.
+        return annotation.holdIds.every(id => HUMAN_REVIEW_HOLD_GATES.includes(id))
+          && annotation.holdIds.some(id => id === 'review-hold-labels' || id === 'review-acceptance');
+      return ['candidacy', 'stale-freeze', 'candidacy+stale-freeze'].includes(annotation.kind)
+        && Array.isArray(annotation.holds) && annotation.holds.length === annotation.holdIds.length
+        && annotation.holds.every((hold, i) => hold?.status === 'hold' && hold.id === annotation.holdIds[i]
+          && (isCandidacyHold(hold) || (hold.id === 'red-main-freeze' && annotation.kind.includes('stale-freeze'))));
+    });
+}
+
+/** Apply review-only excusal while retaining the strict resolver's provenance and conflict checks. */
+export function resolveReviewRequiredChecks({ labels, ...evidence } = {}) {
+  let held = false;
+  const rows = Array.isArray(evidence.rows) ? evidence.rows.map(row => {
+    if (row?.name !== 'merge-gate') return row;
+    const { mergeGateHoldExcused, mergeGateReviewHold, ...original } = row;
+    // Undo compatibility rewrites even when their annotation fails binding.
+    if (mergeGateHoldExcused) original.conclusion = 'failure';
+    if (String(original.status).toLowerCase() === 'completed'
+      && String(original.conclusion).toLowerCase() === 'failure'
+      && boundMergeGateReviewHold(row, { headSha: evidence.head, labels })) {
+      held = true;
+      return { ...original, conclusion: 'success' };
+    }
+    return original;
+  }) : evidence.rows;
+  const result = resolveRequiredChecks({ ...evidence, rows });
+  if (held && result.perName['merge-gate']?.state === 'pass') {
+    result.perName['merge-gate'] = { ...result.perName['merge-gate'], state: 'held',
+      rows: evidence.rows.filter(row => row?.name === 'merge-gate') };
+    if (result.state === 'pass') result.state = 'held';
+  }
+  return result;
+}
 
 const statuses = new Set(['pass', 'hold', 'fail-closed', 'queue', 'enqueue', 'skipped-by-policy']);
 const gates = new Set(GATE_IDS);

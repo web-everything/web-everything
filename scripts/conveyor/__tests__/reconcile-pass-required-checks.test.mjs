@@ -16,7 +16,7 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
 vi.mock('../../lib/write-all-sync.mjs', () => ({ writeAllSync: vi.fn(), writeLineSync: vi.fn() }));
 
 const XX_REQUIRED = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
-const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c20093470';
+const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c2009347';
 const xxPr = () => ({ rowsHead: XX_HEAD, rowsComplete: true, number: 3336, headRefOid: XX_HEAD, headRefName: 'lane/3336-replay', isDraft: true,
   labels: [], comments: [], statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({
     name: i ? 'review-gate' : 'soak-replay-gate', status: 'COMPLETED', conclusion: 'SUCCESS',
