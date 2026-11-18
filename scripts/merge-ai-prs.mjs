@@ -1333,13 +1333,20 @@ export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, 
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
 export async function repollUnknownListings({ prsByRepo, read, sleep, recompute, log = () => {}, maxRecompute = UNKNOWN_MERGEABILITY_MAX_RECOMPUTE, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map(), onPersistentUnknown, nudge }) {
+  const applyFreshRead = (pr, fresh) => {
+    if (!fresh || fresh.number !== pr.number) return false;
+    // A new head cannot inherit listing-only evidence (especially files) from the old head.
+    if (fresh.headRefOid !== pr.headRefOid) for (const field of Object.keys(pr)) delete pr[field];
+    Object.assign(pr, fresh);
+    return true;
+  };
   const unknown = pr => !['CLOSED', 'MERGED'].includes(String(pr.state ?? '').toUpperCase())
     && ['', 'UNKNOWN'].includes(String(pr.mergeable ?? '').toUpperCase());
   const marked = [...prsByRepo].flatMap(([repo, prs]) => prs
     .filter(pr => marks.has(`${repo}#${pr.number}`)).map(pr => ({ repo, pr })));
   await mapWithConcurrency(marked, concurrency, async ({ repo, pr }) => {
     const fresh = await read(repo, pr.number);
-    if (fresh?.number === pr.number) Object.assign(pr, fresh);
+    applyFreshRead(pr, fresh);
   });
   let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
   const limit = Number.isInteger(maxRecompute) && maxRecompute >= 0 ? maxRecompute : UNKNOWN_MERGEABILITY_MAX_RECOMPUTE;
@@ -1352,11 +1359,7 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, recompute,
     await sleep(setting.delayMs);
     await mapWithConcurrency(recomputing, concurrency, async ({ repo, pr }) => {
       const fresh = await read(repo, pr.number);
-      if (fresh?.number === pr.number) {
-        // A new head cannot inherit listing-only evidence (especially files) from the old head.
-        if (fresh.headRefOid !== pr.headRefOid) for (const field of Object.keys(pr)) delete pr[field];
-        Object.assign(pr, fresh);
-      }
+      applyFreshRead(pr, fresh);
     });
     pending = pending.filter(({ pr }) => unknown(pr));
   }
@@ -1364,8 +1367,7 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, recompute,
     await sleep(setting.delayMs);
     const unresolved = await mapWithConcurrency(pending, concurrency, async ({ repo, pr }) => {
       const fresh = await read(repo, pr.number);
-      if (!fresh || fresh.number !== pr.number) return null;
-      Object.assign(pr, fresh);
+      if (!applyFreshRead(pr, fresh)) return null;
       return unknown(pr) ? { repo, pr } : null;
     });
     pending = unresolved.filter(Boolean);

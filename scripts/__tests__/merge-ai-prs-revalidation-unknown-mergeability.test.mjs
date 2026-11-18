@@ -89,13 +89,20 @@ describe('bounded listing mergeability recompute', () => {
     expect(io.onPersistentUnknown).not.toHaveBeenCalled();
   });
 
-  it('discards stale head evidence after recompute moves the head; workflow clearance fails closed', async () => {
-    const candidate = pr({ mergeable: null, files: [{ path: 'src/safe.js', changeType: 'MODIFIED' }] });
+  it.each(['post-recompute', 'retry', 'marked pre-read'])('discards stale head evidence on a %s head change; workflow clearance fails closed', async stage => {
+    const candidate = pr({ mergeable: stage === 'marked pre-read' ? 'MERGEABLE' : null,
+      files: [{ path: 'src/safe.js', changeType: 'MODIFIED' }] });
     const fresh = pr({ headRefOid: 'b'.repeat(40) });
     delete fresh.commits;
     delete fresh.statusCheckRollup;
     delete fresh.mergeStateStatus;
-    await run([candidate], { read: async () => fresh });
+    const read = vi.fn(async () => fresh);
+    if (stage === 'retry') read.mockResolvedValueOnce(pr({ mergeable: 'UNKNOWN' }));
+    const io = await run([candidate], { read,
+      marks: stage === 'marked pre-read' ? new Map([[`${repo}#4602`, { repo, num: 4602, since: 0 }]]) : new Map() });
+    expect(read).toHaveBeenCalledTimes(stage === 'retry' ? 2 : 1);
+    expect(io.sleep).toHaveBeenCalledTimes(stage === 'marked pre-read' ? 0 : stage === 'retry' ? 2 : 1);
+    expect(io.recompute).toHaveBeenCalledTimes(stage === 'marked pre-read' ? 0 : 1);
     expect(candidate).toEqual(fresh);
     for (const field of ['files', 'commits', 'statusCheckRollup', 'mergeStateStatus']) {
       expect(candidate).not.toHaveProperty(field);
