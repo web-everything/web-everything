@@ -758,10 +758,9 @@ export function runReviewTick({
         row.kind === 'nothing-owed' && row.phase === 'queued'
           ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
           : row);
-      const refusal = assertCapability(repo, 'review', { resolveProfile });
-      if (refusal) return;
+      // Safety reconciliation must run even when this repo cannot start new reviews.
       redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
-        capacity, paused });
+        capacity, paused, resolveProfile });
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
     finally {
       // Recovery reports the same start through multiple counters; count it only once, even on error.
@@ -1465,7 +1464,11 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
           history: redTeamGateRetryHistory, log: line => log.error(line) });
       } catch { /* Gate catch-up must never block the capacity queue. */ }
       const options = { ...o, rawPrs,
-        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
+        dispatch: d => {
+          const refusal = assertCapability(o.repo, 'review', { resolveProfile: o.resolveProfile });
+          if (refusal) return { skipped: refusal.why };
+          return dispatchReviewJob(d);
+        }, log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
       const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
       const queueWord = String(queueSetting ?? '').trim().toLowerCase();

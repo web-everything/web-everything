@@ -262,3 +262,27 @@ describe('lander write path inventory', () => {
     }
   });
 });
+
+
+it.each(['longshore', 'unknown/repo'])('refused %s tripwire is unknown and never scans a stale checkout', localSlug => {
+  const scan = vi.fn(() => []);
+  const tripwire = nodes.find(n => ts.isIfStatement(n) && n.expression.getText(file) === '!DRY_RUN'
+    && n.thenStatement.getText(file).includes("__t.time('duplicateCheck'"));
+  const run = compile(declaration('localWriteRefusal').parent.parent.getText(file) + '\n'
+    + declaration('duplicateIdsOnMain').parent.parent.getText(file) + '\n'
+    + tripwire.getText(file) + '\nreturn duplicateIdsOnMain;', {
+    assertCapability, localSlug, DRY_RUN: false, AS_JSON: true,
+    __t: { time: (_name, fn) => fn() }, findDuplicateIds: scan,
+    join: () => 'stale-backlog',
+  });
+  expect(run()).toBeNull();
+  expect(scan).not.toHaveBeenCalled();
+  const unknown = nodes.find(n => ts.isIfStatement(n) && n.expression.getText(file) === 'duplicateIdsOnMain === null'
+    && n.thenStatement.getText(file).includes('result.duplicateIdCheck'));
+  const passResult = nodes.find(n => ts.isVariableDeclaration(n) && n.name.getText(file) === 'result'
+    && n.initializer?.getText(file).startsWith('{ alerts, ok:'));
+  const okExpression = passResult.initializer.properties.find(p => p.name?.getText(file) === 'ok').initializer.getText(file);
+  const result = { ok: compile('return ' + okExpression, { duplicateIdsOnMain: null })() };
+  compile(unknown.getText(file), { duplicateIdsOnMain: null, result })();
+  expect(result).toMatchObject({ ok: false, duplicateIdCheck: { status: 'unknown', reason: 'checkout-sync-refused' } });
+});

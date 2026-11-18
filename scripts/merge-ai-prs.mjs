@@ -4628,11 +4628,11 @@ export function ghListErrText(e) {
 }
 
 /**
- * Partial success exits 0 while JSON `failed` stays populated; `ok` still means no duplicate ids.
- * A failure with no landed PRs exits 2. Duplicate ids always take precedence (exit 3).
+ * Partial merge success exits 0 while JSON `failed` stays populated; `ok` requires a known clean duplicate check.
+ * An unknown duplicate check (null) or a failure with no landed PRs exits 2. Duplicates take precedence (exit 3).
  */
 export function passExitCode({ dup = [], failed = [], mergedCount = 0 } = {}) {
-  return dup?.length ? 3 : (failed.length && mergedCount === 0 ? 2 : 0);
+  return dup?.length ? 3 : (dup === null || (failed.length && mergedCount === 0) ? 2 : 0);
 }
 
 export function engineTierForCandidate(score) { // `score` names the real future param — unused until #3493 unblocks
@@ -7881,8 +7881,11 @@ async function runCli() {
   // prior failed land is caught too — the detect is a cheap fs read, so a standing invariant is strictly stronger.
   let duplicateIdsOnMain = [];
   if (!DRY_RUN) {
-    duplicateIdsOnMain = __t.time('duplicateCheck', () => findDuplicateIds(join(process.cwd(), 'backlog')));
-    if (duplicateIdsOnMain.length && !AS_JSON) {
+    // Refused checkout sync leaves freshness unknown; never certify the stale local backlog.
+    duplicateIdsOnMain = localWriteRefusal ? null
+      : __t.time('duplicateCheck', () => findDuplicateIds(join(process.cwd(), 'backlog')));
+    if (duplicateIdsOnMain === null && !AS_JSON) process.stderr.write(`  ⚠ duplicate-ID tripwire UNKNOWN — checkout sync refused; operator must sync main and rerun the drain\n`);
+    if (duplicateIdsOnMain?.length && !AS_JSON) {
       process.stderr.write(`\n  ✗✗ TRIPWIRE (#2318): duplicate id(s) on main — ${summarizeDuplicates(duplicateIdsOnMain)}. The merge queue stays RED (exit 3) until this is resolved by hand: run \`node scripts/backlog-renumber-collisions.mjs --onto-ref=<pre-dup main sha>\` on main. NOT auto-healed (an unguarded sweep can clobber a surviving edge, #2314); NOT left silent.\n\n`);
     }
   }
@@ -7942,9 +7945,12 @@ async function runCli() {
     const mark = stuckUnknownMarks.get(`${alert.repo}#${alert.num}`);
     return mark && !mark.resolved;
   });
-  const result = { alerts, ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const result = { alerts, ok: duplicateIdsOnMain?.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain?.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (localWriteRefusal) result.localWriteRefusal = localWriteRefusal;
+  if (duplicateIdsOnMain === null) {
+    result.duplicateIdCheck = { status: 'unknown', reason: 'checkout-sync-refused', fallback: 'Operator must sync main and rerun the drain.' };
+  }
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
   }; // end sweepOnce
@@ -8097,9 +8103,13 @@ async function runCli() {
     passes.push(result);
     allMerged.push(...merged);
     lastFailed = failedMerges;
-    lastDup = duplicateIdsOnMain || [];
+    lastDup = duplicateIdsOnMain;
     // #2318 — a duplicate id on main is a hard, LOUD stop: polling won't clear it (main is globally red), so
     // break the watch immediately and surface it rather than spinning idle passes over a broken main.
+    if (lastDup === null) {
+      if (!AS_JSON) process.stderr.write('watch: STOPPING — duplicate-ID tripwire unknown; operator must sync main and rerun the drain.\n');
+      break;
+    }
     if (lastDup.length) {
       if (!AS_JSON) process.stderr.write(`watch: STOPPING — duplicate id(s) survive on main (${summarizeDuplicates(lastDup)}); resolve by hand then re-run the drain.\n`);
       break;
@@ -8136,7 +8146,11 @@ async function runCli() {
         passes.push(confirm.result);
         allMerged.push(...confirm.merged);
         lastFailed = confirm.failedMerges;
-        lastDup = confirm.duplicateIdsOnMain || [];
+        lastDup = confirm.duplicateIdsOnMain;
+        if (lastDup === null) {
+          if (!AS_JSON) process.stderr.write('watch: STOPPING — duplicate-ID tripwire unknown; operator must sync main and rerun the drain.\n');
+          break;
+        }
         if (lastDup.length) {
           if (!AS_JSON) process.stderr.write(`watch: STOPPING — duplicate id(s) survive on main (${summarizeDuplicates(lastDup)}); resolve by hand then re-run the drain.\n`);
           break;
@@ -8162,7 +8176,7 @@ async function runCli() {
   if (!AS_JSON) process.stderr.write(`watch: stopped after ${passes.length} pass(es); merged ${allMerged.length} PR(s) total.\n`);
   // A red-main freeze already emitted its own stop payload (above) — don't double-emit; just exit 5.
   if (redMainStopped) process.exit(5);
-  if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: lastDup.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
+  if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: lastDup?.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup === null ? { duplicateIdCheck: { status: 'unknown', reason: 'checkout-sync-refused' } } : lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
   const exitCode = passExitCode({ dup: lastDup, failed: lastFailed, mergedCount: allMerged.length });
   process.exit(exitCode);
 }

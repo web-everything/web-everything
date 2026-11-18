@@ -271,7 +271,7 @@ it('already-reviewed heads get one recovery hook with remaining capacity; null a
   const out = runReviewTick(options);
   expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
   expect(redTeamOnSkip).toHaveBeenCalledWith({ repo, plan, rawPrs,
-    capacity: { lanes: 3, budget: liveReviewBudget, remainingStarts: Infinity, startsCeiling: Infinity, take: expect.any(Function) }, paused: false });
+    capacity: { lanes: 3, budget: liveReviewBudget, remainingStarts: Infinity, startsCeiling: Infinity, take: expect.any(Function) }, paused: false, resolveProfile: expect.any(Function) });
   expect(out.redTeamOnSkip).toBe(result);
   expect(tagStatus.mock.calls.at(-1)[0].agents).toBeUndefined();
   expect(runReviewTick({ ...options, redTeamOnSkip: null })).not.toHaveProperty('redTeamOnSkip');
@@ -483,5 +483,46 @@ it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery r
     expect(out.dispatched).toHaveLength(1);
     expect(dispatch).toHaveBeenCalledTimes(recoveryStarts);
     expect(out.redTeamOnSkip.dispatched).toHaveLength(recoveryStarts);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+
+it.each(['on', 'off'])('capability-disabled tick still enforces overdue send-backs and gates without starting reviews (queue %s)', queue => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [9601, 9602]);
+  const head = rawPrs[0].headRefOid;
+  rawPrs[0].comments = [{
+    body: `<!-- we:red-team-advisory pr=9601 rev=${head} -->\n1. [**confirmed**] (edge-case, broken) \`scripts/x.mjs:1\` — confirmed break`,
+    createdAt: '2026-11-14T16:00:00Z', author: { login: 'web-everything' },
+  }];
+  const realCatchUp = gateCatchUp.runGateCatchUp;
+  const enforceSendBack = vi.fn(() => ({ status: 'applied' }));
+  const catchUp = vi.spyOn(gateCatchUp, 'runGateCatchUp').mockImplementation(options => realCatchUp({
+    ...options, now: Date.parse('2026-11-14T16:20:00Z'), history: new Map(),
+    setting: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' },
+    readGrantScope: () => null, runGate: enforceSendBack,
+  }));
+  const start = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  const ordinary = vi.fn();
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', queue);
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() }, listCommands: () => '' });
+    const out = runReviewTick({ repo,
+      resolveProfile: () => ({ capabilities: { review: false } }),
+      reconcile: () => ({ ...plan, dispatch: [] }),
+      readPrs: () => rawPrs, readAgents: () => [],
+      dispatch: ordinary, redTeamOnSkip: production.redTeamOnSkip,
+      acquirableLanes: () => 2, hostAdmission: () => ({ admitted: true, maxPerTick: 2 }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
+    });
+    expect(catchUp).toHaveBeenCalledOnce();
+    expect(enforceSendBack).toHaveBeenCalledOnce();
+    expect(enforceSendBack).toHaveBeenCalledWith({ repo, pr: 9601 });
+    expect(out.redTeamOnSkip.dispatched).toEqual([]);
+    expect(out.redTeamOnSkip.notStarted).toContainEqual({ prNumber: 9602, reason: expect.stringContaining('capability unavailable') });
+    expect(start).not.toHaveBeenCalled();
+    expect(ordinary).not.toHaveBeenCalled();
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });

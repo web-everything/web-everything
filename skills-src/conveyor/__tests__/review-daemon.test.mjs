@@ -3243,7 +3243,7 @@ it.each(['idle', 'low', 'denied', 'floor throws', 'sample throws', 'infinite'])(
     }
   });
 
-it('capability-off refuses ordinary and recovery review starts while hold reconciliation runs', () => {
+it('capability-off refuses ordinary reviews while recovery safety and hold reconciliation run', () => {
   const dispatch = vi.fn(), redTeamOnSkip = vi.fn(), holdReconcile = vi.fn(() => []);
   const resolveProfile = vi.fn(() => ({ capabilities: { review: false } }));
   const out = runReviewTick({ repo: 'web-everything/web-everything', resolveProfile,
@@ -3252,7 +3252,7 @@ it('capability-off refuses ordinary and recovery review starts while hold reconc
   });
   expect(out.notStarted).toEqual([expect.objectContaining({ prNumber: 88, reason: expect.stringContaining('capability unavailable') })]);
   expect(dispatch).not.toHaveBeenCalled();
-  expect(redTeamOnSkip).not.toHaveBeenCalled();
+  expect(redTeamOnSkip).toHaveBeenCalledOnce();
   expect(holdReconcile).toHaveBeenCalledOnce();
 });
 

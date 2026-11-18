@@ -141,6 +141,8 @@ describe('#4389 merge failure isolation', () => {
     [{ dup: [1], failed: [], mergedCount: 0 }, 3],
     [{ dup: [1], failed: [{}], mergedCount: 1 }, 3],
     [{ dup: [], failed: [{}], mergedCount: 1 }, 0],
+    [{ dup: null, mergedCount: 0 }, 2],
+    [{ dup: null, mergedCount: 1 }, 2],
     [{ failed: [{}], mergedCount: 0 }, 2],
     [{ failed: [], mergedCount: 0 }, 0],
     [{}, 0],
