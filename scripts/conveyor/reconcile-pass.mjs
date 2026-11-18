@@ -58,6 +58,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { enrichPrsWithStandingRulingGrants } from './standing-ruling-io.mjs';
 import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -66,6 +67,7 @@ import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from 
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
+import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from './timeout-evidence-pool.mjs';
 import { EVIDENCE_READ_BACKOFF_MS, isEvidenceReadTimeout, syncSleep } from './evidence-read-retry.mjs';
 import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
@@ -85,7 +87,7 @@ import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
-import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
+import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, enrichPrRollupEvidence, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { isGhThrottled } from '../lib/gh-deferred.mjs';
 import { withListRetry } from '../lib/gh-list-retry.mjs';
@@ -417,9 +419,9 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {},
   // `fresh`: skip the host-shared snapshot (valid ~75 s, may predate the caller's own baseline probe) but still read small
   // pages — never the heavy 200-row `gh pr list`. The fix daemon plans from such a read.
-  fresh = false, readOnly = false } = {}) {
+  fresh = false, readOnly = false, step = (_name, fn) => fn() } = {}) {
   const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}), ...(readOnly ? { git: readOnlyGitExec } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
-  const enrich = rows => {
+  const enrich = rows => step('planner-cache-diff', () => {
     if (readOnly || factCache?.mode !== 'shadow') return enrichFresh(rows);
     const out = [];
     for (const pr of rows) {
@@ -454,7 +456,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     }
     if (rows.discoveryIncomplete === true || out.length !== rows.length) Object.defineProperty(out, 'discoveryIncomplete', { value: true });
     return out;
-  };
+  });
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
   // Production path: ONE retried read (shared snapshot, else small pages) — a 502/503/504 is retried with backoff and a
@@ -472,6 +474,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const parsed = parseListOutput(out, { repo });
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
     if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
+    enrichPrRollupEvidence({ repo, rows: parsed, exec });
     // `gh pr list` rollups carry no posting app; the planner's external-check exemption needs it (#6926). An unreadable
     // `gh api` answer leaves the app empty (fail closed).
     return resolveCheckAppsByCommit({ repo, rows: parsed, exec });
@@ -1738,11 +1741,16 @@ export function runReconcilePass({
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
   const step = (name, fn) => {
     const startedAt = stepNow();
-    try { return fn(); } finally {
-      try { stepLog(`reconcile-pass: planner-step name=${name} repo=${repoKey} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
-    }
+    // Preserve the original failure output for the smoke classifier when a read throws.
+    const result = fn();
+    try { stepLog(`reconcile-pass: planner-step name=${name} repo=${repoKey} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
+    return result;
   };
   const timedStep = (name, fn) => (...args) => step(name, () => fn(...args));
+  enrichStandDownAutoProceed = timedStep('enrich-stand-down-auto-proceed', enrichStandDownAutoProceed);
+  loadLadder = timedStep('load-fixer-ladder', loadLadder);
+  resolveMainSha = timedStep('resolve-main-sha', resolveMainSha);
+  readPriority = timedStep('read-main-red-priority', readPriority);
   readAgents = timedStep('read-agents', readAgents);
   enrich = timedStep('enrich-agents', enrich);
   excuseMergeGateHolds = timedStep('excuse-merge-gate-holds', excuseMergeGateHolds);
@@ -1768,7 +1776,7 @@ export function runReconcilePass({
   // `owner/name` slug, never the raw input. `repo == null` stays `null` (gh infers the repo from cwd, same as
   // before) — only a caller-supplied value is normalised.
   const resolvedRepo = repo == null ? null : CONSTELLATION_REPOS[repoKey].slug;
-  const rawPrs = readPrs({ repo: resolvedRepo, ...(readOnly ? { readOnly: true } : {}), ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug } : {}) });
+  const rawPrs = step('read-prs', () => readPrs({ repo: resolvedRepo, ...(readOnly ? { readOnly: true } : {}), ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug, step } : {}) }));
   if (isGhDeferred(rawPrs)) return { ...rawPrs, dispatch: [], refusals: [], notes: [rawPrs.message], prs: 0, agents: 0 };
   // #4501 — read the live required-check set (branch protection, cached; degrades to
   // the repo's declared fallback if the live fetch fails) BEFORE enriching main-red facts, so BOTH
@@ -1799,6 +1807,26 @@ export function runReconcilePass({
       readMergeGateVerdict, readFreeze, mergeGateSetting, env,
     });
   } catch { /* An unreadable verdict must retain the original red checks. */ }
+  // An excused candidacy hold owes review, but its listing rollup is not completeness proof.
+  // Re-read the complete exact-head feed through the existing hydration-reader contract.
+  // Carry the excusal only for the same immutable job; never attest the old listing.
+  holdPrs = holdPrs.map(pr => {
+    const excused = pr.statusCheckRollup?.find(row => row?.mergeGateHoldExcused);
+    if (!excused || reduceCheckState(pr.statusCheckRollup, requiredChecks).state !== 'green') return pr;
+    try {
+      const checkRepo = resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug;
+      // Production review proof includes every attempt and legacy commit statuses as well.
+      const rows = readChecks === defaultReadChecks
+        ? readReviewChecks({ repo: checkRepo, headSha: pr.headRefOid })
+        : readChecks({ repo: checkRepo, sha: pr.headRefOid });
+      if (!Array.isArray(rows) || rows.rowsComplete === false) return pr;
+      return { ...pr, rowsHead: pr.headRefOid, rowsComplete: true,
+        statusCheckRollup: rows.map(row => row?.name === 'merge-gate' && row.id === excused.id
+          && Number.isSafeInteger(row.id) && String(row.status).toLowerCase() === 'completed'
+          && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase())
+          ? { ...row, conclusion: 'SUCCESS', mergeGateHoldExcused: excused.mergeGateHoldExcused } : row) };
+    } catch { return pr; } // Keep the incomplete listing refused; retry on the next pass.
+  });
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing
@@ -1896,8 +1924,12 @@ if (IS_CLI) {
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
   let result;
+  // A later read can fail after successful steps. Keep their diagnostics out of a
+  // failed child's first line: live-smoke classifies the original failure summary.
+  const stepLines = [];
   try {
     result = runReconcilePass({
+      stepLog: line => stepLines.push(line),
       repo: typeof flags.repo === 'string' ? flags.repo : null,
       ...(typeof flags['prs-file'] === 'string' ? { readPrs: () => readPrsFromFile(flags['prs-file']) } : {}),
       ...(typeof flags['agents-file'] === 'string' ? { readAgents: () => readPrsFromFile(flags['agents-file']) } : {}),
@@ -1906,6 +1938,7 @@ if (IS_CLI) {
     process.stderr.write(`✗ reconcile pass could not read state: ${String((e && e.message) || e).split('\n')[0]}\n`);
     process.exit(1);
   }
+  for (const line of stepLines) console.error(line);
   if (flags.json) process.stdout.write(JSON.stringify(result) + '\n');
   else process.stdout.write(formatReport(result) + '\n');
 }
@@ -2214,34 +2247,69 @@ function defaultReadCheckOrigin({ repo, head, name, exec = execFileSyncThrottled
 export function enrichPrsWithTimeoutEvidence(prs, {
   repo, read = readTimeoutEvidence, readBudget = readTimeoutBudget, enabled = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0',
   readCheckOrigin = defaultReadCheckOrigin,
+  env = process.env, concurrency: requestedConcurrency,
+  poolRunner = runTimeoutEvidencePool, log = line => console.error(line),
+  clock = Date.now,
   infraMode = resolveInfraCancelledMode(repoKeyForSlug(repo)), infraMaxReruns = DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } = {}) {
   // GRADUATED 2026-10-04 (PR #3826): the opt-in flag was never set on the edge, so the re-run that does not spend
   // heal budget was dead code and a flaky-timeout PR burned 3/3 heals. On by default now; `=0` is the kill switch.
   if (!enabled) return prs;
-  return prs.map((pr) => {
-    if (!(pr.statusCheckRollup ?? []).some((c) => c.name !== 'review-gate'
-      && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
-    const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
-    if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
-      let detailsUrl;
-      try {
-        detailsUrl = readCheckOrigin({ repo, pr: pr.number, head: pr.headRefOid, name: pr.requiredCheckName });
-      } catch { /* Unreadable origins remain missing evidence. */ }
-      if (typeof detailsUrl !== 'string' || !detailsUrl.startsWith(`https://github.com/${repo}/actions/runs/`)
-          || !pr.requiredCheckName || !pr.statusCheckRollup.some((c) => c.name === pr.requiredCheckName)) {
-        return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
-      }
-      pr = { ...pr, statusCheckRollup: pr.statusCheckRollup.map((c) => c.name === pr.requiredCheckName
-        ? { ...c, detailsUrl } : c) };
-    }
-    let timeoutRetry = read(pr, { repo });
+  const started = clock();
+  const setting = resolveTimeoutEvidenceConcurrency({ env });
+  const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurrency >= 1 && requestedConcurrency <= 8
+    ? requestedConcurrency : setting.value;
+  const parallel = read === readTimeoutEvidence && concurrency > 1;
+  let reads = 0;
+  const safeLog = line => { try { log(line); } catch { /* logging never changes evidence */ } };
+  safeLog(`timeout-evidence: ci.timeoutEvidenceConcurrency=${concurrency} (source: ${requestedConcurrency === concurrency ? 'injected' : setting.source})`);
+  const pending = [];
+  const finish = (pr, timeoutRetryBudget, raw) => {
+    let timeoutRetry = raw;
     if (timeoutRetry?.infraCancelled) {
       timeoutRetry = infraMode === 'rerun' ? { ...timeoutRetry, cap: timeoutRetry.cancelledShard ? 1 : infraMaxReruns }
         : { eligible: false, reason: 'infra-cancelled-heal-mode' };
     }
     return { ...pr, timeoutRetry, timeoutRetryBudget };
-  });
+  };
+  try {
+    const out = prs.map((pr, index) => {
+      if (!(pr.statusCheckRollup ?? []).some((c) => c.name !== 'review-gate'
+        && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
+      const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
+      if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
+        let detailsUrl;
+        try {
+          detailsUrl = readCheckOrigin({ repo, pr: pr.number, head: pr.headRefOid, name: pr.requiredCheckName });
+        } catch { /* Unreadable origins remain missing evidence. */ }
+        if (typeof detailsUrl !== 'string' || !detailsUrl.startsWith(`https://github.com/${repo}/actions/runs/`)
+            || !pr.requiredCheckName || !pr.statusCheckRollup.some((c) => c.name === pr.requiredCheckName)) {
+          return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
+        }
+        pr = { ...pr, statusCheckRollup: pr.statusCheckRollup.map((c) => c.name === pr.requiredCheckName
+          ? { ...c, detailsUrl } : c) };
+      }
+      reads++;
+      if (parallel) { pending.push({ pr, index, timeoutRetryBudget }); return pr; }
+      const raw = read(pr, { repo });
+      return finish(pr, timeoutRetryBudget, raw);
+    });
+    if (pending.length) {
+      let results;
+      try { results = poolRunner(pending.map(row => row.pr), { repo, concurrency }); } catch (error) {
+        if (error.code === 'TIMEOUT_EVIDENCE_CLEANUP_FAILED') throw error;
+        /* Serial fallback below. */
+      }
+      pending.forEach(({ pr, index, timeoutRetryBudget }, i) => {
+        if (results?.[i] == null) safeLog(`timeout-evidence: serial-fallback repo=${repo} pr=${pr.number} reason=worker-failed-or-deadline`);
+        const raw = results?.[i] ?? read(pr, { repo });
+        out[index] = finish(pr, timeoutRetryBudget, raw);
+      });
+    }
+    return out;
+  } finally {
+    safeLog(`timeout-evidence prs=${prs.length} read=${reads} concurrency=${concurrency} ms=${clock() - started}`);
+  }
 }
 
 /** IO shell enrichment: never consult the ledger when the policy is off. */

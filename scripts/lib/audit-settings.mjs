@@ -165,6 +165,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/readiness/prepare-hold-state.mjs',
   // Receipt archiving reserves its temp with `wx` and publishes with a no-clobber hard link.
   'scripts/readiness/forge-receipts-archive.mjs',
+  // Forge deploy reserves record temps with `wx` and serializes writers on a flock deploy lock.
+  'scripts/readiness/forge-deploy.mjs',
   // Found by the hold scan (ci-queue-watch.mjs#withHistoryLock and its finalizer among them).
   'scripts/broadcast-inject.mjs', 'scripts/ci/refresh-timings.mjs', 'scripts/conveyor/ci-queue-watch.mjs',
   'scripts/conveyor/ci-red-recovery-watch.mjs', 'scripts/conveyor/health-watch-job.mjs', 'scripts/conveyor/infra-blocked.mjs',
@@ -291,7 +293,9 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/pr-stall-reset.mjs',
   // Landed on main since (PR #6381, CI run 43334197514): the live-owner watch IO. The review head index is a hold-scan
   // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
-  'scripts/conveyor/pr-live-owner-watch-io.mjs']);
+  'scripts/conveyor/pr-live-owner-watch-io.mjs',
+  // The timeout-evidence pool probes the throttle with acquireGhSlotSync/releaseGhSlotSync.
+  'scripts/conveyor/timeout-evidence-pool.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever

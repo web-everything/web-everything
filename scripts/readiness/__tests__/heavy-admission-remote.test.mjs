@@ -9,6 +9,12 @@ import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, res
 import { runRemote } from '../remote-exec.mjs';
 import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
+import { LEASE_FILENAME } from '../../lib/lane-lease.mjs';
+import { createRunFinisher } from '../forge-run-finish.mjs';
+import { buildMarkerTags, HOLD_SESSION_ENV } from '../heavy-admission.mjs'; // marker tag builder round-trip (R1012)
+import { markerContent, createMarkerReaper } from '../forge-slot-markers.mjs';
+
+vi.mock('../forge-run-finish.mjs', () => ({createRunFinisher: vi.fn(() => vi.fn(async () => ({finished: true})))}));
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal();
@@ -67,6 +73,92 @@ function expectFallback(log, reason) {
   if (reason) expect(log.mock.calls[1][0]).toContain(reason);
   else expect(log.mock.calls[1][0].replace(/fallback/gi, '').replace(/[^a-z0-9]/gi, '')).not.toBe('');
 }
+
+describe('R1017 remote marker provenance and nonce plumbing', () => {
+  function multiUnitFixture() {
+    const f = fixture({remote: {mode: 'always', slotUnitsByKind: {FULL: 2, soak: 'auto', standards: 'auto'}}});
+    f.cwd = mkdtempSync(join(process.env.TMPDIR, 'marker-provenance-')); testRoots.push(f.cwd);
+    f.argv = ['npm', 'run', 'test:unit'];
+    f.env = {WE_HEAVY_SESSION: 'fixture-session', WE_HEAVY_SIGNAL_CANCEL_WAIT_MS: '200'};
+    mkdirSync(join(f.cwd, '.git'));
+    writeFileSync(join(f.cwd, '.git', LEASE_FILENAME), JSON.stringify({lane: 14, session: 'lease-session', pr: 1017}));
+    return {...f, remoteRoot: join(f.lockRoot, '..', 'remote')};
+  }
+  it.each([undefined, 'forge-exec', 'forge-exec-2'])('persists nonce, slot %s and trace tags for the primary and every extra unit marker, then removes sidecars', async slot => {
+    const f = multiUnitFixture(), nonce = 'a'.repeat(32), run = 'r-' + 'b'.repeat(32);
+    let files;
+    f.remoteExec = vi.fn(async options => {
+      options.onRun(run, {nonce, slot});
+      files = readdirSync(f.remoteRoot).filter(name => name.endsWith('.unconfirmed'));
+      expect(files).toHaveLength(2);
+      for (const name of files) {
+        const file = join(f.remoteRoot, name), marker = JSON.parse(readFileSync(file, 'utf8'));
+        expect(marker).toMatchObject({pid: process.pid, caller: {kind: 'FULL', session: 'fixture-session', ppid: process.ppid, cmd: 'npm'}, lane: 14, pr: 1017});
+        expect(JSON.parse(readFileSync(file + '.run', 'utf8'))).toEqual({owner: marker.owner, run, nonce, ...(slot !== undefined ? {slot} : {})});
+        expect(statSync(file + '.run').mode & 0o777).toBe(0o600);
+      }
+      return {mode: 'remote', code: 0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+    for (const name of files) {
+      expect(existsSync(join(f.remoteRoot, name))).toBe(false);
+      expect(existsSync(join(f.remoteRoot, name + '.run'))).toBe(false);
+    }
+  });
+  it.each(['SIGTERM', 'SIGINT', 'SIGHUP'])('writes synchronous .exit evidence for every outstanding marker on %s', async signal => {
+    const f = multiUnitFixture();
+    f.remoteExec = vi.fn(async () => {
+      process.emit(signal);
+      const files = readdirSync(f.remoteRoot).filter(name => name.endsWith('.unconfirmed'));
+      expect(files).toHaveLength(2);
+      for (const name of files) {
+        const marker = JSON.parse(readFileSync(join(f.remoteRoot, name), 'utf8'));
+        expect(JSON.parse(readFileSync(join(f.remoteRoot, name + '.exit'), 'utf8'))).toMatchObject({owner: marker.owner, signal, code: expect.any(Number), at: expect.any(Number)});
+      }
+      return {mode: 'unconfirmed'};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, signal});
+    expect(readdirSync(f.remoteRoot).filter(name => name.endsWith('.exit'))).toHaveLength(2);
+  });
+  it('uses PR environment provenance when no lease PR is known and omits unknown lane', async () => {
+    const f = fixture();
+    f.env = {PR_NUMBER: '1017'};
+    f.remoteExec = vi.fn(async () => {
+      const marker = JSON.parse(readFileSync(join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed'), 'utf8'));
+      expect(marker.pr).toBe(1017);
+      expect(marker).not.toHaveProperty('lane');
+      expect(marker.caller).not.toHaveProperty('session');
+      return {mode: 'remote', code: 0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+  });
+  it('wires the finish transport into admission reaping for an old cancelled active run', async () => {
+    const f = fixture({remote: {maxConcurrent: 1}}), root = join(f.lockRoot, '..', 'remote'), run = 'r-' + 'c'.repeat(32), nonce = 'd'.repeat(32);
+    const {easternTimestamp} = await import('../forge-exec-run.mjs');
+    let now = Date.now();
+    f.clock = () => now;
+    f.sleep = vi.fn(async () => { now += 10_000; });
+    mkdirSync(root, {recursive: true});
+    const file = join(root, 'slot-0.unconfirmed');
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    writeFileSync(file, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: now - 600_000}));
+    utimesSync(file, (now - 600_000) / 1000, (now - 600_000) / 1000);
+    const st = statSync(file);
+    writeFileSync(file + '.run', JSON.stringify({owner: 'dead', run, nonce, slot: 'forge-exec-2'}));
+    writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: now - 120_000}));
+    f.readTelemetry = async () => ({...await healthyRead(), sampledAtET: easternTimestamp(now), activeRuns: 1, activeRunIds: [run],
+      recent: [{runId: run, code: f.sleep.mock.calls.length ? 97 : null, startedAtET: easternTimestamp(now - 500_000), stageMs: {install: 0, run: 0}}]});
+    const finish = vi.fn(async () => ({finished: true}));
+    vi.mocked(createRunFinisher).mockReturnValueOnce(finish);
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+    expect(createRunFinisher).toHaveBeenLastCalledWith({host: 'forge'});
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(finish).toHaveBeenCalledWith({run, nonce});
+    expect(f.log.mock.calls.some(([line]) => line.includes("finished on owner's behalf"))).toBe(true);
+    expect(f.sleep).toHaveBeenCalledTimes(1);
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('remote admission policy', () => {
   it.each([
@@ -1273,4 +1365,34 @@ it.each([false,true])('R857 credential warnings reach the fallbacks log without 
     const rows=readFileSync(file,'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toEqual([expect.objectContaining({reason:'credential-warn',detail:'notes.md: high-entropy-key'})]);
   }
+});
+
+describe('R1012 marker tags from the real builder stay readable at boundary values', () => {
+  const NOW = Date.parse('2026-11-17T12:00:00-05:00');
+  const idle = async () => ({sampledAtET: new Date(NOW + 120_000).toISOString().replace('Z', '+00:00'), activeRuns: 0, recent: []});
+  it.each([
+    ['ppid 0 (parent outside the PID namespace)', {ppid: 0}, {ppid: 0}],
+    ['ppid 1', {ppid: 1}, {ppid: 1}],
+    ['negative ppid', {ppid: -1}, {}],
+    ['non-integer ppid', {ppid: Number.NaN}, {}],
+    ['empty session', {ppid: 0, env: {[HOLD_SESSION_ENV]: ''}}, {ppid: 0}],
+    ['blank session', {ppid: 0, env: {[HOLD_SESSION_ENV]: '   '}}, {ppid: 0}],
+    ['overlong session', {ppid: 0, env: {[HOLD_SESSION_ENV]: 's'.repeat(500)}}, {session: 's'.repeat(200), ppid: 0}],
+    ['control-char session', {ppid: 0, env: {[HOLD_SESSION_ENV]: 'a\nb'}}, {ppid: 0}],
+    ['path and spaced command', {ppid: 0, argv: ['/usr/bin/npm run x']}, {ppid: 0, cmd: 'npm'}],
+    ['bare slash command', {ppid: 0, argv: ['/']}, {ppid: 0}],
+    ['overlong command', {ppid: 0, argv: ['c'.repeat(90)]}, {ppid: 0, cmd: 'c'.repeat(40)}],
+  ])('%s: the marker round-trips and a dead owner on idle Forge is released', async (_name, {ppid, env = {}, argv = []}, caller) => {
+    const root = mkdtempSync(join(tmpdir(), 'marker-tags-')); testRoots.push(root);
+    const file = join(root, 'slot-0.unconfirmed');
+    const tags = buildMarkerTags({kind: 'files', env, lease: null, argv, ppid});
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...tags}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    expect(JSON.parse(readFileSync(file, 'utf8')).caller).toEqual({kind: 'files', ...caller});
+    const logs = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead', log: line => logs.push(line)});
+    expect(await reaper.step(idle)).toEqual(['slot-0.unconfirmed']);
+    expect(existsSync(file)).toBe(false);
+    expect(logs.some(line => line.includes('released unconfirmed') && line.includes(JSON.stringify({kind: 'files', ...caller})))).toBe(true);
+  });
 });

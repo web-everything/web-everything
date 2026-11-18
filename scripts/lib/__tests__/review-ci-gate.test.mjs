@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { reviewCiGate } from '../review-ci-gate.mjs';
 const headSha = 'a'.repeat(40);
 const success = name => ({ name, status: 'completed', conclusion: 'success' });
-const gate = checks => reviewCiGate({ headSha, requiredChecks: ['test', 'daemon-soak'], checks });
+const gate = checks => reviewCiGate({ rowsComplete: true, headSha, requiredChecks: ['test', 'daemon-soak'], checks });
 describe('strict review CI prerequisite', () => {
   it('admits complete success, ignoring an advisory failure', () => {
     expect(gate([success('test'), success('daemon-soak'), { name: 'review-gate', status: 'completed', conclusion: 'failure' }]).allowed).toBe(true);
@@ -19,28 +19,42 @@ describe('strict review CI prerequisite', () => {
   });
   it('fails closed for absent evidence', () => {
     for (const over of [{ headSha: null }, { requiredChecks: null }, { requiredChecks: [] }, { requiredChecks: [null] }, { checks: [] }, { checks: null }]) {
-      expect(reviewCiGate({ headSha, requiredChecks: ['test'], checks: [success('test')], ...over }).allowed).toBe(false);
+      expect(reviewCiGate({ rowsComplete: true, headSha, requiredChecks: ['test'], checks: [success('test')], ...over }).allowed).toBe(false);
     }
   });
-  it('uses the newest rerun regardless of REST ordering', () => {
-    const old = { ...success('test'), id: 1, conclusion: 'failure' };
-    const fresh = { ...success('test'), id: 2 };
+  it('supersedes only ordered attempts of the same run', () => {
+    const old = { ...success('test'), id: 1, run_id: 1, run_attempt: 1, conclusion: 'failure' };
+    const fresh = { ...success('test'), id: 2, run_id: 1, run_attempt: 2 };
     for (const rows of [[old, fresh], [fresh, old]]) expect(gate([...rows, success('daemon-soak')]).allowed).toBe(true);
     for (const status of ['in_progress', 'completed']) {
       expect(gate([{ ...fresh, id: 3, status, conclusion: 'failure' }, fresh, success('daemon-soak')]).allowed).toBe(false);
     }
   });
+  it('does not discard same-name failures based on job IDs', () => {
+    expect(gate([{ ...success('test'), id: 1, conclusion: 'failure' }, { ...success('test'), id: 2 }, success('daemon-soak')]).allowed).toBe(false);
+  });
   it('never exempts an explicitly required review-gate', () => {
-    expect(reviewCiGate({ headSha, requiredChecks: ['review-gate'], checks: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })).toMatchObject({ allowed: false, reason: 'required-review-gate-conflict' });
+    expect(reviewCiGate({ rowsComplete: true, headSha, requiredChecks: ['review-gate'], checks: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })).toMatchObject({ allowed: false, reason: 'required-review-gate-conflict' });
   });
   it('admits successful required commit statuses', () => {
     for (const row of [{ context: 'legacy', state: 'success' }, { __typename: 'StatusContext', context: 'legacy', state: 'SUCCESS' }]) {
-      expect(reviewCiGate({ headSha, requiredChecks: ['legacy'], checks: [row] }).allowed).toBe(true);
+      expect(reviewCiGate({ rowsComplete: true, headSha, requiredChecks: ['legacy'], checks: [row] }).allowed).toBe(true);
     }
   });
   it.each([['pending', 'pending'], ['expected', 'pending'], ['failure', 'failure'], ['error', 'error'], ['weird', 'malformed']])(
     'refuses a required commit status in state %s', (state, reason) => {
-      expect(reviewCiGate({ headSha, requiredChecks: ['legacy'], checks: [{ context: 'legacy', state }] }))
+      expect(reviewCiGate({ rowsComplete: true, headSha, requiredChecks: ['legacy'], checks: [{ context: 'legacy', state }] }))
         .toMatchObject({ allowed: false, affected: [{ name: 'legacy', reason }] });
     });
+});
+
+
+describe('review CI completeness evidence', () => {
+  it('refuses missing or false completeness with successful rows and names the fallback', () => {
+    const evidence = { headSha, requiredChecks: ['test'], checks: [success('test')] };
+    expect(reviewCiGate(evidence)).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
+    expect(reviewCiGate({ ...evidence, rowsComplete: false })).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
+    // Retry with exhausted pagination or explicit reads of every required name.
+    expect(reviewCiGate({ ...evidence, rowsComplete: true }).allowed).toBe(true);
+  });
 });

@@ -37,6 +37,7 @@ export const ALWAYS_TRIGGERS = [
 /**
  * Section id → declared inputs. `globs` are repo-relative (`**` crosses directories, `*` does not).
  * `impl` are repo-relative entry modules; their import closure is an input too.
+ * `dynamic: true` marks sections whose checker gate supplies additional runtime inputs.
  */
 export const SECTION_INPUTS = {
   // The three whole-tree scans inside 6d-ter: utc-day-slice (scripts/), invisible-source (scripts/, docs/),
@@ -55,6 +56,7 @@ export const SECTION_INPUTS = {
   // enforcer path the catalogue names (resolved by `dynamicInputs` in check-standards.mjs, since `exists()` on
   // those paths is an input too).
   '9a-rules': {
+    dynamic: true,
     globs: ['backlog/**', 'docs/agent/**', 'scripts/lib/invariant-catalogue.json'],
     impl: ['scripts/lib/validate-rules-anchors.cjs'],
   },
@@ -86,6 +88,10 @@ export const SECTION_INPUTS = {
     impl: ['scripts/lib/mandate-fence-scan.mjs'],
   },
 };
+
+/** Sections whose full inputs cannot be verified by a static local gate alone. */
+export const DYNAMIC_SECTIONS = new Set(Object.entries(SECTION_INPUTS)
+  .filter(([, inputs]) => inputs.dynamic === true).map(([id]) => id));
 
 /** Glob → anchored RegExp. `**` (and `**\/`) crosses `/`; `*` and `?` do not. Pure. */
 export function globToRegExp(glob) {

@@ -2141,6 +2141,43 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Forge client telemetry and remote admission
 
+Admission reaper fixtures pass through the real telemetry parser: use `easternTimestamp()` for
+timestamps and include receipt `stageMs: {install, run}`. Reaper-only fixtures do not prove that
+health admission accepts the same sample. Release logs keep their original five-key JSON and
+byte order for markers without new provenance or exit evidence; PID accompanies new evidence,
+and unknown optional values are omitted rather than logged as null or `no-exit-record`.
+
+R1017 (under R1012): for a host-bound marker with a provably dead local owner, preserve the
+marker grace and death-sample margin. With a persisted 32-hex nonce and fresh integer receipt
+(including 97/254) still listed active, finish on the owner's behalf before claiming/removing
+the marker. Bound SSH and output; failed or timed-out finishes retain capacity, log once and
+retry no faster than 30 seconds per run. Legacy nonce-less markers keep their existing rules.
+For 97/254, finishing on behalf requires a persisted numbered worker slot (`forge-exec-N`, N >= 1), since only that finish path proves descendant cleanup; missing, legacy or malformed slots keep the marker held.
+A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
+rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
+old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and
+a parseable start in `recent` for EVERY active id, strictly outside the inclusive ownership
+window `[marker.at - CLOCK_SKEW_MS, diedBy + CLOCK_SKEW_MS]`. Any in-window null-code or 97/254
+receipt retains the marker.
+
+The accepted residual risk is a request the dead client already dispatched that Forge starts
+MORE than 15 minutes after owner death. Observed start lag is about one minute; client SSH
+calls are short and bounded by `ConnectTimeout`. The dead client never issues `run`, so only
+a prepared run can exist. The grace is an operator ruling, not an enforced remote start
+deadline. If this residual occurs, the consequence is one extra concurrent Forge run until it
+finishes (Forge enforces its own cap). No run is killed and no result is lost: the owner is dead
+and cannot collect one. Pin that accepted behaviour explicitly: release at 15 minutes even if
+a delayed request starts later and remains active at 28 minutes.
+
+Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
+operator-confirmed cleanup remain the fallback while capacity is retained.
+Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
+finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
+lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
+and stuck-slot detail carry these tags plus the exit record, or `no-exit-record` for a client
+that had no chance to log. Remove `.exit` with its marker; operator-confirmed cleanup remains
+the fallback when evidence stays incomplete.
+
 For selected `npx vitest run` phases, verify-lane's remote admission plan rewrites plain
 arguments to `npm run test:unit -- ...`; spawn that planned command without a local slot
 or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and local fallback.
@@ -4435,6 +4472,52 @@ when it stays blocked. Replay two new planner skips per tick alongside four bloc
 heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
 new arrivals must never overtake heads already waiting in the rotation.
 
+## Timeout evidence synchronous worker pool
+
+`timeout-evidence-pool.mjs` runs the unchanged collector once per red PR per pass,
+with bounded child process groups and serial fallback for unavailable worker results.
+`ci.timeoutEvidenceConcurrency` defaults to 4; 1 preserves the serial path, and
+`WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY` overrides the setting (valid range: 1–8).
+`timeout-evidence-pool.test.mjs` uses the production worker and a local gh executable
+to exercise throttle parity, exit markers and process-group cleanup.
+Each detached group carries a watchdog with a pool-deadline-plus-five-second lifetime.
+Planner SIGKILL/SIGTERM regressions wait for two real stub-gh workers, kill the planner,
+then inspect non-zombie process-group members and the exact pool directory. A SIGSTOP
+case keeps the planner alive to exercise the watchdog's independent lifetime bound.
+The planner subprocess import uses Node's URL implementation, independent of the DOM
+test environment. It waits at most three seconds for both gh stubs and their child PIDs
+before atomically renaming the readiness record; the parent polls for at most eight
+seconds and includes bounded planner stderr and exit details in readiness failures.
+Liveness checks inspect `ps` states: absent processes and zombies are acceptable;
+EPERM alone never proves termination. Unverifiable group cleanup propagates through
+enrichment without serial fallback. Temp-directory removal is always attempted;
+removal failures are logged without changing the result or cleanup error.
+Run these tests with `reconcile-pass.test.mjs` through heavy-admission on a host
+permitting process-group signals and process inspection.
+
+The timeout-evidence pool fails closed before spawning: planner and worker probes mkdir
+the throttle root and attempt to acquire/release a real sync slot. Machinery errors or
+failed release after acquisition select serial evidence reads; a busy slot or timeout is
+healthy and preserves worker admission. Worker probe failure exits before calling gh.
+Worker fixtures use a scratch `WE_GH_THROTTLE_LOCK_ROOT` and explicit throttle cap so
+host traffic and inherited capacity settings cannot change whether workers launch.
+Probe refusal may emit no stderr: assert forwarding against worker stderr file sizes
+captured before cleanup, with an explicit empty-file case that forwards nothing.
+The pool is capped
+by the live throttle cap. Result/stderr degradation cancels all active groups with the
+same verified cleanup before serial fallback, and workers exit inside fail-open warnings
+before the throttle can continue ungated. Named pool regressions cover zero-launch
+planner refusal, zero-gh worker refusal, both degradation signals and cap bounds.
+
+
+### Reconcile CLI timing diagnostics
+
+Buffer planner-step timing lines at the reconcile CLI boundary and publish them only
+after the whole pass succeeds. Suppressing only the throwing step is insufficient:
+a successful earlier step can displace the failure summary used by live-smoke
+classification. The CLI timing regression covers a failed read after a successful
+step and successful JSON output; the GitHub-outage soak must hold as
+`smoke-env-unavailable` without writing a smoke rejection.
 Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
 Use an injected HOME and filesystem: the append-only ops store lives under
 `~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
@@ -4457,3 +4540,40 @@ missing-head and unknown-required-set evidence must remain closed.
 Classify the full rollup to preserve wrong-head refusals, and require a second classification
 without wrong-head rows so their successes cannot imply missing required checks. Non-review-owned
 failures on any head must prevent red-only eligibility, including optional failures.
+
+## Required-check row completeness (PR1)
+
+`resolveRequiredChecks` requires `rowsComplete === true`: all-success rows from a capped
+rollup can hide a newer failure. Missing or false completeness produces `unknown` with
+`rows-incomplete`; observing every required name alone is insufficient. Retry by exhausting
+pagination or explicitly fetching every required name, then supply the completeness proof.
+The PR1 acceptance tests numbered 10 and 11 cover incomplete rows and the rule that neutral
+and skipped conclusions fail unless the exact name is in `optionalNames`.
+
+Both `reviewCiGate` and the CI-heal evidence adapter default completeness to false. Bare
+`statusCheckRollup` callers (merge listing, reconcile, drain prestage, merge enqueue, human
+landing and escalation recording) cannot attest completeness. `readReviewChecks` exhausts
+REST pagination for check runs and commit statuses, then marks its array with non-enumerable
+`rowsComplete: true`. `readReviewCiGate` captures that proof before hold excusal replaces the
+array and forwards it through `reviewStartGate`. Bare arrays and serialized historical rows
+carry no proof and fail closed. Never infer completeness from row count or successful names.
+`review-ci-completeness.test.mjs` exercises the real reader-to-start-gate path with multiple
+pages, a hidden failure, incomplete arrays, and unreadable later-page evidence.
+
+Reconcile re-reads an excused candidacy hold through the complete exact-head review reader
+before scheduling its review. The injected hydration reader keeps its complete-feed contract;
+an explicit `rowsComplete: false` refuses proof. Carry an excusal only for the same immutable
+job, preserve observed real CI failures, and reuse the already-read hold verdict. The
+`merge-gate-hold-class.test.mjs` planner cases cover unreadable/incomplete feeds, foreign heads,
+pending checks and replacement jobs. Recording refusals retain the required-check names even
+when incomplete evidence also blocks the verdict; an unavailable roster still refuses recording.
+
+
+REST check-run rows omit workflow run/attempt fields. For duplicate GitHub Actions check
+names, `readReviewChecks` reads the Actions jobs and validates each job ID, workflow run,
+head, exact name, and check-run URL before supplying `run_id`/`run_attempt` to the resolver.
+A check ID, suite ID, timestamp, or URL alone never proves attempt ordering. Job reads are
+cached within the read and capped at 20; missing/mismatched evidence or overflow blocks
+review with an operator-visible request to inspect Actions jobs/reruns before retrying.
+The REST rerun integration cases in `review-ci-completeness.test.mjs` cover successful reruns,
+different runs, invalid lineage, foreign repositories, unavailable jobs, and the read cap.

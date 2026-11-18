@@ -1,3 +1,5 @@
+import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
+
 /**
  * Pure check-state policy. Known unfinished statuses are pending. Completed
  * SUCCESS/NEUTRAL/SKIPPED are green; FAILURE/TIMED_OUT/ACTION_REQUIRED/
@@ -121,4 +123,84 @@ export function summarize(checks = [], {
     gateOnlyRed: redSet.size > 0 && [...redSet].every((name) => gates.has(name)),
     allRequiredGreen: redSet.size === 0 && pendingSet.size === 0,
   };
+}
+
+// Strict admission is intentionally separate from the compatibility reducers above (PR2).
+const evidenceRank = { pass: 0, held: 1, pending: 2, fail: 3, unknown: 4 };
+const worstEvidence = states => states.reduce((a, b) => evidenceRank[b] > evidenceRank[a] ? b : a, 'pass');
+const sha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
+// Canonical positive integers only; unsafe numeric IDs cannot establish ordering.
+const evidenceInteger = value => typeof value === 'number'
+  ? (Number.isSafeInteger(value) && value > 0 ? BigInt(value) : null)
+  : (typeof value === 'string' && /^[1-9][0-9]*(?![\s\S])/.test(value) ? BigInt(value) : null);
+const evidenceName = row => row?.name ?? row?.context;
+const evidenceJob = row => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1];
+
+/** Resolve required evidence without guessing a roster, head, attempt order, or read completeness.
+ * rowsComplete is true only after exhausting pages or explicitly fetching every required name.
+ */
+export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [] } = {}) {
+  const perName = Object.create(null), reasons = [];
+  const validNames = names => Array.isArray(names) && [...names].every(n => typeof n === 'string' && n.trim());
+  if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || !requiredNames.length) reasons.push('roster-unavailable');
+  if (!sha(head)) reasons.push('missing-head');
+  if (rowsHead !== undefined && (!sha(rowsHead) || sha(rowsHead) !== sha(head))) reasons.push('foreign-head');
+  if (!Array.isArray(rows)) reasons.push('rows-unavailable');
+  if (!validNames(optionalNames)) reasons.push('optional-names-malformed');
+  if (rowsComplete !== true) reasons.push('rows-incomplete');
+  if (reasons.some(reason => reason !== 'rows-incomplete')) return { state: 'unknown', perName, reasons };
+  const classified = [...rows].map(row => {
+    const name = evidenceName(row), why = [];
+    let status = normalize(row?.status), conclusion = normalize(row?.conclusion), legacyError = false;
+    // Compatibility excusal rewrites conclusions for legacy consumers. Strict
+    // admission rechecks the original failure and binds any hold to this row.
+    if (name === 'merge-gate' && row?.mergeGateHoldExcused) conclusion = 'failure';
+    if (row?.status === undefined && row?.__typename !== 'CheckRun' && typeof row?.state === 'string') {
+      const legacy = normalize(row.state); legacyError = legacy === 'error';
+      if (['success', 'failure', 'error'].includes(legacy)) { status = 'completed'; conclusion = legacy; }
+      else if (['pending', 'expected'].includes(legacy)) status = 'pending';
+    }
+    let state = 'unknown';
+    if (typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
+      || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');
+    else if (status !== 'completed') { state = 'pending'; why.push('pending'); }
+    else if (['cancelled', 'stale'].includes(conclusion)) { state = 'pending'; why.push('needs-rerun'); }
+    else if (conclusion === 'success' || (optionalNames.includes(name) && ['neutral', 'skipped'].includes(conclusion))) state = 'pass';
+    else { state = 'fail'; why.push(conclusion); }
+    const rowHead = sha(row?.head_sha ?? rowsHead);
+    if (!rowHead || rowHead !== sha(head)) {
+      // Foreign success is waiting for this head's evidence; foreign failure is unreadable.
+      state = state === 'pass' ? 'pending' : 'unknown'; why.unshift('foreign-head');
+    }
+    if (state === 'fail' && name === 'review-gate') state = 'held';
+    if (state === 'fail' && name === 'merge-gate') {
+      const candidates = [row.mergeGateReviewHold, row.mergeGateHoldExcused, ...(Array.isArray(holds) ? holds : [])];
+      if (candidates.some(hold => evidenceJob(row) && evidenceInteger(hold?.jobId) === evidenceInteger(evidenceJob(row))
+        && sha(hold?.headSha) === sha(head) && Array.isArray(hold?.holdIds) && hold.holdIds.length
+        && [...hold.holdIds].every(id => HUMAN_REVIEW_HOLD_GATES.includes(id)))) state = 'held';
+    }
+    return { row, name, state, reasons: why, rowHead, run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
+  });
+  // A nameless row cannot safely be assigned to an advisory check.
+  if (classified.some(r => typeof r.name !== 'string' || !r.name.trim())) reasons.push('malformed');
+  const resolveName = name => {
+    const all = classified.filter(r => r.name === name);
+    const active = all.filter(r => !all.some(other => r.rowHead && r.rowHead === other.rowHead
+      && r.run !== null && r.run === other.run && r.attempt !== null && other.attempt !== null
+      && other.attempt > r.attempt && !r.reasons.includes('malformed') && !r.reasons.includes('foreign-head')));
+    // Sorting is for display only. Metadata other than run_attempt never supersedes evidence.
+    const key = r => JSON.stringify([String(r.run ?? ''), String(evidenceJob(r.row) ?? r.row.id ?? ''),
+      Object.keys(r.row).sort().map(k => [k, r.row[k]])]);
+    active.sort((a, b) => evidenceRank[b.state] - evidenceRank[a.state] || key(a).localeCompare(key(b)));
+    return { state: active.length ? worstEvidence(active.map(r => r.state)) : 'pending',
+      rows: active.map(r => r.row), rerunInFlight: active.some(r => r.state === 'pending' && r.attempt > 1n
+        && !r.reasons.includes('needs-rerun') && !r.reasons.includes('foreign-head')),
+      reasons: active.length ? [...new Set(active.flatMap(r => r.reasons))].sort() : ['missing'] };
+  };
+  for (const name of [...new Set(requiredNames)].sort()) perName[name] = resolveName(name);
+  if (Object.hasOwn(perName, 'integration') && !classified.some(r => r.name === 'integration') && resolveName('test').state === 'pass') {
+    perName.integration = { state: 'pass', rows: [], via: 'test', rerunInFlight: false, reasons: [] };
+  }
+  return { state: reasons.length ? 'unknown' : worstEvidence(Object.values(perName).map(r => r.state)), perName,
+    reasons: [...new Set([...reasons, ...Object.values(perName).flatMap(r => r.reasons)])].sort() };
 }

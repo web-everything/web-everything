@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { runGhSync, execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { ghRestGetPaged } from '../lib/gh-rest-read.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
-import { resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
+import { enrichPrRollupEvidence, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
 
 // #3383 — `baseRefName` joined the union once `reconcile-pass.mjs` and `parked-pr-conflict-watch.mjs` each
 // started reading it (the STACKED-BASE CONFLICT branch needs it to tell a PR stacked on another lane/PR apart
@@ -25,6 +25,7 @@ export function defaultFetchOpenPrs({ repo = null, exec = runGhSync, readComment
   const out = exec(argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(out || '[]'));
   if (!Array.isArray(parsed)) return [];
+  enrichPrRollupEvidence({ repo, rows: parsed, exec: (_cmd, args, opts) => exec(args, opts) });
   // The planner's external-check exemption binds to the posting app; `gh pr list` rows carry none (live #6926).
   resolveCheckAppsByCommit({ repo, rows: parsed, exec: (_cmd, args, o) => exec(args, o) });
   return enrichPrsWithCompleteComments(parsed, { repo, ...(readComments ? { readComments } : {}) });
