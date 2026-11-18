@@ -116,7 +116,9 @@ export function defaultReadHeadCheckState({
   const raw = runGh(checksArgv({ repo: repoSlug, sha }), {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-status-checks', repo: repoSlug },
   });
-  let rows = parseJsonLines(raw);
+  // This REST reader requires explicit completion; a conclusion alone is still pending.
+  let rows = parseJsonLines(raw).map(row => row.status == null || row.status === ''
+    ? { ...row, status: 'pending' } : row);
   try {
     const failingGate = latestFailingMergeGate(rows);
     if (failingGate) {

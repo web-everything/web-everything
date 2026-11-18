@@ -106,7 +106,8 @@ function checkEvidence(rollup, requiredChecks) {
   // Only the shared merge-gate hold classifier's annotation proves a review hold.
   // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
   const holdGateNames = reviewHoldNames(checks);
-  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
+  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks,
+    { checkPassing: requiredCheckPassing })
     .filter(name => !holdGateNames.includes(name)
       && !(name === REVIEW_GATE_CHECK && requiredCheckPassing(checks, name)));
   // CodeQL evidence is never excused by a drain setting or an optional roster.

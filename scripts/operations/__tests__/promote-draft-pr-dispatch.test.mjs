@@ -13,6 +13,18 @@ const FRESH = () => ({ fresh: true, behind: 0 });
 const ALWAYS_GREEN = () => ({ state: 'green', why: 'all required checks succeeded', counts: {} });
 const NOOP_STATUS = () => {};
 
+describe('incomplete promotion status evidence', () => {
+  it.each([undefined, null, ''])('missing/empty status %j with a conclusion remains pending', status => {
+    for (const conclusion of ['SUCCESS', 'FAILURE']) {
+      const out = defaultReadHeadCheckState({ repoSlug: 'owner/repo', sha: 'a'.repeat(40),
+        runGh: () => JSON.stringify({ name: 'test', status, conclusion }),
+        getRequiredChecks: () => ({ checks: ['test'] }) });
+      expect(out).toMatchObject({ state: 'pending', reviewHoldOnly: false,
+        counts: { running: 1, succeeded: 0 } });
+    }
+  });
+});
+
 describe('review-hold-only red draft promotion', () => {
   const HEAD = 'a'.repeat(40);
   const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });

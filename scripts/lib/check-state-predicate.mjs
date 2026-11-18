@@ -58,8 +58,10 @@ export function classifyCheck(check = {}, { optionalNames = [] } = {}) {
   const state = status === 'completed'
     ? ownValue(CHECK_STATE_TABLE.completed, normalize(check.conclusion))
     : ownValue(CHECK_STATE_TABLE, status);
-  return (check.required === false || nameSet(optionalNames, 'optionalNames').has(check.name || check.context))
-    && state !== 'green' ? 'ignore' : state;
+  const optional = nameSet(optionalNames, 'optionalNames').has(check.name || check.context);
+  const optionalOutcome = optional && status === 'completed'
+    && ['skipped', 'neutral'].includes(normalize(check.conclusion));
+  return (check.required === false || optionalOutcome) && state !== 'green' ? 'ignore' : state;
 }
 
 /**
@@ -114,9 +116,11 @@ export function passingAttempts(checks = []) {
 
 /** Exact-name required check admission; missing and ambiguous attempts fail closed. */
 export function requiredCheckPassing(checks, name, { optionalNames = [] } = {}) {
-  if (nameSet(optionalNames, 'optionalNames').has(name)) return true;
+  nameSet(optionalNames, 'optionalNames');
   const rows = passingAttempts(checks).filter(row => checkName(row) === name);
-  return rows.length === 1 && classifyCheck({ ...rows[0], required: true }) === 'green';
+  if (rows.length !== 1) return false;
+  const state = classifyCheck({ ...rows[0], required: true }, { optionalNames });
+  return state === 'green' || state === 'ignore';
 }
 
 /** Review-gate owns review failures; merge-gate requires the head-bound hold-class annotation. */
@@ -151,7 +155,7 @@ export function summarize(checks = [], {
 } = {}) {
   const required = requiredNames === undefined ? null : nameSet(requiredNames, 'requiredNames');
   const gates = nameSet(holdGateNames, 'holdGateNames');
-  const optional = nameSet(optionalNames, 'optionalNames');
+  const optional = [...nameSet(optionalNames, 'optionalNames')].filter(name => !required?.has(name));
   const rows = passingAttempts(checks);
   const observed = new Set();
   const redSet = new Set();
@@ -160,14 +164,14 @@ export function summarize(checks = [], {
     const name = checkName(check);
     observed.add(name);
     const state = classifyCheck(required === null
-      ? check : { ...check, required: required.has(name) }, { optionalNames });
+      ? check : { ...check, required: required.has(name) }, { optionalNames: optional });
     if (state === 'red') redSet.add(name);
     if (state === 'pending') pendingSet.add(name);
   }
   // A name with both red and pending evidence is reported as red once.
   for (const name of redSet) pendingSet.delete(name);
   for (const name of required ?? []) {
-    if (!observed.has(name) && !optional.has(name)) pendingSet.add(name);
+    if (!observed.has(name)) pendingSet.add(name);
   }
   return {
     redSet,

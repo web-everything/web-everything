@@ -14,6 +14,28 @@ const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRe
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
+describe('strict required-check implication', () => {
+  it.each([{}, { run_id: 42, run_attempt: 1 }, { run_id: 43, run_attempt: 2 }])(
+    'ambiguous aggregate successes cannot excuse missing integration: %j', metadata => {
+      const first = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', run_id: 42, run_attempt: 1 };
+      const second = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', ...metadata };
+      for (const rollup of [[first, second], [second, first]]) {
+        expect(requiredCheckStates({ rollup, requiredChecks: ['integration'] }).missing).toEqual(['integration']);
+        expect(ciGreenForEscalation({ rollup, requiredChecks: ['integration'] })).toBe(false);
+      }
+    });
+
+  it('a proven latest aggregate success excuses only absent integration', () => {
+    const first = { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', run_id: 42, run_attempt: 1 };
+    const second = { ...first, conclusion: 'SUCCESS', run_attempt: 2 };
+    for (const rollup of [[first, second], [second, first]]) {
+      expect(ciGreenForEscalation({ rollup, requiredChecks: ['integration'] })).toBe(true);
+      expect(requiredCheckStates({ rollup: [...rollup, { name: 'integration', status: 'QUEUED' }],
+        requiredChecks: ['integration'] }).pending).toEqual(['integration']);
+    }
+  });
+});
+
 describe('R272 shared every-row evidence contract', () => {
   it('retains every original row without mutation in both compatibility exports', () => {
     const older = Object.freeze({ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',

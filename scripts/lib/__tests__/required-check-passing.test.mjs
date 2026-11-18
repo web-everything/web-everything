@@ -25,12 +25,32 @@ describe('required checks need proven latest success', () => {
     }
   });
 
-  it('missing required checks fail closed, with explicit optional names as the only waiver', () => {
+  it('missing required checks fail closed even when declared optional', () => {
     expect(requiredCheckPassing([], 'test')).toBe(false);
-    expect(requiredCheckPassing([], 'test', { optionalNames: ['test'] })).toBe(true);
+    expect(requiredCheckPassing([], 'test', { optionalNames: ['test'] })).toBe(false);
     expect(summarize([check('neutral')], { optionalNames: ['test'] }).allRequiredGreen).toBe(true);
     expect(summarize([], { requiredNames: ['test'] }).allRequiredGreen).toBe(false);
     expect(read([hold])).toMatchObject({ reviewHoldOnly: false, waitingOnReview: false });
+  });
+
+  it.each(['skipped', 'neutral', 'failure', 'cancelled', 'unknown', null])(
+    'optional names excuse only present skipped/neutral evidence: %s', conclusion => {
+      const rows = [check(conclusion)];
+      const options = { optionalNames: ['test'] };
+      const excused = ['skipped', 'neutral'].includes(conclusion);
+      expect(requiredCheckPassing(rows, 'test', options)).toBe(excused);
+      expect(summarize(rows, options).allRequiredGreen).toBe(excused);
+      expect(summarize(rows, { ...options, requiredNames: ['test'] }).allRequiredGreen).toBe(false);
+    });
+
+  it('explicit required names override optional names for missing and pending evidence', () => {
+    const options = { requiredNames: ['test'], optionalNames: ['test'] };
+    expect(summarize([], options)).toMatchObject({ allRequiredGreen: false, pendingSet: new Set(['test']) });
+    const rows = [check(null, { status: 'queued' })];
+    expect(summarize(rows, options).allRequiredGreen).toBe(false);
+    expect(summarize(rows, { optionalNames: ['test'] }).allRequiredGreen).toBe(false);
+    expect(requiredCheckPassing(rows, 'test', options)).toBe(false);
+    expect(requiredCheckPassing([check('success'), check('success')], 'test', options)).toBe(false);
   });
 
   it('only strictly later success in the same run and exact job clears failure', () => {

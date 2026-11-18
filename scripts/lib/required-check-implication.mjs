@@ -16,12 +16,14 @@ export const REQUIRED_CHECK_IMPLIED_BY = Object.freeze({ integration: Object.fre
  * missing, pending or failing.
  * @param {string[]|undefined} requiredChecks
  * @param {Array<object>} rows check-run rows or rollup entries (`name`/`context`, `status`, `conclusion`)
+ * @param {{checkPassing?: Function}} options Caller-specific strict aggregate admission predicate.
  */
-export function withoutImpliedRequiredChecks(requiredChecks, rows) {
+export function withoutImpliedRequiredChecks(requiredChecks, rows, { checkPassing } = {}) {
   if (!Array.isArray(requiredChecks)) return requiredChecks;
   const list = Array.isArray(rows) ? rows : [];
   const nameOf = row => row?.name ?? row?.context;
   const green = name => {
+    if (checkPassing) return checkPassing(list, name);
     const mine = list.filter(row => nameOf(row) === name);
     return mine.length > 0 && mine.every(row => String(row.conclusion ?? '').toLowerCase() === 'success'
       && String(row.status ?? 'completed').toLowerCase() === 'completed');
