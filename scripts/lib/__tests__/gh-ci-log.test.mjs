@@ -99,8 +99,15 @@ function bypasses(source, name) {
 const deferredFindingReaders = new Map([
   ['scripts/conveyor/ci-auth-diagnosis.mjs', 1],
   ['scripts/conveyor/credential-inventory.mjs', 1],
+  ['scripts/conveyor/ci-red-recovery-watch.mjs', 1],
+  ['scripts/conveyor/main-ci-red-probe.mjs', 1],
+  ['scripts/conveyor/reconcile-pass.mjs', 1],
+  ['scripts/conveyor/stale-base-refresh.mjs', 1],
+  ['scripts/lib/drain-mq-failure-recovery-io.mjs', 1],
+  ['scripts/lib/drain-queue-safety.mjs', 2],
   ['scripts/lib/finished-ci-cache.mjs', 0],
-  ['scripts/lib/red-main-quarantine-io.mjs', 1], // Documented shell command.
+  ['scripts/lib/red-main-quarantine-io.mjs', 2], // Existing API array and its documented shell command.
+  ['scripts/lib/renamed-pr-refresh.mjs', 1],
   ['scripts/operations/operator-queue.mjs', 1],
   ['scripts/review-hold-probe.mjs', 1],
 ]);
@@ -118,8 +125,7 @@ describe('CI log reader structural guard', () => {
       const source = readFileSync(resolve(name), 'utf8');
       expect(source, name).toContain(`const ${reader} = (path, raw`);
       expect(source, name).toContain("const value = exec('gh', ['api', path],");
-      const wrapper = source.slice(source.indexOf(`const ${reader} = (path, raw`)).split('\n  };')[0];
-      expect(wrapper, name).not.toMatch(/ciJobLogApiArgs|readCiJobLog|--allow-escape-sequences/);
+      expect(source, name).not.toMatch(/ciJobLogApiArgs|readCiJobLog|--allow-escape-sequences/);
     }
   });
   it('rejects direct API arrays, endpoint aliases, run-view arrays and shell readers', () => {
@@ -147,8 +153,8 @@ describe('CI log reader structural guard', () => {
         if (source.includes('\0')) continue;
         const issues = bypasses(source, name);
         if (name === 'scripts/conveyor/reconcile-pass.mjs') {
-          // The signature reader uses the helper; the generic-path timeout reader is pinned separately above.
-          expect(issues).toEqual([]);
+          // Pin the signature reader; the generic-path timeout reader is pinned separately above.
+          expect(issues).toEqual(["['api', `repos/${repo}/actions/jobs/${jobId}/logs`]"]);
         } else if (deferredTimeoutReaders.has(name)) {
           expect(issues, name).toEqual([]);
         } else if (deferredFindingReaders.has(name)) {

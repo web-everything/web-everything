@@ -5,7 +5,6 @@
  * branch on a guess. Trusted PR comments spend the budget once per base, including
  * failed refreshes, so another failure cannot keep requesting the same refresh.
  */
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -164,7 +163,7 @@ export function readStaleBaseFacts({ repo, pr, defaultBranch = 'main', exec = ex
       jobId: c.detailsUrl?.match(/\/job\/(\d+)/)?.[1] ?? null, log: '' }));
   if (!facts.failingChecks.length || facts.failingChecks.some(c => c.conclusion !== 'FAILURE')) return finish();
   for (const c of facts.failingChecks) {
-    try { if (c.jobId) c.log = run('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${c.jobId}/logs`)); } catch { c.log = ''; }
+    try { if (c.jobId) c.log = run('gh', ['api', `repos/${repo}/actions/jobs/${c.jobId}/logs`]); } catch { c.log = ''; }
     if (!extractFailingTestFiles(c.log).length && !AGGREGATOR_PATTERNS.some(p => p.test(c.log))) return finish();
   }
   const failingFiles = [...new Set(facts.failingChecks.flatMap(c => extractFailingTestFiles(c.log)))];

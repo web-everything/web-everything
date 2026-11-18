@@ -4,7 +4,6 @@
  * Keep owner dispatch and ledger writes in main-ci-red-io.mjs so read-only callers do not
  * inherit the dispatch graph in their import closure.
  */
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
@@ -33,7 +32,7 @@ function ghJson(exec, argv) {
 
 /** Read raw Actions log text, refusing a deferred GitHub read. */
 export function readJobLog(jobId, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
-  const out = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), {
+  const out = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024,
     timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
   });

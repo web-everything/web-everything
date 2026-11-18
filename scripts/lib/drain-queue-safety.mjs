@@ -1,5 +1,4 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
@@ -820,7 +819,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
+          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
           if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
@@ -905,7 +904,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         try {
           if (budget <= 2) throw new Error('retry evidence budget exhausted');
           budget--;
-          const text = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), {
+          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });

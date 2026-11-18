@@ -185,7 +185,7 @@ describe('reconcile ownership', () => {
     { name: 'latest run green', rollup: [run(111, 'FAILURE'), run(222, 'SUCCESS')], job: null },
   ])('proves the hold from the latest test run only: $name', ({ rollup, job }) => temporary(root => {
     const calls = [];
-    const exec = (_command, args) => { calls.push(args.at(-1)); throw new Error('stop after the log path'); };
+    const exec = (_command, args) => { calls.push(args[1]); throw new Error('stop after the log path'); };
     readOwedMainRule(pr({ statusCheckRollup: rollup }), { slug: 'web-everything/web-everything', exec, cache: join(root, 'state.json'), authors });
     expect(calls).toEqual(job ? [`repos/web-everything/web-everything/actions/jobs/${job}/logs`] : []);
     const rows = [pr({ statusCheckRollup: rollup })];

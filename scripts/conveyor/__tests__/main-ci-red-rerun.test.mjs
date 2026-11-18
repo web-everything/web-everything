@@ -285,7 +285,7 @@ describe('rerun IO and ledger', () => {
   it('uses raw logs, guarded compare JSON and failed-job rerun argv', () => {
     const exec = vi.fn(() => log);
     expect(io.readJobLog(42, { exec, repoSlug: 'o/r' })).toBe(log);
-    expect(exec.mock.calls[0][1]).toEqual(['api', '--allow-escape-sequences', 'repos/o/r/actions/jobs/42/logs']);
+    expect(exec.mock.calls[0][1]).toEqual(['api', 'repos/o/r/actions/jobs/42/logs']);
     exec.mockReturnValue('["backlog/a.md"]');
     expect(io.readChangedFiles(green.headSha, red.headSha, { exec, repoSlug: 'o/r' })).toEqual(['backlog/a.md']);
     expect(() => io.readChangedFiles('bad', red.headSha, { exec })).toThrow();
@@ -318,7 +318,7 @@ describe('rerun IO and ledger', () => {
       calls.push(argv);
       if (argv[0] === 'run') { expect(argv.at(-1)).toContain('attempt'); return JSON.stringify([red, green]); }
       if (argv[1].includes('/jobs?')) return JSON.stringify({ total_count: 2, jobs: [{ id: 42, name: 'integration', conclusion: 'failure' }, { id: 43, name: 'test', conclusion: 'failure' }] });
-      if (argv.at(-1).endsWith('/logs')) { expect(argv.at(-1)).toContain('/42/'); return raw; }
+      if (argv[1].endsWith('/logs')) { expect(argv[1]).toContain('/42/'); return raw; }
       if (argv[1].includes('/annotations')) return '[]';
       if (argv[1].includes('/compare/')) return '["backlog/a.md"]';
       throw new Error('no tip');

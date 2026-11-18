@@ -1,5 +1,4 @@
 /** Production adapter for a drain's held same-head MQ failure. No work runs at import time. */
-import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { createMqLiveReader, readMqTimeline, decideMqSameHead } from './drain-queue-safety.mjs';
 import { collectMqFailureEvidence } from './mq-failure-evidence.mjs';
@@ -78,7 +77,7 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
             && ['success', 'skipped', 'neutral', 'cancelled', 'failure'].includes(job.conclusion)) };
         },
         readJobLog({ repo, jobId }) {
-          const text = request('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), { maxBuffer: 256 * 1024 });
+          const text = request('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], { maxBuffer: 256 * 1024 });
           return { text, complete: typeof text === 'string' && Buffer.byteLength(text) <= 256 * 1024 };
         },
       } });
