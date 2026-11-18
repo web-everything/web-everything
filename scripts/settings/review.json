@@ -7,7 +7,7 @@
   "seatsByTouchSet": "on",
   "shadowSeats": {
     "antigravity": {
-      "model": "gemini-4-argon-high",
+      "model": "gemini-4-carbon-high",
       "trialReviews": 30,
       "enabled": false,
       "sampleRate": 0.1,
