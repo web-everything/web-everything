@@ -152,6 +152,40 @@ describe('bounded established overlay hold', () => {
       expect(held()).toBeNull();
     }
   });
+  it('a clean reapplication clears the park notice and a recurring conflict gets a fresh hold', async () => {
+    expect(parked(await tick())).toHaveLength(1);
+    const lost = plan.establishedLost;
+    plan.establishedLost = [];
+    plan.applied = [{ ref, sha }];
+    plan.decisions = [{ ref, sha, action: 'apply' }];
+    time += 60_000;
+    expect((await tick()).terminal).toBe(false);
+    expect(readRebuildState(root, env).pinnedNotified).toBeNull();
+
+    plan.establishedLost = lost;
+    plan.applied = [];
+    plan.decisions = [{ ref, sha, action: 'drop', reason: 'conflict' }];
+    time += 60_000;
+    const since = new Date(time).toISOString();
+    const conflict = await tick();
+    expect(conflict.result.reason).toBe('established-overlay-conflict');
+    expect(parked(conflict)).toEqual([]);
+    expect(held()).toMatchObject({ since, lost: [{ ref, sha }] });
+
+    time += 30 * 60_000;
+    const boundary = await tick();
+    expect(boundary.result.reason).toBe('established-overlay-conflict');
+    expect(parked(boundary)).toEqual([]);
+    expect(held().since).toBe(since);
+
+    time += 1;
+    const expired = await tick();
+    expect(expired.terminal).toBe(false);
+    expect(parked(expired)).toEqual([expect.objectContaining({ detail: expect.objectContaining({ ref, sha, since }) })]);
+    expect(held()).toBeNull();
+    expect(parked(await tick())).toEqual([]);
+    expect(readOverlayEventLog(root, env).filter(e => e.kind === 'established-overlay-parked')).toHaveLength(2);
+  });
   it('setting zero disables parking', async () => {
     env.WE_DAEMON_ESTABLISHED_OVERLAY_PARK_MINUTES = '0';
     time += 24 * 3_600_000;

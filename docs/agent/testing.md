@@ -139,6 +139,9 @@ Established-overlay expiry only parks feature overlays. `established-overlay-par
 uses the planner's shared mechanism classifier and covers pins, mixed lost sets, unavailable
 classification and historical park notices: any protected member holds the entire set on
 last-good indefinitely and emits one needs-you notice per ref/tip via `pinnedNotified`.
+Park notices survive only while the same registered tip remains lost in a complete plan.
+The clean-reapplication regression verifies a recurring conflict starts a fresh 30-minute hold,
+including the exact deadline boundary and one new park alert after expiry.
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
 before push, then `addOverlay` compares the same snapshot under the overlay list mutex before

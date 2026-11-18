@@ -386,12 +386,13 @@ export async function prepareRebuild({
   // (`state.pinnedNotified`: ref → the new tip last reported) is pruned only after a complete plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
   const pinnedNow = Object.create(null);
-  // Keep park notices across rebuild retries and adoption, using the same once-per-record store.
-  // A changed tip or withdrawn registration prunes its notice so the new tip gets a fresh hold.
+  // Keep park notices only while the same registered tip is still lost. A clean reapplication,
+  // retirement or changed tip prunes its notice so a later conflict gets a fresh hold.
   for (const o of overlaysBefore) {
-    const tip = plan.establishedLost?.find(l => l.ref === o.ref)?.sha
-      ?? plan.decisions?.find(d => d.ref === o.ref)?.sha;
-    if (tip && [`established-overlay-parked:${tip}`, `established-overlay-needs-you:${tip}`].includes(pinnedBefore[o.ref])) {
+    const lostTip = plan.establishedLost?.find(l => l.ref === o.ref)?.sha;
+    const tip = lostTip ?? plan.decisions?.find(d => d.ref === o.ref)?.sha;
+    if ((lostTip && pinnedBefore[o.ref] === `established-overlay-parked:${lostTip}`)
+      || (tip && pinnedBefore[o.ref] === `established-overlay-needs-you:${tip}`)) {
       pinnedNow[o.ref] = pinnedBefore[o.ref];
     }
   }
