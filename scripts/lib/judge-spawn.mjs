@@ -723,17 +723,19 @@ function markQuotaFailure(error, text) {
  */
 export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
   let parsed;
+  const events = [];
   try {
     parsed = JSON.parse(String(stdout));
+    events.push(parsed);
   } catch {
-    for (const line of String(stdout).split(/\r?\n/).reverse()) {
+    for (const line of String(stdout).split(/\r?\n/)) {
       if (!line.trim()) continue;
       try {
         const candidate = JSON.parse(line);
+        events.push(candidate);
         if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
-          && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result')) {
+          && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result' || candidate.type === 'error')) {
           parsed = candidate;
-          break;
         }
       } catch { /* stray stdout lines are not result objects */ }
     }
@@ -746,6 +748,20 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       );
       err.unparseableStdout = true;
       throw err;
+    }
+  }
+
+  // A success cannot erase an error elsewhere in the CLI's JSON output.
+  const failure = events.find(event => event && typeof event === 'object' && !Array.isArray(event)
+    && (event.type === 'error' || event.is_error === true
+      || (event.type === 'result' && 'subtype' in event && event.subtype !== 'success')));
+  if (failure) {
+    if (failure.is_error === true) parsed = failure; // Preserve CLI and budget diagnostics below.
+    else {
+      const error = new Error('judge-spawn: the juror emitted a JSON error event or unsuccessful result.');
+      error.unparseableStdout = true;
+      error.verdictIntegrity = true;
+      throw error;
     }
   }
 
@@ -790,7 +806,7 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     const tail = String(stderr).trim().slice(-600);
     throw new Error(
       `judge-spawn: the juror failed with no result text. ` +
-      `parsed: ${JSON.stringify(parsed).slice(0, 600)}\n` +
+      `parsed: ${JSON.stringify({ ...parsed, structured_output: undefined }).slice(0, 600)}\n` +
       (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
     );
   }

@@ -1476,6 +1476,41 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   const sidOf = (argv) => flagValue(argv, '--session-id');
 
   it.each([
+    ['is_error result', { type: 'result', is_error: true, result: 'review failed' }],
+    ['is_error event', { type: 'system', is_error: true, result: 'review failed' }],
+    ['error event', { type: 'error', error: 'x' }],
+    ['unsuccessful subtype with output', { type: 'result', subtype: 'error_during_execution', is_error: false,
+      structured_output: { verdict: 'accept', findings: [], private: 'private-juror-content' } }],
+    ['null subtype', { type: 'result', subtype: null, is_error: false }],
+    ['is_error with output and no result text', { type: 'result', is_error: true,
+      structured_output: { verdict: 'accept', findings: [], private: 'private-juror-content' } }],
+  ].flatMap(([name, event]) => ['alone', 'before success', 'after success'].map(position => [name, event, position])))
+  ('rejects %s %s at exit 0 without a verdict or raw output', async (_name, event, position) => {
+    // Every structured_output is schema-valid, so failure must come from the CLI envelope.
+    const shape = { type: 'object', required: ['verdict', 'findings'] };
+    const line = JSON.stringify(event);
+    const stdout = position === 'alone' ? line : position === 'before success'
+      ? `${line}\n${ANSWER_JSON}` : `${ANSWER_JSON}\n${line}`;
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 0, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err instanceof JudgeUnparseableError || err.message.startsWith('judge-spawn: the juror failed')).toBe(true);
+    expect(err).not.toHaveProperty('value');
+    expect(err).not.toHaveProperty('structured_output');
+    expect(err.message).not.toContain('private-juror-content');
+    expect(err.message).not.toContain('stdout[0..600]');
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([undefined, 'success'])('accepts a single legitimate result with subtype %s', async subtype => {
+    const stdout = JSON.stringify({ ...JSON.parse(ANSWER_JSON), type: 'result', subtype });
+    const { fn } = scriptedSpawn([{ stdout, code: 0 }]);
+    const result = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 0, spawnFn: fn });
+    expect(result.value).toEqual({ verdict: 'accept', findings: [] });
+  });
+
+  it.each([
     ['empty object', {}, SHAPE, /required/],
     ['missing field', { verdict: 'private-juror-content' }, SHAPE, /required/],
     ['wrong type', { verdict: 'private-juror-content', findings: 'private-juror-content' }, SHAPE, /type/],
