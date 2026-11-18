@@ -317,20 +317,29 @@ describe('GitHub ownership source', () => {
   describe('synchronous production source honors the read deadline', () => {
     // A real sync child (`exec sleep`) cannot be interrupted by a timer: only the child's own timeout can stop it.
     function stubGh(seconds) {
-      const bin = join(home(), 'gh');
-      writeFileSync(bin, '#!/bin/sh\nexec sleep ' + seconds + '\n');
+      const dir = home();
+      const bin = join(dir, 'gh');
+      const marker = join(dir, 'started');
+      writeFileSync(bin, '#!/bin/sh\n: > "' + marker + '"\nexec sleep ' + seconds + '\n');
       chmodSync(bin, 0o755);
-      return bin;
+      return { bin, marker };
     }
-    const syncSource = (bin) => guard.createGitHubOwnershipSource({
-      ghApi: (path, options) => guard.runGhApi(path, { ...options, execFile: (_file, args, opts) => execFileSync(bin, args, opts) }),
+    const syncSource = (bin, errors = []) => guard.createGitHubOwnershipSource({
+      ghApi: (path, options) => guard.runGhApi(path, { ...options, execFile: (_file, args, opts) => {
+        try { return execFileSync(bin, args, opts); } catch (error) { errors.push(error); throw error; }
+      } }),
     });
 
     it('kills a stalled gh child at the deadline and fails closed', async () => {
-      const bin = stubGh(30);
+      const { bin, marker } = stubGh(30);
+      const errors = [];
       const started = Date.now();
-      const decision = await guard.resolveHostRole({ thisHost: ME, source: syncSource(bin), timeoutMs: 300 });
+      const decision = await guard.resolveHostRole({ thisHost: ME, source: syncSource(bin, errors), timeoutMs: 300 });
       expect(Date.now() - started).toBeLessThan(5000);
+      // The stub really ran and was killed by its own timeout (not a fast spawn failure).
+      expect(statSync(marker).isFile()).toBe(true);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({ code: 'ETIMEDOUT' });
       expect(decision).toMatchObject({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
     });
 
