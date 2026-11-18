@@ -213,9 +213,17 @@ function parseWorkflowProtection(job, log, prNumber) {
   const tableWorkflowHold = !table.error && table.results.some(r => r.id === 'review-acceptance'
     && r.status === 'hold' && /^human-only: the diff at [0-9a-f]{9} touches \.github\/(?:workflows|actions)\//.test(r.reason));
   if ((!diagnostic || diagnostics.length !== 1) && !tableWorkflowHold) return null;
+  // Workflow protection excuses only its own failure. Check the whole job, including
+  // diagnostics before the table that parsePrResultTable does not inspect.
+  const mergeGateLines = lines.filter(l => l.startsWith('merge-gate:'));
   const summaries = lines.filter(l => /^merge-gate: (?:PASS|HOLD)/.test(l));
   const footer = `merge-gate: HOLD — workflow self-check failed — fail closed: ${diagnostic?.[1]}; `;
-  if (!tableWorkflowHold && (summaries.length !== 1 || !['held', 'all pass'].some(end => summaries[0] === footer + end))) return null;
+  if (tableWorkflowHold
+    ? mergeGateLines.length !== 1 || mergeGateLines[0] !== 'merge-gate: HOLD — held'
+    : mergeGateLines.length !== 2 || summaries.length !== 1
+      || !['held', 'all pass'].some(end => summaries[0] === footer + end)) {
+    return { error: 'unknown or ambiguous workflow-protection merge-gate diagnostic' };
+  }
   // The evaluator must be the sole failed step in the gate's own completed job.
   const steps = job.steps;
   if (job.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure'

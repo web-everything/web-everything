@@ -649,6 +649,23 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
     const { out } = probe(e => { e.log = e.log.split('\n').filter(l => !l.startsWith('merge-gate:')).concat('merge-gate: HOLD — held').join('\n'); });
     expect(out.statusCheckRollup[0].mergeGateReviewHold).toBeTruthy();
   });
+  it.each(['diagnostic HOLD', 'diagnostic PASS', 'table'])('keeps %s red without review ownership on an extra no-verdict diagnostic', path => {
+    for (const position of ['before', 'after']) {
+      const { out } = probe(e => {
+        if (path === 'table') {
+          e.log = e.log.split('\n').filter(l => !l.startsWith('merge-gate:'))
+            .concat('merge-gate: HOLD — held').join('\n');
+        } else if (path === 'diagnostic PASS') {
+          e.log = e.log.replace('#7106: HOLD', '#7106: PASS')
+            .replace(/  hold  review-acceptance  [^\n]+/, '  pass  review-acceptance  accepted')
+            .replace('; held', '; all pass');
+        }
+        const extra = 'merge-gate: no verdict — failing closed';
+        e.log = position === 'before' ? `${extra}\n${e.log}` : `${e.log}\n${extra}`;
+      });
+      expect(out.statusCheckRollup, `${path}: ${position}`).toEqual([workflowRow]);
+    }
+  });
   it.each([
     ['wrong head', e => { e.job.head_sha = 'b'.repeat(40); }],
     ['unreadable job', e => { e.job = null; }],
