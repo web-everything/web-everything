@@ -3580,7 +3580,7 @@ describe('#5135 fix range read wiring', () => {
     const calls = [];
     const exec = (file, args) => {
       calls.push(args);
-      return args[0] === 'rev-parse' ? head : '';
+      return args[0] === 'rev-parse' ? head : args[0] === 'merge-base' ? priorHead : '';
     };
     const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
       number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
@@ -3588,7 +3588,7 @@ describe('#5135 fix range read wiring', () => {
     }) });
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
-    expect(calls.filter(args => args.at(-1) === `${result.net.rev}^{commit}`)).toHaveLength(1);
+    expect(calls.filter(args => args[0] === 'rev-parse')).toEqual([['rev-parse', '--verify', '--end-of-options', 'origin/lane/x^{commit}']]);
     expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]);
   });
 });
@@ -3811,7 +3811,7 @@ describe('held item 177: readPr judges a stacked top against its stack base', ()
   const STACK_DIFF = 'diff --git a/own.mjs b/own.mjs\n--- a/own.mjs\n+++ b/own.mjs\n@@ -1 +1 @@\n-old\n+new\n';
   const view = () => ({ number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [], comments: [] });
   // The main-basis diff is whatever the git stub prints; empty here, so a stack read is distinguishable from it.
-  const exec = (_file, args) => (args[0] === 'rev-parse' ? HEAD : '');
+  const exec = (_file, args) => (args[0] === 'rev-parse' ? HEAD : args[0] === 'merge-base' ? 'e'.repeat(40) : '');
   const stack = (over = {}) => ({ pr: 4624, ref: 'lane/red-main-contain', head: 'c'.repeat(40), contained: 'd'.repeat(40), tree: TREE, topHead: HEAD, ...over });
   const read = (over = {}) => {
     const calls = { stack: [], text: [], files: [] };

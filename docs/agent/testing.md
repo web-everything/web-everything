@@ -4441,3 +4441,13 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Review diff identity races
+
+Review evidence must pin the head commit before merge-base and reuse that basis for
+text, paths and the recorded SHA. Disable Git replacement objects on every scoring
+read, including stack and fix-range diffs. A failed pin or merge-base stays unscored;
+the existing empty degraded-read refusal requires a resolvable checkout before review.
+`scripts/operations/__tests__/review-pr-io-pinned-head.test.mjs` uses real Git in a
+temporary repository, moves the tracking ref between merge-base and the first scoring
+diff, and covers replacement objects, missing commits and unrelated histories.

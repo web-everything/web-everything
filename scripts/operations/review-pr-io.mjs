@@ -343,11 +343,21 @@ export function readPr({
   // the default reads the open PRs and git in this checkout and fails open to null (the main basis, as before).
   // Inert under test unless injected: the default reads `gh` and the network.
   readStack = isUnderTest() ? () => null : ({ pr: n, cwd: dir }) => readStackBase({ pr: n, root: dir }),
-  stackRead = { files: stackNetFiles, text: stackNetDiffText },
+  stackRead = null,
 } = {}) {
   // The net-diff helpers take no `cwd`, so it is baked into the injected `exec` (the drain does the same thing
   // for the opposite reason — see the `escCwd` note in `we:scripts/merge-ai-prs.mjs`).
-  const gitExec = exec || execFileIn(cwd);
+  const run = exec || execFileIn(cwd);
+  const gitExec = (cmd, args, opts) => run(cmd, args, {
+    ...opts, env: { ...process.env, ...opts?.env, GIT_NO_REPLACE_OBJECTS: '1' },
+  });
+  const stackRun = (args, opts) => String(gitExec('git', args, {
+    encoding: 'utf8', timeout: 60e3, maxBuffer: 64 * 1024 * 1024, ...opts,
+  }));
+  const stackDiffRead = stackRead || {
+    files: o => stackNetFiles({ ...o, run: stackRun }),
+    text: o => stackNetDiffText({ ...o, run: stackRun }),
+  };
   if (!Number.isInteger(pr) || pr <= 0) throw new TypeError(`review-pr-io: \`pr\` must be a positive integer, got ${JSON.stringify(pr)}`);
   if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
     throw new TypeError(`review-pr-io: \`repo\` must be <owner/name>, got ${JSON.stringify(repo)}`);
@@ -403,15 +413,13 @@ export function readPr({
   // ONE basis, shared. `fetchExtraRefs` carries the head ref so a lane branch this clone has never seen still
   // resolves — and NOTHING here moves HEAD (#2336): it fetches tracking refs and diffs two trees in place.
   const basis = resolveNetDiffBasis({
-    exec: gitExec, rev: headRefName, fetchExtraRefs: headRefName ? [headRefName] : [],
+    exec: gitExec, rev: headRefName, fetchExtraRefs: headRefName ? [headRefName] : [], pinRev: true,
   });
   let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
-  // `computeNetDiffPaths` resolves its own basis (it takes no `basis` param); the fetch above has already put
-  // the head ref in this clone, so the second resolution is a local probe, not a second network round trip.
-  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [] });
+  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
 
   const priorRounds = priorRoundsFor(repo, pr);
-  const revSha = revParseCommit(gitExec, netPaths.rev);
+  const revSha = basis.ok ? basis.revSha : null;
 
   // Held item 177 — A STACKED TOP IS JUDGED AGAINST ITS STACK BASE. Only when the stack was detected on the SAME
   // head this clone diffed (`revSha`); any mismatch or failed read keeps the main basis (today's behaviour).
@@ -421,8 +429,8 @@ export function readPr({
     try { stack = readStack({ pr, repo, cwd }); } catch { stack = null; }
     if (stack && stack.topHead === revSha) {
       try {
-        const text = String(stackRead.text({ tree: stack.tree, topHead: revSha, root: cwd }));
-        const paths = stackRead.files({ tree: stack.tree, topHead: revSha, root: cwd });
+        const text = String(stackDiffRead.text({ tree: stack.tree, topHead: revSha, root: cwd }));
+        const paths = stackDiffRead.files({ tree: stack.tree, topHead: revSha, root: cwd });
         const fingerprint = fingerprintOf(text);
         if (Array.isArray(paths) && fingerprint) {
           netText = { text, base: stack.tree, rev: netText.rev ?? netPaths.rev, scored: true };
@@ -481,12 +489,7 @@ export function readPr({
     // same predicate in two places, which is the drift #2644 forbids.
     createdAt: typeof view.createdAt === 'string' ? view.createdAt : '',
     clearerId: currentActorId(),
-    // PIN THE REV. `computeNetDiffPaths` reports `rev` as the candidate it resolved — `origin/<headRefName>`,
-    // a MUTABLE ref — so the recorded basis stopped describing the judged diff as soon as the lane pushed
-    // again. Resolve it here, in the io shell, where the git call belongs; `shapeReadFinding` keeps both the
-    // commit and the ref. It is the SAME candidate the diff was taken from and not the PR's `headRefOid`:
-    // `headRefOid` is GitHub's view of the head, which can differ from the ref this clone actually diffed, and
-    // recording it would pin the basis to a tree that was never read.
+    // Identity comes from the single pin taken BEFORE the shared basis and all diffs.
     comments: view.comments,
     net: { ...netPaths, revSha },
     latestFix, deltaReview,

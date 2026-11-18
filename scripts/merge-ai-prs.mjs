@@ -4065,7 +4065,13 @@ function isExecContractError(err) {
  * about some other ref. What is provable is therefore narrower and true: one basis, one fetch, and a mismatched
  * basis is refused rather than answered.
  */
-export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [] } = {}) {
+// `pinRev` resolves a commit before merge-base and every probe, disables replace objects,
+// and refuses a failed fork point instead of using the legacy ancestry/base-tip fallback.
+export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], pinRev = false } = {}) {
+  if (pinRev && typeof exec === 'function') {
+    const run = exec;
+    exec = (cmd, args, opts) => run(cmd, args, { ...opts, env: { ...process.env, ...opts?.env, GIT_NO_REPLACE_OBJECTS: '1' } });
+  }
   // The identity of the REQUEST this basis answers. Rides both the ok and the failure shape so a shared basis
   // is checkable in every case — an `{ok:false}` basis for the wrong ref must not be reported as this ref's
   // own `'ref-unresolved'` either (that reads as "this branch is gone", which is a different fact).
@@ -4086,7 +4092,19 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
     /* a real fetch failure degrades to whatever is locally cached — the diff attempts below still run */
   }
   const candidates = [`${remote}/${rev}`, rev];
-  for (const candidate of candidates) {
+  for (let candidate of candidates) {
+    // Pin BEFORE merge-base or any scoring probe. Once a candidate resolves, never
+    // retry a mutable name if subsequent evidence fails.
+    if (pinRev) {
+      try {
+        candidate = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+        if (!/^[0-9a-f]{40,64}$/.test(candidate)) continue;
+      } catch (err) {
+        if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
+        continue;
+      }
+    }
     // #2404 — narrow the LEFT side of the diff to the provable fork point (`merge-base(baseRef, candidate)`)
     // when one exists, instead of diffing straight off the base tip: a head that's behind an advanced base
     // would otherwise have every upstream-only commit swept in as if the PR touched it. A merge-base lookup
@@ -4103,9 +4121,11 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // the next candidate, or a `null` resolve if both candidates hit it — always the safe over-scoring
       // fallback, never wrong data, but avoidable).
       const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      if (pinRev && !/^[0-9a-f]{40,64}$/i.test(mb)) return { ok: false, reason: 'diff-failed', requestedFor };
       if (mb) { diffBase = mb; basisKind = 'merge-base'; }
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
+      if (pinRev) return { ok: false, reason: 'diff-failed', requestedFor };
       /* no common history, or candidate doesn't resolve yet — the diff below is the real probe */
     }
     // The cumulative `<mergeBase>…head` diff is BOTH the human-gate basis AND the candidate-resolves probe.
@@ -4118,6 +4138,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       humanBasis = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
+      if (pinRev) return { ok: false, reason: 'diff-failed', requestedFor };
       continue; /* candidate doesn't resolve — try the next one */
     }
     // #3343 — the merge-base lookup fell through, so `humanBasis` above is the base-TIP diff: it reports every
@@ -4141,7 +4162,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       catch (err) { if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor }; }
       if (ancestry) { humanBasis = ancestry; basisKind = 'ancestry'; }
     }
-    return { ok: true, baseRef, diffBase, candidate, humanBasis, basisKind, basisNarrowed: basisKind !== 'base-tip', requestedFor };
+    return { ok: true, baseRef, diffBase, candidate, humanBasis, basisKind, basisNarrowed: basisKind !== 'base-tip', requestedFor, ...(pinRev ? { revSha: candidate } : {}) };
   }
   return { ok: false, reason: 'ref-unresolved', requestedFor };
 }
@@ -4349,10 +4370,12 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
  * @param {{exec:Function, remote?:string, base?:string, rev:string, fetchExtraRefs?:string[]}} opts
  * @returns {{paths:string[], base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'}}
  */
-export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [] } = {}) {
+// Accept the same request-checked basis as text, including a basis pinned before resolution.
+export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
   const unscored = { paths: [], base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
-  const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
+  if (sharedBasis && !basisAnswersRequest(sharedBasis, { remote, base, rev })) return { ...unscored, reason: 'basis-mismatch' };
+  const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {
