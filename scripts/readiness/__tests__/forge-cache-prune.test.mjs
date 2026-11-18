@@ -688,7 +688,7 @@ describe('readLiveEvidence', () => {
     {scenario: 'valid false selectors', evidence: {siblings: false, manifest: {siblings: false}}, resolved: true},
     {scenario: 'valid true selectors', evidence: {siblings: true, manifest: {siblings: true}}, resolved: true},
     {scenario: 'absent selectors', evidence: {}, resolved: true, receiptFallback: true},
-    {scenario: 'null manifest is no signal', evidence: {manifest: null}, resolved: true, receiptFallback: true},
+    {scenario: 'null manifest is invalid', evidence: {manifest: null}},
   ];
   it.each(selectorCases.flatMap(testCase => ['prepared', 'running', 'receipt'].flatMap(suffix =>
     (testCase.resolved || suffix === 'receipt' ? [true] : [false, true])
@@ -806,21 +806,35 @@ describe('readLiveEvidence', () => {
     expectDecision(plan(profiles, {live}), resolved ? profiles : [], resolved ? [] : profiles);
   });
 
-  it('protects the whole lock for an older digest-free siblings running record despite a newer known prepared profile', async () => {
+  it.each([
+    {scenario: 'digest-free siblings', evidence: {siblings: true}},
+    {scenario: 'digest-free siblingShas', evidence: {siblingShas: {frontierui: 'd'.repeat(40)}}},
+    ...['manifest', 'siblings', 'siblingShas', 'manifest.siblings', 'manifestDigest', 'inputDigest', 'lock']
+      .flatMap(field => [null, false, 0, '', [], {}].map(value => ({
+        scenario: `${field}=${JSON.stringify(value)}`,
+        evidence: field === 'manifest.siblings' ? {manifest: {siblings: value}} : {[field]: value},
+        refused: ['manifestDigest', 'inputDigest', 'lock'].includes(field),
+      }))),
+    {scenario: 'fieldless running', evidence: {}, fieldless: true},
+  ])('older $scenario running fails closed unless fieldless despite a newer known prepared profile', async ({evidence, refused = false, fieldless = false}) => {
     const run = await reserve();
     const runningPath = join(receipts, `${run}.running`);
     const preparedPath = join(receipts, `${run}.prepared`);
-    await json(runningPath, {lock, siblings: true});
+    await json(runningPath, evidence);
     await json(preparedPath, record(false));
     await fs.utimes(runningPath, (now - 2000) / 1000, (now - 2000) / 1000);
     await fs.utimes(preparedPath, (now - 1000) / 1000, (now - 1000) / 1000);
 
     const live = await readLiveEvidence({receipts, now});
-    expect(live.complete).toBe(true);
-    expect(live.profiles).toEqual(new Set([`${lock}/dev-v5-${hex('b')}`]));
-    expect(live.locks).toEqual(new Set([lock]));
+    expect(live.complete).toBe(!refused);
+    if (refused) {
+      expect(live.refused).toMatch(/Invalid reserved (profile|lock) evidence/);
+    } else {
+      expect(live.profiles).toEqual(new Set([`${lock}/dev-v5-${hex('b')}`]));
+      expect(live.locks).toEqual(new Set(fieldless ? [] : [lock]));
+    }
     const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
-    expectDecision(plan(profiles, {live}), [], profiles);
+    expectDecision(plan(profiles, {live}), fieldless ? profiles.slice(1) : [], fieldless ? profiles.slice(0, 1) : profiles);
   });
 
   it('protects the whole lock for an older manifest-only receipt despite a newer known running profile', async () => {

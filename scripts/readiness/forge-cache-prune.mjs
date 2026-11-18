@@ -253,8 +253,8 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
             throw new Error('Invalid reserved profile evidence');
           }
         }
-        const manifestPresent = record.manifest !== undefined && record.manifest !== null;
-        const manifestKnown = manifestPresent && typeof record.manifest === 'object'
+        const manifestPresent = record.manifest !== undefined;
+        const manifestKnown = manifestPresent && record.manifest !== null && typeof record.manifest === 'object'
           && Object.getPrototypeOf(record.manifest) === Object.prototype;
         // A final receipt has no manifest: its siblingShas say which digest names the profile.
         // The writer omits this field without siblings and otherwise emits a nonempty SHA map.
@@ -272,7 +272,7 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         // Explicit signals must agree before any digest can narrow lock protection.
         // An omitted receipt siblingShas is only the fallback, not a contrary signal.
         const siblingSignals = [];
-        if (manifestKnown) siblingSignals.push(!!record.manifest.siblings);
+        if (manifestKnown) siblingSignals.push(record.manifest.siblings === true);
         if (typeof record.siblings === 'boolean') siblingSignals.push(record.siblings);
         if (suffix === 'receipt' && record.siblingShas !== undefined && !invalidSiblingShas) siblingSignals.push(true);
         const conflictingSiblings = siblingSignals.some(signal => signal !== siblingSignals[0]);
@@ -285,8 +285,7 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         if (!leaked && profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
         // Evidence asserting a profile must resolve even when a newer record is known.
         if (invalidSelector || (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined
-          || typeof record.siblings === 'boolean' || manifestKnown
-          || (suffix === 'receipt' && record.siblingShas !== undefined)))) {
+          || record.siblings !== undefined || manifestPresent || record.siblingShas !== undefined))) {
           unresolvedProfile = true;
         }
         // The newest record decides: an older known profile must not mask a later unknown one.
