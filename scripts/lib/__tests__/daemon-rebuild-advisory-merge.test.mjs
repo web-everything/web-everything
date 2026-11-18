@@ -135,19 +135,85 @@ describe('advisory merge contract', () => {
 });
 
 describe('testing ledger union', () => {
+
+  it.each([
+    ['backtick fence', '```\n'], ['tilde fence', '~~~\n'],
+    ['comment opener', '<!--\n'], ['comment closer', '-->\n'],
+    ['heading', '# Disabled\n'], ['HTML tag', '<script>\n'],
+    ['delimiter', '---\n'], ['indented code', '    - code\n'], ['tab code', '\t- code\n'],
+    ['prose', 'unrestricted prose\n'], ['unterminated row', '- incomplete'], ['inline fence', '- ```\n'],
+    ['inline comment', '- <!-- hidden\n'], ['list heading', '- # Disabled\n'],
+    ['list HTML', '- <div>\n'], ['table delimiter', '| --- | --- |\n'],
+  ])('refuses a testing ledger insertion containing %s', async (_, insertion) => {
+    const { resolveAdvisoryConflicts, resolveAdvisoryInWorktree } = await advisory();
+    const base = '# Tests\n- existing\n';
+    const f = fixture({ testing: [base, base + insertion, base + '- theirs\n'] });
+    assertConflict(f, [TIMINGS, TESTING]);
+    expect(resolveAdvisoryConflicts(f)).toBeNull();
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+  });
+
+  it.each([
+    ['inside a backtick fence', '# Tests\n```md\n', '- example\n```\n'],
+    ['inside a tilde fence', '# Tests\n~~~md\n', '- example\n~~~\n'],
+    ['before a fence', '# Tests\n- existing\n', '```md\nexample\n```\n'],
+    ['after a fence', '# Tests\n```md\nexample\n```\n', ''],
+    ['inside a comment', '# Tests\n<!--\n', '- hidden\n-->\n'],
+    ['before a comment', '# Tests\n- existing\n', '<!--\nhidden\n-->\n'],
+    ['after a comment', '# Tests\n<!-- hidden -->\n', ''],
+    ['after an unclosed fence', '# Tests\n```md\n- example\n', ''],
+    ['after an unclosed comment', '# Tests\n<!--\n- example\n', ''],
+    ['inside indented code', '# Tests\n\n    example\n', '    continuation\n'],
+    ['outside a matching list block', '# Tests\n- existing\n\nprose\n', '\nmore prose\n'],
+    ['before a list block', '# Tests\n', '- existing\n'],
+    ['list next to a table', '# Tests\n| existing |\n', '\nprose\n'],
+  ])('refuses list insertions %s', async (_, before, after) => {
+    const { resolveAdvisoryConflicts } = await advisory();
+    const f = fixture({ testing: [before + after, before + '- ours\n' + after, before + '- theirs\n' + after] });
+    assertConflict(f, [TIMINGS, TESTING]);
+    expect(resolveAdvisoryConflicts(f)).toBeNull();
+  });
+
+  it.each([
+    ['list append', '# Tests\n', '', '- '],
+    ['star append', '# Tests\n', '', '* '],
+    ['numbered append', '# Tests\n', '', '1. '],
+    ['table append', '# Tests\n', '', '| '],
+    ['table header append', '# Tests\n| Header |\n| --- |\n', '', '| '],
+    ['after a separated fence', '# Tests\n```md\nexample\n```\n\n', '', '- '],
+    ['after a separated comment', '# Tests\n<!-- hidden -->\n\n', '', '- '],
+    ['list block end', '# Tests\n- existing\n', '\nprose\n', '- '],
+    ['list block gap', '# Tests\n- existing\n', '- next\n\nprose\n', '- '],
+    ['table block end', '# Tests\n| existing |\n', '\nprose\n', '| '],
+    ['table block gap', '# Tests\n| existing |\n', '| next |\n\nprose\n', '| '],
+    ['append after trailing blanks', '# Tests\n\n', '', '- '],
+  ])('unions ordinary %s', async (_, before, after, prefix) => {
+    const { resolveAdvisoryConflicts, resolveAdvisoryInWorktree } = await advisory();
+    const ours = `${prefix}ours${prefix === '| ' ? ' |' : ''}\n`;
+    const theirs = `${prefix}theirs${prefix === '| ' ? ' |' : ''}\n`;
+    const f = fixture({ testing: [before + after, before + ours + after, before + theirs + after] });
+    assertConflict(f, [TIMINGS, TESTING]);
+    const result = resolveAdvisoryConflicts(f);
+    expect(result).not.toBeNull();
+    expect(f.git(['show', `${result.tree}:${TESTING}`]).stdout).toBe(before + ours + theirs + after);
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(true);
+    expect(readFileSync(join(f.root, TESTING), 'utf8')).toBe(before + ours + theirs + after);
+  });
   it.each(['object database', 'worktree'])('unions append-only notes and deduplicates common additions in the %s', async mode => {
     const { resolveAdvisoryConflicts, resolveAdvisoryInWorktree } = await advisory();
-    const f = fixture({ indexConflict: true, testing: ['# Tests\n', '# Tests\nours\nshared\n', '# Tests\ntheirs\nshared\n'] });
+    const f = fixture({ indexConflict: true, testing: ['# Tests\n', '# Tests\n- ours\n- shared\n', '# Tests\n- theirs\n- shared\n'] });
     assertConflict(f, [TIMINGS, INDEX, TESTING]);
     if (mode === 'worktree') {
       expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
       expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(true);
-      expect(readFileSync(join(f.root, TESTING), 'utf8')).toBe('# Tests\nours\nshared\ntheirs\n');
+      expect(readFileSync(join(f.root, TESTING), 'utf8')).toBe('# Tests\n- ours\n- shared\n- theirs\n');
     } else {
       const before = snapshot(f);
       const result = resolveAdvisoryConflicts(f);
       assertTree(f, result);
-      expect(f.git(['show', `${result.tree}:${TESTING}`]).stdout).toBe('# Tests\nours\nshared\ntheirs\n');
+      expect(f.git(['show', `${result.tree}:${TESTING}`]).stdout).toBe('# Tests\n- ours\n- shared\n- theirs\n');
       expect(snapshot(f)).toEqual(before);
     }
   });
@@ -156,7 +222,7 @@ describe('testing ledger union', () => {
     ['edit', '# Changed\nours\n'], ['deletion', 'ours\n'], ['conflict markers', '# Tests\n<<<<<<< ours\n'],
   ])('refuses a testing ledger %s', async (_, ours) => {
     const { resolveAdvisoryConflicts, resolveAdvisoryInWorktree } = await advisory();
-    const f = fixture({ testing: ['# Tests\n', ours, '# Tests\ntheirs\n'] });
+    const f = fixture({ testing: ['# Tests\n', ours, '# Tests\n- theirs\n'] });
     assertConflict(f, [TIMINGS, TESTING]);
     expect(resolveAdvisoryConflicts(f)).toBeNull();
     expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
@@ -165,7 +231,7 @@ describe('testing ledger union', () => {
 
   it('still refuses another conflicting file alongside additive testing notes', async () => {
     const { resolveAdvisoryConflicts } = await advisory();
-    const f = fixture({ codeConflict: true, testing: ['# Tests\n', '# Tests\nours\n', '# Tests\ntheirs\n'] });
+    const f = fixture({ codeConflict: true, testing: ['# Tests\n', '# Tests\n- ours\n', '# Tests\n- theirs\n'] });
     assertConflict(f, [TIMINGS, TESTING, 'a.mjs']);
     expect(resolveAdvisoryConflicts(f)).toBeNull();
   });

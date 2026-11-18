@@ -252,7 +252,7 @@ export async function previewOverlayConflict({
 
     const candSha = fetched.goneRefs.includes(ref) ? null : verifyRev(scratchGit, `origin/${ref}^{commit}`);
     if (!candSha) return { ok: false, reason: 'ref-unresolved' };
-    const superseded = supersededOverlays(scratchGit, existingOverlays, mainSha, candSha);
+    const superseded = supersededOverlays(scratchGit, existingOverlays, mainSha, candSha, { historyGit: rootGit, headSha: head });
     existingOverlays = existingOverlays.filter(o => !superseded.some(s => s.entry.ref === o.ref));
 
     // 1. Fold every ALREADY-registered overlay using the running HEAD — the SAME `planRebuild` a real rebuild runs —

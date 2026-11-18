@@ -33,21 +33,76 @@ export function mergeTimingsJson(baseText, oursText, theirsText) {
   } catch { return null; }
 }
 
+const textLines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
+
+/** Only unindented data rows are unambiguous here; nested/continuation Markdown needs human resolution. */
+function markdownRow(line) {
+  const text = line.replace(/\r?\n$/, '');
+  if (/[\x00-\x1f\x7f]/.test(text) || /```|~~~|<!--|-->|<\s*[!/?a-z]/i.test(text)) return null;
+  const item = text.match(/^(?:- |\* |\d+\. )(.+)$/);
+  if (item) return /^(?:\s|#|---(?:\s|$)|>)/.test(item[1]) ? null : 'list';
+  if (!/^\|.+/.test(text)) return null;
+  const cells = text.replace(/^\||\|$/g, '').split('|').map(cell => cell.trim());
+  return cells.every(cell => /^:?-+:?$/.test(cell)) ? null : 'table';
+}
+
+/** Mark both neighbouring gaps of protected base lines, including opening/closing delimiters.
+ * Ambiguous or unbalanced base syntax refuses the union rather than guessing at Markdown semantics.
+ */
+function markdownContext(lines) {
+  const unsafe = Array(lines.length + 1).fill(false);
+  const delimiters = [];
+  let fence = null, comment = false;
+  for (const [i, line] of lines.entries()) {
+    let protectedLine = !!fence || comment || /^(?: {4}|\t)/.test(line);
+    if (fence) {
+      const close = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) {
+        delimiters.push(close[1]);
+        fence = null;
+      }
+    } else if (!comment && /^ {0,3}(?:`{3,}|~{3,})/.test(line)) {
+      fence = line.match(/^ {0,3}(`{3,}|~{3,})/)[1];
+      delimiters.push(fence);
+      protectedLine = true;
+    } else {
+      // A fence in an unsupported container (list, quote, etc.) is unclear; fail closed.
+      if (/```|~~~/.test(line)) return null;
+      for (const token of line.match(/<!--|-->/g) ?? []) {
+        if ((token === '<!--') === comment) return null;
+        comment = token === '<!--';
+        delimiters.push(token);
+        protectedLine = true;
+      }
+    }
+    if (protectedLine) unsafe[i] = unsafe[i + 1] = true;
+  }
+  return fence || comment ? null : { unsafe, delimiters: delimiters.join('\n') };
+}
+
 // Preserve every base line; match identical cross-side additions one-for-one at each base gap.
 // A non-additive edit is outside this registry contract; leave it for operator resolution.
 function mergeRegistryLines(baseText, oursText, theirsText, markdown = false) {
-  const lines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
-  const base = lines(baseText), gaps = base.map(() => []);
+  const base = textLines(baseText), gaps = base.map(() => []);
   const headerEnd = base.findIndex(line => line.includes('*/'));
   if (!markdown && (base[0] !== '/**\n' || headerEnd < 1 || ![' */\n', ' */'].includes(base[headerEnd]))) return null;
+  const context = markdown ? markdownContext(base) : null;
+  if (markdown && !context) return null;
+  const lastContent = base.findLastIndex(line => line.trim());
   gaps.push([]);
   const added = gaps.map(() => new Map());
   for (const [side, text] of [oursText, theirsText].entries()) {
     let cursor = 0;
-    for (const line of lines(text)) {
+    for (const line of textLines(text)) {
       if (cursor < base.length && line === base[cursor]) cursor++;
       else {
         if (!markdown && (cursor === 0 || cursor > headerEnd || !/^ \* /.test(line) || line.includes('/*') || line.includes('*/'))) return null;
+        if (markdown) {
+          const kind = markdownRow(line);
+          const previous = cursor > 0 && (/^\|/.test(base[cursor - 1]) ? 'table' : markdownRow(base[cursor - 1]));
+          if (!kind || !line.endsWith('\n') || context.unsafe[cursor]
+            || (cursor <= lastContent && previous !== kind)) return null;
+        }
         const count = added[cursor].get(line) || 0;
         if (side === 1 && count > 0) added[cursor].set(line, count - 1);
         else {
@@ -59,6 +114,7 @@ function mergeRegistryLines(baseText, oursText, theirsText, markdown = false) {
     if (cursor !== base.length) return null;
   }
   const merged = gaps.map((gap, i) => gap.join('') + (base[i] || '')).join('');
+  if (markdown && markdownContext(textLines(merged))?.delimiters !== context.delimiters) return null;
   return /^(?:<{7}|={7}|>{7}|\|{7})/m.test(merged) ? null : merged;
 }
 

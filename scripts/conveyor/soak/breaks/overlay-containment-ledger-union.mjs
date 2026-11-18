@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { withBareOrigin } from '../../../operations/__tests__/helpers/real-repo.mjs';
 import { addOverlay, readOverlays, cloneKey } from '../../../lib/daemon-overlays.mjs';
 import { resolveAdvisoryConflicts } from '../../../lib/daemon-rebuild/advisory-merge.mjs';
+import { supersededOverlays } from '../../../lib/daemon-rebuild/plan.mjs';
+import { REBUILD_IDENTITY_ENV } from '../../../lib/daemon-rebuild/shared.mjs';
 
 const SOURCE = 'scripts/lib/daemon-rebuild/plan.mjs';
 const CLI = fileURLToPath(new URL('../../../daemon-overlay.mjs', import.meta.url));
@@ -13,7 +15,7 @@ const TESTING = 'docs/agent/testing.md';
 const TIMINGS = 'scripts/ci/test-timings.json';
 const INDEX = 'scripts/conveyor/soak/breaks/index.mjs';
 const ledgers = name => ({
-  [TESTING]: `# Tests\n${name ? `${name}\nshared\n` : ''}`,
+  [TESTING]: `# Tests\n${name ? `- ${name}\n- shared\n` : ''}`,
   [TIMINGS]: JSON.stringify({ unit: name ? { [name]: 1 } : {}, soak: {} }) + '\n',
   [INDEX]: `/**\n * Registry.\n${name ? ` * ${name}\n` : ''} */\nexport const breaks = [];\n`,
 });
@@ -57,6 +59,23 @@ export default {
       const git = (args, opts = {}) => spawnSync('git', args, { ...opts, cwd: f.origin,
         env: { ...env, ...opts.env }, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
       if (resolveAdvisoryConflicts({ git, cur: sha('lane/old'), ovSha: sha('lane/destructive') }) !== null) problems.push('non-additive testing edit resolved');
+      for (const [name, line] of [['fence', '```'], ['comment', '<!--'], ['heading', '# Disabled']]) {
+        f.seedOriginBranch(`lane/${name}`, { [TESTING]: `# Tests\n${line}\n` });
+        if (resolveAdvisoryConflicts({ git, cur: sha('lane/old'), ovSha: sha(`lane/${name}`) }) !== null) problems.push(`unsafe ${name} insertion resolved`);
+      }
+
+      // The old head was actually adopted before its registration was force-pushed.
+      f.git(['fetch', 'origin']);
+      const old = sha('lane/old');
+      const build = f.git(['commit-tree', `${old}^{tree}`, '-p', sha('main'), '-p', old,
+        '-m', 'daemon-rebuild: merge overlay lane/old onto main'], { env: { ...env, ...REBUILD_IDENTITY_ENV } }).trim();
+      f.git(['update-ref', 'HEAD', build]);
+      f.seedOriginBranch('lane/old', { 'rewritten.txt': 'rewritten\n' });
+      f.seedOriginBranch('lane/new', { 'new.txt': 'superset of current tip only\n' }, 'lane/old');
+      f.git(['fetch', 'origin']);
+      const cloneGit = args => spawnSync('git', args, { cwd: f.clone, env,
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
+      if (supersededOverlays(cloneGit, [{ ref: 'lane/old' }], sha('main'), sha('lane/new')).length) problems.push('force-pushed registration lost its adopted head');
     });
     return { problems };
   },
