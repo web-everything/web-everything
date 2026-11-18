@@ -6,7 +6,7 @@ import ts from 'typescript';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRecoveryWitness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
-import { redTeamOwedDecision, RED_TEAM_HOLDS, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS, RED_TEAM_CLEARANCE_INPUTS } from '../review-red-team-policy.mjs';
+import { redTeamOwedDecision, RED_TEAM_HOLDS, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS, RED_TEAM_CLEARANCE_INPUTS, RED_TEAM_BREAK_INPUTS } from '../review-red-team-policy.mjs';
 import { redTeamAdmissionHold } from '../drain-queue-safety.mjs';
 import { failedRedTeamRetry } from '../red-team-run-result.mjs';
 import { reviewedRead, completedSeat, completedComment, exemptInput } from './fixtures/red-team-owed.mjs';
@@ -106,14 +106,14 @@ it.each(['queued', 'running', 'unknown'])('a recorded failed execution remains d
 
 const exemptionKeys = [
   'head', 'read.netBasis.rev', 'read.diffScored', 'read.diffText', 'read.netChangedFiles', 'read.netRenameSources',
-  'seats', 'ok', 'result', 'carry', 'carryConflict', 'hasBreak', 'pendingPublish',
+  'seats', 'ok', 'result', 'carry', 'carryConflict', 'hasBreak', 'blocked', 'storedVerdict', 'pendingPublish',
   'scheduling.skipCardOnly', 'scheduling.settingsReadable', 'scheduling.commentsReadable', 'scheduling.sealClear',
   'scheduling.execution', 'scheduling.recorded', 'scheduling.inFlight', 'scheduling.queued', 'scheduling.scheduled',
 ];
 it.each(exemptionKeys)('exemption requires explicit positive input: %s (omitted, null, object, wrong scalar)', key => {
   const baseline = exemptInput('a'.repeat(40));
   expect(redTeamOwedDecision(baseline)).toEqual({ owed: false, cleared: true, reasons: [] });
-  for (const value of [undefined, ...(key === 'result' || key === 'carry' ? [false] : [null]), {}, 7]) {
+  for (const value of [undefined, ...(key === 'result' || key === 'carry' || key === 'storedVerdict' ? [false] : [null]), {}, 7]) {
     const input = structuredClone(baseline), parts = key.split('.'), leaf = parts.pop();
     const parent = parts.reduce((node, part) => node[part], input);
     if (value === undefined) delete parent[leaf]; else parent[leaf] = value;
@@ -228,10 +228,26 @@ function assertStructure(source) {
   expect(source['drain-queue-safety.mjs']).not.toContain('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE');
   expect(source['drain-red-team-input.mjs']).toContain('!configuredRead ||');
   expect(source['drain-red-team-input.mjs']).toContain('path === operatorPreferencesPath(env)');
+  const breakTable = all(policy, n => ts.isVariableDeclaration(n) && n.name?.getText() === 'RED_TEAM_BREAK_INPUTS');
+  expect(breakTable).toHaveLength(1);
+  const breakProperties = breakTable[0].initializer.arguments[0].properties;
+  expect(breakProperties.map(property => property.name.text)).toEqual(['blocked', 'storedVerdict']);
+  for (const property of breakProperties) expect(property.initializer.getText()).toBe(RED_TEAM_BREAK_INPUTS[property.name.text].toString());
+  expect(policy.text).toContain('Object.values(RED_TEAM_BREAK_INPUTS).some(proven => proven(input))');
+  expect(policy.text).toContain('if (recordedBreak && !completedPass && !carried && !hasBreak) reasons.unshift(RED_TEAM_HOLDS.break)');
+  expect(source['drain-red-team-input.mjs']).toContain('hasBreak, blocked, storedVerdict, breakResolved, pendingPublish');
+  expect(source['drain-red-team-input.mjs']).toContain("status.result?.foldedVerdict ?? null");
+  expect(source['drain-red-team-input.mjs']).toContain("=== 'red-team:blocked'");
+  const inputLeaf = parse('drain-red-team-input.mjs', source['drain-red-team-input.mjs']);
+  const resolution = all(inputLeaf, n => ts.isVariableDeclaration(n) && n.name?.getText() === 'breakResolved');
+  expect(resolution).toHaveLength(1);
+  expect(resolution[0].initializer.getText()).not.toMatch(/storedVerdict|accept|status/);
+  expect(resolution[0].initializer.getText()).toContain('!hasBreak && releases.length > 0');
   const labels = parse('red-team-status-labels.mjs', source['red-team-status-labels.mjs']);
   const planner = all(labels, n => ts.isFunctionDeclaration(n) && n.name?.text === 'planRedTeamStatusLabels');
   expect(planner).toHaveLength(1);
   expect(calls(planner[0], 'redTeamOwedDecision')).toHaveLength(1);
+  expect(calls(planner[0], 'readDrainRedTeamEvidence')[0].arguments[0].properties.map(property => property.name?.getText())).toContain('labels');
   const labelDecision = all(planner[0], n => ts.isVariableDeclaration(n) && n.name.getText() === 'decision');
   expect(labelDecision).toHaveLength(1);
   expect(labelDecision[0].initializer.getText()).toBe('redTeamOwedDecision(decisionInput)');
@@ -291,6 +307,14 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
+  ['stored acceptance resolution shortcut restored', 'drain-red-team-input.mjs', text => text.replace(
+    'const breakResolved = !hasBreak && releases.length > 0',
+    "const breakResolved = (status?.head === head && storedVerdict === 'accept') || !hasBreak && releases.length > 0")],
+  ['blocked label input removed', 'red-team-status-labels.mjs', text => text.replace('comments, labels, standingRuling', 'comments, standingRuling')],
+  ['stored verdict normalization removed', 'drain-red-team-input.mjs', text => text.replace('status.result?.foldedVerdict ?? null', 'null')],
+  ['blocked normalization removed', 'drain-red-team-input.mjs', text => text.replace("=== 'red-team:blocked'", "=== 'unused'")],
+  ['recorded break table bypassed', 'review-red-team-policy.mjs', text => text.replace('Object.values(RED_TEAM_BREAK_INPUTS).some(proven => proven(input))', 'false')],
+  ['recorded break hold removed', 'review-red-team-policy.mjs', text => text.replace('reasons.unshift(RED_TEAM_HOLDS.break)', "reasons.unshift(RED_TEAM_HOLDS['pass-owed'])")],
   ['configured preferences proof removed', 'drain-red-team-input.mjs', text => text.replace('!configuredRead || ', '')],
   ['label decision deleted', 'red-team-status-labels.mjs', text => text.replace('redTeamOwedDecision(decisionInput)', '({ cleared: true, reasons: [] })')],
   ['label decision conditionally bypassed', 'red-team-status-labels.mjs', text => text.replace('const decision = redTeamOwedDecision', 'const decision = comments.length ? { cleared: true, reasons: [] } : redTeamOwedDecision')],

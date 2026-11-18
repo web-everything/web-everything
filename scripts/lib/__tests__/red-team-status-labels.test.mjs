@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { reviewedRead, idleEvidence, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
+import { redTeamOwedDecision, RED_TEAM_HOLDS } from '../review-red-team-policy.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
@@ -17,6 +18,45 @@ it('canonical audit: a trusted marker-only comment with recorded in-flight execu
   const plan = planRedTeamStatusLabels({ ...input, labels: ['red-team:blocked', 'red-team:clear'], comments: [result()],
     evidence: { ...idleEvidence(), recorded: true, inFlight: true, loopPayload: { findings: { read: reviewedRead(head) } } } });
   expect(plan).toEqual({ add: null, remove: ['red-team:clear'] });
+});
+it('canonical audit: scored card-only exemption cannot resolve an existing confirmed block', () => {
+  const evidence = { ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(head, ['backlog/123-card.md']) } } };
+  const normalized = readDrainRedTeamEvidence({ ...input, comments: [], labels: ['red-team:blocked'], evidence }).decisionInput;
+  expect(redTeamOwedDecision(normalized)).toMatchObject({ owed: true, cleared: false });
+  expect(redTeamOwedDecision(normalized).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+  expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:blocked'], comments: [], evidence })).toEqual({ add: null, remove: [] });
+});
+it('canonical audit: finished stored changes without a published result yields a blocking break', () => {
+  const evidence = { ...idleEvidence(), status: { head, status: 'finished', result: { foldedVerdict: 'changes' } } };
+  const normalized = readDrainRedTeamEvidence({ ...input, comments: [], evidence }).decisionInput;
+  expect(redTeamOwedDecision(normalized).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+  expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence }))
+    .toEqual({ add: 'red-team:blocked', remove: ['red-team:pending'] });
+});
+it.each(['missing seats', 'unscored read', 'missing result'])(
+  'pre-review: head-matching stored acceptance with %s preserves the normalized break and blocked label', incomplete => {
+    const evidence = { ...proof(), status: { head, status: 'finished', result: { foldedVerdict: 'accept' } } };
+    const comments = incomplete === 'missing result' ? [] : [completedComment(42, head)];
+    if (incomplete === 'missing seats') evidence.seats = [];
+    if (incomplete === 'unscored read') evidence.loopPayload.findings.read.diffScored = false;
+    const options = { ...input, labels: ['red-team:blocked'], comments, evidence };
+    const normalized = readDrainRedTeamEvidence(options).decisionInput;
+    expect(normalized).toMatchObject({ blocked: true, storedVerdict: 'accept', breakResolved: false });
+    expect(redTeamOwedDecision(normalized)).toMatchObject({ owed: true, cleared: false });
+    expect(redTeamOwedDecision(normalized).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+    expect(planRedTeamStatusLabels(options)).toEqual({ add: null, remove: [] });
+  });
+it('stored acceptance resolves a blocked label only through a completed head-bound pass', () => {
+  const evidence = { ...proof(), status: { head, status: 'finished', result: { foldedVerdict: 'accept' } } };
+  const options = { ...input, labels: ['red-team:blocked'], comments: [completedComment(42, head)], evidence };
+  const normalized = readDrainRedTeamEvidence(options).decisionInput;
+  expect(normalized.breakResolved).toBe(false); // The stored verdict itself grants no resolution.
+  expect(redTeamOwedDecision(normalized)).toMatchObject({ owed: true, cleared: true });
+  expect(planRedTeamStatusLabels(options)).toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
+});
+it('a completed result with valid seats explicitly resolves an existing blocked label', () => {
+  expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:blocked'], comments: [completedComment(42, head)], evidence: proof() }))
+    .toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
 });
 describe('head-bound red-team operator labels', () => {
   it('shows scheduled/in-flight as pending and provisions through the label provider', () => {
@@ -83,13 +123,13 @@ it('a pending label with no result and nothing owed is kept, never planned for r
 
 describe('finished stored results without a marker', () => {
   it.each([
-    ['changes', 1, 'red-team:pending'], ['accept', 0, 'red-team:pending'],
-    ['changes', 0, 'red-team:pending'], ['changes', undefined, 'red-team:pending'],
+    ['changes', 1, 'red-team:blocked'], ['accept', 0, 'red-team:pending'],
+    ['changes', 0, 'red-team:blocked'], ['changes', undefined, 'red-team:blocked'],
     ['accept', 3, 'red-team:pending'],
   ])('stored %s with %s confirmed remains %s without completed proof', (foldedVerdict, confirmedMissCount, desired) => {
     expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [],
       evidence: { scheduled: true, status: { status: 'finished', result: { foldedVerdict, confirmedMissCount } } } }))
-      .toEqual({ add: null, remove: [] });
+      .toEqual(desired === 'red-team:blocked' ? { add: desired, remove: ['red-team:pending'] } : { add: null, remove: [] });
   });
   it('keeps existing scheduling behavior for a finished result without a verdict', () => {
     expect(planRedTeamStatusLabels({ ...input, comments: [], evidence: { scheduled: true, status: { status: 'finished', result: {} } } }).add).toBe('red-team:pending');
@@ -116,7 +156,7 @@ it('the real drain evidence reader exposes the finished status and its full resu
       runsDir: env.WE_SHARED_RUNS_DIR, list: () => [], readScorecards: () => [] });
     expect(evidence.status).toMatchObject({ repo: input.repo, pr: input.pr, head, status: 'finished', result: storedResult });
     expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence }))
-      .toEqual({ add: null, remove: [] });
+      .toEqual({ add: 'red-team:blocked', remove: ['red-team:pending'] });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -139,7 +179,7 @@ describe('stale pending on a card-only current head', () => {
     expect(plan(card, { inFlight: true }).remove).toEqual([]);
     expect(plan(card, { carryConflict: { reason: 'conflicting carry' } }).remove).toEqual([]);
     expect(plan(card, { status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }).remove).toEqual([]);
-    expect(plan(card, { status: { status: 'finished', result: { foldedVerdict: 'changes' } } }).add).toBeNull();
+    expect(plan(card, { status: { status: 'finished', result: { foldedVerdict: 'changes' } } }).add).toBe('red-team:blocked');
     expect(plan(card, { skipCardOnly: undefined }).remove).toEqual([]);
     for (const status of [undefined, { status: 'finished', result: {} }, { status: 'finished' }, { status: 'finished', result: { status: 'skipped' } }]) expect(plan(card, { status }).remove).toEqual([]);
     expect(plan([' backlog/123-card.md '], {}).remove).toEqual([]);
@@ -183,8 +223,8 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
   it('removes red-team:pending when the head is proven card-only and nothing is owed', () => {
     expect(plan(['red-team:pending'], { loopPayload: card })).toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
   });
-  it('a proven exemption replaces a stale blocked label through the decision', () => {
-    expect(plan(['red-team:blocked'], { loopPayload: card })).toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
+  it('never removes red-team:blocked on a card-only head', () => {
+    expect(plan(['red-team:blocked'], { loopPayload: card })).toEqual({ add: null, remove: [] });
   });
   it.each([['inFlight'], ['recorded']])('keeps pending while a pass is %s', key => {
     expect(plan(['red-team:pending'], { loopPayload: card, [key]: true })).toEqual({ add: null, remove: [] });

@@ -100,6 +100,16 @@ describe('redTeamOwedDecision', () => {
       expect(redTeamOwedDecision({ ...input, carry: { fromRev, proof } }).reasons).toContainEqual(RED_TEAM_HOLDS['carry-conflict']);
     }
   });
+  it.each([{ blocked: true }, { storedVerdict: 'changes' }])('recorded break %j survives exemption and incomplete proof; a completed pass resolves it', recorded => {
+    const card = { ...exemptInput(head), ...recorded };
+    expect(redTeamOwedDecision(card).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+    expect(redTeamOwedDecision({ ...pass(), ...recorded })).toMatchObject({ owed: true, cleared: true });
+    expect(redTeamOwedDecision({ ...pass(), ...recorded, seats: [] }).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+    expect(redTeamOwedDecision({ ...pass(), ...recorded, hasBreak: true }).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+    expect(redTeamOwedDecision({ ...card, breakResolved: true })).toMatchObject({ owed: false, cleared: true });
+    const stillOwed = redTeamOwedDecision({ ...pass(), ...recorded, result: null, breakResolved: true });
+    expect(stillOwed.cleared).toBe(false); // Resolution never pays execution debt.
+  });
   it('uses fixed hold kinds with only pending-publish non-blocking; cleared is exactly absence of holds', () => {
     expect(Object.values(RED_TEAM_HOLDS).filter(h => !h.blocking).map(h => h.kind).sort()).toEqual(['pending-publish']);
     for (const input of [pass(), {}, { ...pass(), ok: false, reason: 'scan-capped' },

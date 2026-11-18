@@ -11,7 +11,7 @@ export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 
 /** Every label transition derives from the same normalized evidence decision as admission. */
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
-  const { decisionInput } = readDrainRedTeamEvidence({ repo, pr, head, env, comments, standingRuling, evidence, settingsPath });
+  const { decisionInput } = readDrainRedTeamEvidence({ repo, pr, head, env, comments, labels, standingRuling, evidence, settingsPath });
   // A failed head recheck or contradictory live files invalidate stored card-only proof.
   if (redTeamCardOnly(decisionInput.read) && (!headVerified || (headFiles !== null
     && (!Array.isArray(headFiles) || !headFiles.length || !isCardOnlyDiff(headFiles))))) decisionInput.ok = false;

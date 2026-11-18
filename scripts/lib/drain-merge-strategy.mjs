@@ -340,7 +340,7 @@ export function createDrainMergeStrategy({
       const comments = pages.flat();
       const standingRuling = grantScopeFor(c, head, comments);
       evidence = settleUnknownEvidenceByComment(evidence, comments, c.num, head, live.reviews);
-      const hold = redTeamAdmissionHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
+      const hold = redTeamAdmissionHold({ ...evidence, labels: live.labels, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
       // A green snapshot ends recovery only after the live evidence decision clears.
       if (!hold || !hold.blocking) {
         const key = keyOf(c.repo, c.num);
@@ -438,7 +438,7 @@ export function createDrainMergeStrategy({
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();
         const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha, live.reviews);
-        const hold = redTeamAdmissionHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
+        const hold = redTeamAdmissionHold({ ...evidence, labels: live.labels, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
           standingRuling: grantScopeFor(c, headSha, pages.flat()) });
         return { allowed: !hold || (checkRunOnly && !hold.blocking), reason: hold?.message ?? null, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
@@ -501,7 +501,7 @@ export function createDrainMergeStrategy({
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
         evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha, live.reviews);
-        const hold = redTeamAdmissionHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
+        const hold = redTeamAdmissionHold({ ...evidence, labels: live.labels, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
         const reason = hold?.message;
         try {
           const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,

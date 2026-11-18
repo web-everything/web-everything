@@ -19,6 +19,6 @@ export const completedComment = (pr, head, findings = []) => ({ author: { login:
 export const idleEvidence = () => ({ ok: true, status: null, carry: null, queued: false,
   inFlight: false, recorded: false, scheduled: false, skipCardOnly: true, seats: [] });
 export const exemptInput = head => ({ head, read: reviewedRead(head, ['backlog/123-card.md']),
-  seats: [], result: null, carry: null, ok: true, carryConflict: false, hasBreak: false, pendingPublish: false,
+  seats: [], result: null, carry: null, ok: true, carryConflict: false, hasBreak: false, blocked: false, storedVerdict: null, breakResolved: false, pendingPublish: false,
   scheduling: { skipCardOnly: true, settingsReadable: true, commentsReadable: true, sealClear: true,
     execution: 'none', inFlight: false, queued: false, scheduled: false, recorded: false } });

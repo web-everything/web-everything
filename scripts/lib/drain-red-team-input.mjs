@@ -24,7 +24,7 @@ function admissionSettings({ env, settingsPath, readSettings }) {
 }
 
 export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, repo, env = process.env,
-  standingRuling, confirmedBreaks, settingsPath = RED_TEAM_SETTINGS_FILE, readSettings = readFileSync, readSource = raw?.decisionInput?.readSource } = {}) {
+  labels = raw?.labels, standingRuling, confirmedBreaks, settingsPath = RED_TEAM_SETTINGS_FILE, readSettings = readFileSync, readSource = raw?.decisionInput?.readSource } = {}) {
   const disposition = readRedTeamDisposition({ comments, pr, head, repo, env, standingRuling, setting: confirmedBreaks });
   const hit = redTeamResultCommentForHead(comments, pr, head);
   const fromRev = hit?.carriedFrom ?? raw.carry?.loopPayload?.carriedFrom;
@@ -44,9 +44,16 @@ export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, r
     && !Object.hasOwn(status, 'storedFindings')
     && (!Object.hasOwn(status, 'legacyHoldPublished') || status.legacyHoldPublished === false));
   const pendingPublish = redTeamHoldPendingOnly(disposition);
+  const hasBreak = !pendingPublish && !!(disposition.sendBack.length || disposition.held.length);
+  const storedVerdict = status?.status === 'finished' ? status.result?.foldedVerdict ?? null : null;
+  // Reuse the shared disposition's verified releases, never an unverified marker or a skipped pass.
+  const releases = [...disposition.dispositions.values()];
+  const breakResolved = !hasBreak && releases.length > 0
+    && releases.every(release => ['cleared', 'released carded', 'released not-real'].includes(release.state));
+  const blocked = Array.isArray(labels) && labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:blocked');
   return { head, read: raw.loopPayload?.findings?.read, seats: raw.seats, result: hit?.parsed ?? null, carry,
     ok: raw.ok, reason: raw.reason, carryConflict: raw.carryConflict !== undefined && raw.carryConflict !== false ? raw.carryConflict : !!(fromRev && !carry),
-    hasBreak: !pendingPublish && !!(disposition.sendBack.length || disposition.held.length), pendingPublish,
+    hasBreak, blocked, storedVerdict, breakResolved, pendingPublish,
     scheduling: { inFlight: raw.inFlight, queued: raw.queued, scheduled: raw.scheduled, recorded: raw.recorded,
       execution: noExecution ? 'none' : 'unknown', sealClear, commentsReadable: Array.isArray(comments) && comments.every(comment => typeof comment?.body === 'string'),
       settingsReadable: settings !== null, skipCardOnly: settings?.skipCardOnly === true && raw.skipCardOnly === true } };

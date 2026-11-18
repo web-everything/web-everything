@@ -4634,3 +4634,15 @@ proof stays pending without erasing blocked. A marker, stored verdict, current f
 list, or historical clear cannot substitute for completed proof. Structural mutations
 remove the label decision and restore comment-only clear paths; both must fail.
 Already-reviewed result-label repair rechecks historical labels through that planner.
+
+Recorded breaks are decision inputs too: normalized `blocked` and finished
+`storedVerdict` feed `RED_TEAM_BREAK_INPUTS`. A card-only exemption never releases
+an unresolved blocked label. Stored `changes` remains a blocking `break`, even
+without a published result. Only verified disposition releases or a completed
+head-bound pass (including seat/read proof) can supersede these recorded guards;
+current sealed/comment breaks still win. Mutations remove each input and its hold.
+
+A stored `accept` verdict alone never normalizes to `breakResolved`. Verified
+shared-disposition releases set that flag; a completed head-bound result, scored
+read and valid completed seat resolve the block inside the decision. Regression
+cases omit seats, scoring or the result and require the blocking break to survive.

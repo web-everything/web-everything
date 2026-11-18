@@ -86,6 +86,8 @@ export const RED_TEAM_EXEMPTION_INPUTS = Object.freeze({
   carry: x => x.carry === null,
   carryConflict: x => x.carryConflict === false,
   hasBreak: x => x.hasBreak === false,
+  blocked: x => x.blocked === false || x.breakResolved === true,
+  storedVerdict: x => x.storedVerdict === null || x.breakResolved === true,
   pendingPublish: x => x.pendingPublish === false,
   'scheduling.skipCardOnly': x => x.scheduling?.skipCardOnly === true,
   'scheduling.settingsReadable': x => x.scheduling?.settingsReadable === true,
@@ -107,6 +109,12 @@ export const RED_TEAM_CLEARANCE_INPUTS = Object.freeze({
   'scheduling.queued': 'pass-owed',
 });
 
+/** Recorded rejections remain breaks until an explicit resolution or a completed pass proves otherwise. */
+export const RED_TEAM_BREAK_INPUTS = Object.freeze({
+  blocked: x => x.blocked === true && x.breakResolved !== true,
+  storedVerdict: x => x.storedVerdict === 'changes' && x.breakResolved !== true,
+});
+
 /** One decision for admission, recovery and carry. Inputs are normalized by the evidence reader. */
 export function redTeamOwedDecision(input = {}) {
   const { head, read, seats, result, carry, scheduling = {},
@@ -122,7 +130,8 @@ export function redTeamOwedDecision(input = {}) {
   if (!reviewable) hold('unreviewable-read');
   const validSeats = Array.isArray(seats) && seats.every(row => row?.valid === true);
   if (!validSeats) hold('seat-rows-invalid');
-  const exempt = Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input));
+  const recordedBreak = Object.values(RED_TEAM_BREAK_INPUTS).some(proven => proven(input));
+  const exempt = !recordedBreak && Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input));
   let owed = !exempt || reasons.length > 0;
   const completedResult = isPublishableRedTeamResult(result) && result.completedReview === true && result.rev === head;
   let carried = false;
@@ -133,6 +142,9 @@ export function redTeamOwedDecision(input = {}) {
     if (!carried && !carryConflict) hold('carry-conflict');
     if (!carried) owed = true;
   }
+  const completedPass = completedResult && reviewable && read.netBasis.rev === result.rev
+    && validSeats && seats.some(completedRedTeamSeat);
+  if (recordedBreak && !completedPass && !carried && !hasBreak) reasons.unshift(RED_TEAM_HOLDS.break);
   if (owed && !carried) {
     if (!result) hold(scheduling.recorded ? 'result-incomplete' : 'pass-owed');
     else if (!(completedResult && read?.netBasis?.rev === result.rev && validSeats && seats.some(completedRedTeamSeat))) hold('result-incomplete');
