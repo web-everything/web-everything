@@ -4683,6 +4683,15 @@ even on failure. `scripts/settings/urgent-sweep.json` controls the interval thro
 skip host urgent loads. Errors are logged and recorded as probe errors without interrupting the tick.
 Keep cadence, persisted-stamp and fail-soft wiring regressions in `urgent-sweep-tick.test.mjs`.
 
+Absent registrations removed by another actor also require ancestry proof: settle only when HEAD
+excludes the urgent SHA or a freshly fetched `origin/main` contains it. Historical
+`settled-unregistered` receipts without `ancestryVerified` resume monitoring. Persist the first
+observed absence in `monitoring-unregistered`; while unmerged code remains in HEAD, keep reading
+CI and raise one NEEDS-YOU per tracking identity on failure or after 15 minutes. Unloading an
+already absent registration cannot repair that running build. Unknown ancestry/fetch evidence
+escalates and stays tracked. The urgent sweep suite pins both settlement proofs, grace/deduplication,
+later CI failure, legacy receipt migration, and bounded injectable Git IO.
+
 ## Urgent unload adoption
 
 An urgent CI removal persists `unloaded-pending-adoption` before emitting its unload event and

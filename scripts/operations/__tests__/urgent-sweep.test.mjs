@@ -14,7 +14,7 @@ const check = (name, conclusion = 'success', extra = {}) => ({ id: ++checkId, he
 function fixture(rows = required.map(n => check(n))) {
   const state = [], events = [], loads = [load];
   const d = { loads: () => loads, state: () => state, now: () => '2026-11-18T12:00:00Z', required: vi.fn(() => required),
-    containsOverlay: vi.fn(() => true),
+    containsOverlay: vi.fn(() => true), mergedOverlay: vi.fn(() => false),
     overlayState: vi.fn(() => ({ corrupt: false, overlays: loads.map(r => ({ ref: r.registration?.ref })) })),
     checks: vi.fn(() => ({ total_count: rows.length, check_runs: rows, workflows })), remove: vi.fn(() => ({ removed: true })),
     event: vi.fn(e => events.push(e)), settle: vi.fn(e => state.push(e)), escalate: vi.fn() };
@@ -159,17 +159,104 @@ describe('urgent CI sweep', () => {
     expect(f.d.containsOverlay).not.toHaveBeenCalled();
     expect(f.settlements()).toHaveLength(1);
   });
-  it('rechecks green on every pass beyond 24 hours until the overlay is unregistered', async () => {
+  it('rechecks green beyond 24 hours until absent registration and HEAD exclusion are proven', async () => {
     const f = fixture(); await f.run();
     expect(f.settlements()[0].status).toBe('monitoring-green');
     f.d.now = () => '2026-11-25T12:00:00Z';
     await f.run(); await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(3);
     expect(f.settlements()).toHaveLength(1);
     f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: 'lane/other' }] });
+    f.d.containsOverlay.mockReturnValue(false);
     expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unregistered' }] });
     await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(3);
     expect(f.d.overlayState).toHaveBeenCalledTimes(4);
     expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('tracks absent registration with unmerged code in HEAD and escalates once after 15 minutes per tracking ID', async () => {
+    const f = fixture();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    expect(await f.run()).toMatchObject({ ok: true, results: [{ status: 'monitoring-unregistered' }] });
+    f.d.now = () => '2026-11-18T12:14:59Z';
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).not.toHaveBeenCalled();
+    f.d.now = () => '2026-11-18T12:15:00Z';
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: expect.stringContaining('unmerged urgent overlay') }] });
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.checks).toHaveBeenCalledTimes(4);
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.settlements()[0]).toMatchObject({ status: 'monitoring-unregistered', at: '2026-11-18T12:00:00Z', fallbackEscalated: true });
+    f.loads[0] = { ...load, trackingId: 'reload' };
+    await f.run();
+    f.d.now = () => '2026-11-18T12:30:00Z';
+    await f.run();
+    expect(f.d.escalate).toHaveBeenCalledTimes(2);
+    expect(f.d.escalate.mock.calls[0][0].id).not.toBe(f.d.escalate.mock.calls[1][0].id);
+  });
+  it.each(['excluded from HEAD', 'merged into main'])('settles absent registration only when code is %s', async proof => {
+    const f = fixture();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    await f.run();
+    f.d.containsOverlay.mockReturnValue(proof !== 'excluded from HEAD');
+    f.d.mergedOverlay.mockReturnValue(proof === 'merged into main');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unregistered' }] });
+    expect(f.settlements()[0]).toMatchObject({ ancestryVerified: true });
+    expect(await f.run()).toMatchObject({ results: [] });
+    expect(f.d.checks).toHaveBeenCalledTimes(1);
+    expect(f.d.mergedOverlay).toHaveBeenCalledTimes(proof === 'merged into main' ? 2 : 1);
+  });
+  it('rechecks legacy unregistered settlements without ancestry proof', async () => {
+    const f = fixture(); await f.run();
+    f.settlements()[0].status = 'settled-unregistered';
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-unregistered' }] });
+    expect(f.d.checks).toHaveBeenCalledTimes(2);
+  });
+  it('checks later CI failures for absent registrations and escalates immediately without a no-op unload', async () => {
+    const f = fixture();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    await f.run();
+    f.d.checks.mockReturnValue({ check_runs: [check('test', 'failure')] });
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: expect.stringContaining('CI failed and unloading is a no-op') }] });
+    await f.run();
+    expect(f.d.checks).toHaveBeenCalledTimes(3);
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.events).toEqual([]);
+    expect(f.settlements()[0].status).toBe('monitoring-unregistered');
+  });
+  it.each(['containsOverlay', 'mergedOverlay'])('keeps absent registration tracked on unknown %s evidence', async reader => {
+    const f = fixture();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d[reader].mockReturnValue(undefined);
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(f.settlements()).toEqual([]);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ question: expect.stringContaining('NEEDS-YOU') }));
+    f.d[reader].mockReturnValue(true);
+    expect((await f.run()).ok).toBe(true);
+  });
+  it.each([undefined, { total_count: 101, check_runs: [] }, { total_count: 1, check_runs: [] }])('escalates unreadable or oversized absent-registration CI evidence (%j)', async data => {
+    const f = fixture();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.checks.mockReturnValue(data);
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(f.settlements()[0].status).toBe('monitoring-unregistered');
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ question: expect.stringContaining('NEEDS-YOU') }));
+  });
+  it.each(['bad', '2026-11-18T11:59:59Z'])('escalates unreadable or backwards absent-registration time (%s)', async now => {
+    const f = fixture();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    await f.run();
+    f.d.now = () => now;
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: expect.stringContaining('timestamp') }] });
+    expect(f.settlements()[0].status).toBe('monitoring-unregistered');
+  });
+  it('keeps absent registration tracked when CI is unreadable', async () => {
+    const f = fixture();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.checks.mockRejectedValue(new Error('CI unavailable'));
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(f.settlements()[0].status).toBe('monitoring-unregistered');
   });
   it('unloads a failing same-SHA rerun more than 24 hours after persisted green', async () => {
     const f = fixture(); await f.run();
@@ -403,6 +490,25 @@ describe('production sweep storage and removal guards', () => {
     else expect(() => deps.containsOverlay(load)).toThrow('unreadable clone HEAD ancestry');
     expect(exec).toHaveBeenCalledWith('git', ['merge-base', '--is-ancestor', sha, 'HEAD'],
       { cwd: load.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+  });
+  it.each([0, 1, 128, '1', undefined])('reads fresh main ancestry with bounded injectable Git IO (exit %s)', status => {
+    const exec = vi.fn((cmd, args) => {
+      if (args[0] === 'merge-base' && status !== 0) throw Object.assign(new Error('git failed'), { status });
+      return '';
+    });
+    const env = {}, deps = createSweepDeps({ exec, env });
+    if (status === 0 || status === 1) expect(deps.mergedOverlay(load)).toBe(status === 0);
+    else expect(() => deps.mergedOverlay(load)).toThrow('unreadable origin/main ancestry');
+    const options = { cwd: load.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 };
+    expect(exec.mock.calls).toEqual([
+      ['git', ['fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main'], options],
+      ['git', ['merge-base', '--is-ancestor', sha, 'origin/main'], options],
+    ]);
+  });
+  it('refuses stale main evidence when fetching fails, including exit 1', () => {
+    const exec = vi.fn(() => { throw Object.assign(new Error('offline'), { status: 1 }); });
+    expect(() => createSweepDeps({ exec }).mergedOverlay(load)).toThrow('unreadable origin/main fetch');
+    expect(exec).toHaveBeenCalledTimes(1);
   });
   it('reads exact-SHA checks through the origin-bound throttled reader and guards the actual overlay tip', () => {
     const exec = vi.fn((cmd, args) => args[0] === 'remote' ? load.repo : 'workflow');

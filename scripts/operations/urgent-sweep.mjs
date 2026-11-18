@@ -17,6 +17,16 @@ import { writeEscalationPacket } from './land-advance-escalations.mjs';
 const failedCheck = (c, sha) => c?.head_sha === sha && c.status === 'completed'
   && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(c.conclusion);
 const identity = r => createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
+const validateChecks = (data, sha) => {
+  if (!Number.isInteger(data?.total_count)
+    || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
+    || data.check_runs.length !== data.total_count || new Set(data.check_runs.map(c => c?.id)).size !== data.total_count
+    || data.check_runs.some(c => !Number.isSafeInteger(c?.id)
+      || c.head_sha !== sha || typeof c.name !== 'string' || !Number.isSafeInteger(c.app?.id)
+      || !['queued', 'in_progress', 'completed'].includes(c.status)
+      || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
+    throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
+};
 export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync, ghExec = execFileSyncThrottled, remove = removeRegistration, readState = readOverlayState, env = process.env } = {}) {
   const read = name => {
     const path = urgentLedger(home, name);
@@ -66,6 +76,19 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
         throw new Error('unreadable clone HEAD ancestry; inspect the daemon build manually');
       }
     },
+    mergedOverlay: r => {
+      const options = { cwd: r.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 };
+      try {
+        exec('git', ['fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main'], options);
+      } catch { throw new Error('unreadable origin/main fetch; inspect overlay graduation manually'); }
+      try {
+        exec('git', ['merge-base', '--is-ancestor', r.sha, 'origin/main'], options);
+        return true;
+      } catch (e) {
+        if (e.status === 1) return false;
+        throw new Error('unreadable origin/main ancestry; inspect overlay graduation manually');
+      }
+    },
     remove: r => remove({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
       reason: `urgent-sweep: CI failed for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
@@ -99,12 +122,13 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
   };
   try {
     const settlements = deps.state();
-    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
+    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-unregistered', 'monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
     // Historical time-based green receipts never prove an overlay is no longer registered.
     // Old unload receipts prove removal only; resume them through the adoption check too.
     const unloaded = new Map(settlements.filter(r => ['settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted'].includes(r.status)).map(r => [r.id, r]));
-    const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered').map(r => r.id));
+    const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered' && r.ancestryVerified === true).map(r => r.id));
+    const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
     for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && notificationsComplete(r)) settled.add(id);
     const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
     const records = deps.loads();
@@ -161,8 +185,34 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           continue;
         }
         if (!registered) {
-          await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-unregistered' });
-          results.push({ id, status: 'settled-unregistered' });
+          const contains = await deps.containsOverlay(r);
+          if (typeof contains !== 'boolean') throw new Error('unreadable clone HEAD ancestry; inspect the daemon build manually');
+          const merged = contains ? await deps.mergedOverlay(r) : false;
+          if (typeof merged !== 'boolean') throw new Error('unreadable origin/main ancestry; inspect overlay graduation manually');
+          if (!contains || merged) {
+            await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-unregistered', ancestryVerified: true });
+            results.push({ id, status: 'settled-unregistered' });
+            continue;
+          }
+          let receipt = absent.get(id) ?? { id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-unregistered' };
+          const now = Date.parse(deps.now()), absentAt = Date.parse(receipt.at);
+          if (!Number.isFinite(now) || !Number.isFinite(absentAt) || now < absentAt)
+            throw new Error('unreadable absent registration timestamp; inspect the daemon build manually');
+          if (!absent.has(id)) await deps.settle(receipt);
+          // Removal is already a no-op. Continue reading CI and escalate the live build directly.
+          const data = await deps.checks(r);
+          const failed = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
+          if (!failed) validateChecks(data, r.sha);
+          const overdue = now - absentAt >= 15 * 60 * 1000;
+          const detail = `The daemon still runs a build containing unmerged urgent overlay ${r.sha} after registration removal${failed ? '; CI failed and unloading is a no-op' : ''}. Inspect and repair the daemon build in ${r.clone}.`;
+          if (failed || overdue) {
+            if (!receipt.fallbackEscalated) {
+              await escalate(`${id}-fallback`, r.ref, detail);
+              receipt = { ...receipt, fallbackEscalated: true };
+              await deps.settle(receipt);
+            }
+            results.push({ id, status: 'needs-you', detail });
+          } else results.push({ id, status: receipt.status });
           continue;
         }
         const data = await deps.checks(r);
@@ -175,14 +225,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           await notifyUnload(id, r, receipt, notificationErrors);
           report({ id, status: 'unloaded-pending-adoption' });
         } else {
-          if (!Number.isInteger(data?.total_count)
-            || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
-            || data.check_runs.length !== data.total_count || new Set(data.check_runs.map(c => c?.id)).size !== data.total_count
-            || data.check_runs.some(c => !Number.isSafeInteger(c?.id)
-              || c.head_sha !== r.sha || typeof c.name !== 'string' || !Number.isSafeInteger(c.app?.id)
-              || !['queued', 'in_progress', 'completed'].includes(c.status)
-              || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
-            throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
+          validateChecks(data, r.sha);
           const required = await deps.required(r);
           if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
           const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
