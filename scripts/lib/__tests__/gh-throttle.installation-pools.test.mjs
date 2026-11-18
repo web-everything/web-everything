@@ -206,6 +206,24 @@ console.log(result);`;
     expect(execute).not.toHaveBeenCalled();
     expect(rows('calls.jsonl').find(r => r.outcome === 'slot_throttled').bucket).toBe('202');
   });
+  it.each([
+    ['101', true],
+    ['202', false],
+  ])('a nested call whose outer was admitted to pool %s is throttled: %s (inner resolves installation 202, which is full)', (outerBucket, throttled) => {
+    delivery.readDeliveryIdentity.mockReturnValue({ roles: {
+      reviewer: { appId: '1', installations: { example: '202' } },
+      worker: { appId: '2', installations: { example: '101' } },
+    }, callerRoles: { 'review-pr.mjs': 'reviewer' } });
+    expect(acquire('202', 'reviewer-first').ok).toBe(true);
+    expect(acquire('202', 'reviewer-second').ok).toBe(true);
+    const execute = vi.fn(ok);
+    const extra = { cap: 20, caller: 'custom-read', shimRouted: true,
+      resolveSlotBucket: input => resolveGhSlotBucket({ ...input, readFresh: path => ({ installationId: path.includes('.202.') ? '202' : '101' }) }) };
+    const env = { GH_CALLER: 'review-pr.mjs', WE_GH_THROTTLE_OUTER_INV: 'outer-inv', WE_GH_THROTTLE_OUTER_BUCKET: outerBucket };
+    const result = invoke('cli', env, execute, extra);
+    if (throttled) { expect(result).toMatchObject({ status: 1, throttled: true }); expect(execute).not.toHaveBeenCalled(); }
+    else expect(execute).toHaveBeenCalled();
+  });
   it('admits a generated shim cached reviewer token to its installation while shared is full', () => {
     expect(acquire(null, 'shared-holder').ok).toBe(true);
     const cachePath = defaultCachePath();

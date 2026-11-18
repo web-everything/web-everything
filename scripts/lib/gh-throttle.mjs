@@ -1091,6 +1091,9 @@ export const GH_OUTER_TIMEOUT_ENV = 'WE_GH_THROTTLE_OUTER_TIMEOUT_MS';
 /** Env var beside {@link GH_OUTER_TIMEOUT_ENV}: the outer exec's kill signal, so the nested child is stopped the
  *  way the outer caller asked (e.g. `SIGKILL`), not with the nested default `SIGTERM`. */
 export const GH_OUTER_KILL_SIGNAL_ENV = 'WE_GH_THROTTLE_OUTER_KILL_SIGNAL';
+/** Env var beside {@link GH_OUTER_INV_ENV}: the pool label ('shared' or an installation id) the outer call was
+ *  admitted to. A nested passthrough rides the outer slot only when it resolves the SAME pool. */
+export const GH_OUTER_BUCKET_ENV = 'WE_GH_THROTTLE_OUTER_BUCKET';
 /** The outer timeout options a nested passthrough must honour, or null (un-nested, absent or unparseable → its own
  *  default). An unknown signal is dropped (spawn would throw on it) and the node default applies. */
 function outerExecLimits(outer, env) {
@@ -2000,10 +2003,11 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const bin = throttle.bin || 'gh';
   const capture = !throttle.exec && resolveCostHeaderCapture(env) && !(execOpts.env || process.env).GH_DEBUG && stdioPipesStderr(execOpts.stdio);
   let lastCapture = null;
+  let outerBucketLabel = 'shared';
   const exec = throttle.exec || ((a, o) => {
     if (throttle.execOptions) o = throttle.execOptions(o);
     const held = ghExecOptions(o, a, ghHolderPolicy(env));
-    const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
+    const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_BUCKET_ENV]: outerBucketLabel, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
       ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
     if (!capture) return (throttle.execFileSync || execFileSync)(bin, a, childOpts);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
@@ -2089,6 +2093,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // reasoning as releasing the slot before a backoff sleep, below).
     const pool = callSlotPool({ lockRoot, cap, identity, env: callEnv, args, caller, cwd: execOpts.cwd ?? process.cwd(), shimRouted, throttle, reserved, policy: ghHolderPolicy(env) });
     const bucket = pool.bucket;
+    outerBucketLabel = /^\d+$/.test(String(bucket)) ? String(bucket) : 'shared';
     const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
@@ -2379,7 +2384,11 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     const pool = callSlotPool({ lockRoot, cap, identity, env: callEnv, args: argv, caller, cwd: process.cwd(), shimRouted: !usedPersonalToken && !callEnv.GH_TOKEN && !callEnv.GITHUB_TOKEN && (throttle.shimRouted ?? ghBinIsWeShim(bin, callEnv)), throttle, reserved, policy: ghHolderPolicy(env) });
     const bucket = pool.bucket;
     const waitStartedMs = Date.now();
-    const acq = gated && !outer ? failOpenGate('acquire', () => {
+    // A nested call rides the outer slot only when it resolved the SAME pool the outer was admitted to; otherwise
+    // (outer charged installation 101 but the shim selected 202) it takes its own slot in the pool it resolved.
+    const outerBucket = env[GH_OUTER_BUCKET_ENV] || process.env[GH_OUTER_BUCKET_ENV] || null;
+    const ridesOuter = !!outer && (outerBucket === null || outerBucket ===(/^\d+$/.test(String(bucket)) ? String(bucket) : 'shared'));
+    const acq = gated && !ridesOuter ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
