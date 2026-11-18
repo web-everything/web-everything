@@ -91,6 +91,18 @@ describe('urgent verifier', () => {
     const d = fixture(); d.clean.mockReturnValueOnce(true).mockReturnValue(false);
     expect(await urgentVerify({ sha }, d)).toMatchObject({ marker: { result: 'red' } });
   });
+  it.each([
+    ['HEAD', { sha: 'b'.repeat(40), repo: urgentFuiRepo }],
+    ['origin', { sha, repo: 'https://example.com/foreign/repo' }],
+    ['missing evidence', undefined],
+  ])('records red if final FUI %s differs from the recorded checkout', async (_, finalFui) => {
+    const d = fixture();
+    d.verifyFui.mockReturnValueOnce({ sha, repo: urgentFuiRepo }).mockReturnValueOnce(finalFui);
+    expect(await urgentVerify({ sha }, d)).toMatchObject({ ok: false, marker: { result: 'red', fuiSha: sha, fuiRepo: urgentFuiRepo } });
+    expect(d.verifyFui).toHaveBeenLastCalledWith({ sha, repo: urgentFuiRepo });
+    expect(d.verifyFui.mock.invocationCallOrder.at(-1)).toBeGreaterThan(d.standards.mock.invocationCallOrder[0]);
+    expect(d.append).toHaveBeenCalledTimes(1);
+  });
   it('binds the operation and exposes sha in generated argv parsing', () => {
     const { declaration, sinks } = resolveOperation('urgent-verify');
     expect(parseOperationArgv(declaration, [`--sha=${sha}`])).toMatchObject({ input: { sha } });
@@ -104,6 +116,31 @@ describe('urgent verifier', () => {
 });
 
 describe('real adapter contract with injected filesystem and subprocesses', () => {
+  it.each(['dirty worktree', 'changed HEAD', 'changed origin', 'unreadable status'])(
+    'records red when the real FUI adapter detects %s after all suites', async change => {
+      let finished = false;
+      const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+      const packageText = readFileSync('package.json', 'utf8');
+      const fs = { readFileSync: p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow,
+        mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), copyFileSync: vi.fn() };
+      const spawnSync = vi.fn((cmd, args, opts) => {
+        const sibling = opts.cwd === '/frontierui';
+        if (finished && sibling && change === 'unreadable status' && args[0] === 'status') return { status: 1 };
+        let stdout = '';
+        if (args[0] === 'remote') stdout = sibling ? (finished && change === 'changed origin' ? marker.repo : urgentFuiRepo) : marker.repo;
+        if (args[0] === 'rev-parse') stdout = finished && sibling && change === 'changed HEAD' ? 'b'.repeat(40) : sha;
+        if (args[0] === 'status' && finished && sibling && change === 'dirty worktree') stdout = '?? unexpected-file';
+        if (args[0]?.includes('shard-assign')) stdout = 'scripts/example.test.mjs\n';
+        return { status: 0, stdout };
+      });
+      const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync });
+      const standards = d.standards;
+      d.standards = () => { standards(); finished = true; };
+      expect(await urgentVerify({ sha }, d)).toMatchObject({ ok: false, marker: { result: 'red', fuiSha: sha, fuiRepo: urgentFuiRepo } });
+      expect(finished).toBe(true);
+      expect(spawnSync.mock.calls.filter(([, args]) => args[0] === 'fetch')).toHaveLength(1);
+      expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
+    });
   it('strips CI markers from every subprocess so host admission cannot be bypassed', () => {
     const markers = ['CI', 'GITHUB_ACTIONS', 'CONTINUOUS_INTEGRATION', 'GITLAB_CI',
       'BUILDKITE', 'CIRCLECI', 'TRAVIS', 'JENKINS_URL', 'TEAMCITY_VERSION', 'TF_BUILD', 'BUILD_NUMBER'];

@@ -36,10 +36,15 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       fs.rmSync(join(cwd, 'coverage-shards'), { recursive: true, force: true });
       return ciUnitPlan(workflow);
     },
-    verifyFui: () => {
+    verifyFui: (expected) => {
       const repo = normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'], fui));
       if (repo !== urgentFuiRepo) throw new Error('FUI sibling origin must be frontier-ui/frontierui on github.com');
       if (run('git', ['status', '--porcelain', '--untracked-files=all'], fui) !== '') throw new Error('FUI sibling must exist and be clean');
+      if (expected) {
+        const head = run('git', ['rev-parse', 'HEAD'], fui).trim();
+        if (head !== expected.sha || repo !== expected.repo) throw new Error('FUI sibling changed');
+        return { sha: head, repo };
+      }
       run('git', ['fetch', 'origin'], fui);
       let tip;
       try { tip = run('git', ['rev-parse', '--verify', 'origin/HEAD^{commit}'], fui).trim(); }
@@ -102,6 +107,8 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
       for (const shard of plan) { steps.push(`unit:${shard.group ?? 'unit'}:${shard.shard}`); await deps.shard(shard); }
       for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) { steps.push(step); await deps[step](); }
       if (!deps.clean() || deps.head() !== sha) throw new Error('checkout changed');
+      const finalFui = await deps.verifyFui({ sha: fuiSha, repo: fuiRepo });
+      if (finalFui.sha !== fuiSha || finalFui.repo !== fuiRepo) throw new Error('FUI sibling changed');
     } catch { result = 'red'; }
     const marker = { sha, suite: 'full', shards: plan.length, result, startedAt, finishedAt: deps.now(), host: deps.host, repo, steps, fuiSha, fuiRepo };
     marker.sig = urgentSignature(marker, deps.readKey());

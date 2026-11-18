@@ -5,7 +5,7 @@ import { removeRegistration } from '../../daemon-overlay.mjs';
 import { resolveOperation } from '../run.mjs';
 
 const sha = 'a'.repeat(40);
-const load = { type: 'prototype-load.urgent', trackingId: 'first-load', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
+const load = { type: 'prototype-load.urgent', trackingId: 'first-load', at: '2026-11-18T12:00:00Z', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
   registration: { clone: '/clone', ref: 'lane/repair-m1', sha: 'b'.repeat(40) } };
 const workflows = { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: sha, path: '.github/workflows/ci.yml' }] };
 const required = ['changes', 'test-shard', 'test'];
@@ -21,6 +21,59 @@ function fixture(rows = required.map(n => check(n))) {
   return { d, state, settlements: () => [...new Map(state.filter(r => r.status !== 'sweep-cursor').map(r => [r.id, r])).values()], events, loads, run: () => urgentSweep({}, d) };
 }
 describe('urgent CI sweep', () => {
+  it('unloads a 17-day-old zero-check load, escalates once and tracks adoption', async () => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, at: '2026-11-01T12:00:00Z' };
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(f.loads[0]);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', evidence: ['urgent load has no CI verdict after 6h'] }));
+    expect(f.settlements()[0]).toMatchObject({ status: 'unloaded-pending-adoption', unloadReason: expect.stringContaining('no CI verdict after 24h') });
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate.mock.calls.filter(([p]) => p.evidence.includes('urgent load has no CI verdict after 6h'))).toHaveLength(1);
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-adopted' }] });
+  });
+  it('escalates a 7h pending load once per tracking id and keeps it loaded', async () => {
+    const f = fixture([check('test', null, { status: 'in_progress' })]);
+    f.loads[0] = { ...load, at: '2026-11-18T05:00:00Z' };
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', evidence: ['urgent load has no CI verdict after 6h'] }));
+    f.loads[0] = { ...f.loads[0], trackingId: 'reload' };
+    await f.run();
+    expect(f.d.escalate).toHaveBeenCalledTimes(2);
+  });
+  it.each(['bad', undefined, '2026-11-19T12:00:00Z'])('fails closed on missing or invalid load time %s', async at => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, at };
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: expect.stringContaining('timestamp') }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: [expect.stringContaining('unload manually')] }));
+  });
+  it.each([
+    ['before 6h', '2026-11-18T06:00:01Z', false, false],
+    ['at 6h', '2026-11-18T06:00:00Z', true, false],
+    ['before 24h', '2026-11-17T12:00:01Z', true, false],
+    ['at 24h', '2026-11-17T12:00:00Z', true, true],
+  ])('enforces verdict timeout boundary %s', async (_, at, alerted, removed) => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, at };
+    await f.run();
+    expect(f.d.escalate.mock.calls.some(([p]) => p.evidence.includes('urgent load has no CI verdict after 6h'))).toBe(alerted);
+    expect(f.d.remove.mock.calls.length > 0).toBe(removed);
+  });
+  it('keeps an old load with a completed required check and another pending check', async () => {
+    const f = fixture([check('changes'), check('test', null, { status: 'queued' })]);
+    f.loads[0] = { ...load, at: '2026-11-01T12:00:00Z' };
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).not.toHaveBeenCalled();
+  });
+
   it.each(['failure', 'cancelled', 'timed_out'])('unloads required %s and escalates once across repeated passes', async conclusion => {
     const f = fixture([check('test-shard (1)', conclusion), check('test', null, { status: 'in_progress' })]);
     expect(await f.run()).toMatchObject({ ok: true, results: [{ status: 'unloaded-pending-adoption' }] });

@@ -90,7 +90,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       }
     },
     remove: r => remove({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
-      reason: `urgent-sweep: CI failed for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
+      reason: `urgent-sweep: CI failed or no verdict after 24h for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
     escalate: packet => writeEscalationPacket(packet, { dir: join(home, 'workspace/.operations/escalations'), fs: io }),
   };
@@ -108,7 +108,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     for (const [flag, send] of [
       ['unloadEventSent', () => deps.event({ type: 'prototype-load.urgent-unloaded', at: receipt.removedAt ?? receipt.at,
         id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration })],
-      ['unloadEscalationSent', () => escalate(id, r.ref, `Unloaded ${r.sha}: CI failed. Inspect and repair before reloading.`)],
+      ['unloadEscalationSent', () => escalate(id, r.ref, receipt.unloadReason ?? `Unloaded ${r.sha}: CI failed. Inspect and repair before reloading.`)],
     ]) {
       if (receipt[flag] === true) continue;
       try {
@@ -122,7 +122,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
   };
   try {
     const settlements = deps.state();
-    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-unregistered', 'monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
+    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-ci', 'monitoring-unregistered', 'monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
     // Historical time-based green receipts never prove an overlay is no longer registered.
     // Old unload receipts prove removal only; resume them through the adoption check too.
@@ -130,6 +130,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered' && r.ancestryVerified === true).map(r => r.id));
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
     for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && notificationsComplete(r)) settled.add(id);
+    const ciEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.noVerdictEscalated === true).map(r => r.id));
     const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
     const records = deps.loads();
     const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
@@ -217,20 +218,37 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           continue;
         }
         const data = await deps.checks(r);
-        if (Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha))) {
+        let unload = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
+        let required, checks, unloadReason;
+        if (!unload) {
+          validateChecks(data, r.sha);
+          required = await deps.required(r);
+          if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
+          checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
+            && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
+          if (!checks.some(c => c.status === 'completed')) {
+            const loadedAt = Date.parse(r.at), now = Date.parse(deps.now());
+            if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
+              throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
+            const age = now - loadedAt;
+            if (age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
+              await escalate(`${id}-no-ci-verdict`, r.ref, 'urgent load has no CI verdict after 6h');
+              await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', noVerdictEscalated: true });
+              ciEscalated.add(id);
+            }
+            unload = age >= 24 * 60 * 60 * 1000;
+            if (unload) unloadReason = `Unloaded ${r.sha}: urgent load has no CI verdict after 24h. Inspect and repair before reloading.`;
+          }
+        }
+        if (unload) {
           const removal = await deps.remove(r);
           if (!removal || removal.refused || (removal.removed !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };
-          const receipt = { ...event, removedAt: event.at, status: 'unloaded-pending-adoption', unloadEventSent: false, unloadEscalationSent: false };
+          const receipt = { ...event, ...(unloadReason ? { unloadReason } : {}), removedAt: event.at, status: 'unloaded-pending-adoption', unloadEventSent: false, unloadEscalationSent: false };
           await deps.settle(receipt);
           await notifyUnload(id, r, receipt, notificationErrors);
           report({ id, status: 'unloaded-pending-adoption' });
         } else {
-          validateChecks(data, r.sha);
-          const required = await deps.required(r);
-          if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
-          const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
-            && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
           if (testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
             && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
             && checks.every(c => c.status === 'completed' && c.conclusion === 'success')
