@@ -20,7 +20,9 @@ vi.mock('node:fs', async importOriginal => {
   };
   return { ...actual, readFileSync, default: { ...actual.default, readFileSync } };
 });
-vi.mock('../../lib/daemon-events.mjs', () => ({ appendDaemonEvent: io.append }));
+vi.mock('../../lib/daemon-events.mjs', async importOriginal => ({
+  ...await importOriginal(), appendDaemonEvent: io.append,
+}));
 // An accidentally uninjected GitHub call must fail locally, never hit GitHub.
 vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(),
@@ -289,7 +291,7 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
       labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED' })));
     const run = vi.fn(async ([op]) => {
       expect(emitEvent.mock.calls.filter(([e]) => e.kind === 'ready-stuck')).toHaveLength(5);
-      return op === 'why' ? { owner: 'operator' } : { likelyBlocker: 'held' };
+      return op === 'why' ? { owner: 'operator', sections: [] } : { likelyBlocker: 'held' };
     });
     const drain = vi.fn(args => drainStuckTraces({ ...args, run, emit: () => true }));
     const options = { drain, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } };
@@ -324,18 +326,19 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     expect(state.prs[17].heads[HEAD].readyStuckAlerted).toBe(true);
   });
 
-  it('drains once after budget deferral, outside all 128 guarded GitHub reads', async () => {
-    prs.set(REPO, Array.from({ length: 140 }, (_, i) => readyPr({ number: i + 1,
-      labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED' })));
-    const read = gh.getMockImplementation();
-    gh.mockImplementation(args => {
-      if (args[0] === 'pr' && Number(args[2]) !== 1) throw Error('view unavailable');
-      return read(args);
-    });
-    const drain = vi.fn(() => { expect(gh).toHaveBeenCalledTimes(128); });
-    await tick(181, { drain, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } });
-    expect(drain).toHaveBeenCalledTimes(1);
+  it.each([127, 128])('skips drain when 128 reads finish or defer the pass (%i PRs)', async count => {
+    prs.set(REPO, Array.from({ length: count }, (_, i) => readyPr({ number: i + 1, state: 'CLOSED' })));
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(join(stateDir, `${encodeURIComponent(REPO)}.json`), JSON.stringify({
+      prs: Object.fromEntries(prs.get(REPO).map(pr => [pr.number, { heads: {}, merged: false }])),
+    }));
+    const drain = vi.fn();
+    await tick(181, { drain });
+    expect(drain).not.toHaveBeenCalled();
     expect(gh).toHaveBeenCalledTimes(128);
+    const cursorFile = join(stateDir, 'cursor.json');
+    if (count === 127) expect(fs.existsSync(cursorFile)).toBe(false);
+    else expect(JSON.parse(fs.readFileSync(cursorFile, 'utf8')).number).toBe(128);
   });
 
   it('closed without merged_at is not proof of a merge', async () => {

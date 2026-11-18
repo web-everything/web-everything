@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { enqueueStuckTrace, drainStuckTraces, TRACE_TRIGGERS } from '../stuck-trace.mjs';
@@ -20,7 +20,7 @@ function fixture(t) {
     ci: [{ name: 'lint', ageMinutes: 20 }], queue: { landingHolder: 9 }, conflicts: ['accepted + pending'],
     looping: [{ source: 'fix', count: 12 }], latest: { fix: 'refused #17', drain: 'behind #9' },
     latestAtET: { fix: '07:00 ET', drain: '06:59 ET' }, unavailable: ['review ledger'], incomplete: [] };
-  const options = { repo, pr: 17, head, kind: 'ready-stuck', stateDir: root, now, env: {},
+  const options = { repo, pr: 17, head, kind: 'ready-stuck', stateDir: root, now, env: { WE_DAEMON_EVENTS: join(root, 'events.jsonl') },
     run: async args => { calls.push(args); return args[0] === 'why' ? { runId: 'why-17', verdict: why } : trace; },
     emit: event => { events.push(event); return true; } };
   return { root, options, events, calls, why, trace };
@@ -150,11 +150,31 @@ test('reads both direct and wrapped verdict shapes for each operation', async t 
   }
 });
 
-test('unknown direct shapes remain queued without delivering a note', async t => {
+test('unknown direct shapes deliver an INCOMPLETE note', async t => {
   const f = fixture(t);
   await traceStuckPr({ ...f.options, run: async () => ({ owner: 17, likelyBlocker: null }) });
-  assert.equal(f.events.length, 0);
-  assert.equal(queue(f)[key].state, 'queued');
+  assert.match(f.events[0].detail.note, /INCOMPLETE/);
+  assert.equal(queue(f)[key].state, 'done');
+});
+
+test('empty wrapped verdicts in either or both layers deliver an INCOMPLETE note', async t => {
+  for (const failed of [['why'], ['pr-trace'], ['why', 'pr-trace']]) {
+    const f = fixture(t); f.trace.unavailable = [];
+    await traceStuckPr({ ...f.options, run: args => failed.includes(args[0])
+      ? { verdict: {} } : f.options.run(args) });
+    assert.match(f.events[0].detail.note, /INCOMPLETE/);
+    assert.equal(queue(f)[key].state, 'done');
+  }
+});
+
+test('why verdict requires string owner and array sections in direct and wrapped shapes', async t => {
+  for (const wrapped of [false, true]) for (const verdict of [{ owner: 'operator' }, { owner: 17, sections: [] }]) {
+    const f = fixture(t); f.trace.unavailable = [];
+    await traceStuckPr({ ...f.options, run: args => args[0] === 'why'
+      ? (wrapped ? { verdict } : verdict) : f.options.run(args) });
+    assert.match(f.events[0].detail.note, /INCOMPLETE/);
+    assert.equal(f.events[0].detail.owner, 'unavailable');
+  }
 });
 
 test('persistent failure of either evidence read never delivers duplicate incomplete notes', async t => {
@@ -301,5 +321,45 @@ test('watch hook runs only after successful delivery for ready-stuck and pr-no-p
       drain: () => {}, enqueue: args => { seen.push(args); assert.ok(order.includes(args.kind)); } });
     assert.equal(seen.length, delivery === 'ok' ? 1 : 0, `${kind} ${delivery}`);
     if (seen.length) { assert.equal(seen[0].kind, kind); assert.equal(seen[0].head, head); }
+  }
+});
+
+
+test('late sink completion after timeout is found on retry and emits exactly one event', async t => {
+  const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
+  enqueueStuckTrace(f.options);
+  let complete;
+  const emit = event => new Promise(resolve => { complete = () => {
+    f.events.push(event);
+    appendFileSync(f.options.env.WE_DAEMON_EVENTS, JSON.stringify(event) + '\n');
+    resolve(true);
+  }; });
+  const pending = drainStuckTraces({ ...f.options, emit });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(1000);
+  await pending;
+  assert.equal(queue(f)[key].state, 'queued');
+  complete();
+  assert.equal(f.events[0].detail.traceKey, key);
+  await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_000,
+    emit: () => { assert.fail('already delivered'); } });
+  assert.equal(f.events.length, 1);
+  assert.equal(f.calls.length, 2);
+  assert.equal(queue(f)[key].state, 'done');
+  t.mock.timers.reset();
+});
+
+test('retry uses only the last 256 KB and leaves unavailable delivery history queued for manual inspection', async t => {
+  for (const history of ['oversized', 'matching tail', 'unreadable', 'invalid']) {
+    const f = fixture(t); enqueueStuckTrace(f.options);
+    await drainStuckTraces({ ...f.options, emit: () => false });
+    const file = f.options.env.WE_DAEMON_EVENTS;
+    if (history === 'unreadable') f.options.env.WE_DAEMON_EVENTS = f.root;
+    else writeFileSync(file, history === 'invalid' ? '{bad\n' : 'x'.repeat(256 * 1024) + '\n'
+      + (history === 'matching tail' ? JSON.stringify({ kind: 'stuck-trace', detail: { traceKey: key } }) + '\n' : ''));
+    await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_000 });
+    assert.equal(f.events.length, 0);
+    assert.equal(f.calls.length, 2);
+    assert.equal(queue(f)[key].state, history === 'matching tail' ? 'done' : 'queued');
   }
 });

@@ -50,7 +50,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
   const config = settings ? { ...defaults, ...settings } : resolveMergeWatchSettings({ log });
   const stamp = Date.parse(now);
   if (!Number.isFinite(stamp) || Object.entries(config).some(([k, v]) => !minutesValid(v) || (k === 'ciJobOverdueFactor' && v <= 0) || (k === 'readyStuckMinutes' && v > 1440))) throw Error('invalid merge-watch time/settings');
-  let calls = 0, delivered = 0, incomplete = false, budgetExhausted = false;
+  let calls = 0, delivered = 0, incomplete = false, budgetExhausted = false, completed = false;
   const read = args => {
     if (calls >= 128) { budgetExhausted = true; throw Error('GitHub evidence tick budget exceeded'); }
     calls++;
@@ -202,9 +202,10 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
     }
   }
   if (cursor !== null && repoOrder.length) atomicJson(cursorFile, { repo: repoOrder[0], number: null });
+  completed = true;
   return { delivered, incomplete };
   } finally {
-    try { await drain({ stateDir, now, max: 2 }); } catch { /* post-pass best effort */ }
+    try { if (completed && calls < 128) await drain({ stateDir, now, max: 2 }); } catch { /* post-pass best effort */ }
   }
 }
 

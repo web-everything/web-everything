@@ -10,11 +10,11 @@
  */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
-import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { localDateString } from '../lib/local-date.mjs';
 
@@ -77,6 +77,30 @@ export function enqueueStuckTrace({ repo, pr, head, kind, stateDir, now = Date.n
   } catch { report(); return { queued: false, skipped: 'incomplete' }; }
 }
 
+// Retry evidence is bounded; if the retained tail cannot rule out delivery,
+// leave the entry queued and report manual inspection rather than risk a duplicate.
+function wasDelivered(traceKey, env) {
+  let fd;
+  try {
+    fd = openSync(daemonEventsPath({ env }), 'r');
+    const size = fstatSync(fd).size, start = Math.max(0, size - 256 * 1024);
+    const buffer = Buffer.alloc(size - start);
+    if (readSync(fd, buffer, 0, buffer.length, start) !== buffer.length) throw Error('incomplete event tail');
+    const lines = buffer.toString('utf8').split('\n');
+    if (start) lines.shift(); // The first record may begin outside the retained tail.
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      if (event?.kind === 'stuck-trace' && event.detail?.traceKey === traceKey) return true;
+    }
+    if (start) throw Error('delivery history exceeds tail; inspect manually');
+    return false;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
+
 export async function drainStuckTraces({ stateDir, max = 2, now = Date.now(), run,
   emit = appendDaemonEvent, env = process.env } = {}) {
   if (!run && (isUnderTest(env) || isUnderTest())) return { processed: 0 };
@@ -100,7 +124,8 @@ export async function drainStuckTraces({ stateDir, max = 2, now = Date.now(), ru
       const subject = /^([\w.-]+\/[\w.-]+)#([1-9]\d*)@(.+)$/.exec(key);
       if (!subject) { report(); continue; }
       const [, repo, pr, head] = subject;
-      const result = await traceStuckPr({ repo, pr: Number(pr), head, kind: claim.kind, run, emit, env });
+      const result = claim.attempts > 1 && wasDelivered(key, env) ? { posted: true }
+        : await traceStuckPr({ repo, pr: Number(pr), head, kind: claim.kind, run, emit, env });
       if (!result.posted) continue;
       try {
         withFileLock(`${file}.lock`, () => {
@@ -125,10 +150,11 @@ async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
     const evidence = Promise.all(['why', 'pr-trace'].map(async op => {
       try {
         const result = await (run ?? (args => runner(args, env)))([op, `--pr=${pr}`, `--repo=${repo}`, '--json']);
-        if (result?.verdict && typeof result.verdict === 'object' && !Array.isArray(result.verdict)) return result.verdict;
+        const verdict = result && Object.hasOwn(result, 'verdict') ? result.verdict : result;
         const field = op === 'pr-trace' ? 'likelyBlocker' : 'owner';
-        if (!result || Array.isArray(result) || typeof result[field] !== 'string') throw Error('missing verdict');
-        return result;
+        if (!verdict || Array.isArray(verdict) || typeof verdict[field] !== 'string'
+          || (op === 'why' && !Array.isArray(verdict.sections))) { report(); return undefined; }
+        return verdict;
       } catch { report(); return null; }
     }));
     let why, trace;
@@ -139,7 +165,7 @@ async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
     } finally { clearTimeout(timer); }
     // Retry failed reads without delivering a note that would then be repeated.
     // Valid verdicts may still describe incomplete evidence; a delivered note is final.
-    if (!why || !trace) { report(); return { posted: false, skipped: 'incomplete' }; }
+    if (why === null || trace === null) { report(); return { posted: false, skipped: 'incomplete' }; }
     const section = name => why?.sections?.find(s => s.name === name)?.lines;
     const headline = clean(trace?.likelyBlocker ?? 'unavailable root cause; inspect why/pr-trace manually');
     const owner = clean(why?.owner), waitingFor = clean(why?.waitingFor);
@@ -163,7 +189,7 @@ async function traceStuckPr({ repo, pr, head, kind, run, emit, env }) {
     try {
       const delivered = await Promise.race([
         Promise.resolve().then(() => emit({ kind: 'stuck-trace', repo, pr,
-          detail: { head: clean(head), trigger: kind, headline, owner, waitingFor, note: bounded } }, { env })),
+          detail: { traceKey: `${repo}#${pr}@${head}`, head: clean(head), trigger: kind, headline, owner, waitingFor, note: bounded } }, { env })),
         new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); }),
       ]);
       if (delivered === false) throw Error('delivery failed');
