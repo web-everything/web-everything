@@ -5,7 +5,7 @@ import { GUARD_FLOOR, AUDITOR_FLOOR, REVIEW_AUTH_FLOOR, LOCK_PRIMITIVES, LOCK_HO
 import { findingKey, parseFindingLocation, symbolAt, symbolRangeAt } from '../lib/audit-finding-key.mjs';
 
 export const PREEXISTING_ELIGIBLE = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
-const protectedPath = (path, extra = []) => matchesSome(path, [...GUARD_FLOOR, ...AUDITOR_FLOOR, ...REVIEW_AUTH_FLOOR,
+export const protectedPath = (path, extra = []) => matchesSome(path, [...GUARD_FLOOR, ...AUDITOR_FLOOR, ...REVIEW_AUTH_FLOOR,
   ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS, ...extra]);
 
 const unknown = () => ({ status: 'UNDETERMINED' });

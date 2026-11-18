@@ -10,7 +10,7 @@ import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { join } from 'node:path';
-import { cardHash, PREEXISTING_ELIGIBLE } from './audit-base-repro.mjs';
+import { cardHash, PREEXISTING_ELIGIBLE, protectedPath } from './audit-base-repro.mjs';
 import { findingKey } from '../lib/audit-finding-key.mjs';
 import { FINDING_CLASSES, debtCardVerified, productionFindingBlocks, readCardFromMain } from './audit-verdict.mjs';
 
@@ -47,7 +47,8 @@ function wellFormedAudit(record) {
 }
 
 // Re-read present-day authority; an old proof is never a permanent exemption.
-function exemptionsCurrent(record, { settingsOptions, readFile, readCards, readCard, env, now, warn }) {
+export function revalidateExemptions(record, { settingsOptions = {}, readFile = readFileSync, readCards,
+  readCard = readCardFromMain, env = process.env, now = Date.now, warn = message => console.warn(message) } = {}) {
   try {
     const settings = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, ...settingsOptions });
     const policy = settings.value;
@@ -60,16 +61,18 @@ function exemptionsCurrent(record, { settingsOptions, readFile, readCards, readC
     };
     if (typeof persisted.cards !== 'string' || typeof persisted.index !== 'string') return false;
     const lines = persisted.cards.split(/\r?\n/);
-    const rows = persisted.index.split(/\r?\n/).filter(l => l.trim()).map(l => JSON.parse(l));
+    persisted.index.split(/\r?\n/).filter(l => l.trim()).forEach(l => JSON.parse(l));
     return record.preExisting.every(f => {
+      if (!validPreExisting(f)) return false;
       const [path, symbol, cls] = f.key.split('|');
+      if (protectedPath(path, [...policy.raceBlockPaths, ...policy.guardFloorPaths])) return false;
       if (!PREEXISTING_ELIGIBLE.includes(cls) || productionFindingBlocks(cls, policy.releaseStage)) return false;
       const cardPresent = lines.some(l => l.startsWith('- [R1053] ')
         && l.endsWith(` ET: pre-existing audit finding (${cls}) in we:${path}#${symbol}, reproduces on main ${f.base.sha.slice(0, 10)}: ${f.line}`));
-      if (!cardPresent && !rows.some(r => r?.key === f.key && r.cardHash === f.cardHash)) return false;
+      // An index receipt cannot substitute for the actual, exact key-bearing card line.
+      if (!cardPresent) return false;
       if (cls.startsWith('B') && !lines.some(l => l.startsWith('- [R1053][needs-you] ')
         && l.endsWith(` ET: security pre-existing (${cls}) ${f.key}`))) return false;
-      if (cls !== 'D2') return true;
       const pathToCard = /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(f.line)?.[0];
       const body = pathToCard ? readCard(pathToCard) : null;
       if (pathToCard && typeof body !== 'string') return false;
@@ -161,7 +164,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     evidence = { ok: false, reason: 'no-record' };
   }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.
-  if (evidence.ok && evidence.record?.preExisting?.length && !exemptionsCurrent(evidence.record,
+  if (evidence.ok && evidence.record?.preExisting?.length && !revalidateExemptions(evidence.record,
     { settingsOptions, readFile, readCards, readCard, env, now, warn })) {
     return refuse('canonical-audit-exemption-stale', 'pre-existing exemption authority is stale or unreadable; restore current policy/card evidence or request human review');
   }

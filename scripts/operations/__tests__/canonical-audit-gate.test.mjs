@@ -216,10 +216,12 @@ describe('R1053 additive audit records', () => {
   const entry = { line: 'x.mjs:2 unsafe return', key: 'x.mjs|X|B2',
     base: { sha: base, path: 'x.mjs', line: 2, quote: 'return unsafe();' }, relation: 'SAME', cardHash: cardHash('x.mjs|X|B2') };
   const scoped = { ...green, modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [entry] };
+  const held = f => `- [R1053] today ET: pre-existing audit finding (${f.key.split('|').at(-1)}) in we:${f.key.split('|')[0]}#${f.key.split('|')[1]}, reproduces on main ${f.base.sha.slice(0, 10)}: ${f.line}`;
+  const security = f => `- [R1053][needs-you] today ET: security pre-existing (${f.key.split('|').at(-1)}) ${f.key}`;
   const current = (audit = {}, cards = {}) => ({
     settingsOptions: { platform: null, env: {}, fileRead: () => JSON.stringify({ audit: {
       preExisting: { mode: 'prove' }, releaseStage: 'prerelease', cards: { requirePayBy: false }, ...audit } }) },
-    readCards: () => ({ cards: '- [R1053][needs-you] today ET: security pre-existing (B2) x.mjs|X|B2',
+    readCards: () => ({ cards: `${held(entry)}\n${security(entry)}`,
       index: JSON.stringify({ key: entry.key, cardHash: entry.cardHash }), ...cards }),
     readCard: () => 'mustPayBefore: 2099-01-01',
   });
@@ -235,7 +237,7 @@ describe('R1053 additive audit records', () => {
   });
   it.each(['expired', 'missing', 'malformed', 'unreadable'])('D2 rechecks persisted pay-by: %s', kind => {
     const key = 'x.mjs|X|D2', debt = { ...entry, key, line: entry.line + ' backlog/debt.md', cardHash: cardHash(key) };
-    const io = current({ cards: { requirePayBy: true } }, { index: JSON.stringify({ key, cardHash: debt.cardHash }) });
+    const io = current({ cards: { requirePayBy: true } }, { cards: held(debt), index: JSON.stringify({ key, cardHash: debt.cardHash }) });
     io.readCard = path => { expect(path).toBe('backlog/debt.md');
       if (kind === 'unreadable') throw Error('disk');
       return { expired: 'mustPayBefore: 2020-01-01', missing: '', malformed: 'mustPayBefore: 2099-02-31' }[kind]; };
@@ -250,7 +252,7 @@ describe('R1053 additive audit records', () => {
     if (kind === 'needs-you') io.readCards = () => ({ cards: '', index: JSON.stringify({ key: entry.key, cardHash: entry.cardHash }) });
     expect(fixture({ records: [scoped], exemptionIO: io }).result.reason).toBe('canonical-audit-exemption-stale');
   });
-  it('accepts a current indexed security exemption and leaves historical passes unaffected', () => {
+  it('accepts a current persisted security exemption and leaves historical passes unaffected', () => {
     expect(fixture({ records: [scoped], exemptionIO: current() }).result.ok).toBe(true);
     expect(fixture({ records: [green], exemptionIO: { readCards: () => { throw Error('must not read'); } } }).result.ok).toBe(true);
   });
@@ -266,8 +268,8 @@ describe('R1053 additive audit records', () => {
     const cards = `- [R1053] today ET: pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${base.slice(0, 10)}: ${entry.line}\n- [R1053][needs-you] today ET: security pre-existing (B2) ${entry.key}`;
     expect(fixture({ records: [scoped], exemptionIO: current({}, { cards, index: '' }) }).result.ok).toBe(true);
   });
-  it('requires the matching index hash and revalidates every exemption', () => {
-    const wrongHash = current({}, { index: JSON.stringify({ key: entry.key, cardHash: '0'.repeat(64) }) });
+  it('refuses a stale index without a held card and revalidates every exemption', () => {
+    const wrongHash = current({}, { cards: security(entry), index: JSON.stringify({ key: entry.key, cardHash: '0'.repeat(64) }) });
     expect(fixture({ records: [scoped], exemptionIO: wrongHash }).result.reason).toBe('canonical-audit-exemption-stale');
     const key = 'other.mjs|Y|B3';
     const second = { ...entry, key, cardHash: cardHash(key) };
@@ -276,12 +278,45 @@ describe('R1053 additive audit records', () => {
   });
   it('D2 accepts current persisted pay-by and revokes it when the clock reaches the deadline', () => {
     const key = 'x.mjs|X|D2', debt = { ...entry, key, line: entry.line + ' backlog/debt.md', cardHash: cardHash(key) };
-    const io = current({ cards: { requirePayBy: true } }, { index: JSON.stringify({ key, cardHash: debt.cardHash }) });
+    const io = current({ cards: { requirePayBy: true } }, { cards: held(debt), index: JSON.stringify({ key, cardHash: debt.cardHash }) });
     io.now = () => Date.parse('2098-12-31');
     const records = [{ ...scoped, preExisting: [debt] }];
     expect(fixture({ records, exemptionIO: io }).result.ok).toBe(true);
     io.now = () => Date.parse('2099-01-01');
     expect(fixture({ records, exemptionIO: io }).result.reason).toBe('canonical-audit-exemption-stale');
+  });
+  it.each(['', undefined, 'unrelated card', security(entry)])('index alone cannot authorize missing or changed card storage: %j', cards => {
+    expect(fixture({ records: [scoped], exemptionIO: current({}, { cards }) }).result.reason)
+      .toBe('canonical-audit-exemption-stale');
+  });
+  it('B-class requires the persisted needs-you line even when the held card and index remain', () => {
+    expect(fixture({ records: [scoped], exemptionIO: current({}, { cards: held(entry) }) }).result.reason)
+      .toBe('canonical-audit-exemption-stale');
+  });
+  it.each(['E1', 'E2', 'B2', 'D2'])('%s shares auditor pay-by requirements for expired, missing and current cards', cls => {
+    const key = `x.mjs|X|${cls}`, exemption = { ...entry, key, cardHash: cardHash(key), line: entry.line + ' backlog/debt.md' };
+    const records = [{ ...scoped, preExisting: [exemption] }];
+    const io = current({ cards: { requirePayBy: true } }, { cards: `${held(exemption)}\n${security(exemption)}`, index: '' });
+    io.now = () => Date.parse('2098-12-31');
+    for (const body of [null, '', 'mustPayBefore: 2020-01-01', 'mustPayBefore: 2099-02-31']) {
+      io.readCard = () => body;
+      expect(fixture({ records, exemptionIO: io }).result.reason).toBe('canonical-audit-exemption-stale');
+    }
+    io.readCard = () => 'mustPayBefore: 2099-01-01';
+    expect(fixture({ records, exemptionIO: io }).result.ok).toBe(true);
+    io.now = () => Date.parse('2099-01-01');
+    expect(fixture({ records, exemptionIO: io }).result.reason).toBe('canonical-audit-exemption-stale');
+    const noReference = { ...exemption, line: entry.line };
+    expect(fixture({ records: [{ ...scoped, preExisting: [noReference] }],
+      exemptionIO: current({ cards: { requirePayBy: true } }, { cards: `${held(noReference)}\n${security(noReference)}`, index: '' }) }).result.reason)
+      .toBe('canonical-audit-exemption-stale');
+  });
+  it.each(['builtin', 'raceBlockPaths', 'guardFloorPaths'])('revokes exemptions on current protected paths: %s', source => {
+    const path = source === 'builtin' ? 'scripts/lib/marker-authorship.mjs' : 'x.mjs';
+    const key = `${path}|X|B2`, exemption = { ...entry, key, cardHash: cardHash(key), line: `${path}:2 unsafe return`, base: { ...entry.base, path } };
+    expect(fixture({ records: [{ ...scoped, preExisting: [exemption] }],
+      exemptionIO: current(source === 'builtin' ? {} : { [source]: [path] }, { cards: `${held(exemption)}\n${security(exemption)}`, index: '' }) }).result.reason)
+      .toBe('canonical-audit-exemption-stale');
   });
   it.each([
     { key: undefined }, { key: 2 }, { key: 'x.mjs|X|Z9' }, { key: 'x.mjs|X|B2|extra' }, { key: '|X|B2' },
