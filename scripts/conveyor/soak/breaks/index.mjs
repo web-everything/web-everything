@@ -44,6 +44,7 @@
  * `red-team-gate-send-back-failed-never-retried.mjs` uses the same automatic registration.
  * `ready-candidate-diagnostic-event-masks-drop.mjs` uses the same automatic registration.
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.
+ * `unchecked-draft-and-stale-accepted-status.mjs` uses the same automatic registration.
  *
  * `daemon-load-overlay-stale-tracking-ref.mjs` uses the same automatic registration.
  *
