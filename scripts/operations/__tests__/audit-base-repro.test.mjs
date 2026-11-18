@@ -8,8 +8,9 @@ const finding = { text: 'lib/x.mjs:2 missing guard', sourceText: source };
 const answer = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') =>
   `#1 ${status} ${relation} CLASS=${cls} BASE=lib/x.mjs:2\nQUOTE: return unsafe();`;
 const diff = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n@@ -5 +5 @@\n-  return old();\n+  return fixed();\n';
+const stat = '1\t1\tlib/x.mjs\n';
 const options = over => ({ findings: [finding], answers: parseReproAnswer(answer(), 1), baseSha: 'base-sha', headSha: 'head-sha',
-  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff), recheckMax: 6, cardWritten: () => true, ...over });
+  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, cardWritten: () => true, ...over });
 const classify = over => classifyPreExisting(options(over));
 
 describe('strict reproduction protocol', () => {
@@ -68,13 +69,16 @@ describe('pre-existing classification', () => {
   });
   it('an empty, truncated or incomplete diff clears nothing', () => {
     expect(classify({ changedLines: parseDiffChangedLines('') })[0].blocking).toBe(true);
-    expect(classify({ changedLines: parseDiffChangedLines(diff.replace('+  return fixed();\n', '')) })[0].blocking).toBe(true);
+    expect(classify({ changedLines: parseDiffChangedLines(diff.replace('+  return fixed();\n', ''), stat) })[0].blocking).toBe(true);
     expect(classify({ changedLines: new Map() })[0].blocking).toBe(true);
     const headerOnly = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
-    expect(parseDiffChangedLines(headerOnly).complete).toBe(false);
+    expect(parseDiffChangedLines(headerOnly, stat).complete).toBe(false);
+    expect(parseDiffChangedLines('diff --git a/lib/x.mjs b/lib/x.mjs\n', stat).complete).toBe(false);
+    expect(parseDiffChangedLines(diff.replace('-  return old();\n', ''), stat).complete).toBe(false);
+    expect(parseDiffChangedLines(diff).complete).toBe(false);
     const cutEarlier = diff.replace('+  return fixed();\n', '') + diff;
-    expect(parseDiffChangedLines(cutEarlier).complete).toBe(false);
-    expect(parseDiffChangedLines(diff).complete).toBe(true);
+    expect(parseDiffChangedLines(cutEarlier, stat).complete).toBe(false);
+    expect(parseDiffChangedLines(diff, stat).complete).toBe(true);
   });
   it('the base quote must sit at the claimed base line and path', () => {
     const wrongLine = parseReproAnswer(answer().replace('lib/x.mjs:2', 'lib/x.mjs:999999'), 1);
@@ -84,7 +88,7 @@ describe('pre-existing classification', () => {
   });
   it('a2 flagged changed head line blocks before carding', () => {
     const cardWritten = vi.fn();
-    expect(classify({ changedLines: new Map([['lib/x.mjs', new Set([2])]]), cardWritten })[0].blocking).toBe(true);
+    expect(classify({ changedLines: Object.assign(new Map([['lib/x.mjs', new Set([2])]]), { complete: true }), cardWritten })[0].blocking).toBe(true);
     expect(cardWritten).not.toHaveBeenCalled();
   });
   it.each([

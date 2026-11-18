@@ -84,27 +84,33 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
 }
 
 /** Parse added head ranges, including additions replacing removed lines; deletions add no head lines. */
-export function parseDiffChangedLines(diffU0Text) {
-  const files = new Map(); let file = null, remaining = 0, headLine = 0, hunks = 0, bad = false;
-  const endSection = () => { if (remaining > 0 || (file && !hunks)) bad = true; remaining = 0; hunks = 0; };
-  for (const line of diffU0Text.split('\n')) {
-    if (remaining > 0 && /^[ +]/.test(line)) {
-      if (line.startsWith('+')) files.get(file).add(headLine);
-      headLine++; remaining--; continue;
-    }
-    if (line.startsWith('diff --git ')) { endSection(); file = null; }
+export function parseDiffChangedLines(diffU0Text, numstatText) {
+  const files = new Map(), seen = new Map(); let file = null, newLeft = 0, oldLeft = 0, headLine = 0, bad = false;
+  const endHunk = () => { if (newLeft > 0 || oldLeft > 0) bad = true; newLeft = oldLeft = 0; };
+  for (const line of String(diffU0Text).split('\n')) {
+    if (oldLeft > 0 && line.startsWith('-')) { oldLeft--; continue; }
+    if (newLeft > 0 && line.startsWith('+')) { files.get(file).add(headLine++); newLeft--; continue; }
+    if (line.startsWith('diff --git ')) { endHunk(); file = null; }
     if (line.startsWith('+++ b/')) {
-      const path = line.slice(6);
-      try { file = findingKey({ file: path, class: 'B1' }).split('|')[0]; files.set(file, files.get(file) || new Set()); }
+      try { file = findingKey({ file: line.slice(6), class: 'B1' }).split('|')[0]; files.set(file, files.get(file) || new Set()); }
       catch { file = null; bad = true; }
     }
-    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-    if (hunk && remaining > 0) bad = true;
-    if (hunk && file) { headLine = Number(hunk[1]); remaining = Number(hunk[2] ?? 1); hunks++; }
+    const hunk = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (hunk) {
+      endHunk();
+      const del = Number(hunk[1] ?? 1), add = Number(hunk[3] ?? 1);
+      if (!file) { bad = true; continue; }
+      headLine = Number(hunk[2]); oldLeft = del; newLeft = add;
+      const t = seen.get(file) || [0, 0]; seen.set(file, [t[0] + add, t[1] + del]);
+    }
   }
-  endSection();
-  // Complete only for a non-empty diff where every file section had a hunk read in full; anything else clears nothing.
-  files.complete = !bad && /^diff --git /m.test(diffU0Text);
+  endHunk();
+  // Complete only when `git diff --numstat -U0` counts agree with every file's hunks; anything else clears nothing.
+  const stat = String(numstatText ?? '').split('\n').filter(Boolean).map(l => /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(l));
+  const agrees = stat.length > 0 && stat.every(m => m && (m[1] === '-' ? true : (() => {
+    try { const p = findingKey({ file: m[3], class: 'B1' }).split('|')[0], t = seen.get(p);
+      return !!t && t[0] === Number(m[1]) && t[1] === Number(m[2]); } catch { return false; } })()));
+  files.complete = !bad && agrees;
   return files;
 }
 
