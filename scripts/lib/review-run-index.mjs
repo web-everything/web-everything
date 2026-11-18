@@ -2,7 +2,8 @@
  * Overflow/corruption/missing records fall back to the ordinary scan and its HOLD.
  * Backfill stages a complete pass over review ids, at most 50 payloads per drain tick.
  */
-import { mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { isValidRunId, parseRunRecord } from '../operations/run-record.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
@@ -23,17 +24,59 @@ function validEntries(index) {
 }
 function load(path) {
   const index = readJson(path);
-  if (!validEntries(index)) throw Error('invalid review index');
-  return index;
+  if (index?.version === 2 && validEntries(index.entries)) return index;
+  if (validEntries(index)) return { version: 2, entries: index }; // legacy hints have no completeness proof
+  throw Error('invalid review index');
 }
 function writeBounded(path, value) {
   if (Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`) > MAX_BYTES) throw Error('review index oversized; inspect omitted runs manually');
   writeJsonAtomic(path, value);
 }
-export function readReviewRunIndex(runsDir, repo, pr) {
-  try { return (load(reviewRunIndexPath(runsDir))[keyOf(repo, pr)] ?? []).map(row => row.id); }
-  catch { return []; }
+const listReviewIds = dir => readdirSync(dir).filter(name => name.endsWith('.json')).map(name => name.slice(0, -5)).filter(reviewId);
+function poisonNames(path) {
+  try { return readdirSync(`${path}.poison`).sort(); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
 }
+function poison(path) {
+  try {
+    mkdirSync(`${path}.poison`, { recursive: true });
+    // Unique, create-only markers cannot lose a failure racing a backfill or another writer.
+    writeFileSync(join(`${path}.poison`, randomUUID()), '', { flag: 'wx' });
+  } catch { /* The reader's stat-only snapshot check also detects a lost append. */ }
+}
+function listing(runsDir, list, stat) {
+  return list(runsDir).filter(reviewId).sort().map(id => {
+    const metadata = stat(id), mtimeMs = metadata.mtimeMs;
+    if (!Number.isFinite(mtimeMs)) throw Error('unreadable review mtime');
+    // Run-store writes use atomic replacement. File identity detects a missed append
+    // even when a replacement preserves a coarse/old mtime and poison creation failed.
+    const identity = [metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs].map(value => value ?? null);
+    return { id, mtimeMs, identity };
+  });
+}
+export function readReviewRunIndex(runsDir, repo, pr, {
+  list = listReviewIds, stat = id => statSync(join(runsDir, `${id}.json`)),
+} = {}) {
+  try {
+    const path = reviewRunIndexPath(runsDir), index = load(path), proof = index.completeness;
+    const key = keyOf(repo, pr), rows = index.entries[key] ?? [];
+    if (!proof || !Number.isFinite(proof.completeThroughMtimeMs)
+      || !Array.isArray(proof.keys) || proof.keys.length > MAX_KEYS || !proof.keys.includes(key)
+      || !Array.isArray(proof.files) || !proof.files.every(row => reviewId(row?.id) && Number.isFinite(row.mtimeMs))
+      || !Array.isArray(proof.poisons)
+      || JSON.stringify(proof.poisons) !== JSON.stringify(poisonNames(path))) return [];
+    const seen = new Map(proof.files.map(row => [row.id, JSON.stringify(row)]));
+    const indexed = new Map(rows.map(row => [row.id, row.mtimeMs]));
+    for (const row of listing(runsDir, list, stat)) {
+      if (indexed.get(row.id) === row.mtimeMs) continue;
+      // Also reject absent ids with old/coarse mtimes: a failed poison write cannot hide them.
+      if (seen.get(row.id) !== JSON.stringify(row) || row.mtimeMs > proof.completeThroughMtimeMs) return [];
+    }
+    if (JSON.stringify(proof.poisons) !== JSON.stringify(poisonNames(path))) return [];
+    return rows.map(row => row.id);
+  } catch { return []; }
+}
+
 function add(index, key, row) {
   if (!reviewId(row.id) || !Number.isFinite(row.mtimeMs)) throw Error('invalid review index metadata');
   // Empty is a persistent overflow sentinel: never silently drop a possibly newer review.
@@ -66,19 +109,23 @@ export function appendReviewRunIndex(record, runsDir, mtimeMs) {
   try {
     mtimeMs ??= statSync(join(runsDir, `${record.id}.json`)).mtimeMs;
     return withFileLock(`${path}.lock`, () => {
-      let index; try { index = load(path); } catch { index = {}; }
-      add(index, key, { id: record.id, mtimeMs });
+      let index;
+      try { index = load(path); } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        index = { version: 2, entries: {} };
+      }
+      add(index.entries, key, { id: record.id, mtimeMs });
       writeBounded(path, index);
       return true;
     }, { timeoutMs: 0 });
-  } catch { return false; }
+  } catch { poison(path); return false; }
 }
 /** Caller supplies the live open set: qualified repo#PR keys, or numbers with `repo`.
  * Cursor and staging survive daemon restarts. No partial pass is published. Unreadable
  * candidate records abort the batch, leaving the normal fail-closed scan in charge.
  */
 export function backfillReviewRunIndex({ runsDir, repo, openPrs, maxParses = 50,
-  list = dir => readdirSync(dir).filter(name => name.endsWith('.json')).map(name => name.slice(0, -5)),
+  list = listReviewIds,
   read = id => {
     const parsed = parseRunRecord(readFileSync(join(runsDir, `${id}.json`), 'utf8'));
     if (!parsed.ok) throw Error(parsed.reason);
@@ -94,22 +141,27 @@ export function backfillReviewRunIndex({ runsDir, repo, openPrs, maxParses = 50,
     return withFileLock(`${path}.lock`, () => {
       let state;
       try { state = readJson(statePath); } catch { /* start a pass */ }
-      if (state?.signature !== signature || !validEntries(state.entries) || typeof state.after !== 'string') state = { signature, after: '', entries: {} };
-      const ids = list(runsDir).filter(reviewId).filter(id => id > state.after).sort();
+      const files = listing(runsDir, list, stat);
+      if (state?.signature !== signature || !validEntries(state.entries) || typeof state.after !== 'string'
+        || JSON.stringify(state.files) !== JSON.stringify(files)) {
+        state = { signature, after: '', entries: {}, files, poisons: poisonNames(path) };
+      }
+      const ids = files.map(row => row.id).filter(id => id > state.after);
       const batch = ids.slice(0, maxParses);
       for (const id of batch) {
         const record = read(id), key = keyOf(record?.input?.repo, record?.input?.pr);
-        if (record?.id === id && record.op === 'review-pr' && wanted.has(key)) add(state.entries, key, { id, mtimeMs: stat(id).mtimeMs });
+        if (record?.id !== id || record.op !== 'review-pr' || !key) throw Error('unverified backfill record');
+        if (wanted.has(key)) add(state.entries, key, { id, mtimeMs: stat(id).mtimeMs });
         state.after = id;
       }
       const complete = batch.length === ids.length;
       if (complete) {
-        let index; try { index = load(path); } catch { index = {}; }
-        for (const [key, entries] of Object.entries(state.entries)) {
-          if (entries.length === 0) index[key] = [];
-          else for (const row of entries) add(index, key, row);
-        }
-        writeBounded(path, index);
+        if (JSON.stringify(files) !== JSON.stringify(listing(runsDir, list, stat))) throw Error('review listing changed during backfill');
+        // Replace, rather than merge, every rebuilt key. Only this complete pass clears poison.
+        const entries = Object.fromEntries(keys.map(key => [key, state.entries[key] ?? []]));
+        const completeThroughMtimeMs = files.reduce((max, row) => Math.max(max, row.mtimeMs), 0);
+        writeBounded(path, { version: 2, entries,
+          completeness: { keys, files, completeThroughMtimeMs, poisons: state.poisons } });
         state = { signature, after: '', entries: {} };
       }
       writeBounded(statePath, state);

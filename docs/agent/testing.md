@@ -4588,3 +4588,19 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+
+## Review index completeness proof
+
+Appending a review id is only a discovery hint. Trust requires a completed backfill's
+`completeThroughMtimeMs`, stat-only id/mtime/file-identity snapshot, rebuilt PR keys, and acknowledged
+create-only poison markers. A changed listing restarts a staged pass, including ids behind
+the cursor. Failed appends poison the whole sidecar independently of its write lock; only a
+complete rebuild acknowledges those markers. Readers stat the current listing before parsing
+indexed ids and fall back on unknown ids, changed unindexed mtimes, missing watermarks,
+unreadable listings or new poison markers. File identity also detects atomic replacements with
+unchanged mtimes when marker creation fails. Even an older/coarse mtime cannot hide an unknown id.
+Oversized snapshots retain the bounded scan and its scan-capped
+HOLD; inspect omitted runs manually. Keep the lost-append, poison, complete-hit and restart
+regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
+through heavy admission.

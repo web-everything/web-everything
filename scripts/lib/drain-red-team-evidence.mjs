@@ -499,7 +499,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
     if (!scan) {
-      const ids = readReviewRunIndex(runsDir, repo, pr);
+      const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)) });
       if (ids.length) {
         try {
           runScan(ids);
