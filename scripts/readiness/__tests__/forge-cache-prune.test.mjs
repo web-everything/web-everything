@@ -80,7 +80,7 @@ async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active') {
   return run;
 }
 const record = siblings => ({lock, inputDigest: hex('b'), manifestDigest: hex('c'),
-  manifest: siblings ? {siblings: {frontierui: {sha: 'd'.repeat(40)}}} : {}});
+  manifest: siblings ? {siblings: true} : {}});
 
 describe('resolveSettings', () => {
   it('refuses entirely missing bounds and names the first missing variable', () => {
@@ -672,6 +672,50 @@ describe('live reservation compatibility', () => {
 });
 
 describe('readLiveEvidence', () => {
+  const selectorCases = [
+    {scenario: 'string siblings', evidence: {siblings: 'true'}},
+    {scenario: 'numeric siblings', evidence: {siblings: 1}},
+    {scenario: 'null siblings', evidence: {siblings: null}},
+    {scenario: 'string manifest', evidence: {manifest: 'invalid'}},
+    {scenario: 'array manifest', evidence: {manifest: []}},
+    {scenario: 'string manifest.siblings', evidence: {manifest: {siblings: 'yes'}}},
+    {scenario: 'numeric manifest.siblings', evidence: {manifest: {siblings: 1}}},
+    {scenario: 'null manifest.siblings', evidence: {manifest: {siblings: null}}},
+    {scenario: 'historical object manifest.siblings', evidence: {manifest: {siblings: {frontierui: {sha: 'd'.repeat(40)}}}}},
+    {scenario: 'array manifest.siblings', evidence: {manifest: {siblings: []}}},
+    {scenario: 'invalid siblingShas despite valid siblings', evidence: {siblings: true, siblingShas: {}}},
+    {scenario: 'invalid siblings despite valid manifest', evidence: {siblings: 'true', manifest: {siblings: true}}},
+    {scenario: 'valid false selectors', evidence: {siblings: false, manifest: {siblings: false}}, resolved: true},
+    {scenario: 'valid true selectors', evidence: {siblings: true, manifest: {siblings: true}}, resolved: true},
+    {scenario: 'absent selectors', evidence: {}, resolved: true, receiptFallback: true},
+    {scenario: 'null manifest is no signal', evidence: {manifest: null}, resolved: true, receiptFallback: true},
+  ];
+  it.each(selectorCases.flatMap(testCase => ['prepared', 'running', 'receipt'].flatMap(suffix =>
+    (testCase.resolved || suffix === 'receipt' ? [true] : [false, true])
+      .map(withDigests => ({...testCase, suffix, withDigests})))))
+  ('leaked reservation with $scenario in $suffix (digests=$withDigests) protects the whole lock unless resolved', async ({evidence, suffix, withDigests, resolved: selectorsResolved = false, receiptFallback = false}) => {
+    const resolved = selectorsResolved && (!receiptFallback || suffix === 'receipt');
+    const run = await reserve();
+    const receiptPath = join(receipts, `${run}.receipt`);
+    const evidencePath = join(receipts, `${run}.${suffix}`);
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), ...(suffix === 'receipt' ? evidence : {})});
+    if (suffix !== 'receipt') {
+      await json(evidencePath, {lock, ...(withDigests ? {inputDigest: hex('b'), manifestDigest: hex('c')} : {}), ...evidence});
+      await fs.utimes(evidencePath, (now - 3000) / 1000, (now - 3000) / 1000);
+    }
+    await fs.utimes(join(receipts, 'worker-active', 'reservation.json'),
+      (now - 3 * HOUR) / 1000, (now - 3 * HOUR) / 1000);
+    await fs.utimes(receiptPath, (now - 2000) / 1000, (now - 2000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(resolved ? [] : [lock]));
+    expect(live.profiles).toEqual(new Set());
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), resolved ? profiles : [], resolved ? [] : profiles);
+  });
+
   const siblingSelectionCases = [
     {scenario: 'receipt siblings:false conflicts with valid siblingShas',
       evidence: {siblings: false, siblingShas: {frontierui: 'd'.repeat(40)}}, conflict: true},

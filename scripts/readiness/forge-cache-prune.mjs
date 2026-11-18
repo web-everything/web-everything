@@ -253,14 +253,22 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
             throw new Error('Invalid reserved profile evidence');
           }
         }
-        const manifestKnown = record.manifest && typeof record.manifest === 'object' && !Array.isArray(record.manifest);
+        const manifestPresent = record.manifest !== undefined && record.manifest !== null;
+        const manifestKnown = manifestPresent && typeof record.manifest === 'object'
+          && Object.getPrototypeOf(record.manifest) === Object.prototype;
         // A final receipt has no manifest: its siblingShas say which digest names the profile.
         // The writer omits this field without siblings and otherwise emits a nonempty SHA map.
-        const invalidSiblingShas = suffix === 'receipt' && record.siblingShas !== undefined
+        const invalidSiblingShas = record.siblingShas !== undefined
           && !(record.siblingShas !== null && typeof record.siblingShas === 'object'
             && Object.getPrototypeOf(record.siblingShas) === Object.prototype
             && Object.keys(record.siblingShas).length > 0
             && Object.values(record.siblingShas).every(sha => typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha)));
+        // Any present but invalid selector makes this record unresolved, even if
+        // another selector agrees or the receipt fallback could select a digest.
+        const invalidSelector = (record.siblings !== undefined && typeof record.siblings !== 'boolean')
+          || (manifestPresent && !manifestKnown)
+          || (manifestKnown && record.manifest.siblings !== undefined && typeof record.manifest.siblings !== 'boolean')
+          || invalidSiblingShas;
         // Explicit signals must agree before any digest can narrow lock protection.
         // An omitted receipt siblingShas is only the fallback, not a contrary signal.
         const siblingSignals = [];
@@ -268,7 +276,7 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         if (typeof record.siblings === 'boolean') siblingSignals.push(record.siblings);
         if (suffix === 'receipt' && record.siblingShas !== undefined && !invalidSiblingShas) siblingSignals.push(true);
         const conflictingSiblings = siblingSignals.some(signal => signal !== siblingSignals[0]);
-        const siblings = invalidSiblingShas || conflictingSiblings ? undefined
+        const siblings = invalidSelector || conflictingSiblings ? undefined
           : siblingSignals.length ? siblingSignals[0] : suffix === 'receipt' ? false : undefined;
         const digest = siblings === undefined ? undefined : (siblings ? record.manifestDigest : record.inputDigest);
         const profileKnown = typeof digest === 'string' && HEX.test(digest);
@@ -276,9 +284,9 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
         if (!leaked && profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
         // Evidence asserting a profile must resolve even when a newer record is known.
-        if (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined
+        if (invalidSelector || (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined
           || typeof record.siblings === 'boolean' || manifestKnown
-          || (suffix === 'receipt' && record.siblingShas !== undefined))) {
+          || (suffix === 'receipt' && record.siblingShas !== undefined)))) {
           unresolvedProfile = true;
         }
         // The newest record decides: an older known profile must not mask a later unknown one.
