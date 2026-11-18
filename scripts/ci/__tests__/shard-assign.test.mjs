@@ -1,5 +1,7 @@
+// @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
@@ -59,6 +61,7 @@ describe('shard-assign — timings from vitest json reports', () => {
     expect(() => assertTimingKeys({ unit })).toThrow(/repository-relative/);
     expect(() => formatUpdatedTimings({ unit: {}, soak: {} }, 'unit', unit)).toThrow(/repository-relative/);
     expect(() => assertTimingKeys({ soak: unit })).toThrow(/repository-relative/);
+    expect(() => assertTimingKeys({ integration: unit })).toThrow(/repository-relative/);
   });
 
   it('maps absolute names to repo-relative seconds, keeping the largest sample', () => {
@@ -104,4 +107,45 @@ describe('shard-assign — persisted unit timing freshness', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+
+describe('integration timing persistence', () => {
+  it.each(['unit', 'soak', 'integration'])('updating %s round-trips all three sections', (suite) => {
+    const dir = mkdtempSync(join(tmpdir(), 'timing-roundtrip-'));
+    try {
+      const file = join(dir, 'timings.json');
+      const original = { unit: { 'u.test.mjs': 1 }, soak: { 's.test.mjs': 2 }, integration: { 'i.test.mjs': 3 } };
+      writeFileSync(file, formatUpdatedTimings(original, suite, { 'new.test.mjs': 4 }));
+      expect(loadTimings(file)).toEqual({ ...original, [suite]: { 'new.test.mjs': 4 } });
+      expect(loadTimings(join(dir, 'missing'))).toEqual({ unit: {}, soak: {}, integration: {} });
+      writeFileSync(file, JSON.stringify({ unit: original.unit, soak: original.soak }));
+      expect(loadTimings(file).integration).toEqual({}); // persisted pre-TT1 format
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('CLI --update --suite=integration writes timings and refuses assignment or an empty update', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'integration-update-'));
+    try {
+      const script = join(dir, 'shard-assign.mjs');
+      const file = join(dir, 'test-timings.json');
+      const report = join(dir, 'report.json');
+      writeFileSync(script, readFileSync(new URL('../shard-assign.mjs', import.meta.url)));
+      const original = { unit: { 'u.test.mjs': 1 }, soak: { 's.test.mjs': 2 }, integration: {} };
+      writeFileSync(file, JSON.stringify(original));
+      // The copied CLI resolves its root two directories above its location.
+      writeFileSync(report, JSON.stringify({ testResults: [{ name: join(dir, 'i.test.mjs'), startTime: 0, endTime: 2500 }] }));
+      execFileSync(process.execPath, [script, '--suite=integration', `--update=${report}`], { timeout: 5000 });
+      const updated = loadTimings(file);
+      expect(updated.unit).toEqual(original.unit);
+      expect(updated.soak).toEqual(original.soak);
+      expect(Object.values(updated.integration)).toEqual([2.5]);
+      for (const args of [[], ['--shard=1/2'], [`--update=${report}`, '--shard=1/2'], ['--update='], [`--update=${report}`, '--group=covered']]) {
+        const result = spawnSync(process.execPath, [script, '--suite=integration', ...args], { encoding: 'utf8', timeout: 5000 });
+        expect(result.status).toBe(2);
+        expect(result.stderr).toMatch(/requires|forbids/);
+      }
+      expect(loadTimings(file)).toEqual(updated);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });

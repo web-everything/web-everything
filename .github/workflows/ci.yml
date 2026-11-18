@@ -495,7 +495,16 @@ jobs:
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
-        run: npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")
+        run: npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration.json $(node scripts/ci/quarantine-skip.mjs --job="integration")
+
+      # Per-file timing evidence only; missing reports never gate CI.
+      - name: Upload integration timings
+        if: ${{ needs.changes.outputs.light != 'true' && (always()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-integration
+          path: web-everything/coverage/timing-integration.json
+          if-no-files-found: ignore
 
   # #4075 DAEMON SOAK HARNESS (card x0zg44l) — `npm run test:soak`: the REAL review + fix daemons, the real
   # rebuild/self-sync + live smoke gate, a real bare remote with main moving, fake GitHub + fake sessions, the
