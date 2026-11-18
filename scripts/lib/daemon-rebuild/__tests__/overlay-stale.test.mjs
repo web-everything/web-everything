@@ -97,6 +97,17 @@ describe('post-plan stale detector', () => {
     expect(t()[0].count).toBe(1);
     expect(t()[0].count).toBe(2);
   });
+  it('attention head stays unique for long branch names (feed truncates head to 128 chars)', () => {
+    const long = `lane/${'x'.repeat(200)}`, heads = [];
+    overlay = { ref: long, pr: 0, addedAt: 'a' };
+    const t = () => tick({ remoteTips: { [long]: tip }, emit: r => heads.push(r) });
+    t(); t(); t();
+    overlay = { ...overlay, addedAt: 'b' };
+    t(); t(); t();
+    expect(heads).toHaveLength(2);
+    const seen = new Set(heads.map(r => detector.attentionHead(r).slice(0, 128)));
+    expect(seen.size).toBe(2);
+  });
   it('a failed publish is retried next tick and then marked delivered', () => {
     emit.mockImplementationOnce(() => { throw new Error('feed down'); });
     tick(); tick(); tick();

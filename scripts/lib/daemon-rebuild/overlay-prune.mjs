@@ -43,11 +43,13 @@ export function readOpenPrHeads(root, env, query = runGhSync) {
       && rows.every(r => typeof r.headRefName === 'string' && FULL_SHA_RE.test(r.headRefOid)) ? rows : null;
   } catch { return null; }
 }
+/** Fixed-length identity: the feed truncates `head`, so branch name length must not erase tip/registration. */
+export const attentionHead = row => createHash('sha256').update(`${row.ref}\0${row.tip ?? ''}\0${row.registration ?? ''}`).digest('hex').slice(0, 40);
 function notify(root, env, row) {
   const kind = row.reason === 'conflict' ? 'overlay-stale-conflict' : `overlay-stale-${row.reason}`;
   appendOverlayEvent(root, { kind, ...row }, { env });
   if (row.reason !== 'superseded') publishAttention({ repo: 'web-everything', pr: 0,
-    head: `${row.ref}@${row.tip ?? 'unknown'}#${row.registration ?? ''}`, ref: row.ref, kind, title: `Overlay ${row.ref}`, reason: row.reason, ...row,
+    head: attentionHead(row), ref: row.ref, kind, title: `Overlay ${row.ref}`, reason: row.reason, ...row,
   }, { path: feedPath({ env }) });
 }
 /** Unknown inputs retain the registration and request operator inspection. No loss inference lives here. */

@@ -146,7 +146,8 @@ export async function prepareRebuild({
   const finishVerifiedSwaps = async () => {
     try {
       if (!state.inProgress && !state.unverified && !state.quarantine && state.adopted?.head
-        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled) {
+        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled
+        && !dropPendingNow()) { // swaps remove registrations: never while a drop intent is unsettled
         await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent });
       }
     } catch (error) {
