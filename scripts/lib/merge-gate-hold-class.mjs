@@ -8,7 +8,7 @@
 import { readFileSync } from 'node:fs';
 import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
 import { GATE_IDS } from './merge-gate-inventory.mjs';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { reviewHoldRollupRows } from './review-hold-rollup.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -115,7 +115,7 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
 
 /** Find a completed failure among current job partitions; another workflow cannot hide it. */
 export function latestFailingMergeGate(rows) {
-  return collapseRollupToLatestPerName(rows).find(row => row.name === 'merge-gate'
+  return reviewHoldRollupRows(rows).find(row => row?.name === 'merge-gate'
     && String(row.status).toLowerCase() === 'completed'
     && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase())) ?? null;
 }

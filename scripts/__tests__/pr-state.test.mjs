@@ -66,8 +66,8 @@ describe('prStateRecord', () => {
     const supersededThenGreen = {
       ...greenView,
       statusCheckRollup: [
-        { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'CANCELLED', run_attempt: 1 },
-        { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2 },
+        { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'CANCELLED' },
+        { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
       ],
     };
     expect(prStateRecord(supersededThenGreen).checks).toBe('passed');

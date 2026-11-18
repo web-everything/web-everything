@@ -382,7 +382,8 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
             { status: value === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'COMPLETED',
               ...(name === 'merge-gate' && value === 'FAILURE'
                 ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) })];
-        const readers = { readPr: () => gatePr([...row('test', required), ...row(gate, state)]),
+        const readers = { readPr: () => gatePr([...row('test', required),
+          ...(state === 'FAILURE' ? [check(gate, 'SUCCESS')] : []), ...row(gate, state)]),
           readRequired: async () => ({ checks: ['test', gate] }) };
         const human = await checkNeedsHumanEscalable({ ...humanOptions(), ...readers });
         const notCi = await checkNotCiBreakRecordable({ ...recordOptions(), ...readers });
@@ -737,6 +738,7 @@ const facts = ${JSON.stringify({ number: 6042, labels, headRefOid: HEAD, statusC
   ...(evidence === 'conflicting-flags' ? [
     { name: gate, status: 'COMPLETED', conclusion: 'FAILURE', required: false },
   ] : []),
+  { name: gate, status: 'COMPLETED', conclusion: 'SUCCESS' },
   { name: gate, status: 'COMPLETED', conclusion: 'FAILURE',
     ...(gate === 'review-gate' && evidence === 'review'
       ? { output: { summary: 'check-review-gate held - a review hold stands: review:pending' } } : {}),
@@ -921,6 +923,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     const facts = { number: 6042, url: 'https://github.com/example/repo/pull/6042',
       headRefOid: HEAD, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'merge-gate', id: 1, status: 'COMPLETED', conclusion: 'SUCCESS' },
         { name: 'merge-gate', id: jobId, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T13:00:00-04:00' },
       ] };
     return { pr: 6042, repo: 'example/repo', headSha: HEAD, outcome: 'needs-human',

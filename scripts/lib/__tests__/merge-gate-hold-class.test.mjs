@@ -7,7 +7,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { parsePrResultTable, classifyMergeGateHold, excuseMergeGateRows, latestFailingMergeGate, resolveMergeGateHoldSetting, readMergeGateVerdict } from '../merge-gate-hold-class.mjs';
 import { runReconcilePass } from '../../conveyor/reconcile-pass.mjs';
 import { defaultReadHeadCheckState } from '../../operations/promote-draft-pr-dispatch.mjs';
-import { reduceCheckState } from '../../operations/pr-status.mjs';
+import { requiredCheckStates } from '../../conveyor/ci-heal-verdict-recheck.mjs';
 
 const log4965 = `2026-10-12T09:49:30.3934630Z #4965: HOLD
 2026-10-12T09:49:30.3936795Z   hold              candidate-label        no "ready-to-merge" label — the drain never considers it
@@ -71,7 +71,7 @@ describe('settings and row evidence', () => {
       { ...review, conclusion: 'SUCCESS', mergeGateHoldExcused: expect.objectContaining({ jobId: review.id }) },
       ci, green,
     ]);
-    expect(reduceCheckState(out.rows, ['merge-gate', 'test']).state).toBe('red');
+    expect(requiredCheckStates({ rollup: out.rows, requiredChecks: ['merge-gate', 'test'] }).red).toEqual(['merge-gate']);
     expect(latestFailingMergeGate(out.rows)).toBe(ci);
   });
 
@@ -94,17 +94,17 @@ describe('settings and row evidence', () => {
     expect(resolveMergeGateHoldSetting({ platform: { mergeGate: { candidacyHoldIsNotCiFailure: 'off' } }, repo: { mergeGate: { candidacyHoldIsNotCiFailure: 'on' } }, env: {} }).source).toBe('repo');
   });
   it.each([{ setting: { value: 'off' } }, { readVerdict: () => ({ error: 'no log' }) }, { headSha: 'b'.repeat(40) }, { prNumber: 5000 }, { readVerdict: () => { throw Error('read failed'); } }])('preserves red on missing authority %j', extra => expect(excuseMergeGateRows([row], opts(extra)).rows).toEqual([row]));
-  it('replaces only latest merge-gate and retains other red checks', () => {
+  it('replaces only the selected merge-gate and retains every other raw red row', () => {
     const badTest = { ...green, conclusion: 'FAILURE' };
     const older = { ...row, id: 122, run_attempt: 1 };
     const latest = { ...row, run_attempt: 2 };
-    const out = excuseMergeGateRows([older, latest, badTest], opts());
-    expect(out.rows).toEqual([older, { ...latest, conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy', holds: expect.any(Array), jobId: 123 } }, badTest]);
+    const out = excuseMergeGateRows([latest, older, badTest], opts());
+    expect(out.rows).toEqual([{ ...latest, conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy', holds: expect.any(Array), jobId: 123 } }, older, badTest]);
     expect(excuseMergeGateRows([{ ...row, status: 'completed', conclusion: 'failure' }], opts()).rows[0].conclusion).toBe('success');
   });
   it('never reads a superseded failure', () => {
     const readVerdict = vi.fn();
-    excuseMergeGateRows([{ ...row, run_attempt: 1 }, { ...row, id: 124, run_attempt: 2, conclusion: 'SUCCESS' }], opts({ readVerdict }));
+    excuseMergeGateRows([{ ...row, run_id: 42, run_attempt: 1 }, { ...row, id: 124, run_id: 42, run_attempt: 2, conclusion: 'SUCCESS' }], opts({ readVerdict }));
     expect(readVerdict).not.toHaveBeenCalled();
   });
   it('reads and caches immutable job evidence with throttled gh', () => {

@@ -68,6 +68,7 @@ import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
 import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
+import { reviewHoldRollupState } from '../conveyor/ci-heal-verdict-recheck.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
@@ -144,7 +145,9 @@ export function defaultReadHeadCheckState({
     ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
     : requiredChecks;
   const result = reduceCheckState(rows, promotionChecks);
-  return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks, labels) };
+  const state = reviewHoldRollupState({ rollup: rows, requiredChecks: promotionChecks, labels });
+  return { ...result, state, ...(state !== result.state ? { why: `raw check evidence is ${state}` } : {}),
+    reviewHoldOnly: state === 'red' && reviewHoldOnlyRed(rows, promotionChecks, labels) };
 }
 
 function validatePrLabels(labels) {

@@ -141,7 +141,7 @@ import {
   ciHealBudgetEvidence, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER, CI_HEAL_FAILURE_MARKER,
   CI_HEAL_ROUND_CAP, CI_HEAL_ATTEMPT_CAP_ENV, CI_HEAL_RESET_ON_FIX_HEAD_ENV, resolveCiHealBudget, ciHealBudgetResetAt, FIX_MARKER_WHO_RE,
 } from './ci-heal-mark.mjs';
-import { ciGreenForEscalation, resolveCiHealVerdictSettings, gateOnlyRedStates, waitingOnReview } from './ci-heal-verdict-recheck.mjs';
+import { ciGreenForEscalation, resolveCiHealVerdictSettings, gateOnlyRedStates, waitingOnReview, reviewHoldRollupState } from './ci-heal-verdict-recheck.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
@@ -509,20 +509,12 @@ export function splitFailingChecks(rollup, requiredChecks) {
 
 /** PURE: every failing check is a review-owned hold, including gates outside the required roster. */
 export function reviewHoldGatesOnlyRed(rollup, requiredChecks, labels) {
-  if (!Array.isArray(rollup)) return false;
-  if (rollup.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
-  return gateOnlyRedStates({ rollup, requiredChecks, labels }).gateOnlyRed;
+  return waitingOnReview({ rollup, requiredChecks, labels });
 }
 
 /** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
 export function reviewHoldOnlyRed(rollup, requiredChecks, labels) {
-  if (!reviewHoldGatesOnlyRed(rollup, requiredChecks, labels)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
-  const failing = failingCheckNames(latest);
-  // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
-  return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
-    ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
-    && reduceCheckState(latest, requiredChecks).counts.unreadable === 0;
+  return waitingOnReview({ rollup, requiredChecks, labels });
 }
 
 /**
@@ -2784,12 +2776,20 @@ export function planReconcile({
       continue;
     }
 
-    // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
-    const phase = classifyPr({
+    // Borrow the ordinary phase/CI policy; review-hold contexts additionally retain raw evidence.
+    const borrowedPhase = classifyPr({
       state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
     }, requiredChecks);
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
+    const reviewHoldContext = Array.isArray(requiredChecks) && requiredChecks.length > 0
+      && labelNames(pr?.labels).some(label => REVIEW_HOLD_LABELS.includes(label))
+      && pr?.statusCheckRollup?.some(row => ['review-gate', 'merge-gate'].includes(row?.name || row?.context));
+    if (reviewHoldContext) {
+      check.state = reviewHoldRollupState({ rollup: pr?.statusCheckRollup, requiredChecks, labels: pr?.labels });
+    }
+    const phase = reviewHoldContext && check.state === 'red' && !['landed', 'bounced', 'needs-human'].includes(borrowedPhase)
+      ? 'ci-red' : borrowedPhase;
     const withPhase = { phase, check: check.state, labels: labelNames(pr?.labels) };
 
     // ── ALREADY-LANDED — its OWN branch, AHEAD OF EVERY OTHER CHECK IN THIS LOOP (`ci-red`, the advisory-fix
@@ -3133,7 +3133,7 @@ export function planReconcile({
       && waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks, labels: pr?.labels });
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, ciClassification: 'waiting-on-review', owner: 'review/orchestrator',
-        why: `review daemon owns held gates: ${failingCheckNames(collapseRollupToLatestPerName(pr?.statusCheckRollup)).join(', ')}` });
+        why: `review daemon owns held gates: ${gateOnlyRedStates({ rollup: pr?.statusCheckRollup, requiredChecks, labels: pr?.labels }).red.join(', ')}` });
       // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling
       // guards below reachable, without healing held gates or dispatching a second review.
       if (phase !== 'bounced' && !(phase === 'needs-human' && withPhase.labels.includes(ADVISORY_LABELS.CHANGES))) {

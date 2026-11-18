@@ -269,7 +269,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
         expected[conclusion === 'CANCELLED' ? 'pending' : 'red'] = ['test'];
         expect(requiredCheckStates(evidence)).toEqual(expected);
         expect(contradictingChecks(evidence)).toEqual(expected.red);
-        expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(conclusion === 'CANCELLED');
+        expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
         expect(ciGreenForEscalation(evidence)).toBe(false);
       }
     }
@@ -432,7 +432,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
             .toEqual(expected);
           expect(contradictingChecks(evidence)).toEqual(expected.red);
           expect(ciGreenForEscalation(evidence)).toBe(bucket === 'green');
-          expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(bucket !== 'red');
+          expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(bucket === 'green');
           const pr = { headRefOid: input.headSha, statusCheckRollup: evidence.rollup };
           expect(Boolean(notCiBreakRecordRefusal({ headSha: input.headSha, pr, requiredChecks: ['test'] })))
             .toBe(bucket !== 'green');
@@ -572,7 +572,8 @@ describe('requiredCheckStates shared predicate regressions', () => {
 
 describe('review wait requires a roster and the review-gate failure cause', () => {
   const evidence = { requiredChecks: ['test', 'review-gate'], labels: ['review:pending'],
-    rollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, heldReview] };
+    rollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'SUCCESS' }, heldReview] };
 
   it.each([{ requiredChecks: [] }, { requiredChecks: null }])('unknown required roster $requiredChecks cannot establish a wait even with a proven hold', ({ requiredChecks }) => {
     expect(verdictRecheck.waitingOnReview({ ...evidence, requiredChecks, rollup: [heldReview] })).toBe(false);
@@ -615,7 +616,7 @@ describe('review wait requires a roster and the review-gate failure cause', () =
   it.each(['check-review-gate held -', 'check-review-gate ✗ held —'])(
     'recognizes the %s workflow verdict with label objects', prefix => {
       const input = { ...evidence, labels: [{ name: 'review:pending' }], rollup: [
-        evidence.rollup[0], { ...heldReview, output: { summary: `${prefix} a review hold stands: review:pending` } },
+        ...evidence.rollup.slice(0, 2), { ...heldReview, output: { summary: `${prefix} a review hold stands: review:pending` } },
       ] };
       expect(verdictRecheck.waitingOnReview(input)).toBe(true);
       expect(ciGreenForEscalation(input)).toBe(true);
@@ -633,6 +634,73 @@ describe('review wait requires a roster and the review-gate failure cause', () =
     expect(verdictRecheck.waitingOnReview({ ...evidence, rollup: [
       evidence.rollup[0], ...(reverse ? rows.toReversed() : rows),
     ] })).toBe(false);
+  });
+});
+
+describe('raw review-wait supersession proof', () => {
+  const done = (conclusion, extra = {}) => ({ name: 'test', status: 'COMPLETED', conclusion, ...extra });
+  const evidence = rows => ({ requiredChecks: ['test'], labels: ['review:pending'], rollup: [...rows, heldReview] });
+
+  it.each([
+    ['independent start times', { startedAt: '2026-11-17T10:00:00Z' }, { startedAt: '2026-11-17T11:00:00Z' }],
+    ['same suite and increasing check IDs without attempt proof', { id: 10, checkSuite: { id: 1 } }, { id: 20, checkSuite: { id: 1 } }],
+    ['same workflow name without run proof', { workflowName: 'ci', run_attempt: 1 }, { workflowName: 'ci', run_attempt: 2 }],
+    ['independent workflows', { workflowName: 'ci', run_id: 1, run_attempt: 1 }, { workflowName: 'review', run_id: 2, run_attempt: 2 }],
+    ['pre-review collision: ci failure id 10 and other workflow success id 20',
+      { workflowName: 'ci', id: 10 }, { workflowName: 'other', id: 20 }],
+    ['pre-review collision: independent suite failure id 10 and success id 20',
+      { checkSuite: { id: 1 }, id: 10 }, { checkSuite: { id: 2 }, id: 20 }],
+    ['different runs of the same workflow', { run_id: 1, run_attempt: 1 }, { run_id: 2, run_attempt: 2 }],
+    ['same run without attempt or completion order', { run_id: 1, id: 10 }, { run_id: 1, id: 20 }],
+  ])('%s retains the failing row in either order', (_label, failed, passed) => {
+    const rows = [done('FAILURE', failed), done('SUCCESS', passed)];
+    for (const ordered of [rows, rows.toReversed()]) {
+      const input = evidence(ordered);
+      expect(verdictRecheck.waitingOnReview(input)).toBe(false);
+      expect(verdictRecheck.gateOnlyRedStates(input).gateOnlyRed).toBe(false);
+      expect(requiredCheckStates(input).red).toEqual(['test']);
+    }
+  });
+
+  it.each([
+    [{ workflowRun: { databaseId: 42 }, run_attempt: 1 }, { workflowRun: { databaseId: 42 }, run_attempt: 2 }],
+    [{ run_id: 42, run_attempt: 1 }, { run_id: 42, run_attempt: 2 }],
+    [{ checkSuite: { workflowRun: { databaseId: 42 } }, completedAt: '2026-11-17T10:00:00Z' },
+      { checkSuite: { workflowRun: { databaseId: 42 } }, completedAt: '2026-11-17T11:00:00Z' }],
+  ])('a genuine same-run green rerun clears only its older failure (%j)', (failed, passed) => {
+    const rows = [done('FAILURE', failed), done('SUCCESS', passed)];
+    for (const ordered of [rows, rows.toReversed()]) {
+      expect(verdictRecheck.waitingOnReview(evidence(ordered))).toBe(true);
+      expect(requiredCheckStates(evidence(ordered)).red).toEqual([]);
+      expect(ordered).toContainEqual(done('FAILURE', failed));
+    }
+  });
+
+  it.each([
+    null, {}, { name: '' }, { name: 'optional', status: 'QUEUED' },
+    { name: 'optional', status: 'COMPLETED', conclusion: 'UNKNOWN' },
+    { name: 'optional', status: 'COMPLETED', conclusion: null },
+    { name: 'optional', conclusion: 'SUCCESS' },
+  ])('any pending or unreadable raw row prevents waiting (%j)', row => {
+    expect(verdictRecheck.waitingOnReview(evidence([done('SUCCESS'), row]))).toBe(false);
+  });
+
+  it('does not erase pending or unknown evidence with a later same-run green attempt', () => {
+    for (const row of [{ status: 'IN_PROGRESS', conclusion: null }, { conclusion: 'UNKNOWN' }]) {
+      expect(verdictRecheck.waitingOnReview(evidence([
+        done('FAILURE', { run_id: 42, run_attempt: 1, ...row }),
+        done('SUCCESS', { run_id: 42, run_attempt: 2 }),
+      ]))).toBe(false);
+    }
+  });
+
+  it('each required check, including a held gate, needs its own completed green row', () => {
+    const input = { ...evidence([done('SUCCESS')]), requiredChecks: ['test', 'review-gate'] };
+    expect(verdictRecheck.waitingOnReview(input)).toBe(false);
+    expect(verdictRecheck.waitingOnReview({ ...input, rollup: [...input.rollup,
+      { ...heldReview, conclusion: 'SUCCESS' },
+    ] })).toBe(true);
+    expect(verdictRecheck.waitingOnReview({ ...input, requiredChecks: ['test', 'integration'] })).toBe(false);
   });
 });
 
@@ -665,7 +733,7 @@ describe('gateOnlyRedStates', () => {
 
     it.each(['FAILURE', 'failure'])('completed %s establishes a review wait', conclusion => {
       const evidence = { labels: ['review:pending'], requiredChecks: ['test', name], rollup: [
-        ...green, gate({ status: 'completed', conclusion }),
+        ...green, gate({ status: 'completed', conclusion: 'SUCCESS' }), gate({ status: 'completed', conclusion }),
       ] };
       expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(true);
       expect(verdictRecheck.waitingOnReview(evidence)).toBe(true);

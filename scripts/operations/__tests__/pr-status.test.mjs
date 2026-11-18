@@ -26,7 +26,7 @@ import { listArgv, checksArgv, parseJsonLines, labelNames, createPrReader, LIST_
 // `reduceCheckState` collapses to the LATEST run per check NAME first (`collapseRollupToLatestPerName`,
 // #2925/#xkfv491 — see that function's own header, and `reduceCheckState`'s, for why). Two helper calls that
 // share a `name` (the default, when omitted) are therefore NOT two independent checks — they are two RUNS of
-// the SAME check; supersession needs attempt evidence, otherwise a blocker remains. Give each its own distinct
+// the SAME check, and only the LAST one in the array is read. Give every check in a test its own distinct
 // `name` unless the point of that specific test IS the same-name collapse.
 const done = (conclusion, name = 'test') => ({ name, status: 'completed', conclusion });
 const running = (name = 'test') => ({ name, status: 'in_progress', conclusion: null });
@@ -65,7 +65,7 @@ describe('reduceCheckState — the empty list is the whole point', () => {
 
   it('pending outranks failure outranks success — a caller acts on the worst thing still true', () => {
     // One job still running is not green however many siblings passed.
-    expect(reduceCheckState([done('success', 'test'), done('failure', 'smoke'), running('in-flight-job')]).state).toBe('pending');
+    expect(reduceCheckState([done('success'), done('failure'), running()]).state).toBe('pending');
     expect(reduceCheckState([done('success'), done('failure')]).state).toBe('red');
     expect(reduceCheckState([done('success'), done('success')]).state).toBe('green');
   });
@@ -113,17 +113,17 @@ describe('reduceCheckState — the empty list is the whole point', () => {
     // The exact live shape: `soak-replay-gate` failed once, then reran green on the SAME head — no new push,
     // just a rerun (GitHub keeps both check runs). Every OTHER required check only ever ran once, green.
     expect(reduceCheckState([
-      { ...done('failure', 'soak-replay-gate'), run_attempt: 1 }, // stale — superseded below
+      done('failure', 'soak-replay-gate'), // stale — superseded below
       done('success', 'test'),
       done('success', 'smoke'),
       done('success', 'daemon-soak'),
-      { ...done('success', 'soak-replay-gate'), run_attempt: 2 }, // the LATEST run of the same check — this is the one that counts
+      done('success', 'soak-replay-gate'), // the LATEST run of the same check — this is the one that counts
     ], required).state).toBe('green');
     // The mirror case: a check that PASSED once and then genuinely failed on a LATER rerun must still read
     // red — collapsing to the latest run is not "ever green, always green".
     expect(reduceCheckState([
-      { ...done('success', 'soak-replay-gate'), run_attempt: 1 },
-      { ...done('failure', 'soak-replay-gate'), run_attempt: 2 },
+      done('success', 'soak-replay-gate'),
+      done('failure', 'soak-replay-gate'),
     ], required).state).toBe('red');
   });
 
@@ -131,24 +131,24 @@ describe('reduceCheckState — the empty list is the whole point', () => {
   // `assessPrs`/`pr-reconcile` and `promote-draft-pr-dispatch.mjs#defaultReadHeadCheckState`) lists runs
   // NEWEST-FIRST, the opposite of `statusCheckRollup`. A positional "last entry wins" collapse would keep the
   // OLDEST run there, so a check that passed and then genuinely failed on a later rerun read green — and
-  // promote-draft could `gh pr ready` a draft whose latest required check is red. Explicit workflow run
-  // IDs establish ordering; REST check IDs alone identify jobs and cannot establish supersession.
-  it('REST newest-first feed: workflow run ordering supersedes older evidence', () => {
+  // promote-draft could `gh pr ready` a draft whose latest required check is red. Each REST row carries its
+  // run `id` (monotonic by creation), so the collapse ranks by it whenever every run of a name has one.
+  it('REST newest-first feed: ranks by run id, so a later failure is never hidden behind an older success', () => {
     const required = ['soak-replay-gate'];
-    const run = (id, conclusion) => ({ id, run_id: id, name: 'soak-replay-gate', status: 'completed', conclusion });
+    const run = (id, conclusion) => ({ id, name: 'soak-replay-gate', status: 'completed', conclusion });
     expect(reduceCheckState([run(109255880842, 'failure'), run(109255874532, 'success')], required).state).toBe('red');
     expect(reduceCheckState([run(109255880842, 'success'), run(109255874532, 'failure')], required).state).toBe('green');
     // Same runs, rollup (oldest-first) order — the answer must not depend on the feed's ordering.
     expect(reduceCheckState([run(109255874532, 'success'), run(109255880842, 'failure')], required).state).toBe('red');
   });
 
-  it('fails closed without attempt evidence even with numeric check IDs', () => {
+  it('falls back to last-by-position unless EVERY run of a name has a numeric id (the rollup carries none)', () => {
     const row = (id, conclusion) => ({ ...(id === undefined ? {} : { id }), name: 'x', status: 'completed', conclusion });
     const pick = (rows) => collapseRollupToLatestPerName(rows)[0].conclusion;
-    expect(pick([row(undefined, 'failure'), row(undefined, 'success')])).toBe('failure'); // no attempt evidence
-    expect(pick([row(9, 'success'), row(undefined, 'failure')])).toBe('failure');         // missing evidence stays blocking
-    expect(pick([row('CR_kwA', 'success'), row('CR_kwB', 'failure')])).toBe('failure');   // opaque check IDs do not establish order
-    expect(pick([row('20', 'failure'), row('10', 'success')])).toBe('failure');           // check IDs do not prove attempt order
+    expect(pick([row(undefined, 'failure'), row(undefined, 'success')])).toBe('success'); // rollup: no ids
+    expect(pick([row(9, 'success'), row(undefined, 'failure')])).toBe('failure');         // mixed → positional
+    expect(pick([row('CR_kwA', 'success'), row('CR_kwB', 'failure')])).toBe('failure');   // GraphQL node ids → positional
+    expect(pick([row('20', 'failure'), row('10', 'success')])).toBe('failure');           // numeric strings rank
   });
 
   it('only ever answers with a declared state', () => {
@@ -265,7 +265,7 @@ describe('the io shell', () => {
     expect(argv.join(' ')).not.toMatch(/pr checks/);
   });
 
-  it('selects each check job\'s `id` for head-bound evidence reads', () => {
+  it('selects each run\'s `id` — the REST feed is newest-first, and the per-name collapse ranks by it (PR #2894 review)', () => {
     const jq = checksArgv({ repo: 'o/r', sha: 'deadbeef' }).at(-1);
     expect(jq).toMatch(/\{[^}]*\bid\b[^}]*\}/);
   });
@@ -465,11 +465,11 @@ it.each([
   expect(reduceCheckState(runs, ['test', 'smoke']).state).toBe(state);
 });
 
-it('xxh4zw8 complete required evidence and later run attempts restore green in either order', () => {
+it('xxh4zw8 complete required evidence and latest numeric reruns restore green in either order', () => {
   const runs = [
     { id: 10, name: 'test', status: 'completed', conclusion: 'success' },
-    { id: 11, name: 'smoke', status: 'completed', conclusion: 'cancelled', run_attempt: 1 },
-    { id: 12, name: 'smoke', status: 'completed', conclusion: 'success', run_attempt: 2 },
+    { id: 11, name: 'smoke', status: 'completed', conclusion: 'cancelled' },
+    { id: 12, name: 'smoke', status: 'completed', conclusion: 'success' },
   ];
   for (const ordered of [runs, [...runs].reverse()]) {
     expect(reduceCheckState(ordered, ['test', 'smoke'])).toMatchObject({ state: 'green', counts: { total: 2, failed: 0 } });

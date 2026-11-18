@@ -3546,10 +3546,12 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   // Shape attached by excuseMergeGateRows: a review hold keeps merge-gate red but annotates its owner.
   const heldRollup = () => [
     check('test'),
-    check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }),
-    check('review-gate', 'failure'),
+    check('merge-gate', 'success', { id: 1 }),
+    check('review-gate', 'success', { id: 2 }),
+    check('merge-gate', 'failure', { id: 3, mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }),
+    check('review-gate', 'failure', { id: 4 }),
   ];
-  const reviewOnlyRollup = () => [check('test'), check('merge-gate'), check('review-gate', 'failure')];
+  const reviewOnlyRollup = () => [check('test'), check('merge-gate'), check('review-gate'), check('review-gate', 'failure')];
   const plan = (over = {}) => planReconcile({
     prs: [pr1563({ isDraft: true, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...over })],
     requiredChecks, agents: [], durableCounts: {}, now: NOW,
@@ -3587,6 +3589,55 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     const result = plan({ isDraft: false, statusCheckRollup: rollup() });
     expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
     expect(result.refusals.filter(row => row.kind === 'review-ci' || row.reviewRefusal?.kind === 'review-ci')).toEqual([]);
+  });
+
+  it.each([
+    ['independent same-name rows with different starts',
+      { startedAt: '2026-09-30T10:00:00Z' }, { startedAt: '2026-09-30T11:00:00Z' }, false],
+    ['same suite with increasing check IDs and no attempt proof',
+      { id: 10, checkSuite: { id: 42 } }, { id: 20, checkSuite: { id: 42 } }, false],
+    ['different workflows',
+      { workflowName: 'ci', run_id: 1, run_attempt: 1 }, { workflowName: 'review', run_id: 2, run_attempt: 2 }, false],
+    ['a genuine same-run rerun',
+      { workflowRun: { databaseId: 42 }, run_attempt: 1 }, { workflowRun: { databaseId: 42 }, run_attempt: 2 }, true],
+  ])('planReconcile requires supersession proof for %s', (_label, failed, passed, waiting) => {
+    const rows = [check('test', 'failure', failed), check('test', 'success', passed)];
+    for (const ordered of [rows, rows.toReversed()]) {
+      const result = plan({ isDraft: false, statusCheckRollup: [...ordered, ...heldRollup().slice(1)] });
+      expect(result.refusals.some(row => row.ciClassification === 'waiting-on-review')).toBe(waiting);
+      expect(result.dispatch.some(row => row.kind === 'ci-heal')).toBe(!waiting);
+    }
+  });
+
+  it.each([
+    { name: 'optional', status: 'in_progress' },
+    { name: 'optional', status: 'completed', conclusion: 'unknown' },
+  ])('planReconcile never reports waiting-on-review with an unreadable or pending optional row: %j', row => {
+    const result = plan({ isDraft: false, statusCheckRollup: [...heldRollup(), row] });
+    expect(result.refusals.some(row => row.ciClassification === 'waiting-on-review')).toBe(false);
+    expect(result.dispatch.some(row => row.kind === 'ci-heal')).toBe(true);
+  });
+
+  it.each([
+    ['same suite without supersession proof', { checkSuite: { id: 42 } }, { checkSuite: { id: 42 } }],
+    ['independent workflows from the pre-review finding', { workflowName: 'ci' }, { workflowName: 'other' }],
+    ['independent suites from the pre-review finding', { checkSuite: { id: 1 } }, { checkSuite: { id: 2 } }],
+  ])('keeps required repair for %s when the held gate is outside the required roster', (_label, failed, passed) => {
+    const rollup = [check('test', 'failure', { id: 10, ...failed }),
+      check('test', 'success', { id: 20, ...passed }), check('review-gate', 'failure')];
+    for (const rows of [rollup, rollup.toReversed()]) {
+      const result = planReconcile({ prs: [pr1563({ labels: lbl('review:pending'), comments: [],
+        statusCheckRollup: rows })], requiredChecks: ['test'], agents: [], now: NOW });
+      expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal', check: 'red' }));
+      expect(result.refusals.some(row => row.ciClassification === 'waiting-on-review')).toBe(false);
+    }
+  });
+
+  it('requires completed green evidence even for required held gates before reporting a review wait', () => {
+    const result = plan({ isDraft: false, statusCheckRollup: heldRollup().filter(row =>
+      !['merge-gate', 'review-gate'].includes(row.name) || row.conclusion === 'failure') });
+    expect(result.refusals.some(row => row.ciClassification === 'waiting-on-review')).toBe(false);
+    expect(result.dispatch.some(row => row.kind === 'ci-heal')).toBe(true);
   });
 
   it.each([

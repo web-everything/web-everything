@@ -460,10 +460,10 @@ describe('latestRequiredCheck — a superseded run must not outvote the one that
     expect(isRequiredCheckFailed(staleGreenPlusQueued)).toBe(false); // and not red either
   });
 
-  it('ranks by completedAt and fails closed when stamps are unusable', () => {
+  it('ranks by completedAt when every run has one; creation order decides only when stamps are unusable', () => {
     // 2026-10-07 (PR #4290): GitHub's rollup order is NOT creation order (a FAILURE@17:27 was listed before its
     // superseded SUCCESS@17:13), so positional "last wins" read stale green. A run with a real completedAt now
-    // ranks by it; without usable attempt evidence, conflicting failures remain in force.
+    // ranks by it (in-flight runs, which have none, are newest); no usable stamp keeps the positional rule.
     const stampsContradictOrder = {
       statusCheckRollup: [
         { name: 'test', conclusion: 'FAILURE', startedAt: '2026-08-05T18:40:00Z', completedAt: '2026-08-05T18:50:00Z' },
@@ -472,14 +472,14 @@ describe('latestRequiredCheck — a superseded run must not outvote the one that
     };
     expect(isRequiredCheckGreen(stampsContradictOrder)).toBe(false);
     const noTimes = { statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED' }, { name: 'test', conclusion: 'SUCCESS' }] };
-    expect(isRequiredCheckGreen(noTimes)).toBe(false);
+    expect(isRequiredCheckGreen(noTimes)).toBe(true);
     const badTimes = {
       statusCheckRollup: [
         { name: 'test', conclusion: 'CANCELLED', startedAt: 'not-a-date' },
         { name: 'test', conclusion: 'SUCCESS', startedAt: 'also-not-a-date' },
       ],
     };
-    expect(isRequiredCheckGreen(badTimes)).toBe(false);
+    expect(isRequiredCheckGreen(badTimes)).toBe(true);
   });
 
   it('a LONE StatusContext decides when the workflow produced no `test` CheckRun', () => {
@@ -537,8 +537,8 @@ describe('latestRequiredCheck — a superseded run must not outvote the one that
 describe('collapseRollupToLatestPerName — the #2925 shared seam every rollup-folding reader routes through', () => {
   // The decisive #2925 case: CANCELLED at index 0, SUCCESS at index 1 for the SAME name.
   const cancelledThenSuccess = [
-    { __typename: 'CheckRun', name: 'test', conclusion: 'CANCELLED', run_attempt: 1 },
-    { __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', run_attempt: 2 },
+    { __typename: 'CheckRun', name: 'test', conclusion: 'CANCELLED' },
+    { __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS' },
   ];
 
   it('collapses to ONE row per name, keeping the latest tier-preferred entry (CANCELLED at index 0 loses)', () => {
@@ -549,8 +549,8 @@ describe('collapseRollupToLatestPerName — the #2925 shared seam every rollup-f
 
   it('preserves EVERY distinct name — only within-name entries collapse', () => {
     const roll = [
-      { __typename: 'CheckRun', name: 'test', conclusion: 'CANCELLED', run_attempt: 1 },
-      { __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', run_attempt: 2 },
+      { __typename: 'CheckRun', name: 'test', conclusion: 'CANCELLED' },
+      { __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS' },
       { __typename: 'CheckRun', name: 'cla', conclusion: 'SUCCESS' },
     ];
     const collapsed = collapseRollupToLatestPerName(roll);
@@ -613,7 +613,7 @@ describe('rollupRowKind — the union member comes off `__typename`, it is not g
   });
 
   it('an all-untagged rollup still resolves latest-wins (fixtures / re-normalised rows keep working)', () => {
-    const pr = { statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED', run_attempt: 1 }, { name: 'test', conclusion: 'SUCCESS', run_attempt: 2 }] };
+    const pr = { statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED' }, { name: 'test', conclusion: 'SUCCESS' }] };
     expect(isRequiredCheckGreen(pr)).toBe(true);
   });
 });

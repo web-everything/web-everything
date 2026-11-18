@@ -453,6 +453,7 @@ async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings 
   // Only IO failures may use the warning fallback. Malformed check evidence must
   // reach the CLI's error handler before it can post an escalation.
   if (!readPr) facts = classifyPrChecks(facts, { pr, repo }, prChecksOptions);
+  else summarize(facts?.statusCheckRollup ?? [], { requiredNames: [] });
   const refusal = facts?.readError && expectedOutcome === 'needs-human'
     ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
   return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) } : {}) };

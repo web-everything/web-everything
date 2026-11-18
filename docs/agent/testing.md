@@ -4473,40 +4473,28 @@ rosters, missing/pending required checks, both hold verdicts, setup failures, an
 per-row evidence isolation. Keep historical raw rollup fixtures unchanged: their
 unreadable failure causes must remain red under this rule.
 
-Pass raw `statusCheckRollup` rows into review-wait/hold predicates. The shared
-collapse helper partitions workflow and check-suite identities; evidence readers
-use `preserveUnknownJobs` so unknown sources and unordered attempts stay separate.
-Only an ordered rerun of the same identifiable job supersedes an earlier failure.
-Equal completion timestamps without check IDs do not establish attempt order;
-retain both rows. The job-identity regression asserts this for both timestamp
-spellings and both input orders, including conflicting failure/success evidence.
-The gate-wait regression covers two same-name gates with one unreadable failure
-in both orders (including absent source metadata), requiring CI heal, recovery
-and escalation to remain available. The promotion fixture also refuses that
-shape; the job-identity fixture covers successful reruns. Unreadable causes retain
-the normal CI repair/escalation path as the operator-visible fallback.
+Pass raw `statusCheckRollup` rows into review-wait/hold predicates. Shared
+`rollup-collapse.mjs` retains main's existing semantics for unrelated consumers.
+The review-hold-only `review-hold-rollup.mjs` retains every row except a known
+completed failure cleared by a completed green rerun of the same workflow run
+(`workflowRun.databaseId`/run ID) and exact job name. A strictly later attempt,
+or a strictly later completion within that same run when attempts do not conflict,
+proves supersession. Workflow names, suite IDs, increasing check IDs, start times,
+and unknown sources alone never do. Pending, cancelled, unknown and unreadable
+rows remain even beside a later successful attempt.
 
+`waitingOnReview` and both reconcile hold helpers require a completed green row
+for every required name, including a required held gate; implied checks cannot
+replace missing rows for this claim. Each remaining failed row must independently
+prove a review hold, and no pending or unreadable row anywhere may be ignored.
+Uncertain evidence keeps normal CI repair/escalation available: inspect the failed
+job and acquire readable rerun evidence rather than suppressing its repair.
+The verdict and reconcile suites pin independent same-name start times, check IDs
+10/20 in one suite without attempt proof, genuine same-run reruns in both orders,
+and pending/unknown optional evidence. The gate-wait fixture also covers recovery
+and escalation callers; promotion re-reads raw evidence before admitting a draft.
 
-## Same-job rollup attempts and merge-gate hold isolation
-
-Check IDs identify jobs, not rerun attempts. Rollup collapse orders same-job rows by
-workflow run ID first, then `run_attempt`/`runAttempt` within that run, then
-`completedAt`/`startedAt` (including REST snake-case fields). Compare start times
-when all rows have usable starts; otherwise compare completion times only and
-retain unfinished rows. A completion time must never be compared with another
-execution's start time to prove supersession. Attempt counters reset
-for each workflow run: a newer run at attempt 1 supersedes an older run at attempt 2.
-Without run metadata, keep the attempt/timestamp fallback; when run metadata is
-present, rows with missing or unreadable run identity remain in force rather than
-borrowing another run's attempt ordering. Tied, missing or unreadable evidence never
-supersedes a blocker; scalar readers retain a blocking row and per-row evidence
-guards retain every non-superseded row. A genuine later attempt can clear an older
-failure. When ordering is unavailable, acquire readable rerun evidence before
-treating the job as green. Workflow/suite partitions remain independent.
-
-`rollup-collapse-job-identity.test.mjs` pins unordered failure/pending/unreadable
-rows and real reruns through collapse, required-check lookup and CI reduction.
 `merge-gate-hold-class.test.mjs` pins excusing only the exact head-bound row whose
-verdict was read: every other merge-gate row remains, including independent CI
-failures. A successful first workflow must not hide a failure in another. Run
-these and affected reader fixtures through heavy admission.
+verdict was read: all other raw merge-gate rows remain, including independent CI
+failures. A successful first workflow cannot hide a failure in another. Run these
+and the unchanged main rollup-collapse suite through heavy admission.

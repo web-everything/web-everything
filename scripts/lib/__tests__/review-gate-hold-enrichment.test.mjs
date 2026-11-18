@@ -9,11 +9,12 @@ const repo = 'web-everything/web-everything';
 const head = 'a'.repeat(40);
 const holdLine = 'check-review-gate held - a review hold stands: review:pending, review:human';
 const requiredChecks = ['test', 'review-gate'];
-const makeRow = (extra = {}) => ({ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE',
+const makeRow = (extra = {}) => ({ id: 123, name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE',
   detailsUrl: `https://github.com/${repo}/actions/runs/100/job/123`, ...extra });
 const makePr = (row = makeRow()) => ({ number: 7037, headRefOid: head, headRefName: 'lane/review-hold',
   baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [],
-  statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, row] });
+  statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, row,
+    { id: 1, name: 'review-gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
 const evidence = (log = holdLine, job = {}) => ({ log,
   job: { name: 'review-gate', head_sha: head, status: 'completed', conclusion: 'failure', ...job } });
 const enrich = (pr, readLog) => excusePrMergeGateHolds([pr], {
@@ -102,7 +103,7 @@ describe('review-gate hold log enrichment', () => {
     const readLog = vi.fn(({ jobId }) => evidence(jobId === 123 ? holdLine : 'checkout failed'));
     const out = enrich(pr, readLog);
     expect(out.statusCheckRollup[1].output.summary).toBe(holdLine);
-    expect(out.statusCheckRollup[2].output).toBeUndefined();
+    expect(out.statusCheckRollup[3].output).toBeUndefined();
     expect(waiting(out)).toBe(false);
     expect(readLog).toHaveBeenCalledTimes(2);
   });

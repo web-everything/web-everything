@@ -27,7 +27,7 @@ import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.
 import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { reviewHoldRollupRows } from '../lib/review-hold-rollup.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -78,7 +78,8 @@ export function ciGreenForEscalation({ rollup, requiredChecks, labels }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
   const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks, labels });
   if (red.length || pending.length || missing.length) return false;
-  const { checks, holdGateNames } = checkEvidence(rollup, requiredChecks, labels);
+  const { checks, holdGateNames, unreadable } = checkEvidence(rollup, requiredChecks, labels);
+  if (unreadable) return false;
   return summarize(checks.filter(row => !holdGateNames.includes(row.name)), {
     requiredNames: checks.map(row => row.name).filter(name => !holdGateNames.includes(name)),
   }).allRequiredGreen;
@@ -95,33 +96,40 @@ const normalizeRollupCheck = row => {
   const check = { ...row, name: row?.name || row?.context };
   if (row?.status == null && row?.state != null) {
     if (['pending', 'expected'].includes(lowerState(row.state))) check.status = 'pending';
-    else check.conclusion = row.state;
+    else { check.status = 'completed'; check.conclusion = row.state; }
   }
   return check;
 };
 
-/** Supersede only ordered attempts of an identifiable job; retain unknown sources. */
+/** Review-hold evidence retains raw rows except proven, successful same-run reruns. */
 export function latestRollupAttempts(rollup) {
-  return collapseRollupToLatestPerName(rollup, { preserveUnknownJobs: true });
+  return reviewHoldRollupRows(rollup);
 }
 
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks, labels) {
-  const checks = latestRollupAttempts(rollup).map(normalizeRollupCheck);
-  const holdLabels = Array.isArray(labels)
+  const raw = latestRollupAttempts(rollup).map(normalizeRollupCheck);
+  const named = row => typeof row.name === 'string' && row.name.trim().length > 0;
+  const checks = raw.filter(named);
+  const unreadable = !Array.isArray(rollup) || raw.some(row => !named(row));
+  const labelsReadable = Array.isArray(labels) && Array.from(labels).every(label =>
+    typeof (typeof label === 'string' ? label : label?.name) === 'string');
+  const holdLabels = labelsReadable
     ? labels.map(label => typeof label === 'string' ? label : label?.name).filter(label => REVIEW_HOLD_LABELS.includes(label))
     : [];
   // No IO here. Both workflow paths print this verdict, but an overall FAILURE
   // also covers checkout/setup/npm-ci errors. Without this row's own hold
   // summary and a matching current label, leave the failure as CI work.
   const reviewHold = row => typeof row.output?.summary === 'string'
-    && row.output.summary.split('\n').some(line => {
-      const match = /^check-review-gate (?:✗ held —|held -) a review hold stands: (.+)$/.exec(line.trim());
+    && (() => {
+      const lines = row.output.summary.split(/\r?\n/).filter(line => line.startsWith('check-review-gate '));
+      if (lines.length !== 1) return false;
+      const match = /^check-review-gate (?:✗ held —|held -) a review hold stands: (.+)$/.exec(lines[0]);
       if (!match) return false;
       const reported = match[1].split(', ');
       return reported.every(label => REVIEW_HOLD_LABELS.includes(label))
         && reported.some(label => holdLabels.includes(label));
-    });
+    })();
   // Every non-green gate row must be a completed FAILURE. Setup failures,
   // unfinished or unreadable evidence cannot establish a review wait. merge-gate
   // additionally needs the shared classifier's head-bound review-hold annotation.
@@ -139,7 +147,7 @@ function checkEvidence(rollup, requiredChecks, labels) {
   if (checks.some(row => row.name === CODEQL_CHECK_NAME) && !roster.includes(CODEQL_CHECK_NAME)) {
     roster.push(CODEQL_CHECK_NAME);
   }
-  return { checks, roster, holdGateNames };
+  return { checks, roster, holdGateNames, unreadable };
 }
 
 /**
@@ -149,12 +157,12 @@ function checkEvidence(rollup, requiredChecks, labels) {
  */
 export function requiredCheckStates({ rollup, requiredChecks, labels }) {
   const out = { red: [], pending: [], missing: [], green: [] };
-  const { checks, roster } = checkEvidence(rollup, requiredChecks, labels);
+  const { checks, roster, unreadable } = checkEvidence(rollup, requiredChecks, labels);
   const { redSet, pendingSet } = summarize(checks, { requiredNames: roster });
   const observed = new Set(checks.map(row => row.name));
   for (const name of roster) {
     if (!observed.has(name)) out.missing.push(name);
-    else if (redSet.has(name)) out.red.push(name);
+    else if (unreadable || redSet.has(name)) out.red.push(name);
     else if (pendingSet.has(name)) out.pending.push(name);
     else out.green.push(name);
   }
@@ -163,22 +171,46 @@ export function requiredCheckStates({ rollup, requiredChecks, labels }) {
 
 /** Include gates and CodeQL evidence, even outside the required roster. */
 export function gateOnlyRedStates({ rollup, requiredChecks, labels }) {
-  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks, labels);
+  const { checks, roster, holdGateNames, unreadable } = checkEvidence(rollup, requiredChecks, labels);
   // Review-wait is a claim about the whole rollup, not just branch protection.
   // In particular review-gate and real optional failures must not disappear.
   const requiredNames = [...new Set([...roster, ...checks.map(row => row.name)])];
-  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
-  return { gateOnlyRed, red: [...redSet] };
+  const { gateOnlyRed, redSet, pendingSet } = summarize(checks, { requiredNames, holdGateNames });
+  return { gateOnlyRed: gateOnlyRed && !unreadable && pendingSet.size === 0
+    && checks.every(row => classifyCheck({ ...row, required: true }) === 'green'
+      || (holdGateNames.includes(row.name) && lowerState(row.conclusion) === 'failure')),
+  red: [...redSet] };
 }
 
-/** Proven review-only failure, with complete green evidence for every other check. */
+/** Raw CI state for review-hold callers; the shared collapse policy stays unchanged. */
+export function reviewHoldRollupState({ rollup, requiredChecks, labels }) {
+  if (!Array.isArray(rollup) || !rollup.length) return 'unchecked';
+  const { checks, unreadable } = checkEvidence(rollup, requiredChecks, labels);
+  if (unreadable) return 'red';
+  const inFlight = checks.some(row => classifyCheck({ ...row, required: true }) === 'pending'
+    && lowerState(row.conclusion) !== 'cancelled');
+  if (inFlight) return 'pending';
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length
+    || Array.from(requiredChecks).some(name => typeof name !== 'string' || !name.trim())) return 'red';
+  const requiredNames = [...new Set([...requiredChecks, ...checks.map(row => row.name)])];
+  const { redSet, pendingSet } = summarize(checks, { requiredNames });
+  if (redSet.size || checks.some(row => lowerState(row.conclusion) === 'cancelled'
+    || typeof row.status !== 'string' || lowerState(row.status) !== 'completed')) return 'red';
+  if (pendingSet.size) return 'pending';
+  return 'green';
+}
+
+/** Proven review-only failure, with a completed green row for every required name. */
 export function waitingOnReview({ rollup, requiredChecks, labels }) {
-  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length
+    || Array.from(requiredChecks).some(name => typeof name !== 'string' || !name.trim())) return false;
   if (!Array.isArray(rollup) || !rollup.length) return false;
-  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks, labels);
-  const requiredNames = [...new Set([...roster, ...checks.map(row => row.name)])];
-  const { gateOnlyRed, pendingSet } = summarize(checks, { requiredNames, holdGateNames });
-  return gateOnlyRed && pendingSet.size === 0;
+  if (!gateOnlyRedStates({ rollup, requiredChecks, labels }).gateOnlyRed) return false;
+  const { checks } = checkEvidence(rollup, requiredChecks, labels);
+  // A proven hold does not substitute for a required check's completed green row.
+  return checks.every(row => typeof row.status === 'string' && lowerState(row.status) === 'completed')
+    && requiredChecks.every(name => checks.some(row => row.name === name
+      && classifyCheck({ ...row, required: true }) === 'green'));
 }
 
 /**

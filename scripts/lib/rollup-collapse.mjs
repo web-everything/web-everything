@@ -53,65 +53,43 @@ export function rollupRowKind(c) {
  * pr-status.mjs#reduceCheckState` all fold every entry — collapse to the latest entry per name FIRST, then fold.
  *
  * Within a name: take the FIRST non-empty tier of `CheckRun` → untagged → `StatusContext` ({@link
- * rollupRowKind}), then remove only proven superseded attempts in that tier. Pure. Order of the returned rows is
- * NOT the input order — source/name groups are returned in first-seen order.
- * Workflow and check-suite identities partition same-named jobs: a run in one
- * workflow/suite cannot supersede evidence from another. Without source metadata,
- * the default retains per-name grouping and selects a blocking row if attempts
- * cannot be ordered. `preserveUnknownJobs` passes unknown sources and all
- * non-superseded attempts through separately for per-row evidence guards.
+ * rollupRowKind}), then the LATEST entry in that tier ({@link latestOf}). Pure. Order of the returned rows is
+ * NOT the input order — one row per distinct name, in first-seen order.
  *
  * A row with NEITHER `name` NOR `context` (unreachable off a real `gh pr view --json statusCheckRollup` — every
  * live row carries one or the other) is passed through UNCOLLAPSED, one output row per such input row: there is
  * no name to group it by, so grouping it with any other nameless row would silently fold two unrelated checks
  * into one and grouping it under a shared empty-string key would do the same. Each gets its own group.
  * @param {Array<object>|null|undefined} rollup
- * @param {{preserveUnknownJobs?: boolean}} [options]
- * @returns {Array<object>} latest entries per source/name (unidentifiable evidence passes through).
+ * @returns {Array<object>} one collapsed entry per distinct check name (nameless rows pass through 1:1).
  */
-export function collapseRollupToLatestPerName(rollup, { preserveUnknownJobs = false } = {}) {
+export function collapseRollupToLatestPerName(rollup) {
   const roll = Array.isArray(rollup) ? rollup : [];
   const byName = new Map();
   for (const c of roll) {
-    const name = c?.name || c?.context;
-    const scalar = value => (typeof value === 'string' && value.trim())
-      || (Number.isSafeInteger(value) && value > 0 ? String(value) : null);
-    const workflow = scalar(c?.workflowName ?? c?.workflow_name
-      ?? c?.workflowRun?.workflow?.id ?? c?.workflowRun?.workflow?.name
-      ?? c?.checkSuite?.workflowRun?.workflow?.id ?? c?.checkSuite?.workflowRun?.workflow?.name);
-    const suite = scalar(c?.checkSuite?.id ?? c?.check_suite?.id ?? c?.checkSuiteId ?? c?.check_suite_id);
-    const sourceKnown = !!(workflow || suite);
-    const key = !name || (preserveUnknownJobs && !sourceKnown)
-      ? Symbol('unidentified-rollup-job')
-      : JSON.stringify([name, workflow, suite, sourceKnown ? rollupRowKind(c) : null]);
-    if (!byName.has(key)) byName.set(key, []);
-    byName.get(key).push(c);
+    const name = c?.name || c?.context || Symbol('nameless-rollup-row'); // ungroupable — its own singleton group
+    if (!byName.has(name)) byName.set(name, []);
+    byName.get(name).push(c);
   }
   const out = [];
   for (const matches of byName.values()) {
     const tier = (k) => matches.filter((c) => rollupRowKind(c) === k);
     const pool = [tier('CheckRun'), tier('untagged'), matches].find((t) => t.length);
-    const current = latestAttemptsOf(pool);
-    out.push(...(preserveUnknownJobs ? current : [blockingRowOf(current)]));
+    out.push(latestOf(pool));
   }
   return out;
 }
 
 /**
- * The latest evidence for ONE named check, or `null` when it has not reported.
- * Independent workflow/suite rows cannot supersede one another: scalar readers
- * see a failure first, then unfinished/unreadable evidence, then a passing row.
- * `we:scripts/merge-ai-prs.mjs#latestRequiredCheck` and the card group's combined-PR
+ * The latest run of ONE named check ({@link collapseRollupToLatestPerName}, then a by-name lookup), or `null` when
+ * that check has not reported. `we:scripts/merge-ai-prs.mjs#latestRequiredCheck` and the card group's combined-PR
  * reconcile (`we:scripts/lib/card-group.mjs`) both read the required check through this one lookup. Pure.
  * @param {Array<object>|null|undefined} rollup
  * @param {string} name
  * @returns {object|null}
  */
 export function latestCheckNamed(rollup, name) {
-  const rows = collapseRollupToLatestPerName(rollup).filter(c => (c?.name || c?.context) === name);
-  return rows.find(isFailedCheckRow)
-    || rows.find(c => !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(c?.conclusion || c?.state || '').toUpperCase()))
-    || rows[0] || null;
+  return collapseRollupToLatestPerName(rollup).find((c) => (c?.name || c?.context) === name) || null;
 }
 
 /** Every conclusion (or legacy StatusContext `state`) that means a check DEFINITIVELY failed. The one list the
@@ -166,52 +144,42 @@ export function mergeRequiredCheckRuns(pr, requiredCheck, stdout) {
 }
 
 /**
- * Only a strictly later attempt of the same job supersedes a row. Order workflow
- * runs first (never by check/job IDs), then attempts within the current run:
- * attempt counters reset for each workflow run. Without run identity metadata,
- * retain the attempt/timestamp fallback. Missing or invalid run identity cannot
- * borrow a known run's attempt ordering; that evidence stays in force.
+ * The latest run among several runs of ONE check. PR #2894 review (CONFIRMED live): the two feeds this module
+ * serves disagree on order — `gh pr view --json statusCheckRollup` is oldest→newest (creation order,
+ * #xkfv491), but the REST `commits/<sha>/check-runs` feed (`we:scripts/operations/pr-status-io.mjs#checksArgv`)
+ * is NEWEST-first, so a positional "last wins" silently kept the OLDEST run there. When EVERY run carries a
+ * numeric run `id` (REST rows do — `checksArgv` selects it; GitHub run ids are monotonic by creation), the
+ * highest id wins regardless of order. Otherwise (the rollup, which carries no id) the last entry wins, as
+ * before. Timestamps are deliberately NOT used: the rollup reports a queued run's `startedAt` as the zero date,
+ * which would rank the newest run oldest.
+ * @param {Array<object>} runs non-empty
+ * @returns {object}
  */
-function latestAttemptsOf(runs) {
-  const workflowRun = c => c?.workflowRun ?? c?.checkSuite?.workflowRun
-    ?? c?.check_suite?.workflow_run;
-  const positive = value => {
-    const n = typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value))
-      ? Number(value) : NaN;
-    return Number.isSafeInteger(n) && n > 0 ? n : null;
-  };
-  const timestamp = value => {
-    const time = Date.parse(value);
-    return Number.isFinite(time) && time > Date.parse('2000-01-01T00:00:00Z') ? time : null;
-  };
-  const started = c => timestamp(c?.startedAt ?? c?.started_at);
-  const completed = c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED'
-    ? null : timestamp(c?.completedAt ?? c?.completed_at);
-  const attempt = c => c?.run_attempt ?? c?.runAttempt
-    ?? workflowRun(c)?.run_attempt ?? workflowRun(c)?.runAttempt;
-  const runId = c => workflowRun(c)?.id ?? c?.run_id ?? c?.runId;
-  const latestBy = (rows, rank) => {
-    const ranks = rows.map(rank);
-    const latest = ranks.reduce((max, value) => value === null ? max : Math.max(max, value), -Infinity);
-    return rows.filter((_c, i) => ranks[i] === null || ranks[i] === latest);
-  };
-  // Compare the same timestamp field across rows. A completion after another
-  // job's start does not prove a later execution; unfinished rows stay in force
-  // unless comparable starts (or explicit run/attempt metadata) supersede them.
-  // Malformed explicit attempts prevent a timestamp from silently overriding them.
-  const withinRun = rows => latestBy(rows, rows.some(c => attempt(c) != null)
-    ? c => positive(attempt(c)) : rows.every(c => started(c) !== null) ? started : completed);
-  if (!runs.some(c => runId(c) != null)) return withinRun(runs);
-
-  const currentRun = latestBy(runs, c => positive(runId(c)));
-  const currentAttempts = new Set(withinRun(currentRun.filter(c => positive(runId(c)) !== null)));
-  return currentRun.filter(c => positive(runId(c)) === null || currentAttempts.has(c));
+function latestOf(runs) {
+  const ids = runs.map((c) => Number(c?.id));
+  if (!ids.every((id) => Number.isSafeInteger(id) && id > 0)) return latestByTime(runs);
+  return runs[ids.indexOf(Math.max(...ids))];
 }
 
-/** Scalar consumers must never see success while unordered blocking evidence remains. */
-function blockingRowOf(rows) {
-  return rows.find(isFailedCheckRow)
-    || rows.find(c => (c?.status && String(c.status).toUpperCase() !== 'COMPLETED')
-      || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(c?.conclusion || c?.state || '').toUpperCase()))
-    || rows[0];
+/**
+ * No ids (the rollup): the rollup is NOT reliably oldest→newest (live 2026-10-07, PR #4290: `soak-replay-gate`
+ * listed FAILURE@17:27 BEFORE its superseded SUCCESS@17:13, so "last wins" read stale green — the fix daemon saw
+ * no red check and owed no ci-heal, while the review dispatch gate, reading REST by run id, saw the real red).
+ * A run still in flight (no real `completedAt` — absent or the zero date) is the newest; otherwise the greatest
+ * `completedAt` wins, ties broken by position (later wins). Any run with no usable timestamp at all keeps the
+ * old positional rule for the whole group.
+ */
+function latestByTime(runs) {
+  const stamp = (c) => {
+    const done = Date.parse(c?.completedAt);
+    if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) return done;
+    const status = String(c?.status ?? '').toUpperCase();
+    if (status && status !== 'COMPLETED') return Infinity; // queued / in progress: the newest run
+    return null;
+  };
+  const stamps = runs.map(stamp);
+  if (stamps.some((s) => s === null)) return runs[runs.length - 1];
+  let best = 0;
+  for (let i = 1; i < runs.length; i++) if (stamps[i] >= stamps[best]) best = i;
+  return runs[best];
 }

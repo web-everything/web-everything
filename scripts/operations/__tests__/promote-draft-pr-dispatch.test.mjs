@@ -17,7 +17,8 @@ describe('review-hold-only red draft promotion', () => {
   const HEAD = 'a'.repeat(40);
   const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion,
     ...(name === 'review-gate' ? { output: { summary: 'check-review-gate held - a review hold stands: review:pending' } } : {}), ...extra });
-  const heldRows = () => [check('test'), check('review-gate', 'failure'), check('merge-gate', 'failure', { id: 123 })];
+  const heldRows = () => [check('test'), check('review-gate'), check('merge-gate'),
+    check('review-gate', 'failure'), check('merge-gate', 'failure', { id: 123 })];
   const verdict = () => ({ num: 198, head_sha: HEAD, ok: false,
     results: [{ id: 'review-hold-labels', status: 'hold', reason: 'review required' }] });
 
@@ -29,7 +30,7 @@ describe('review-hold-only red draft promotion', () => {
     const rows = [check('test'), check('merge-gate', mergeGateFailure ? 'failure' : 'success', { id: 123 }), {
       name: 'review-gate', status: 'completed', conclusion: 'failure',
       details_url: `https://github.com/${repoSlug}/actions/runs/100/job/456`,
-    }];
+    }, check('review-gate'), ...(mergeGateFailure ? [check('merge-gate')] : [])];
     const runGh = vi.fn(() => rows.map(row => JSON.stringify(row)).join('\n'));
     const ready = vi.fn();
     const readFreshLabels = vi.fn(readPrLabels);
@@ -116,7 +117,7 @@ describe('review-hold-only red draft promotion', () => {
 
   it.each([
     ['annotated merge-gate and review-gate red', heldRows(), 'red', true],
-    ['review-gate red only', [check('test'), check('review-gate', 'failure'), check('merge-gate')], 'red', true],
+    ['review-gate red only', [check('test'), check('review-gate'), check('review-gate', 'failure'), check('merge-gate')], 'red', true],
     ['green', [check('test'), check('review-gate'), check('merge-gate')], 'green', false],
     ['another required failure', heldRows().map(row => row.name === 'test' ? check('test', 'failure') : row), 'red', false],
     ['another required check pending', heldRows().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row), 'pending', false],
@@ -149,6 +150,33 @@ describe('review-hold-only red draft promotion', () => {
       mergeGateSetting: { value: 'off' },
     });
     expect(out).toMatchObject({ state: 'red', reviewHoldOnly: false });
+  });
+
+  it.each([
+    ['independent workflows', { workflowName: 'ci' }, { workflowName: 'other' }],
+    ['independent suites', { checkSuite: { id: 1 } }, { checkSuite: { id: 2 } }],
+  ])('fresh promotion refuses the pre-review failure id 10 / success id 20 collision from %s', (_label, failed, passed) => {
+    const colliding = [check('test', 'failure', { id: 10, ...failed }),
+      check('test', 'success', { id: 20, ...passed })];
+    for (const ordered of [colliding, colliding.toReversed()]) {
+      const rows = [...ordered, check('merge-gate'), check('review-gate'), check('review-gate', 'failure')];
+      const readHeadCheckState = () => defaultReadHeadCheckState({
+        repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
+        runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
+        getRequiredChecks: () => ({ checks: ['test', 'merge-gate', 'review-gate'], source: 'live' }),
+        readPrLabels: () => ['review:pending'], mergeGateSetting: { value: 'off' },
+      });
+      expect(readHeadCheckState()).toMatchObject({ state: 'red', reviewHoldOnly: false });
+      const ready = vi.fn();
+      const result = runReconcilePromoteDraftDispatch({ root: '/repo',
+        reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
+        provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [], readHeadCheckState,
+        clearAwaitingCi: NOOP_STATUS,
+      });
+      expect(ready).not.toHaveBeenCalled();
+      expect(result.dispatched).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'stale-check-refused', checkState: 'red' })]);
+    }
   });
 
   it('the fresh reader keeps an unannotated red merge-gate ineligible when its verdict is unreadable', () => {

@@ -221,12 +221,12 @@ describe('classifyPr', () => {
   it('collapses to the latest run per check name — PR #2878\'s real live rollup, 2026-09-28/29 '
     + '(we:backlog/fix-review-ciheal-deadlock)', () => {
     const pr2878Rollup = [
-      { __typename: 'CheckRun', name: 'review-gate', conclusion: 'FAILURE', run_attempt: 1 }, // stale — superseded below
-      { __typename: 'CheckRun', name: 'review-gate', conclusion: 'FAILURE', run_attempt: 2 },
-      { __typename: 'CheckRun', name: 'soak-replay-gate', conclusion: 'FAILURE', run_attempt: 1 }, // stale — superseded below
+      { __typename: 'CheckRun', name: 'review-gate', conclusion: 'FAILURE' }, // stale — superseded below
+      { __typename: 'CheckRun', name: 'review-gate', conclusion: 'FAILURE' },
+      { __typename: 'CheckRun', name: 'soak-replay-gate', conclusion: 'FAILURE' }, // stale — superseded below
       { __typename: 'CheckRun', name: 'test-shard (1)', conclusion: 'SUCCESS' },
-      { __typename: 'CheckRun', name: 'review-gate', conclusion: 'SUCCESS', run_attempt: 3 }, // the LATEST review-gate run
-      { __typename: 'CheckRun', name: 'soak-replay-gate', conclusion: 'SUCCESS', run_attempt: 2 }, // the LATEST run — this counts
+      { __typename: 'CheckRun', name: 'review-gate', conclusion: 'SUCCESS' }, // the LATEST review-gate run
+      { __typename: 'CheckRun', name: 'soak-replay-gate', conclusion: 'SUCCESS' }, // the LATEST run — this counts
       { __typename: 'CheckRun', name: 'test-shard (2)', conclusion: 'SUCCESS' },
       { __typename: 'CheckRun', name: 'test-shard (3)', conclusion: 'SUCCESS' },
       { __typename: 'CheckRun', name: 'test-shard (4)', conclusion: 'SUCCESS' },

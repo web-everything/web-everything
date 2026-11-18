@@ -20,8 +20,10 @@ const rawPr = (labels = ['review:pending']) => ({
   number: 7037, state: 'OPEN', headRefOid: HEAD, headRefName: 'lane/workflow-edit',
   mergeStateStatus: 'UNSTABLE', labels: labels.map(name => ({ name })), comments: [],
   statusCheckRollup: [check('test'), check('merge-gate', 'FAILURE', {
+    id: 123,
     detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/1/job/123',
-  }), check('review-gate', 'FAILURE', { output: { summary: 'check-review-gate held - a review hold stands: review:pending, review:human, review:changes, review:held-mechanical' } })],
+  }), check('review-gate', 'FAILURE', { output: { summary: 'check-review-gate held - a review hold stands: review:pending, review:human, review:changes, review:held-mechanical' } }),
+  check('merge-gate', 'SUCCESS', { id: 1 })],
 });
 const log = (extra = []) => {
   const overrides = new Map([
@@ -146,12 +148,12 @@ test('same-name review gates from different workflows/suites or unknown sources 
 });
 
 test('a newer successful rerun of the same identifiable job supersedes its older failure and is not red', () => {
-  for (const source of [{ workflowName: 'review' }, { check_suite: { id: 42 } }]) {
+  for (const source of [{ workflowRun: { databaseId: 42 } }, { run_id: 42 }]) {
     for (const reverse of [false, true]) {
       const pr = classified();
       const rows = [
-        check('review-gate', 'FAILURE', { id: 10, ...source }),
-        check('review-gate', 'SUCCESS', { id: 20, ...source }),
+        check('review-gate', 'FAILURE', { id: 10, run_attempt: 1, ...source }),
+        check('review-gate', 'SUCCESS', { id: 20, run_attempt: 2, ...source }),
       ];
       pr.statusCheckRollup = [check('test'), check('merge-gate'), ...(reverse ? rows.toReversed() : rows)];
       const evidence = { rollup: pr.statusCheckRollup, requiredChecks: [...requiredChecks, 'review-gate'], labels: pr.labels };
