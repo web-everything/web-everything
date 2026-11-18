@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import ts from 'typescript';
 import { assertCapability } from '../lib/repo-profile.mjs';
+import { createDrainMergeStrategy } from '../lib/drain-merge-strategy.mjs';
 
 const source = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
 const file = ts.createSourceFile('merge-ai-prs.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -229,5 +230,35 @@ describe('lander write path inventory', () => {
     compile(declaration('strandedSweep').parent.parent.getText(file), { runStrandedSweepStep: opts => { if (!opts.dryRun) sweep(); }, DRY_RUN: false, localWriteRefusal: {}, AS_JSON: true, redMainHeld: false })();
     expect(push).not.toHaveBeenCalled();
     expect(sweep).not.toHaveBeenCalled();
+  });
+
+  it.each(['longshore', 'unknown/repo', 'we'])('preserves pending queue follow-ups when %s is refused; retires them after admitted completion', localSlug => {
+    const pending = [{ num: 42, repo: null, headSha: 'a'.repeat(40) }];
+    let state = { pending, followedUp: [] };
+    const mergeStrategy = createDrainMergeStrategy({
+      statePath: 'injected-queue-state', quiet: true, localSlug, log: { write: vi.fn() },
+      resolved: { policy: { strategy: 'github-merge-queue' }, note: null },
+      readFile: () => JSON.stringify(state),
+      writeState: (_path, next) => { state = next; },
+      exec: () => { throw new Error('unexpected external IO'); },
+    });
+    // Exercise the shipped refusal, landedLocal and completion expressions, then the real state writer.
+    const wiring = {
+      assertCapability, localSlug, DRY_RUN: false, merged: pending, isLocalRepo: () => true,
+      followup: { handedOff: false }, localSynced: true, numbered: {},
+      resolveOnLandReport: { failed: [] }, derived: { failed: [] }, mergeStrategy, queueFollowUps: pending,
+    };
+    const confirmation = nodes.find(n => ts.isExpressionStatement(n)
+      && n.expression.getText(file).startsWith('mergeStrategy.confirmQueueFollowUps('));
+    compile(['localWriteRefusal', 'landedLocalAny', 'landedLocal', 'queueFollowUpsClean']
+      .map(name => declaration(name).parent.parent.getText(file)).join('\n')
+      + '\n' + confirmation.getText(file), wiring)();
+    if (localSlug === 'we') {
+      expect(state.pending).toEqual([]);
+      expect(state.followedUp).toEqual(['cwd#42']);
+    } else {
+      expect(state.pending).toEqual(pending);
+      expect(state.followedUp).toEqual([]);
+    }
   });
 });

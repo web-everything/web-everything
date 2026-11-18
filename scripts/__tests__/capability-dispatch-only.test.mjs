@@ -76,3 +76,96 @@ describe('capabilities admit dispatch only', () => {
       'sweepOnce', 'sweepOnce', 'refreshApprovedHead', 'sweepOnce', 'prepare', 'form', 'run', 'sweepOnce']);
   });
 });
+
+// card: scope every gh write with an explicit --repo / known remaining unguarded write sites
+// Debt inventory only: these existing writes are not additional capability-admission sites.
+// Pin argv and multiplicity, not line numbers, so a new call cannot borrow an existing exception.
+// The daemon delegates writes; include its label/comment helpers as well as direct gh effects.
+const delegatedWrites = new Set([
+  'sweepHumanSurfaceRepark', 'sweepReviewHoldLabels', 'holdReconcile', 'notifyReferral',
+  'tagStatus', 'tagRound', 'tagReviewRound', 'tagReviewStatus', 'postRefreshMarker',
+  'syncResultOnHeadLabels', 'runGateCatchUp',
+]);
+function remainingWriteSites(source) {
+  const file = ts.createSourceFile('source.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const sites = [];
+  function visit(node) {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression.getText(file);
+      if (delegatedWrites.has(callee)) sites.push(callee);
+      else if (node.arguments[0] && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === 'gh') {
+        const argv = node.arguments[1];
+        // Only positively identified reads are exempt. Dynamic argv stays visible in the ratchet.
+        const words = argv && ts.isArrayLiteralExpression(argv) ? argv.elements.map(n => ts.isStringLiteral(n) ? n.text : null) : [];
+        const read = ['pr', 'repo', 'issue'].includes(words[0]) && ['list', 'view'].includes(words[1])
+          || words[0] === 'api' && !argv.elements.some(ts.isSpreadElement)
+            && !words.some(w => w && /^(?:-X|-f|-F|--method|--field|--raw-field|--input)/.test(w));
+        if (!read) sites.push(`${callee}(${node.arguments.slice(0, 2).map(n => n.getText(file).replace(/\s+/g, ' ')).join(', ')})`);
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(file);
+  return sites;
+}
+const remainingUnguardedWrites = [
+  {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"exec('gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr))"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"exec('gh', GH_ARGV.readPrReviews(slug, pr))"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Apply lifecycle/park/review label","call":"exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"exec('gh', apiArgs(repo, headRef))"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Apply lifecycle/park/review label","call":"exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Apply lifecycle/park/review label","call":"execFileSync('gh', ['pr', 'edit', String(num), ...repoFlag(repo), '--add-label', label])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"execFileSync('gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Publish drain reason comment","call":"execFileSync('gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment(kind, reasonText, auditLine)])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Publish drain reason comment","call":"execFileSync('gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment('park', reasonText)])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Edit existing park comment","call":"execFileSync('gh', ['api', '-X', 'PATCH', `repos/${repo || '{owner}/{repo}'}/issues/comments/${plan.commentId}`, '-f', `body=${buildDrainReasonComment('park', reasonText)}`])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"exec('gh', args)"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args)"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"execFileP('gh', listArgs)"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', READY_TO_MERGE_LABEL])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel])"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Reconcile carrier PR body","call":"execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--body', reconciled.body])"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Repark human review surfaces","call":"sweepHumanSurfaceRepark"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Reconcile hold labels","call":"sweepReviewHoldLabels"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Run hold/stamp reconciliation","call":"holdReconcile"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Refresh review/status labels","call":"tagStatus"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish referral pause notice","call":"notifyReferral"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish scope-refresh result marker","call":"postRefreshMarker"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish dispatched review round","call":"tagRound"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Refresh review/status labels","call":"tagStatus"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Repair result labels on current head","call":"syncResultOnHeadLabels"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish missing red-team gate result","call":"runGateCatchUp"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Wire round-label writer","call":"tagReviewRound"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Wire status-label writer","call":"tagReviewStatus"},
+];
+
+describe('remaining GitHub write debt ratchet', () => {
+  it.each(['scripts/merge-ai-prs.mjs', 'skills-src/conveyor/review-daemon.mjs'])
+    ('%s adds no write sites outside the documented debt inventory', path => {
+      const expected = remainingUnguardedWrites.filter(site => site.file === path);
+      expect(expected.every(site => site.description.trim().length > 0)).toBe(true);
+      expect(remainingWriteSites(readFileSync(resolve(root, path), 'utf8')).sort())
+        .toEqual(expected.map(site => site.call).sort());
+    });
+
+  it.each([
+    `exec('gh', ['pr', 'edit', '42', '--add-label', 'new'])`,
+    `exec('gh', ['api', '-X', 'PATCH', 'repos/owner/repo/issues/42'])`,
+    `exec('gh', ['api', 'repos/owner/repo/issues/42', '-f', 'title=new'])`,
+    `exec('gh', ['api', '-XPOST', 'repos/owner/repo/issues'])`,
+    `exec('gh', ['api', 'repos/owner/repo/issues', ...writeFlags])`,
+    `exec('gh', dynamicArgs)`,
+    `tagStatus({repo, pr: 42})`,
+  ])('detects an added write or opaque gh boundary: %s', source => {
+    expect(remainingWriteSites(source)).toHaveLength(1);
+    expect(remainingWriteSites(`${source}; ${source};`)).toHaveLength(2);
+  });
+  it('ignores comments and positively identified reads', () => {
+    expect(remainingWriteSites(`// exec('gh', ['pr', 'edit', '42'])
+      exec('gh', ['pr', 'view', '42']); exec('gh', ['api', 'repos/owner/repo/pulls']);`)).toEqual([]);
+  });
+});

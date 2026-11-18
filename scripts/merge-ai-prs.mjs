@@ -7903,7 +7903,8 @@ async function runCli() {
 
   // xtpxusq — retire the queue-merged PRs' follow-ups only now that numbering, resolve-on-land and derived regen are
   // done AND none of them reported a failure; otherwise they stay pending and the next pass reruns them (idempotent).
-  const queueFollowUpsClean = (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
+  // Capability refusal skips that work, so it must also keep the follow-ups pending for the operator.
+  const queueFollowUpsClean = !localWriteRefusal && (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
   mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
 
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress
