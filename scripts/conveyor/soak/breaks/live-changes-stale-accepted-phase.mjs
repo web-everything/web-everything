@@ -1,9 +1,12 @@
 /** Live send-back: string labels must outrank an older accepted/queued snapshot. */
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { planReconcile } from '../../reconcile-core.mjs';
+import { execFileSync } from 'node:child_process';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildStandDownComment } from '../../stand-down.mjs';
 import { buildReviewedShaMarker } from '../../../lib/review-escalation.mjs';
+
+const SELF = fileURLToPath(import.meta.url);
+const ROOT = resolve(SELF, '../../../../..');
 
 export default {
   id: 'live-changes-stale-accepted-phase',
@@ -11,10 +14,21 @@ export default {
   card: 'live review:changes ignored behind an older accepted/queued phase',
   fixedBy: { sha: '02eeb4e57f', where: 'lane/live-review-changes', paths: ['scripts/conveyor/reconcile-core.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8')
-      .includes('labels: labelNames(pr?.labels).map(name => ({ name }))');
+    // Like idle-row-dangling-call-holds-pr: keep the harness's probe synchronous,
+    // but judge real behavior in the requested tree, including the stand-down note.
+    try {
+      const code = `import(${JSON.stringify(pathToFileURL(SELF).href)}).then(async ({ default: b }) => {
+        const report = await b.run({ sourceRoot: ${JSON.stringify(root)} });
+        process.exit(b.judge(report).length ? 1 : 0);
+      }).catch(() => process.exit(2));`;
+      execFileSync(process.execPath, ['--input-type=module', '-e', code], { stdio: 'ignore', timeout: 60_000 });
+      return true;
+    } catch {
+      return false;
+    }
   },
-  run({ log } = {}) {
+  async run({ log, sourceRoot = process.env.SOAK_TREE_ROOT || ROOT } = {}) {
+    const { planReconcile } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/reconcile-core.mjs')).href);
     const head = 'b'.repeat(40);
     const pr = {
       number: 1563, state: 'OPEN', isDraft: false,
