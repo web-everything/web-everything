@@ -1067,7 +1067,7 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
  * THE SINKS, bound to a repo root and an output channel.
  *
  * @param {{root?: string, out?: (line: string) => void, runNode?: Function, postComment?: Function, labelProvider?: object,
- *   json?: boolean, readLabels?: Function, setLabels?: Function}} [o] -
+ *   json?: boolean, readLabels?: Function, readHead?: Function, setLabels?: Function}} [o] -
  *   `runNode` is the injectable subprocess runner (`(argv) => stdout`), so the label sink is testable without
  *   `gh`; `postComment` is the injectable `(repo, pr, body) => void` the `advise` sink posts through (#xlw02hw),
  *   so it too is testable without `gh` — defaults to `createGhProvider().postComment`. `readLabels` (`(repo, pr)
@@ -1125,6 +1125,8 @@ export function createReviewPrSinks({
   labelProvider = createReferralGhProvider(),
   // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own two primitives (see the header note above).
   readLabels = createGhProvider().readLabels,
+  // Read-only recovery of a pending label swap; same forge transport as the publish barrier.
+  readHead = readReviewHead,
   setLabels = createGhProvider().setLabels,
   // Card 5469 — the scoped re-review shadow's reads and writes, injectable so the sink is testable with no git/ledger.
   shadowGitExec = execFileIn(root),
@@ -2060,6 +2062,27 @@ export function createReviewPrSinks({
   };
   // Only historical body-file argument refusals prove a pending label attempt never wrote.
   sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
+  // Removal labels were narrowed at declaration time: only the complete applied state resolves observation.
+  // A not-applied retry needs comment dedupe by a marker (follow-up card): review-set-label posts a durable comment.
+  sinks[REVIEW_EFFECTS.LABEL].observeOutcome = async entry => {
+    const payload = entry?.payload;
+    const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+    if (!payload || !Number.isInteger(payload.pr) || payload.pr <= 0
+      || !nonempty(payload.repo) || !nonempty(payload.reviewedHead) || !nonempty(payload.addLabel)
+      || !Array.isArray(payload.removeLabels) || !payload.removeLabels.every(nonempty)) return null;
+    try {
+      const head = await readHead({ repo: payload.repo, pr: payload.pr });
+      if (head !== payload.reviewedHead) return null;
+      const labels = await readLabels(payload.repo, payload.pr);
+      if (!Array.isArray(labels)) return null;
+      const names = labels.map(label => typeof label === 'string' ? label : label?.name);
+      if (!names.every(nonempty)) return null;
+      const added = names.includes(payload.addLabel);
+      const removed = payload.removeLabels.filter(label => names.includes(label));
+      if (added && removed.length === 0) return 'applied';
+      return null;
+    } catch { return null; }
+  };
   return sinks;
 }
 

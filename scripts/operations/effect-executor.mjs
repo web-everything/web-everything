@@ -98,8 +98,8 @@ export function isPermanentGuardRefusal(error) {
  * starting the work and hearing back lands in a state a person can see and act on:
  *   - `inFlightEntries` reports it under `unknown` — "something may be running and cannot be observed" — where
  *     a `pending` entry says only "an attempt was made", losing the fact that work may still be out there.
- *   - `resolveInFlight` accepts it, so there is a supported way to close it out. `pending` has none, and the
- *     operator's only option is to hand-edit the run record.
+ *   - `resolveInFlight` accepts it, so there is a supported way to close it out. A `pending` entry instead
+ *     requires `sink.observeOutcome` evidence that it was applied (or separate proof it was not applied) before recovery.
  * Writing `in-flight` after the sink returned would put a process-killed dispatch back in `pending`, invisible
  * to both. A sink that THROWS is a different path and does not need the ordering — the catch branch below
  * records `in-flight` on its own.
@@ -283,10 +283,20 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
         store.write(run);
         continue;
       }
+      // Observation only proves applied, never permission to replay an unknown attempt.
+      let observed;
+      try {
+        if (typeof sink.observeOutcome === 'function') observed = await sink.observeOutcome(entry, run);
+      } catch { /* Unreadable evidence leaves the outcome unknown. */ }
+      if (observed === 'applied') {
+        run = withEntry(run, entry.key, { status: 'applied', error: null, result: { observed: true } });
+        store.write(run);
+        continue;
+      }
       throw new Error(
         `operations: effect ${entry.key} (${entry.type}) was attempted and its outcome is UNKNOWN — it is not declared ` +
-        'idempotent, so replaying it could double-apply. Refusing. Resolve it by hand (mark the entry `applied` or ' +
-        '`failed` on the run record) and re-run.',
+        'idempotent, so replaying it could double-apply. Refusing. Reconcile through observation with ' +
+        'sink.observeOutcome proving applied and re-run; otherwise keep this effect blocked.',
       );
     }
   }
@@ -322,7 +332,7 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
     //   - a DISPATCH gets `in-flight` with no handle yet. That does NOT make a crash here resumable — a
     //     handle-less entry is refused on replay exactly as `pending` is. What it buys is VISIBILITY: the
     //     crash lands in `inFlightEntries().unknown` and is closable through `resolveInFlight`, where a
-    //     `pending` entry is invisible to both and can only be hand-edited. See the `inFlight` docblock.
+    //     `pending` entry instead requires sink outcome observation. See the `inFlight` docblock.
     // COUNT THE ATTEMPT, and record WHO made it. This is instrumentation, not policy: nothing reads these to
     // decide anything, and #3083 — where retry gets a cap, a backoff and an owner — is unruled. They are here
     // now because they cannot be recovered later. The corpus held zero retry observations when this landed

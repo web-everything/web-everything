@@ -104,6 +104,76 @@ describe('permanent guard refusals', () => {
   });
 });
 
+describe('pending outcome observation', () => {
+  const pending = store => {
+    const run = atEffectStep();
+    Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: connection reset' });
+    store.write(run);
+    return run;
+  };
+
+  it.each([false, true])('persists observed applied without replay and advances, including restart (async: %s)', async asynchronous => {
+    const store = createMemoryRunStore();
+    const run = pending(store);
+    const healthy = recordingSinks();
+    let observations = 0;
+    const observe = (entry, record) => {
+      observations++;
+      expect(entry).toEqual(run.effects[0]);
+      expect(record.id).toBe(run.id);
+      return 'applied';
+    };
+    healthy.sinks['comment.post'].observeOutcome = asynchronous ? async (...args) => observe(...args) : observe;
+    const result = await applyPendingEffects(run, { sinks: healthy.sinks, store });
+    expect(result.run.effects[0]).toMatchObject({ status: 'applied', attempts: 1, error: null, result: { observed: true } });
+    expect(store.read(run.id).effects[0]).toEqual(result.run.effects[0]);
+    expect(healthy.calls.map(call => call.type)).toEqual(['label.swap']);
+    expect(runStatus(advance(result.run, { registry }), { registry })).toBe('complete');
+    const replay = await applyPendingEffects(store.read(run.id), { sinks: healthy.sinks, store });
+    expect(replay.applied).toEqual([]);
+    expect(observations).toBe(1);
+    expect(healthy.calls).toHaveLength(1);
+  });
+
+  it('refuses observed not-applied without changing the record or replaying any sink', async () => {
+    const store = createMemoryRunStore();
+    const run = pending(store);
+    const states = [];
+    const write = store.write;
+    store.write = record => { states.push(record.effects[0].status); return write(record); };
+    const healthy = recordingSinks();
+    healthy.sinks['comment.post'].observeOutcome = async () => 'not-applied';
+    await expect(applyPendingEffects(run, { sinks: healthy.sinks, store })).rejects.toThrow(/outcome is UNKNOWN.*proving applied/);
+    expect(states).toEqual([]);
+    expect(store.read(run.id)).toEqual(run);
+    expect(healthy.calls).toEqual([]);
+  });
+
+  it('uses proof before observation', async () => {
+    const store = createMemoryRunStore();
+    const run = pending(store);
+    const healthy = recordingSinks();
+    let observed = false;
+    healthy.sinks['comment.post'].provablyNotApplied = () => true;
+    healthy.sinks['comment.post'].observeOutcome = () => { observed = true; return 'applied'; };
+    await applyPendingEffects(run, { sinks: healthy.sinks, store });
+    expect(observed).toBe(false);
+    expect(healthy.calls).toHaveLength(2);
+  });
+
+  it.each([null, undefined, false, true, {}, 'unknown', 'throws', 'rejects'])('fails closed without any sink writes when observation is %s', async value => {
+    const store = createMemoryRunStore();
+    const run = pending(store);
+    const healthy = recordingSinks();
+    healthy.sinks['comment.post'].observeOutcome = value === 'rejects'
+      ? async () => { throw new Error('unreadable'); }
+      : () => { if (value === 'throws') throw new Error('unreadable'); return value; };
+    await expect(applyPendingEffects(run, { sinks: healthy.sinks, store })).rejects.toThrow(/Reconcile through observation/);
+    expect(healthy.calls).toEqual([]);
+    expect(store.read(run.id)).toEqual(run);
+  });
+});
+
 describe('the happy path', () => {
   it('applies every declared effect in declared order and lets the run complete', async () => {
     const store = createMemoryRunStore();
@@ -266,7 +336,7 @@ describe('the indeterminate case — an attempt whose outcome is unknown', () =>
     store.write(run);
     const healthy = recordingSinks();
     healthy.sinks['comment.post'].provablyNotApplied = () => proof;
-    await expect(applyPendingEffects(run, { sinks: healthy.sinks, store })).rejects.toThrow(/Resolve it by hand/);
+    await expect(applyPendingEffects(run, { sinks: healthy.sinks, store })).rejects.toThrow(/Reconcile through observation/);
     expect(healthy.calls).toEqual([]);
     expect(store.read(run.id).effects[0].status).toBe('pending');
   });

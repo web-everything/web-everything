@@ -39,7 +39,7 @@ const fixtureRunStore = (root) => ({ read: (id) => {
   try { body = readFileSync(join(root ?? '', '.operations', 'review', id, 'o-n-7-verdict.md'), 'utf8'); } catch { /* none staged */ }
   return { id, effects: ['o-n-7-verdict.md', 'v.md'].map((bodyFile, i) => ({ key: `${id}#0#${i}`, type: 'review.write-up', status: 'applied', payload: { bodyFile, body: body || 'Accept' } })) };
 } });
-const createReviewPrSinks = (o = {}) => createSinks({ runStore: fixtureRunStore(o.root), readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
+const createReviewPrSinks = (o = {}) => createSinks({ runStore: fixtureRunStore(o.root), readHead: () => null, readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.mjs';
@@ -4393,5 +4393,78 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       decorate: gate => ({ ...gate, reason: 'untrusted-required-set' }) });
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
     expect(f.runNode).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('pending label swap observation', () => {
+  // Persisted PR #7109 shape: the label write landed but its response did not.
+  const entry = {
+    status: 'pending', attempts: 1,
+    payload: { pr: 7109, repo: 'o/n', reviewedHead: 'd20084f7c427cdb0000c40f298fff4f6bdff3179',
+      addLabel: 'review:accepted', removeLabels: ['review:pending'], to: 'accepted' },
+  };
+  const live = ['ready-to-merge', 'review:accepted', 'review-round:1', 'status:ready-to-merge', 'red-team:pending'];
+  const observer = (options = {}) => createReviewPrSinks({ root,
+    readHead: async () => entry.payload.reviewedHead, readLabels: async () => live, ...options,
+  })[REVIEW_EFFECTS.LABEL].observeOutcome;
+
+  it('observes PR 7109 applied on its reviewed head using the live forge readers', async () => {
+    const readHead = vi.fn(() => entry.payload.reviewedHead);
+    const readLabels = vi.fn(() => live.map(name => ({ name })));
+    await expect(observer({ readHead, readLabels })(entry)).resolves.toBe('applied');
+    expect(readHead).toHaveBeenCalledWith({ repo: 'o/n', pr: 7109 });
+    expect(readLabels).toHaveBeenCalledWith('o/n', 7109);
+  });
+
+  it('keeps the same PR 7109 labels unknown on a moved head', async () => {
+    await expect(observer({ readHead: () => 'b'.repeat(40) })(entry)).resolves.toBeNull();
+  });
+
+  it('fails closed when source labels remain and the added label is absent', async () => {
+    await expect(observer({ readLabels: () => ['review:pending', 'ready-to-merge'] })(entry)).resolves.toBeNull();
+  });
+
+  it.each([
+    ['partial swap', ['review:pending', 'review:accepted']],
+    ['neither before nor after', ['ready-to-merge']],
+    ['unreadable labels', null],
+    ['malformed labels', [{}]],
+    ['missing label name', [null]],
+  ])('fails closed for %s', async (_name, labels) => {
+    await expect(observer({ readLabels: () => labels })(entry)).resolves.toBeNull();
+  });
+
+  it('fails closed for a partially removed multi-label swap', async () => {
+    const multiple = { ...entry, payload: { ...entry.payload, removeLabels: ['review:pending', 'review:changes'] } };
+    for (const labels of [['review:pending'], ['review:pending', 'review:accepted']]) {
+      await expect(observer({ readLabels: () => labels })(multiple)).resolves.toBeNull();
+    }
+  });
+
+  it('fails closed for an absent added label with no removals but observes the complete added state', async () => {
+    const addOnly = { ...entry, payload: { ...entry.payload, removeLabels: [] } };
+    await expect(observer({ readLabels: () => [] })(addOnly)).resolves.toBeNull();
+    await expect(observer()(addOnly)).resolves.toBe('applied');
+  });
+
+  it.each(['pr', 'repo', 'reviewedHead', 'addLabel', 'removeLabels'])('fails closed for missing payload field %s', async field => {
+    const payload = { ...entry.payload };
+    delete payload[field];
+    await expect(observer()({ ...entry, payload })).resolves.toBeNull();
+  });
+
+  it.each([null, { repo: '' }, { pr: 0 }, { removeLabels: [null] }, { removeLabels: 'review:pending' }, { reviewedHead: '' }])('fails closed for incomplete payload %j', async invalid => {
+    const payload = invalid === null ? null : { ...entry.payload, ...invalid };
+    await expect(observer()({ ...entry, payload })).resolves.toBeNull();
+  });
+
+  it.each(['readHead', 'readLabels'])('fails closed when %s throws or rejects', async reader => {
+    await expect(observer({ [reader]: () => { throw new Error('unreadable'); } })(entry)).resolves.toBeNull();
+    await expect(observer({ [reader]: async () => { throw new Error('unreadable'); } })(entry)).resolves.toBeNull();
+  });
+
+  it.each([null, undefined, ''])('fails closed for unreadable head %s', async head => {
+    await expect(observer({ readHead: () => head })(entry)).resolves.toBeNull();
   });
 });
