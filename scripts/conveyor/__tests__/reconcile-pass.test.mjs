@@ -1212,29 +1212,35 @@ it.each([
   const plan = runReconcilePass(options);
   expect(plan.dispatch).toEqual([]);
   const wait = plan.refusals.find(r => r.kind === 'fix-join-wait');
-  expect(wait).toMatchObject({ prNumber: 3336, evidenceReason: expect.stringContaining('rows-incomplete'),
-    deadline: options.now + 15 * 60_000 });
-  const afterCap = runReconcilePass({ ...options, now: wait.deadline + 1 });
-  expect(afterCap.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'fix']]);
-  expect(afterCap.refusals.some(r => r.kind === 'fix-join-wait')).toBe(false);
+  expect(wait).toMatchObject({ prNumber: 3336, evidenceReason: expect.stringContaining('rows-incomplete') });
+  const afterCap = runReconcilePass({ ...options, now: options.now + 60 * 60_000 });
+  expect(afterCap.dispatch).toEqual([]);
+  expect(afterCap.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+    evidenceReason: expect.stringContaining('rows-incomplete') }));
+  const refreshed = runReconcilePass({ ...options, readChecks: () => xxRuns(), now: options.now + 60 * 60_000 });
+  expect(refreshed.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'ci-heal']]);
   // Absent evidence = the checks never started: owed a trigger, NOT a failed read. A real read error still refuses.
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
     .toEqual(isReadFailure ? [expect.objectContaining({ prNumber: 3336 })] : []);
   expect(plan.owedTriggers.map(t => t.prNumber)).toEqual(isReadFailure ? [] : [3336]);
 });
 
-// Known failing/pending evidence already in the snapshot must survive a refused hydration: a cancelled required
-// check seen in the truncated snapshot still schedules recovery on this tick, while the refusal stays visible.
+// Preserve known rows for diagnostics, but a refused hydration cannot authorize recovery from incomplete evidence.
 it.each([
   ['unreadable read', () => { throw new Error('HTTP 502'); }, true],
   ['absent evidence', () => xxRuns().filter(row => row.name === 'soak-replay-gate'), false],
-])('xxh4zw8 %s keeps the known cancelled snapshot so recovery is still scheduled', async (_, readChecks, isReadFailure) => {
+])('xxh4zw8 %s keeps the known cancelled snapshot but waits for complete evidence', async (_, readChecks, isReadFailure) => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const pr = { ...xxPr(), statusCheckRollup: [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED',
     completedAt: '2026-10-01T10:00:00Z' }] };
-  const plan = runReconcilePass({ ...xxOptions(), readChecks, readPrs: () => [pr] });
-  expect(plan.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'ci-heal']]);
-  expect(plan.refusals.some(r => r.kind === 'fix-join-wait')).toBe(false);
+  const options = { ...xxOptions(), readOnly: true, readChecks, readPrs: () => [pr] };
+  const plan = runReconcilePass(options);
+  expect(plan.enrichedPrs[0].statusCheckRollup).toEqual(pr.statusCheckRollup);
+  expect(plan.dispatch).toEqual([]);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+    evidenceReason: expect.stringContaining('rows-incomplete') }));
+  const refreshed = runReconcilePass({ ...options, readChecks: () => xxRuns() });
+  expect(refreshed.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'ci-heal']]);
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
     .toEqual(isReadFailure ? [expect.objectContaining({ prNumber: 3336 })] : []);
 });
@@ -1249,11 +1255,13 @@ it('xxh4zw8 a cancelled snapshot from a foreign head waits visibly instead of au
   const plan = runReconcilePass(options);
   expect(plan.dispatch).toEqual([]);
   const wait = plan.refusals.find(r => r.kind === 'fix-join-wait');
-  expect(wait).toMatchObject({ prNumber: 3336, evidenceReason: expect.stringContaining('foreign-head'),
-    deadline: options.now + 15 * 60_000 });
-  const afterCap = runReconcilePass({ ...options, now: wait.deadline + 1 });
-  expect(afterCap.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'ci-heal']]);
-  expect(afterCap.refusals.some(r => r.kind === 'fix-join-wait')).toBe(false);
+  expect(wait).toMatchObject({ prNumber: 3336, evidenceReason: expect.stringContaining('foreign-head') });
+  const afterCap = runReconcilePass({ ...options, now: options.now + 60 * 60_000 });
+  expect(afterCap.dispatch).toEqual([]);
+  expect(afterCap.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+    evidenceReason: expect.stringContaining('foreign-head') }));
+  const refreshed = runReconcilePass({ ...options, readChecks: () => xxRuns(), now: options.now + 60 * 60_000 });
+  expect(refreshed.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'ci-heal']]);
 });
 
 it('xxh4zw8 a refused hydration keeps known pending evidence but never promotes on a truncated green snapshot', async () => {
@@ -1308,7 +1316,7 @@ it('xe8y12n real PR read shell enriches the reported missing-family shape from c
 // GitHub runs no CI on a conflicting head, so its required checks can never appear. Hydration used to read the REST
 // feed every tick and refuse `check-read-failed: missing required checks`, for a PR whose owed work (a mechanical
 // re-sync with main) does not require a successful CI result. Absence there is EXPECTED: no read failure;
-// the joined fix waits for evidence only up to its cap. Other paths still refuse/read as appropriate.
+// unknown provenance still waits for a trusted snapshot. Other paths still refuse/read as appropriate.
 describe('conflicting head: missing required checks are expected (#3771)', () => {
   const real = async () => (await import('node:fs')).readFileSync(
     (await import('node:path')).join(process.cwd(), 'scripts/conveyor/__tests__/fixtures/pr-3771-conflicting-no-ci.json'), 'utf8');
@@ -1317,7 +1325,7 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
     enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p });
   const dispatchOf = (plan) => plan.dispatch.map(d => [d.prNumber, d.kind, d.isConflict ?? null]);
 
-  it('real #3771 data: conflict repair waits visibly for unknown CI, then dispatches after the join cap without a read', async () => {
+  it('real #3771 data: conflict repair waits for provenance past the join cap without a read', async () => {
     const { runReconcilePass } = await import('../reconcile-pass.mjs');
     const readChecks = vi.fn(() => []);
     const pr = await livePr();
@@ -1325,12 +1333,14 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
     const plan = runReconcilePass(options);
     expect(dispatchOf(plan)).toEqual([]);
     const wait = plan.refusals.find(r => r.kind === 'fix-join-wait');
-    expect(wait).toMatchObject({ prNumber: 3771, evidenceReason: expect.stringContaining('foreign-head'),
-      deadline: expect.any(Number) });
-    expect(Number.isFinite(wait.deadline)).toBe(true);
-    const afterCap = runReconcilePass({ ...options, now: wait.deadline + 1 });
-    expect(dispatchOf(afterCap)).toEqual([[3771, 'fix', true]]);
-    expect(afterCap.refusals.some(r => r.kind === 'fix-join-wait')).toBe(false);
+    expect(wait).toMatchObject({ prNumber: 3771, evidenceReason: expect.stringContaining('foreign-head') });
+    const afterCap = runReconcilePass({ ...options, now: options.now + 60 * 60_000 });
+    expect(dispatchOf(afterCap)).toEqual([]);
+    expect(afterCap.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
+      evidenceReason: expect.stringContaining('foreign-head') }));
+    const refreshed = runReconcilePass({ ...options, now: options.now + 60 * 60_000,
+      readPrs: () => [{ ...pr, rowsHead: pr.headRefOid, rowsComplete: true }] });
+    expect(dispatchOf(refreshed)).toEqual([[3771, 'fix', true]]);
     expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
     expect(readChecks).not.toHaveBeenCalled();
   });
@@ -2190,5 +2200,7 @@ it('hydration never promotes an unreadable row merely because a higher check ID 
   for (const read of [[unreadable, ...rows], [...rows, unreadable]]) {
     const plan = runReconcilePass({ ...xxOptions(), readChecks: () => read });
     expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed',
+      why: expect.stringContaining(`unreadable conclusions: ${unreadable.name}`) }));
   }
 });

@@ -1571,7 +1571,7 @@ function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, de
           || (row.completed_at != null && !Number.isFinite(Date.parse(row.completed_at))))) {
           throw new Error('malformed check runs');
         }
-        const unreadable = collapseRollupToLatestPerName(rows).filter(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
+        const unreadable = rows.filter(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && row.status.toLowerCase() === 'completed'
           && !['success', ...FAILING_CONCLUSIONS, ...NON_BLOCKING_CONCLUSIONS].includes(row.conclusion?.toLowerCase()));
         if (unreadable.length) throw new Error(`unreadable conclusions: ${unreadable.map(row => row.name).join(', ')}`);
@@ -1608,9 +1608,9 @@ function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, de
     // The refusal withholds CI evidence only. The PR stays in planning for every branch that does not consume
     // it (conflict-fix, review dispatch, stand-down, label reconciliation): an unreadable read swaps the
     // truncated snapshot for an empty rollup (`unchecked`, never green or red), never drops the PR. The one thing
-    // a refused hydration must NOT discard is evidence already in hand that says red or pending: that is a
-    // positive observation, so a cancelled or still-running required check seen in the known snapshot keeps
-    // scheduling recovery on this tick. A truncated snapshot that merely looks green is NOT kept — a later,
+    // a refused hydration must NOT discard is evidence already in hand that says red or pending. Keep those
+    // observations for recovery diagnostics; the joined-fix gate still requires complete provenance before
+    // dispatching a worker. A truncated snapshot that merely looks green is NOT kept — a later,
     // unread rerun could contradict it, so it stays `unchecked`.
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):

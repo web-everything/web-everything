@@ -4096,16 +4096,11 @@ export function planReconcile({
     const facts = timingFacts(pr, { agents, repo, requiredChecks,
       reviewDispatched: dispatch.some(d => d.prNumber === entry.prNumber && d.kind === 'review') });
     const decision = joinedFixDecision({ ...facts, now, policy: fixTiming });
-    // Known head-local failures (including cancelled checks) remain actionable in an incomplete snapshot.
-    const evidenceReason = facts.ciFailed || ['pass', 'held', 'pending', 'fail'].includes(facts.reason) ? undefined : facts.reason;
-    const evidenceSince = Number.isFinite(facts.firstReadyAt) ? facts.firstReadyAt
-      : Date.parse(entry.waitingSince ?? pr?.createdAt);
-    const evidenceDeadline = evidenceSince + fixTiming.joinWaitMaxMin * 60_000;
-    const evidenceWait = evidenceReason && (!Number.isFinite(evidenceDeadline)
-      || !Number.isFinite(now) || now < evidenceDeadline);
-    if (evidenceWait || decision.action === 'wait') {
-      refusals.push({ ...entry, kind: 'fix-join-wait', deadline: evidenceWait ? evidenceDeadline : decision.deadline, evidenceReason,
-        why: evidenceReason ? `waiting for readable head-pinned CI evidence: ${evidenceReason}`
+    // The join cap bounds waiting for a known counterpart, never authorizes unknown evidence.
+    const evidenceReason = ['pass', 'held', 'pending', 'fail'].includes(facts.reason) ? undefined : facts.reason;
+    if (evidenceReason || decision.action === 'wait') {
+      refusals.push({ ...entry, kind: 'fix-join-wait', deadline: evidenceReason ? undefined : decision.deadline, evidenceReason,
+        why: evidenceReason ? `waiting for readable head-pinned CI evidence: ${evidenceReason}; refresh the required-check evidence before dispatch`
           : 'waiting for the other CI/review input within fix.joinWaitMaxMin' });
       continue;
     }

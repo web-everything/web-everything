@@ -25,6 +25,7 @@ const ANNOTATIONS = [{
   title: 'Incomplete multi-character sanitization', message: 'This string may still contain [<!--](1), which may cause an HTML element injection vulnerability.',
 }];
 const pr4370 = (over = {}) => ({
+  rowsHead: HEAD, rowsComplete: true, rosterSource: 'live',
   number: 4370, state: 'OPEN', headRefName: 'lane/velocity', headRefOid: HEAD, mergeStateStatus: 'UNSTABLE', mergeable: 'MERGEABLE',
   labels: lbl('ready-to-merge', 'review:accepted', 'review-round:1'), statusCheckRollup: rollup(), comments: [], ...over,
 });
