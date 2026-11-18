@@ -541,10 +541,39 @@ describe('runFixCli', () => {
     expect(readLease.mock.calls.length).toBeGreaterThanOrEqual(3);
     expect(m.spawn).toHaveBeenCalledOnce();
   });
+  it.each([
+    ['doc-fix', 1, ['we:docs'], true], ['feature', 1, ['we:docs'], false],
+    ['doc-fix', 3, ['we:docs'], false], ['doc-fix', 1, [], false],
+  ])('real detached dispatch derives repair admission from item %s size %s scope %j', async (taskKind, size, scope, admitted) => {
+    const m = mk(['aaa', 'aaa']);
+    const { resolveFixProvider } = await import('../fix-run.mjs');
+    const provider = await resolveFixProvider('antigravity');
+    const runTask = vi.fn(async () => ({ status: 'ok', finalMessage: 'done' }));
+    const spawnDetached = vi.fn(() => ({ pid: 99 }));
+    fixDetachedProvider({ pr: 7, num: '7', sessionSlug: 'fix-7', ref: 'lane/7-x',
+      promptFile: '/p.md', repo: 'o/r', laneRepo: '/w', scope: scope.join(','),
+      policyRoute: { provider: 'antigravity' } }, { spawnDetached, logPathFor: () => '/unused', readDeliveryAgentMarker: () => null });
+    const store = ledger();
+    // Argon follows three unproductive runs on this head.
+    for (let i = 0; i < 3; i++) recordRoutedOutcome({ pr: 7, head: 'aaa', outcome: 'failed', store, readClaim: () => null });
+    const out = await runFixCli(spawnDetached.mock.calls[0][0].slice(1), { ...m.io,
+      loadFixItem: async () => ({ taskKind, size, scope }),
+      resolveProvider: () => ({ spawn: (request, io) => provider.spawn(request, { ...io, runTask }) }),
+      recordRouted: entry => recordRoutedOutcome({ ...entry, store, readClaim: () => null }),
+    });
+    expect(out.code).toBe(admitted ? 0 : 1);
+    if (admitted) expect(runTask).toHaveBeenCalledWith(expect.objectContaining({ kind: 'doc-fix', size: 1, scope: ['docs'] }));
+    else {
+      expect(runTask).not.toHaveBeenCalled();
+      expect(consecutiveUnproductiveOnHead(store.read(), { repo: 'we', pr: 7, head: 'aaa' })).toBe(4);
+      expect(chooseFixExecutor({ setting: { value: 'codex-first' }, chain: { value: ['codex', 'codex-alt', 'argon', 'claude'] },
+        codexUnproductive: 4, launcherAvailable: () => true }).executor).toBe('claude');
+    }
+  });
   it('records a no-change Argon outcome and resolves its provider', async () => {
     const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
     const resolveProvider = vi.fn(m.io.resolveProvider);
-    expect((await runFixCli(argv.map(a=>a==='--provider=codex'?'--provider=antigravity':a), {...m.io,resolveProvider,recordRouted})).code).toBe(0);
+    expect((await runFixCli([...argv.map(a=>a==='--provider=codex'?'--provider=antigravity':a), '--num=7'], {...m.io,resolveProvider,recordRouted,loadFixItem:async()=>({taskKind:'doc-fix',size:1,scope:['we:docs']})})).code).toBe(0);
     expect(resolveProvider).toHaveBeenCalledWith('antigravity');
     expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({head:'aaa',outcome:'no-change'}));
   });
@@ -558,7 +587,7 @@ describe('runFixCli', () => {
       return m.run(cmd, args, opts);
     };
     const recordRouted = vi.fn(entry => ({ 'we#7': [entry, entry] }));
-    const out = await runFixCli(argv.map(a => a === '--provider=codex' ? `--provider=${provider}` : a), { ...m.io, run, recordRouted });
+    const out = await runFixCli([...argv.map(a => a === '--provider=codex' ? `--provider=${provider}` : a), '--task-kind=doc-fix', '--size=1', '--scope=we:docs'], { ...m.io, run, recordRouted });
     expect(out.code).toBe(1);
     expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', note: diagnosis, reason: expect.stringContaining(diagnosis) }));
     expect(comments).toHaveLength(1);
@@ -2119,7 +2148,8 @@ it('every fix executor declares confinement or is unavailable for dispatch', () 
     }
   }
   expect(fixLauncherAvailable('codex')).toBe(true);
-  expect(fixLauncherAvailable('antigravity')).toBe(true);
+  expect(fixLauncherAvailable('antigravity')).toBe(false);
+  expect(fixLauncherAvailable('antigravity', { taskKind: 'doc-fix', size: 1, scope: ['docs'] })).toBe(true);
 });
 
 it('refuses the production Antigravity worker before running untrusted review input', async () => {
@@ -2133,7 +2163,8 @@ it('declares sandbox-exec confinement and propagates a host confinement refusal 
   const { resolveFixProvider } = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
   expect(provider.confinement).toMatchObject({ mode: 'sandboxed', boundary: 'workspace', mechanism: 'sandbox-exec' });
-  expect(fixLauncherAvailable('antigravity')).toBe(true);
+  expect(fixLauncherAvailable('antigravity')).toBe(false);
+  expect(fixLauncherAvailable('antigravity', { taskKind: 'doc-fix', size: 1, scope: ['docs'] })).toBe(true);
   await expect(provider.spawn({ prompt: 'attempt a write outside the clone', kind: 'doc-fix', size: 1,
     scope: ['docs'], sessionSlug: 'fix-7' }, { resolveLane: () => '/missing/lane',
     runTask: async () => ({ status: 'refused', reasons: ['requires macOS sandbox-exec; use another fix provider'] }) }))
@@ -2143,7 +2174,7 @@ it('declares sandbox-exec confinement and propagates a host confinement refusal 
 it.each([{exitCode:1}, {exitCode:null}, {exitCode:0,timedOut:true}])('reports failed Gemini task %j with its final message', async failure => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
-  await expect(provider.spawn({prompt:'edit',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({status:'failed',...failure,events:{agentMessages:['diagnosis']}})}))
+  await expect(provider.spawn({prompt:'edit',kind:'doc-fix',size:1,scope:['docs'],sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({status:'failed',...failure,events:{agentMessages:['diagnosis']}})}))
     .rejects.toMatchObject({finalMessage:'diagnosis'});
 });
 

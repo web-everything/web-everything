@@ -17,7 +17,7 @@ function fixture() {
   const laneDir = join(root, 'lane');
   const stateDir = join(homeDir, '.gemini/antigravity-cli');
   const workspaceOps = join(homeDir, 'workspace/.operations');
-  for (const p of [cloneDir, privateTempDir, laneDir, stateDir, ...sandboxSecretPaths(homeDir), workspaceOps]) mkdirSync(p, { recursive: true });
+  for (const p of [cloneDir, privateTempDir, laneDir, join(stateDir, 'log'), join(stateDir, 'bin'), join(stateDir, 'builtin'), ...sandboxSecretPaths(homeDir), workspaceOps]) mkdirSync(p, { recursive: true });
   return { root, homeDir, cloneDir, privateTempDir, laneDir, workspaceOps };
 }
 
@@ -27,11 +27,15 @@ describe('pure sandbox profile', () => {
     const profile = buildSandboxProfile(f);
     expect(profile).toContain('(allow default)\n(deny file-write*)');
     const writeRule = profile.split('\n').find(line => line.startsWith('(allow file-write*'));
-    for (const p of [f.cloneDir, f.privateTempDir, join(f.homeDir, '.gemini/antigravity-cli')]) expect(writeRule).toContain(`(subpath ${JSON.stringify(p)})`);
+    for (const p of [f.cloneDir, f.privateTempDir, ...['log', 'cache', 'conversations', 'brain', 'crashes', 'presence', 'persistent_terminals', 'implicit'].map(p => join(f.homeDir, '.gemini/antigravity-cli', p))]) expect(writeRule).toContain(`(subpath ${JSON.stringify(p)})`);
     for (const p of ['/dev/null', '/dev/tty', '/dev/dtracehelper']) expect(writeRule).toContain(`(literal "${p}")`);
-    for (const p of [realpathSync(tmpdir()), '/private/var/folders', join(f.homeDir, '.gemini'), f.laneDir])
+    for (const p of [realpathSync(tmpdir()), '/private/var/folders', join(f.homeDir, '.gemini'), join(f.homeDir, '.gemini/antigravity-cli'), f.laneDir])
       expect(writeRule).not.toContain(`(subpath ${JSON.stringify(p)})`);
     expect(writeRule).toContain(`(literal ${JSON.stringify(join(f.homeDir, '.gemini/projects.json'))})`);
+    for (const name of ['conversation_summaries.db', 'conversation_summaries.db-wal', 'conversation_summaries.db-shm', 'conversation_summaries.db-journal', 'jetbox_summaries_proto.pb', 'jetski_state.pbtxt', 'history.jsonl', 'cli.log'])
+      expect(writeRule).toContain(`(literal ${JSON.stringify(join(f.homeDir, '.gemini/antigravity-cli', name))})`);
+    for (const name of ['settings.json', 'bin', 'builtin', 'installation_id', 'sibling'])
+      expect(writeRule).not.toContain(JSON.stringify(join(f.homeDir, '.gemini/antigravity-cli', name)));
     expect(writeRule).toContain('(regex #');
     expect(profile).not.toContain('deny network');
   });
@@ -96,7 +100,9 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     expect(run('printf allowed > "$1"', inside).status).toBe(0);
     expect(existsSync(inside)).toBe(true);
     for (const allowed of [join(f.privateTempDir, 'allowed'),
-      join(f.homeDir, '.gemini/antigravity-cli/state'), join(f.homeDir, '.gemini/projects.json'),
+      join(f.homeDir, '.gemini/antigravity-cli/log/x'),
+      ...['conversation_summaries.db', 'conversation_summaries.db-wal', 'conversation_summaries.db-shm', 'conversation_summaries.db-journal',
+        'jetbox_summaries_proto.pb', 'jetski_state.pbtxt', 'history.jsonl', 'cli.log'].flatMap(p => [p, `${p}.tmp`, `${p}.123.tmp`]).map(p => join(f.homeDir, '.gemini/antigravity-cli', p)), join(f.homeDir, '.gemini/projects.json'),
       join(f.homeDir, '.gemini/projects.json.123.tmp')]) {
       expect(run('printf allowed > "$1"', allowed).status, allowed).toBe(0);
       expect(existsSync(allowed)).toBe(true);
@@ -106,6 +112,7 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     const sibling = join(f.homeDir, '.gemini-like');
     mkdirSync(sibling);
     for (const outside of [osTempTarget, join(f.root, 'blocked'), join(f.laneDir, 'blocked'),
+      ...['settings.json', 'bin/x', 'builtin/x', 'installation_id', 'sibling', 'settings.json.123.tmp', 'log-sibling'].map(p => join(f.homeDir, '.gemini/antigravity-cli', p)),
       join(sibling, 'blocked'), join(f.homeDir, '.gemini/other-state'),
       join(f.homeDir, '.gemini/projects.json.123.tmp.extra')]) {
       const write = run('printf blocked > "$1"', outside);

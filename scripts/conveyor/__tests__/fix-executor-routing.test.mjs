@@ -510,6 +510,33 @@ describe('fallback chain routing', () => {
     expect(chooseFixExecutor({ setting, chain, codexUnproductive: 3, launcherAvailable: fixLauncherAvailable }))
       .toMatchObject({ executor: 'claude', rung: 'claude', reason: expect.stringContaining('argon launcher unavailable') });
   });
+  it.each([
+    [{ taskKind: 'doc-fix', size: 1, scope: ['we:docs'] }, 'antigravity'],
+    [{ taskKind: 'fix', size: 1, scope: ['we:docs/a.md'] }, 'antigravity'],
+    [{ taskKind: 'test-fix', size: 1, scope: ['we:tests'] }, 'antigravity'],
+    [{ taskKind: 'feature', size: 1, scope: ['we:docs'] }, 'claude'],
+    [{ taskKind: 'doc-fix', size: 3, scope: ['we:docs'] }, 'claude'],
+    [{ taskKind: 'doc-fix', scope: ['we:docs'] }, 'claude'],
+    [{ taskKind: 'doc-fix', size: 1, scope: [] }, 'claude'],
+    [{ taskKind: 'doc-fix', size: 1, scope: ['we:../escape'] }, 'claude'],
+    [{ taskKind: 'doc-fix', size: 1, scope: ['fui:docs'] }, 'claude'],
+  ])('selects Argon only with derivable repair evidence %j', (item, executor) => {
+    const head = 'a'.repeat(40);
+    const decision = routeFixExecutor({ repo: 'we', pr: 42, itemNum: '7', headRefOid: head, scope: item.scope }, {
+      setting, chain, criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
+      loadFixItems: () => [{ num: '7', ...item }],
+      readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head, outcome: 'failed' })) }),
+    });
+    expect(decision.executor).toBe(executor);
+    if (executor === 'antigravity') expect(decision.agyAdmission).toEqual({ kind: item.taskKind === 'fix' ? 'doc-fix' : item.taskKind,
+      size: 1, scope: item.scope.map(p => p.slice(3)) });
+  });
+  it('skips Argon when the item read fails', () => {
+    expect(routeFixExecutor({ pr: 42, itemNum: '7', headRefOid: 'aaa' }, { setting, chain,
+      criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
+      readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head: 'aaa', outcome: 'failed' })) }),
+      loadFixItems: () => { throw Error('unreadable'); } }).executor).toBe('claude');
+  });
   it.each(['fix', 'ci-heal'])('round 3 %s with two unproductive runs still tries codex-alt', kind => {
     const head = 'a'.repeat(40);
     const decision = routeFixExecutor({ repo: 'we', pr: 42, kind, round: 3, headRefOid: head }, {

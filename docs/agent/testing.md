@@ -4701,3 +4701,10 @@ and `~/.gemini/projects.json` / `projects.json.*.tmp` writes (plus the named dev
 remain read-only. The REAL probe covers these boundaries. Build transcript admission checks
 every tool update against the native-tool allowlist and clone containment regardless of status;
 errored tools cannot bypass it. The juror's separate error exemption does not apply to builds.
+
+## Confined AgY repair admission
+
+Keep repair routing and `fix-run` fixtures on raw item evidence, through the detached-provider argv
+handoff and real AgY adapter. General build admission allows kind OR size; repair admission requires
+doc/test kind AND size at most 1 AND a repo-relative scope. Refusals record an unproductive outcome
+so the existing provider chain advances. Terminal transcript fixtures use nested `result.status: SUCCESS`.

@@ -14,7 +14,7 @@ const commit = dir => { git(dir, 'add', '.'); git(dir, '-c', 'user.name=fixture'
 const tool = (name, parameters, extra = {}) => ({ event: 'step_update', step_update: {
   step_type: 'tool', step_index: 1, state: 'DONE', tool_name: name, tool_info: { parameters }, ...extra,
 } });
-const finish = { event: 'result', result: { status: 'success', response: 'done' } };
+const finish = { event: 'result', result: { status: 'SUCCESS', response: 'done' } };
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'we-agy-build-test-'));
@@ -291,6 +291,25 @@ describe('escape evidence', () => {
     const f = fixture();
     expect((await f.run(undefined, options)).status).toBe('voided');
     expect(existsSync(f.clone())).toBe(false);
+  });
+  it.each([
+    ['error result', [{ event: 'result', result: { status: 'ERROR', error: 'failed' } }]],
+    ['max turns', [{ event: 'result', result: { status: 'MAX_TURNS' } }]],
+    ['malformed result', [{ event: 'result', result: {} }]],
+    ['missing result', [{ event: 'init' }]],
+    ['two results', [finish, finish]],
+    ['error after success', [finish, { event: 'error', error: 'late failure' }]],
+    ['error flag', [{ ...finish, is_error: true }]],
+    ['error subtype', [{ ...finish, subtype: 'error_max_turns' }]],
+    ['nested error flag', [{ ...finish, result: { ...finish.result, is_error: true } }]],
+  ])('voids %s even after an in-scope edit', async (_label, transcript) => {
+    const f = fixture();
+    expect((await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n'), { transcript })).status).toBe('voided');
+    expect(readFileSync(join(f.lane, 'docs/a.md'), 'utf8')).toBe('before\n');
+  });
+  it('admits exactly one terminal SUCCESS result', async () => {
+    const f = fixture();
+    expect((await f.run(undefined, { transcript: [finish] })).status).toBe('ok');
   });
   it('returns failed with cleanup after a failed agy run with complete escape evidence', async () => {
     const f = fixture();

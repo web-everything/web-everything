@@ -70,7 +70,13 @@ async function defaultSpawnAgy(options) {
 function auditTranscript(text, clone) {
   const lines = text.trim().split('\n');
   const events = lines.map(line => JSON.parse(line)); // partial/malformed evidence is never enough
-  if (!events.length || !events.some(e => e?.event === 'result')) throw new Error('incomplete transcript');
+  const results = events.filter(e => e?.event === 'result');
+  const terminal = results[0]?.result;
+  if (results.length !== 1 || events.at(-1) !== results[0] || !terminal || Array.isArray(terminal)
+    || terminal.status !== 'SUCCESS' || typeof terminal.response !== 'string' || terminal.error
+    || [terminal.is_error, results[0].is_error].some(v => v !== undefined && v !== false)
+    || [terminal.subtype, results[0].subtype].some(s => s !== undefined && s !== 'success'))
+    throw new Error('incomplete or unsuccessful terminal transcript');
   for (const event of events) {
     const s = event?.step_update;
     if (s?.step_type !== 'tool') continue;
