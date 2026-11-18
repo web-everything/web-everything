@@ -35,6 +35,10 @@ export const CONSTELLATION_REPOS = Object.freeze({
   we: { slug: 'web-everything/web-everything', slugTag: '', path: '', dirs: ['web-everything', 'webeverything'] },
   frontierui: { slug: 'frontier-ui/frontierui', slugTag: 'fui', path: '$HOME/workspace/frontierui', dirs: ['frontierui'] },
   'plateau-app': { slug: 'plateauapp/plateau-app', slugTag: 'pa', path: '$HOME/workspace/plateau-app', dirs: ['plateau-app'] },
+});
+
+// Registered but not swept; moves into CONSTELLATION_REPOS with the S2 capability filter.
+export const PENDING_REPOS = Object.freeze({
   longshore: { slug: `${repoNames.repos.longshore.owner}/${repoNames.repos.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'] },
 });
 

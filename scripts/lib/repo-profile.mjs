@@ -27,7 +27,10 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from './constellation-repos.mjs';
+import { CONSTELLATION_REPOS, PENDING_REPOS, repoKeyForDir, repoKeyForSlug } from './constellation-repos.mjs';
+
+// Profile registration includes pending repos without enrolling them in constellation sweeps.
+const PROFILE_REPOS = Object.freeze({ ...CONSTELLATION_REPOS, ...PENDING_REPOS });
 
 // This module's OWN checkout root — the `we` entry's `path: ''` means "wherever this file is physically
 // checked out" (the primary checkout or a lane clone of it), never a fixed location. Computed once from
@@ -79,8 +82,8 @@ function resolveProfileKey(input) {
   if (!stripped) return null;
   const bySlugOrKey = repoKeyForSlug(stripped);
   if (bySlugOrKey !== null) return bySlugOrKey;
-  for (const [key, meta] of Object.entries(CONSTELLATION_REPOS)) {
-    if (meta.slugTag && meta.slugTag === stripped) return key;
+  for (const [key, meta] of Object.entries(PROFILE_REPOS)) {
+    if (key === stripped || meta.slug === stripped || (meta.slugTag && meta.slugTag === stripped)) return key;
   }
   return Object.hasOwn(PREFIX_ALIASES, stripped) ? PREFIX_ALIASES[stripped] : null;
 }
@@ -121,7 +124,7 @@ function resolveProfileKey(input) {
 export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
   const key = resolveProfileKey(keyOrSlugOrPrefix);
   if (key === null) return null;
-  const meta = CONSTELLATION_REPOS[key];
+  const meta = PROFILE_REPOS[key];
   const checkoutPath = key === 'we' ? WE_CHECKOUT_ROOT : resolve(meta.path.replace(/^\$HOME(?=\/|$)/, home));
   const lanePoolRepo = checkoutPath;
   return Object.freeze({
@@ -244,7 +247,7 @@ export function primaryCheckoutForLanePath(lanePath, { home } = {}) {
 /**
  * build-path-codex-isolation-locus — THE FULL PROFILE (not just the checkout path) for a lane clone's own
  * absolute PATH, given nothing else. Generalizes {@link primaryCheckoutForLanePath}'s own pool-dir-basename
- * lookup (unchanged — same `repoKeyForDir`/`repoProfile` calls) so a caller that needs the repo's `key` or
+ * lookup (including profile-only pending repos) so a caller that needs the repo's `key` or
  * `canonicalPrefix` — e.g. `deliver-item-wrapper.mjs#commitBuildTurn`'s commit-subject prefix, which must say
  * `PLATEAU #<item>` for a plateau-app lane rather than an always-`WE` literal — has one shared lookup to call
  * instead of re-deriving the pool-dir-basename math a second time. Returns `null` under the exact same
@@ -256,7 +259,8 @@ export function primaryCheckoutForLanePath(lanePath, { home } = {}) {
  */
 export function repoProfileForLanePath(lanePath, { home } = {}) {
   const poolDirBasename = basename(dirname(String(lanePath ?? '')));
-  const key = repoKeyForDir(poolDirBasename);
+  const key = repoKeyForDir(poolDirBasename)
+    ?? Object.entries(PENDING_REPOS).find(([, meta]) => meta.dirs.includes(poolDirBasename))?.[0] ?? null;
   if (key === null) return null;
   return repoProfile(key, { home });
 }

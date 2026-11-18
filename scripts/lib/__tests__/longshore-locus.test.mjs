@@ -5,8 +5,9 @@
 import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
-import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from '../constellation-repos.mjs';
-import { repoProfile, deliveryLocusForScope } from '../repo-profile.mjs';
+import { CONSTELLATION_REPOS, PENDING_REPOS, repoKeyForDir, repoKeyForSlug, siblingKeys, repoSlugTag, repoKeyForSlugTag, canonicalizeSlug } from '../constellation-repos.mjs';
+import { repoProfile, deliveryLocusForScope, repoProfileForLanePath, primaryCheckoutForLanePath } from '../repo-profile.mjs';
+import { planReviewDispatch } from '../../operations/review-dispatch.mjs';
 import { CROSS_REPO_LOCI, findDanglingLoci } from '../citation-check.mjs';
 import { CARD_REF_RE, referralCardReadable } from '../referral-card-readable.mjs';
 import { LOCI, LOCUS_NAMES, scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
@@ -18,9 +19,28 @@ const SLUG = `${settings.repos.longshore.owner}/${settings.repos.longshore.name}
 describe('longshore registry entry', () => {
   it('resolves its slug from the repo-names setting (default longshoreai/longshore)', () => {
     expect(SLUG).toBe('longshoreai/longshore');
-    expect(CONSTELLATION_REPOS.longshore.slug).toBe(SLUG);
-    expect(repoKeyForSlug(SLUG)).toBe('longshore');
-    expect(repoKeyForDir('longshore')).toBe('longshore');
+    expect(PENDING_REPOS.longshore.slug).toBe(SLUG);
+    expect(Object.isFrozen(PENDING_REPOS)).toBe(true);
+    expect(repoKeyForSlug(SLUG)).toBeNull();
+    expect(repoKeyForDir('longshore')).toBeNull();
+  });
+  it('excludes longshore from every sweep registry lookup and list while retaining its profile', () => {
+    const sweepKeys = ['we', 'frontierui', 'plateau-app'];
+    expect(Object.keys(CONSTELLATION_REPOS)).toEqual(sweepKeys);
+    for (const selfKey of [null, 'unknown', 'longshore', ...sweepKeys]) {
+      expect(siblingKeys(selfKey)).toEqual(sweepKeys.filter((key) => key !== selfKey));
+    }
+    expect(repoKeyForSlug(SLUG)).toBeNull();
+    expect(repoKeyForSlug('longshore')).toBeNull();
+    expect(repoKeyForDir('longshore')).toBeNull();
+    expect(repoSlugTag('longshore')).toBeNull();
+    expect(repoKeyForSlugTag('ls')).toBeNull();
+    expect(canonicalizeSlug('chalbert/longshore')).toBe('chalbert/longshore');
+    expect(repoProfile('longshore').key).toBe('longshore');
+    for (const repo of ['longshore', SLUG]) {
+      expect(() => planReviewDispatch({ pr: 1, repo, checkoutExists: () => true }))
+        .toThrow(/not a constellation repo/);
+    }
   });
   it('never hard-codes the slug in the registry source', () => {
     const src = readFileSync('scripts/lib/constellation-repos.mjs', 'utf8');
@@ -34,6 +54,16 @@ describe('longshore registry entry', () => {
     expect(p.canonicalPrefix).toBe('longshore');
     expect(p.capabilities).toEqual({ review: false, fix: false, ciHeal: false, build: 'none' });
     expect(repoProfile('longshore:', { home: '/h' }).key).toBe('longshore');
+  });
+  it.each(['longshore', SLUG, 'ls', 'longshore:', `${SLUG}:`, 'ls:'])('resolves pending profile spelling %s', (input) => {
+    expect(repoProfile(input, { home: '/h' })).toEqual(repoProfile('longshore', { home: '/h' }));
+  });
+  it('resolves pending lane profiles and primary checkout without sweep registration', () => {
+    expect(repoProfileForLanePath('/lanes/longshore/lane-1', { home: '/h' }))
+      .toEqual(repoProfile('longshore', { home: '/h' }));
+    expect(primaryCheckoutForLanePath('/lanes/longshore/lane-1', { home: '/h' }))
+      .toBe('/h/workspace/longshore');
+    expect(repoProfileForLanePath('/lanes/unknown/lane-1')).toBeNull();
   });
   it('does not resolve junk prefixes', () => {
     for (const j of ['longshor', 'longshoreai', 'longshore2', 'xlongshore', 'long']) expect(repoProfile(j)).toBeNull();
