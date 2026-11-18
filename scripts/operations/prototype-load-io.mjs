@@ -27,7 +27,7 @@ import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, t
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
-import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason } from './urgent-verify-marker.mjs';
+import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason, urgentKeyPath, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -235,7 +235,7 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
   return merged;
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
+  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
@@ -552,14 +552,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       let checkRun;
       try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
       catch (e) { if (!input.urgent) throw e; }
+      if (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success')
+        return stop('no-ready', { detail: 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
       if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
-        let ledger, shards;
+        let ledger, shards, origin;
         try {
+          origin = normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin'));
           ledger = fs.readFileSync(urgentLedger(env.HOME), 'utf8');
           shards = ciUnitPlan(fs.readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8')).length;
         } catch { /* Missing or unreadable evidence fails closed below. */ }
-        const urgent = urgentMarker({ ...input, ledger, shards, now: now() });
+        const urgent = urgentMarker({ ...input, ledger, shards, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);
         checkRun = urgent.evidence;
       }

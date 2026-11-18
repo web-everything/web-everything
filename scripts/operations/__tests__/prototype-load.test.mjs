@@ -15,6 +15,8 @@ import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import { urgentSignature } from '../urgent-verify-marker.mjs';
+const urgentKey = Buffer.alloc(32, 7);
 import * as prototypeLoad from '../prototype-load.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -88,6 +90,7 @@ function fixture(options = {}) {
     expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...Object.keys(options.gitEnv || {}), ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])].sort());
     if (options.gitEnv) expect(config.env).toMatchObject(options.gitEnv);
     if (options.execFailure === args[0]) throw Object.assign(new Error('maxBuffer exceeded; inspect full output separately'), { code: 'ENOBUFS' });
+    if (cmd === 'git' && args[0] === 'remote' && !options.defaultTestCheck) return options.origin ?? 'https://example.com/org/repo.git\n';
     if (cmd === 'plutil') return JSON.stringify({ WorkingDirectory: '/home/test/workspace/review' });
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
@@ -256,7 +259,7 @@ function fixture(options = {}) {
   }
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
-  const load = createPrototypeLoader({ exec, fs, env, retirePlanner,
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, readUrgentKey: () => { if (options.missingUrgentKey) throw new Error('missing'); return urgentKey; },
     // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
     testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
@@ -267,7 +270,8 @@ function fixture(options = {}) {
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
   const reason = 'Restore critical daemon operation';
-  const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: '/repo' };
+  const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['coverage', 'hostPaths', 'integration', 'standards'] };
+  marker.sig = urgentSignature(marker, urgentKey);
   it('logs the urgent event and writes explicit urgent readiness evidence', async () => {
     const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
@@ -283,6 +287,24 @@ describe('urgent prototype admission', () => {
     const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
     expect(await f.run()).toMatchObject({ detail: 'no-passing-test-check' });
     expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+  });
+  it.each(['failure', 'cancelled', 'timed_out', 'neutral', 'skipped', null])('refuses completed CI %s even with a signed green marker', async conclusion => {
+    const f = fixture({ testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion, appId: prototypeLoad.TEST_CHECK_APP_ID }), urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+    expect(f.readyWrites).toEqual([]);
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+  });
+  it.each(['queued', 'in_progress', 'unreadable'])('allows signed urgent evidence when CI is %s', async status => {
+    const f = fixture({ testCheck: async () => { if (status === 'unreadable') throw new Error('unreadable'); return { sha: SHA, name: 'test', status }; }, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+  });
+  it.each(['unsigned', 'bad signature', 'wrong repo', 'missing key'])('refuses %s without readiness writes', async kind => {
+    const forged = { ...marker };
+    if (kind === 'unsigned') delete forged.sig;
+    if (kind === 'bad signature') forged.sig = '0'.repeat(64);
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(forged), missingUrgentKey: kind === 'missing key', ...(kind === 'wrong repo' ? { origin: 'https://example.com/other/repo' } : {}) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(f.readyWrites).toEqual([]);
   });
   it('uses normal passing CI when urgent was requested and still logs the event', async () => {
     const f = fixture();
@@ -3009,7 +3031,7 @@ describe('refuse-only safety properties P1–P9', () => {
   });
   it.each([null, { sha: TREE, name: 'test', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'other', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'in_progress', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'completed', conclusion: 'failure' }])('P8 fails closed on absent, wrong-sha or nonpassing check evidence: %j', async check => {
     const f = fixture({ ready: '', testCheck: async () => check });
-    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: check?.sha === SHA && check.status === 'completed' && check.conclusion !== 'success' ? 'ci-test-failed' : 'no-passing-test-check' });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('P9 an already-live registration is never removed or rebuilt, and an unaudited re-load is still refused', async () => {
@@ -3186,8 +3208,8 @@ describe('default test check-run reader (production wiring)', () => {
       } };
     return { gh, ...fixture({ ready: '', defaultTestCheck: true, combinedIO, ...options }) };
   }
-  const refused = async (f) => {
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+  const refused = async (f, detail = 'no-passing-test-check') => {
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   };
   it('admits a passing test bound to the expected workflow file and writes fresh readiness', async () => {
@@ -3212,7 +3234,7 @@ describe('default test check-run reader (production wiring)', () => {
     ['a truncated check-runs page', { checks: { total_count: 101, check_runs: [run()] } }],
     ['a check-run from another GitHub app', { checks: { total_count: 1, check_runs: [run({ app: { id: 1 } })] } }],
     ['a failing test check-run', { checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } }],
-  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options)); });
+  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options), options.checks?.check_runs?.[0]?.conclusion === 'failure' ? 'ci-test-failed' : 'no-passing-test-check'); });
 });
 
 const shippedRuledSettings = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));

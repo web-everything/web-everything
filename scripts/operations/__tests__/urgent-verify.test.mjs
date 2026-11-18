@@ -1,13 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { ciUnitPlan, urgentMarker, urgentLedger } from '../urgent-verify-marker.mjs';
+import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo } from '../urgent-verify-marker.mjs';
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
-const marker = { sha, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: '/repo' };
-const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, now, ledger: JSON.stringify(m), ...input });
+const key = Buffer.alloc(32, 7);
+const sign = m => ({ ...m, sig: urgentSignature(m, key) });
+const marker = sign( { sha, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: ['coverage', 'hostPaths', 'integration', 'standards'] });
+const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, now, repo: marker.repo, readKey: () => key, ledger: JSON.stringify(m), ...input });
 
 describe('urgent marker', () => {
   it('accepts an exact full green marker', () => expect(check()).toMatchObject({ ok: true, evidence: { source: 'urgent-local-full', marker } }));
@@ -24,8 +26,15 @@ describe('urgent marker', () => {
     ['missing reason', { reason: undefined }], ['short reason', { reason: 'short' }],
     ['missing urgent flag', { urgent: false }], ['short input sha', { sha: sha.slice(0, 8) }],
     ['unreadable ledger', { ledger: undefined }], ['malformed ledger', { ledger: '{oops' }],
-    ['unreadable shard count', { shards: undefined }],
+    ['unreadable shard count', { shards: undefined }], ['missing key', { readKey: () => { throw new Error('missing'); } }],
+    ['wrong key', { readKey: () => Buffer.alloc(32, 8) }], ['short key', { readKey: () => Buffer.alloc(1) }],
+    ['wrong repo', { repo: 'https://example.com/other/repo' }],
   ])('rejects %s', (_, input) => expect(check(marker, input).ok).toBe(false));
+  it.each([undefined, '0'.repeat(64), 'bad'])('refuses forged signature %s', sig => expect(check({ ...marker, sig }).ok).toBe(false));
+  it('signature covers every evidence field', () => {
+    for (const field of ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps'])
+      expect(urgentSignature({ ...marker, [field]: 'tampered' }, key)).not.toBe(marker.sig);
+  });
   it('later red for same sha supersedes green, regardless of its timestamp', () => {
     expect(check(marker, { ledger: [marker, { ...marker, result: 'red' }].map(JSON.stringify).join('\n') }).ok).toBe(false);
   });
@@ -36,20 +45,20 @@ describe('urgent marker', () => {
 
 function fixture() {
   let tick = now - 1000;
-  return { repo: '/repo', host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
-    plan: () => [{ shard: '1/2' }, { shard: '2/2' }], shard: vi.fn(), standards: vi.fn(), append: vi.fn() };
+  return { repo: () => marker.repo, readKey: () => key, host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
+    plan: () => [{ shard: '1/2' }, { shard: '2/2' }], shard: vi.fn(), standards: vi.fn(), coverage: vi.fn(), hostPaths: vi.fn(), integration: vi.fn(), append: vi.fn() };
 }
 describe('urgent verifier', () => {
   it('records green only after all shards sequentially and standards', async () => {
     const d = fixture(), order = [];
     d.shard = async s => { order.push(s.shard); await Promise.resolve(); order.push('done'); };
-    d.standards = () => order.push('standards');
+    for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) d[step] = () => order.push(step);
     expect(await urgentVerify({ sha, result: 'red' }, d)).toMatchObject({ ok: true });
-    expect(order).toEqual(['1/2', 'done', '2/2', 'done', 'standards']);
+    expect(order).toEqual(['1/2', 'done', '2/2', 'done', 'coverage', 'hostPaths', 'integration', 'standards']);
     expect(d.append).toHaveBeenCalledTimes(1);
-    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, suite: 'full', result: 'green', shards: 2, host: 'host', repo: '/repo' }));
+    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, suite: 'full', result: 'green', shards: 2, host: 'host', repo: marker.repo, steps: ['unit:unit:1/2', 'unit:unit:2/2', 'coverage', 'hostPaths', 'integration', 'standards'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) }));
   });
-  it.each(['shard', 'standards'])('records red when %s fails', async stage => {
+  it.each(['shard', 'coverage', 'hostPaths', 'integration', 'standards'])('records red when %s fails', async stage => {
     const d = fixture(); d[stage] = vi.fn(() => { throw new Error('failed'); });
     expect(await urgentVerify({ sha, result: 'green' }, d)).toMatchObject({ ok: false, marker: { result: 'red' } });
     expect(d.append).toHaveBeenCalledTimes(1);
@@ -87,17 +96,23 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(plan[0]).toEqual({ group: 'covered', shard: '1/9' });
     expect(plan[9]).toEqual({ group: 'nocov', shard: '1/1' });
     const packageText = readFileSync('package.json', 'utf8');
-    const fs = { readFileSync: vi.fn(p => p.endsWith('package.json') ? packageText : workflow), mkdirSync: vi.fn(), appendFileSync: vi.fn() };
-    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0]?.includes('shard-assign') ? 'scripts/example.test.mjs\n' : '' }));
+    const fs = { readFileSync: vi.fn(p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow), mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), copyFileSync: vi.fn() };
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? `${marker.repo}.git/\n` : args[0]?.includes('shard-assign') ? 'scripts/example.test.mjs\n' : '' }));
     const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync });
     expect((await urgentVerify({ sha }, d)).ok).toBe(true);
     const heavy = spawnSync.mock.calls.filter(([, args]) => args[0] === 'scripts/readiness/heavy-admission.mjs');
-    expect(heavy).toHaveLength(11);
+    expect(heavy).toHaveLength(14);
     expect(heavy.every(([, args, opts]) => args.includes('--wait-ms=60000') && opts.maxBuffer > 0 && opts.timeout > 0)).toBe(true);
     expect(heavy.slice(0, 10).every(([, args]) => args.includes('vitest') && args.includes('scripts/example.test.mjs'))).toBe(true);
     const coverageArgs = JSON.parse(packageText).scripts['test:coverage:shard'].split(' -- ')[1].split(' ');
     expect(heavy[0][1].slice(4, -1)).toEqual(coverageArgs);
-    expect(heavy[10][1]).toContain('check:standards');
+    expect(heavy[10][1].slice(4)).toEqual(['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9']);
+    expect(heavy[11][1].slice(4)).toEqual(['node', 'scripts/lint-host-paths.mjs']);
+    expect(heavy[12][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--']);
+    expect(heavy[13][1]).toContain('check:standards');
+    expect(fs.copyFileSync.mock.calls).toEqual(Array.from({ length: 9 }, (_, i) => ['/repo/coverage/coverage-final.json', `/repo/coverage-shards/coverage-shard-${i + 1}/coverage-final.json`]));
+    expect(fs.rmSync).toHaveBeenCalledWith('/repo/coverage-shards', { recursive: true, force: true });
+    expect(fs.writeFileSync).toHaveBeenCalledWith(urgentKeyPath('/home/test'), expect.any(Buffer), { flag: 'wx', mode: 0o600 });
     expect(fs.appendFileSync).toHaveBeenCalledWith(urgentLedger('/home/test'), expect.stringMatching(/"suite":"full".*\n$/), { encoding: 'utf8', mode: 0o600 });
   });
   it.each(['broken', 'jobs: {}', 'jobs:\n  test-shard:\n    strategy:\n      matrix:\n        shard: [1, 3]', `jobs:\n  test-shard:\n    strategy:\n      matrix:\n        shard: [${Array.from({ length: 65 }, (_, i) => i + 1)}]`])('refuses unreadable or oversized CI plans with a diagnostic', workflow => {
@@ -111,10 +126,43 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
   });
   it('treats admission failure as red and appends once without retrying', async () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8'), packageText = readFileSync('package.json', 'utf8');
-    const fs = { readFileSync: p => p.endsWith('package.json') ? packageText : workflow, mkdirSync: vi.fn(), appendFileSync: vi.fn() };
-    const spawnSync = vi.fn((cmd, args) => ({ status: args[0].includes('heavy-admission') ? 75 : 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : 'scripts/example.test.mjs\n' }));
+    const fs = { readFileSync: p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow, mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn() };
+    const spawnSync = vi.fn((cmd, args) => ({ status: args[0].includes('heavy-admission') ? 75 : 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? marker.repo : 'scripts/example.test.mjs\n' }));
     expect(await urgentVerify({ sha }, createUrgentDeps({ fs, spawnSync }))).toMatchObject({ ok: false, marker: { result: 'red' } });
     expect(spawnSync.mock.calls.filter(([, args]) => args[0].includes('heavy-admission'))).toHaveLength(1);
     expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
   });
+});
+
+
+describe('CI gate mirroring fails closed', () => {
+  const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+  it.each([
+    ['merge', 'npm run coverage:merge -- coverage-shards --threshold=80 --expect=9'],
+    ['lint', 'node scripts/lint-host-paths.mjs'],
+    ['integration', 'npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")'],
+    ['upload', 'path: web-everything/coverage/coverage-final.json'],
+    ['download', 'pattern: coverage-shard-*'],
+  ])('refuses changed %s before running suites', (_, command) => {
+    expect(() => ciGatePlan(workflow.replace(command, command + ' changed'))).toThrow('unreadable-ci-gates');
+  });
+  it('passes quarantine output as one literal argv, refusing unexpected syntax', () => {
+    for (const output of ['', '--exclude={scripts/a.test.mjs,scripts/b.test.mjs}', '$(touch injected)']) {
+      const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0].includes('quarantine-skip') ? output : '' }));
+      const fs = { readFileSync: () => workflow, rmSync: vi.fn() };
+      const deps = createUrgentDeps({ fs, spawnSync }); deps.plan();
+      if (output.startsWith('$')) { expect(() => deps.integration()).toThrow(); expect(spawnSync).toHaveBeenCalledTimes(1); }
+      else {
+        deps.integration();
+        expect(spawnSync.mock.calls[1][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--', ...(output ? [output] : [])]);
+        expect(spawnSync.mock.calls.every(([, , opts]) => !opts.shell)).toBe(true);
+      }
+    }
+  });
+  it('reuses the existing private key without overwriting it', () => {
+    const fs = { mkdirSync: vi.fn(), writeFileSync: vi.fn(() => { throw Object.assign(new Error(), { code: 'EEXIST' }); }), readFileSync: vi.fn(() => key) };
+    expect(createUrgentDeps({ fs }).readKey()).toBe(key);
+    expect(fs.writeFileSync.mock.calls[0][2]).toEqual({ flag: 'wx', mode: 0o600 });
+  });
+  it('normalizes trailing origin whitespace and git suffix', () => expect(normalizeUrgentRepo(' https://example.com/org/repo.git/\n')).toBe(marker.repo));
 });

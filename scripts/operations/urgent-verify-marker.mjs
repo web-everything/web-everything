@@ -1,5 +1,13 @@
 /** Urgent evidence permits prototype loading only; merging still requires real CI. */
 import yaml from 'js-yaml';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+export const urgentKeyPath = home => `${home}/workspace/.operations/state/urgent-verify.key`;
+export const normalizeUrgentRepo = url => String(url ?? '').trim().replace(/\/+$/, '').replace(/\.git$/, '');
+export function urgentSignature(record, key) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('unreadable urgent key');
+  const fields = ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps'];
+  return createHmac('sha256', key).update(JSON.stringify(Object.fromEntries(fields.map(k => [k, record[k]])))).digest('hex');
+}
 export const urgentLedger = (home, name = 'urgent-full-green') => `${home}/workspace/.operations/coordination/${name}.jsonl`;
 export const urgentReason = (reason) => typeof reason === 'string' && reason.trim().length >= 10;
 const fullSha = (sha) => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
@@ -27,7 +35,32 @@ export function ciUnitPlan(workflow) {
   return shards.map(i => ({ shard: `${i}/${shards.length}` }));
 }
 
-export function urgentMarker({ urgent, reason, sha, ledger, shards, now }) {
+/** Mirror only the known CI command and artifact layout; changes require an operator update. */
+export function ciGatePlan(workflow) {
+  const jobs = yaml.safeLoad(workflow)?.jobs, plan = ciUnitPlan(workflow);
+  const covered = plan.filter(s => s.group === 'covered').length;
+  const step = (job, name) => {
+    const matches = jobs?.[job]?.steps?.filter(s => s.name === name);
+    if (matches?.length !== 1) throw new Error('unreadable-ci-gates');
+    return matches[0];
+  };
+  const merge = step('coverage-merge', 'Merge coverage + enforce 80% bar (#2082)').run;
+  const host = step('host-paths', 'Host-local path ratchet').run;
+  const integration = step('integration', 'Real-git integration suite (lane-pool, operations transport)').run;
+  const upload = step('test-shard', 'Upload shard coverage');
+  const download = step('coverage-merge', 'Download shard coverage');
+  if (!covered || merge !== `npm run coverage:merge -- coverage-shards --threshold=80 --expect=${covered}`
+    || host !== 'node scripts/lint-host-paths.mjs'
+    || integration !== 'npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")'
+    || upload.uses !== 'actions/upload-artifact@v4' || upload.with?.name !== 'coverage-shard-${{ matrix.shard }}'
+    || upload.with?.path !== 'web-everything/coverage/coverage-final.json' || upload.with?.['if-no-files-found'] !== 'error'
+    || !upload.if?.includes(`matrix.shard != ${plan.length}`)
+    || download.uses !== 'actions/download-artifact@v4' || download.with?.path !== 'web-everything/coverage-shards'
+    || download.with?.pattern !== 'coverage-shard-*' || download.with?.['merge-multiple'] === true) throw new Error('unreadable-ci-gates');
+  return { coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- $(')[0].split(' ') };
+}
+
+export function urgentMarker({ urgent, reason, sha, ledger, shards, now, repo, readKey }) {
   const no = (detail) => ({ ok: false, detail, fallback: `Run node scripts/operations/run.mjs urgent-verify --sha=${sha} in a clean checkout, then retry with --urgent --reason=<at least 10 characters>; or wait for passing CI.` });
   if (urgent !== true || !urgentReason(reason) || !fullSha(sha)) return no('no-urgent-marker');
   try {
@@ -39,6 +72,8 @@ export function urgentMarker({ urgent, reason, sha, ledger, shards, now }) {
       || marker.shards !== shards || !Number.isFinite(now) || !Number.isFinite(finished) || !(started < finished)
       || now - finished > 2 * 60 * 60_000 || finished - now > 5 * 60_000
       || typeof marker.host !== 'string' || !marker.host.trim()) return no('no-urgent-marker');
+    if (!repo || marker.repo !== repo || !Array.isArray(marker.steps) || !/^[a-f0-9]{64}$/.test(marker.sig ?? '')
+      || !timingSafeEqual(Buffer.from(marker.sig, 'hex'), Buffer.from(urgentSignature(marker, readKey()), 'hex'))) return no('no-urgent-marker');
     return { ok: true, evidence: { source: 'urgent-local-full', marker, reason } };
   } catch { return no('no-urgent-marker'); }
 }

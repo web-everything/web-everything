@@ -4630,3 +4630,7 @@ Other admission gates remain in force; merging still requires real CI. Urgent ad
 `prototype-load.urgent` events to `~/workspace/.operations/coordination/urgent-loads.jsonl`.
 `urgent-verify.test.mjs` and `prototype-load.test.mjs` cover runner authorship, closed paths,
 later-red supersession, event logging and the unchanged non-urgent CI gate. Run via heavy admission.
+
+## Urgent local verification receipts
+
+Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
