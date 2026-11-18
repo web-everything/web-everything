@@ -1453,10 +1453,8 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
       livePrs.clear();
       if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
-      let plannerSkipReplanMinutes = 15;
-      try { plannerSkipReplanMinutes = loadRedTeamQueueFloor({ log: line => log.error(line) }).plannerSkipReplanMinutes; }
-      catch { log.error('review-daemon: red-team queue planner-skip settings unreadable; default 15 minutes'); }
-      redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr, plannerSkipReplanMinutes });
+      // Only the dispatch wrapper replans: maintenance must not double the per-tick probe budget.
+      redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr, replan: false });
     },
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;

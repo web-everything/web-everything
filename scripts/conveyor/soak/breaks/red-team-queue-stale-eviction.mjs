@@ -16,7 +16,7 @@ export default {
     const repo = 'example/project', head = 'a'.repeat(40), file = 'queue.json';
     const files = new Map(), logs = [];
     let at = 1_000_000;
-    const candidates = [1, 2, 3, 4, 5, 6].map(pr => ({ pr, head }));
+    const candidates = [1, 2, 3, 4, 5, 6, 7].map(pr => ({ pr, head }));
     try {
       const { createRedTeamDispatchQueue, runWithRedTeamQueue } = await import(pathToFileURL(join(sourceRoot, PATH)).href);
       const open = () => createRedTeamDispatchQueue({ file, now: () => at,
@@ -27,19 +27,19 @@ export default {
         writeFile: (path, data) => files.set(path, data),
         rename: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
         unlink: path => files.delete(path), log: line => logs.push(line),
-        readLivePr: ({ pr }) => ({ state: pr === 6 ? 'MERGED' : 'OPEN', headRefOid: head }),
+        readLivePr: ({ pr }) => ({ state: pr === 7 ? 'MERGED' : 'OPEN', headRefOid: head }),
       });
       const queue = open();
       queue.sync(repo, candidates);
-      queue.admit(repo, 6);
+      queue.admit(repo, 7);
       queue.settle(repo, { rows: candidates.map(({ pr }) => ({ prNumber: pr, action: 'skip', why: 'superseded acceptance' })) });
       const seen = new Set();
       for (let tick = 0; tick < 3; tick++) {
         const resumed = open();
-        resumed.reconcile({ plannerSkipReplanMinutes: 20,
+        resumed.reconcile({ replan: false,
           candidates: candidates.map(candidate => ({ ...candidate, repo })) });
         resumed.sync(repo, candidates); // Stale planner still offers the merged PR.
-        check(resumed.entries().length === 5 && resumed.entries().every(entry => entry.pr !== 6),
+        check(resumed.entries().length === 6 && resumed.entries().every(entry => entry.pr !== 7),
           'merged PR survived maintenance or was re-enqueued from stale candidates');
         const probes = resumed.admit(repo, 0);
         check(probes.length === 2 && probes.every(entry => entry.blocked === 'planner-skip'),
@@ -49,15 +49,22 @@ export default {
           'admission or restart changed attempts without settlement');
         at += 1_000;
       }
-      check(seen.size === 5, 'bounded probes starved a persisted planner skip across restarts');
+      check(seen.size === 6, 'bounded probes starved a persisted planner skip across restarts');
       at = 1_000_000 + 20 * 60_000;
       const expired = open();
+      const beforeMaintenance = JSON.stringify(expired.entries());
+      expired.reconcile({ replan: false });
+      check(JSON.stringify(open().entries()) === beforeMaintenance,
+        'maintenance must retain all six expired planner skips without replanning');
+      check(logs.every(line => !line.includes('replan ')), 'maintenance consumed a replan before dispatch');
+      let runnerCalls = 0;
       runWithRedTeamQueue({ queue: expired, repo,
         plan: { refusals: candidates.map(({ pr }) => ({ prNumber: pr, kind: 'already-reviewed-head', headSha: head })) },
         rawPrs: candidates.map(({ pr }) => ({ number: pr, headRefOid: head })),
-        capacity: { lanes: 5, remainingStarts: 0, budget: { left: 5 } },
+        capacity: { lanes: 6, remainingStarts: 0, budget: { left: 6 } },
         floor: { plannerSkipReplanMinutes: 20 }, readNetFiles: () => ({ ok: false }),
         run: options => {
+          runnerCalls++;
           check(options.plan.refusals.map(row => row.prNumber).join() === '1,2',
             'wrapper bypassed the two-probe bound with expired skips and exhausted capacity');
           check(options.rawPrs.map(pr => pr.number).join() === '1,2',
@@ -65,20 +72,21 @@ export default {
           return { notStarted: options.plan.refusals.map(row => ({ prNumber: row.prNumber, reason: 'no review capacity left' })) };
         },
       });
-      check(open().entries().filter(entry => entry.blocked === 'planner-skip').length === 3,
+      check(runnerCalls === 1, 'maintenance-then-dispatch must reach the runner exactly once');
+      check(open().entries().filter(entry => entry.blocked === 'planner-skip').length === 4,
         'wrapper must keep the remaining expired skips blocked and probe-eligible');
       check(logs.filter(line => line.includes('replan ')).length === 2,
         'wrapper replanned more than two expired skips in one reconciliation');
       const remaining = open();
       remaining.reconcile({ plannerSkipReplanMinutes: 20 });
-      check(remaining.entries().filter(entry => entry.blocked === 'planner-skip').length === 1,
+      check(remaining.entries().filter(entry => entry.blocked === 'planner-skip').length === 2,
         'next reconciliation did not replan exactly two more expired skips');
       remaining.reconcile({ plannerSkipReplanMinutes: 20 });
       check(remaining.entries().every(entry => entry.blocked === undefined && entry.blockedAt === undefined
         && entry.attempts === 1), 'bounded replan did not eventually unblock all entries while preserving attempts');
       check(remaining.admit(repo, 0).length === 0, 'replanned runnable entries bypassed zero capacity');
       check(remaining.admit(repo, 1).map(entry => entry.pr).join() === '1', 'replan lost FIFO capacity-one admission');
-      check(logs.filter(line => line.includes('replan ')).length === 5, 'replan did not log exactly one unblock per entry');
+      check(logs.filter(line => line.includes('replan ')).length === 6, 'replan did not log exactly one unblock per entry');
       const before = remaining.entries(), persisted = files.get(file), error = new Error('runner failed');
       let caught;
       try {

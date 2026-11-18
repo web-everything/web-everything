@@ -169,7 +169,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     entries: () => copy(entries),
     // Validate incoming PRs too: maintenance may have removed a terminal PR still present in a stale plan.
     // Each PR is read once per reconciliation; the daemon reader shares evidence across the tick.
-    reconcile({ readLivePr: read = readLivePr, plannerSkipReplanMinutes = 15, candidates = [] } = {}) {
+    reconcile({ readLivePr: read = readLivePr, plannerSkipReplanMinutes = 15, candidates = [], replan = true } = {}) {
       live = new Map(); waiting = new Set(); replanned = new Set();
       const expired = [];
       const persisted = new Set(entries);
@@ -195,7 +195,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           delete entry.blocked; delete entry.blockedAt; delete entry.lastProbeTurn;
           changed(`re-key ${entry.key}: live head changed; position preserved`);
         }
-        if (entry.blocked === 'planner-skip') {
+        if (replan && entry.blocked === 'planner-skip') {
           if (now() - (entry.blockedAt ?? entry.enqueuedAt) >= replanMinutes(plannerSkipReplanMinutes) * 60000) {
             expired.push(entry);
           } // Before expiry, retain the existing bounded fair probes.

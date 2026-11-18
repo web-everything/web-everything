@@ -187,3 +187,25 @@ it('production maintenance evicts a merged persisted entry without invoking redT
   expect(readLivePr).toHaveBeenCalledWith({ repo: 'example/project', pr: 7012 });
   expect(queueRun).not.toHaveBeenCalled();
 });
+
+it('production maintenance retains expired skips while re-keying heads and deferring unreadable PRs', async () => {
+  const file = join(directory, 'queue.json');
+  const entries = [1, 2, 3, 4, 5, 6].map(pr => ({ key: `example/project#${pr}`, repo: 'example/project', pr,
+    head: 'a'.repeat(40), blocked: 'planner-skip', blockedAt: 1, attempts: 1, enqueuedAt: 1 }));
+  writeFileSync(file, JSON.stringify(entries));
+  const { cliReviewTickOpts } = await import('../review-daemon.mjs');
+  const opts = cliReviewTickOpts({ log, readLivePr: ({ pr }) => {
+    if (pr === 5) return { state: 'OPEN', headRefOid: 'b'.repeat(40) };
+    if (pr === 6) return null;
+    return { state: 'OPEN', headRefOid: 'a'.repeat(40) };
+  } });
+  opts.reconcileRedTeamQueue({ repo: 'example/project' });
+  const persisted = JSON.parse(readFileSync(file, 'utf8'));
+  expect(persisted.slice(0, 4)).toEqual(entries.slice(0, 4));
+  expect(persisted[4]).toEqual({ key: 'example/project#5', repo: 'example/project', pr: 5,
+    head: 'b'.repeat(40), attempts: 0, enqueuedAt: 1 });
+  expect(persisted[5]).toEqual(entries[5]);
+  expect(log.error.mock.calls.flat().join(' ')).toContain('live PR unreadable; admission deferred');
+  expect(log.error.mock.calls.flat().some(line => line.includes('replan '))).toBe(false);
+  expect(queueRun).not.toHaveBeenCalled();
+});

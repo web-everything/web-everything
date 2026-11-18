@@ -4541,6 +4541,9 @@ the interval additionally clears their blocked state, restoring capacity-bound F
 admission. Keep exact per-probe attempt counts and max-attempt requeue assertions.
 The `red-team-queue-stale-eviction` soak break replays terminal PR eviction against
 stale planner candidates, persisted probe fairness, and capacity-bound replan expiry.
+Daemon maintenance must use `replan: false`; only the dispatch wrapper clears expired
+planner skips. Both the queue regression and soak replay maintenance then dispatch
+with six expired skips and zero remaining starts, admitting exactly two to the runner.
 Run its `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
 
 ## Timeout evidence synchronous worker pool

@@ -1512,7 +1512,7 @@ describe('live red-team queue reconciliation and planner-skip expiry', () => {
   it.each(['MERGED', 'CLOSED'])('maintenance followed by dispatch never re-enqueues or dispatches a stale %s planner candidate', state => {
     const readLivePr = vi.fn(({ pr }) => ({ state: pr === 1 ? state : 'OPEN', headRefOid: head(pr) }));
     const f = fixture({ readLivePr }); seed(f);
-    f.queue.reconcile();
+    f.queue.reconcile({ replan: false });
     expect(numbers(f.open().entries())).toEqual([2]);
     const afterMaintenance = f.logs.length;
     const run = vi.fn(options => {
@@ -1625,6 +1625,29 @@ describe('live red-team queue reconciliation and planner-skip expiry', () => {
     expect(numbers(resumed.admit(repo, 0))).toEqual([]); // The two replans consume this turn's probes.
     resumed.reconcile();
     expect(numbers(resumed.entries().filter(entry => entry.blocked === 'planner-skip'))).toEqual([]);
+  });
+  it('maintenance then dispatch sends only two of six expired skips to the runner with exhausted starts', () => {
+    const f = fixture();
+    const prs = [1, 2, 3, 4, 5, 6];
+    f.queue.sync(repo, candidates(prs));
+    f.queue.admit(repo, 6);
+    f.queue.settle(repo, { rows: prs.map(prNumber => ({ prNumber, action: 'skip', why: 'superseded acceptance' })) });
+    f.advance(20 * 60000);
+    const queue = f.open();
+    const before = queue.entries();
+    queue.reconcile({ replan: false });
+    expect(f.open().entries()).toEqual(before);
+    expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(0);
+    const run = vi.fn(options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2]);
+      expect(options.rawPrs.map(pr => pr.number)).toEqual([1, 2]);
+      return { notStarted: options.plan.refusals.map(row => ({ prNumber: row.prNumber, reason: 'no review capacity left' })) };
+    });
+    runWithRedTeamQueue({ queue, ...inputs(prs), capacity: { lanes: 6, remainingStarts: 0, budget: { left: 6 } },
+      readNetFiles: () => ({ ok: false }), run });
+    expect(run).toHaveBeenCalledOnce();
+    expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(2);
+    expect(numbers(f.open().entries().filter(entry => entry.blocked === 'planner-skip'))).toEqual([3, 4, 5, 6]);
   });
   it('migrates a legacy planner-skip without blockedAt using enqueuedAt and admits it as runnable', () => {
     const f = fixture(); seed(f);
