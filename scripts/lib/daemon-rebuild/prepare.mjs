@@ -133,11 +133,12 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
-  try {
-    if (readPendingDrops(root, env).length) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
-  } catch (error) {
+  // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
+  // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.
+  let dropPending = false;
+  try { dropPending = readPendingDrops(root, env).length > 0; } catch (error) {
+    dropPending = true;
     alert('drop-pending-unsettled', { error: String(error.message) });
-    return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   }
 
   const finishVerifiedSwaps = async () => {
@@ -385,6 +386,7 @@ export async function prepareRebuild({
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
+  if (dropPending && plan.ok && plan.finalSha !== prevHead) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   if (!readyOnly) {
     try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git }); }
     catch (error) { alert('overlay-stale-unknown', { error: String(error.message) }); }

@@ -2,6 +2,7 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { overlayFilePath, registrationIdentity, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
@@ -45,7 +46,7 @@ function notify(root, env, row) {
   const kind = row.reason === 'conflict' ? 'overlay-stale-conflict' : `overlay-stale-${row.reason}`;
   appendOverlayEvent(root, { kind, ...row }, { env });
   if (row.reason !== 'superseded') publishAttention({ repo: 'web-everything', pr: 0,
-    head: `${row.ref}@${row.tip ?? 'unknown'}`, ref: row.ref, kind, title: `Overlay ${row.ref}`, reason: row.reason, ...row,
+    head: `${row.ref}@${row.tip ?? 'unknown'}#${row.registration ?? ''}`, ref: row.ref, kind, title: `Overlay ${row.ref}`, reason: row.reason, ...row,
   }, { path: feedPath({ env }) });
 }
 /** Unknown inputs retain the registration and request operator inspection. No loss inference lives here. */
@@ -53,7 +54,7 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
   openPrHeads, remoteTips, settings = overlayStaleSettings(env), emit = row => notify(root, env, row),
 }) {
   if (!settings.enabled) return [];
-  const state = readState(root, env), rows = [];
+  const state = readState(root, env), rows = [], skipped = new Set();
   if (!overlays.length) return [];
   let heads = openPrHeads;
   const probe = args => { try { return git(args)?.status; } catch { return null; } };
@@ -71,17 +72,17 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
       || plan.applied?.some(a => a.ref === ref && a.pinnedFrom)
       || plan.decisions?.some(d => d.ref === ref && /pinned/.test(d.reason ?? ''))
       || plan.alerts?.some(a => a.detail?.ref === ref && /pinned/.test(a.kind));
-    if (excluded) { record.count = 0; continue; }
+    if (excluded) { record.count = 0; skipped.add(ref); continue; }
     if (heads === undefined) heads = readOpenPrHeads(root, env);
     // A fork PR reusing the branch name is not this origin branch's PR.
-    if (heads?.some(h => h.headRefName === ref && h.isCrossRepository !== true)) { record.count = 0; continue; }
+    if (heads?.some(h => h.headRefName === ref && h.isCrossRepository !== true)) { record.count = 0; skipped.add(ref); continue; }
     let reason = null;
     if (!tip || !FULL_SHA_RE.test(mainSha) || !Array.isArray(heads)) reason = 'unknown';
     if (!reason) {
       let pin;
       try { pin = pinnedStatus(git, overlay, mainSha, tip); } catch { pin = { why: 'unknown' }; }
       if (pin.why === 'unknown') reason = 'unknown';
-      else if (pin.pinned) { record.count = 0; continue; }
+      else if (pin.pinned) { record.count = 0; skipped.add(ref); continue; }
     }
     if (!reason) {
       // A pinned carrier's sha is what the plan actually carries; pinnedFrom is the rejected fetched tip.
@@ -102,7 +103,7 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
       else if (merge.status === 1) reason = 'conflict';
     }
     record.count = reason === 'conflict' ? record.count + 1 : 0;
-    const row = { ref, tip, count: record.count, reason: reason ?? 'clean',
+    const row = { ref, tip, registration: createHash('sha256').update(key).digest('hex').slice(0, 12), count: record.count, reason: reason ?? 'clean',
       ownerAction: reason === 'superseded' ? `daemon-overlay.mjs remove ${ref}` : `rebase ${ref} onto main` };
     rows.push(row);
     if (reason && (reason !== 'conflict' || record.count > settings.threshold) && !(record.seen ??= {})[reason]) {
@@ -115,8 +116,10 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
   const file = sidecar(root, env), tmp = `${file}.${process.pid}.tmp`;
   mkdirSync(dirname(file), { recursive: true });
   // Clear a pending notice only after delivery succeeds: a failed publish retries next tick (never lost).
-  for (const record of Object.values(state.records)) {
+  for (const [key, record] of Object.entries(state.records)) {
     for (const [why, notice] of Object.entries(record.pending ?? {})) {
+      // Recheck tip, registration and pin: an obsolete notice is dropped, never delivered.
+      if (state.current[notice.ref] !== key || skipped.has(notice.ref)) { delete record.pending[why]; continue; }
       try { emit(notice); delete record.pending[why]; } catch { /* retried next tick */ }
     }
   }

@@ -7,6 +7,7 @@ import { overlayFilePath, addOverlay } from '../../daemon-overlays.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
 import * as planner from '../plan.mjs';
 import * as detector from '../overlay-prune.mjs';
+import { readRebuildState } from '../state.mjs';
 import * as localState from '../local-state.mjs';
 import * as repair from '../../lane-repair.mjs';
 import * as fetcher from '../edge-fetch.mjs';
@@ -43,7 +44,7 @@ describe('post-plan stale detector', () => {
     expect(tick()[0].count).toBe(3);
     tick();
     expect(emit).toHaveBeenCalledTimes(1);
-    expect(emit).toHaveBeenCalledWith({ ref, tip, count: 3, reason: 'conflict', ownerAction: `rebase ${ref} onto main` });
+    expect(emit).toHaveBeenCalledWith({ ref, tip, registration: expect.any(String), count: 3, reason: 'conflict', ownerAction: `rebase ${ref} onto main` });
   });
   it('a transient unknown does not suppress the later conflict alert', () => {
     tick({ remoteTips: {} });
@@ -56,6 +57,22 @@ describe('post-plan stale detector', () => {
     const heads = [{ headRefName: ref, headRefOid: sha('e'), isCrossRepository: true }];
     expect(tick({ openPrHeads: heads })[0].count).toBe(1);
     expect(tick({ openPrHeads: [{ ...heads[0], isCrossRepository: false }] })).toHaveLength(0);
+  });
+  it('a retried notice is dropped when the overlay became pinned or its tip moved', () => {
+    emit.mockImplementationOnce(() => { throw new Error('feed down'); });
+    tick(); tick(); tick();
+    expect(emit).toHaveBeenCalledTimes(1);
+    tick({ openPrHeads: [{ headRefName: ref, headRefOid: sha('e'), isCrossRepository: false }] });
+    tick(); tick();
+    expect(emit).toHaveBeenCalledTimes(1);
+  });
+  it('re-registration at the same tip changes the attention identity', () => {
+    const rows = [];
+    tick({ emit: r => rows.push(r) }); tick({ emit: r => rows.push(r) }); tick({ emit: r => rows.push(r) });
+    overlay = { ...overlay, addedAt: 'later' };
+    tick({ emit: r => rows.push(r) }); tick({ emit: r => rows.push(r) }); tick({ emit: r => rows.push(r) });
+    expect(rows).toHaveLength(2);
+    expect(rows[0].registration).not.toBe(rows[1].registration);
   });
   it('a failed publish is retried next tick and then marked delivered', () => {
     emit.mockImplementationOnce(() => { throw new Error('feed down'); });
@@ -184,15 +201,35 @@ describe('post-plan stale detector', () => {
   });
 });
 
-it.each(['pending', 'unreadable'])('F1 refuses %s drop intent before planning or Git', async mode => {
+function stubPrepare() {
+  vi.spyOn(localState, 'ensureSafeToMove').mockReturnValue({ safe: true, untracked: [] });
+  vi.spyOn(repair, 'repairCloneRefs').mockReturnValue({ ok: true, pruned: [], reportedNew: [] });
+  vi.spyOn(fetcher, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
+}
+const headSha = sha('1'), newSha = sha('2');
+const gitRun = args => ({ status: 0, stdout: args[0] === 'symbolic-ref' ? 'main' : args[0] === 'rev-parse' ? headSha : '' });
+function writePending(mode) {
   const file = `${overlayFilePath(root, env)}.drop-pending`;
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, mode === 'pending' ? JSON.stringify({ pending: [{ ref }] }) : 'bad');
-  const plan = vi.spyOn(planner, 'planRebuild'), run = vi.fn(() => { throw new Error('must not reach Git'); });
-  const result = await prepareRebuild({ root, env, run, now: () => 0 });
+}
+
+it.each(['pending', 'unreadable'])('F1 %s drop intent refuses a build that changes applied overlays, after planning', async mode => {
+  stubPrepare(); writePending(mode);
+  const plan = vi.spyOn(planner, 'planRebuild').mockResolvedValue({ ok: true, finalSha: newSha, mainSha, applied: [{ ref, sha: tip }], decisions: [], alerts: [] });
+  const result = await prepareRebuild({ root, env, run: gitRun, now: () => 0, prBaseChain: () => [] });
   expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'drop-pending-unsettled' } });
-  expect(plan).not.toHaveBeenCalled();
-  expect(run).not.toHaveBeenCalled();
+  expect(plan).toHaveBeenCalledTimes(1);
+});
+
+it('a pending drop intent still lets unverified-build recovery run (it never drops registrations)', async () => {
+  stubPrepare(); writePending('pending');
+  const { writeRebuildState } = await import('../state.mjs');
+  writeRebuildState(root, { unverified: { head: headSha, prevHead: headSha } }, env);
+  vi.spyOn(planner, 'planRebuild').mockResolvedValue({ ok: false, reason: 'test-plan', applied: [], decisions: [], alerts: [] });
+  const result = await prepareRebuild({ root, env, run: gitRun, now: () => 0, prBaseChain: () => [] });
+  expect(result.result.reason).toBe('test-plan');
+  expect(readRebuildState(root, env).unverified ?? null).toBeNull();
 });
 
 it('prepare runs detection after planning and contains detector failures', async () => {
