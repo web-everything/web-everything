@@ -336,7 +336,12 @@ export function gitMergeTreeParsed({ pr, cwd = REPO_ROOT, exec = execFileSyncThr
   }
   const parsed = parseMergeTree(stdout, exitCode);
   if (!parsed.tree) return null;
-  return includeRefEvidence ? { ...parsed, headSha, baseSha, fetchSucceeded: true } : parsed;
+  if (!includeRefEvidence) return parsed;
+  // Strict evidence only: the conflicted-file block must hold nothing but recognised records.
+  const block = String(stdout).split('\n').slice(1);
+  const end = block.findIndex(line => line.trim() === '');
+  const unrecognized = (end < 0 ? block : block.slice(0, end)).filter(line => line.trim() && !/^\d{6} [0-9a-f]+ [0-3]\t.+$/.test(line)).length;
+  return { ...parsed, headSha, baseSha, fetchSucceeded: true, exitCode, unrecognizedConflictLines: unrecognized };
 }
 
 /**

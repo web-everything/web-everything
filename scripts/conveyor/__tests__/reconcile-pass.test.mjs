@@ -569,7 +569,7 @@ it.each([
 // repeat apart from a fresh tip.
 describe('enrichPrsWithConflictDisposition', () => {
   const head = 'a'.repeat(40), base = 'b'.repeat(40);
-  const evidence = (disposition, headSha = head) => ({ fetchSucceeded: true, headSha, baseSha: base,
+  const evidence = (disposition, headSha = head) => ({ fetchSucceeded: true, headSha, baseSha: base, exitCode: disposition === 'clean' ? 0 : 1, unrecognizedConflictLines: 0,
     clean: disposition === 'clean', conflictPaths: disposition === 'manifest-only' ? ['.lane-manifest.json'] : ['src/app.js'] });
   const dirty = (over = {}) => ({ number: 1, headRefOid: head, headRefName: 'lane/x', state: 'OPEN', baseRefName: 'main', mergeStateStatus: 'DIRTY', ...over });
 
@@ -587,6 +587,12 @@ describe('enrichPrsWithConflictDisposition', () => {
       const pr = dirty({ baseRefName: 'trunk', mergeStateStatus: 'CLEAN', ...signal });
       expect(enrichPrsWithConflictDisposition([pr], { mainSha: base, defaultBranch: 'trunk', compute: () => evidence('clean') })[0].conflictDisposition).toBe('clean');
     });
+
+  it.each([{ exitCode: 2 }, { unrecognizedConflictLines: 1 }])('refuses manifest-only on incomplete conflict evidence %j', async over => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const out = enrichPrsWithConflictDisposition([dirty()], { mainSha: base, compute: () => ({ ...evidence('manifest-only'), ...over }) });
+    expect(out[0].conflictDisposition).toBeNull();
+  });
 
   it('never trusts a supplied conflictDisposition on unprobed rows', async () => {
     const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');

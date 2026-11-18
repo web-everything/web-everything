@@ -1402,7 +1402,7 @@ export function enrichPrsWithConflictDisposition(prs, { compute = gitMergeTreePa
       if (isSha(mainSha) && isSha(pr.headRefOid) && parsed?.fetchSucceeded === true
         && parsed.headSha === pr.headRefOid && parsed.baseSha === mainSha) {
         if (parsed.clean === true) conflictDisposition = 'clean';
-        else if (parsed.clean === false && parsed.conflictPaths?.length > 0
+        else if (parsed.clean === false && parsed.exitCode === 1 && parsed.unrecognizedConflictLines === 0 && parsed.conflictPaths?.length > 0
           && parsed.conflictPaths.every(path => isDrainTransientPath(path))) conflictDisposition = 'manifest-only';
       }
     } catch { /* Unknown evidence never earns a mechanical exemption. */ }
