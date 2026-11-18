@@ -54,7 +54,7 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
       { job, event: 'workflow_dispatch', ref: 'refs/heads/main' },
       { job, event: 'pull_request', ref: 'refs/pull/6010/merge' },
     ]) expect(skip(job, file, { flags }).skip).toEqual([]);
-    expect(skip(job, `${file}::named failure`).skip).toEqual([]);
+    expect(skip(job, `${file}::named failure`).skip).toEqual(job.startsWith('soak-shard') ? [file] : []);
   });
 });
 
@@ -83,7 +83,7 @@ async function runSoak(args, files = [soakFile, otherFile], status = 0) {
 
 describe('soak CLI quarantine consumption', () => {
   it('removes the quarantined file after shard assignment and still runs the other file', async () => {
-    await runSoak(skip('soak-shard (1)', soakFile).line.split(' '));
+    await runSoak(skip('soak-shard (1)', `${soakFile}::50 real daemon ticks`).line.split(' '));
     expect(io.files).toHaveBeenCalledWith({ shard: 1, total: 8 });
     expect(io.spawn.mock.calls[0][1]).toEqual(['vitest', 'run', '--config', 'vitest.soak.config.ts', otherFile]);
   });

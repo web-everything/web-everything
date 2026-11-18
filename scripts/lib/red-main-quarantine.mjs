@@ -383,7 +383,8 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = 
   const changed = new Set(changedFiles);
   const touched = tests.filter((t) => changed.has(testFileOf(t)));
   const rest = tests.filter((t) => !changed.has(testFileOf(t)));
-  const { args, unsupported } = vitestExcludeArgs(rest);
+  // Soak shards consume file identities; a tagged case quarantines its scenario file. Unit exclusions stay whole-file only.
+  const { args, unsupported } = vitestExcludeArgs(/^soak-shard \(\d+\)$/.test(localJobName(job)) ? rest.map(testFileOf) : rest);
   const skip = args.map((a) => a.slice('--exclude='.length));
   return { skip, unsupported, why: `skipping ${skip.length} quarantined test file(s)${touched.length ? `; running ${touched.length} this PR changes` : ''}` };
 }

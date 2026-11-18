@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs, runAddCommand } from '../red-main-quarantine-io.mjs';
+import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs, runAddCommand, mainQuarantineCovered } from '../red-main-quarantine-io.mjs';
 import { addEntries, pruneOnGreen, testsToSkip } from '../red-main-quarantine.mjs';
 
 const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -70,6 +70,10 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
 });
 
 describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
+  it('operator --job reaches the published entry', () => {
+    runAddCommand({ tests: 'a.test.mjs::case', 'broken-sha': SHA, actor: 'operator', owner: 'o', reason: 'r', job: 'soak-shard (1)' },
+      { rerun: () => null, write: ({ change }) => { expect(change(null).list.entries[0].job).toBe('soak-shard (1)'); return { ok: true }; } });
+  });
   const flags = { tests: 'a.test.mjs', 'broken-sha': SHA, owner: 'o', reason: 'r', actor: 'a' };
   it('a successful add calls the rerun with the broken sha and --dir, and attaches `rerun` to the output', () => {
     const rerun = vi.fn(() => ({ rerun: true, runId: 42 }));
@@ -101,6 +105,28 @@ describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
     const rerun = vi.fn();
     expect(() => runAddCommand(flags, { write: () => { throw new Error('refused'); }, rerun })).toThrow('refused');
     expect(rerun).not.toHaveBeenCalled();
+  });
+});
+
+describe('latest main quarantine coverage releases the drain only with complete evidence', () => {
+  const file = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs', job = 'soak-shard (1)';
+  it.each(['all-covered', 'unit-covered', 'one-uncovered', 'unreadable-list', 'unreadable-run', 'expired', 'non-shard', 'integration', 'oversized', 'incomplete-jobs', 'unreadable-log', 'newer-run', 'legacy', 'wrong-job'])('%s proceeds only when all failures are covered; otherwise holds', (scenario) => {
+    const now = Date.now(), readLog = vi.fn(() => ({ complete: true, files: [file, ...(scenario === 'one-uncovered' ? ['other.test.mjs'] : [])] }));
+    const list = addEntries(null, { tests: [`${file}::50 real daemon ticks`], brokenSha: SHA, actor: 'operator', owner: 'o', reason: 'r', now,
+      ...(scenario === 'legacy' ? {} : { job: scenario === 'wrong-job' ? 'soak-shard (2)' : job }) }).list;
+    list.mode = 'quarantine';
+    if (scenario === 'expired') { list.entries[0].addedAt = now - 1; list.entries[0].expiresAt = now; }
+    const failed = [{ id: 1, name: job }, { id: 2, name: 'daemon-soak' }];
+    if (scenario === 'unit-covered') { list.entries[0].test = file; list.entries[0].job = 'test-shard (1)'; failed[0].name = 'test-shard (1)'; failed[1].name = 'test'; }
+    if (scenario === 'non-shard') failed.push({ id: 3, name: 'lint' });
+    if (scenario === 'integration') failed.push({ id: 3, name: 'integration' });
+    if (scenario === 'oversized') failed.push(...[2, 3, 4, 5, 6].map((n) => ({ id: n + 2, name: `soak-shard (${n})` })));
+    const result = mainQuarantineCovered({ list: scenario === 'unreadable-list' ? null : list, signal: { latestRedSha: SHA }, now,
+      exec: () => { if (scenario === 'unreadable-run') throw new Error('unreadable'); return JSON.stringify([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: scenario === 'newer-run' ? 'other' : SHA }]); },
+      readJobs: () => ({ complete: scenario !== 'incomplete-jobs', failed }),
+      readLog: scenario === 'unreadable-log' ? () => { throw new Error('unreadable'); } : readLog });
+    expect(result).toBe(['all-covered', 'unit-covered'].includes(scenario));
+    if (scenario === 'oversized') expect(readLog).not.toHaveBeenCalled();
   });
 });
 

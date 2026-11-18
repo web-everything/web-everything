@@ -14,7 +14,7 @@
  *       skip (CI runs everything — the safe direction). The main-fix PR / main always skip nothing: the fix PRs the
  *       list publishes always count, `--fix-prs` only adds to them.
  *   node scripts/lib/red-main-quarantine-io.mjs add --actor=<red-main-safety-net|operator> --broken-sha=<sha>
- *       --owner=<who> --reason=<why> --tests=<id,id> [--area=<dir/>] [--ttl-min=<n>]
+ *       --owner=<who> --reason=<why> --tests=<id,id> [--job=<CI job>] [--area=<dir/>] [--ttl-min=<n>]
  *   node scripts/lib/red-main-quarantine-io.mjs prune --actor=<..> --main-green=<true|false|unknown>
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
@@ -30,11 +30,12 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { resolveRedMainMode, RED_MAIN_HOLD_SETTINGS_FILE } from './red-main-hold.mjs';
-import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
+import { mainRedState, mainCiRedSettings } from '../conveyor/main-ci-red-core.mjs';
+import { readRunJobs } from '../conveyor/main-ci-red-probe.mjs';
 import {
   QUARANTINE_BRANCH, QUARANTINE_REF, QUARANTINE_LIST_PATH, QUARANTINE_EVENTS_PATH,
   validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, vitestExcludeArgs,
-  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT,
+  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT, decideCiSkip, testFileOf,
 } from './red-main-quarantine.mjs';
 
 const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, killSignal: 'SIGKILL', ...opts });
@@ -625,6 +626,36 @@ export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = fal
   return testsToSkip({ list: r.list, now, prNumber, fixPrs, onMain });
 }
 
+/** Fresh, complete evidence only. At most five shard logs; larger/unknown reds stay held for operator repair. */
+export function mainQuarantineCovered({ list, signal, now, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug,
+  readJobs = (id) => readRunJobs(id, { exec, repoSlug }), readLog = (id) => readJobFailures(id, { exec, repoSlug }) }) {
+  try {
+    if (!validateQuarantineList(list).ok || list.mode !== 'quarantine') return false;
+    const settings = mainCiRedSettings();
+    const [run] = JSON.parse(String(exec('gh', ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow,
+      '--branch', settings.mainCiRedBranch, '--limit', '1', '--json', 'databaseId,status,conclusion,headSha'],
+    { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] })));
+    if (run?.status !== 'completed' || !['failure', 'timed_out'].includes(run.conclusion)
+      || !/^[1-9]\d*$/.test(String(run.databaseId)) || !run.headSha || run.headSha !== (signal.latestRedSha ?? signal.firstRedSha)) return false;
+    const jobs = readJobs(run.databaseId);
+    if (!jobs?.complete || !Array.isArray(jobs.failed) || !jobs.failed.length) return false;
+    const local = (name) => String(name).split(' / ').at(-1);
+    const shards = jobs.failed.filter((j) => /^(test|soak)-shard \(\d+\)$/.test(local(j.name)));
+    if (!shards.length || shards.length > 5) return false;
+    const derived = { test: 'test-shard', 'coverage-merge': 'test-shard', 'daemon-soak': 'soak-shard' };
+    if (jobs.failed.some((j) => !shards.includes(j) && !shards.some((s) => local(s.name).startsWith(`${derived[local(j.name)]} (`)))) return false;
+    const shas = [signal.firstRedSha, signal.latestRedSha].filter(Boolean);
+    const entries = list.entries.filter((e) => shas.some((s) => s.startsWith(e.brokenSha) || e.brokenSha.startsWith(s)));
+    return shards.every((j) => {
+      const failures = readLog(j.id);
+      if (failures?.complete !== true || !Array.isArray(failures.files) || !failures.files.length) return false;
+      const { skip } = decideCiSkip({ mode: 'quarantine', read: { ok: true, list: { ...list, entries } },
+        ctx: { known: true, onMain: false, prNumber: null }, changedFiles: [], now, job: j.name });
+      return failures.files.every((f) => skip.includes(testFileOf(f)));
+    });
+  } catch { return false; }
+}
+
 /**
  * The `add` command: write the quarantine change, then (only when the write did not report `ok:false`) re-run the failed
  * jobs of the broken main run and attach the result as `rerun`. Pure wiring over injectable `write`/`rerun`, so the
@@ -639,7 +670,7 @@ export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChan
   const brokenSha = typeof f['broken-sha'] === 'string' ? f['broken-sha'].toLowerCase() : f['broken-sha'];
   const out = write({
     actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(brokenSha).slice(0, 9)}, by ${f.actor})`,
-    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
+    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null, job: f.job }),
   });
   const result = out?.ok === false ? undefined : rerun({ brokenSha, ...(f.dir ? { dir: f.dir } : {}) });
   return result ? { ...out, rerun: result } : out;

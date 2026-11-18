@@ -2388,6 +2388,8 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
+Quarantine coverage probes must use the latest completed main run, complete shard failure logs, and active job-matched entries; missing evidence retains the drain hold. Soak case IDs map to scenario files only in explicitly tagged soak jobs; unit name-qualified entries still run.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
