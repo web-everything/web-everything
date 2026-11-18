@@ -4580,3 +4580,60 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## R986 I1 probation core and report-only wiring
+
+`scripts/lib/daemon-rebuild/probation.mjs` is a pure transition core, not a running
+probation service. At adoption, `freezeProbation` takes the complete registered roster
+for one clone and `readClosure(daemon, sha)` snapshots at proven-good and adopted heads.
+A snapshot is `{ complete: true, files: { '.tree': rootTreeId, [entry]: entryBlobId } }`.
+`readClosure(root, daemon, sha)` validates the SHA, resolves its root tree with
+`git rev-parse sha^{tree}`, and checks the single entry path with `git ls-tree`:
+the entry must be a regular-file blob (mode `100644` or `100755`), never a symlink.
+Any tracked change anywhere in the repository
+changes the tree ID and owes proof for every registered daemon, including changes
+to docs, scripts, JSON configs and unrelated CommonJS files. Identical trees give
+equal snapshots even across distinct commits. Unknown, incomplete, empty or
+unreadable snapshots owe proof.
+An unknown or ambiguous roster refuses adoption: the operator must recover the roster.
+`owed` stays fixed for this adoption. `recordProof` stores independent daemon records;
+boot and completed tick evidence must name that daemon, agree on its PID and adopted
+head, and show process start at/after adoption with a later completed tick. Callers
+must obtain boot evidence from that daemon's process record, not from a sibling or
+from the wrapper's first tick time. `evaluateProbation` passes only with all owed
+records, or immediately for a known empty owed set. Non-owed evidence is a no-op.
+Legacy single-record state cannot promote; it requires operator recovery.
+
+The probation tests adapt the WIP adoption clock/heads and invalid-tick cases. The
+self-sync test uses the WIP injected rebuild/lock/closure fixture as a core consumer;
+it does not establish production probation integration. `probation-io.mjs` now observes the legacy prepare/finalize adoption paths inside
+their existing `withWriteLock` holds. It freezes launchd labels (stable daemon IDs),
+entry paths and SHA-specific tree/entry snapshots in a per-clone `.probation.json`
+under `stateDir`. The previous smoke-adopted head supplies the legacy comparison
+baseline; this observer never promotes it. Failed closure reads conservatively owe
+proof. Roster failure produces an invalid record and requires operator recovery of
+registrations. Every persisted read is
+validated; missing, unreadable and malformed records report invalid, never empty.
+Self-sync submits only its own immutable PID/start/boot-head and completed tick
+head after releasing its read lock; ambiguous process identity earns no proof.
+`createProbationObserver().status()` exposes pending/pass and reason under the
+shared write lock. Results are logged and have NO effect on tick, adoption,
+proven-good, rollback or marker decisions. Missing records are not reconstructed
+by a sibling tick. No boot counting or probation deadline policy ships here.
+`probation-io.test.mjs` uses real Git objects, temp files and the shared clone lock
+to exercise repository-wide proof debt, invalid reads and concurrent proof writers.
+`probation-callers.test.mjs` exercises the real observer through self-sync and the
+locked prepare/finalize callers. Telemetry-only hooks need caller tests for pass,
+invalid persistence and lock refusal: assert lifecycle results, rebuild state and
+protected marker bytes, not only the observer's return value. Prepare/planning and
+launchd identity are stubbed; probation persistence and the shared lock remain real.
+
+Probation closure evidence reads only the root tree ID and the entry blob ID;
+it never buffers a recursive tree listing or scopes dependency paths. Any Git
+failure or missing/non-regular entry makes the snapshot incomplete and owes proof;
+an operator must inspect Git evidence if it cannot be collected. The IO tests
+exercise repository-wide changes, identical trees, immutable snapshots, invalid
+SHAs, missing/non-regular entries and external symlink targets changing while
+the tracked tree stays identical. Adoption may create a record only when none
+exists or the existing record validates. Invalid/unreadable records (including dangling symlinks)
+remain untouched and require operator recovery; they never reset the debt baseline.

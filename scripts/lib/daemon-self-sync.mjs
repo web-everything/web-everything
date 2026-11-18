@@ -128,6 +128,7 @@ import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
 import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
 import { readReadyCandidate } from './daemon-rebuild/state.mjs';
+import { createProbationObserver, ownDaemonId } from './daemon-rebuild/probation-io.mjs';
 import { createAdoptYieldProbe } from './daemon-rebuild/adopt-yield.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
@@ -958,6 +959,16 @@ export function withSelfSync(effects, {
   // the drift check for this process's lifetime rather than risk comparing against a wrong/stale value.
   const bootSha = readHead(syncOpts());
   const bootAt = now();
+  // Own process record: boot identity is immutable; completed tick HEAD is captured under the read lock.
+  const probationObserver = realIo && !vctx && !resolvedPocBranch ? createProbationObserver({ root, env, log,
+    lockOpts: { waitMs: 0 } }) : null;
+  let probationDaemonId = null;
+  if (probationObserver) {
+    try { probationDaemonId = ownDaemonId(root, entries?.[0], { env }); }
+    catch (e) { log.error?.(`daemon-probation: invalid process identity; operator recovery required: ${e.message}`); }
+  }
+  const ownProcess = { daemonId: probationDaemonId, pid: process.pid, bootHead: bootSha,
+    startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString() };
   const cloneLockOpts = () => (env && env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {});
   // #4044 restart gate (see decideRestart). The closure is walked lazily, once, from the BOOT tree's files — the
   // code actually loaded in memory. (A file newly added to the closure only matters via an edit to an existing
@@ -1334,9 +1345,15 @@ export function withSelfSync(effects, {
           // 4. Run the real tick under the read lock.
           tickResult = await tick(...args);
           markTickDone();
+          ownProcess.tickHead = headNow;
+          ownProcess.lastTickDoneAt = new Date(now()).toISOString();
         } finally {
           releaseOnce();
         }
+
+        // Report only, AFTER releasing the read lock. Neither pass nor invalid changes this tick's result.
+        if (probationObserver) await probationObserver.proof({ ...ownProcess, tickHead: ownProcess.tickHead,
+          lastTickDoneAt: ownProcess.lastTickDoneAt });
 
         // 5. A cooperative adopt-yield (S1), or #3383 bug 1 — this SAME tick's own result shows it hit the stale-main refusal
         //    (origin/main moved mid-tick). Rebuild IMMEDIATELY (never a raw merge) rather than wait out the rest
