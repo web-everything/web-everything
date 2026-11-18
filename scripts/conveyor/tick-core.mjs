@@ -2196,6 +2196,7 @@ async function main(argv) {
   // never bind on a fresh conveyor. Only `review:changes` PRs are read (rare), so it adds no per-tick gh cost in
   // the common case; a comment read that fails is best-effort (floor 0 — the in-session tally still guards).
   const { countRearmComments } = await import('./rearm-review.mjs');
+  const { countRedTeamFixComments } = await import('./red-team-fix-round-count.mjs'); // spent red-team rounds share this floor
   const prRearmCounts = {};
   const prCiHealCounts = {};
   const prCiHealRefunds = {};
@@ -2222,7 +2223,7 @@ async function main(argv) {
       const raw = time('prCommentReadsMs', () => execFileSync('gh', prViewArgs,
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }));
       const comments = JSON.parse(raw)?.comments;
-      if (wantsRearm) prRearmCounts[p.prNumber] = countRearmComments(comments);
+      if (wantsRearm) prRearmCounts[p.prNumber] = countRearmComments(comments) + countRedTeamFixComments(comments);
       if (wantsCiHeal) {
         const floor = ciHealFloorFromComments(comments);
         prCiHealCounts[p.prNumber] = floor.count;
