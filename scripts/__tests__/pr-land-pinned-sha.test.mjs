@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { computeNetDiffText, computeNetDiffPaths, computeNetDiffChangedFiles, computeNetDiffSignals, resolveNetDiffBasis, readNetDiffAtHead, readDrainNetDiffSignals } from '../merge-ai-prs.mjs';
 import { requireScoredNetDiff } from '../pr-land.mjs';
+import { fetchTestGamingDiffEvidence } from '../conveyor/convert-advisory-dispatch.mjs';
+import { scanDrainTestTampering } from '../merge-ai-prs.mjs';
+import { shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 import { resolveNetDiff } from '../fetch-parked.mjs';
 
 describe('pr-land pinned SHA evidence', () => {
@@ -12,7 +15,8 @@ describe('pr-land pinned SHA evidence', () => {
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
   const exec = (cmd, args, opts) => {
     calls.push({ args, opts });
-    if (args[0] === 'fetch') throw new Error('offline fixture');
+    if (args[0] === 'fetch') return ''; // Simulated successful transport.
+    if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
     return execFileSync(cmd, args, { ...opts, cwd: root });
   };
   beforeEach(() => {
@@ -31,6 +35,45 @@ describe('pr-land pinned SHA evidence', () => {
     git('update-ref', `refs/remotes/origin/${head}`, base);
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it.each(['transport failed', 'ETIMEDOUT'])('failed base fetch refuses a cached base containing the candidate: %s', message => {
+    git('update-ref', 'refs/remotes/origin/main', head);
+    expect(git('diff', '--name-only', 'refs/remotes/origin/main', head)).toBe('');
+    const failed = (cmd, args, opts) => {
+      if (args[0] === 'fetch') throw Object.assign(new Error(message), { code: message });
+      return exec(cmd, args, opts);
+    };
+    const options = { exec: failed, rev: head, pinRev: true };
+    expect(resolveNetDiffBasis(options)).toEqual({ ok: false, reason: 'base-fetch-failed',
+      requestedFor: { remote: 'origin', base: 'main', rev: head } });
+    for (const read of [computeNetDiffText, computeNetDiffPaths, computeNetDiffChangedFiles]) {
+      expect(read(options)).toMatchObject({ scored: false, reason: 'base-fetch-failed' });
+    }
+    const sig = computeNetDiffSignals(options);
+    expect(sig).toMatchObject({ scored: false, diffHunks: null, netDiffText: { scored: false, reason: 'base-fetch-failed' } });
+    expect(() => requireScoredNetDiff(sig, head)).toThrow(/unscored/);
+    const drain = readDrainNetDiffSignals({ exec: failed, headSha: head });
+    expect(drain.scored).toBe(false);
+    const gaming = scanDrainTestTampering(drain.netDiffText);
+    expect(shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: drain.scored })).toBe(true);
+    expect(resolveNetDiff({ exec: failed, headRef: 'lane/x', headRefOid: head }).basis).toBe('three-dot');
+    expect(fetchTestGamingDiffEvidence({ exec: failed, rev: head, paths: ['guard.test.mjs'] }))
+      .toMatchObject({ scored: false, reason: 'base-fetch-failed' });
+  });
+
+  it.each(['mismatched', 'unreadable', 'empty'])('successful fetch with %s fetched tip refuses stale tracking evidence', kind => {
+    git('update-ref', 'refs/remotes/origin/main', head);
+    const read = (cmd, args, opts) => {
+      if (args.at(-1) === 'FETCH_HEAD^{commit}') {
+        if (kind === 'unreadable') throw new Error('missing FETCH_HEAD');
+        return kind === 'empty' ? '' : base;
+      }
+      return exec(cmd, args, opts);
+    };
+    const sig = computeNetDiffSignals({ exec: read, rev: head });
+    expect(sig.netDiffText).toMatchObject({ scored: false, reason: 'base-fetch-failed' });
+    expect(() => requireScoredNetDiff(sig, head)).toThrow(/unscored/);
+  });
 
   it('moved ref and origin/SHA collision cannot clear another head', () => {
     const sig = computeNetDiffSignals({ exec, rev: head, fetchExtraRefs: ['lane/x'], pinRev: true });
@@ -71,7 +114,7 @@ describe('pr-land pinned SHA evidence', () => {
     const read = (cmd, args, opts) => {
       expect(opts.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
       expect(args.join(' ')).not.toContain(`origin/${sha}`);
-      if (args[0] === 'fetch') throw new Error('offline');
+      if (args[0] === 'fetch') return '';
       if (args[0] === 'rev-parse') return sha;
       if (args[0] === 'merge-base') return fork;
       if (args.includes('diff')) return '';

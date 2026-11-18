@@ -4654,3 +4654,14 @@ branch candidates probe qualified remote then local branch refs, never tags. Rea
 regressions in `review-pr-io-pinned-head.test.mjs` cover local branch/tag shadows named
 `origin/main`, a missing tracking base, tag-only heads, and a base moving after pinning.
 Unresolvable bases remain unscored: repair the checkout/read and rerun or request human review.
+
+Pinned net-diff scoring also requires a successful base fetch (timeouts included) and a
+tracking-base SHA matching the fetched base tip in `FETCH_HEAD`. Failed transport,
+unreadable fetched identity, or a tip mismatch returns unscored `base-fetch-failed`;
+repair the checkout/transport and rerun, or request human review of the full diff.
+`pr-land-pinned-sha.test.mjs` covers a cached base already containing the candidate,
+fetch timeouts, successful transport with stale tracking evidence, and downstream
+pr-land refusal, drain holds, parked bundles and advisory evidence. Positive pinned
+fixtures must explicitly simulate successful fetches and supply the fetched base identity;
+throwing “offline” cannot stand in for a successful scored read. Legacy unpinned display
+reads retain their cached-ref fallback. Run these regressions through heavy-admission.

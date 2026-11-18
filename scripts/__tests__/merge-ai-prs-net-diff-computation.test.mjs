@@ -140,7 +140,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
 
   it('the fetch failing degrades gracefully — still attempts the diff off whatever is locally cached', () => {
     const { exec, calls } = fakeExec({
-      'git fetch origin +main:refs/remotes/origin/main --quiet': { throw: 'network unreachable' },
+      'git fetch --quiet origin +main:refs/remotes/origin/main': { throw: 'network unreachable' },
       'git diff --numstat refs/remotes/origin/main refs/heads/deadbeef': { stdout: '1\t0\tREADME.md\n' },
     });
     const r = computeNetDiffChangedFiles({ exec, rev: 'deadbeef' });
@@ -1029,7 +1029,10 @@ describe('mixed binary and readable test-removal evidence', () => {
   it('retains test-removal hunks, surfaces only binary needsReview, and holds an accepted PR', () => {
     const root = mkdtempSync(join(tmpdir(), 'mixed-tamper-'));
     const exec = (cmd, args, opts) => {
-      if (args[0] === 'fetch') throw new Error('offline fixture');
+      if (args[0] === 'fetch') {
+        writeFileSync(join(root, '.git/FETCH_HEAD'), git('rev-parse', 'refs/remotes/origin/main') + '\n');
+        return '';
+      }
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
     const git = (...args) => exec('git', args, { encoding: 'utf8' }).trim();
@@ -1068,10 +1071,10 @@ describe('drain pinned-head signals', () => {
       const intent = scoringArgs(args);
       const op = intent[0];
       calls.push({ args: intent, opts });
-      if (op === 'fetch') throw new Error('offline');
+      if (op === 'fetch') return ''; // Explicit successful fetch fixture.
       if (op === 'rev-parse') {
         const ref = intent.at(-1);
-        if (ref === 'refs/remotes/origin/main^{commit}') return fork;
+        if (ref === 'refs/remotes/origin/main^{commit}' || ref === 'FETCH_HEAD^{commit}') return fork;
         if (ref === `${head}^{commit}`) {
           if (unavailable) throw new Error('missing PR head');
           return resolved;
@@ -1098,7 +1101,7 @@ describe('drain pinned-head signals', () => {
     const gaming = scanDrainTestTampering(sig.netDiffText);
     expect(gaming.tampered).toBe(true);
     expect(shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: sig.netDiffText.scored })).toBe(true);
-    expect(calls.filter(c => c.args[0] === 'rev-parse')).toHaveLength(2);
+    expect(calls.filter(c => c.args[0] === 'rev-parse')).toHaveLength(3);
     for (const { args, opts } of calls.filter(c => ['merge-base', 'diff'].includes(c.args[0]))) {
       expect(args).toContain(head);
       expect(args.join(' ')).not.toContain('lane/x');

@@ -4093,7 +4093,8 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
     // #2952 — a shape-violating exec fails EVERY call the same way; bail immediately rather than degrade to
     // "whatever is locally cached", which would just re-throw on the very next call below.
     if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
-    /* a real fetch failure degrades to whatever is locally cached — the diff attempts below still run */
+    if (pinRev) return { ok: false, reason: 'base-fetch-failed', requestedFor };
+    /* Legacy unpinned display reads may still use cached refs. */
   }
   if (pinRev) {
     try {
@@ -4102,6 +4103,16 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       baseSha = String(hardenedGitRead(exec, ['rev-parse', '--verify', '--end-of-options', `${baseRef}^{commit}`],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
       if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(baseSha)) return { ok: false, reason: 'ref-unresolved', requestedFor };
+      // The base refspec is first, so FETCH_HEAD names the fetched base tip.
+      // A successful transport alone does not prove the tracking ref was updated.
+      let fetchedBaseSha;
+      try {
+        fetchedBaseSha = String(hardenedGitRead(exec, ['rev-parse', '--verify', '--end-of-options', 'FETCH_HEAD^{commit}'],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+      } catch (err) {
+        return { ok: false, reason: isExecContractError(err) ? 'exec-contract' : 'base-fetch-failed', requestedFor };
+      }
+      if (fetchedBaseSha !== baseSha) return { ok: false, reason: 'base-fetch-failed', requestedFor };
       baseRef = baseSha;
     } catch (err) {
       return { ok: false, reason: isExecContractError(err) ? 'exec-contract' : 'ref-unresolved', requestedFor };
@@ -4362,7 +4373,7 @@ export function readDrainNetDiffSignals({ exec, headSha, headRef = null, baseRev
   if (validHead && sig.revSha === headSha.toLowerCase() && sig.netDiffText.revSha === headSha.toLowerCase()) return sig;
   // Invalidate BOTH consumers: a file-list fallback must not revive clean tamper evidence.
   return { ...sig, scored: false, diffHunks: null,
-    netDiffText: { text: '', base: null, rev: null, scored: false, reason: validHead ? 'head-mismatch' : 'head-unbound' } };
+    netDiffText: { text: '', base: null, rev: null, scored: false, reason: sig.netDiffText.reason === 'base-fetch-failed' ? 'base-fetch-failed' : validHead ? 'head-mismatch' : 'head-unbound' } };
 }
 
 /** Keep readable tamper findings while refusing incomplete evidence as clearance. */

@@ -3596,11 +3596,14 @@ describe('#5135 fix range read wiring', () => {
   });
   it('uses the same pinned SHA for the review basis and latest fix', () => {
     const head = 'b'.repeat(40);
+    const base = 'c'.repeat(40);
     const priorHead = 'a'.repeat(40);
     const calls = [];
     const exec = (file, args) => {
       calls.push(args);
-      return args[0] === 'rev-parse' ? head : args[0] === 'merge-base' ? priorHead : '';
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'rev-parse') return args.at(-1) === 'refs/remotes/origin/lane/x^{commit}' ? head : base;
+      return args[0] === 'merge-base' ? priorHead : '';
     };
     const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
       number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
@@ -3608,8 +3611,10 @@ describe('#5135 fix range read wiring', () => {
     }) });
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
+    expect(calls[0]).toEqual(['fetch', '--quiet', '--end-of-options', 'origin', '+main:refs/remotes/origin/main', 'lane/x']);
     expect(calls.filter(args => args[0] === 'rev-parse')).toEqual([
       ['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/main^{commit}'],
+      ['rev-parse', '--verify', '--end-of-options', 'FETCH_HEAD^{commit}'],
       ['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/lane/x^{commit}'],
     ]);
     expect(calls).toContainEqual(hardenedGitDiffCommand(['diff', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]).args);

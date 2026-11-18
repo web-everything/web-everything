@@ -278,12 +278,9 @@ export function scopeFilesToNet({ ghFiles, netPaths } = {}) {
  * The NET diff bundle for one PR head — text + plain path list + the basis label, resolved in ONE shot so the
  * three can never disagree. `exec(cmd, args, opts)` is injected, so this is unit-testable with a fake.
  *
- * PROVING THE REF IS CURRENT, not merely resolvable (PR #1031 review). `computeNetDiff*`'s `scored` means only "a
- * candidate ref RESOLVED" — `resolveNetDiffBasis` swallows its own fetch error and falls through to whatever
- * `origin/<headRef>` happens to be cached. A working `gh` API path plus a broken git transport would then hand
- * back a plausible OLDER diff labelled `net`: the panel signs off commit A while the head is commit B, with no
- * signal at all. Before this existed, a diff failure produced `diff: ''`, which degrades the round to
- * needs-human — strictly safer. So two things are proven here, not one:
+ * PROVING THE REF IS CURRENT, not merely resolvable (PR #1031 review). Pinned `computeNetDiff*`
+ * reads require a successful base fetch and matching fetched/tracking base tips. This wrapper
+ * additionally proves the fetched head matches the API identity, before labelling evidence `net`:
  *   1. the fetch actually ran (its failure is caught, not swallowed), and
  *   2. `origin/<headRef>` now points at the head `gh` reported (`headRefOid`). Exit 0 is NOT enough: a clone
  *      with a narrowed refspec returns 0 from `git fetch origin lane/x` while never creating `origin/lane/x`.

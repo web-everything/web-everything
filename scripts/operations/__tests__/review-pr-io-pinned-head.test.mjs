@@ -42,8 +42,9 @@ describe('review read pins real Git evidence before merge-base', () => {
     const exec = (cmd, args, opts) => {
       expect(opts.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
       calls.push(args);
-      // Offline cached-ref operation: never perform a network call in this fixture.
-      if (args[0] === 'fetch') throw new Error('offline fixture');
+      // Explicit successful fetch evidence; never perform a network call in this fixture.
+      if (args[0] === 'fetch') return ''; // Simulated successful transport.
+      if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
       if (args.includes('diff')) {
         // These policies are absent from origin/main, even where --no-ext-diff
         // already protected text. Assert them on the production reader too.
@@ -82,6 +83,7 @@ describe('review read pins real Git evidence before merge-base', () => {
       if (args[0] === 'fetch') {
         // Exercise the ordering contract: fetch replaces a previously wrong base.
         git('update-ref', 'refs/remotes/origin/main', base);
+        writeFileSync(join(root, '.git/FETCH_HEAD'), base + '\n');
         return '';
       }
       return execFileSync(cmd, args, { ...opts, cwd: root });
@@ -109,7 +111,8 @@ describe('review read pins real Git evidence before merge-base', () => {
     git('update-ref', 'refs/tags/origin/lane/security', card);
     git('update-ref', 'refs/tags/lane/security', card);
     const exec = (cmd, args, opts) => {
-      if (args[0] === 'fetch') throw new Error('offline fixture');
+      if (args[0] === 'fetch') return ''; // Simulated successful transport.
+      if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
     expect(computeNetDiffText({ exec, rev: 'lane/security', pinRev })).toMatchObject({ scored: false, reason: 'ref-unresolved' });
@@ -152,13 +155,14 @@ describe('review read pins real Git evidence before merge-base', () => {
       ['merge-base', '--end-of-options', base, executable],
     ]);
     for (const args of calls.filter(a => a.includes('diff'))) expect(args.join(' ')).not.toContain('origin/lane/security');
-    expect(calls.filter(a => a[0] === 'rev-parse')).toHaveLength(2);
+    expect(calls.filter(a => a[0] === 'rev-parse')).toHaveLength(3);
   });
 
   it('pins the standalone text helper before merge-base and never repins after the race', () => {
     let pins = 0;
     const exec = (cmd, args, opts) => {
-      if (args[0] === 'fetch') throw new Error('offline fixture');
+      if (args[0] === 'fetch') return ''; // Simulated successful transport.
+      if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
       if (args[0] === 'rev-parse') pins++;
       if (args.includes('diff')) git('update-ref', 'refs/remotes/origin/lane/security', card);
       return execFileSync(cmd, args, { ...opts, cwd: root });
@@ -269,7 +273,8 @@ describe('review read pins real Git evidence before merge-base', () => {
 
   it('refuses an empty successful renderer when raw oids changed', () => {
     const exec = (cmd, args, opts) => {
-      if (args[0] === 'fetch') throw new Error('offline fixture');
+      if (args[0] === 'fetch') return ''; // Simulated successful transport.
+      if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
       if (args.includes('diff') && !args.some(a => ['--raw', '--numstat', '--name-only'].includes(a))) return '';
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
@@ -333,8 +338,21 @@ describe('review read pins real Git evidence before merge-base', () => {
   });
 
   it('fails closed when no common ancestor exists', () => {
-    git('update-ref', 'refs/remotes/origin/main', git('commit-tree', `${base}^{tree}`, '-m', 'unrelated root'));
-    const { result } = read();
+    const unrelated = git('commit-tree', `${base}^{tree}`, '-m', 'unrelated root');
+    git('update-ref', 'refs/heads/main', unrelated);
+    git('update-ref', 'refs/heads/lane/security', executable);
+    // Let production fetch and verify the unrelated base from a real local origin.
+    const origin = join(root, 'origin.git');
+    git('clone', '--quiet', '--bare', root, origin);
+    git('remote', 'add', 'origin', origin);
+    const calls = [];
+    const { result } = read(null, { exec: (cmd, args, opts) => {
+      calls.push(args);
+      return execFileSync(cmd, args, { ...opts, cwd: root });
+    } });
+    expect(git('rev-parse', 'FETCH_HEAD^{commit}')).toBe(unrelated);
+    expect(git('rev-parse', 'refs/remotes/origin/main')).toBe(unrelated);
+    expect(calls).toContainEqual(['merge-base', '--end-of-options', unrelated, executable]);
     expect(result.net).toMatchObject({ scored: false, reason: 'diff-failed' });
     expect(result.diff).toMatchObject({ scored: false, reason: 'diff-failed' });
   });
@@ -348,7 +366,8 @@ describe('review read pins real Git evidence before merge-base', () => {
 
   it('rejects a shared paths basis for another request', () => {
     const exec = (cmd, args, opts) => {
-      if (args[0] === 'fetch') throw new Error('offline fixture');
+      if (args[0] === 'fetch') return ''; // Simulated successful transport.
+      if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
       return execFileSync(cmd, args, { ...opts, cwd: root });
     };
     const basis = resolveNetDiffBasis({ exec, rev: 'lane/security', pinRev: true });
