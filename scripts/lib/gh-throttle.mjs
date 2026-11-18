@@ -1855,8 +1855,10 @@ function logFinishedCiHit(args, cls, throttle, env) {
 }
 
 /** Permit ANSI-bearing job logs on gh 2.104+, without mutating the caller's argv. */
-export function allowJobLogEscapeSequences(args) {
-  return isJobLogRead(args) && !args.includes('--allow-escape-sequences')
+export function allowJobLogEscapeSequences(args, opts = {}) {
+  const out = Array.isArray(opts.stdio) ? opts.stdio[1] : opts.stdio;
+  // Never disable gh's guard when stdout is not captured (inherit would reach the terminal unsanitised).
+  return isJobLogRead(args) && (out === undefined || out === 'pipe') && !args.includes('--allow-escape-sequences')
     ? [...args, '--allow-escape-sequences'] : args;
 }
 
@@ -1873,7 +1875,8 @@ function sanitizeJobLog(args, result, encoding) {
   const clean = text
     .replace(/\u001b\[[0-9;]*m/g, '');
   // Fail closed: only SGR colour markup (ESC[...m) is understood; OSC/hyperlink/lone ESC could hide verdict rows from parsers.
-  if (clean.includes('\u001b')) throw new Error('job log contains unsupported terminal escape sequences');
+  const c1 = Buffer.isBuffer(result) ? result.toString('utf8') : clean;
+  if (clean.includes('\u001b') || /[\u009b\u009d]/.test(c1)) throw new Error('job log contains unsupported terminal escape sequences');
   return Buffer.isBuffer(result) ? Buffer.from(clean, codec) : clean;
 }
 
@@ -1918,7 +1921,7 @@ function sanitizeJobLog(args, result, encoding) {
  * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
 export function runGhSync(args, opts = {}) {
-  const executionArgs = allowJobLogEscapeSequences(args);
+  const executionArgs = allowJobLogEscapeSequences(args, opts);
   const { throttle = {}, ...execOpts } = opts;
   if (isGhLocalOnly(args)) return runGhSyncUnmemoized(args, opts);
   const childEnv = execOpts.env || process.env;

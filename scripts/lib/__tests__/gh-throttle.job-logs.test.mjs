@@ -17,7 +17,7 @@ describe('job-log escape-sequence permission', () => {
   ])('strips CSI colour markup while preserving other controls and %s output (encoding %s)', (type, encoding) => {
     const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
     const controls = String.fromCharCode(...Array.from({ length: 32 }, (_, i) => i).filter(i => ![9, 10, 13, 27].includes(i)))
-      + '\u007f\u0080\u009b\u009c\u009d\u00ff';
+      + '\u007f\u0080\u009c\u00ff';
     const raw = '\u001b[31mhéllo\u001b[0m'
       + controls + '\tline\r\n';
     const clean = 'héllo' + controls + '\tline\r\n';
@@ -32,7 +32,7 @@ describe('job-log escape-sequence permission', () => {
     expect(runGhSync(['api', 'repos/o/r/actions/jobs/123'], opts)).toBe(output);
   });
 
-  it.each(['\u001b[2J', '\u001b[1A', '\u001b]0;title\u0007', '\u001b]8;;https://x\u001b\\', '\u001b'])('fails closed on non-CSI escapes (%j)', esc => {
+  it.each(['\u009b2J', '\u009d0;t\u0007', '\u001b[2J', '\u001b[1A', '\u001b]0;title\u0007', '\u001b]8;;https://x\u001b\\', '\u001b'])('fails closed on non-CSI escapes (%j)', esc => {
     const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
     expect(() => runGhSync(['api', 'repos/o/r/actions/jobs/123/logs'], { encoding: 'utf8', throttle: {
       env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false, exec: () => `a\n${esc}  fail-closed codeql\n`,
@@ -85,6 +85,7 @@ describe('job-log escape-sequence permission', () => {
     ['pr', 'view', 'repos/o/r/actions/jobs/123/logs'],
   ])('leaves unrelated or already-permitted calls untouched: %j', (...args) => {
     expect(allowJobLogEscapeSequences(args)).toBe(args);
+    expect(allowJobLogEscapeSequences(['api', 'repos/o/r/actions/jobs/1/logs'], { stdio: 'inherit' })).toEqual(['api', 'repos/o/r/actions/jobs/1/logs']);
   });
 
   it('parses #7037 review-hold logs through runGhSync and annotates the failing merge-gate row', () => {
