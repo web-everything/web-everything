@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
+import { redTeamSentBackFindings } from '../conveyor/dispatch-eligibility-facts.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -390,6 +391,13 @@ const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[
  */
 export function renderPrContext(json) {
   const pr = typeof json === 'string' ? JSON.parse(json) : json;
+  const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  if (labels.includes('review:accepted') && labels.includes('red-team:blocked') && !labels.includes('review:changes')) {
+    const findings = redTeamSentBackFindings(pr);
+    if (!findings.length) throw new LauncherError('no-finding: no trusted current-head red-team send-back');
+    return '## Red-team sent-back findings (authoritative ask)\nRepair and push the same branch; preserve review:accepted. Never rearm review.\n'
+      + `${FENCED_DATA_RULE}\n${fenceUntrusted('findings', JSON.stringify(findings))}\n`;
+  }
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const found = comments.filter((c) => CHANGES_COMMENT_RE.test(String(c?.body ?? '')));
   const latest = found.sort((a, b) => String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''))).at(-1);
@@ -717,7 +725,8 @@ export async function runFixCli(argv = [], {
   try {
     const brief = assertBriefTaskContent(readPrompt(launch.promptFile));
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
-    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid,labels', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const accepted = (prHead.labels ?? []).some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted');
     prHeadSha = prHead.headRefOid ?? null;
     const mergeConflictingBase = !launch.mergeOnto && prHead.mergeable === 'CONFLICTING';
     const mergeOnto = mergeConflictingBase ? PR_BASE_MERGE_TARGET : launch.mergeOnto;
@@ -745,7 +754,7 @@ export async function runFixCli(argv = [], {
       }
       prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
-        : renderPrContext({ ...prHead, comments });
+        : renderPrContext({ ...prHead, number: Number(pr), comments, commentsComplete: true });
     }
     // Wait before the repair so failures from the previous head can join the same agent run and push.
     // The push boundary below reuses this deadline rather than starting a second wait budget.
@@ -816,6 +825,10 @@ export async function runFixCli(argv = [], {
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
     before = checkLane(prHeadSha).laneHead;
     const rearmReview = () => {
+      if (accepted) {
+        write(`fix-run: PR #${pr} re-arm skipped — preserving review:accepted\n`);
+        return;
+      }
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
       } catch (e) {
@@ -1203,7 +1216,7 @@ export async function runFixCli(argv = [], {
       await postEvidence(after);
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
-      result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
+      result = `PR #${pr} (pushed ${after.slice(0, 9)}, ${accepted ? 'preserved review:accepted' : 're-armed review:pending'})`;
       outcome = FIX_RUN_OUTCOME.PUSHED; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);

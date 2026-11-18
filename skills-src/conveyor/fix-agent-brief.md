@@ -35,6 +35,12 @@
 
 ## Fill these before spawning
 
+**RED-TEAM SENT-BACK MODE (`mode: red-team-sent-back`).** An accepted PR can still owe the gate's unresolved
+confirmed findings on its current head. Use the gate findings supplied in the dispatch context as the ask,
+instead of step 2's latest review comment. Repair, verify, and push to the same PR branch. Skip step 7's
+`rearm-review.mjs`: preserve `review:accepted` and all review labels. Report completion and release the lane
+as usual. The launcher also skips rearm for accepted PRs.
+
 | Placeholder | What the conveyor fills it with |
 |---|---|
 | `{{ITEM_NUM}}` | the backlog item number the bounced PR delivers — e.g. `2608`; **blank** for a PR that names no backlog item at all (multi-repo slice 6 — `{{ATTRIBUTION}}` is `PR #{{PR_NUM}}` in that case, never a fabricated number) |

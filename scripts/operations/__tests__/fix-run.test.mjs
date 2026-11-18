@@ -9,7 +9,9 @@ import { fileURLToPath } from 'node:url';
 import { createFixBorrowGate, recordRoutedOutcome, consecutiveUnproductiveOnHead, chooseFixExecutor } from '../../lib/fix-slot-borrow.mjs';
 import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { openOperatorSendBacks } from '../../lib/operator-send-backs.mjs';
-import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
+import { dispatchFix, writePrivateBorrowedPrompt, withPlannedContext } from '../../conveyor/reconcile-fix-dispatch.mjs';
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
+import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
@@ -23,6 +25,35 @@ afterEach(() => vi.unstubAllEnvs());
 
 
 const MIN = 60_000;
+const acceptedRedTeamPr = () => {
+  const head = 'a'.repeat(40), number = 7, author = { login: 'web-everything' };
+  const comments = [{ author, body: renderRedTeamComment({ pr: number, rev: head, provider: 'codex', model: 'm',
+    recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ summary: 'Gate break to repair', category: 'edge-case',
+      impactIfUnfixed: 'broken', file: 'scripts/example.mjs', line: 1, confirmedByRecheck: true }] }) }];
+  comments.push({ author, body: redTeamGateMarker(number, head, 'sent-back', liveResultGateState(comments, number, head).resultId) });
+  return { number, headRefOid: head, labels: [{ name: 'review:accepted' }, { name: 'red-team:blocked' }], comments, commentsComplete: true };
+};
+
+describe('red-team sent-back fix context', () => {
+  it('uses the gate findings even without a changes-requested review comment', () => {
+    const context = renderPrContext(acceptedRedTeamPr());
+    expect(context).toContain('Gate break to repair');
+    expect(context).toContain('Never rearm review');
+  });
+  it('refuses unread gate evidence instead of falling back to an unrelated review', () => {
+    const pr = acceptedRedTeamPr();
+    pr.commentsComplete = false;
+    pr.comments.push({ body: '🔁 review — changes requested\nUNRELATED' });
+    expect(() => renderPrContext(pr)).toThrow('no trusted current-head red-team send-back');
+  });
+  it('fences the gate findings and gives fresh and resumed prompts the accepted-head hand-back', () => {
+    const text = withPlannedContext('BRIEF', { mode: 'red-team-sent-back', redTeamSentBack: { findings: ['Gate break'] } });
+    expect(text).toContain('push the same PR branch');
+    expect(text).toContain('preserve review:accepted');
+    expect(text).toContain('<findings>');
+    expect(text).toContain('Gate break');
+  });
+});
 /** Whether a recorded command staged anything (`git add` against the private copy, or a direct index write). */
 const staged = (c) => c.includes('add') || c.includes('update-index');
 let clock = 1_000_000;
@@ -115,6 +146,22 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { persistEvidence: () => {}, readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it('pushes an accepted red-team repair to the same branch without rearm, even under fail policy', async () => {
+    vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'fail');
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    const pr = acceptedRedTeamPr();
+    const run = (cmd, args, opts) => {
+      const result = m.run(cmd, args, opts);
+      return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+    };
+    const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
+    expect(result.code).toBe(0);
+    expect(result.result).toContain('preserved review:accepted');
+    expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
+    expect(m.calls.find(c => c.includes('push'))).toContain('HEAD:refs/heads/lane/7-x');
+    expect(m.calls.flat().some(a => String(a).endsWith('rearm-review.mjs'))).toBe(false);
+    expect(m.spawn.mock.calls[0][0].prompt).toContain('Gate break to repair');
+  });
   it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     let now = 1000;
@@ -766,7 +813,7 @@ describe('runFixCli', () => {
     } else {
       expect(m.calls.some(c => c.includes('fetch') || c.includes('merge'))).toBe(false);
     }
-    expect(m.calls).toContainEqual(['gh', 'pr', 'view', '7', '--json', 'title,body,baseRefName,mergeable,headRefOid', '--repo=o/r']);
+    expect(m.calls).toContainEqual(['gh', 'pr', 'view', '7', '--json', 'title,body,baseRefName,mergeable,headRefOid,labels', '--repo=o/r']);
   });
   it('uses the supplied commit message with the shared provider trailer outside the lane', async () => {
     const m = mk(['aaa', 'bbb']);
@@ -940,7 +987,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
-        expect(['title,body,baseRefName,mergeable,headRefOid', 'headRefOid,labels,statusCheckRollup,changedFiles']).toContain(args[args.indexOf('--json') + 1]);
+        expect(['title,body,baseRefName,mergeable,headRefOid,labels', 'headRefOid,labels,statusCheckRollup,changedFiles']).toContain(args[args.indexOf('--json') + 1]);
         m.calls.push([cmd, ...args]);
         return JSON.stringify({ title: 'T', body: 'B', headRefOid: 'aaa', baseRefName: base });
       }

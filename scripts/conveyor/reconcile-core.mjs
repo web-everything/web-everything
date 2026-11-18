@@ -1,4 +1,5 @@
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
+import { redTeamSentBackFindings } from './dispatch-eligibility-facts.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
@@ -2884,6 +2885,26 @@ export function planReconcile({
           why: attempts >= effectiveRoundCap ? sendBackRoundWhy : 'operator send-back not yet addressed after a fixer had its chance' });
       }
       continue;
+    }
+
+    // A later accept on an unchanged head cannot retire the red-team gate's confirmed send-back.
+    // review:changes remains owned by the ordinary bounced path; accepted heads must never be rearmed.
+    if (phase === 'queued' && pr?.state === 'OPEN' && !pr?.isDraft
+        && withPhase.labels.includes('review:accepted') && withPhase.labels.includes('red-team:blocked')
+        && !withPhase.labels.includes('review:changes')) {
+      const findings = redTeamSentBackFindings(pr);
+      if (findings.length) {
+        const attempts = roundAttempts();
+        if (attempts >= effectiveRoundCap) {
+          refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+            why: 'red-team send-back remains unresolved on the accepted head; automatic fix rounds exhausted' }, { allowTakeover: false });
+        } else {
+          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'red-team-sent-back', findings: findings.length,
+            redTeamSentBack: { head: pr.headRefOid, findings },
+            why: 'confirmed red-team send-back remains unresolved on this accepted head; repair and push the same branch without rearming' });
+        }
+        continue;
+      }
     }
 
     // ── `restore-review-label` (LIVE INCIDENT 2026-10-03/04, PR #3830 — an approval-time prevention-card PR) —

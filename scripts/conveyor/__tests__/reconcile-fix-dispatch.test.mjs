@@ -2155,6 +2155,16 @@ describe('routed Codex fallback', () => {
 
 
 describe('stale-base mechanical fix brief', () => {
+  it.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])('preserves red-team gate findings through planning %s', headRefName => {
+    const redTeamSentBack = { head: 'a'.repeat(40), findings: [{ summary: 'Gate break' }] };
+    const { planned, refusals } = planFixesFromReconcile([{
+      kind: 'fix', prNumber: 7031, headRefName, mode: 'red-team-sent-back', redTeamSentBack,
+    }], findItemStub, () => [], () => [], 'we', () => ['src/x.ts']);
+    expect(refusals).toEqual([]);
+    expect(planned).toMatchObject([{ mode: 'red-team-sent-back', redTeamSentBack }]);
+    expect(withPlannedContext('brief', planned[0])).toContain('Gate break');
+    expect(withPlannedContext('brief', planned[0])).toContain('preserve review:accepted');
+  });
   const staleBase = { missing: ['standards', 'new-job'], defaultBranch: 'main' };
   it('leaves ordinary prompts alone and spells out the mechanical-only hand-back', () => {
     expect(withStaleBase('brief', null)).toBe('brief');
