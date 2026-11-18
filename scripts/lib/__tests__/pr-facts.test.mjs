@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { createEventLog, createMemoryStorage, handleRequest, parseGithubEvent } from '../../conveyor/pr-events-worker/core.mjs';
 import {
   PR_FACTS_DEFAULTS, lookupPrFacts, readPrFacts, readPrFactsFromGithub, readPrFactsOrGithub, readRepoFacts,
-  resolvePrFactsConfig,
+  resolvePrFactsConfig, compactMirror, seedMirror, applyDelta, lookupInMirror, refreshMirror, loadMirror, readMirrorFile, mirrorPath,
 } from '../pr-facts.mjs';
 
 const REPO = 'Web-Everything/web-everything';
@@ -279,7 +279,9 @@ describe('contract: store answer = GitHub answer', () => {
     const w = worker();
     w.bootstrap([]);
     w.deliver('pull_request', prPayload('opened', { labels: [{ name: 'review:pending' }, { name: 'size:s' }] }));
+    await readPrFacts({ ...w.opts(), number: 7 }); // observe the closure through a delta, not an undated full seed
     w.deliver('pull_request', prPayload('closed', { state: 'closed', merged: true, labels: [{ name: 'review:pending' }, { name: 'size:s' }] }));
+    w.clock.t += PR_FACTS_DEFAULTS.refreshAfterMs;
     const strip = ({ source, asOfMs, cursor, ...facts }) => facts;
     const store = await readPrFacts({ ...w.opts(), number: 7 });
     expect(strip(store)).toEqual(strip(readPrFactsFromGithub({ repo: REPO, number: 7, exec: fakeGh(fx) })));
@@ -289,4 +291,143 @@ describe('contract: store answer = GitHub answer', () => {
 
 it('suppresses real state with WE_UNDER_TEST alone', () => {
   expect(resolvePrFactsConfig({ WE_UNDER_TEST: '1' })).toMatchObject({ enabled: false, disabledReason: 'test run' });
+});
+
+describe('mirror compaction', () => {
+  const key = (n) => JSON.stringify([REPO.toLowerCase(), n]);
+  const shaKey = (sha) => JSON.stringify([REPO.toLowerCase(), sha]);
+  const check = (sha, prs = [7], at = T0) => ({ type: 'check_run', repo: REPO.toLowerCase(), sha, prs,
+    name: 'test', app: 'github-actions', conclusion: 'success', seq: 2, at: new Date(at).toISOString() });
+  const row = (number, state = 'open') => ({ repo: REPO, number, sha: HEAD, state, draft: false, labels: ['review:pending'],
+    checks: [check(HEAD), check(OLD)], suites: [] });
+  const body = (prs = [row(7)]) => ({ prs, stateCursor: 10, lastDeliveryAt: T0,
+    coverage: { bootstrap: [{ repo: REPO, status: 'complete' }] } });
+  const seed = (prs) => seedMirror({ repo: REPO, body: body(prs), nowMs: T0 });
+  const compact = (m, retentionMs = 1000, nowMs = T0) => compactMirror(m, { nowMs, retentionMs });
+  const lookup = (m, number = 7) => lookupInMirror(m, { number, nowMs: T0 });
+
+  it('preserves open facts, removes stale-head checks, and keeps historical open SHA mappings', () => {
+    const m = seed();
+    m.buckets.shas[shaKey(OLD)] = [7];
+    const before = structuredClone(m);
+    const next = compact(m);
+    expect(lookup(next)).toEqual(lookup(m));
+    expect(lookup(next).facts.checks).toHaveLength(1);
+    expect(Object.values(next.buckets.checks).map((c) => c.sha)).toEqual([HEAD]);
+    expect(next.buckets.shas).toEqual(m.buckets.shas);
+    expect(m).toEqual(before);
+    expect(compact(next)).toEqual(next);
+  });
+
+  it.each([false, true])('retains all checks for a recently closed PR (merged=%s), then expires at the boundary', (merged) => {
+    const m = seed([{ ...row(7, 'closed'), merged }]);
+    m.closedSeen = { 7: T0 - 999 };
+    const next = compact(m);
+    expect(next.buckets.prs).toEqual(m.buckets.prs);
+    expect(next.buckets.checks).toEqual(m.buckets.checks);
+    expect(lookup(next).facts).toMatchObject({ state: 'closed', merged });
+    const expired = compact(next, 1000, T0 + 1);
+    expect(expired.buckets).toEqual({ prs: {}, checks: {}, shas: {} });
+    expect(expired.closedSeen).toEqual({});
+    expect(lookup(expired)).toEqual({ facts: null, reason: 'no-row' });
+    expect(compact(expired)).toEqual(expired);
+  });
+
+  it('prunes evicted PRs from shared SHA entries and retains checks shared with an open current head', () => {
+    const m = seed([row(7), row(8, 'closed')]);
+    m.closedSeen = { 8: T0 - 1000 };
+    m.buckets.shas[shaKey(OLD)] = [8];
+    const next = compact(m);
+    expect(next.buckets.shas).toEqual({ [shaKey(HEAD)]: [7] });
+    expect(Object.values(next.buckets.checks).map((c) => c.sha)).toEqual([HEAD]);
+    expect(lookup(next)).toEqual(lookup(m));
+  });
+
+  it('keeps a current-head check joined to an open PR only through the sha bucket', () => {
+    const m = seed();
+    const c = check(HEAD, [], T0);
+    m.buckets.checks = { x: c };
+    const next = compact(m);
+    expect(Object.keys(next.buckets.checks)).toEqual(['x']);
+    expect(lookup(next)).toEqual(lookup(m));
+  });
+
+  it('keeps only recent unattached checks; unknown, old and future dates are dropped', () => {
+    const m = seed([]);
+    m.buckets.checks = Object.fromEntries([T0, T0 - 1000, T0 + 1, NaN].map((at, i) => [i,
+      { ...check(HEAD, [], T0), at: Number.isNaN(at) ? null : new Date(at).toISOString() }]));
+    expect(Object.keys(compact(m).buckets.checks)).toEqual(['0']);
+  });
+
+  it('honours zero and large retention values without clamping, including legacy mirrors', () => {
+    const m = seed([row(7, 'closed'), row(8)]);
+    delete m.closedSeen;
+    expect(compact(m, 0).buckets.prs).toEqual({ [key(8)]: m.buckets.prs[key(8)] });
+    const next = compact(m, 10 ** 12);
+    expect(next.closedSeen).toEqual({});
+    expect(next.buckets.prs).toEqual({ [key(8)]: m.buckets.prs[key(8)] });
+    const dated = { ...m, closedSeen: { 7: T0 } };
+    expect(compact(dated, 10 ** 12, T0 + 10 ** 11).buckets.prs).toEqual(m.buckets.prs);
+    expect(compact(m, 1000).buckets.prs).toEqual({ [key(8)]: m.buckets.prs[key(8)] });
+  });
+
+  it('a reopened PR loses its closure timestamp', () => {
+    const m = seed();
+    m.closedSeen = { 7: T0 - 1000, 99: T0 };
+    expect(compact(m).closedSeen).toEqual({});
+  });
+
+  it('late delta events create bounded skeletons for evicted PRs', () => {
+    const evicted = compact(seed([row(7, 'closed')]));
+    const event = { ...parseGithubEvent('pull_request_review', review('approved'), { receivedAt: T0 }), seq: 11 };
+    const next = compact(applyDelta(evicted, [event]));
+    expect(next.closedSeen).toEqual({ 7: T0 });
+    expect(lookup(next)).toEqual({ facts: null, reason: 'incomplete-row' });
+    expect(compact(next, 1000, T0 + 1000).buckets.prs).toEqual({});
+    expect(compact(applyDelta(evicted, [event]), 0).buckets.prs).toEqual({});
+  });
+
+  it('full seeds expire unknown closures and carry known closure timestamps from the previous mirror', () => {
+    const b = body([row(7, 'closed'), row(8, 'closed')]);
+    const m = seedMirror({ repo: REPO, body: b, nowMs: T0, retentionMs: 1000, prev: { closedSeen: { 7: T0 - 500 } } });
+    expect(compact(m).closedSeen).toEqual({ 7: T0 - 500 });
+    expect(compact(seedMirror({ repo: REPO, body: b, nowMs: T0, retentionMs: 10 ** 12 }), 10 ** 12).buckets.prs).toEqual({});
+  });
+
+  it.each(['full', 'full:gap', 'full:reset', 'full:backlog', 'delta'])('compacts successful refresh mode %s', async (mode) => {
+    const prev = seed([row(7, 'closed'), row(8)]);
+    prev.closedSeen = { 7: T0 - 1000 };
+    const fetchImpl = async (url) => new Response(JSON.stringify(url.endsWith('/prs') ? body([row(7, 'closed'), row(8)]) :
+      { cursor: 11, events: [], gap: mode === 'full:gap', reset: mode === 'full:reset', more: mode === 'full:backlog' }));
+    const r = await refreshMirror(mode === 'full' ? null : prev, { repo: REPO, url: 'https://w.local', nowMs: T0,
+      retentionMs: 1000, maxDeltaPages: 1, fetchImpl });
+    expect(r.mode).toBe(mode);
+    expect(Object.values(r.mirror.buckets.prs).map((p) => p.number)).toEqual([8]);
+    expect(r.mirror.closedSeen).toEqual({});
+    expect(Object.values(r.mirror.buckets.checks).map((c) => c.sha)).toEqual([HEAD]);
+  });
+
+  it('does not compact failed refreshes', async () => {
+    const prev = seed([row(7, 'closed')]);
+    const r = await refreshMirror(prev, { repo: REPO, url: 'https://w.local', nowMs: T0, retentionMs: 0,
+      fetchImpl: async () => { throw new Error('offline'); } });
+    expect(r.mode).toBe('failed');
+    expect(r.mirror.buckets).toEqual(prev.buckets);
+    expect(r.mirror.closedSeen).toEqual(prev.closedSeen);
+  });
+
+  it('declares 24h retention, resolves invalid settings, and writes compacted deltas using the environment setting', async () => {
+    expect(PR_FACTS_DEFAULTS.closedRetentionMs).toBe(86_400_000);
+    for (const value of [undefined, '', '-1', 'bad', 'Infinity']) {
+      expect(resolvePrFactsConfig({ WE_PR_FACTS_CLOSED_RETENTION_MS: value }).closedRetentionMs).toBe(86_400_000);
+    }
+    expect(resolvePrFactsConfig({ WE_PR_FACTS_CLOSED_RETENTION_MS: '1000000000000' }).closedRetentionMs).toBe(10 ** 12);
+    const w = coveredWorker();
+    await loadMirror(w.opts());
+    w.deliver('pull_request', prPayload('closed', { state: 'closed' }));
+    w.clock.t += PR_FACTS_DEFAULTS.refreshAfterMs;
+    const { mirror } = await loadMirror(w.opts({ env: { WE_PR_FACTS_CLOSED_RETENTION_MS: '0' } }));
+    expect(mirror.buckets).toEqual({ prs: {}, checks: {}, shas: {} });
+    expect(readMirrorFile(mirrorPath(dir, REPO))).toEqual(mirror);
+  });
 });

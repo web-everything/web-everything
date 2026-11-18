@@ -54,11 +54,13 @@ export const PR_FACTS_DISABLE_ENV = 'WE_PR_FACTS';
 export const PR_FACTS_DIR_ENV = 'WE_PR_FACTS_DIR';
 export const PR_FACTS_TTL_ENV = 'WE_PR_FACTS_TTL_MS';
 export const PR_FACTS_REFRESH_ENV = 'WE_PR_FACTS_REFRESH_MS';
+export const PR_FACTS_CLOSED_RETENTION_ENV = 'WE_PR_FACTS_CLOSED_RETENTION_MS';
 
 /** The declared settings. `ttlMs` is the staleness bound: an answer older than this is never served. */
 export const PR_FACTS_DEFAULTS = Object.freeze({
   ttlMs: 120_000,          // mirror older than this → null → the caller reads GitHub
   refreshAfterMs: 15_000,  // mirror older than this → refresh from the Worker first (a Worker call, no GitHub budget)
+  closedRetentionMs: 86_400_000, // retain closed PRs for 24 hours after first observing closure
   staleAfterMs: PR_EVENTS_DEFAULTS.staleAfterMs, // no webhook delivery for this long → feed 'stale' → null
   maxDeltaPages: 5,        // a backlog deeper than this many /events pages → one full /prs pull instead
   pageLimit: 500,
@@ -90,6 +92,7 @@ export function resolvePrFactsConfig(env = process.env, { readFile = readFileSyn
     disabledReason: off ? `${PR_FACTS_DISABLE_ENV}=0` : testOff ? 'test run' : ev.enabled ? null : `not configured (missing ${ev.missing.join(', ') || ev.tokenError})`,
     ttlMs: num(env[PR_FACTS_TTL_ENV], PR_FACTS_DEFAULTS.ttlMs),
     refreshAfterMs: num(env[PR_FACTS_REFRESH_ENV], PR_FACTS_DEFAULTS.refreshAfterMs),
+    closedRetentionMs: num(env[PR_FACTS_CLOSED_RETENTION_ENV], PR_FACTS_DEFAULTS.closedRetentionMs),
     staleAfterMs: PR_FACTS_DEFAULTS.staleAfterMs,
   };
 }
@@ -113,12 +116,15 @@ function bucketStorage(buckets) {
  * Build a mirror from one full `/prs` answer, keeping only `repo`'s rows. The served rows are folded back into
  * projection buckets keyed exactly as the Worker keys them, so later deltas replace (never duplicate) entries.
  */
-export function seedMirror({ repo, body, nowMs }) {
+export function seedMirror({ repo, body, nowMs, prev, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs }) {
   const r = repoKey(repo);
   const buckets = { prs: {}, checks: {}, shas: {} };
+  const closedSeen = {};
   for (const row of body.prs || []) {
     if (repoKey(row.repo) !== r || !Number.isInteger(row.number)) continue;
     const { checks = [], suites = [], ...rest } = row;
+    // A full snapshot cannot date a closure; unknown closed rows are already expired.
+    if (row.state === 'closed') closedSeen[row.number] = prev?.closedSeen?.[row.number] ?? nowMs - retentionMs;
     buckets.prs[JSON.stringify([r, row.number])] = { ...rest, repo: r, checks: [], suites: [], fields: {}, labelChanges: rest.labelChanges || {} };
     if (row.sha) {
       const k = JSON.stringify([r, row.sha]);
@@ -133,7 +139,7 @@ export function seedMirror({ repo, body, nowMs }) {
   }
   const bootstrap = (body.coverage?.bootstrap || []).find((x) => repoKey(x?.repo) === r) || null;
   return {
-    v: PR_FACTS_VERSION, repo: r, buckets, cursor: body.stateCursor ?? body.head ?? null,
+    v: PR_FACTS_VERSION, repo: r, buckets, closedSeen, cursor: body.stateCursor ?? body.head ?? null,
     fetchedAtMs: nowMs, lastOkAt: nowMs, lastFailAt: null, lastError: null,
     lastDeliveryAt: body.lastDeliveryAt ?? null, lastEventAt: body.lastEventAt ?? null,
     bootstrap: bootstrap ? { status: bootstrap.status, baseCursor: bootstrap.baseCursor, importId: bootstrap.importId } : null,
@@ -150,6 +156,37 @@ export function applyDelta(mirror, events) {
     foldObservation(storage, e);
   }
   return next;
+}
+
+/** Bound the disposable mirror without changing retained facts. PURE (no input mutation). */
+export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs }) {
+  const prs = {}, checks = {}, shas = {}, closedSeen = {};
+  const retained = new Map();
+  for (const [key, row] of Object.entries(mirror.buckets.prs)) {
+    if (row.state === 'closed' || !row.state) {
+      // A legacy mirror (no closedSeen yet) cannot date its closures: treat them as expired.
+      const seen = mirror.closedSeen?.[row.number] ?? (mirror.closedSeen ? nowMs : nowMs - retentionMs);
+      if (nowMs - seen >= retentionMs) continue;
+      closedSeen[row.number] = seen;
+    }
+    prs[key] = row;
+    retained.set(row.number, row);
+  }
+  for (const [key, c] of Object.entries(mirror.buckets.checks)) {
+    // projectPrRows joins a check to its PRs both by `prs` and by the head-sha → PRs bucket.
+    const attached = [...new Set([...(c.prs || []), ...(mirror.buckets.shas[JSON.stringify([c.repo, c.sha])] || [])])];
+    const keep = attached.some((n) => {
+      const row = retained.get(n);
+      return row && (closedSeen[n] != null || c.sha === row.sha);
+    });
+    const age = nowMs - Date.parse(c.at);
+    if (keep || (!attached.length && age >= 0 && age < retentionMs)) checks[key] = c;
+  }
+  for (const [key, numbers] of Object.entries(mirror.buckets.shas)) {
+    const kept = numbers.filter((n) => retained.has(n));
+    if (kept.length) shas[key] = kept;
+  }
+  return { ...mirror, buckets: { ...mirror.buckets, prs, checks, shas }, closedSeen };
 }
 
 const sortBy = (...keys) => (a, b) => { for (const k of keys) { const x = String(a[k] ?? ''); const y = String(b[k] ?? ''); if (x !== y) return x < y ? -1 : 1; } return 0; };
@@ -268,9 +305,10 @@ async function withAsyncLock(lockPath, fn, { waitMs, staleMs }) {
  * judges `feed-unreachable` and every read falls back to GitHub.
  */
 export async function refreshMirror(prev, { repo, url, token, fetchImpl = globalThis.fetch, nowMs = Date.now(),
-  timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
+  retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs, timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
   const io = { fetchImpl, timeoutMs };
-  const full = async () => seedMirror({ repo, body: await getJson(`${url}/prs`, token, io), nowMs });
+  const compact = (mirror) => compactMirror(mirror, { nowMs, retentionMs });
+  const full = async () => compact(seedMirror({ repo, body: await getJson(`${url}/prs`, token, io), nowMs, prev, retentionMs }));
   try {
     if (!prev || prev.v !== PR_FACTS_VERSION || !Number.isInteger(prev.cursor)) return { mirror: await full(), mode: 'full' };
     let m = prev;
@@ -283,7 +321,7 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
         return { mirror: { ...mirror, fullPulls: (prev.fullPulls || 0) + 1 }, mode: b.gap ? 'full:gap' : 'full:reset' };
       }
       m = { ...applyDelta(m, b.events), cursor: b.cursor, lastDeliveryAt: b.lastDeliveryAt ?? m.lastDeliveryAt, lastEventAt: b.lastEventAt ?? m.lastEventAt };
-      if (!b.more) return { mirror: { ...m, fetchedAtMs: nowMs, lastOkAt: nowMs, lastError: null }, mode: 'delta' };
+      if (!b.more) return { mirror: compact({ ...m, fetchedAtMs: nowMs, lastOkAt: nowMs, lastError: null }), mode: 'delta' };
     }
     const mirror = await full();
     return { mirror: { ...mirror, fullPulls: (prev.fullPulls || 0) + 1 }, mode: 'full:backlog' };
@@ -323,7 +361,7 @@ export async function loadMirror({ repo, env = process.env, fetchImpl = globalTh
     const locked = await withAsyncLock(`${path}.lock`, async () => {
       const again = readMirrorFile(path); // a concurrent refresher may have finished while we waited
       if (!due(again)) return again;
-      const r = await refreshMirror(again, { repo, url, token, fetchImpl, nowMs: now(), timeoutMs: o.timeoutMs, maxDeltaPages: o.maxDeltaPages });
+      const r = await refreshMirror(again, { repo, url, token, fetchImpl, nowMs: now(), retentionMs: o.closedRetentionMs ?? cfg.closedRetentionMs, timeoutMs: o.timeoutMs, maxDeltaPages: o.maxDeltaPages });
       writeJsonAtomic(path, r.mirror);
       return r.mirror;
     }, { waitMs: o.lockWaitMs ?? PR_FACTS_DEFAULTS.lockWaitMs, staleMs: PR_FACTS_DEFAULTS.lockStaleMs });
