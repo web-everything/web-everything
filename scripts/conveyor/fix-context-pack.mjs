@@ -338,7 +338,9 @@ export function renderCiPack({ checks = [], failedTests = [], logTail = '', filt
   if (logTail && budget - filesReserve > 200) {
     const title = filtered === true ? 'Failed log (last lines)' : 'Job log (unfiltered context, last lines)';
     const overhead = bytes(`### ${title}\n\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', '')}`);
-    const room = budget - filesReserve - overhead - 20;
+    // Reserve the paragraph separator exactly; an extra margin can discard a
+    // final diagnostic even when the complete fenced block fits the byte cap.
+    const room = budget - filesReserve - overhead - 2;
     const tail = room >= 100 ? boundedCiLogTail(logTail, { maxBytes: room }) : '';
     if (tail.trim()) {
       const block = `### ${title}\n\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', tail.trimEnd())}`;

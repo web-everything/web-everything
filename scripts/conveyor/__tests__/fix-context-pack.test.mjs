@@ -13,6 +13,7 @@ import {
   excerptLines, trimBriefSections, applyContextPack, briefWithContextPack, extractFailedTests, readFixPackInputs, readCiPackInputs, renderCiPack, localTestsSection,
 } from '../fix-context-pack.mjs';
 import { boundedCiLogTail } from '../../lib/ci-log-evidence.mjs';
+import { FENCED_DATA_RULE } from '../../lib/mandate-fence.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const FIX_BRIEF = readFileSync(join(ROOT, 'skills-src/conveyor/fix-agent-brief.md'), 'utf8');
@@ -110,9 +111,15 @@ describe('CI context pack whole-job reads', () => {
       expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(maxBytes);
       expect(tail).toContain('deployment denied');
     }
-    const pack = renderCiPack({ checks: [check], logTail: boundedCiLogTail(text), maxBytes: 1000 });
-    expect(Buffer.byteLength(pack)).toBeLessThanOrEqual(1000);
-    expect(pack).toContain('deployment denied');
+    for (const filtered of [false, true]) {
+      const pack = renderCiPack({ checks: [check], logTail: boundedCiLogTail(text), filtered, maxBytes: 1000 });
+      expect(Buffer.byteLength(pack)).toBeLessThanOrEqual(1000);
+      expect(pack).toContain('deployment denied');
+      expect(pack).toContain(FENCED_DATA_RULE);
+      expect(pack).toContain('<material>\n');
+      expect(pack).toContain('\n</material>');
+      if (!filtered) expect(pack).toContain('### Failing tests\n\nunknown (unfiltered log)');
+    }
   });
   it('honours every byte budget from 20 through 2000 and retains a final diagnostic when it fits', () => {
     const notice = '… [log tail truncated; inspect the full job log for earlier context]\n';
