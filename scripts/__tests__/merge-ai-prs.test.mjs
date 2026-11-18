@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, readFreshQueueRollup, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -62,8 +62,8 @@ describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
 
 describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
   const clean = { repo: 'fixture/repo', decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND',
-    mergeable: 'MERGEABLE', hasManifest: false, certifyLabel: true, testGreen: true, headSha: 'reviewed-head' };
-  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, reclassified = true, patch = {}, prPatch = {}, queueRequiredChecks = ['test', 'smoke'] } = {}) => {
+    mergeable: 'MERGEABLE', hasManifest: false, certifyLabel: true, testGreen: true, headSha: 'a'.repeat(40) };
+  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, reclassified = true, patch = {}, prPatch = {}, rosterSource = 'live', requiredNames = ['test', 'smoke'], queueRequiredChecks = ['test', 'smoke'] } = {}) => {
     const verdict = { ...clean, ...patch };
     const before = { ...verdict };
     const rebaseDropManifest = vi.fn(() => ({ action: 'skip', reason: 'fixture rebase probe' }));
@@ -71,7 +71,7 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     const operation = routeRebaseBeforeEnqueue(verdict, {
       setting, mergeStrategy, manifestFree: () => manifestFree,
       reclassifiesMerge: () => reclassified && classifyPr(retainCheckedQueueHead({ ...freshPr, ...prPatch }, {
-        hold: true, queueOwnsFreshness: ownsFreshness, requiredCheck: 'test', queueRequiredChecks,
+        hold: true, queueOwnsFreshness: ownsFreshness, requiredCheck: 'test', queueRequiredChecks, rosterSource, requiredNames,
       }), { requiredCheck: 'test', defaultBranch: 'main', queueRequiredChecks }).decision === 'merge',
       rebase: rebaseDropManifest,
     });
@@ -80,13 +80,13 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     return { verdict, before, operation, rebaseDropManifest, mergeStrategy, args, result };
   };
 
-  const freshPr = { number: 42, title: 'Retained head', body: 'What changed and why', headRefOid: clean.headSha,
+  const freshPr = { rowsComplete: true, number: 42, title: 'Retained head', body: 'What changed and why', headRefOid: clean.headSha,
     baseRefName: 'main', mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
       { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
   const revalidate = (verdict, { patch = {}, setting = 'conflict-only', queueOwnsFreshness = true,
-    expectedHeadSha = clean.headSha, queueRequiredChecks = ['test', 'smoke'] } = {}) => revalidateWithUnknownRetry({
-    read: async () => retainBypassedQueueHead({ ...freshPr, ...patch }, { verdict, setting, queueOwnsFreshness, expectedHeadSha, requiredCheck: 'test', queueRequiredChecks }),
+    expectedHeadSha = clean.headSha, rosterSource = 'live', requiredNames = ['test', 'smoke'], queueRequiredChecks = ['test', 'smoke'] } = {}) => revalidateWithUnknownRetry({
+    read: async () => retainBypassedQueueHead({ ...freshPr, ...patch }, { verdict, setting, queueOwnsFreshness, expectedHeadSha, requiredCheck: 'test', queueRequiredChecks, rosterSource, requiredNames }),
     opts: { defaultBranch: 'main', expectedHeadSha, requiredCheck: 'test', queueRequiredChecks }, setting: { retries: 0 },
   });
 
@@ -111,6 +111,12 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
   const testGreen = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
   const incompleteChecks = [
     ['failing smoke', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE' }]],
+    ['skipped smoke', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'SKIPPED' }]],
+    ['neutral smoke', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'NEUTRAL' }]],
+    ['missing conclusion', [testGreen, { name: 'smoke', status: 'COMPLETED' }]],
+    ['nameless row', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }, null]],
+    ['conflicting smoke rows', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }]],
     ['missing smoke', [testGreen]],
     ['pending smoke', [testGreen, { name: 'smoke', status: 'IN_PROGRESS', conclusion: null }]],
     ['smoke from another head', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: 'other-head' }]],
@@ -136,7 +142,7 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     expect(verdict.decision).toBe('merge');
     const pr = { ...freshPr, statusCheckRollup };
     expect(retainCheckedQueueHead(pr, { hold: true, queueOwnsFreshness: true,
-      requiredCheck: 'test', queueRequiredChecks: ['smoke'] })).toBe(pr);
+      requiredCheck: 'test', queueRequiredChecks: ['smoke'], rosterSource: 'live', requiredNames: ['test', 'smoke'] })).toBe(pr);
     const fresh = await revalidate(verdict, { patch: { statusCheckRollup } });
     expect(fresh.decision).toBe('skip');
     const enqueue = vi.fn();
@@ -153,8 +159,40 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     expect((await revalidate(admitted, { queueRequiredChecks: null })).decision).toBe('skip');
   });
 
+  it.each(['unavailable', 'declared', 'fallback', undefined])('roster source %s refuses bypass and fresh retention', async (source) => {
+    // Explicitly override the fixture default for the absent-source case.
+    const rosterSource = source ?? null;
+    const result = route({ rosterSource });
+    expect(result.verdict).toEqual(result.before);
+    expect(result.operation).toBe(result.rebaseDropManifest);
+    expect((await revalidate(route().verdict, { rosterSource })).decision).toBe('skip');
+  });
+
+  it('accepts a cache roster and unions its secondary requirements with the queue', async () => {
+    expect(route({ rosterSource: 'cache' }).operation).toBe(null);
+    expect(route({ requiredNames: ['test', 'smoke', 'secondary'] }).operation).not.toBe(null);
+    expect((await revalidate(route().verdict, { requiredNames: ['test', 'smoke', 'secondary'] })).decision).toBe('skip');
+  });
+
+  it.each([false, undefined])('incomplete/capped evidence (%s) cannot hide a newer smoke failure', async (rowsComplete) => {
+    const statusCheckRollup = [...freshPr.statusCheckRollup,
+      ...Array.from({ length: 98 }, () => ({ name: 'advisory', status: 'COMPLETED', conclusion: 'SUCCESS' }))];
+    const patch = { rowsComplete, statusCheckRollup };
+    const result = route({ prPatch: patch });
+    expect(result.verdict).toEqual(result.before);
+    expect(result.operation).toBe(result.rebaseDropManifest);
+    expect((await revalidate(route().verdict, { patch })).decision).toBe('skip');
+  });
+
+  it('preserves raw run_attempt supersession instead of collapsing by timestamps', () => {
+    const statusCheckRollup = [testGreen,
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', run_id: 1, run_attempt: 1 },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', run_id: 1, run_attempt: 2 }];
+    expect(route({ prPatch: { statusCheckRollup } }).operation).toBe(null);
+  });
+
   it('approved-human retention accepts all required checks green but preserves a BEHIND conflict', () => {
-    const options = { hold: true, queueOwnsFreshness: true, requiredCheck: 'test', queueRequiredChecks: ['smoke'] };
+    const options = { hold: true, queueOwnsFreshness: true, requiredCheck: 'test', queueRequiredChecks: ['smoke'], rosterSource: 'live', requiredNames: ['test', 'smoke'] };
     expect(retainCheckedQueueHead(freshPr, options).mergeStateStatus).toBe('CLEAN');
     const conflicting = { ...freshPr, mergeable: 'CONFLICTING' };
     expect(retainCheckedQueueHead(conflicting, options)).toBe(conflicting);
@@ -579,5 +617,50 @@ describe('headTreeLacksManifestFile — authoritative manifest-path probe', () =
   });
   it('false without a full head sha', () => {
     expect(headTreeLacksManifestFile({ headRef: 'lane/x', headSha: 'abc', prNumber: 1, git: mk('', '') })).toBe(false);
+  });
+});
+
+
+describe('fresh queue rollup completeness', () => {
+  const headRefOid = 'a'.repeat(40);
+  const success = name => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+  const pr = { headRefOid, mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE',
+    statusCheckRollup: [success('test'), success('smoke')] };
+  const page = (nodes, totalCount, hasNextPage, endCursor = null) => ({ stdout: JSON.stringify({ data: { repository: {
+    object: { oid: headRefOid, statusCheckRollup: { contexts: { nodes, totalCount, pageInfo: { hasNextPage, endCursor } } } },
+  } } }) });
+  const retained = fresh => retainCheckedQueueHead(fresh, { hold: true, queueOwnsFreshness: true,
+    requiredCheck: 'test', queueRequiredChecks: ['smoke'], requiredNames: ['test', 'smoke'], rosterSource: 'live' });
+
+  it('reads past the cap to preserve a newer secondary required failure', async () => {
+    const first = [...pr.statusCheckRollup, ...Array.from({ length: 98 }, () => success('advisory'))];
+    const failure = { ...success('smoke'), conclusion: 'FAILURE' };
+    const exec = vi.fn().mockResolvedValueOnce(page(first, 101, true, 'next')).mockResolvedValueOnce(page([failure], 101, false));
+    const fresh = await readFreshQueueRollup(pr, { repo: 'owner/repo', exec });
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls[1][1].at(-1)).toContain('after:"next"');
+    expect(fresh.rowsComplete).toBe(true);
+    expect(fresh.statusCheckRollup).toHaveLength(101);
+    expect(retained(fresh)).toBe(fresh);
+  });
+
+  it('a complete all-success read permits BEHIND retention', async () => {
+    const fresh = await readFreshQueueRollup(pr, { repo: 'owner/repo', exec: async () => page(pr.statusCheckRollup, 2, false) });
+    expect(fresh.rowsComplete).toBe(true);
+    expect(retained(fresh).mergeStateStatus).toBe('CLEAN');
+  });
+
+  it.each(['failed page', 'missing metadata', 'short connection', 'oversized connection', 'foreign head'])('%s leaves BEHIND for skip/rebase', async kind => {
+    const exec = vi.fn(async () => {
+      if (kind === 'failed page') throw new Error('unreadable');
+      if (kind === 'missing metadata') return { stdout: '{}' };
+      if (kind === 'short connection') return page(pr.statusCheckRollup, 3, false);
+      if (kind === 'foreign head') return { stdout: page(pr.statusCheckRollup, 2, false).stdout.replace(headRefOid, 'b'.repeat(40)) };
+      return page(Array.from({ length: 100 }, () => success('advisory')), 1001, true, `cursor-${exec.mock.calls.length}`);
+    });
+    const fresh = await readFreshQueueRollup(pr, { repo: 'owner/repo', exec });
+    expect(fresh.rowsComplete).toBe(false);
+    expect(retained(fresh)).toBe(fresh);
+    if (kind === 'oversized connection') expect(exec).toHaveBeenCalledTimes(10);
   });
 });
