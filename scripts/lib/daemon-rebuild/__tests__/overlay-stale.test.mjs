@@ -90,6 +90,12 @@ describe('post-plan stale detector', () => {
     tick(); tick(); tick();
     expect(emit).toHaveBeenCalledTimes(2);
   });
+  it('a branch named __proto__ still counts conflicts across ticks', () => {
+    overlay = { ref: '__proto__', pr: 0, addedAt: 'x' };
+    const t = () => tick({ remoteTips: { ['__proto__']: tip } });
+    expect(t()[0].count).toBe(1);
+    expect(t()[0].count).toBe(2);
+  });
   it('a failed publish is retried next tick and then marked delivered', () => {
     emit.mockImplementationOnce(() => { throw new Error('feed down'); });
     tick(); tick(); tick();

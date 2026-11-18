@@ -24,10 +24,11 @@ function readState(root, env) {
   try {
     const state = JSON.parse(readFileSync(sidecar(root, env), 'utf8'));
     if (!state.current || !state.records || !Array.isArray(state.rows)) throw new Error('invalid stale sidecar');
-    return state;
+    // Null-prototype maps: a branch named `__proto__` must be an ordinary key.
+    return { ...state, current: Object.assign(Object.create(null), state.current), records: Object.assign(Object.create(null), state.records) };
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    return { current: {}, records: {}, rows: [] };
+    return { current: Object.create(null), records: Object.create(null), rows: [] };
   }
 }
 /** Inspect the last detector output without probing, publishing or advancing counters. */
