@@ -98,6 +98,29 @@ export const STATUS_LABEL_RE = /^review-status:(reviewing|review-stalled|fixing|
  */
 const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
 
+/** Head-bound acceptance is complete only with an unambiguous red-team clearance. */
+export function reviewConcluded(labels) {
+  if (!Array.isArray(labels)) return false;
+  const names = Array.from(labels, l => typeof l === 'string' ? l : l?.name);
+  if (names.some(name => typeof name !== 'string' || !name)) return false;
+  return names.includes('review:accepted') && names.includes('red-team:clear')
+    && !names.some(name => ['review:pending', 'review:changes', 'review:human',
+      'red-team:pending', 'red-team:blocked', 'review-status:draft-withdrawn'].includes(name));
+}
+
+// A newly dispatched review can briefly coexist with the preceding verdict labels.
+// Preserve its visible reviewing hold for two minutes; malformed/future dates keep that hold
+// until the evidence is repaired. Older timestamp-less rows rely on the head-bound labels alone.
+const REVIEW_START_GRACE_MS = 120_000;
+function concludedReviewRow(row, now) {
+  const stamps = [row.startedAt, row.updatedAt].filter(value => value !== undefined);
+  return stamps.every(value => {
+    const ms = typeof value === 'number' ? value : typeof value === 'string'
+      ? (/^\d+$/.test(value.trim()) ? Number(value) : Date.parse(value)) : NaN;
+    return Number.isFinite(ms) && ms > 0 && Number.isFinite(now) && now - ms >= REVIEW_START_GRACE_MS;
+  });
+}
+
 /**
  * PURE: find the LIVE agent session (if any) bound to `pr` by NAME alone (`review-<pr>` / `fix-<pr>` /
  * `ci-heal-<pr>`) and classify it. See {@link LIVE_STATES} for exactly which raw states count as live.
@@ -112,10 +135,10 @@ const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
  * (`we:scripts/conveyor/reconcile-core.mjs#classifyPr`'s `ci-red` phase is its own branch ahead of the
  * `OWED`/`OWED_ELSEWHERE` table), so the ordering is precedence-in-name-only — it never actually shadows a
  * real ci-heal for a PR that also has a stale review/fix session row sitting in `claude agents --json`.
- * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null}} o
+ * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null, reviewConcluded?:boolean, now?:number}} o
  * @returns {{role:'review'|'fix'|'ci-heal'|'draft', state:'reviewing'|'review-stalled'|'fixing'|'fix-stalled'|'fixing-conflict'|'fixing-conflict-stalled'|'healing-ci'|'ci-heal-stalled'|'awaiting-ci'|'awaiting-base'|'draft-scope-change'|'draft-withdrawn'|'needs-human'}|null}
  */
-export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = false, baseRefName, defaultBranch = 'main', mergeConflicted = false, fixClaim = null, escalation = null } = {}) {
+export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = false, baseRefName, defaultBranch = 'main', mergeConflicted = false, fixClaim = null, escalation = null, reviewConcluded = false, now = Date.now() } = {}) {
   const reviewName = mintSessionSlug({ kind: 'review', id: pr, repo });
   const fixName = mintSessionSlug({ kind: 'fix', id: pr, repo });
   const ciHealName = mintSessionSlug({ kind: 'ci-heal', id: pr, repo });
@@ -141,7 +164,8 @@ export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = fal
   // name) — a session actually making progress right now is more informative than a stuck sibling. A `done`/
   // other row is simply not a candidate at all — see LIVE_STATES.
   const liveFor = (name) => {
-    const matches = list.filter((a) => a?.name === name && Object.hasOwn(LIVE_STATES, a.state) && !isFinishedOverride(a));
+    const matches = list.filter((a) => a?.name === name && Object.hasOwn(LIVE_STATES, a.state) && !isFinishedOverride(a)
+      && !(name === reviewName && reviewConcluded === true && concludedReviewRow(a, now)));
     return matches.find((a) => a.state === 'working') ?? matches[0] ?? null;
   };
   if (escalation?.outcome === 'needs-human') return { role: 'ci-heal', state: 'needs-human' };
@@ -273,9 +297,9 @@ export function tagReviewStatus({
   // A failed read throws before any label write, preserving an existing human signal.
   const subject = prState ?? provider.readPrState?.(repo, pr);
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
-  const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
-    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation });
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
+  const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: reviewConcluded(currentLabels) });
   const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
     add: null,
     remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)

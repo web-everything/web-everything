@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus as tagReviewStatusIo, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
+import { reviewConcluded, deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus as tagReviewStatusIo, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
 const tagReviewStatus = (options) => tagReviewStatusIo({
   signalFix: () => {}, readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
   ...options,
@@ -544,4 +544,65 @@ it('uses the PR snapshot to tag awaiting-base and clears it on promotion', () =>
   expect(writes[0]).toEqual({ add: 'review-status:awaiting-base', remove: ['review-status:awaiting-ci'] });
   applyReviewStatus({ pr: 3915, repo: 'we', state: null, currentLabels: [result.label], provider });
   expect(writes[1]).toEqual({ add: undefined, remove: ['review-status:awaiting-base'] });
+});
+
+
+describe('concluded head review with a lingering process', () => {
+  const accepted = ['review:accepted', 'red-team:clear'];
+  const now = Date.parse('2026-11-18T12:00:00Z');
+  const row = { name: 'review-7099', state: 'working', pid: 12345 };
+  const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
+    reviewConcluded: true, now, agents: [{ ...row, ...fields }], ...options });
+
+  it('requires both labels in either supported label shape', () => {
+    expect(reviewConcluded(accepted)).toBe(true);
+    expect(reviewConcluded(accepted.map(name => ({ name })))).toBe(true);
+  });
+  it.each(['review:pending', 'review:changes', 'review:human', 'red-team:pending',
+    'red-team:blocked', 'review-status:draft-withdrawn'])('fails closed on %s alongside acceptance', blocker => {
+    expect(reviewConcluded([...accepted, blocker])).toBe(false);
+  });
+  it.each([undefined, null, {}, [], ['review:accepted'], ['red-team:clear'],
+    [...accepted, null], [...accepted, {}]])('fails closed on incomplete or malformed labels %j', labels => {
+    expect(reviewConcluded(labels)).toBe(false);
+  });
+  it('ignores a concluded timestamp-less working or blocked review, but defaults to live', () => {
+    expect(derive()).toBeNull();
+    expect(derive({ state: 'blocked' })).toBeNull();
+    expect(derive({}, { reviewConcluded: false })).toEqual({ role: 'review', state: 'reviewing' });
+    expect(derive({}, { reviewConcluded: 'true' })?.state).toBe('reviewing');
+  });
+  it.each(['startedAt', 'updatedAt'])('uses %s with a two-minute inclusive bound in epoch, numeric string and ISO shapes', key => {
+    for (const stamp of [now - 120_000, String(now - 120_000), new Date(now - 120_000).toISOString()]) {
+      expect(derive({ [key]: stamp })).toBeNull();
+    }
+    expect(derive({ [key]: now - 119_999 })?.state).toBe('reviewing');
+  });
+  it.each([null, '', 'unreadable', Infinity, Number.MAX_VALUE, 0, now + 1])('retains the reviewing hold on invalid/future timestamp %j', startedAt => {
+    expect(derive({ startedAt })?.state).toBe('reviewing');
+  });
+  it('does not let an old sibling or start hide a fresh review row/update', () => {
+    expect(derive({ startedAt: now - 600_000, updatedAt: now })?.state).toBe('reviewing');
+    expect(derive({}, { agents: [{ ...row, startedAt: now - 600_000 }, { ...row, startedAt: now }] })?.state).toBe('reviewing');
+  });
+  it('keeps live fix claims, fix sessions, CI healing and draft states', () => {
+    expect(derive({}, { fixClaim: {} })).toEqual({ role: 'fix', state: 'fixing' });
+    for (const [kind, state] of [['fix', 'fixing'], ['ci-heal', 'healing-ci']]) {
+      expect(derive({}, { agents: [row, { name: `${kind}-7099`, state: 'working' }] })?.state).toBe(state);
+    }
+    expect(derive({}, { isDraft: true })?.state).toBe('awaiting-ci');
+    expect(derive({}, { fixClaim: { meta: { draft: true, reason: 'withdrawn' } } })?.state).toBe('draft-withdrawn');
+  });
+  it('a failed label read throws before any label write', () => {
+    const writes = [];
+    expect(() => tagReviewStatus({ pr: 7099, repo: 'we', agents: [row], prState: {}, readFixClaim: () => null,
+      provider: { readLabels: () => { throw new Error('labels unavailable'); },
+        ensureLabel: (...args) => writes.push(args), setLabels: (...args) => writes.push(args) },
+    })).toThrow('labels unavailable');
+    expect(writes).toEqual([]);
+  });
+  it('a tick removes stale reviewing and awaiting-review labels after acceptance', async () => {
+    const { default: scenario } = await import('../soak/breaks/concluded-review-lingering-process.mjs');
+    expect(scenario.judge(await scenario.run({}))).toEqual([]);
+  });
 });
