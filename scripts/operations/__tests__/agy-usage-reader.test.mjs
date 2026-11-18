@@ -88,6 +88,13 @@ describe('PTY collection', () => {
     await assertion;
     expect(h.kill.mock.calls).toEqual([[1236, 'SIGKILL'], [1235, 'SIGKILL'], [-1234, 'SIGKILL']]);
   });
+  it('says so loudly when child processes cannot be listed', async () => {
+    const h = processFixture({ descendants: () => { throw new Error('ps failed'); } });
+    const assertion = expect(h.promise).rejects.toThrow('cleanup incomplete');
+    await vi.advanceTimersByTimeAsync(45000);
+    await assertion;
+    expect(h.kill).toHaveBeenCalledWith(-1234, 'SIGKILL');
+  });
   it('lists descendants leaf first from ps output', () => {
     expect(descendantPids(10, () => '10 1\n11 10\n12 11\n13 99\n')).toEqual([12, 11]);
   });

@@ -11,12 +11,10 @@ import { readSettings } from '../lib/settings-files.mjs';
 /** Exact PIDs of every descendant of `root` (script moves agy into its own session, so the group kill misses it). */
 export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })) {
   const children = new Map();
-  try {
-    for (const line of list().split('\n')) {
-      const [pid, ppid] = line.trim().split(/\s+/).map(Number);
-      if (Number.isInteger(pid) && Number.isInteger(ppid)) children.set(ppid, [...(children.get(ppid) ?? []), pid]);
-    }
-  } catch { return []; }
+  for (const line of list().split('\n')) {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    if (Number.isInteger(pid) && Number.isInteger(ppid)) children.set(ppid, [...(children.get(ppid) ?? []), pid]);
+  }
   const out = [], queue = [root];
   while (queue.length) for (const pid of children.get(queue.shift()) ?? []) { out.push(pid); queue.push(pid); }
   return out.reverse();
@@ -55,7 +53,7 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
   maxBytes = 1024 * 1024, descendants = descendantPids } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnFn('sh', ['-c', 'cat | script -q /dev/null agy'], { cwd: home, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    let screen = '', bytes = 0, requested = false, stopping = false, settled = false;
+    let leaked = false, screen = '', bytes = 0, requested = false, stopping = false, settled = false;
     const timers = [];
     const later = (fn, ms) => timers.push(setTimeout(fn, ms));
     const finish = (error, value) => {
@@ -64,9 +62,13 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       timers.forEach(clearTimeout);
       if (Number.isInteger(child.pid) && child.pid > 0) {
         // Exact PIDs only: descendants first (agy lives in script's own session), then the wrapper and its group.
-        for (const pid of descendants(child.pid)) { try { kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
+        try {
+          for (const pid of descendants(child.pid)) { try { kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
+        } catch { leaked = true; }
         try { kill(-child.pid, 'SIGKILL'); } catch { /* child may already have exited */ }
       }
+      if (leaked) console.error(`agy-usage-reader: could not list child processes of ${child.pid}; check for a stray agy process`);
+      if (error && leaked) error.message += ' (cleanup incomplete: a stray agy process may remain)';
       error ? reject(error) : resolve(value);
     };
     const send = value => { if (!settled) child.stdin.write(value); };
