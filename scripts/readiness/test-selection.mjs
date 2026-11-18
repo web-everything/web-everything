@@ -58,7 +58,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { isBlastRadiusPath, isStatutePath, isGateSelfPath } from '../lib/review-escalation.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
-import { buildReverseImportGraph, selectRelatedTests, loadCiSelection } from '../lib/related-test-selection.mjs';
+import { buildReverseImportGraph, selectRelatedTests, loadCiSelection, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { admittedArgv } from './heavy-admission.mjs';
 
 // ── the flag (NOT defaulted — DoD) ───────────────────────────────────────────────────────────────────────────
@@ -358,7 +358,11 @@ export function selectTests({ base = 'origin/main', runGit, env = process.env, f
       reasons: [`changed dependency target(s) absent from tracked inventory (${absentTargets.join(', ')}) — full suite (deleted dependencies cannot be resolved)`] };
     const settings = loadCiSelection({ env });
     const reverse = buildReverseImportGraph({ files, readFile, staticEdges: settings.staticEdges });
+    if (reverse.unreadable) return { ...decision, mode: 'full',
+      reasons: [`${reverse.unreadable} unreadable graph source(s) — full suite (incomplete dependency evidence)`] };
     const selection = selectRelatedTests({ changedFiles, reverse, env, maxTests, maxDepth, settings });
+    if (selection.fullTestCount === 0 && changedFiles.some(path => !isVitestTestFile(path))) return { ...decision, mode: 'full',
+      reasons: ['graph selection yielded zero tests for non-test changed files — full suite'] };
     return { ...decision, selection, partial: selection.partial,
       selectedFiles: selection.tests ?? selection.reachableTests,
       reasons: [...decision.reasons, `${selection.partial ? 'partial: ' : ''}${selection.reason}`] };

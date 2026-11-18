@@ -37,12 +37,13 @@ export function loadCiSelection({ env = process.env, readFile = readFileSync, to
   let override = {};
   try { override = JSON.parse(env.WE_CI_SELECTION || '{}'); } catch { /* defaults */ }
   const integer = v => Number.isSafeInteger(v) && v >= 0;
-  const bools = v => v && typeof v === 'object' && ['spawnPath', 'alias', 'literalRead'].every(k => typeof v[k] === 'boolean');
+  const edgeEnabled = v => typeof v === 'boolean' && (!(env.CI || env.GITHUB_ACTIONS) || v);
+  const bools = v => v && typeof v === 'object' && ['spawnPath', 'alias', 'literalRead'].every(k => edgeEnabled(v[k]));
   const resolved = cascadePolicy('ci.selection', tool, { standard: DEFAULT_SELECTION, platform, env,
     envValues: override && typeof override === 'object' ? override : {},
     valid: { maxTests: integer, maxTestsInCi: v => v === DEFAULT_SELECTION.maxTestsInCi,
-      staticEdges: bools, 'staticEdges.spawnPath': v => typeof v === 'boolean',
-      'staticEdges.alias': v => typeof v === 'boolean', 'staticEdges.literalRead': v => typeof v === 'boolean' }, ...(log ? { log } : {}) });
+      staticEdges: bools, 'staticEdges.spawnPath': edgeEnabled,
+      'staticEdges.alias': edgeEnabled, 'staticEdges.literalRead': edgeEnabled }, ...(log ? { log } : {}) });
   return resolved.value;
 }
 
@@ -59,7 +60,7 @@ function repoAliases() {
 
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
-const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
+const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport(?:\s|\/\*[\s\S]*?\*\/)+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/;
 const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts', '/index.tsx', '/index.cjs', '/index.mts', '/index.jsx'];
 
@@ -177,7 +178,7 @@ export function specifierBasesResolvingTo(path) {
 
 /**
  * The reverse-import graph: `Map<imported file, Set<importing file>>`. Unreadable files (a tracked file deleted in the
- * working tree, whose imports are gone with it) are skipped. Only source files are READ for imports, but any tracked
+ * working tree, whose imports are gone with it) are counted in non-enumerable `unreadable`. Only source files are READ, but any tracked
  * file can be an import TARGET, so a test that imports a changed JSON fixture still has its edge.
  * @param {{files: string[], readFile: (path: string) => string}} args
  */
@@ -186,14 +187,16 @@ export function buildReverseImportGraph({ files, readFile, ...options }) {
   const sources = files.filter(isGraphSourceFile);
   const fileSet = new Set(files.filter((f) => !f.startsWith('node_modules/') && !f.includes('/node_modules/')));
   const reverse = new Map();
+  let unreadable = 0;
   for (const file of sources) {
     let text;
-    try { text = String(readFile(file)); } catch { continue; }
+    try { text = String(readFile(file)); } catch { unreadable++; continue; }
     for (const target of resolvedImportsOf(file, text, fileSet, options)) {
       if (!reverse.has(target)) reverse.set(target, new Set());
       reverse.get(target).add(file);
     }
   }
+  Object.defineProperty(reverse, 'unreadable', { value: unreadable });
   return reverse;
 }
 

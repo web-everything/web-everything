@@ -2,7 +2,7 @@
  * @file scripts/lib/__tests__/related-test-selection.test.mjs
  * @description #5128 — bounded selection keeps direct importers; all fixtures live in memory.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { replaySelections, runReplayCli } from '../../readiness/selection-replay.mjs';
 import { selectTests } from '../../readiness/test-selection.mjs';
 import { buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile, resolvedImportsOf, loadCiSelection } from '../related-test-selection.mjs';
@@ -243,5 +243,82 @@ describe('S1 static edges', () => {
       reasons: expect.arrayContaining([expect.stringContaining('partial:')]) });
     expect(selectTests({ ...options, env: { ...options.env, CI: 'true' } })).toMatchObject({ partial: false,
       selectedFiles: ['deep.test.mjs', 'direct.test.mjs'] });
+  });
+});
+
+
+describe('readiness graph selection fails closed', () => {
+  const select = (files, readFile = path => files[path], changed = 'docs/x.mjs') => selectTests({
+    env: { WE_DIFF_TEST_SELECTION: '1' }, files: Object.keys(files), readFile,
+    runGit: args => args[0] === 'merge-base' ? 'abc' : changed,
+  });
+
+  it('runs the full suite when a non-test change reaches zero graph tests', () => {
+    const result = select({ 'docs/x.mjs': '', 'unrelated.test.mjs': '' });
+    expect(result).toMatchObject({ mode: 'full', partial: false,
+      reasons: [expect.stringContaining('zero tests for non-test changed files')] });
+    expect(result).not.toHaveProperty('selection');
+  });
+
+  it('resolves a side-effect import with an inline comment and selects its test', () => {
+    const files = { 'docs/x.mjs': '', 'docs/__tests__/x.test.mjs': 'import /* c */ "../x.mjs"' };
+    expect(resolvedImportsOf('docs/__tests__/x.test.mjs', files['docs/__tests__/x.test.mjs'], new Set(Object.keys(files))))
+      .toEqual(['docs/x.mjs']);
+    expect(select(files)).toMatchObject({ mode: 'shrink', selectedFiles: ['docs/__tests__/x.test.mjs'] });
+  });
+
+  it('counts injected EACCES sources and runs the full suite despite a surviving test edge', () => {
+    const files = { 'docs/x.mjs': '', 'direct.test.mjs': 'import "./docs/x.mjs"',
+      'denied.mjs': '', 'denied.test.mjs': '' };
+    const readFile = path => {
+      if (path.startsWith('denied')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      return files[path];
+    };
+    const reverse = buildReverseImportGraph({ files: Object.keys(files), readFile });
+    expect(reverse.unreadable).toBe(2);
+    expect(Object.keys(reverse)).not.toContain('unreadable');
+    expect(testDepths(['docs/x.mjs'], reverse).has('direct.test.mjs')).toBe(true);
+    const result = select(files, readFile);
+    expect(result).toMatchObject({ mode: 'full', partial: false,
+      reasons: [expect.stringContaining('2 unreadable graph source(s)')] });
+    expect(result).not.toHaveProperty('selection');
+  });
+
+  it('keeps a changed test selected when it has no imports', () => {
+    expect(select({ 'docs/x.test.mjs': '' }, undefined, 'docs/x.test.mjs'))
+      .toMatchObject({ mode: 'shrink', selectedFiles: ['docs/x.test.mjs'] });
+  });
+});
+
+describe('CI static edge policy', () => {
+  const allEdges = { spawnPath: true, alias: true, literalRead: true };
+  const cases = ['spawnPath', 'alias', 'literalRead'].flatMap(edge => ['env', 'file', 'platform'].map(layer => [edge, layer]));
+  const load = (edge, layer, env) => {
+    const staticEdges = { ...allEdges, [edge]: false };
+    return loadCiSelection({ env: { ...env, ...(layer === 'env' ? { WE_CI_SELECTION: JSON.stringify({ staticEdges }) } : {}) },
+      platform: layer === 'platform' ? { staticEdges } : {}, tool: layer === 'file' ? undefined : {},
+      readFile: () => JSON.stringify({ ci: { selection: { staticEdges } } }) });
+  };
+
+  it.each(cases)('ignores disabling %s via %s under either CI flag', (edge, layer) => {
+    for (const flag of ['CI', 'GITHUB_ACTIONS']) {
+      expect(load(edge, layer, { [flag]: 'true' }).staticEdges).toEqual(allEdges);
+    }
+  });
+
+  it.each(cases)('allows disabling %s via %s outside CI', (edge, layer) => {
+    expect(load(edge, layer, {}).staticEdges).toEqual({ ...allEdges, [edge]: false });
+  });
+
+  it('keeps import-only replay explicit options effective with process.env.CI set', () => {
+    vi.stubEnv('CI', 'true');
+    try {
+      expect(loadCiSelection({ tool: {}, platform: {}, env: { ...process.env,
+        WE_CI_SELECTION: JSON.stringify({ staticEdges: { ...allEdges, spawnPath: false } }) } }).staticEdges).toEqual(allEdges);
+      const files = { 'scripts/child.mjs': '', 'edge.test.mjs': "spawn('node', ['scripts/child.mjs'])" };
+      expect(replaySelections({ records: [{ pr: '7094', changedFiles: ['scripts/child.mjs'],
+        testFiles: ['edge.test.mjs'], evidenceComplete: true }], files: Object.keys(files), readFile: path => files[path] })[0])
+        .toMatchObject({ oldMissed: ['edge.test.mjs'], newMissed: [] });
+    } finally { vi.unstubAllEnvs(); }
   });
 });
