@@ -1030,14 +1030,18 @@ describe('#verify-phase-admission', () => {
 
 // #5128 — graph reads and tracked-file discovery stay injected; no real repository graph.
 describe('#5128 — bounded related-test selection', () => {
-  function boundedGate(maxTests = 3, withReader = true) {
+  function boundedGate(maxTests = 3, withReader = true, unreadableGraph = 0) {
     const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'",
       'scripts/direct.test.mjs': "import './hub.mjs'" };
     for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
     const git = fakeGit(['scripts/hub.mjs']);
+    let hubReads = 0;
     return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: maxTests, relatedDepth: 2 },
       runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
-      ...(withReader ? { readRepoFile: path => files[path] } : {}),
+      ...(withReader ? { readRepoFile: path => {
+        if (path === 'scripts/hub.mjs' && ++hubReads === unreadableGraph) throw new Error('injected read error');
+        return files[path];
+      } } : {}),
     });
   }
 
@@ -1047,6 +1051,13 @@ describe('#5128 — bounded related-test selection', () => {
     expect(gate.decision.selection.status).toBe('selection-truncated');
     expect(gate.decision.targets).toEqual(['scripts/hub.mjs']);
     expect(describeGate(gate)).toContain('selection-truncated');
+  });
+
+  it.each([1, 2])('keeps plain vitest related with no selection when graph %s has an unreadable source', unreadableGraph => {
+    const gate = boundedGate(3, true, unreadableGraph);
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision).not.toHaveProperty('selection');
+    expect(gate.decision.partial).toBe(false);
   });
 
   it('recognizes a requester without the limit (older base) as the default gate, not a whole-gate fallback', () => {

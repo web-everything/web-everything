@@ -48,6 +48,19 @@ describe('#5128 — related import graph', () => {
   });
 
   it.each([
+    `import x from /* c */ \n /* d */ "../x.mjs"`,
+    `export * from /* c */ \n /* d */ "../x.mjs"`,
+    `import /* c */ \n /* d */ "../x.mjs"`,
+    `import /* c */ ( /* d */ "../x.mjs" /* e */ )`,
+    'import /* c */ ( /* d */ `../x.mjs`)',
+    ...['require', 'mock', 'doMock', 'unmock', 'doUnmock', 'importActual', 'importMock']
+      .map(name => `${name === 'require' ? '' : 'vi.'}${name} /* c */ ( /* d */ "../x.mjs")`),
+  ])('reads block comments and whitespace between specifier tokens: %s', source => {
+    expect(graph({ 'x.mjs': '', 'src/main.mjs': source }))
+      .toEqual(new Map([['x.mjs', new Set(['src/main.mjs'])]]));
+  });
+
+  it.each([
     ['./m.mjs', 'src/m.mts'], ['./folder2', 'src/folder2/index.tsx'], ['./folder3', 'src/folder3/index.cjs'],
     ['./g', 'src/g.mjs'], ['./h.js', 'src/h.ts'], ['./g.mjs?raw', 'src/g.mjs'],
     ['./folder', 'src/folder/index.ts'], ['node:fs', null], ['vitest', null], ['./missing', null], ['../../outside', null],

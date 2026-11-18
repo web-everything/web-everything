@@ -561,6 +561,8 @@ function relatedSelection({ targets, runGit, readRepoFile, settings, env }) {
         imports: buildReverseImportGraph({ files, readFile: readRepoFile, staticEdges: { spawnPath: false, alias: false, literalRead: false } }) };
       graphCache.set(readRepoFile, graphs);
     }
+    // Incomplete graphs cannot justify narrowing; keep plain vitest related.
+    if (graphs.reverse.unreadable || graphs.imports.unreadable) return null;
     const selection = selectRelatedTests({ changedFiles: targets, reverse: graphs.reverse, maxTests: settings.relatedMaxTests,
       maxDepth: settings.relatedDepth, env });
     const oldTests = testDepths(targets, graphs.imports);

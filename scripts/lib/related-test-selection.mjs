@@ -60,7 +60,15 @@ function repoAliases() {
 
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
-const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport(?:\s|\/\*[\s\S]*?\*\/)+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
+// Block comments are valid token separators, including around call parentheses.
+const SPECIFIER_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/)*`;
+const SPECIFIER_RE = new RegExp([
+  String.raw`\bfrom${SPECIFIER_GAP}['"]([^'"\n]+)['"]`,
+  String.raw`\bimport${SPECIFIER_GAP}\(${SPECIFIER_GAP}['"]([^'"\n]+)['"]${SPECIFIER_GAP}\)`,
+  String.raw`\bimport${SPECIFIER_GAP}['"]([^'"\n]+)['"]`,
+  String.raw`\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)${SPECIFIER_GAP}\(${SPECIFIER_GAP}['"]([^'"\n]+)['"]`,
+  String.raw`\bimport${SPECIFIER_GAP}\(${SPECIFIER_GAP}` + '`([^`$\\n]+)',
+].join('|'), 'g');
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/;
 const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts', '/index.tsx', '/index.cjs', '/index.mts', '/index.jsx'];
 
