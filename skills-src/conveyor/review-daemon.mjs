@@ -1003,10 +1003,15 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   const rotatedResults = forEachRepo(orderedRepos, (repo) => {
     const started = Date.now();
     const spentBefore = tickOpts.hostAdmission?.spent?.() ?? 0;
+    // The live-review pool is a second shared seat pool: a live-job skip can keep its seat without a host take or a
+    // dispatch entry, so a net drop in `left` over this repo's tick also counts as a seat spent.
+    const leftBefore = tickOpts.liveReviewBudget?.left;
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
     finally {
       perRepoMs[repo] = Date.now() - started;
-      if ((tickOpts.hostAdmission?.spent?.() ?? 0) > spentBefore) seatTakers.add(repo);
+      const leftAfter = tickOpts.liveReviewBudget?.left;
+      if ((tickOpts.hostAdmission?.spent?.() ?? 0) > spentBefore
+        || (Number.isFinite(leftBefore) && Number.isFinite(leftAfter) && leftAfter < leftBefore)) seatTakers.add(repo);
     }
   });
   // Preserve the public result (and aggregate) order even when execution starts at another repo.

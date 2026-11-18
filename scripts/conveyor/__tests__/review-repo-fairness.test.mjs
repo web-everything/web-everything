@@ -99,6 +99,22 @@ describe('shared review seats across repos', () => {
     expect(order[0]).toBe(three[0]);
   });
 
+  it('moves past a repo that kept a live-review seat on a live-job skip (seat pool without a host take)', async () => {
+    const runAll = await fresh();
+    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const order = [];
+    for (let i = 0; i < 3; i++) {
+      const shared = { live: 7, max: 8, left: 1, reason: 'live review rounds 7 of maxLiveReviewRounds=8 (tool)' };
+      runAll({ repos: three, log() {}, liveReviewBudget: shared,
+        // No hostAdmission at all: only the live-review pool says a seat was kept, and nothing is dispatched.
+        tick({ repo, liveReviewBudget }) {
+          if (liveReviewBudget.left > 0) { order.push(repo); liveReviewBudget.left--; }
+          return { reviewsOwed: 1, dispatched: [], failed: [], refusals: 0 };
+        } });
+    }
+    expect(order).toEqual(three);
+  });
+
   it.each([0, 1])('reports all eight occupied seats and the earlier dispatch for startIndex=%i', startIndex => {
     const shared = budget();
     const result = runReviewTickAllRepos({ ...options(), startIndex, liveReviewBudget: shared });
