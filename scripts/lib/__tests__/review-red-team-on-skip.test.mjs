@@ -12,6 +12,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery, planRedTeamOnSkip, recoveryProbe, runRedTeamOnSkip, resolveReviewRedTeamOnSkip,
   CARRIED_CHECK_ESCALATION } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
+import { settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir,
@@ -3228,6 +3229,60 @@ describe('finished skipped empty net diff recovery', () => {
       expect(planRedTeamOnSkip(input)[0]).toMatchObject({ action: 'clear', policy: 'empty-net-diff' });
       expect(planRedTeamOnSkip({ ...input, cwd: daemonCwd })[0]).toMatchObject({ action: 'skip',
         why: 'empty net diff not proven for this head; inspect stored evidence' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('runRedTeamOnSkip threads the subject cwd to the planner and the settle recheck (real git, two repositories)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-run-subject-cwd-'));
+    const daemonCwd = join(dir, 'daemon'), subjectCwd = join(dir, 'subject');
+    const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      for (const cwd of [daemonCwd, subjectCwd]) {
+        mkdirSync(cwd);
+        git(cwd, 'init', '--quiet');
+      }
+      const commit = message => git(subjectCwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', message);
+      commit('subject base');
+      const base = git(subjectCwd, 'rev-parse', 'HEAD');
+      commit('subject head');
+      const rev = git(subjectCwd, 'rev-parse', 'HEAD');
+      for (const sha of [base, rev]) expect(() => git(daemonCwd, 'cat-file', '-e', sha)).toThrow();
+      const run = cwd => {
+        const o = options();
+        const status = o.readStatus();
+        status.head = rev;
+        Object.assign(status.loopPayload.findings.read.netBasis, { base, rev });
+        o.rawPrs[0].headRefOid = rev;
+        o.rawPrs[0].comments[0].body = `✅ review — accepted\n<!-- reviewed-sha: ${rev} -->`;
+        // The daemon's implicit Git cwd is another repository: a dropped cwd falls back to it, never to the subject.
+        const gitCwds = [];
+        const exec = (file, args, opts = {}) => {
+          gitCwds.push(opts.cwd);
+          return execFileSync(file, args, { ...opts, cwd: opts.cwd ?? daemonCwd, stdio: ['ignore', 'pipe', 'pipe'] });
+        };
+        const settle = vi.fn(settleRedTeamSkip);
+        const publishCheck = vi.fn(() => ({ ok: true })), syncLabels = vi.fn();
+        runGhSync.mockClear();
+        const { gitExec: _unused, ...rest } = o;
+        const row = runRedTeamOnSkip({ ...fixture(rest), plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: rev }] },
+          now: () => 2_000_000, exec, cwd, settle, publishCheck, syncLabels, dispatch: vi.fn() }).rows[0];
+        return { row, settle, publishCheck, syncLabels, gitCwds };
+      };
+      const subject = run(subjectCwd);
+      expect(subject.row).toMatchObject({ action: 'clear', policy: 'empty-net-diff' });
+      expect(subject.row.why).not.toMatch(/failed/);
+      expect(subject.syncLabels).toHaveBeenCalledOnce();
+      expect(subject.settle).toHaveBeenCalledTimes(1);
+      expect(subject.settle.mock.calls[0][0].io.cwd).toBe(subjectCwd);
+      // Planner probe and settle-time recheck both ran git in the subject checkout.
+      expect(subject.gitCwds.length).toBeGreaterThanOrEqual(2);
+      expect(subject.gitCwds.every(cwd => cwd === subjectCwd)).toBe(true);
+      expect(subject.publishCheck).toHaveBeenCalledTimes(1);
+      expect(runGhSync).toHaveBeenCalledWith(expect.arrayContaining(['pr', 'comment', String(pr)]), expect.anything());
+      const daemon = run(daemonCwd);
+      expect(daemon.row).toMatchObject({ action: 'skip', why: 'empty net diff not proven for this head; inspect stored evidence' });
+      expect(daemon.settle).not.toHaveBeenCalled();
+      expect(daemon.publishCheck).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('holds empty-net-diff recovery without an explicit subject cwd and asks to inspect stored evidence', () => {
