@@ -24,10 +24,11 @@
  * that over the whole graph. Keeping the fs shell in the same module would have put `node:fs` in the
  * engine's import graph and reduced "the engine touches no disk" to a claim in a comment.
  *
- * PURE. No fs, no clock, no process, no randomness, no network.
+ * No fs, clock, randomness, or network. Tool-summary redaction also masks credential values from process.env.
  */
 
 import { JOB_OP_PREFIX, newJobBlock, validateJobBlock } from './job-record.mjs';
+import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 /** Schema version stamped on every record. A reader refuses a version it does not know. */
 export const RUN_RECORD_VERSION = 1;
@@ -152,7 +153,7 @@ const TELEMETRY_STRING_MAX = Object.freeze({ stderrTail: 1000, failureText: 500,
 const TELEMETRY_FLAGS = Object.freeze(['timedOut']);
 
 /**
- * NORMALIZE one juror spawn's telemetry into a run-record row. PURE.
+ * NORMALIZE one juror spawn's telemetry into a run-record row; redact tool summaries before bounding them.
  *
  * WHY A WHITELIST AND NOT A SPREAD. The row is supplied by the ADAPTER (the engine declares the juror call and
  * never makes it — see {@link ./engine.mjs}), so its contents come from outside the pure core, and the record
@@ -176,7 +177,8 @@ export function normalizeJudgeTelemetry({ step = '', stepIndex = null, telemetry
   for (const k of TELEMETRY_STRINGS) {
     if (typeof src[k] === 'string' && src[k]) {
       const max = TELEMETRY_STRING_MAX[k];
-      row[k] = max ? (k === 'stderrTail' ? src[k].slice(-max) : src[k].slice(0, max)) : src[k];
+      const text = k === 'lastToolCall' ? redactSpawnText(src[k]) : src[k];
+      row[k] = max ? (k === 'stderrTail' ? text.slice(-max) : text.slice(0, max)) : text;
     }
   }
   for (const k of TELEMETRY_FLAGS) {
@@ -187,7 +189,7 @@ export function normalizeJudgeTelemetry({ step = '', stepIndex = null, telemetry
       type: typeof event.type === 'string' ? event.type.slice(0, 40) : 'unrecognized',
       ...(event.truncated === true ? { truncated: true } : {}),
       ...(Array.isArray(event.tools) ? { tools: Object.freeze(event.tools.slice(-8)
-        .filter(t => typeof t === 'string').map(t => t.slice(0, 160))) } : {}),
+        .filter(t => typeof t === 'string').map(t => redactSpawnText(t).slice(0, 160))) } : {}),
     })));
   }
   const usage = {};

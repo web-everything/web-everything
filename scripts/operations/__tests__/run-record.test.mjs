@@ -38,6 +38,19 @@ describe('validateRunRecord — permanent guard refusal evidence', () => {
 });
 
 describe('normalizeJudgeTelemetry — a failed seat keeps its spawn evidence', () => {
+  it.each(['', `${'x'.repeat(140)} `])('redacts tool summaries before truncation (prefix %j)', prefix => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+    const summary = `${prefix}Bash: ${secret}`;
+    const row = normalizeJudgeTelemetry({ telemetry: {
+      lastToolCall: summary,
+      lastEvents: [{ type: 'assistant', tools: [summary, 'Bash: git status'] }],
+    } });
+    const expected = `${prefix}Bash: <redacted-token>`.slice(0, 160);
+    expect(row.lastToolCall).toBe(expected);
+    expect(row.lastEvents[0].tools).toEqual([expected, 'Bash: git status']);
+    expect(JSON.stringify(row)).not.toContain('ghp_');
+  });
+
   it('keeps string failureKind and failureText alongside existing telemetry', () => {
     expect(normalizeJudgeTelemetry({ step: 'judgeSecurity', stepIndex: 2, telemetry: {
       failureKind: 'provider-quota', failureText: "You've hit your weekly limit",

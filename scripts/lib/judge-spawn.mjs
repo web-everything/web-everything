@@ -230,15 +230,15 @@ function stderrSnippet(stderr) {
   return String(stderr).trim().replace(/\s+/g, ' ').slice(-160);
 }
 
-/** Fixed bounds also apply when the caller supplies a more permissive environment. */
+/** Preserve explicit caller settings; cap Bash timeouts even in a more permissive environment. */
 export function buildJudgeEnv(env = process.env) {
   const capTimeout = (key, cap) => {
     const existing = Number(env[key]);
     return String(Number.isFinite(existing) && existing > 0 ? Math.min(existing, cap) : cap);
   };
   return markWorkerEnv({ ...sanitizeSpawnEnv(env),
-    GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
-    GIT_TERMINAL_PROMPT: '0', CI: '1',
+    GIT_SSH_COMMAND: env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes -o ConnectTimeout=10',
+    GIT_TERMINAL_PROMPT: env.GIT_TERMINAL_PROMPT ?? '0', CI: env.CI ?? '1',
     BASH_DEFAULT_TIMEOUT_MS: capTimeout('BASH_DEFAULT_TIMEOUT_MS', 300000),
     BASH_MAX_TIMEOUT_MS: capTimeout('BASH_MAX_TIMEOUT_MS', 600000),
   });

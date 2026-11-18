@@ -160,13 +160,31 @@ describe('Claude non-interactive environment', () => {
     expect(env).toEqual({ BASH_DEFAULT_TIMEOUT_MS: '1000', BASH_MAX_TIMEOUT_MS: '2000' });
   });
 
-  it('sanitizes credentials and overrides interactive settings and unbounded Bash timeouts', () => {
+  it('sanitizes credentials, preserves explicit settings, and caps unbounded Bash timeouts', () => {
     const env = { GH_TOKEN: 'secret', GIT_SSH_COMMAND: 'ssh', GIT_TERMINAL_PROMPT: '1', CI: '0',
       BASH_DEFAULT_TIMEOUT_MS: '9999999', BASH_MAX_TIMEOUT_MS: '9999999', PATH: '/bin' };
-    expect(buildJudgeEnv(env)).toMatchObject({ GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
-      GIT_TERMINAL_PROMPT: '0', CI: '1', BASH_DEFAULT_TIMEOUT_MS: '300000', BASH_MAX_TIMEOUT_MS: '600000', PATH: '/bin' });
+    expect(buildJudgeEnv(env)).toMatchObject({ GIT_SSH_COMMAND: 'ssh',
+      GIT_TERMINAL_PROMPT: '1', CI: '0', BASH_DEFAULT_TIMEOUT_MS: '300000', BASH_MAX_TIMEOUT_MS: '600000', PATH: '/bin' });
     expect(buildJudgeEnv(env).GH_TOKEN).toBeUndefined();
     expect(env.GIT_TERMINAL_PROMPT).toBe('1');
+  });
+
+  it.each([
+    { GIT_SSH_COMMAND: 'false', GIT_TERMINAL_PROMPT: '0', CI: 'true' },
+    { GIT_SSH_COMMAND: '', GIT_TERMINAL_PROMPT: '', CI: '' },
+  ])('preserves caller Git and CI restrictions in the spawned environment: %j', async env => {
+    const original = { ...env };
+    const f = fake([result]);
+    await judgeSpawn({ ...request, ...f, env });
+    expect(f.options().env).toMatchObject(original);
+    expect(env).toEqual(original);
+  });
+
+  it('defaults absent Git and CI settings to non-interactive values', () => {
+    expect(buildJudgeEnv({})).toMatchObject({
+      GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10',
+      GIT_TERMINAL_PROMPT: '0', CI: '1',
+    });
   });
 });
 
