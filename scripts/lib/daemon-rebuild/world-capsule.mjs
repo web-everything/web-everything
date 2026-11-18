@@ -43,7 +43,7 @@ function readOnlyKey(command, args) {
       '--state', '--author', '--assignee', '--label', '--search', '--base', '--head',
       '--branch', '--workflow', '--user', '--status', '--event', '--commit', '--job']);
   const switches = api
-    ? new Set(['--paginate', '--slurp', '--include', '-i', '--silent'])
+    ? new Set(['--paginate', '--slurp', '--include', '-i', '--silent', '--allow-escape-sequences'])
     : new Set(['--comments', '--log', '--log-failed', '--verbose']);
   let endpoints = 0;
   for (let i = api ? 1 : 2; i < args.length; i++) {

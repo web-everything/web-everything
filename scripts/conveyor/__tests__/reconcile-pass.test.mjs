@@ -1060,9 +1060,10 @@ it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-
   Object.values(sources).forEach((source, i) => { data[`${prefix}/git/blobs/blob${i}`] = {encoding:'base64',content:Buffer.from(source).toString('base64')}; });
   const calls = [];
   const exec = (cmd, args) => {
-    expect(cmd).toBe('gh'); expect(args[0]).toBe('api'); calls.push(args[1]);
-    if (!(args[1] in data)) throw new Error(`unaccounted read ${args[1]}`);
-    return typeof data[args[1]] === 'string' ? data[args[1]] : JSON.stringify(data[args[1]]);
+    expect(cmd).toBe('gh'); expect(args[0]).toBe('api');
+    const path = args.at(-1); calls.push(path);
+    if (!(path in data)) throw new Error(`unaccounted read ${path}`);
+    return typeof data[path] === 'string' ? data[path] : JSON.stringify(data[path]);
   };
   const pr = { number:3415,headRefOid:head,state:'OPEN',labels:[],statusCheckRollup:[{
     name:'test',status:'COMPLETED',conclusion:'FAILURE',detailsUrl:`https://github.com/${repo}/actions/runs/10/job/20`}] };
