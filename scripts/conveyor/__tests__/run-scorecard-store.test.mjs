@@ -91,6 +91,19 @@ describe('appendScorecard', () => {
     expect(() => appendScorecard({ ...baseRow(), provider: '' }, io)).toThrow(/refusing/);
     expect(readStore(io).records).toHaveLength(0);
   });
+  it.each([null, '{ prior evidence', '{}', '{"records":null}'])('refuses missing or malformed evidence without overwriting it: %j', text => {
+    const dir = mkdtempSync(join(tmpdir(), 'scorecard-append-refusal-'));
+    const path = join(dir, 'scorecards.json');
+    try {
+      if (text !== null) writeFileSync(path, text);
+      // Even a caller requesting a permissive read cannot erase durable evidence through append.
+      expect(() => appendScorecard(baseRow(), { path, strict: false })).toThrow(text === null ? MissingStoreError : /scorecard store malformed/);
+      if (text === null) expect(existsSync(path)).toBe(false);
+      else expect(readFileSync(path, 'utf8')).toBe(text);
+      expect(existsSync(`${path}.lock`)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('accumulates multiple rows across calls', () => {
     const io = memIo();
     appendScorecard(baseRow(), io);
@@ -315,6 +328,34 @@ describe('migrateLegacyStore — review findings on PR #2684', () => {
   const newDir = () => { dir = mkdtempSync(join(tmpdir(), 'scorecard-review-')); return join(dir, 'state', '.conveyor', 'run-scorecards.json'); };
   const records = (p) => JSON.parse(readFileSync(p, 'utf8')).records;
 
+  it.each([undefined, [{ legacy: 1 }]])('strict default absence never creates or migrates a store (legacy history: %j)', legacy => {
+    const target = newDir();
+    const repo = makeRepo('repo', legacy);
+    const modulePath = resolve(import.meta.dirname, '../run-scorecard-store.mjs');
+    const moduleRepoRoot = resolve(import.meta.dirname, '..', '..', '..');
+    const stateRoot = join(dir, 'strict-default');
+    const script = `
+      import assert from 'node:assert/strict';
+      import { existsSync } from 'node:fs';
+      import { dirname } from 'node:path';
+      import { readStore, resolveScorecardStorePath, MissingStoreError, legacyGitStamp } from ${JSON.stringify(modulePath)};
+      const path = resolveScorecardStorePath();
+      assert.throws(() => readStore({ strict: true }), MissingStoreError);
+      assert.equal(existsSync(path), false);
+      assert.equal(existsSync(dirname(path)), false);
+      // A non-strict read of the SAME default path really does migrate and stamp this source.
+      const control = readStore();
+      assert.equal(existsSync(path), true);
+      assert.deepEqual(control.records, ${JSON.stringify(legacy ?? [])});
+      assert.ok(control.migrations.includes(legacyGitStamp(${JSON.stringify(moduleRepoRoot)})));
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      env: { ...process.env, CONVEYOR_STATE_ROOT: stateRoot, GIT_DIR: join(repo, '.git'), GIT_WORK_TREE: repo },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    expect(existsSync(target)).toBe(false);
+  });
+
   it('migration preserves an append made during legacy-history retrieval (no lost update)', () => {
     const target = newDir();
     const repo = makeRepo('repo', [{ legacy: 1 }]);
@@ -414,6 +455,7 @@ it('#4439 appends a launch trial once under concurrent file-store writers', asyn
   const dir = mkdtempSync(join(tmpdir(), 'judge-race-'));
   try {
     const io = { path: join(dir, 'store.json') };
+    writeStore({ version: 1, records: [] }, io);
     const row = { ...baseRow(), dispatchKind: 'probation-trial', pr: 101 };
     expect(storeModule.appendScorecardUnlessJudged(row, io)).toMatchObject(row);
     expect(storeModule.appendScorecardUnlessJudged(row, io)).toBeNull();

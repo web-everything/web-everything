@@ -23,7 +23,7 @@ import {
 import { runReviewJob, summarizeRedTeam } from '../review-job.mjs';
 import { JUDGE_MODEL } from '../review-pr.mjs';
 import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
-import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
+import { validateScorecard, writeStore } from '../../conveyor/run-scorecard-store.mjs';
 import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { resolveOperationRoute } from '../../lib/dispatch-routing-policy-io.mjs';
 
@@ -90,6 +90,62 @@ function fakeIo(over = {}) {
   };
   return { io, calls, rows, trials };
 }
+
+describe('red-team finalization requires the admitted scorecard evidence', () => {
+  const cases = [completeRedTeam, finishSpeculativeRedTeam].flatMap(finish =>
+    ['before-finalization', 'before-append'].flatMap(when => ['missing', 'malformed'].map(damage => ({ name: finish.name, finish, when, damage }))));
+  it.each(cases)('$name holds when evidence becomes $damage $when', async ({ finish, when, damage }) => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-finalization-evidence-'));
+    const storePath = join(root, 'run-scorecards.json');
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0', WE_RED_TEAM_STATUS_LABELS: '0' };
+    try {
+      writeStore({ version: 1, records: [{ archivedEvidence: 'keep this history' }] }, { path: storePath });
+      const original = readFileSync(storePath, 'utf8');
+      const real = createRedTeamIo({ env, root, storePath });
+      const { io, calls, trials } = fakeIo({ readRecords: real.readRecords, append: real.append,
+        reserveCalls: real.reserveCalls, releaseCalls: real.releaseCalls, cliAvailable: p => p === 'codex' });
+      io.redTeamStatus = event => calls.push(['status', event]);
+      const loopPayload = payload('accept');
+      const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read, env, resume: false }, io);
+      expect(pass.status).toBe('speculated');
+      expect(calls.filter(call => call[0] === 'seat')).toHaveLength(1);
+      expect(readFileSync(storePath, 'utf8')).toBe(original);
+      const corrupt = original.slice(0, -5);
+      const damageStore = () => damage === 'missing' ? rmSync(storePath) : writeFileSync(storePath, corrupt);
+      if (when === 'before-finalization') damageStore();
+      else io.append = row => { damageStore(); return real.append(row); };
+      calls.length = 0;
+      const result = await finish({ pr: 5, repo: REPO, loopPayload, pass, env }, io);
+      expect(result).toMatchObject({ status: 'error', reason: expect.stringContaining('inspect stored evidence') });
+      expect(calls.filter(call => ['seat', 'post', 'status'].includes(call[0]))).toEqual([]);
+      expect(trials).toEqual([]);
+      if (damage === 'missing') expect(existsSync(storePath)).toBe(false);
+      else expect(readFileSync(storePath, 'utf8')).toBe(corrupt);
+      expect(existsSync(`${storePath}.lock`)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('finalizes a real admitted pass and preserves its prior history when evidence stays readable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-finalization-intact-'));
+    const storePath = join(root, 'run-scorecards.json');
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0' };
+    try {
+      const history = { archivedEvidence: 'keep this history' };
+      writeStore({ version: 1, records: [history] }, { path: storePath });
+      const real = createRedTeamIo({ env, root, storePath });
+      const { io, calls } = fakeIo({ readRecords: real.readRecords, append: real.append,
+        reserveCalls: real.reserveCalls, releaseCalls: real.releaseCalls, cliAvailable: p => p === 'codex' });
+      const loopPayload = payload('accept');
+      const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read, env, resume: false }, io);
+      expect(pass.status).toBe('speculated');
+      const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env }, io);
+      expect(result.status).toBe('ran');
+      expect(result.rowsWritten).toBeGreaterThan(0);
+      expect(real.readRecords()[0]).toEqual(history);
+      expect(calls.filter(call => call[0] === 'post')).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe('failed red-team executions (#6096)', () => {
   it.each(['quota', 'daily cap'])('a failed seat still defers another call under its %s', async limit => {

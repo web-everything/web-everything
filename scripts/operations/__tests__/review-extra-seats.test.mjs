@@ -500,7 +500,7 @@ describe('#4194 prompt, answer parsing, confirmation, rows', () => {
     const juror = rows.find((r) => r.seat === 'extra-juror');
     expect(juror).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', lens: 'correctness', status: 'ok', findingsCount: 1, confirmedCount: 1, claudeConfirmed: true, taskType: 'review-lens:extra-juror:correctness' });
     // real store write, in memory
-    let text = null;
+    let text = JSON.stringify({ version: 1, records: [] });
     const io = { path: '/mem/store.json', read: () => text, write: (_p, t) => { text = t; }, exists: () => text !== null };
     appendScorecard(juror, io);
     expect(JSON.parse(text).records.at(-1)).toMatchObject({ dispatchKind: 'review-seat', lens: 'correctness', confirmedCount: 1 });
@@ -867,6 +867,7 @@ describe('#4194 createExtraSeatsIo — real effects, on a throwaway repo and sto
     const storePath = join(root, 'state', 'run-scorecards.json');
     const ledger = join(root, 'state', 'review-seat-reservations.json');
     mkdirSync(join(root, 'state'), { recursive: true });
+    writeStore({ version: 1, records: [] }, { path: storePath });
     writeFileSync(`${ledger}.lock`, '99999');
     const old = new Date(Date.now() - 60_000);
     utimesSync(`${ledger}.lock`, old, old);
@@ -892,6 +893,7 @@ describe('#4194 createExtraSeatsIo — real effects, on a throwaway repo and sto
   it('reserveCalls persists the ledger beside the store, so a second job sees the first one\'s reservation', () => {
     const storePath = join(root, 'state', 'run-scorecards.json');
     const now = Date.now();
+    writeStore({ version: 1, records: [] }, { path: storePath });
     const first = createExtraSeatsIo({ env: process.env, storePath }).reserveCalls({ want: 2, dailyCap: 3, now });
     const second = createExtraSeatsIo({ env: process.env, storePath }).reserveCalls({ want: 2, dailyCap: 3, now });
     expect(first.callIds).toHaveLength(2);

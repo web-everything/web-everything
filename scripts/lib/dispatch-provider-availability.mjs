@@ -3,7 +3,7 @@ import { accessSync, constants } from 'node:fs';
 import { join } from 'node:path';
 import { readStore } from '../conveyor/run-scorecard-store.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
-export function dispatchProviderAvailable(provider, { env = process.env, records = readStore().records, now = Date.now(), access = accessSync } = {}) {
+export function dispatchProviderAvailable(provider, { env = process.env, records = readStore({ strict: true }).records, now = Date.now(), access = accessSync } = {}) {
   const family = provider.startsWith('agy-') ? 'antigravity' : provider;
   if (providerQuotaHold(records, family, now)) return false;
   const binary = family === 'antigravity' ? 'agy' : family;

@@ -3,8 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { MissingStoreError, resolveScorecardStorePath, writeStore } from '../../conveyor/run-scorecard-store.mjs';
-import { createRedTeamIo, runRedTeam, speculateRedTeam } from '../../operations/review-extra-seats.mjs';
+import { MissingStoreError, resolveScorecardStorePath, writeStore, appendScorecard, appendScorecardUnlessJudged } from '../../conveyor/run-scorecard-store.mjs';
+import { createRedTeamIo, createExtraSeatsIo, runExtraSeats, readSeatCapUsage, completeRedTeam, finishSpeculativeRedTeam, redTeamReadFingerprint, runRedTeam, speculateRedTeam } from '../../operations/review-extra-seats.mjs';
+import { defaultProviderQuotaHold } from '../../operations/cli-adapter.mjs';
+import { defaultReadScorecards } from '../../operations/dispatch-lane-io.mjs';
+import { dispatchProviderAvailable } from '../dispatch-provider-availability.mjs';
+import { runJudge } from '../model-probation.mjs';
 import { createReviewJobIo } from '../../operations/review-job.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { readDrainRedTeamEvidence, readRecoveryWitness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
@@ -45,16 +49,56 @@ function fixture(empty) {
     readStatus: () => null, readEvidence: key => readDrainRedTeamEvidence({ ...key, env, runsDir }), ...extra })[0];
   const publisher = extra => publishStoredRedTeamResult({ status: { repo, pr, head }, statusDir: redTeamStatusDir(env),
     listComments: () => [], postComment: forbid('publication'), publishNeedsYou: event => effects.push(event.kind), ...extra });
-  return { root, env, key, storePath, statusPath, status, effects, seatIo, planner, publisher };
+  return { root, env, key, storePath, statusPath, status, effects, seatIo, extraIo: createExtraSeatsIo({ env, root, storePath }), planner, publisher };
 }
 
 const missingThrows = fn => expect(fn).toThrow(MissingStoreError);
 const heldPlan = row => expect(row).toMatchObject({ action: 'skip', why: expect.stringContaining('inspect stored evidence') });
 
+const malformedThrows = fn => expect(fn).toThrow(/scorecard store malformed/);
+const heldFinalization = async fn => expect(await fn()).toMatchObject({ status: 'error', reason: expect.stringContaining('inspect stored evidence') });
+const trial = { rubricVersion: 'fixture.1', subjectClass: 'work-agent', provider: 'codex', model: 'fixture',
+  dispatchKind: 'probation-trial', handle: 'matrix', pr, criteriaEvaluated: 0, score: null, deductions: [] };
+const pass = { status: 'speculated', readFingerprint: redTeamReadFingerprint(read), rev: head,
+  provider: 'codex', model: 'fixture', callId: 'matrix-call', call: { status: 'ok' },
+  parsed: { 'red-team': { ok: true, verdict: 'accept', findings: [] } }, evidence: {}, findings: [], recheckStatus: 'not-needed' };
+// New decision edges also pin malformed evidence, against the same real store files.
+const decisionCallers = [
+  ['review-extra-seats: default extra-seat records', f => f.extraIo.readRecords(), missingThrows,
+    result => expect(result).toEqual([]), malformedThrows],
+  ['review-extra-seats: quota usage', f => readSeatCapUsage({ env: f.env, storePath: f.storePath }), missingThrows,
+    result => expect(result.codex).toMatchObject({ usedToday: 0, fraction: 0 }), malformedThrows],
+  ['review-extra-seats: reservation', f => f.extraIo.reserveCalls({ provider: 'codex', want: 1, dailyCap: 2, now: Date.now() }),
+    (fn, f) => { missingThrows(fn); expect(existsSync(join(dirname(f.storePath), 'review-seat-reservations.json'))).toBe(false); },
+    result => expect(result).toMatchObject({ used: 0, callIds: [expect.any(String)] }),
+    (fn, f) => { malformedThrows(fn); expect(existsSync(join(dirname(f.storePath), 'review-seat-reservations.json'))).toBe(false); }],
+  ['review-extra-seats: extra-seat admission', f => runExtraSeats({ repo, pr, loopPayload, env: f.env }, { ...f.seatIo, cliAvailable: () => false }),
+    heldFinalization, result => expect(result).toMatchObject({ status: 'skipped' }), heldFinalization],
+  ['review-extra-seats: completion', f => completeRedTeam({ repo, pr, loopPayload, pass, post: false, record: false }, f.seatIo),
+    heldFinalization, result => expect(result).toMatchObject({ status: 'ran', rowsWritten: 0 }), heldFinalization],
+  ['review-extra-seats: speculative finalization', f => finishSpeculativeRedTeam({ repo, pr, loopPayload: { ...loopPayload, replay: true }, pass, env: f.env, post: false }, f.seatIo),
+    heldFinalization, result => expect(result).toMatchObject({ status: 'ran', rowsWritten: 0 }), heldFinalization],
+  ['scorecard store: append', f => appendScorecard(trial, { path: f.storePath }), missingThrows,
+    (result, f) => { expect(result).toMatchObject(trial); expect(f.extraIo.readRecords()).toEqual([result]); }, malformedThrows],
+  ['scorecard store: append unless judged', f => appendScorecardUnlessJudged(trial, { path: f.storePath }), missingThrows,
+    (result, f) => { expect(result).toMatchObject(trial); expect(f.extraIo.readRecords()).toEqual([result]); }, malformedThrows],
+  ['model-probation: judge', f => runJudge({ io: { path: f.storePath }, log: () => {}, lookupPr: () => { throw Error('unexpected lookup'); } }), missingThrows,
+    result => expect(result).toEqual({ judged: 0, pending: 0, failed: 0 }), malformedThrows],
+  ['cli-adapter: provider quota clearance', f => { vi.stubEnv('CONVEYOR_STATE_ROOT', f.root); return defaultProviderQuotaHold('codex', Date.now()); },
+    async fn => expect(await fn()).toMatch(/scorecard evidence unreadable:.*inspect stored evidence/),
+    result => expect(result).toBeNull(), async fn => expect(await fn()).toMatch(/scorecard evidence unreadable:.*inspect stored evidence/)],
+  ['dispatch-provider-availability: provider admission', f => { vi.stubEnv('CONVEYOR_STATE_ROOT', f.root);
+    return dispatchProviderAvailable('codex', { env: { PATH: f.root }, access: () => {} }); }, missingThrows,
+    result => expect(result).toBe(true), malformedThrows],
+  ['dispatch-lane-io: trial route reader', f => { vi.stubEnv('CONVEYOR_STATE_ROOT', f.root); return defaultReadScorecards(); },
+    fn => expect(fn()).toEqual([]), result => expect(result).toEqual([]), fn => expect(fn()).toEqual([])],
+];
+
 // One table covers every direct strict-store reader and its admission/recovery consumers.
 // Only external effects are injected; every scorecard, status and run read uses real files.
 const callers = [
-  ['review-extra-seats: createRedTeamIo.readRecords', f => f.seatIo.readRecords({ strict: true }),
+  ...decisionCallers,
+  ['review-extra-seats: createRedTeamIo.readRecords', f => f.seatIo.readRecords(),
     missingThrows, result => expect(result).toEqual([])],
   ['review-extra-seats: sealing reader', f => {
     // A prior operator alert keeps this reader-only probe from writing the attention feed.
@@ -126,5 +170,16 @@ describe('strict scorecard caller matrix: missing holds, present-empty preserves
     const present = fixture(true);
     await empty(await run(present), present);
     expect(present.effects.filter(effect => !effect.startsWith('red-team-legacy'))).toEqual([]);
+  });
+});
+
+describe('strict decision caller matrix: malformed evidence stays available for inspection', () => {
+  it.each(decisionCallers)('%s', async (_name, run, _missing, _empty, malformed) => {
+    const f = fixture(true);
+    const text = '{"records":[{"priorEvidence":"keep me"}]';
+    writeFileSync(f.storePath, text);
+    await malformed(() => run(f), f);
+    expect(readFileSync(f.storePath, 'utf8')).toBe(text);
+    expect(f.effects).toEqual([]);
   });
 });

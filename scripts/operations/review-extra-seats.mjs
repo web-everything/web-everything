@@ -675,8 +675,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
       return { status: 'skipped', reason: 'the review loop printed no pinned head commit (netBasis.rev) — the released lane\'s HEAD is not safe to review' };
     }
     const now = io.now();
-    let records = [];
-    try { records = io.readRecords(); } catch (e) { io.log(`added seats: could not read the scorecard store (${e.message}) — treating it as empty`); }
+    const records = io.readRecords({ strict: true });
     // Card xn2wf9t — PER-PROVIDER caps, counted and reserved separately (see `resolveRoutingProviderCap`/
     // `callsUsedTodayForProvider`): a provider at its own cap is treated exactly like a quota hold or a missing
     // CLI — excluded from `available` — so `reviewSeatRoutes` naturally falls the seat back to whichever OTHER
@@ -872,12 +871,12 @@ export function reservationLedgerFileFor(provider) {
  * for admission, rather than under-reporting. `storePath` pins the store (tests/fixtures); default is the shared one.
  */
 export function readSeatCapUsage({ env = process.env, storePath, now = Date.now() } = {}) {
-  const stateDir = dirname(storePath ?? resolveScorecardStorePath());
+  const stateDir = dirname(storePath ?? resolveScorecardStorePath(env));
   const ledgers = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => {
     const path = join(stateDir, reservationLedgerFileFor(p));
     return [p, existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null];
   }));
-  return reviewSeatCapUsage(readStore(storePath ? { path: storePath } : {}).records, now, env, ledgers);
+  return reviewSeatCapUsage(readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records, now, env, ledgers);
 }
 
 /** How long a reservation waits for the ledger lock before giving up (and launching nothing). */
@@ -1032,8 +1031,8 @@ export function seatInputDir(scratch) {
 }
 
 export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storePath, lockTimeoutMs = LEDGER_LOCK_TIMEOUT_MS } = {}) {
-  const storeIo = storePath ? { path: storePath } : {};
-  const stateDir = dirname(storePath ?? resolveScorecardStorePath());
+  const storeIo = { path: storePath ?? resolveScorecardStorePath(env), strict: true };
+  const stateDir = dirname(storePath ?? resolveScorecardStorePath(env));
   const ledgerPathFor = (provider) => join(stateDir, reservationLedgerFileFor(provider));
   const newId = () => randomUUID();
   return {
@@ -1594,7 +1593,11 @@ async function finishRedTeamEffects({
   if (record) {
     const missRows = buildMissRows({ pr, repo, rev, runCallId: callId, redTeamProvider: provider, redTeamModel: model, builder, confirmed, changedFiles });
     for (const r of [...(seatRow ? [seatRow] : []), ...missRows.filter((m) => !missRowRecorded(records, m))]) {
-      try { io.append(r); rowsWritten += 1; } catch (e) { rowErrors += 1; io.log(`red team: evidence row (${r.missRole ?? r.seat}) NOT written — ${e.message}`); }
+      try { io.append(r); rowsWritten += 1; } catch (e) {
+        // A write failure may be retryable, but lost store evidence must stop all later effects.
+        io.readRecords({ strict: true });
+        rowErrors += 1; io.log(`red team: evidence row (${r.missRole ?? r.seat}) NOT written — ${e.message}`);
+      }
     }
   }
 
@@ -2016,8 +2019,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     // confirmed break in the fold: an accepting jury may have waived its own finding.
     const findings = pass.findings.map(f => ({ ...withFileReadEvidence(f),
       confirmedByClaude: claudeFindings ? Boolean(findingCorroboratedBy(f, claudeFindings)) : null }));
-    let records = [];
-    try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
+    const records = io.readRecords({ strict: true });
     const [seatRow] = buildSeatRows({
       evidence, startedAt: pass.startedAt, finishedAt: pass.finishedAt,
       callId, pr, repo, provider, model, effort, seats: [RED_TEAM_SEAT], call, parsed, claudeFindings, claudeVerdict: verdict, quota, durationMs,
@@ -2054,7 +2056,10 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       }, io));
     } else if (record) {
       // A pass that did not run cleanly leaves only its seat row — the quota hold and the daily cap read it.
-      try { io.append(row); rowsWritten = 1; } catch (e) { io.log(`red team: evidence row (${row.seat}) NOT written — ${e.message}`); }
+      try { io.append(row); rowsWritten = 1; } catch (e) {
+        io.readRecords({ strict: true });
+        io.log(`red team: evidence row (${row.seat}) NOT written — ${e.message}`);
+      }
     }
 
     if (record && post) {
@@ -2088,8 +2093,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     if (!fp || fp !== pass.readFingerprint) {
       return { status: 'stale', reason: `the speculative pass judged a different read (head ${String(pass.rev).slice(0, 12)} vs ${String(read?.netBasis?.rev ?? '-').slice(0, 12)})` };
     }
-    let records = [];
-    try { records = io.readRecords(); } catch { records = []; }
+    const records = io.readRecords({ strict: true });
     if (priorRedTeamRow(records, pr, pass.rev, repo)) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
@@ -2168,8 +2172,6 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   return {
     ...base,
     readAiRouting,
-    readRecords: ({ strict = false } = {}) => strict
-      ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
     readRecoveryComments: readCompleteComments,
     redTeamStatus: input => {

@@ -2319,7 +2319,7 @@ export function runReviewLabelCli({
       } else if (delegation) {
         const isMiss = to === 'changes';
         const outcome = isMiss ? 'reworked' : 'landed';
-        const trialStore = readTrialStore(trialLogIo);
+        const trialStore = readTrialStore({ ...trialLogIo, strict: true });
         const alreadyLogged = (trialStore?.records ?? []).some((row) =>
           row.dispatchKind === 'session-delegation' && row.pr === Number(pr) && row.outcome === outcome);
         if (!alreadyLogged) {

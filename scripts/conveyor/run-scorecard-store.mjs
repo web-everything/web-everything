@@ -226,7 +226,7 @@ export function mergeLegacyStores(target, legacyTexts, stamps = []) {
  * must stay fast — no git, no network. Like every user of that lock, it is best-effort: a holder that cannot
  * get it within 5s (or hits an unexpected fs error) writes unlocked rather than fail a scoring pass, so a lost
  * update stays possible only under that extreme contention. Probation builds pass `requireLock: true`
- * to migration and append: lock acquisition failure then refuses the write instead.
+ * to append: lock acquisition failure then refuses the write instead.
  */
 function withStoreLock(path, fn, requireLock = false) {
   return withInfraLock(path, fn, { requireLock });
@@ -310,12 +310,12 @@ export class MissingStoreError extends Error {
  * caller always gets a usable (if empty) history rather than a crash mid-scoring-pass.
  *
  * On the first real read of the DEFAULT store in a process (no `path`, no injected `read`), the one-time
- * {@link migrateLegacyStore} runs first, so no reader ever sees the history the old tracked file held go
- * missing. An explicit `path` or injected IO reads exactly what it is given.
- * `strict` preserves read/parse failures for admission checks; absence throws MissingStoreError.
+ * {@link migrateLegacyStore} runs first for non-strict reads. An explicit `path` or injected IO reads
+ * exactly what it is given. Strict reads only observe evidence: they never migrate or stamp the store,
+ * and preserve read/parse failures; absence throws MissingStoreError before any migration can create it.
  */
 export function readStore({ path, read, exists, strict = false } = {}) {
-  ensureMigrated({ path, read, exists });
+  if (!strict) ensureMigrated({ path, read, exists });
   const target = path ?? resolveScorecardStorePath();
   const doRead = read ?? ((p) => readFileSync(p, 'utf8'));
   try {
@@ -324,7 +324,7 @@ export function readStore({ path, read, exists, strict = false } = {}) {
       return { version: 1, records: [] };
     }
     const parsed = parseStoreText(doRead(target));
-    if (!parsed && strict) throw new Error('scorecard store malformed');
+    if (!parsed && strict) throw new Error('scorecard store malformed; inspect stored evidence before retrying');
     return parsed ?? { version: 1, records: [] };
   } catch (error) {
     if (strict) {
@@ -342,7 +342,9 @@ export function writeStore(store, { path = resolveScorecardStorePath(), write = 
 
 /**
  * Append ONE scorecard row. REFUSES (throws) on an invalid row — a scorecard is a durable historical fact,
- * so a caller must fix the row rather than have it silently coerced or dropped.
+ * so a caller must fix the row rather than have it silently coerced or dropped. The existing store must
+ * pass a strict read under the append lock; missing or unreadable evidence is never replaced. Initialize
+ * a new store explicitly with writeStore after inspecting/recovering any prior evidence.
  * @param {object} row - everything `validateScorecard` requires, plus whatever else Fork 2's shape names
  *   (`item`, `handle`, `effort`, `outcome`, `probationStatus`, `scoredAt`, …) — including `changedFiles` (#4034
  *   follow-up, card 4034b), the PR's changed files net versus its base, and `prepared` (#4304: whether the
@@ -375,11 +377,10 @@ function appendRowToStore(row, io, alreadyJudged = () => false) {
   if (!verdict.ok) {
     throw new Error(`run-scorecard-store: refusing to append an invalid scorecard:\n  - ${verdict.errors.join('\n  - ')}`);
   }
-  // Migrate first (it takes the lock itself), then read-modify-write under the lock so a concurrent append or
-  // migration is never overwritten. Injected in-memory IO has no file to lock.
-  ensureMigrated(io);
+  // Read strictly under the lock: neither migration nor an empty-history fallback may replace missing or
+  // malformed evidence. Injected in-memory IO has no file to lock.
   const appendRow = () => {
-    const store = readStore(io);
+    const store = readStore({ ...io, strict: true });
     if (alreadyJudged(store.records)) return null;
     store.records.push(stamped);
     writeStore(store, io);

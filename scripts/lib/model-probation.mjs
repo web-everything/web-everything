@@ -438,7 +438,7 @@ function lookupPrWithGh(launch) {
 
 /** Run the judge command with injectable lookup, store IO and logging; never modifies the registry. */
 export function runJudge({ lookupPr = lookupPrWithGh, io = {}, dryRun = false, log = console.log } = {}) {
-  const { judged, pending, failed } = judgePendingTrials(readStore(io).records, {
+  const { judged, pending, failed } = judgePendingTrials(readStore({ ...io, strict: true }).records, {
     lookupPr, append: dryRun ? () => {} : row => appendScorecardUnlessJudged(row, io),
   });
   for (const t of judged) log(`${dryRun ? '(dry run) ' : ''}PR #${t.pr} ${t.provider}/${t.model} · ${t.taskType}: ${t.outcome}${t.criticalMiss ? ' (critical miss)' : ''}`);

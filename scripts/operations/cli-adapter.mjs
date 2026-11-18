@@ -679,9 +679,8 @@ export const PROVIDER_QUOTA_FALLBACK = Object.freeze({ codex: 'antigravity' });
  * such caller, whether or not it ever seats a graceful judge request; the dynamic import here pays it only
  * when a request actually opts in (today, only `review-pr`'s `judgeAdvisory` seat).
  *
- * Never throws: an unreadable store, a failed import, or any other scan error reads as "no records", which
- * `quotaHold` itself already treats as usable — the same fail-open posture `review-extra-seats.mjs` takes on
- * its own read (`runExtraSeats`'s `catch` around `io.readRecords()`).
+ * Never throws: unreadable evidence returns an operator-visible hold reason, so provider admission
+ * cannot mistake missing history for clearance.
  * @param {string} providerName
  * @param {number} when - epoch ms.
  * @returns {Promise<string|null>} the hold reason, or null when usable.
@@ -692,9 +691,9 @@ export async function defaultProviderQuotaHold(providerName, when) {
       import('./review-extra-seats.mjs'),
       import('../conveyor/run-scorecard-store.mjs'),
     ]);
-    return quotaHold(readStore().records, providerName, when);
-  } catch {
-    return null;
+    return quotaHold(readStore({ strict: true }).records, providerName, when);
+  } catch (error) {
+    return `scorecard evidence unreadable: ${String(error?.message ?? error)}; inspect stored evidence before retrying`;
   }
 }
 

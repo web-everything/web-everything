@@ -1026,7 +1026,7 @@ runner result names the failed check even when the output tail only contains the
 Verify parallel isolation with the integration test
 `scripts/__tests__/lane-pool-acquire-shares-scan-cache.test.mjs` (the three concurrent acquirers case).
 The build-run tests separately race real scorecard writers in temporary storage. Probation builds
-pass `requireLock: true` through scorecard migration and append, refusing the shared lock's usual
+pass `requireLock: true` through scorecard append, refusing the shared lock's usual
 unlocked fallback on timeout. A refused scorecard write is reported on stderr without undoing a
 successful build. Operation records use UUID filenames and atomic rename; call logs use append-only
 writes, so they do not replace a sibling process's records.
@@ -4448,9 +4448,29 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 scorecard reads and their recovery consumers. Each row uses real temporary scorecard,
 status and review-run files: a missing store retains the hold, denies an exemption/retry
 or refuses the read; a present-empty store preserves the caller's previous behavior.
-Keep the record reader, sealing reader, recovery guard, speculation, recovery witness,
-drain evidence, withheld publisher, review-job admission/infra guard, retry predicates
-and on-skip recovery consumers in this table. Missing evidence requires operator
-inspection before retrying. The store unit suite separately pins `MissingStoreError`
-for strict absence and unchanged non-strict reads. Run these and the affected red-team
-suites through the host heavy-admission queue.
+Keep the record readers, sealing reader, recovery guard, speculation, recovery witness,
+drain evidence, withheld publisher, review-job admission/infra guard, retry predicates,
+on-skip recovery consumers, extra-seat admission/reservations, quota clearance, provider
+availability, dispatch trial reader, probation judge, append and both red-team finalizers
+in this table. Missing or malformed evidence requires operator inspection before retrying.
+Strict reads only observe the existing file: they never run lazy migration, even when a
+no-history git stamp would otherwise create an empty store. Appends always re-read strictly
+under the store lock, including ordinary scorecards and once-only probation trials. Recover
+the original evidence before retrying; only explicitly initialize a new empty store with
+`writeStore` after inspection establishes that no prior history needs recovery.
+
+The store suite proves default strict absence creates no file or migration directory, with
+real legacy-history and no-history repositories as controls. The red-team suite admits a
+real pass, then removes/truncates its file before completion or speculative finalization
+(and immediately before append); every case refuses without replacing the file or publishing
+finished effects. Its intact control preserves history and finalizes normally.
+
+Audited decision edges: `runExtraSeats`, `createExtraSeatsIo.readRecords`,
+`createExtraSeatsIo.reserveCalls`, `readSeatCapUsage`, `completeRedTeam`,
+`finishSpeculativeRedTeam`, the shared append implementation (including discard, miss,
+delegation and probation rows), `defaultProviderQuotaHold`, `dispatchProviderAvailable`,
+`defaultReadScorecards`, `runJudge`, and the `review-set-label` delegation dedup read.
+The dispatch trial reader retains its fail-closed `[]` fallback (no qualifying trials),
+and quota-read failures return an explicit inspection hold. Remaining non-strict scorecard
+reads serve reports/aggregates or explicit maintenance backfills, not admission, clearance,
+retry or finalization. Run the matrix and affected suites through host heavy admission.

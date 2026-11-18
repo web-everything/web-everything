@@ -721,6 +721,7 @@ describe('standalone task types and workers', () => {
   it('separate processes append all scorecards under the existing store lock', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'probation-scorecard-race-'));
     const path = join(dir, 'scorecards.json');
+    writeFileSync(path, JSON.stringify({ version: 1, records: [] }));
     const storeUrl = pathToFileURL(resolve('scripts/conveyor/run-scorecard-store.mjs')).href;
     const launcherUrl = pathToFileURL(resolve('scripts/lib/probation-launcher.mjs')).href;
     try {

@@ -661,7 +661,7 @@ export function defaultRunNode(argv, opts = {}, { exec = execFileSync } = {}) {
  *
  * #3906 adaptation: the prototype read the tracked `scripts/conveyor/run-scorecards.json`; main moved the trial
  * history to ONE shared store outside every git tree (#4155), so this reads through that store's own reader
- * (`run-scorecard-store.mjs#readStore`, which never throws). Anything unusable yields `[]` — NO trials — which
+ * (`run-scorecard-store.mjs#readStore`, in strict mode). Anything unusable yields `[]` — NO trials — which
  * is fail-closed here: with no clean verified trials the cascade can never find a non-Claude provider fit.
  *
  * READ-ONLY BY CONSTRUCTION: the store path is passed EXPLICITLY, which is what makes `readStore` skip its
@@ -670,7 +670,7 @@ export function defaultRunNode(argv, opts = {}, { exec = execFileSync } = {}) {
  * @param {{readStore?: () => {records?: unknown}}} [io]
  * @returns {Array<object>} the records, or `[]`.
  */
-export function defaultReadScorecards({ readStore = () => readScorecardStore({ path: resolveScorecardStorePath() }) } = {}) {
+export function defaultReadScorecards({ readStore = () => readScorecardStore({ path: resolveScorecardStorePath(), strict: true }) } = {}) {
   try {
     const records = readStore()?.records;
     return Array.isArray(records) ? records.filter((r) => r && typeof r === 'object') : [];

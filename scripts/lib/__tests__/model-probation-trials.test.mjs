@@ -11,7 +11,7 @@ import {
   graduationProgress, judgePendingTrials, judgedTrialRow, pendingProbationLaunches, trialOutcomeFromPr, runJudge,
 } from '../model-probation.mjs';
 import { launchScorecardRow } from '../probation-launcher.mjs';
-import { appendScorecard, readStore } from '../../conveyor/run-scorecard-store.mjs';
+import { appendScorecard, readStore, writeStore } from '../../conveyor/run-scorecard-store.mjs';
 import { criticalMissesFor, isCriticalMiss } from '../critical-work.mjs';
 
 const worker = { id: 'codex', provider: 'codex', model: 'gpt-6-astra', executor: 'codex', taskType: 'ci-heal' };
@@ -64,7 +64,7 @@ describe('judgedTrialRow', () => {
 describe('judgePendingTrials through the real scorecard store', () => {
   let dir;
   let io;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'probation-trials-')); io = { path: join(dir, 'run-scorecards.json') }; });
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'probation-trials-')); io = { path: join(dir, 'run-scorecards.json') }; writeStore({ version: 1, records: [] }, io); });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   it('converts a reviewed launch into a verified trial the report counts, once', () => {
@@ -164,6 +164,7 @@ it('#4439 real CLI reads paginated current verdict events, fails closed and repo
   const dir = mkdtempSync(join(tmpdir(), 'judge-cli-'));
   try {
     const io = { path: join(dir, 'store.json') };
+    writeStore({ version: 1, records: [] }, io);
     const cli = resolve(import.meta.dirname, '../model-probation.mjs');
     const stub = `#!${process.execPath}
 const args = process.argv.slice(2);

@@ -2277,7 +2277,7 @@ describe('the write arc and its #2964 ordering', () => {
       const p = stubProvider({ labels: ['review:pending'], body, title: 'Fix launch wrapper' });
       const io = memIo();
       const readTrialStore = vi.fn((passedIo) => {
-        expect(passedIo).toBe(io);
+        expect(passedIo).toEqual({ ...io, strict: true });
         expect(p.calls).toContain('postComment');
         expect(p.calls).toContain('setLabels');
         expect(p.calls).not.toContain('readLabels');
