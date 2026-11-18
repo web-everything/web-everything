@@ -49,7 +49,7 @@ describe('R501 needs-git vs host overload', () => {
 });
 
 describe('R501 remote success record', () => {
-  it.each([false,true])('main preserves remote-runs and logs usage only with resources=%s', async measured => {
+  for (const measured of [false, true]) it(`main preserves remote-runs and logs usage only with resources=${measured}`, async () => {
     const root = mk(); const pool = join(root, 'pool'); mkdirSync(pool);
     const prefs = join(root, 'preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always' } } }));
