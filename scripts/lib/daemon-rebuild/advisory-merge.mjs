@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { FULL_SHA_RE } from './shared.mjs';
 
@@ -46,6 +47,7 @@ function mergeRegistryLines(baseText, oursText, theirsText) {
     for (const line of lines(text)) {
       if (cursor < base.length && line === base[cursor]) cursor++;
       else {
+        if (!/^ \* /.test(line) || line.includes('/*') || line.includes('*/')) return null;
         const count = added[cursor].get(line) || 0;
         if (side === 1 && count > 0) added[cursor].set(line, count - 1);
         else {
@@ -61,10 +63,12 @@ function mergeRegistryLines(baseText, oursText, theirsText) {
 }
 
 function validateModule(path) {
-  return spawnSync(process.execPath,
-    ['--input-type=module', '-e', 'await import(process.argv[1])', pathToFileURL(path).href], {
+  const sentinel = `advisory-import-complete:${randomUUID()}`;
+  const result = spawnSync(process.execPath,
+    ['--input-type=module', '-e', `await import(process.argv[1]); console.log(${JSON.stringify(sentinel)})`, pathToFileURL(path).href], {
     encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-  }).status === 0;
+  });
+  return result.status === 0 && result.stdout?.split('\n').includes(sentinel);
 }
 
 function readMerge(git, revisions, path) {
