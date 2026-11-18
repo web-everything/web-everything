@@ -220,3 +220,18 @@ it('final live green checks on the pinned open head permit admission; an unknown
   expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], readLive: () => row() }).hold).toBe(false);
   expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: null, readLive: () => row() }).hold).toBe(true);
 });
+
+it.each([undefined, null, false])('refuses cached rows when the live target reader is missing (%s)', async readTarget => {
+  const path = setup(); save(path);
+  const listLive = vi.fn();
+  await expect(readFastDrainRoundListing({ ...options(path), listLive, readTarget }))
+    .rejects.toThrow('live target reader missing — retry next pass');
+  expect(listLive).not.toHaveBeenCalled();
+});
+
+it.each([null, {}, { ...row(), number: 99 }, { ...row(), state: 'UNKNOWN' }])(
+  'refuses cached rows when the live target is unreadable (%j)', async target => {
+    const path = setup(); save(path);
+    await expect(readFastDrainRoundListing({ ...options(path), readTarget: async () => target }))
+      .rejects.toThrow('live target unreadable');
+  });

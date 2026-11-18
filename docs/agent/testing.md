@@ -4475,3 +4475,14 @@ final live evidence winning over a cached green row on the actual `enqueuePr` mu
 Run it with `fast-drain-scope.test.mjs`, `enqueue-on-event.test.mjs` and
 `merge-queue-enqueue.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+
+## Fast-drain final admission evidence
+
+The synchronous enqueue boundary and asynchronous listing reads share `resolveListedChecks` and
+its check-run pagination logic. A capped rollup requires resolving every required name against the
+pinned head; a failed direct read must retain the hold even if the visible rollup is green.
+`scripts/__tests__/merge-ai-prs.test.mjs` drives `createFastDrainEnqueueVerifier` with GitHub I/O
+fixtures, including a successful admission through the production required-checks lookup, so a
+broken reference cannot hide behind fail-closed handling. Round snapshots always require a live
+target reader; missing readers throw instead of returning cached rows.

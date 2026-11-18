@@ -227,7 +227,7 @@ export async function readFastDrainRoundListing({ path, repo, onlyPr, env = proc
   }
   log(`fast-drain: ${base.hit ? 'served-from-snapshot' : 'listed-live'} (round listing; TTL=${ttl.seconds}s, source=${ttl.source})`);
   reuseDefaultBranch(base.defaultBranch);
-  if (!readTarget) return base.rows;
+  if (typeof readTarget !== 'function') throw new Error('round listing live target reader missing — retry next pass');
   const target = await readTarget();
   if (!target || String(target.number) !== String(onlyPr) || !['OPEN', 'CLOSED', 'MERGED'].includes(target.state)) {
     throw new Error('round listing live target unreadable');
