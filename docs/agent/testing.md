@@ -4665,3 +4665,16 @@ pr-land refusal, drain holds, parked bundles and advisory evidence. Positive pin
 fixtures must explicitly simulate successful fetches and supply the fetched base identity;
 throwing “offline” cannot stand in for a successful scored read. Legacy unpinned display
 reads retain their cached-ref fallback. Run these regressions through heavy-admission.
+
+## Paired net-diff evidence
+
+Text and path readers must share one `resolveNetDiffBasis({ pinRev: true })` result,
+including `baseSha`. Compare both returned head and base identities, then run
+`verifyRenderedDiff` on the actual returned text and listed paths; a second rendered
+patch cannot validate the first. Missing sections, unequal path counts, identity
+mismatches, and unreported opaque paths invalidate the whole pair. Retain the
+unscored fallback for human review of the full diff. `fetch-parked.test.mjs` covers
+the incomplete-first-render probe, advancing-base pin, and mismatched pair identities.
+`review-pr-io-pinned-head.test.mjs` exercises the same incomplete-render failure
+through the review reader. `merge-gate-ci.test.mjs` covers acceptance reusing the
+scored text after main advances and retaining unscored evidence when rendering fails.

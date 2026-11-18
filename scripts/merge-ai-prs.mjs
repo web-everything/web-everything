@@ -4281,7 +4281,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Structural/raw verification failures still throw and invalidate this entire result.
     const needsReview = [];
     const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }, { needsReview }) || '');
-    return { text, ...(needsReview.length ? { needsReview } : {}), base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
+    return { text, ...(needsReview.length ? { needsReview } : {}), base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha, baseSha: basis.baseSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
@@ -4387,6 +4387,26 @@ export function scanDrainTestTampering(netDiffText) {
   return gaming;
 }
 
+/** Validate the actual paired outputs, not a separately re-rendered patch. Throws to
+ * invalidate the whole read; callers retain their unscored/human-review fallback.
+ */
+export function verifyNetDiffPair({ exec, basis, text, paths }) {
+  if (!basis?.ok || !basis.revSha || !basis.baseSha ||
+      text?.scored !== true || paths?.scored !== true ||
+      text.revSha !== paths.revSha || text.revSha !== basis.revSha ||
+      text.baseSha !== paths.baseSha || text.baseSha !== basis.baseSha ||
+      text.base !== paths.base || text.base !== basis.diffBase ||
+      text.rev !== paths.rev || text.rev !== basis.candidate ||
+      typeof text.text !== 'string' || !Array.isArray(paths.paths)) {
+    throw new Error('paired diff basis mismatch; human review required');
+  }
+  const needsReview = [];
+  verifyRenderedDiff(exec, text.base, text.rev, text.text, { paths: paths.paths, needsReview });
+  if (needsReview.some(path => !text.needsReview?.includes(path))) {
+    throw new Error('unreported opaque diff path; human review required');
+  }
+}
+
 /**
  * #2901 / #1031 review finding 5 — the NET changed-file list as PLAIN PATHS, off the SAME basis
  * `computeNetDiffText` resolves. This is the list a REVIEWER or a JUROR may cite.
@@ -4430,7 +4450,7 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
     const paths = String(raw || '').split('\0').filter(Boolean);
     const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate]));
     verifyRenderedDiff(exec, diffBase, candidate, text, { paths });
-    return { paths, base: diffBase, rev: candidate, scored: true, ...(pinRev ? { revSha: basis.revSha } : {}) };
+    return { paths, base: diffBase, rev: candidate, scored: true, ...(pinRev ? { revSha: basis.revSha, baseSha: basis.baseSha } : {}) };
   } catch (err) {
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
   }

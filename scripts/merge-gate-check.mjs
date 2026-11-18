@@ -40,7 +40,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluatePrGates, evaluateGroup, groupMembership, prNumberOfSubject, formatPrResult } from './lib/merge-gate-ci.mjs';
 import { deferCandidacyHoldsOnPrEvent, loadMergeGateHoldSetting } from './lib/merge-gate-hold-class.mjs';
-import { readDrainAcceptance, computeNetDiffSignals, computeNetDiffText } from './merge-ai-prs.mjs';
+import { readDrainAcceptance, computeNetDiffSignals } from './merge-ai-prs.mjs';
 import { extractManifestFromBody } from './readiness/lane-manifest.mjs';
 import { remoteManifestApiArgs } from './lib/remote-manifest.mjs';
 import { findDuplicateIds } from './lib/duplicate-id-tripwire.mjs';
@@ -290,7 +290,12 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
     else {
       try {
         const acc = readDrainAcceptance({ pr: num, repo, cwd, local: true, exec: (c, a, o) => exec(c, a, { cwd, ...o }),
-          netDiff: (o) => { const t = computeNetDiffText({ ...o, rev: pin.sha, fetchExtraRefs: [], pinRev: true }); return t?.revSha === pin.sha ? t : { ...t, scored: false }; } });
+          // Reuse the exact text already paired with the scored signals. A second
+          // resolution could advance main while retaining the same pinned head.
+          netDiff: () => {
+            const t = facts.netSignals?.netDiffText;
+            return facts.netSignals?.scored && t?.revSha === pin.sha ? t : { text: '', scored: false };
+          } });
         facts.acceptance = acc?.headSha === pin.sha ? acc : { error: `acceptance read saw head ${String(acc?.headSha).slice(0, 9)}, not the pinned ${pin.sha.slice(0, 9)}` };
       } catch (e) { facts.acceptance = { error: firstLine(e) }; }
     }

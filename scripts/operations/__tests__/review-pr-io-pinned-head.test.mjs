@@ -63,6 +63,24 @@ describe('review read pins real Git evidence before merge-base', () => {
         headRefName: 'lane/security', comments: [], labels: [], files: [] }), ...overrides });
     return { result, calls };
   };
+  it('invalidates both outputs when the first rendered text omits the later listed path', () => {
+    let renders = 0;
+    const exec = (cmd, args, opts) => {
+      if (args[0] === 'fetch') return '';
+      if (args.at(-1) === 'FETCH_HEAD^{commit}') return base;
+      if (args.includes('diff') && !args.some(a => ['--raw', '--numstat', '--name-only'].includes(a))) {
+        renders++;
+        if (renders === 1) return '';
+      }
+      if (args.includes('--raw') && renders === 1) return '';
+      return execFileSync(cmd, args, { ...opts, cwd: root });
+    };
+    const { result } = read(null, { exec });
+    expect(result.net).toMatchObject({ scored: false, paths: [] });
+    expect(result.diff).toMatchObject({ scored: false, text: '' });
+    expect(renders).toBe(2);
+  });
+
   const expectExecutable = result => {
     expect(result.net).toMatchObject({ scored: true, rev: executable, revSha: executable, base, paths: ['executable.mjs'] });
     expect(result.diff).toMatchObject({ scored: true, rev: executable, base });

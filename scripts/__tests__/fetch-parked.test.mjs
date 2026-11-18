@@ -9,6 +9,7 @@ import {
   filterToRequired, recoverCheckRows, resolveRequiredNames,
   scopeFilesToNet, resolveNetDiff, sameCommit,
 } from '../fetch-parked.mjs';
+import { verifyNetDiffPair } from '../merge-ai-prs.mjs';
 import { classifyChecks } from '../pr-land.mjs';
 import { parseEscalationReason } from '../review-detail.mjs';
 import { buildEscalationReasonBlock } from '../lib/review-escalation.mjs';
@@ -477,6 +478,49 @@ describe('resolveNetDiff — a `net` basis is CLAIMED only when it is PROVEN', (
     expect(r.basis).toBe('net');
     expect(r.text).toContain('diff --git');
     expect(r.paths).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('refuses the probe: first text omits x.ts while the later path read includes it', () => {
+    const full = fakeExec({ names: 'x.ts\0y.ts\0', diffText: 'diff --git a/x.ts b/x.ts\nold mode 100644\nnew mode 100755\ndiff --git a/y.ts b/y.ts\nold mode 100644\nnew mode 100755\n' });
+    let renders = 0;
+    const exec = (cmd, args, opts) => {
+      if (args.includes('diff') && !args.some(a => ['--raw', '--numstat', '--name-only'].includes(a))) {
+        renders++;
+        if (renders === 1) return 'diff --git a/y.ts b/y.ts\nold mode 100644\nnew mode 100755\n';
+      }
+      // Each read is internally consistent; only cross-checking the returned pair catches this.
+      if (args.includes('--raw') && renders === 1) return `:100644 100755 ${OID} ${OID} M\0y.ts\0`;
+      return full.exec(cmd, args, opts);
+    };
+    expect(resolveNetDiff({ exec, headRef: 'lane/x', headRefOid: OID }))
+      .toEqual({ text: '', paths: [], basis: 'three-dot' });
+    expect(renders).toBe(2);
+  });
+
+  it('pins one base resolution even when a later fetch would advance main', () => {
+    const fake = fakeExec();
+    let baseFetches = 0;
+    const bases = [];
+    const exec = (cmd, args, opts) => {
+      if (args[0] === 'fetch' && args.includes('+main:refs/remotes/origin/main')) baseFetches++;
+      if (args[0] === 'rev-parse' && /(?:main|FETCH_HEAD)\^\{commit\}$/.test(args.at(-1))) {
+        return (baseFetches > 1 ? 'f'.repeat(40) : OID) + '\n';
+      }
+      if (args.includes('diff') && !args.includes('--numstat')) bases.push(args.slice(args.indexOf('--end-of-options') + 1));
+      return fake.exec(cmd, args, opts);
+    };
+    expect(resolveNetDiff({ exec, headRef: 'lane/x', headRefOid: OID }).basis).toBe('net');
+    expect(baseFetches).toBe(1);
+    expect(bases.length).toBeGreaterThan(0);
+    expect(bases.every(refs => refs[0] === OID || refs[0] === `${OID}..${OID}`)).toBe(true);
+  });
+
+  it.each(['baseSha', 'base', 'revSha'])('refuses paired outputs with differing %s before raw verification', field => {
+    const basis = { ok: true, revSha: OID, baseSha: OID, diffBase: OID, candidate: OID };
+    const text = { scored: true, text: '', revSha: OID, baseSha: OID, base: OID, rev: OID };
+    const paths = { ...text, paths: [], [field]: 'f'.repeat(40) };
+    expect(() => verifyNetDiffPair({ exec: () => { throw new Error('must not read'); }, basis, text, paths }))
+      .toThrow(/paired diff basis mismatch/);
   });
 
   it('guards EVERY caller-supplied argv position with --end-of-options', () => {

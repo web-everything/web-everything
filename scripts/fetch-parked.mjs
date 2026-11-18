@@ -31,7 +31,7 @@
 import { execFileSync } from 'node:child_process';
 // #2901 — the NET two-tree diff basis. merge-ai-prs.mjs guards its CLI behind `if (IS_CLI)`, so importing
 // this one function does not run the lander; the /review skill mandates the same import for the same reason.
-import { computeNetDiffText, computeNetDiffPaths, collapseRollupToLatestPerName } from './merge-ai-prs.mjs';
+import { computeNetDiffText, computeNetDiffPaths, resolveNetDiffBasis, verifyNetDiffPair, collapseRollupToLatestPerName } from './merge-ai-prs.mjs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { classifyChecks } from './pr-land.mjs';
@@ -331,17 +331,20 @@ export function resolveNetDiff({ exec, headRef, headRefOid } = {}) {
   //     the proof site returned the head 93d417ae while the diff site returned the tag 02d9552b, and `net` was
   //     still claimed. `git clone` fetches tags by default and `git fetch origin <ref>` auto-follows them; the
   //     local-BRANCH variant resolves with no ambiguity warning at all.
-  //   • TOCTOU. Each compute re-runs `resolveNetDiffBasis`, which re-fetches — so the proof is re-invalidated
+  //   • TOCTOU. Previously each compute re-ran `resolveNetDiffBasis`, which re-fetches — so the proof is re-invalidated
   //     twice, after the fact. A head that moves mid-run (a rebase-drop force-push, a producer push landing
   //     mid-drain — both routine here) yields a `net`-labelled diff of commit B while `view.files` and the
   //     reviewed sha are commit A: verbatim the failure this function claims to eliminate.
-  // Passing the pinned object id closes both: only the exact oid is resolved,
-  // and an object id cannot move. `fetchExtraRefs` still carries the NAME so the fetch stays correct.
+  // Pin both ends once and share that basis: neither the head nor the fetched base
+  // can move between the reads. `fetchExtraRefs` still carries the NAME for transport.
   const rev = pinnedHead;
-  const net = computeNetDiffText({ exec, rev, fetchExtraRefs: [headRef], pinRev: true });
+  const basis = resolveNetDiffBasis({ exec, rev, fetchExtraRefs: [headRef], pinRev: true });
+  const net = computeNetDiffText({ exec, rev, basis, pinRev: true });
   if (!net || !net.scored || net.revSha !== pinnedHead || typeof net.text !== 'string') return degraded;
-  const list = computeNetDiffPaths({ exec, rev, fetchExtraRefs: [headRef], pinRev: true });
+  const list = computeNetDiffPaths({ exec, rev, basis, pinRev: true });
   if (!list || !list.scored || list.revSha !== pinnedHead) return degraded;
+  try { verifyNetDiffPair({ exec, basis, text: net, paths: list }); }
+  catch { return degraded; }
   // An EMPTY net diff is not a failure — it is this basis's most valuable signal: the branch is
   // content-identical to main. `scored` already separates "empty" from "could not resolve", so discarding it in
   // favour of the inflated three-dot diff would throw away the one case a reviewer most needs told about.

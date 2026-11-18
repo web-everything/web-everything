@@ -8,6 +8,7 @@ import yaml from 'js-yaml';
 import { evaluatePrGates, evaluateGroup, groupPrNumbers, groupMembership, asQueuedPr, resolveMergeGateMode, loadMergeGateMode, applyGateMode, runGate, STANDARD_MERGE_GATE_MODE } from '../merge-gate-ci.mjs';
 import { DRAIN_GATES } from '../merge-gate-inventory.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+import { normalizeDiffFingerprint } from '../review-escalation.mjs';
 import { scoreEscalation } from '../review-escalation.mjs';
 import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
@@ -1063,6 +1064,43 @@ function realGitExec(clone, ghRules) {
 }
 
 describe('gatherPrFacts pins every git read to the exact head sha', () => {
+  it.each([false, true])('acceptance reuses scored text and never resolves a second base (unscored=%s)', unreadable => {
+    const { git, work, clone, commit } = gitRepo();
+    const prior = git(work, 'rev-parse', 'HEAD');
+    git(work, 'checkout', '--quiet', '-b', 'lane/x');
+    const pinned = commit('lane/x', 'docs/a.md', 'pinned change\n');
+    let acceptanceStarted = false;
+    let laterBaseFetches = 0;
+    const runner = realGitExec(clone, [
+      [/pr view 7 .*--json number,title/, () => prJson({ headRefOid: pinned, headRefName: 'lane/x' })],
+      GH_MANIFEST_404, GH_HISTORY(0, []),
+      // readPrReviews emits JSON lines (jq .[]); no reviews means no lines.
+      [/pulls\/7\/reviews/, ''],
+      [/pr view 7 .*headRefOid,headRefName,comments/, () => {
+        acceptanceStarted = true;
+        git(work, 'checkout', '--quiet', 'main');
+        commit('main', 'upstream.md', 'main advanced\n');
+        return JSON.stringify({ headRefOid: pinned, headRefName: 'lane/x', comments: [{ viewerDidAuthor: true,
+          body: `✅ review — accepted\n<!-- reviewed-sha: ${prior} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint('diff --git a/docs/a.md b/docs/a.md\n@@ -1 +1 @@\n-old\n+prior\n')} -->` }] });
+      }],
+    ]);
+    const exec = (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'fetch' && args.some(a => a.includes('+main:'))) {
+        if (acceptanceStarted) laterBaseFetches++;
+      }
+      if (unreadable && cmd === 'git' && args.includes('diff') &&
+          !args.some(a => ['--raw', '--numstat', '--name-only'].includes(a))) throw new Error('renderer unreadable');
+      return runner(cmd, args, opts);
+    };
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: clone, defaultBranch: 'main',
+      ledgerConfig: { authority: 'labels' }, expectedHeadSha: pinned, exec });
+    expect(acceptanceStarted).toBe(true);
+    expect(laterBaseFetches).toBe(0);
+    expect(facts.netSignals.scored).toBe(!unreadable);
+    if (unreadable) expect(facts.acceptance).toMatchObject({ headReadFailed: true, headDiff: null });
+    else expect(facts.acceptance.headDiff).toBe(facts.netSignals.netDiffText.text);
+  });
+
   it('TOCTOU: the branch moves after the PR was read — the gate still judges the pinned sha, not the branch', () => {
     const { git, work, clone, commit } = gitRepo();
     git(work, 'checkout', '--quiet', '-b', 'lane/x');

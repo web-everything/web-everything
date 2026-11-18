@@ -53,7 +53,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assembleReviewDetail } from '../review-detail.mjs';
-import { computeNetDiffPaths, computeNetDiffText, resolveNetDiffBasis } from '../merge-ai-prs.mjs';
+import { computeNetDiffPaths, computeNetDiffText, resolveNetDiffBasis, verifyNetDiffPair } from '../merge-ai-prs.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { fingerprintOf, readStackBase, stackNetDiffText, stackNetFiles } from '../conveyor/review-stack-base.mjs';
 import { currentActorId, parseAuthorActorId } from '../lib/review-independence.mjs';
@@ -421,6 +421,15 @@ export function readPr({
   });
   let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
   let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
+  try {
+    if (netText.scored === true && netPaths.scored === true) {
+      verifyNetDiffPair({ exec: gitExec, basis, text: netText, paths: netPaths });
+    }
+  }
+  catch {
+    netText = { text: '', scored: false, reason: 'diff-pair-invalid' };
+    netPaths = { paths: [], scored: false, reason: 'diff-pair-invalid' };
+  }
   // Fail closed: the two reads answer one question. If either is unscored, neither may stand as a scored read.
   if (netText.scored !== true || netText.needsReview?.length || netPaths.scored !== true) {
     netText = { text: '', base: null, rev: null, scored: false, reason: netText.reason || (netText.needsReview?.length ? 'needs-human-review' : netPaths.reason) || 'diff-failed' };
