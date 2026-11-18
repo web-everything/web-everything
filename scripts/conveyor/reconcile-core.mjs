@@ -3167,7 +3167,9 @@ export function planReconcile({
     }
 
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
-    const reviewHoldRed = ciRepairOwed && admissionCi.checks === pr?.statusCheckRollup
+    // Admission filtering must not disable the raw-evidence hold when a durable
+    // ci:failed label still routes a review-held PR through the CI repair path.
+    const reviewHoldRed = ciRepairOwed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
