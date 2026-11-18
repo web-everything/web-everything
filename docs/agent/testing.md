@@ -1,6 +1,22 @@
 # Testing — Three-Tier Strategy
 
+## Review PR fetch isolation (R37)
+
+Review PR transport runs in a fresh temporary bare repository with empty global/system
+config, never in the agent-writable lane. The lane contributes only alternate objects and
+one negotiation ref; a bounded binary pack/index-pack handoff imports the pinned commit.
+`review-job-fetch-security.test.mjs` replants hostile local/worktree/includeIf config after
+the scrub to prove isolation, and checks failed handoffs and moved heads leave the commit absent.
+
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
+## Review PR transport isolation (R37)
+
+`review-job-fetch-security.test.mjs` replants URL rewrites and transport settings after the lane
+scrub: the network fetch must run in a fresh bare repository with empty global/system config.
+Only object data crosses back through a bounded thin-pack handoff. Keep both review entry points,
+worktree/includeIf config, unborn HEAD, and refused pack/index-pack cases covered; a moved PR head
+must be refused before importing objects. Do not replace this boundary with more config reject rules.
 
 ## Human-only enqueue approval license (R212)
 
@@ -2199,6 +2215,8 @@ a delayed request starts later and remains active at 28 minutes.
 
 Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
 operator-confirmed cleanup remain the fallback while capacity is retained.
+Cancel-finish waits for the supervisor, then proves the reserved UID empty before clearing a stale
+`executing` lock; unprovable cleanup holds the marker and raises one needs-you alert naming the slot (throttled per slot).
 Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
 finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
 lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
@@ -3339,6 +3357,10 @@ reclamation: acquisition, prepare, execution, and finish hold shared leases on
 persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
 leases through scanning and deletion and proves UID process absence before
 removing a reservation.
+Cancel-finish clears a stale `executing` lock only with both proven UID emptiness and
+an `lstat` mtime age at least the hard max runtime, measured with the injected clock.
+Before that bound, even successful UID cleanup retains the lock and requires an operator
+to stop the reserved UID; failed cleanup also retains it past the bound.
 The root supervisor requires reservation evidence and rechecks it under its own shared lease;
 a forked child retains that lease through UID drop and closes it before task exec.
 Only reservations declaring `writerGuard: 1` participate; historical or uncertain
@@ -4572,7 +4594,88 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
+Global and system config point at the same temporary empty file, system config is disabled, and
+inherited indexed config and config-source overrides are removed before applying the hardening
+pins. The empty file is removed on success or failure. Before scrubbing, reject effective
+`fetch.fsck.*`, `transfer.fsck.*`,
+`receive.fsck.*`, and `fsck.*` keys, including worktree and include/includeIf config
+(`git config --includes`, without `--local`): object-checking pins do not override severities or skip lists.
+An unreadable check refuses fetching; only status 1 with empty output proves no matches.
+Lane setup then reuses `scrubRiskyLaneConfig` before fetching, so removing include directives
+cannot hide prohibited fsck settings from the check.
+Retained `origin.uploadpack` and
+`origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
+with the lane-pool transport pins (`protocol.ext.allow=never` and
+`--upload-pack=git-upload-pack`), plus `submodule.recurse=false` and `--no-recurse-submodules`:
+populated submodules retain their own unscrubbed remote helpers. `review-job-fetch-security.test.mjs` uses real local repositories
+and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
+then exercises the production SSH URL without networking and verifies the marker stays absent.
+Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring
+lane inspection/repair. Only the scrubber's intentionally retained exact origin keys are exempt.
+SSH transport failure surfaces directly; there is no HTTPS fallback. The job suites
+cover unreadable/oversized config, inherited global and lane URL rewrites, no fallback, and terminal failure labels.
 
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## R986 I1 probation core (production wiring pending)
+
+`scripts/lib/daemon-rebuild/probation.mjs` is a pure transition core, not a running
+probation service. At adoption, `freezeProbation` takes the complete registered roster
+for one clone and `readClosure(daemon, sha)` snapshots at proven-good and adopted heads.
+A snapshot is `{ complete: true, files: { repoRelativePath: gitBlobId } }`; include
+all imported files. Unknown, incomplete, empty or unreadable snapshots owe proof.
+The core copies and validates each closure's files before the next `readClosure` call;
+readers may reuse their result object or files map without changing earlier evidence.
+An unknown or ambiguous roster refuses adoption: the operator must recover the roster.
+`owed` stays fixed for this adoption. `recordProof` stores independent daemon records;
+boot and completed tick evidence must name that daemon, agree on its PID and adopted
+head, and show process start at/after adoption with a later completed tick. Callers
+must obtain boot evidence from that daemon's process record, not from a sibling or
+from the wrapper's first tick time. `evaluateProbation` passes only with all owed
+records, or immediately for a known empty owed set. Non-owed evidence is a no-op.
+Each entry uses the same sanitizing boundary to recursively capture enumerable data
+properties and reject accessor descriptors without invoking getters or setters, including
+when `records` precedes `owed` in key order. Validation and decisions use only the frozen
+plain copy. State and evidence restored from JSON contain no accessors.
+The boundary catches read/copy errors, rejects cycles and functions (except the separately
+captured injected closure reader), memoizes aliases, and does not execute `toJSON`.
+Copying is limited to 100,000 properties/array slots per entry.
+Oversized input follows the same closed path; recover a bounded roster or state
+before retrying, and treat an identity return from adoption as a refused adoption.
+It preserves invalid values such as `undefined` and `NaN` for the validator rather than
+silently dropping unknown fields or coercing values through JSON serialization.
+Unreadable adoption options return the original options; readable but invalid rosters
+still throw the operator recovery error. Unreadable proof/state input is a no-op for
+`recordProof`; validation reports invalid state and evaluation stays pending.
+A recorded proof returns a fresh frozen copy, so
+mutating restored (for example JSON-parsed) state, a getter or a hidden key cannot
+discharge another daemon. A no-op still returns the caller's own input object.
+Legacy single-record state cannot promote; it requires operator recovery.
+
+The probation tests adapt the WIP adoption clock/heads and invalid-tick cases. The
+self-sync test uses the WIP injected rebuild/lock/closure fixture as a core consumer;
+it does not establish production probation integration. Remaining wiring: enumerate
+clone registrations, read both import closures by SHA, persist adoption and daemon
+boot/tick records under a shared mutation lock, and advance proven-good only on pass.
+No rollback, boot counting or probation deadline policy ships in this I1 core.
+
+`scripts/conveyor/soak/breaks/probation-accessor-snapshot.mjs` replays the operator's
+shared-files-map, records-getter-popping-owed, interacting-getters and throwing-boot probes against the real
+core. Its soak wrapper is automatically registered by the breaks directory discovery.
+The shared-map case pins an earlier repair; the records getter and top-level boot getter
+reproduce the failure at `41aaa588c39397fc7ad7eca7f63e9bf5fa041483`. All accessor cases now
+also require zero getter calls, including nested evidence.
+At `a19d094c84a838c161105da3296c3558467fc319`, interacting `records` and `owed` getters
+remove `review` and return `pass`. Rejecting accessors returns the original state untouched,
+keeps both daemons owed, calls no getters, and returns `pending`.
+These pure-core probes do not establish live daemon integration or merge compatibility.
 ## Review job exit evidence
 
 Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
@@ -4614,3 +4717,17 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+## Ready-candidate adoption during overlay churn
+
+`daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
+refs and descendant advances remain pending after adoption, and the next adopt-only tick
+must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
+open-kind rebuild alert emitted after successful adoption only when pending refs exist.
+A candidate containing a removed ref is refused as `overlay-no-longer-wanted`, even when
+another overlay contains its tip; `pr-merged`/`in-main` removals retain their existing wanted
+handling. Each wanted tip must equal or descend from the candidate's tip. Preserve the independent
+live-applied omission, build-provenance, smoke, forced-record and canonical-audit gates.
+Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a live overlay
+retired during planning must reject its omission and preserve HEAD.
+Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
+rule does not reset overlay main-sync parking or add retries for parked overlays.
