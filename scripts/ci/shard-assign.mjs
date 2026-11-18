@@ -219,6 +219,10 @@ async function main(argv) {
   if (balance) {
     const limit = Number((argv.find(a => a.startsWith('--max-ratio=')) ?? '--max-ratio=1.2').slice(12));
     if (!Number.isFinite(limit) || limit < 1) throw new Error('--max-ratio must be finite and at least 1');
+    // The balance check must not pass an assignment CI's shard command would reject.
+    const bad = ambiguousFilters(files, universe);
+    if (bad.length) throw new Error(`shard-assign: filter is a substring of another test path: ${bad.map(([a, b]) => `${a} in ${b}`).join('; ')}`);
+    if (files.some((f) => /\s/.test(f))) throw new Error('shard-assign: a test path contains whitespace; the workflow cannot pass it as a filter');
     const ratio = predictedBalance(files, loadTimings().unit, total);
     process.stdout.write(`predicted slowest/average ${ratio.toFixed(2)}\n`);
     return ratio > limit ? 3 : 0;
