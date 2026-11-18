@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { foldReviewRefusalInto, planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { reviewCiGate } from '../review-ci-gate.mjs';
-import { readPlannerRow, readPlannerRows } from '../red-team-planner-row.mjs';
+import { readPlannerRow, readPlannerRows, redTeamNominationRefusal } from '../red-team-planner-row.mjs';
 import { planRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../red-team-dispatch-queue.mjs';
 
@@ -106,6 +106,23 @@ describe('readPlannerRow', () => {
   it('preserves refusal order and multiple refusals for the same PR', () => {
     const rows = [refusal('scope-bloat'), refusal('review-ci'), refusal('already-reviewed-head')];
     expect(readPlannerRows({ refusals: rows }).map(row => row.refusal)).toEqual(rows);
+  });
+
+  it('keeps historical saved rows without safety evidence closed, with an operator fallback', () => {
+    const raw = { ...rawPr([check('review-gate')]), state: 'OPEN', isDraft: false, labels: ['review:human'] };
+    const saved = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [raw], requiredChecks: ['review-gate'] });
+    delete saved.nominationSafety;
+    const row = readPlannerRow({ pr, rawPrs: [raw], plan: { refusals: [saved.refusal], plannerRows: [saved] } });
+    expect(redTeamNominationRefusal(row, raw)).toBe('planner safety evidence unreadable; inspect reconciliation before retrying');
+  });
+
+  it('preserves the producer safety evidence when the daemon only has a raw snapshot', () => {
+    const enriched = { ...rawPr([check('review-gate')]), state: 'OPEN', isDraft: false,
+      labels: ['review:human'], scopeBloat };
+    const saved = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [enriched], requiredChecks: ['review-gate'] });
+    const row = readPlannerRow({ pr, rawPrs: [rawPr()], plan: { refusals: [saved.refusal], plannerRows: [saved] } });
+    expect(row.nominationSafety).toBe(saved.nominationSafety);
+    expect(redTeamNominationRefusal(row, { ...enriched, scopeBloat: undefined })).toContain('scope-bloat');
   });
 });
 

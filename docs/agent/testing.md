@@ -4443,17 +4443,9 @@ review-owned merge-gate holds. Preserve the classification from that enriched sn
 `plannerRows`; use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining
 top-level ownership and the folded `reviewRefusal` separately. The planner-row unit and
 production suites pin refusal parity and propagation through normal and read-only passes.
-
-
 ## Human-head red-team nomination
 
-`review:human` heads missing a red-team result use `readPlannerRow` and the existing
-`planRedTeamOnSkip` full-review guards. Only `review-ci`, `ci-heal-escalated` and
-`owed-ci-rerun` refusals with exclusively review-owned required-check holds qualify;
-folded scope/referral refusals, absent rows/checks and unrelated CI failures remain closed.
-`red-team-enqueue --pr=<N> --reason=<text>` (optional `--repo=owner/repo`) uses the same
-planner before posting a trusted head-bound request. Requests retain all guards and queue limits.
-Inspect reconciliation/check evidence before retrying a refusal; shorten reasons over 1000 characters.
-The enqueue parity table pins decisions and reasons against automatic planning, including
-formal reviews, labels, head changes and missing evidence. Run it with the planner-row,
-queue, on-skip and HTTP-adapter tests through heavy-admission.
+`readPlannerRow` reuses reconciliation with `reviewSafetyOnly` to reach holds behind CI refusals,
+plus `refuseUnreviewable` and readable files/size. Automatic nomination and `red-team-enqueue`
+share these guards and queue limits. Inspect full reconciliation evidence before retrying a hold;
+shorten reasons over 1000 characters. Run the enqueue parity table with planner-row, queue, on-skip and HTTP-adapter tests through heavy-admission.

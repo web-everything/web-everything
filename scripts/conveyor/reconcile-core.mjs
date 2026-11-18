@@ -1509,7 +1509,7 @@ function earlyStartShadowFields(pr, requiredChecks) {
  * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
  * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
  */
-function refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
+export function refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   if (pr?.isDraft) {
     refuse('draft', { ...withPhase, ...extra, ...earlyStartShadowFields(pr, requiredChecks), why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
     return true;
@@ -2210,6 +2210,7 @@ export function planReconcile({
   // is the one that fetches (and caches) the live set; omitted, `classifyPr` falls back to its own exclusion-
   // list default unchanged — byte-identical behaviour to before this param existed.
   requiredChecks = null, reviewTiming = REVIEW_TIMING_DEFAULTS, fixTiming = FIX_TIMING_DEFAULTS,
+  reviewSafetyOnly = false, // Read-only nomination projection: reach later holds despite CI repair ownership.
   advisoryReviewOnHumanHandoff = 'off', unlabeledRedAgentPr = 'off',
   // xilx617 (epic #4075/#3383) — the bound a `live-process` refusal must overrun before it also gets a
   // surfaced `session-overrun` note (see {@link LIVE_SESSION_OVERRUN_MS}'s own docblock). A `planReconcile`
@@ -2992,8 +2993,8 @@ export function planReconcile({
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
-      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
+    const ciRepairOwed = !reviewSafetyOnly && (phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -4094,7 +4095,7 @@ export function planReconcile({
     notes.push({ kind: 'review-churn', prNumber: d.prNumber, loops: d.churnCap.loops, cap: d.churnCap.cap,
       text: `PR #${d.prNumber}: ${d.churnCap.loops} reviews of distinct heads (review.reviewChurn.maxLoopsPerPr=${d.churnCap.cap}) — the fix/review loop is not converging; the new head is still reviewed, and a person should look at the PR` });
   }
-  try {
+  if (!reviewSafetyOnly) try {
     const { mode, appendLine, readLocals, ...deps } = eligibilityShadowDeps({
       ...(shadowDeps ? { hermetic: true } : {}), ...shadowDeps,
     });

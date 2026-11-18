@@ -49,3 +49,18 @@ it('exposes scope-bloat folded by the normal not-a-ci-break escalation, without 
   expect(row.refusal.reviewRefusal).not.toHaveProperty('ciHealNotCiBreak');
   expect(plan.dispatch).toEqual([]);
 });
+
+it.each([false, true])('produces independent safety evidence behind early CI refusals (readOnly=%s)', readOnly => {
+  const raw = { ...source(), isDraft: false, labels: ['review:human'],
+    files: [{ path: 'scripts/guard.mjs', additions: 1, deletions: 0 }] };
+  const scopeBloat = { stale: true, why: 'unrelated files' };
+  const plan = runReconcilePass({ ...options(raw), readOnly,
+    loadPrOwnership: () => ({ advisoryReviewOnHumanHandoff: { value: 'off', source: 'fixture' } }),
+    readRequiredChecks: () => ({ checks: ['test', 'review-gate'] }),
+    enrichScopeBloat: prs => prs.map(pr => ({ ...pr, scopeBloat })) });
+  const row = readPlannerRow({ pr, plan, rawPrs: [raw] });
+  expect(row.refusal.kind).toBe('review-ci');
+  expect(row.refusal.reviewRefusal).toBeUndefined();
+  expect(raw).not.toHaveProperty('scopeBloat');
+  expect(row.nominationSafety).toMatchObject({ head, hold: expect.stringContaining('scope-bloat') });
+});
