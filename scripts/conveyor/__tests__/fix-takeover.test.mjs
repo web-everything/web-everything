@@ -606,3 +606,12 @@ describe('conflict-fix pass exemption setting', () => {
     expect(resolve({ read: () => { throw new Error('EACCES'); } }).conflictFixExemptPerPass).toBe(0);
   });
 });
+
+
+describe('conflictFixExemptPerPass operational maximum', () => {
+  it.each(['11', '1000'])('treats %s as invalid (disabled)', async value => {
+    const mod = await import('../fix-takeover.mjs');
+    const resolve = mod.resolveFixSettings ?? mod.resolveFixTakeoverSettings;
+    expect(resolve({ env: { WE_CONFLICT_FIX_EXEMPT_PER_PASS: value } }).conflictFixExemptPerPass).toBe(0);
+  });
+});

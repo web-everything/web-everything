@@ -134,7 +134,7 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   const platformLayer = platform === undefined ? platformPreference('fix', { env }) : platform;
   const conflictPlatform = platform === undefined ? readPlatformPreferences({ env }) : { prefs: { fix: platform }, errors: [] };
   const exemptCap = value => value === undefined ? undefined : ((typeof value === 'number' || typeof value === 'string')
-    && /^(0|[1-9]\d*)$/.test(String(value)) && Number.isSafeInteger(Number(value)) ? Number(value) : 0);
+    && /^(0|[1-9]\d*)$/.test(String(value)) && Number.isSafeInteger(Number(value)) && Number(value) <= 10 ? Number(value) : 0); // enforced operational maximum 10; larger or invalid disables
   const envAutoProceed = env.WE_FIX_STAND_DOWN_AUTO_PROCEED;
   // Standard → platform → tool → env. Opus is reachable only through the critical-work verdict.
   const model = cascadePolicy('fix', {
