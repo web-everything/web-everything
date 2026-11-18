@@ -532,13 +532,21 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
       let urgentCiFailed = false;
       const readTestCheck = testCheck || (({ sha }) => {
+        let apiUnavailable = false;
         const gh = (args) => {
           try { return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: gitRepo, env: childEnv,
             encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024, throttle: { caller: 'prototype-load', ...(exec !== execFileSync ? { exec: (ghArgs, ghOpts) => exec('gh', ghArgs, ghOpts) } : {}) } })) }; }
-          catch { return { code: 1, stdout: '' }; }
+          catch (e) {
+            if (e.code === 'ENOBUFS' || /maxBuffer/i.test(String(e.message))) throw e;
+            apiUnavailable = true;
+            return { code: 1, stdout: '' };
+          }
         };
         const origin = resolveOriginRepository({ git: (args) => git(...args), gh });
-        if (!origin.repo) return null;
+        if (!origin.repo) {
+          if (apiUnavailable) return null;
+          throw new Error('unreadable CI repository');
+        }
         const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
         if (result.code !== 0) return null;
         const data = JSON.parse(result.stdout);
@@ -548,19 +556,38 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(r.conclusion));
         if (urgentCiFailed) return null;
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
+        if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
+          || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count
+          || data.check_runs.some(r => !r || !Number.isSafeInteger(r.id) || !validSha(r.head_sha)
+            || typeof r.name !== 'string' || !Number.isSafeInteger(r.app?.id) || !Number.isSafeInteger(r.check_suite?.id)
+            || !['queued', 'in_progress', 'completed'].includes(r.status)
+            || (r.status === 'completed' ? !['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion) : r.conclusion !== null)))
+          throw new Error('malformed, incomplete or oversized CI checks');
         const evidence = testCheckEvidence(data, sha);
         if (!evidence) return null;
         // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
         const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
         if (runs.code !== 0) return null;
-        return testWorkflowBound(evidence, JSON.parse(runs.stdout), sha, config.testWorkflowPath) ? evidence : null;
+        const runsData = JSON.parse(runs.stdout);
+        if (!Number.isInteger(runsData?.total_count) || runsData.total_count < 0 || runsData.total_count > 100
+          || !Array.isArray(runsData.workflow_runs) || runsData.workflow_runs.length !== runsData.total_count
+          || runsData.workflow_runs.some(r => !r || !Number.isSafeInteger(r.check_suite_id) || !validSha(r.head_sha) || typeof r.path !== 'string'))
+          throw new Error('malformed, incomplete or oversized CI workflows');
+        const bound = testWorkflowBound(evidence, runsData, sha, config.testWorkflowPath);
+        if (input.urgent && !bound) throw new Error('unbound CI workflow');
+        return bound ? evidence : null;
       });
       if (input.urgent && !urgentReason(input.reason)) return stop('no-ready', { detail: 'no-urgent-marker', fallback: 'Supply --reason with at least 10 characters after trimming, or wait for passing CI.' });
       let checkRun;
       try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
-      catch (e) { if (!input.urgent) throw e; }
+      catch (e) { return stop('no-ready', { detail: 'ci-evidence-unreadable', error: String(e.message || e),
+        fallback: 'Repair the CI evidence reader or wait for complete, readable CI evidence (at most 100 checks and workflow runs), then retry.' }); }
       if (urgentCiFailed || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
         return stop('no-ready', { detail: 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
+      if (input.urgent && checkRun != null && !(checkRun.sha === input.sha && checkRun.name === 'test'
+        && (['queued', 'in_progress'].includes(checkRun.status)
+          || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
+        return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
       if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
         let ledger, shards, expectedSteps, origin;

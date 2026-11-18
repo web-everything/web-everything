@@ -294,9 +294,16 @@ describe('urgent prototype admission', () => {
     expect(f.readyWrites).toEqual([]);
     expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
   });
-  it.each(['queued', 'in_progress', 'unreadable'])('allows signed urgent evidence when CI is %s', async status => {
-    const f = fixture({ testCheck: async () => { if (status === 'unreadable') throw new Error('unreadable'); return { sha: SHA, name: 'test', status }; }, urgentLedger: JSON.stringify(marker) });
+  it.each(['queued', 'in_progress'])('allows signed urgent evidence when CI is %s', async status => {
+    const f = fixture({ testCheck: async () => { return { sha: SHA, name: 'test', status }; }, urgentLedger: JSON.stringify(marker) });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+  });
+  it('refuses a thrown CI reader error even with a signed receipt', async () => {
+    const f = fixture({ testCheck: async () => { throw new Error('unreadable'); }, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'ci-evidence-unreadable', fallback: expect.stringContaining('Repair') });
+    expect(f.readyWrites).toEqual([]);
+    expect(mutations(f, 'add')).toHaveLength(0);
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
   });
   it.each(['unsigned', 'bad signature', 'wrong repo', 'missing key'])('refuses %s without readiness writes', async kind => {
     const forged = { ...marker };
@@ -3200,7 +3207,7 @@ describe('default test check-run reader (production wiring)', () => {
   const REPO_SLUG = 'web-everything/web-everything';
   const run = (o = {}) => ({ id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 }, ...o });
   const wf = (o = {}) => ({ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml', ...o });
-  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, ...options } = {}) {
+  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, ...options } = {}) {
     const gh = [];
     const combinedIO = { fs: {},
       handles: (cmd, args) => cmd === 'gh' || (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url'),
@@ -3208,9 +3215,10 @@ describe('default test check-run reader (production wiring)', () => {
         if (cmd === 'git') return `https://github.com/${REPO_SLUG}.git\n`;
         gh.push(args.join(' '));
         const bad = () => { throw Object.assign(new Error('gh: HTTP 500'), { status: 1, stdout: '', stderr: 'HTTP 500' }); };
-        if (args[0] === 'repo' && args[1] === 'view') return JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
-        if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : JSON.stringify(checks);
-        if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : JSON.stringify(runs);
+        if (args[0] === 'repo' && args[1] === 'view') return fail === 'repo' ? bad() : JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
+        if (args[0] === 'api' && args[1].includes('/check-runs') && fail === 'overflow') throw Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' });
+        if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : checksRaw ?? JSON.stringify(checks);
+        if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : runsRaw ?? JSON.stringify(runs);
         throw new Error(`unexpected gh call ${args.join(' ')}`);
       } };
     return { gh, ...fixture({ ready: '', defaultTestCheck: true, combinedIO, ...options }) };
@@ -3241,7 +3249,11 @@ describe('default test check-run reader (production wiring)', () => {
     expect(f.gh.some(c => c.includes('/actions/runs'))).toBe(false);
   });
   it.each([
-    ['unreadable raw checks', { fail: 'checks' }],
+    ['unavailable repository API (nonzero)', { fail: 'repo' }],
+    ['unavailable raw checks (API nonzero)', { fail: 'checks' }],
+    ['unavailable workflow binding (API nonzero)', { fail: 'runs' }],
+    ['absent check', { checks: { total_count: 0, check_runs: [] } }],
+    ['queued CI', { checks: { total_count: 1, check_runs: [run({ status: 'queued', conclusion: null })] } }],
     ['pending CI', { checks: { total_count: 1, check_runs: [run({ status: 'in_progress', conclusion: null })] } }],
     ['a failure on another SHA', { checks: { total_count: 1, check_runs: [run({ head_sha: TREE, conclusion: 'failure' })] } }],
   ])('urgent requires a signed receipt with %s', async (_, options) => {
@@ -3251,6 +3263,25 @@ describe('default test check-run reader (production wiring)', () => {
     const missing = ghFixture(options);
     expect(await missing.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
     expect(missing.readyWrites).toEqual([]);
+  });
+  it.each([
+    ['check response buffer overflow', { fail: 'overflow' }],
+    ['invalid check JSON', { checksRaw: '{' }],
+    ['missing check array', { checks: { total_count: 0 } }],
+    ['incomplete checks', { checks: { total_count: 2, check_runs: [run()] } }],
+    ['oversized checks', { checks: { total_count: 101, check_runs: Array.from({ length: 101 }, () => run()) } }],
+    ['malformed check', { checks: { total_count: 1, check_runs: [run({ check_suite: null })] } }],
+    ['unknown check status', { checks: { total_count: 1, check_runs: [run({ status: 'unknown' })] } }],
+    ['invalid workflow JSON', { runsRaw: '{' }],
+    ['incomplete workflows', { runs: { total_count: 2, workflow_runs: [wf()] } }],
+    ['oversized workflows', { runs: { total_count: 101, workflow_runs: Array.from({ length: 101 }, () => wf()) } }],
+    ['malformed workflow', { runs: { total_count: 1, workflow_runs: [null] } }],
+    ['foreign workflow', { runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }],
+  ])('urgent refuses %s before reading a signed receipt', async (_, options) => {
+    const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-evidence-unreadable', fallback: expect.stringContaining('Repair') });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
   });
   it('admits a passing test bound to the expected workflow file and writes fresh readiness', async () => {
     const f = ghFixture();
@@ -3274,7 +3305,7 @@ describe('default test check-run reader (production wiring)', () => {
     ['a truncated check-runs page', { checks: { total_count: 101, check_runs: [run()] } }],
     ['a check-run from another GitHub app', { checks: { total_count: 1, check_runs: [run({ app: { id: 1 } })] } }],
     ['a failing test check-run', { checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } }],
-  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options), options.checks?.check_runs?.[0]?.conclusion === 'failure' ? 'ci-test-failed' : 'no-passing-test-check'); });
+  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options), options.checks?.check_runs?.[0]?.conclusion === 'failure' ? 'ci-test-failed' : (options.checks?.total_count > 100 || options.runs?.total_count === 2) ? 'ci-evidence-unreadable' : 'no-passing-test-check'); });
 });
 
 const shippedRuledSettings = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));

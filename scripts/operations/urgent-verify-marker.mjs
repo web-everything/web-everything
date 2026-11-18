@@ -124,6 +124,12 @@ fi
   ],
 };
 
+// Exact action references observed in the mirrored jobs of ci.yml. New actions require a mirror review.
+const mirroredActions = new Set([
+  'actions/checkout@v4', 'actions/setup-node@v4', 'actions/create-github-app-token@v2',
+  'actions/upload-artifact@v4', 'actions/download-artifact@v4',
+]);
+
 /** Mirror only the known CI command and artifact layout; changes require an operator update. */
 export function ciGatePlan(workflow) {
   const jobs = yaml.safeLoad(workflow)?.jobs, plan = ciUnitPlan(workflow);
@@ -131,8 +137,9 @@ export function ciGatePlan(workflow) {
     const steps = jobs?.[job]?.steps;
     const allowed = new Set([...setupRuns, ...mirrored].map(runText));
     if (!Array.isArray(steps) || steps.some(s => !s || typeof s !== 'object' || ('run' in s &&
-      (typeof s.run !== 'string' || !allowed.has(runText(s.run))))))
-      throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run steps`);
+      (typeof s.run !== 'string' || !allowed.has(runText(s.run)))))
+      || steps.some(s => 'uses' in s && !mirroredActions.has(s.uses)))
+      throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run or uses steps`);
   }
   const covered = plan.filter(s => s.group === 'covered').length;
   const step = (job, name) => {

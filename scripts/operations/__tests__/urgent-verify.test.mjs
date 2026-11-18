@@ -147,7 +147,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
 
 describe('CI gate mirroring fails closed', () => {
   const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
-  it('accepts every run step in the real CI workflow', () => {
+  it('accepts every run and uses step in the real CI workflow', () => {
     expect(ciGatePlan(workflow)).toEqual({
       coverage: ['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9'],
       hostPaths: ['node', 'scripts/lint-host-paths.mjs'],
@@ -159,6 +159,18 @@ describe('CI gate mirroring fails closed', () => {
       const changed = yaml.safeLoad(workflow);
       changed.jobs[job].steps.push({ name: 'Additional validation', run: 'npm run new-validation' });
       expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates: update the urgent verification mirror');
+    });
+  it.each(['test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'])(
+    'refuses an unknown uses action in %s and tells the operator to update the mirror', job => {
+      const changed = yaml.safeLoad(workflow);
+      changed.jobs[job].steps.push({ uses: 'unknown/validation@v1' });
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates: update the urgent verification mirror');
+    });
+  it.each(['actions/checkout@unknown', 'docker/unknown@v1', './local-action', 42, null, ''])(
+    'refuses unlisted or malformed action reference %s', uses => {
+      const changed = yaml.safeLoad(workflow);
+      changed.jobs.standards.steps.push({ uses });
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
     });
   it.each(['npm ci\nnpm run new-validation', 42, ''])(
     'refuses changed setup or unreadable run text %s', run => {
