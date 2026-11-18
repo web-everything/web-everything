@@ -1,14 +1,18 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { proveHumanOnlyLicense, resolveApprovalLicensesEnqueue } from '../human-only-enqueue-license.mjs';
+import { proveNumberingOnlyMove, numberingGitRunner } from '../numbering-carry.mjs';
+import { proveHumanOnlyLicense, proveHumanOnlyLicenseWithRunner, resolveApprovalLicensesEnqueue } from '../human-only-enqueue-license.mjs';
 
 const roots = [];
 const rawChange = path => `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} M\0${path}\0`;
 const removeTreeEntryTabs = entry => entry.replaceAll('\t', '');
+// Config discovery also sees the command-line origin pin and appends its discovered override.
+const GIT_PINS = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=',
+  '-c', 'remote.origin.promisor=false', '-c', 'remote.origin.promisor=false'];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), 'human-enqueue-')); roots.push(cwd);
@@ -21,8 +25,11 @@ function fixture() {
   const approved = commit('approved'); git(['update-ref', 'refs/remotes/origin/main', approved]);
   let head = approved, labels = ['review:accepted'];
   const comments = [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${approved} -->\n<!-- cleared-human: operator -->` }];
-  const exec = (cmd, args, opts) => cmd === 'gh' ? JSON.stringify({ headRefOid: head, labels }) : execFileSync(cmd, args, opts);
-  const prove = (options = {}) => proveHumanOnlyLicense({ repo: 'o/r', pr: 7, headSha: head, exec, cwd, readComments: () => comments, ...options });
+  const exec = cmd => { expect(cmd).toBe('gh'); return JSON.stringify({ headRefOid: head, labels }); };
+  const prove = ({ run, ...options } = {}) => {
+    const inputs = { repo: 'o/r', pr: 7, headSha: head, exec, cwd, readComments: () => comments, ...options };
+    return run ? proveHumanOnlyLicenseWithRunner(inputs, numberingGitRunner({ cwd, run })) : proveHumanOnlyLicense(inputs);
+  };
   return { cwd, git, write, commit, approved, comments, exec, prove, setHead: sha => { head = sha; }, setLabels: v => { labels = v; } };
 }
 
@@ -49,6 +56,53 @@ describe('human-only enqueue license', () => {
     r.setHead(r.commit('drain: JIT-number xabc123→#7001 at land (#2288)'));
     expect(r.prove()).toMatchObject({ licensed: true, tier: 'numbering' });
   });
+  it.each(['numbering', 'mechanical'])('passes exact explicit bounds and hardened pins through the actual %s license proof', tier => {
+    const r = fixture(), calls = [];
+    r.git(['config', 'remote.secondary.promisor', 'true']);
+    if (tier === 'numbering') {
+      r.git(['mv', 'backlog/xabc123-example.md', 'backlog/7001-example.md']);
+      r.write('backlog/7001-example.md', '---\nbornAs: xabc123\nkind: story\n---\ncard\n');
+      r.setHead(r.commit('drain: JIT-number xabc123→#7001 at land (#2288)'));
+    } else {
+      r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+      const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+      r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
+      r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    }
+    expect(r.prove({ run: (cmd, args, options) => {
+      calls.push({ cmd, args, options });
+      return execFileSync(cmd, args, options);
+    } })).toMatchObject({ licensed: true, tier });
+    expect(calls.some(({ args }) => args.includes(tier === 'numbering' ? 'blob' : 'diff-tree'))).toBe(true);
+    for (const { cmd, args, options } of calls) {
+      expect(cmd).toBe('git');
+      expect(options).toMatchObject({ cwd: r.cwd, encoding: null, timeout: 5000,
+        maxBuffer: args.includes('blob') ? 1024 * 1024 : 8 * 1024 * 1024,
+        env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
+      expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false']);
+      if (!args.includes('--get-regexp')) expect(args.slice(6, 8)).toEqual(['-c', 'remote.secondary.promisor=false']);
+    }
+  });
+  it.each(['missing main', 'failed alias grep'])('refuses unreadable owned numbering evidence: %s', failure => {
+    const r = fixture();
+    r.git(['mv', 'backlog/xabc123-example.md', 'backlog/7001-example.md']);
+    r.write('backlog/7001-example.md', '---\nbornAs: xabc123\nkind: story\n---\ncard\n');
+    const head = r.commit('drain: JIT-number xabc123→#7001 at land (#2288)');
+    r.setHead(head);
+    if (failure === 'missing main') r.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+    else r.git(['config', 'grep.threads', '-1']);
+    expect(proveNumberingOnlyMove({ cwd: r.cwd, fromSha: r.approved, toSha: head }).readFailed).toBe(true);
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringContaining('numbering git evidence unreadable') });
+  });
+  it('keeps grep status 1 and absent promisor config readable and licenses numbering', () => {
+    const r = fixture();
+    r.git(['mv', 'backlog/xabc123-example.md', 'backlog/7001-example.md']);
+    r.write('backlog/7001-example.md', '---\nbornAs: xabc123\nkind: story\n---\ncard\n');
+    const head = r.commit('drain: JIT-number xabc123→#7001 at land (#2288)'); r.setHead(head);
+    expect(() => r.git(['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'])).toThrowError(expect.objectContaining({ status: 1 }));
+    expect(proveNumberingOnlyMove({ cwd: r.cwd, fromSha: r.approved, toSha: head })).toMatchObject({ ok: true, readFailed: false });
+    expect(r.prove()).toMatchObject({ licensed: true, tier: 'numbering' });
+  });
   it.each(['.github/workflows/ci.yml', '.github/actions/setup/action.yml', 'scripts/merge-ai-prs.mjs'])('refuses an unapproved sensitive successor: %s', path => {
     const r = fixture(); r.write(path, 'unapproved'); r.setHead(r.commit('author change'));
     expect(r.prove()).toMatchObject({ licensed: false });
@@ -61,15 +115,16 @@ describe('human-only enqueue license', () => {
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     let diffArgs;
     const treeReads = [];
-    expect(r.prove({ exec: (cmd, args, opts) => {
+    expect(r.prove({ run: (cmd, args, opts) => {
       if (cmd === 'git' && args.includes('diff-tree')) diffArgs = args;
       if (cmd === 'git' && args.includes('ls-tree')) treeReads.push(args);
-      return r.exec(cmd, args, opts);
+      return execFileSync(cmd, args, opts);
     } })).toMatchObject({ licensed: true, tier: 'mechanical' });
-    expect(diffArgs).toEqual(['-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false',
+    expect(diffArgs).toEqual([...GIT_PINS, '-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false',
       '-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-abbrev',
       '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', r.approved, r.git(['rev-parse', 'HEAD'])]);
     expect(treeReads).toEqual([r.git(['rev-parse', 'HEAD']), main].map(ref => [
+      ...GIT_PINS,
       '-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--full-tree', ref,
     ]));
   });
@@ -170,10 +225,7 @@ describe('human-only enqueue license', () => {
     // Model Git's macOS pathspec precomposition on every host, including Linux.
     const emptyLookups = [head, main].map(ref => r.git(['ls-tree', '-z', ref, '--', path.normalize('NFC')]));
     expect(emptyLookups).toEqual(['', '']);
-    expect(r.prove({ exec: (cmd, args, opts) => {
-      if (cmd === 'git' && args.includes('ls-tree') && args.includes('--')) return Buffer.alloc(0);
-      return r.exec(cmd, args, opts);
-    } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
   });
   it('refuses a policy successor differing from main even in a main merge', () => {
     const r = fixture();
@@ -206,9 +258,9 @@ describe('human-only enqueue license', () => {
     r.git(['checkout', '-qb', 'pr', r.approved]); r.write(path, body); r.commit('identical author content');
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     const reads = [];
-    expect(r.prove({ exec: (cmd, args, opts) => {
+    expect(r.prove({ run: (cmd, args, opts) => {
       if (cmd === 'git') reads.push(args);
-      return r.exec(cmd, args, opts);
+      return execFileSync(cmd, args, opts);
     } })).toMatchObject({ licensed: true, tier: 'mechanical' });
     expect(reads.some(args => args.includes('diff') || args.includes('show')
       || (args.includes('cat-file') && !args.includes('-e')))).toBe(false);
@@ -255,13 +307,13 @@ describe('human-only enqueue license', () => {
     const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
     expect(r.git(['ls-tree', head, '--', path])).not.toBe(r.git(['ls-tree', main, '--', path]));
     const reads = [];
-    expect(r.prove({ exec: (cmd, args, opts) => {
+    expect(r.prove({ run: (cmd, args, opts) => {
       if (cmd === 'git' && args.includes('diff')) throw Error('content diff must not be read');
       if (cmd === 'git' && args.includes('ls-tree')) reads.push({ args, opts });
-      return r.exec(cmd, args, opts);
+      return execFileSync(cmd, args, opts);
     } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/unapproved.*re-approve.*queue/) });
     expect(reads).toEqual([head, main].map(ref => ({
-      args: ['-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--full-tree', ref],
+      args: [...GIT_PINS, '-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--full-tree', ref],
       opts: expect.objectContaining({ cwd: r.cwd, timeout: 5000, maxBuffer: 8 * 1024 * 1024 }),
     })));
   });
@@ -275,7 +327,7 @@ describe('human-only enqueue license', () => {
     r.git(['merge', '--no-ff', '-m', 'merge main', main]);
     const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
     let injected = false;
-    expect(r.prove({ exec: (cmd, args, opts) => {
+    expect(r.prove({ run: (cmd, args, opts) => {
       if (cmd === 'git' && args.includes('ls-tree') && args.at(-1) === (ref === 'head' ? head : main)) {
         injected = true;
         if (failure === 'unreadable') throw Error('tree unavailable');
@@ -292,8 +344,8 @@ describe('human-only enqueue license', () => {
         if (failure === 'unicode path') return Buffer.from(entry.replace('README.md', 'caf\u00e9.md'));
         if (failure === 'control path') return Buffer.from(entry.replace('README.md', 'bad\u0085.md'));
       }
-      return r.exec(cmd, args, opts);
-    } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/unreadable or oversized.*re-approve.*queue/) });
+      return execFileSync(cmd, args, opts);
+    } })).toMatchObject({ licensed: false, reason: 'approval or git evidence unreadable or oversized; operator must re-approve the current head or queue it' });
     expect(injected).toBe(true);
   });
   it.each(['A', 'M', 'D'])('requires a deletion record for a path absent from both complete trees: %s', status => {
@@ -306,49 +358,106 @@ describe('human-only enqueue license', () => {
     const newMode = status === 'D' ? '000000' : '100644';
     const oldId = (status === 'A' ? '0' : 'a').repeat(40);
     const newId = (status === 'D' ? '0' : 'b').repeat(40);
-    const result = r.prove({ exec: (cmd, args, opts) => cmd === 'git' && args.includes('diff-tree')
-      ? Buffer.from(`:${oldMode} ${newMode} ${oldId} ${newId} ${status}\0missing.md\0`) : r.exec(cmd, args, opts) });
+    let injected = false;
+    const result = r.prove({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff-tree')) {
+        injected = true;
+        return Buffer.from(`:${oldMode} ${newMode} ${oldId} ${newId} ${status}\0missing.md\0`);
+      }
+      return execFileSync(cmd, args, opts);
+    } });
+    expect(injected).toBe(true);
     expect(result).toMatchObject(status === 'D' ? { licensed: true, tier: 'mechanical' }
-      : { licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+      : { licensed: false, reason: 'successor changes an unapproved path differing from main; operator must re-approve the current head or queue it' });
+  });
+  it.each([
+    ['missing terminator', rawChange('docs.md').slice(0, -1), 'successor diff incomplete'],
+    ['missing path', rawChange('docs.md').split('\0')[0] + '\0', 'successor diff incomplete'],
+    ['malformed header', 'unreadable\0docs.md\0', 'successor tree evidence unreadable'],
+    ['unknown mode', rawChange('docs.md').replace('100644', '170000'), 'successor tree evidence unreadable'],
+    ['empty path', rawChange(''), 'successor path unreadable'],
+  ])('refuses incomplete or unreadable raw tree evidence: %s', (_name, output, reason) => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    let injected = false;
+    expect(r.prove({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff-tree')) {
+        injected = true;
+        return Buffer.from(output);
+      }
+      return execFileSync(cmd, args, opts);
+    } }))
+      .toMatchObject({ licensed: false, reason: `${reason}; operator must re-approve the current head or queue it` });
+    expect(injected).toBe(true);
+  });
+  it('refuses oversized git evidence and directs the operator to re-approve or queue', () => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    expect(r.prove({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff-tree')) return Buffer.alloc(8 * 1024 * 1024 + 1);
+      return execFileSync(cmd, args, opts);
+    } })).toMatchObject({ licensed: false, reason: 'approval or git evidence unreadable or oversized; operator must re-approve the current head or queue it' });
+  });
+  it.each(['head', 'main'].flatMap(ref => ['missing', 'corrupt'].map(failure => [ref, failure])))(
+    'refuses %s tree objects that are %s and names the operator fallback', (ref, failure) => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    const oid = r.git(['rev-parse', `${ref === 'head' ? head : main}^{tree}`]);
+    const object = join(r.cwd, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+    rmSync(object);
+    if (failure === 'corrupt') writeFileSync(object, 'corrupt object');
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+  });
+  it.each(['non-UTF8 path', 'duplicate', 'empty path', 'unknown mode', 'truncated'])(
+    'refuses real malformed Git tree evidence: %s', failure => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    const blob = Buffer.from(r.git(['rev-parse', `${main}:README.md`]), 'hex');
+    const entry = (mode, path) => Buffer.concat([Buffer.from(`${mode} `), Buffer.from(path), Buffer.from([0]), blob]);
+    let tree = entry('100644', 'README.md');
+    if (failure === 'non-UTF8 path') tree = entry('100644', Buffer.from([0xff]));
+    if (failure === 'duplicate') tree = Buffer.concat([tree, tree]);
+    if (failure === 'empty path') tree = entry('100644', '');
+    if (failure === 'unknown mode') tree = entry('170000', 'README.md');
+    if (failure === 'truncated') tree = tree.subarray(0, -10);
+    // --literally stores adversarial object bytes; every proof read still runs real Git.
+    const oid = execFileSync('git', ['hash-object', '-w', '--literally', '-t', 'tree', '--stdin'],
+      { cwd: r.cwd, input: tree, encoding: 'utf8' }).trim();
+    const head = r.git(['commit-tree', oid, '-p', r.approved, '-p', main, '-m', 'merge main']);
+    r.setHead(head);
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
   });
   it.each(['cafe\u0301.md', 'caf\u00e9.md', 'bad\n.md', 'bad\t.md', 'bad\u007f.md', 'bad\u0085.md'])(
     'refuses ambiguous Unicode or control characters in raw diff paths: %j', path => {
       const r = fixture();
-      r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
-      const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+      r.git(['checkout', '-qb', 'main-change']);
+      const oid = r.git(['rev-parse', `${r.approved}:.github/workflows/ci.yml`]);
+      r.git(['-c', 'core.precomposeUnicode=false', 'update-index', '--add', '--cacheinfo', '100644', oid, path]);
+      r.git(['commit', '-qm', 'main ambiguous path']);
+      const main = r.git(['rev-parse', 'HEAD']); r.git(['update-ref', 'refs/remotes/origin/main', main]);
       r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
       r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
-      expect(r.prove({ exec: (cmd, args, opts) => {
-        if (cmd === 'git' && args.includes('diff-tree')) return Buffer.from(rawChange(path));
-        if (cmd === 'git' && args.includes('ls-tree')) return Buffer.from(`100644 blob ${'b'.repeat(40)}\t${path}\0`);
-        return r.exec(cmd, args, opts);
-      } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+      expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
     });
   it('refuses a main merge with more than 1024 paths and names the operator fallback', () => {
     const r = fixture();
-    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    r.git(['checkout', '-qb', 'main-change']);
+    for (let i = 0; i < 1025; i++) r.write(`docs/${i}.md`, 'main docs');
     const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
-    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
-    expect(r.prove({ exec: (cmd, args, opts) => cmd === 'git' && args.includes('diff-tree')
-      ? Buffer.from(Array.from({ length: 1025 }, (_, i) => rawChange(`docs/${i}.md`)).join('')) : r.exec(cmd, args, opts) }))
-      .toMatchObject({ licensed: false, reason: expect.stringMatching(/1024.*re-approve.*queue/) });
-  });
-  it.each([
-    ['missing terminator', rawChange('docs.md').slice(0, -1)],
-    ['missing path', rawChange('docs.md').split('\0')[0] + '\0'],
-    ['malformed header', 'unreadable\0docs.md\0'],
-    ['unknown mode', rawChange('docs.md').replace('100644', '170000')],
-    ['empty path', rawChange('')],
-  ])('refuses incomplete or unreadable raw tree evidence: %s', (_name, output) => {
-    const r = fixture();
-    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
-    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
-    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
-    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
-    expect(r.prove({ exec: (cmd, args, opts) => cmd === 'git' && args.includes('diff-tree')
-      ? Buffer.from(output) : r.exec(cmd, args, opts) }))
-      .toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/1024.*re-approve.*queue/) });
   });
   it('refuses a head that is not a descendant of approval', () => {
     const r = fixture(); r.git(['checkout', '--orphan', 'unrelated']); r.write('README.md', 'new root');
@@ -366,19 +475,35 @@ describe('human-only enqueue license', () => {
     expect(r.prove(options)).toMatchObject({ licensed: false });
   });
   it('refuses unreadable git evidence', () => {
-    const r = fixture(); r.write('README.md', 'safe'); r.setHead(r.commit('docs'));
-    expect(r.prove({ exec: (cmd, args, opts) => { if (cmd === 'git') throw Error('unreadable'); return r.exec(cmd, args, opts); } })).toMatchObject({ licensed: false });
+    const r = fixture(); r.write('README.md', 'safe'); const head = r.commit('docs'); r.setHead(head);
+    rmSync(join(r.cwd, '.git', 'objects', head.slice(0, 2), head.slice(2)));
+    expect(r.prove()).toMatchObject({ licensed: false });
   });
-  it('refuses oversized git evidence and directs the operator to re-approve or queue', () => {
+  it.each(['origin', 'secondary'].flatMap(remote => ['approved', 'head'].map(side => [remote, side])))(
+    'never lazy-fetches missing license objects from partial clone promisor %s (%s)', (remote, side) => {
     const r = fixture();
-    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
-    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
-    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
-    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
-    expect(r.prove({ exec: (cmd, args, opts) => {
-      if (cmd === 'git' && args.includes('diff-tree')) return 'x'.repeat(8 * 1024 * 1024 + 1);
-      return r.exec(cmd, args, opts);
-    } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/oversized.*re-approve.*queue/) });
+    r.write('README.md', 'ordinary'); r.setHead(r.commit('author docs'));
+    const marker = join(r.cwd, 'helper-ran'), helper = join(r.cwd, 'upload-pack-helper');
+    writeFileSync(helper, '#!/bin/sh\nprintf ran > "' + marker + '"\nexit 1\n', { mode: 0o755 });
+    r.git(['config', 'extensions.partialClone', remote]);
+    r.git(['config', `remote.${remote}.promisor`, 'true']);
+    r.git(['config', `remote.${remote}.url`, r.cwd]);
+    r.git(['config', `remote.${remote}.uploadpack`, helper]);
+    r.git(['config', 'protocol.file.allow', 'always']);
+    const missing = 'abcdef0123456789abcdef0123456789abcdef0123';
+    if (side === 'head') r.setHead(missing);
+    else r.comments[0].body = `<!-- reviewed-sha: ${missing} -->\n<!-- cleared-human: operator -->`;
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+    expect(existsSync(marker)).toBe(false);
+  });
+  it('refuses real Git output over 8 MiB and directs the operator to re-approve or queue', () => {
+    const r = fixture();
+    r.write('README.md', 'ordinary'); r.setHead(r.commit('author docs'));
+    // Config discovery is a bounded Git read too; one large value exceeds its output cap.
+    r.git(['config', '--add', 'remote.huge.promisor', 'false']);
+    const config = join(r.cwd, '.git', 'config');
+    writeFileSync(config, readFileSync(config, 'utf8') + '\n[remote "oversized"]\n promisor = ' + 'x'.repeat(8 * 1024 * 1024) + '\n');
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/oversized.*re-approve.*queue/) });
   });
 });
 
