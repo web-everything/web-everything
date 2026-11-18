@@ -268,15 +268,17 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold with a newer malformed advisory note', [advisory, { ...advisory, createdAt: '2999-01-01T00:00:00Z', body: advisory.body.replace(/^Net basis:.*$/im, '') }], {}, /no clean advisory accept/],
     ['same-head hold with a second malformed outcome line', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`123\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a duplicate accept outcome line', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`accept\`` }], {}, /no clean advisory accept/],
+    ['same-head hold after two review attempts', comments, { count: 2, attemptsSinceWake: 2 }, /no clean advisory accept/],
+    ['same-head hold with an advisory older than the PR', comments, { }, /no clean advisory accept/, { createdAt: '2999-01-01T00:00:00Z' }],
     ['same-head hold with a short-prefix advisory head', [{ ...advisory, body: advisory.body.replace(/(Net basis: `[a-f0-9]+\.\.)[a-f0-9]+`/i, '$1' + fx.headRefOid.slice(0, 1) + '`') }], {}, /no clean advisory accept/],
     ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
     ['no verdict', comments, { noVerdict: {} }, /no verdict ever landed/],
     ['ledger cause', comments, { cause: 'ledger-unreadable' }, /ledger cannot answer/],
     ['hold on another head', comments, { head: 'a'.repeat(40) }, /not on the live head/],
-  ])('%s stays review-referrals-pending', (_name, thread, change, reason) => {
+  ])('%s stays review-referrals-pending', (_name, thread, change, reason, prChange = {}) => {
     const pr = held();
     // Bypass the planner's earlier unmarked-page refusal to exercise the referral guard even on a marked full read.
-    const out = resolved({ ...pr, comments: thread, commentsComplete: true, referralHold: { ...pr.referralHold, ...change } });
+    const out = resolved({ ...pr, ...prChange, comments: thread, commentsComplete: true, referralHold: { ...pr.referralHold, ...change } });
     expect(out.referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(reason) });
     const p = plan(out);
     expect(p.dispatch).toEqual([]);
