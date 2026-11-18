@@ -4669,8 +4669,11 @@ Cursor records never settle a load; older ledgers without a cursor start at the 
 failures in any check-run on the SHA, regardless of job or app, remove the recorded clone/ref with a tip guard and open a NEEDS-YOU escalation through
 `land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
 require operator repair or manual unloading. Settlement identity includes the load tracking ID, so a reload
-starts fresh. Check failures are handled before required-job/workflow parsing; unreadable green evidence
-stays tracked. Green loads are checked every pass while their clone/ref remains in the shared overlay
+starts fresh. Check failures authorize removal only for the GitHub Actions app and jobs in the configured
+`test` needs closure, with each suite bound to that workflow run on the exact SHA. Validate complete,
+bounded check pages before acting; malformed pages may still unload on an explicit bound failure.
+Unrelated app/workflow/job failures never authorize removal. Unknown workflow or required-job
+evidence stays tracked and requires operator inspection; the existing verdict expiry still applies. Green loads are checked every pass while their clone/ref remains in the shared overlay
 store, including historical time-complete receipts. Only confirmed absence ends monitoring; corrupt
 overlay state escalates and stays tracked. A failed registration command can leave a persisted overlay:
 the loader writes a registration-failed note only after the shared overlay reader proves clone/ref
@@ -4742,7 +4745,9 @@ Urgent CI failure and expired-verdict unloads use `retireRegistration` with the 
 (`registration.sha`, which may differ from the source SHA) and the observed full entry snapshot.
 The normal retirement proof still runs; only `unique-commits-not-on-main` and `pr-open` keep
 verdicts may authorize urgent withdrawal, with a matching tracking record, SHA and exact live tip.
-Pinned, edge-resolution and unreadable keep verdicts still refuse. Keep regression cases for changed
+Pinned, edge-resolution and unreadable keep verdicts still refuse. Check the registration
+`edgeResolution` explicitly before overriding a keep verdict: the planner can return `pr-open`
+before inspecting its approved edge. Keep regression cases for changed
 entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the

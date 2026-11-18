@@ -42,7 +42,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
   };
   return {
     loads: () => read('urgent-loads'), state: () => read('urgent-sweep-state'), now: () => new Date().toISOString(),
-    required: r => ciGatePlan(String(exec('git', ['show', `${r.sha}:.github/workflows/ci.yml`],
+    required: (r, path = '.github/workflows/ci.yml') => ciGatePlan(String(exec('git', ['show', `${r.sha}:${path}`],
       { cwd: r.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 }))).requiredJobs,
     checks: r => {
       const git = args => ({ code: 0, stdout: String(exec('git', args, { cwd: r.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 })) });
@@ -54,8 +54,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       const result = origin.gh(['api', `repos/${origin.repo}/commits/${r.sha}/check-runs?per_page=100&filter=all`]);
       if (result.code !== 0) throw new Error('unreadable CI checks');
       const data = JSON.parse(result.stdout);
-      if (Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha))) return data;
-      // Preserve raw failures even when workflow/config evidence is unavailable.
+      // Failures also require suite-to-workflow binding before they authorize removal.
       try {
         const tool = JSON.parse(io.readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../settings/prototype-load.json'), 'utf8'));
         const platform = readPlatformPreferences({ env: { ...env, HOME: home }, readFile: (p, encoding) => io.readFileSync(p, encoding) });
@@ -226,16 +225,22 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
           throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
         const age = now - loadedAt;
-        let data, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
+        let data, boundFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
         try {
           data = await deps.checks(r);
-          unload = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
+          try { validateChecks(data, r.sha); } catch (e) { evidenceError = e; }
+          const required = await deps.required(r, data?.testWorkflowPath);
+          if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
+            throw new Error('unreadable required CI jobs');
+          const checks = (Array.isArray(data?.check_runs) ? data.check_runs : []).filter(c =>
+            c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
+            && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)
+            && required.some(n => c.name === n || c.name.startsWith(`${n} (`))
+            && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, r.sha, data.testWorkflowPath));
+          boundFailure = checks.find(c => failedCheck(c, r.sha));
+          unload = Boolean(boundFailure);
+          if (evidenceError) throw evidenceError;
           if (!unload) {
-            validateChecks(data, r.sha);
-            const required = await deps.required(r);
-            if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
-            const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
-              && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
             requiredSucceeded = testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
               && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
               && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
@@ -257,7 +262,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         }
         if (unload) {
           // Commit negative evidence before the guarded mutation; a write failure keeps the overlay.
-          const failed = Array.isArray(data?.check_runs) ? data.check_runs.find(c => failedCheck(c, r.sha)) : undefined;
+          const failed = boundFailure;
           await deps.settle({ id, status: 'unload-decision', at: deps.now(), trackingId: r.trackingId,
             clone: r.clone, ref: r.ref, sha: r.sha, registration: r.registration,
             reason: unloadReason ? 'ci-expired' : 'ci-failed',

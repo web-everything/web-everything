@@ -11,7 +11,7 @@ import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, recoverDrops, inferPrNumber } from '../daemon-overlay.mjs';
-import { addOverlay } from '../lib/daemon-overlays.mjs';
+import { addOverlay, recordEdgeResolution } from '../lib/daemon-overlays.mjs';
 import { planRebuild } from '../lib/daemon-rebuild.mjs';
 
 const CLI = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-overlay.mjs');
@@ -280,10 +280,11 @@ describe('daemon-overlay.mjs retire', () => {
 });
 
 describe.each(['unique-commits-not-on-main', 'pr-open'])('guarded urgent-failed unload with a %s keep verdict', reason => {
-  async function urgent({ outcome = 'held', snapshot = 'same' } = {}) {
+  async function urgent({ outcome = 'held', snapshot = 'same', edge = false } = {}) {
     const f = fixture();
     const tip = f.push('lane/urgent', 'urgent.txt', 'unmerged urgent work\n');
     addOverlay(f.clone, { ref: 'lane/urgent', reason: 'urgent load' }, { env: f.env });
+    if (edge) recordEdgeResolution(f.clone, 'lane/urgent', { sha: tip, by: 'reviewer' }, { env: f.env });
     const entry = f.entry('lane/urgent');
     let dropped = false;
     const args = { root: f.clone, ref: entry.ref, expectedTip: tip,
@@ -314,6 +315,14 @@ describe.each(['unique-commits-not-on-main', 'pr-open'])('guarded urgent-failed 
       } };
     return { f, tip, entry, args };
   }
+  it('refuses urgent withdrawal of an approved edge even when the planner returns pr-open', async () => {
+    const { f, args, tip } = await urgent({ edge: true });
+    args.deps.prove = () => ({ action: 'keep', reason: 'pr-open', tip });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'not-proved',
+      proof: { action: 'keep', reason: 'edge-resolution-recorded' } });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
   it('re-proves ordinary retirement then explicitly withdraws unmerged urgent work under lock with durable intent', async () => {
     const { f, args } = await urgent();
     expect(await retireRegistration(args)).toMatchObject({ retired: true, reason: 'urgent-failed' });

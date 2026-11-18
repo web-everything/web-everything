@@ -506,6 +506,8 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     }
     let proof = prove(entry);
     if (proof.action === 'keep' && ['unique-commits-not-on-main', 'pr-open'].includes(proof.reason) && mode === 'urgent-failed') {
+      // The planner can return pr-open before inspecting the approved edge.
+      if (entry.edgeResolution) return refuse('not-proved', { proof: { ...proof, reason: 'edge-resolution-recorded' } });
       // CI failure / expired verdict authorizes withdrawal, not a claim that the work landed.
       let current;
       try { current = tip(ref); } catch { /* unreadable evidence refuses below */ }

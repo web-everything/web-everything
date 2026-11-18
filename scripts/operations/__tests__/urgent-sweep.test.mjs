@@ -399,7 +399,7 @@ describe('urgent CI sweep', () => {
   it('unloads a failing same-SHA rerun more than 24 hours after persisted green', async () => {
     const f = fixture(); await f.run();
     f.d.now = () => '2026-11-25T12:00:00Z';
-    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
     expect(await urgentSweep({}, { ...f.d })).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
@@ -418,12 +418,12 @@ describe('urgent CI sweep', () => {
     const f = fixture(); await f.run();
     Object.assign(f.settlements()[0], { status: 'settled-green', monitoringComplete: true,
       greenAt: '2026-11-16T12:00:00Z', at: '2026-11-18T12:00:00Z' });
-    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('smoke', 'failure')] });
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test-shard', 'failure')], workflows });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
   it('rechecks pre-trackingId identity receipts instead of inheriting their settlement', async () => {
-    const f = fixture([check('smoke', 'failure')]);
+    const f = fixture([check('test-shard', 'failure')]);
     const id = createHash('sha256').update(JSON.stringify([load.ref, load.sha, load.clone, load.registration])).digest('hex');
     f.state.push({ id, status: 'settled-green', monitoringComplete: true,
       greenAt: '2026-11-16T12:00:00Z', at: '2026-11-18T12:00:00Z' });
@@ -437,11 +437,11 @@ describe('urgent CI sweep', () => {
     f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: load.registration.ref }] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
   });
-  it('unloads any failing check before attempting an unreadable required-job parse', async () => {
+  it('keeps an unrelated app failure when the required-job parse is unreadable', async () => {
     const f = fixture([check('smoke', 'failure', { app: { id: 1 } })]);
     f.d.required.mockImplementation(() => { throw new Error('workflow parse failed'); });
-    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.required).not.toHaveBeenCalled(); expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.required).toHaveBeenCalled(); expect(f.d.remove).not.toHaveBeenCalled();
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
   });
   it('never settles green on unreadable required jobs and retries next pass', async () => {
@@ -490,7 +490,7 @@ describe('urgent CI sweep', () => {
     const f = fixture();
     f.loads.push({ ...load, type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
     expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
-    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
@@ -506,20 +506,57 @@ describe('urgent CI sweep', () => {
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
-  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('unloads and raises NEEDS-YOU for completed smoke %s from any app', async conclusion => {
-    for (const appId of [15368, 1]) {
-      const f = fixture([...required.map(n => check(n)), check('smoke', conclusion, { app: { id: appId } })]);
-      expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-      expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
-      expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded' })]);
-      expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
-    }
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('unloads a bound needed-job %s', async conclusion => {
+    const f = fixture([check('test-shard (1)', conclusion)]);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
+  });
+  it.each([
+    ['unrelated app', { app: { id: 1 } }],
+    ['unrelated workflow', { check_suite: { id: 8 } }],
+    ['missing suite', { check_suite: undefined }],
+  ])('keeps a failure from an %s', async (_, extra) => {
+    const f = fixture([check('test-shard', 'failure', extra)]);
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test-shard', 'failure', extra)],
+      workflows: { total_count: 2, workflow_runs: [...workflows.workflow_runs,
+        { check_suite_id: 8, head_sha: sha, path: '.github/workflows/unrelated.yml' }] } });
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.events).toEqual([]);
+  });
+  it.each([
+    ['unrelated app', { app: { id: 1 } }, workflows],
+    ['unrelated workflow', { check_suite: { id: 8 } }, workflows],
+    ['unreadable workflows', {}, null],
+    ['incomplete workflows', {}, { total_count: 2, workflow_runs: workflows.workflow_runs }],
+    ['oversized workflows', {}, { total_count: 101, workflow_runs: workflows.workflow_runs }],
+  ])('escalates malformed evidence with %s failure without unloading', async (_, extra, runs) => {
+    const f = fixture();
+    f.d.checks.mockReturnValue({ total_count: 101, check_runs: [check('test', 'failure', extra)], workflows: runs });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled();
+    expect(f.events).toEqual([]);
+  });
+  it('binds failures and the required-job reader to the configured workflow path', async () => {
+    const f = fixture();
+    const path = '.github/workflows/custom.yml';
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test-shard', 'failure')],
+      testWorkflowPath: path, workflows: { total_count: 1, workflow_runs: [{ ...workflows.workflow_runs[0], path }] } });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.required).toHaveBeenCalledWith(load, path);
+    expect(f.d.remove).toHaveBeenCalled();
+  });
+  it('keeps an unrelated job failure in the bound workflow', async () => {
+    const f = fixture([check('smoke', 'failure')]);
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
   });
   it('unloads and raises NEEDS-YOU when required CI fails after required green with another run pending', async () => {
     const f = fixture([...required.map(n => check(n)), check('smoke', null, { status: 'in_progress' })]);
     expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
     expect(f.settlements()).toEqual([]); expect(f.d.remove).not.toHaveBeenCalled();
-    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
@@ -528,7 +565,7 @@ describe('urgent CI sweep', () => {
     const f = fixture(); await f.run();
     Object.assign(f.settlements()[0], { status: 'settled-green', checksComplete });
     delete f.settlements()[0].greenAt;
-    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
@@ -557,17 +594,17 @@ describe('urgent CI sweep', () => {
     ['oversized', { total_count: 101, check_runs: [check('test', 'failure')] }],
     ['incomplete', { total_count: 2, check_runs: [check('test', 'failure')] }],
     ['missing count', { check_runs: [check('test', 'failure')] }],
-    ['malformed row', { total_count: 2, check_runs: [null, check('smoke', 'failure', { app: undefined, id: undefined })] }],
+    ['malformed row', { total_count: 2, check_runs: [null, check('test-shard', 'failure')] }],
     ['duplicate IDs', { total_count: 2, check_runs: [check('test', 'success', { id: 1 }), check('test', 'failure', { id: 1 })] }],
-  ])('unloads before escalating %s evidence containing an explicit exact-SHA failure', async (_, data) => {
-    const f = fixture(); f.d.checks.mockReturnValue(data);
+  ])('unloads before escalating %s evidence containing an explicit bound-workflow failure', async (_, data) => {
+    const f = fixture(); f.d.checks.mockReturnValue({ ...data, workflows });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded' })]);
     expect(f.settlements()).toEqual([expect.objectContaining({ status: 'unloaded-pending-adoption' })]);
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
     expect(f.d.remove.mock.invocationCallOrder[0]).toBeLessThan(f.d.escalate.mock.invocationCallOrder[0]);
-    expect(f.d.required).not.toHaveBeenCalled();
+    expect(f.d.required).toHaveBeenCalled();
   });
   it.each([
     ['foreign SHA', check('test', 'failure', { head_sha: 'c'.repeat(40) })],
@@ -612,7 +649,7 @@ describe('urgent CI sweep', () => {
       registration: { ...load.registration, ref: `lane/ref-${i}` } })));
     const failing = f.loads[32];
     f.d.checks.mockImplementation(r => {
-      if (r === failing) return { total_count: 1, check_runs: [check('test', 'failure')] };
+      if (r === failing) return { total_count: 1, check_runs: [check('test', 'failure')], workflows };
       if (status === 'needs-you') throw new Error('reader needs operator repair');
       return { total_count: 1, check_runs: [check('test', null, { status: 'in_progress' })] };
     });
@@ -714,7 +751,7 @@ describe('production sweep storage and removal guards', () => {
     expect(await deps.remove(load, { ref: load.registration.ref })).toMatchObject({ retired: false });
     expect(retire).toHaveBeenCalledTimes(1);
   });
-  it('retrieves failures before the production workflow and required-job readers', async () => {
+  it('keeps failures when the production workflow binding is unavailable', async () => {
     const exec = vi.fn((cmd, args) => {
       if (args[0] === 'show') throw new Error('workflow unavailable');
       return load.repo;
@@ -722,7 +759,7 @@ describe('production sweep storage and removal guards', () => {
     const ghExec = vi.fn((cmd, args) => {
       if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: 'org/repo', url: load.repo });
       if (args[1].includes('/actions/runs')) throw new Error('workflow unavailable');
-      return JSON.stringify({ total_count: 1, check_runs: [check('test', 'failure')] });
+      return JSON.stringify({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
     });
     const io = { readFileSync: p => {
       if (p.endsWith('prototype-load.json')) return '{}';
@@ -730,13 +767,13 @@ describe('production sweep storage and removal guards', () => {
     } };
     const production = createSweepDeps({ exec, ghExec, io });
     const data = production.checks(load);
-    expect(data.workflows).toBeUndefined();
-    expect(ghExec.mock.calls.some(([, args]) => args[1]?.includes('/actions/runs'))).toBe(false);
+    expect(data.workflows).toBeNull();
+    expect(ghExec.mock.calls.some(([, args]) => args[1]?.includes('/actions/runs'))).toBe(true);
     const f = fixture(); f.d.checks.mockReturnValue(data);
     f.d.required = vi.fn(production.required);
-    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.escalate).toHaveBeenCalled(); expect(f.d.required).not.toHaveBeenCalled();
-    expect(exec.mock.calls.some(([, args]) => args[0] === 'show')).toBe(false);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.escalate).toHaveBeenCalled(); expect(f.d.remove).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'show')).toBe(true);
   });
   it('bounds ledgers before reading and uses the shared escalation packet writer', async () => {
     const io = { statSync: () => ({ size: 4 * 1024 * 1024 + 1 }), readFileSync: vi.fn(), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn() };
