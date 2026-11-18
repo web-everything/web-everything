@@ -4733,7 +4733,7 @@ test`) to dispatched agents and blocks backgrounding them for everyone; the deli
 30 minutes is reaped by the next admission attempt (`heavy-admission.mjs reap [--apply]` previews/applies it).
 Card: #3785.
 
-**Core budget (PROVISIONAL — to be re-evaluated from telemetry, not a ratified constant).** On the 12-core
+**Core budget (PROVISIONAL — to be re-evaluated from telemetry, not a ratified constant).** On the primary
 workstation: about **2 cores reserved** for the system and VS Code; the **heavy pool** is cap 2 × 4 vitest
 threads (the #3650 thread cap) = **8 cores**; lanes themselves are light and share what is left; the worker
 dispatch cap is **3**. Evidence it rests on (host sampler, 18.6 h, 2026-09-20/21): the pool held 0/1/2 slots in

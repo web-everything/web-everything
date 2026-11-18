@@ -13,7 +13,7 @@ tags: []
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5624 (reviewed head `2b893754ccf3ed784ba432d7dbc0ee0809622963`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
 1. `we:scripts/readiness/heavy-admission.mjs:1208` — (edge-case, degraded) Host-load waiters block interactive commands despite free slots
-   - Scenario: Start a mandatory noninteractive FULL caller at load 36 on 12 cores with cap=1 and no occupied slots. It registers a waiting marker, then sleeps for host load. Start an interactive FULL caller afterward. Its host check admits it, but FCFS ranks it behind the sleeping background caller. An in-memory filesystem probe reproduced three blocked polls with zero held slots. This can delay the operator for the default 15-minute host wait plus the background job's runtime. Callers waiting for host eligibility should not prevent an eligible interactive caller from taking a free slot.
+   - Scenario: Start a mandatory noninteractive FULL caller at load 36 against the host core count with cap=1 and no occupied slots. It registers a waiting marker, then sleeps for host load. Start an interactive FULL caller afterward. Its host check admits it, but FCFS ranks it behind the sleeping background caller. An in-memory filesystem probe reproduced three blocked polls with zero held slots. This can delay the operator for the default 15-minute host wait plus the background job's runtime. Callers waiting for host eligibility should not prevent an eligible interactive caller from taking a free slot.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

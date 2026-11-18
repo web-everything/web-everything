@@ -10,7 +10,7 @@ tags: []
 
 # Heavy-admission: record queue wait (waitMs, route, reason) and expose p50/p90 in queue-status
 
-The queue wait before a heavy slot is not recorded; durations.jsonl has run ms only. Record waitMs, route and wait reason per admission and add p50/p90 over the last N minutes to queue-status. Needed for the Mac Studio load-limit experiment.
+The queue wait before a heavy slot is not recorded; durations.jsonl has run ms only. Record waitMs, route and wait reason per admission and add p50/p90 over the last N minutes to queue-status. Needed for the primary host load-limit experiment.
 
 ## Acceptance
 

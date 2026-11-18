@@ -2180,9 +2180,13 @@ For 97/254, finishing on behalf requires a persisted numbered worker slot (`forg
 A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
 rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
 old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and
-a parseable start in `recent` for EVERY active id, strictly outside the inclusive ownership
+a parseable start in `recent` for every unclaimed active id, strictly outside the inclusive ownership
 window `[marker.at - CLOCK_SKEW_MS, diedBy + CLOCK_SKEW_MS]`. Any in-window null-code or 97/254
 receipt retains the marker.
+Both the 15-minute and bounded-orphan checks skip active IDs bound to another marker in the
+same root (inline or owner-matched `.run` sidecar), whether its owner is live or dead. This
+permits recovery when that run has fallen out of the newest-50 receipt window. Unclaimed
+active IDs missing from `recent` still fail closed; receipt-window guards remain unchanged.
 
 The accepted residual risk is a request the dead client already dispatched that Forge starts
 MORE than 15 minutes after owner death. Observed start lag is about one minute; client SSH
@@ -2866,6 +2870,7 @@ head with them. Test an initially empty repository label catalog and a same-head
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
 UNKNOWN listings before collecting head-bound context and also revalidates before
 merging, waiting for the configured delay at most three times per read stage.
+Before listing re-polls, a bounded REST GET trigger requests mergeability computation for up to ten unknown or empty candidates without changing their facts or classification.
 Hermetic drain CLI fixtures with synthetic UNKNOWN reads pin
 `WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC=0` while retaining the retry count and
 merge/hold assertions. Several read stages can otherwise exhaust a child-process
@@ -4575,3 +4580,10 @@ Use `ciJobLogApiArgs` or `readCiJobLog` from `scripts/lib/gh-ci-log.mjs` for fix
 Only explicit `filtered: true` provenance may supply a failing-test list. For whole-job logs (`filtered: false`) or missing provenance, both fixer renderers report `unknown (unfiltered log)` and fence an ANSI-stripped tail as context; passing-step `FAIL` fixtures and errors must never become repair targets. `ci-log-evidence.mjs` caps tails by UTF-8 bytes and lines, retaining the end of even an oversized final line and directing the fixer to inspect the full log when truncated. Strip ANSI before timestamp ownership matching too: a coloured passing-step timestamp must end failed-step ownership. Context-pack, fix-run, operator prompt and builder-draft recovery tests pin these guarantees.
 
 A failed log read is `log-unreadable`: it refuses evidence-based mechanical reruns while ordinary bounded repair remains available. Actual request timeouts stay unknown and retry. Escape errors remain `{ eligible: false, reason: 'log-unreadable' }`; the named follow-up does not change that mapping in this slice. `ci-log-unreadable.test.mjs` supplies an escape-coded passing-step timeout plus an unrelated deploy failure and asserts plain argv, one failed log read, no retry and no eligibility across the direct, facts-disabled, facts-enabled and facts raw-API paths. Unreadable logs retain the readable-failure repair route. In particular, bounced CI-heal entries must still reach `ci-heal-pr-dispatch` and its unsettled-worker, unconfirmed-accounting and per-head loop hold/park guards. `ci-heal-pr-dispatch.test.mjs` exercises each refusal with real planner output; `ci-log-unreadable.test.mjs` pins routing parity and preserves the existing joined fixer for trusted current-head review findings, including the log evidence reason in its brief. Helper, context-pack and builder-draft recovery regressions cover whole-log context and unreadable evidence.
+## Review job exit evidence
+
+Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
+a subdirectory beside the live `<slug>.json` records so no valid slug can collide. Exit markers
+are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
+marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
+review-job and review-daemon suites.
