@@ -309,7 +309,7 @@ describe('preflight CLI IO hooks', () => {
       const envs = [];
       const redirecting = { GIT_DIR: 'a', GIT_WORK_TREE: 'b', GIT_COMMON_DIR: 'c', GIT_INDEX_FILE: 'd', GIT_OBJECT_DIRECTORY: 'e',
         GIT_ALTERNATE_OBJECT_DIRECTORIES: 'f', GIT_NAMESPACE: 'g', GIT_PREFIX: 'h', GIT_CEILING_DIRECTORIES: 'i' };
-      const io = cliIO({ ...ENV, PATH: '/bin', HOME: '/home/x', ...redirecting }, { execFileSync: (...args) => {
+      const io = cliIO({ ...ENV, PATH: '/bin', HOME: 'fake-home', ...redirecting }, { execFileSync: (...args) => {
         envs.push(args[2].env);
         return args[1].at(-1) === '--show-toplevel' ? root : SHA;
       } });
@@ -317,7 +317,7 @@ describe('preflight CLI IO hooks', () => {
       expect(envs).toHaveLength(2);
       for (const env of envs) {
         for (const key of Object.keys(redirecting)) expect(env, key).not.toHaveProperty(key);
-        expect(env).toMatchObject({ PATH: '/bin', HOME: '/home/x' });
+        expect(env).toMatchObject({ PATH: '/bin', HOME: 'fake-home' });
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
