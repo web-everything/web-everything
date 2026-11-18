@@ -3543,12 +3543,12 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
     });
 
     it('is true for the exact literal "1", regardless of probation status', () => {
-      expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '1' }, { isOnProbation: () => false })).toBe(true);
+      expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => false })).toBe(true);
     });
 
     // #3383 — the probation default, mirroring both Codex seats' own.
     it('when the env var is UNSET, defaults to the injected probation check', () => {
-      expect(antigravityReviewFromEnv({}, { isOnProbation: () => true })).toBe(true);
+      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true })).toBe(true);
       expect(antigravityReviewFromEnv({}, { isOnProbation: () => false })).toBe(false);
     });
 
@@ -3556,10 +3556,10 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
       expect(antigravityReviewFromEnv({})).toBe(defaultAntigravityReviewProbationCheck());
     });
 
-    it('the real default probation check reads the ANTIGRAVITY identity, and today\'s registry declares it on probation', () => {
+    it('the real default probation check reads the ANTIGRAVITY identity, and Carbon probation bookkeeping does not auto-seat it', () => {
       // #3383's own `model-probation.json` entry — a DIFFERENT identity from either Codex seat's own, proving
       // this seat's probation default is not silently reading the Codex identity by mistake.
-      expect(defaultAntigravityReviewProbationCheck()).toBe(true);
+      expect(defaultAntigravityReviewProbationCheck()).toBe(false);
     });
 
     it('is a SEPARATE env var from BOTH Codex seats\' own — flipping one does not seat another', () => {
@@ -3948,6 +3948,8 @@ describe('#4315 incident-shaped mandatory referral', () => {
 describe('#4315 operation / I/O restart soak', () => {
   it.each(['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory', 'judgeAntigravityReview'])(
     '%s cannot bypass a missing mandatory ruling (25 restarts)', async seat => {
+      // R1062: use the same promoted seat policy for durable writes and the landing guard.
+      const env = { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' };
       const source = { summary: 'confirmed off-scope defect', file: 'outside-diff.mjs', verdict: 'CONFIRMED',
         impactIfUnfixed: 'broken', outcome: 'fixed', prevention: 'captured #7', disposition: 'nit' };
       const { registry } = registryFor({ netRev: PINNED_HEAD }, { codexAdvisory: true, correctnessAdvisory: true, antigravityReview: true });
@@ -3962,7 +3964,7 @@ describe('#4315 operation / I/O restart soak', () => {
       for (let restart = 0; restart < 25; restart++) {
         const store = createMemoryRunStore();
         const sinks = createReviewPrSinks({ labelProvider: provider, referralJudge: judge, mirrorReferral: () => {}, out: () => {},
-          env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' } });
+          env });
         let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: `run-referral-${restart}`, input: { pr: 7, repo: 'o/r' }, registry }), { registry });
         while (run.pending?.kind === 'judge') {
           run = advanceWhileRunning(run, { registry, resume: { value: run.pending.step === seat
@@ -3977,7 +3979,7 @@ describe('#4315 operation / I/O restart soak', () => {
         expect(run.pending).toMatchObject({ kind: 'confirm', of: 'human' });
         expect(run.verdict.pendingReferrals).toHaveLength(1);
         expect(run.verdict.verdict).toBe('needs-human');
-        expect(() => assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7 })).toThrow(/mandatory referral hold/);
+        expect(() => assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7, env })).toThrow(/mandatory referral hold/);
         expect(() => advanceWhileRunning(run, { registry, resume: { value: 'accept' } })).toThrow(/ruling required/);
       }
       expect(judge).toHaveBeenCalledTimes(1);
@@ -4035,7 +4037,10 @@ describe('xfkqowg historical ruling replay', () => {
       postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : 'advisory'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
       editComment: (id, body) => { trace.push('referral'); state.comments.find(c => c.id === id).body = body; },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; } };
-    const sinks = createReviewPrSinks({ labelProvider: provider, postComment: provider.postComment, referralJudge: judge,
+    // R1062: these historical records came from a seated advisory reviewer.
+    const sinks = createReviewPrSinks({
+      env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' },
+      labelProvider: provider, postComment: provider.postComment, referralJudge: judge,
       postRedTeamCheckRun: () => ({ ok: true }),
       readPublishHead: () => head, publishGate: () => ({ headSha: head, checks: [] }),
       mirrorReferral: () => {}, cardReadable: () => true, out: () => {} });
@@ -5002,4 +5007,9 @@ describe('card-only light review', () => {
     expect(() => advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'card-race', input: BASE_INPUT, registry }), { registry }))
       .toThrow(/card-only light lane/);
   });
+});
+
+it('Carbon pin and injected probation never auto-seat an unpromoted non-shadow reviewer', () => {
+  expect(antigravityReviewFromEnv({})).toBe(false);
+  expect(antigravityReviewFromEnv({ REVIEW_PR_ANTIGRAVITY_REVIEW: '1' }, { isOnProbation: () => true })).toBe(false);
 });

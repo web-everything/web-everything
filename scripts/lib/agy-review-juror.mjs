@@ -55,6 +55,8 @@ export const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)),
  */
 export const READ_ONLY_AGY_TOOLS = Object.freeze([
   'view_file', 'list_dir', 'grep_search', 'find_by_name', 'view_file_outline', 'view_code_item', 'codebase_search',
+  // Gemini 4 Carbon names its plain file read `read_file` (live 2026-11-18: a pure read voided the seat). Path-contained like the rest.
+  'read_file',
   // agy returns its structured answer through a `finish` tool step (live transcripts: ~1 in 4 runs end this way).
   'finish',
 ]);
@@ -282,9 +284,23 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   }
   const out = [];
   for (const step of steps.values()) {
-    if (!step.isTool || step.errored) continue;
+    if (!step.isTool || (step.errored && step.name !== 'read_file')) continue;
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
+    if (name === 'read_file') {
+      let params = step.params;
+      if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = null; } }
+      // Carbon must name a direct path, not merely bury one in a list or nested options.
+      const paths = params && typeof params === 'object' && !Array.isArray(params)
+        ? Object.entries(params).filter(([key]) => PATH_PARAM_KEY.test(key)).map(([, value]) => value) : [];
+      const laneRoots = lanes.map(canonicalPath).filter(Boolean);
+      if (!cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
+        || readsOutside(p, laneRoots, cwd))
+        || pathLeaves(params, false).some(p => readsOutside(p, laneRoots, cwd))) {
+        out.push('read_file (missing or invalid in-lane path)');
+        continue;
+      }
+    }
     // A completed READ must stay inside the juror lane or this conversation's brain folder.
     // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
     if (roots.length && name !== 'finish' && step.params != null) {
@@ -390,7 +406,9 @@ export function scrubPaths(text, roots = [], home = homedir()) {
  */
 export function relativizeFindings(findings, roots = []) {
   const prefixes = roots.filter(Boolean).map((r) => `${String(r).replace(/\/+$/, '')}/`);
-  return (Array.isArray(findings) ? findings : []).map((f) => {
+  // Preserve malformed raw evidence for the shadow answer validator; never turn it into a clean accept.
+  if (!Array.isArray(findings)) return findings;
+  return findings.map((f) => {
     if (!f || typeof f.file !== 'string') return f;
     const hit = prefixes.find((p) => f.file.startsWith(p));
     return hit ? { ...f, file: f.file.slice(hit.length) } : f;
@@ -481,6 +499,26 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     let transcriptText = '';
     if (transcriptFile) {
       try { transcriptText = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
+      // Every line must be an event object; an answered juror must end with a successful result.
+      const lines = String(transcriptText).split('\n').filter(line => line.trim());
+      const events = [];
+      let malformed = false;
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.event !== 'string') malformed = true;
+          else events.push(event);
+        } catch { malformed = true; }
+      }
+      if (malformed) reasons.push('transcript malformed — escape check incomplete');
+      const terminal = events.at(-1);
+      const successfulResult = terminal?.event === 'result' && terminal.result
+        && typeof terminal.result === 'object' && !Array.isArray(terminal.result)
+        && terminal.result.status === 'SUCCESS';
+      const relevant = events.some(event => event.event === 'step_update' || event.event === 'result');
+      if (!lines.length || !relevant || (outcome?.value != null && !successfulResult)) {
+        reasons.push('transcript empty/unrelated — escape check incomplete');
+      }
       const calls = stateChangingToolCalls(transcriptText, {
         allowedRoots: [jurorLane, realpathOr(jurorLane)], home, sessionId: outcome?.sessionId,
       });

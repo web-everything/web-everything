@@ -113,6 +113,35 @@ export function resolveShadowTrialReviews({ env = process.env, file = REVIEW_SET
   return { value: null, source: 'default' };
 }
 
+/** Reporting only: env > settings > 10 agreeing PRs, with a ruled floor of 10 (R1062). */
+export function resolveShadowPromotionPrs({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8'), log = (m) => console.error(m) } = {}) {
+  const valid = (v, source) => {
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : NaN);
+    if (Number.isSafeInteger(n) && n >= 10) return n;
+    if (v !== undefined) log(`review.shadowSeats.antigravity.promotionAgreeingPrs: invalid ${source} layer ignored (requires a safe integer >= 10); falling through`);
+    return null;
+  };
+  const fromEnv = valid(env?.WE_REVIEW_SHADOW_AGY_PROMOTION_PRS, 'env');
+  if (fromEnv) return { value: fromEnv, source: 'env' };
+  try {
+    const value = valid(JSON.parse(readFile(file))?.shadowSeats?.antigravity?.promotionAgreeingPrs, 'settings');
+    if (value) return { value, source: 'settings' };
+  } catch { /* built-in */ }
+  return { value: 10, source: 'default' };
+}
+
+/** Report-only replacement target: one existing provider seat, never an extra seat. */
+export function resolveShadowPromotionReplaces({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
+  const valid = v => ['claude', 'codex', 'agy'].includes(v);
+  const fromEnv = env?.WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES;
+  if (valid(fromEnv)) return { value: fromEnv, source: 'env' };
+  try {
+    const value = JSON.parse(readFile(file))?.shadowSeats?.antigravity?.promotionReplaces;
+    if (valid(value)) return { value, source: 'settings' };
+  } catch { /* built-in */ }
+  return { value: 'claude', source: 'default' };
+}
+
 /** Operational panel safeguards. Standard → platform review → tool review.json → env.
  * enabled: false; scope: high-care; dailyCap: 100 (New York day); sampleRate: 0.1 in [0,1) (1 is refused).
  * minNonClaudeSeats: positive integer, default 1.
@@ -183,4 +212,26 @@ export function resolveCardOnlyReviewSettings({ env = process.env, platform,
   });
   log(formatCascadeSourcesLine('review.cardOnly', result));
   return result;
+}
+
+/** R1062: only the orchestrator promotes Carbon after ten agreeing PRs; no automatic graduation. */
+export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTINGS_FILE,
+  readFile = (p) => readFileSync(p, 'utf8'), platform, log = (m) => console.error(m) } = {}) {
+  let tool = {};
+  try { tool = JSON.parse(readFile(file)); } catch { /* default refuses */ }
+  const project = value => typeof value === 'boolean' ? { promoted: value } : {};
+  const result = cascadePolicy('review.shadowSeats.antigravity', project(tool?.shadowSeats?.antigravity?.promoted), {
+    standard: { promoted: false },
+    platform: project((platform ?? platformPreference('review', { env }))?.shadowSeats?.antigravity?.promoted),
+    env, envValues: { promoted: env.WE_REVIEW_SHADOW_AGY_PROMOTED === undefined ? undefined
+      : env.WE_REVIEW_SHADOW_AGY_PROMOTED === 'true' ? true
+        : env.WE_REVIEW_SHADOW_AGY_PROMOTED === 'false' ? false : env.WE_REVIEW_SHADOW_AGY_PROMOTED },
+    valid: { promoted: v => typeof v === 'boolean' },
+  });
+  log(formatCascadeSourcesLine('review.shadowSeats.antigravity', result).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' '));
+  return { value: result.value.promoted, source: result.sources.promoted };
+}
+
+export function carbonNonShadowAllowed(model, options) {
+  return !/carbon/i.test(String(model)) || resolveShadowPromoted(options).value === true;
 }
