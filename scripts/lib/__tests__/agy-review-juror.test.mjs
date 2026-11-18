@@ -122,6 +122,15 @@ describe('shared checkouts correlate changes with every transcript tool update',
     expect(out.status).toBe('voided');
   });
 
+  it('a plain read_file read (Gemini 4 Carbon) inside the lane is not a state change, outside it still voids', async () => {
+    const fx = fixture();
+    const inside = await fx.run(undefined, (cwd) => [tool(join(cwd, 'file.txt'), { tool_name: 'read_file' })]);
+    expect(inside.reasons.join(' ')).not.toMatch(/state-changing/);
+    const fx2 = fixture();
+    const outside = await fx2.run(undefined, () => [tool(join(fx2.shared, 'file.txt'), { tool_name: 'read_file' })]);
+    expect(outside.status).toBe('voided');
+  });
+
   it('opaque errored parameters alone do not imply a shared change', async () => {
     const fx = fixture();
     const out = await fx.run(undefined, () => [tool('', { status: 'TOOL_ERROR', tool_name: 'run_command', tool_info: { parameters: '{broken' } })]);

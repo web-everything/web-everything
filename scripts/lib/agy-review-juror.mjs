@@ -55,6 +55,8 @@ export const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)),
  */
 export const READ_ONLY_AGY_TOOLS = Object.freeze([
   'view_file', 'list_dir', 'grep_search', 'find_by_name', 'view_file_outline', 'view_code_item', 'codebase_search',
+  // Gemini 4 Carbon names its plain file read `read_file` (live 2026-11-18: a pure read voided the seat). Path-contained like the rest.
+  'read_file',
   // agy returns its structured answer through a `finish` tool step (live transcripts: ~1 in 4 runs end this way).
   'finish',
 ]);
