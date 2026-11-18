@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
@@ -124,8 +125,15 @@ describe('shard balance metrics', () => {
     expect(predictedBalance(Object.keys(old), fresh, 2)).toBe(1);
   });
 
-  it('committed unit timings predict at most 1.2 over nine shards using their own keys', () => {
-    const unit = loadTimings().unit;
-    expect(balanceRatio(assignByTime(Object.keys(unit), unit, 9), unit)).toBeLessThanOrEqual(1.2);
+  it('refuses a balance check without measurements', () => {
+    expect(() => predictedBalance(['a', 'b'], {}, 2)).toThrow(/measured timings/);
   });
+
+  it('committed unit timings predict at most 1.2 over nine shards for the discovered coverage group', () => {
+    // A child process discovers and classifies the real repo exactly as CI does.
+    const result = spawnSync(process.execPath, [join(REPO_ROOT, 'scripts/ci/shard-assign.mjs'), '--suite=unit', '--balance', '--total=9', '--group=covered', '--max-ratio=1.2'], { encoding: 'utf8', timeout: 120_000 });
+    expect(result.stderr.replace(/.*CJS build.*\n/g, '')).toBe('');
+    expect(result.stdout).toMatch(/^predicted slowest\/average \d\.\d\d\n$/);
+    expect(result.status).toBe(0);
+  }, 150_000);
 });
