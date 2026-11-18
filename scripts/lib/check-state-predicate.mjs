@@ -148,6 +148,11 @@ const evidenceJob = row => {
 // A present state has its own closed vocabulary, independent of conclusions.
 const knownEvidenceStates = new Set(['success', 'failure', 'error', 'pending', 'expected']);
 const contradictoryEvidence = row => {
+  const status = normalize(row?.status), state = normalize(row?.state);
+  // Every conclusion is terminal, including outcomes that require a rerun.
+  if (row?.conclusion != null && ((status && status !== 'completed')
+    || ['pending', 'expected'].includes(state))) return true;
+  if (status === 'completed' && ['pending', 'expected'].includes(state)) return true;
   const outcomes = [row?.status, row?.conclusion, row?.state].map(normalize).map(value => {
     if (value === 'error') return 'red';
     if (value === 'expected') return 'pending';
@@ -187,13 +192,15 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
     // Compatibility excusal rewrites conclusions for legacy consumers. Strict
     // admission rechecks the original failure and binds any hold to this row.
     if (name === 'merge-gate' && row?.mergeGateHoldExcused) conclusion = 'failure';
-    if (row?.status === undefined && row?.__typename !== 'CheckRun' && typeof row?.state === 'string') {
+    if (row?.status === undefined && row?.conclusion == null
+      && row?.__typename !== 'CheckRun' && typeof row?.state === 'string') {
       const legacy = normalize(row.state); legacyError = legacy === 'error';
       if (['success', 'failure', 'error'].includes(legacy)) { status = 'completed'; conclusion = legacy; }
       else if (['pending', 'expected'].includes(legacy)) status = 'pending';
     }
     let state = 'unknown';
     if ((row != null && Object.hasOwn(row, 'state') && !knownEvidenceStates.has(normalize(row.state)))
+      || (row?.status !== undefined && !Object.hasOwn(CHECK_STATE_TABLE, normalize(row.status)))
       || contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
       || (row?.conclusion != null && !Object.hasOwn(CHECK_STATE_TABLE.completed, normalize(row.conclusion)))
       || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');

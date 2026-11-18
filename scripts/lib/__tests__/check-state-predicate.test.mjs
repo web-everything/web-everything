@@ -611,6 +611,47 @@ describe('required check evidence contract (PR1 acceptance)', () => {
     requiredNames: ['test'], rosterSource: 'live', rowsComplete: true, ...extra });
   const orders = rows => [rows, rows.toReversed()];
 
+  // Independent contract oracle: enumerate coherent evidence, rather than use
+  // the production classifier or its outcome table to predict the result.
+  const terminal = {
+    success: ['pass', ['success']],
+    neutral: ['fail', ['success']],
+    skipped: ['fail', ['success']],
+    failure: ['fail', ['failure', 'error']],
+    cancelled: ['pending', []],
+    timed_out: ['fail', ['failure', 'error']],
+    action_required: ['fail', ['failure', 'error']],
+    stale: ['pending', []],
+    startup_failure: ['fail', ['failure', 'error']],
+  };
+  const combinations = [undefined, 'queued', 'in_progress', 'completed', 'BOGUS'].flatMap(status =>
+    [undefined, ...Object.keys(terminal), 'SUCCESS', 'SuCcEsS', 'BOGUS'].flatMap(conclusion =>
+      [undefined, 'success', 'SUCCESS', 'SuCcEsS', 'failure', 'error', 'pending', 'expected', 'neutral', 'BOGUS']
+        .map(state => ({ status, conclusion, state }))));
+  it.each(combinations)('rule 3 reconciles every field combination: %j', fields => {
+    const conclusion = fields.conclusion?.toLowerCase(), state = fields.state?.toLowerCase();
+    for (const __typename of [undefined, 'StatusContext', 'CheckRun']) {
+      const evidence = { name: 'test', ...Object.fromEntries(Object.entries({ ...fields, __typename })
+        .filter(([, value]) => value !== undefined)) };
+      let expected = 'unknown';
+      if (fields.status === undefined && conclusion === undefined && __typename !== 'CheckRun') {
+        expected = { success: 'pass', failure: 'fail', error: 'fail', pending: 'pending', expected: 'pending' }[state] ?? 'unknown';
+      } else if (['queued', 'in_progress'].includes(fields.status) && conclusion === undefined
+        && [undefined, 'pending', 'expected'].includes(state)) expected = 'pending';
+      else if (fields.status === 'completed' && Object.hasOwn(terminal, conclusion)
+        && (state === undefined || terminal[conclusion][1].includes(state))) expected = terminal[conclusion][0];
+      const result = resolve([evidence]);
+      expect(result.state).toBe(expected);
+      expect(result.perName.test.state).toBe(expected);
+      if (expected === 'unknown') expect(result.perName.test.reasons).toContain('malformed');
+      const optional = expected === 'fail' && ['neutral', 'skipped'].includes(conclusion) ? 'pass' : expected;
+      expect(resolve([evidence], { optionalNames: ['test'] }).perName.test.state).toBe(optional);
+      expect(resolve([evidence], { optionalNames: ['TEST'] }).perName.test.state).toBe(expected);
+      expect(evidence).toEqual({ name: 'test', ...Object.fromEntries(Object.entries({ ...fields, __typename })
+        .filter(([, value]) => value !== undefined)) });
+    }
+  });
+
   it('1: missing status is unknown, never inferred completed', () => {
     expect(resolve([{ name: 'test', conclusion: 'success' }])).toMatchObject({ state: 'unknown',
       perName: { test: { reasons: ['malformed'] } } });
