@@ -246,8 +246,10 @@ export function fixPushGate({ headSha, rowsHead, rowsComplete, rosterSource, pre
   const deadline = firstHeldAt + maxMin * 60_000;
   const input = { headSha, rowsHead, rowsComplete, rosterSource, checks: previousHeadChecks, requiredChecks };
   const resolved = evidence(input);
-  if (resolved.state !== 'unknown' && Object.values(resolved.perName).every(value =>
-    value.state !== 'pending' || value.reasons.every(reason => reason === 'needs-rerun')))
+  // Held review gates alone are no CI evidence: at least one non-held required check must have finished.
+  if (resolved.state !== 'unknown' && Object.values(resolved.perName).some(value => ['pass', 'fail'].includes(value.state))
+    && Object.values(resolved.perName).every(value =>
+      value.state !== 'pending' || value.reasons.every(reason => reason === 'needs-rerun')))
     return { action: 'push', reason: 'ci-complete', ciFailures: fixReadiness(input).ciFailures };
   if (Number.isFinite(now) && Number.isFinite(deadline) && now >= deadline)
     return { action: 'push', reason: 'bound', deadline };
