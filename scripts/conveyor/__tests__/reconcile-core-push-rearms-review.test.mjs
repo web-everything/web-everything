@@ -28,6 +28,64 @@ const held = comments => ({ comments, labels: ['review:human'],
   referralHold: { kind: 'same-head', head: HEAD, why: 'findings ruled' },
   referralHoldAutoResolve: { outcome: 'resume', head: HEAD, why: 'all ruled' } });
 
+describe('live send-back on the current head owes its first fixer', () => {
+  const fresh = extra => ({ comments: [sendBack()], labels: ['review:changes'], ...extra });
+  it.each([
+    ['review:changes'],
+    ['review:changes', 'red-team:blocked', 'status:sent-back-red-team'],
+    ['review:changes', 'review:accepted', 'status:sent-back-review'],
+  ])('dispatches the send-back with labels %j even without machine-parsed findings', (...labels) => {
+    const result = run(fresh({ labels }));
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced',
+      rulingNotAddressed: expect.objectContaining({ source: 'operator-send-back' }) })]);
+    expect(result.refusals).toEqual([]);
+  });
+  it('a previously queued head becomes owed when the send-back and changes label arrive', () => {
+    expect(run({ comments: [], labels: ['review:accepted'] }).refusals[0]?.kind).toBe('nothing-owed');
+    expect(run(fresh({ labels: ['review:changes', 'review:accepted'] })).dispatch[0]?.kind).toBe('fix');
+  });
+  it.each([
+    ['review:changes', 'red-team:blocked', 'status:sent-back-red-team'],
+    ['review:changes', 'review:accepted'],
+  ])('ordinary judge bounce dispatches through OWED with labels %j', (...labels) => {
+    const request = sendBack({ author, body: sendBack().body.replace('Recorded by chalbert', 'Recorded by round-judge') });
+    expect(run(fresh({ labels, comments: [request] })).dispatch).toEqual([
+      expect.objectContaining({ kind: 'fix', phase: 'bounced' }),
+    ]);
+  });
+  it('does not dispatch while the fixer holds a claim', () => {
+    const result = run(fresh({ fixClaim: { who: 'fix-6360' } }));
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0]?.kind).toBe('fix-claimed');
+  });
+  it('a completed repair with explicit send-back coverage owes no second fixer', () => {
+    const request = sendBack({ body: sendBack().body.replace(HEAD, OLD) });
+    const release = end({ body: `${end().body}\n\n<!-- addresses-operator-send-back: send-back -->` });
+    const comments = [advisory(), request, release];
+    // Completed repairs retain the stale advisory labels; fresh() instead models an explicit
+    // review:changes bounce, which already selected the operator re-arm before includeUnattempted.
+    expect(openOperatorSendBacks(pr({ comments }))).toEqual([]);
+    const result = run({ comments });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review', headRefOid: HEAD })]);
+  });
+  it('preserves cap refusal when the operator allowance is disabled', () => {
+    // The existing operator ceremony grants a minimum budget of two; exhaust that effective cap.
+    const result = run(fresh(), [], { roundCap: 1, durableCounts: { 6360: 2 },
+      operatorRulingExtraRounds: { value: 0, source: 'tool' } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0]).toMatchObject({ kind: 'cap-exhausted', attempts: 2, cap: 2 });
+  });
+  it('a trusted rearm consumes the first repair instead of re-dispatching every pass', () => {
+    const result = run(fresh({ comments: [sendBack(), { author, createdAt: END_AT, body: REARM_COMMENT_MARKER }] }));
+    expect(result.dispatch.filter(d => d.mode === 'ruling-not-addressed')).toEqual([]);
+  });
+  it('keeps the rebase ownership refusal for an unbounced conflicted PR', () => {
+    const result = run(fresh({ labels: ['review:accepted'], mergeStateStatus: 'DIRTY' }));
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0]?.kind).toBe('owed-elsewhere');
+  });
+});
+
 describe('R618 pushed fix owes its review', () => {
   it('reviews a new fixer head despite the stale advisory:changes label', () => {
     expect(run().dispatch).toEqual([expect.objectContaining({ kind: 'review', headRefOid: HEAD })]);

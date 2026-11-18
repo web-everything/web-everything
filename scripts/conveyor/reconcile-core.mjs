@@ -2871,7 +2871,12 @@ export function planReconcile({
 
     // An earlier operator request survives later mechanical bounces and advisory accepts. Keep the existing
     // stand-down, liveness and already-landed guards above; an unaddressed request belongs to a fixer.
-    const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid));
+    const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid), {
+      // Initial repairs use the ordinary populations. Keep draft and conflict ownership, and the
+      // existing same-head advisory one-shot path, intact; completed misses still use this retry path.
+      includeUnattempted: ['bounced', 'open', 'queued'].includes(phase) && !pr?.isDraft
+        && pr?.mergeStateStatus !== 'DIRTY' && !withPhase.labels.includes(CONFLICT_LABEL),
+    });
     if (operatorRuling && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
       const attempts = roundAttempts();
       if (attempts >= effectiveRoundCap && !sendBackRound) {
@@ -2881,7 +2886,7 @@ export function planReconcile({
         dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed',
           findings: operatorRuling.items.length, rulingNotAddressed: operatorRuling,
           ...(attempts >= effectiveRoundCap ? sendBackRoundFields : {}),
-          why: attempts >= effectiveRoundCap ? sendBackRoundWhy : 'operator send-back not yet addressed after a fixer had its chance' });
+          why: attempts >= effectiveRoundCap ? sendBackRoundWhy : 'open operator send-back still owes a repair' });
       }
       continue;
     }

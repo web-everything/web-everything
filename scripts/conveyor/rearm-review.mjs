@@ -32,6 +32,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
+import { operatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
@@ -184,7 +185,8 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * that pushed fix is never stranded. Any moved head (a rebase-only re-push included) counts as a change.
  * An exact trusted `rearm-review` answer to the latest stand-down since fix-begin clears the window and
  * reviewed head; later claims still count. An unrelated or nonexistent target grants no exception.
- * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
+ * Without a claim, an unchanged verdict head still owes a fixer unless trusted fix evidence follows it.
+ * Unparseable claims retain the historical claim-window behavior; the CLI refuses unreadable evidence.
  * @returns {{empty:boolean, since?:string}}
  */
 /** REST uses `user` and numeric `id`; gh uses `author` and the GraphQL ID. Prefer REST's matching `node_id`. */
@@ -205,6 +207,7 @@ function normaliseComment(c) {
 export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
+  let fixEvidenceHead = null;
   let standDownIds = [];
   let rearmed = false;
   for (const raw of comments) {
@@ -218,6 +221,7 @@ export function rearmWindow(comments) {
     if (!rearmed && answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && operatorPoster) {
       claims = [];
       reviewedHead = null;
+      fixEvidenceHead = null;
       standDownIds = [];
       rearmed = true;
       continue;
@@ -227,9 +231,14 @@ export function rearmWindow(comments) {
     const text = body.trimStart();
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
       claims = [];
-      reviewedHead = verdictReviewedHead(c);
+      reviewedHead = verdictReviewedHead(c) ?? operatorSendBacks([c])[0]?.head ?? null;
+      fixEvidenceHead = null;
       standDownIds = [];
       rearmed = false;
+    } else if (/^(?:🔓 conveyor fix-end|## Fix evidence)(?:\s|$)/.test(text)) {
+      fixEvidenceHead = (text.startsWith('🔓 conveyor fix-end')
+        ? /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`[^`\r\n]+` released the fix claim at `([a-f0-9]{7,40})`\./i.exec(text)?.[1]
+        : /^Head:[ \t]*`([a-f0-9]{7,40})`[ \t]*$/im.exec(text)?.[1])?.toLowerCase() ?? null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
       if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false };
@@ -238,15 +247,18 @@ export function rearmWindow(comments) {
       if (c.id != null) standDownIds.push(String(c.id));
     }
   }
-  return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed };
+  return { claims, reviewedHead, fixEvidenceHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed };
 }
 
 export function decideEmptyFixRound({ comments, liveHead } = {}) {
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
-  const { claims, reviewedHead } = rearmWindow(comments);
+  const { claims, reviewedHead, fixEvidenceHead } = rearmWindow(comments);
   if (!claims) return { empty: false };
-  if (!claims.length) return { empty: false };
+  const fixedHere = fixEvidenceHead && (live.startsWith(fixEvidenceHead) || fixEvidenceHead.startsWith(live));
+  if (!claims.length) return !fixedHere && reviewedHead
+    && (live.startsWith(reviewedHead) || reviewedHead.startsWith(live))
+    ? { empty: true, since: reviewedHead } : { empty: false };
   // A fix pushed AFTER the verdict by a session whose claim predates it leaves no earlier-head claim in the
   // window; the head the verdict named still proves the push (live PR #6798: verdict on 83f39cd, live 4c14f91).
   if (reviewedHead && !(live.startsWith(reviewedHead) || reviewedHead.startsWith(live))) return { empty: false };
@@ -286,7 +298,7 @@ export function buildNoChangeComment({ actor, since }) {
   return [
     NO_CHANGE_COMMENT_MARKER,
     '',
-    `${who} asked to re-arm review, but the PR head is still \`${since}\` — the head the fix began at. No commit was pushed, so this round was NOT re-armed and does NOT count toward the round limit. The fix is still owed to the fixer.`,
+    `${who} asked to re-arm review, but the PR head is still \`${since}\` — unchanged since the send-back or fix-begin. No commit was pushed, so this round was NOT re-armed and does NOT count toward the round limit. The fix is still owed to the fixer.`,
   ].join('\n');
 }
 
@@ -329,8 +341,8 @@ if (IS_CLI) {
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
-  // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
-  // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
+  // Refuse an empty ordinary fix round before any label write. Unreadable evidence requires a retry;
+  // a failed refusal note never lets the re-arm through.
   const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
   // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
   if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
@@ -348,14 +360,22 @@ if (IS_CLI) {
       // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
       const apiRepo = repoVal || ':owner/:repo';
       const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
+      if (!/^[a-f0-9]{40}$/i.test(head ?? '') || !Array.isArray(pages)
+        || !pages.length || pages.some(page => !Array.isArray(page)
+          || page.some(c => !c || typeof c.body !== 'string' || !(c.author ?? c.user)?.login))) {
+        throw new Error('incomplete repair evidence');
+      }
       verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
-    } catch { /* fail open: never block a real push on a read error */ }
+    } catch {
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'refused: repair evidence unreadable — retry the head/thread read or ask the operator to verify the repair' }));
+      process.exit(1);
+    }
     if (verdict.empty) {
       try {
         readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
           { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
       } catch { /* the note is best-effort; the refusal below is not */ }
-      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since send-back or fix-begin)', head: verdict.since }));
       process.exit(1);
     }
   }

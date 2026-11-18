@@ -173,10 +173,19 @@ describe('operator send-backs, PR #5243 replay', () => {
     expect(operatorSendBacks([{ ...mechanical, author: { login: 'chalbert' } },
       { ...original, author: { login: 'stranger' } }])).toEqual([]);
   });
-  it('waits for a fixer chance; accepts a trusted later fix-end even without a head change', () => {
-    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original] }))).toBeNull();
-    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, { ...ended, author: { login: 'stranger' } }] }))).toBeNull();
+  it('owes the initial same-head repair; a forged fix-end cannot consume it', () => {
+    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original] }))?.items).toHaveLength(1);
+    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, { ...ended, author: { login: 'stranger' } }] }))?.items).toHaveLength(1);
     expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, ended] }))).not.toBeNull();
+  });
+  it('refuses to infer an initial repair from an unreadable live head', () => {
+    expect(sendBackNotAddressed(fixture({ headRefOid: 'unknown', comments: [original] }))).toBeNull();
+  });
+  it('a trusted completed rearm consumes the initial repair, but a pause wake does not', () => {
+    const rearm = comment('rearm', 'web-everything', '21:00', '🔧 conveyor fix — re-armed for re-review');
+    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, rearm] }))).toBeNull();
+    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original,
+      { ...rearm, body: `${rearm.body}\n\n<!-- same-head-pause-wake -->` }] }))?.items).toHaveLength(1);
   });
 });
 

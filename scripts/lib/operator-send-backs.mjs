@@ -1,5 +1,7 @@
 /** Operator repair requests survive every mechanical bounce. Pure thread readers and prompt renderers; no I/O. */
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
+import { isFixRoundRearmComment } from '../conveyor/rearm-round-count.mjs';
 
 const commentsOf = pr => Array.isArray(pr?.comments) ? pr.comments : [];
 // Keep a separator so removal cannot assemble new comment delimiters or evidence references.
@@ -290,18 +292,24 @@ export function renderOperatorSendBackReviewBlock(open) {
     + quotedItems(open) + '\n\n';
 }
 
-/** A fixer had a chance: a trusted later fix-end, or an observed head change. */
-export function sendBackNotAddressed(pr) {
+/** An unresolved request owes its first fixer too; completed turns retain the existing retry path. */
+export function sendBackNotAddressed(pr, { includeUnattempted = true } = {}) {
   const comments = commentsOf(pr);
   const items = openOperatorSendBacks(pr).filter(item => differentHead(item.head, pr?.headRefOid)
     || comments.some((c, index) => index > item.index && isTrustedMarkerAuthor(c)
-      && String(c?.body ?? '').trimStart().startsWith('🔓 conveyor fix-end')));
+      && String(c?.body ?? '').trimStart().startsWith('🔓 conveyor fix-end'))
+    || (includeUnattempted && item.head && shaOf(pr?.headRefOid) && Number.isFinite(Date.parse(item.at))
+      && !differentHead(item.head, pr.headRefOid)
+      && !comments.slice(item.index + 1).some(c => isTrustedMarkerAuthor(c)
+        && (isFixRoundRearmComment(c) || isFixEvidence(stripQuoted(String(c?.body ?? '')))
+          || String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)
+          || /^(?:🔁 (?:human )?review — changes requested|✅ review — accepted)/.test(String(c?.body ?? '').trimStart())))));
   return items.length ? { head: pr?.headRefOid ?? null, items } : null;
 }
 
 /** Adapt the detector to the existing ruling-not-addressed notice path; dedup is supplied by its shared reader. */
-export function operatorSendBackRuling(pr, noticedRungs = []) {
-  const detected = sendBackNotAddressed(pr);
+export function operatorSendBackRuling(pr, noticedRungs = [], options = {}) {
+  const detected = sendBackNotAddressed(pr, options);
   return detected && { ...detected, source: 'operator-send-back', noticedRungs,
     rung: { id: 'operator-send-back', at: 1, label: 'repair the unresolved operator send-back' },
     matches: detected.items.map(item => ({ source: 'operator-send-back',

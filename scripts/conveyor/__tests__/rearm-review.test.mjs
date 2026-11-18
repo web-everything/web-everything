@@ -502,13 +502,43 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
   it.each([
     ['the head read fails', { ...EMPTY, failView: true }],
     ['the comments read fails', { ...EMPTY, failApi: true }],
-  ])('FAILS OPEN when %s: no refusal, no note, control passes to the shared label CLI', (_n, scenario) => {
+    ['the head is unreadable', { ...EMPTY, head: null }],
+    ['the thread is incomplete', { ...EMPTY, comments: null }],
+  ])('refuses when %s: retry or operator verification required, no writes', (_n, scenario) => {
     const r = run(['6798', '--repo=o/r'], scenario);
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('repair evidence unreadable');
+    expect(r.out).toContain('operator');
+    expect(r.wrote).toBe(false);
+  });
+
+  const unclaimed = { ...verdict, body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nAt head \`${H0}\`: repair the export.`, user: { login: 'chalbert' } };
+  it.each([
+    ['missing', []],
+    ['forged', [{ author: { login: 'outsider' }, body: `## Fix evidence\nHead: \`${H0}\`` }]],
+    ['another head', [{ author: BOT, body: `## Fix evidence\nHead: \`${'b'.repeat(40)}\`` }]],
+    ['headless', [{ author: BOT, body: '## Fix evidence\nFixed.' }]],
+  ])('unchanged send-back refuses %s fix evidence', (_name, evidence) => {
+    expect(decideEmptyFixRound({ comments: [unclaimed, ...evidence], liveHead: H0 })).toEqual({ empty: true, since: H0 });
+  });
+  it('preserves the existing path when a trusted fixer already ended on this head', () => {
+    const release = { user: BOT, body: `🔓 conveyor fix-end — fix claim released\n\n\`fix-1\` released the fix claim at \`${H0}\`.` };
+    expect(decideEmptyFixRound({ comments: [unclaimed, release], liveHead: H0 }).empty).toBe(false);
+  });
+  it('refuses an unchanged send-back without any fix-begin, with no repair claim or counted round', () => {
+    const r = run(['6798', '--repo=o/r'], { head: H0, comments: [unclaimed] });
+    expect(r.status).toBe(1);
+    expect(JSON.parse(r.out)).toMatchObject({ ok: false, head: H0 });
+    expect(r.calls.map(c => c.slice(0, 2).join(' '))).toEqual(['pr view', expect.stringMatching(/^api /), 'pr comment']);
+    const body = bodyOf(r);
+    expect(body).toContain('fix is still owed');
+    expect(body).not.toContain('repaired and re-pushed');
+    expect(countRearmComments([{ author: BOT, body }])).toBe(0);
+  });
+  it('allows a moved send-back head without a fix-begin', () => {
+    const r = run(['6798', '--repo=o/r'], { head: 'b'.repeat(40), comments: [unclaimed] });
     expect(r.out).not.toContain('no change made');
-    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
-    // the shared CLI ran after the guard gave up: it issued a gh call that is not one of the guard's two reads (its reads
-    // pass `--json` as one comma-joined element, so the fake's exact `headRefOid` element match rejects them as unsupported)
-    expect(r.calls.some((c) => !(c[0] === 'pr' && c.includes('headRefOid')) && !(c[0] === 'api' && String(c[1]).includes('/comments')))).toBe(true);
+    expect(r.calls.some(c => c[0] === 'pr' && c[1] === 'view' && !c.includes('headRefOid'))).toBe(true);
   });
 
   it('a head that moved since the claim is NOT refused (the pushed fix proceeds to the shared CLI)', () => {
