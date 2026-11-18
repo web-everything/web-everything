@@ -11,8 +11,11 @@ export function isAdmissibleTargetPath(p) {
     || /\.(json|yml|yaml|toml)$/.test(p) || /\.real\.test\.mjs$/.test(p)
     || /(^|\/)(?:[^/]*\.config\.[^/]+|tsconfig[^/]*|[^/]*\.lockb?)$/.test(p)
     || !(isDoc(p) || isTest(p))) return false;
+  // Fixtures and tests of critical modules protect enforcement: a test is admissible only when its SUBJECT is not critical.
+  if (/(^|\/)fixtures?(\/|$)/.test(p)) return false;
+  const subject = p.replace(/(^|\/)__tests__\//, '$1').replace(/\.(test|spec)(\.[^/.]+)$/, '$2');
   try {
-    return criticalWorkVerdict({ filesTouched: [p, `${p}/`] }).critical === false;
+    return criticalWorkVerdict({ filesTouched: [p, `${p}/`, ...(subject === p ? [] : [subject])] }).critical === false;
   } catch { return false; } // Unknown criticality uses the next provider/operator.
 }
 

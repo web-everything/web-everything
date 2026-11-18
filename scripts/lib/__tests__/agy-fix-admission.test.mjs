@@ -116,3 +116,14 @@ it('shared verdict keeps ordinary documentation non-critical and admissible', ()
   expect(criticalWorkVerdict({ filesTouched: ['docs/guide.md'] }).critical).toBe(false);
   expect(admit({ size: 1, scope: ['docs/guide.md'] })).not.toBeNull();
 });
+
+describe('tests of critical subjects and fixtures are not admissible (audit: gate regression tests)', () => {
+  it.each([
+    'scripts/lib/__tests__/fixtures/agy-target-path-cases.mjs',
+    'scripts/lib/__tests__/required-status-checks.test.mjs',
+    'scripts/lib/__tests__/agy-confined-build.test.mjs',
+  ])('refuses %s', path => { expect(isAdmissibleTargetPath(path)).toBe(false); });
+  it('still admits a test whose subject is not critical', () => {
+    expect(isAdmissibleTargetPath('docs/guide.md')).toBe(true);
+  });
+});
