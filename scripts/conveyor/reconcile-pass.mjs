@@ -62,7 +62,7 @@ import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1n
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
-import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
+import { GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
 import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from './timeout-evidence-pool.mjs';
@@ -1496,12 +1496,52 @@ export function formatReport({ dispatch = [], refusals = [], notes = [], owedTri
   return lines.join('\n');
 }
 
-/** Read exact-head REST check runs; this reader does not prove exhaustive check/status coverage. */
+/** Exhaust both pinned-head feeds. The shared call cap fails visibly for operator investigation. */
 export function defaultReadChecks({ repo, sha }, { exec = execFileSyncThrottled } = {}) {
-  return parseJsonLines(exec('gh', checksArgv({ repo, sha }), {
-    encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
-    throttle: { op: 'pr-status-checks', repo },
-  }));
+  const rows = Object.assign([], { rowsHead: sha, rowsComplete: false });
+  let calls = 0;
+  const read = path => {
+    if (++calls > 128) throw new Error('exhaustive checks call cap reached; operator must investigate oversized evidence');
+    return JSON.parse(exec('gh', ['api', `repos/${repo}/${path}`], {
+      encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
+      throttle: { op: 'pr-status-checks', repo },
+    }));
+  };
+  try {
+    if (!isSha(sha)) throw new Error('missing or invalid exact head SHA');
+    for (const feed of ['check-runs', 'statuses']) {
+      let seen = 0;
+      for (let page = 1; ; page++) {
+        const data = read(`commits/${sha}/${feed}?per_page=100&page=${page}${feed === 'check-runs' ? '&filter=all' : ''}`);
+        const batch = feed === 'check-runs' ? data.check_runs : data;
+        if (!Array.isArray(batch) || batch.length > 100 || data.truncated === true) throw new Error(`malformed ${feed} page`);
+        for (const row of batch) {
+          if ((row.head_sha ?? row.sha ?? sha) !== sha) throw new Error(`${feed} head mismatch`);
+          rows.push(feed === 'check-runs' ? { ...row, __typename: 'CheckRun', detailsUrl: row.details_url ?? row.html_url ?? null }
+            : { ...row, __typename: 'StatusContext', name: row.context, context: row.context,
+              state: row.state, createdAt: row.created_at });
+        }
+        seen += batch.length;
+        if (batch.length < 100) {
+          if (data.total_count > seen) throw new Error(`truncated ${feed} pagination`);
+          break;
+        }
+      }
+    }
+    const jobs = new Map();
+    for (const row of rows) {
+      const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)(?:\?.*)?$/.exec(row.detailsUrl ?? '');
+      if (!match) continue;
+      if (match[1] !== repo) throw new Error('Actions repository mismatch');
+      if (!jobs.has(match[3])) jobs.set(match[3], read(`actions/jobs/${match[3]}`));
+      const job = jobs.get(match[3]);
+      if (job.id !== Number(match[3]) || job.run_id !== Number(match[2]) || job.head_sha !== sha
+        || !Number.isSafeInteger(job.run_attempt) || job.run_attempt < 1) throw new Error('Actions job head/identity mismatch');
+      Object.assign(row, { run_id: job.run_id, run_attempt: job.run_attempt });
+    }
+    rows.rowsComplete = true;
+  } catch (error) { rows.readError = String(error?.message ?? error); }
+  return rows;
 }
 
 /**
@@ -1537,7 +1577,12 @@ function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, de
     const pr = { ...rawPr, rosterSource };
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = withoutImpliedRequiredChecks(requiredChecks ?? [], runs).filter(name => !runs.some(run => run?.name === name));
-    if (pr.rowsComplete !== false && runs.length < 100 && !missing.length) { ready.push(pr); continue; }
+    // A short rollup may avoid a refresh, but never proves completeness for strict admission.
+    if (pr.rowsComplete !== false && (pr.rowsComplete === true || runs.length < 100) && !missing.length) {
+      const complete = pr.rowsComplete === true && pr.rowsHead === pr.headRefOid;
+      ready.push({ ...pr, rowsComplete: complete, ...(!complete ? { rollupIncomplete: true } : {}) });
+      continue;
+    }
     if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)
       && runs.length < 100 && missing.length === (requiredChecks ?? []).length) {
       const basePrNumber = prs.find(candidate => candidate.headRefName === pr.baseRefName)?.number ?? null;
@@ -1564,14 +1609,18 @@ function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, de
       try {
         if (!isSha(sha)) throw new Error('missing or invalid exact head SHA');
         const rows = readChecks({ repo, sha });
+        if (rows?.readError) throw new Error(rows.readError);
         if (!Array.isArray(rows) || rows.some(row => !row || !Number.isSafeInteger(row.id)
-          || typeof row.name !== 'string' || !row.name || typeof row.status !== 'string'
+          || (row.__typename === 'StatusContext'
+            ? typeof row.context !== 'string' || !row.context || !['success', 'failure', 'error', 'pending', 'expected'].includes(row.state?.toLowerCase())
+              || !Number.isFinite(Date.parse(row.createdAt))
+            : (typeof row.name !== 'string' || !row.name || typeof row.status !== 'string'
           || !['queued', 'in_progress', 'completed', 'waiting', 'requested', 'pending'].includes(row.status.toLowerCase())
           || (row.conclusion != null && typeof row.conclusion !== 'string')
-          || (row.completed_at != null && !Number.isFinite(Date.parse(row.completed_at))))) {
+          || (row.completed_at != null && !Number.isFinite(Date.parse(row.completed_at))))))) {
           throw new Error('malformed check runs');
         }
-        const unreadable = rows.filter(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
+        const unreadable = rows.filter(row => row.__typename !== 'StatusContext' && (!requiredChecks?.length || requiredChecks.includes(row.name))
           && row.status.toLowerCase() === 'completed'
           && !['success', ...FAILING_CONCLUSIONS, ...NON_BLOCKING_CONCLUSIONS].includes(row.conclusion?.toLowerCase()));
         if (unreadable.length) throw new Error(`unreadable conclusions: ${unreadable.map(row => row.name).join(', ')}`);
@@ -1581,9 +1630,15 @@ function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, de
         // or promotes, and the refusal below keeps that visible.
         const absent = withoutImpliedRequiredChecks(requiredChecks ?? [], rows).filter(name => !rows.some(row => row.name === name));
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
-          && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
+          && (row.__typename === 'StatusContext' ? row.state.toLowerCase() !== 'success'
+            : row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
         cache.set(key, { rowsHead: rows.rowsHead === undefined ? sha : rows.rowsHead,
-          rowsComplete: rows.rowsComplete === true, rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
+          rowsComplete: rows.rowsComplete === true && (rows.rowsHead === undefined || rows.rowsHead === sha),
+          rows: rows.map(row => row.__typename === 'StatusContext' ? { ...row,
+            status: ['pending', 'expected'].includes(row.state.toLowerCase()) ? 'PENDING' : 'COMPLETED',
+            conclusion: ['pending', 'expected'].includes(row.state.toLowerCase()) ? null
+              : row.state.toLowerCase() === 'error' ? 'FAILURE' : row.state.toUpperCase(),
+          } : ({ ...row, status: row.status.toUpperCase(),
           detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
           conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });

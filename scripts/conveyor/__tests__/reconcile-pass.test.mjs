@@ -1115,7 +1115,7 @@ it('hydrated REST check origins reach timeout enrichment', async () => {
   expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
 });
 
-it('production REST hydration preserves attribution but missing completeness metadata fails closed', async () => {
+it('production exhaustive REST hydration preserves attribution and dispatches the repair', async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -1125,7 +1125,8 @@ it('production REST hydration preserves attribution but missing completeness met
   try {
     const path = join(dir, 'prs.json');
     writeFileSync(path, JSON.stringify([xxPr()]));
-    const exec = vi.fn(() => xxRuns().map(row => JSON.stringify(row)).join('\n'));
+    const exec = vi.fn((_bin, args) => JSON.stringify(args[1].includes('/check-runs?')
+      ? { check_runs: xxRuns().map(row => ({ ...row, head_sha: XX_HEAD })) } : []));
     const plan = runReconcilePass({ ...xxOptions(), readOnly: true, readPrs: () => readPrsFromFile(path),
       readChecks: args => defaultReadChecks(args, { exec }),
       enrichMainRed: (prs, opts) => {
@@ -1136,13 +1137,11 @@ it('production REST hydration preserves attribution but missing completeness met
         expect(enriched.prs[0].requiredCheckCompletedAt).toBe('2026-10-01T10:00:00Z');
         return enriched;
       } });
-    expect(plan.enrichedPrs[0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
-    expect(plan.dispatch).toEqual([]);
-    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
-      evidenceReason: expect.stringContaining('rows-incomplete') }));
-    expect(exec.mock.calls[0][1]).toContain('--paginate');
-    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs`);
-    expect(exec.mock.calls[0][1].at(-1)).toContain('completed_at');
+    expect(plan.enrichedPrs[0]).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: true });
+    expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+    expect(exec.mock.calls[0][1]).toEqual(['api',
+      `repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs?per_page=100&page=1&filter=all`]);
+    expect(exec.mock.calls[1][1][1]).toContain(`/commits/${XX_HEAD}/statuses?per_page=100&page=1`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1292,7 +1291,121 @@ it('xxh4zw8 hydration preserves proven rerun lineage for superseded cancellation
   }
 });
 
-it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads are deduplicated', async () => {
+it('exhaustive production reader paginates both feeds and hydrates legacy states and Actions lineage', async () => {
+  const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const repo = 'web-everything/web-everything';
+  const checks = Array.from({ length: 101 }, (_, i) => ({ id: i + 1, name: `check-${i}`,
+    head_sha: XX_HEAD, status: 'completed', conclusion: 'success' }));
+  checks[100] = { ...checks[100], details_url: `https://github.com/${repo}/actions/runs/7/job/20` };
+  const statuses = Array.from({ length: 101 }, (_, i) => ({ id: i + 1000, sha: XX_HEAD,
+    context: `legacy-${i}`, state: 'success', created_at: '2026-10-01T10:00:00Z' }));
+  const exec = vi.fn((_bin, args, opts) => {
+    expect(opts).toMatchObject({ timeout: 60_000, maxBuffer: 32 * 1024 * 1024,
+      throttle: { op: 'pr-status-checks', repo } });
+    if (args[1].endsWith('/actions/jobs/20')) return JSON.stringify({ id: 20, run_id: 7, run_attempt: 2, head_sha: XX_HEAD });
+    expect(args[1]).toContain(`/commits/${XX_HEAD}/`);
+    const page = Number(/[?&]page=(\d+)(?:&|$)/.exec(args[1])[1]);
+    const isChecks = args[1].includes('/check-runs?');
+    if (isChecks) expect(args[1]).toContain('&filter=all');
+    const batch = (isChecks ? checks : statuses).slice((page - 1) * 100, page * 100);
+    return JSON.stringify(isChecks ? { check_runs: batch } : batch);
+  });
+  const rows = defaultReadChecks({ repo, sha: XX_HEAD }, { exec });
+  expect(rows).toHaveLength(202);
+  expect(rows).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: true });
+  expect(rows[100]).toMatchObject({ run_id: 7, run_attempt: 2,
+    detailsUrl: `https://github.com/${repo}/actions/runs/7/job/20` });
+  expect(rows[201]).toMatchObject({ __typename: 'StatusContext', context: 'legacy-100', state: 'success',
+    createdAt: '2026-10-01T10:00:00Z' });
+  expect(exec).toHaveBeenCalledTimes(5);
+  const plan = runReconcilePass({ ...xxOptions(), readOnly: true,
+    readRequiredChecks: () => ({ checks: ['check-100', 'legacy-100'], source: 'live' }),
+    readChecks: () => rows });
+  expect(plan.enrichedPrs[0]).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: true });
+  expect(plan.enrichedPrs[0].statusCheckRollup[201]).toMatchObject(rows[201]);
+  expect(plan.dispatch.map(d => d.kind)).toEqual(['promote-draft']);
+});
+
+it.each([['success', 'green'], ['failure', 'red'], ['error', 'red'], ['pending', 'pending']])(
+  'production legacy %s stays %s through hydration', async (state, expected) => {
+    const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
+    const { reduceCheckState } = await import('../../operations/pr-status.mjs');
+    const exec = vi.fn((_bin, args) => JSON.stringify(args[1].includes('/check-runs?') ? { check_runs: [] }
+      : [{ id: 1, context: 'legacy', state, created_at: '2026-10-01T10:00:00Z' }]));
+    const plan = runReconcilePass({ ...xxOptions(), readOnly: true,
+      readRequiredChecks: () => ({ checks: ['legacy'], source: 'live' }),
+      readChecks: args => defaultReadChecks(args, { exec }) });
+    expect(plan.enrichedPrs[0]).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: true });
+    expect(plan.enrichedPrs[0].statusCheckRollup[0]).toMatchObject({
+      __typename: 'StatusContext', state, context: 'legacy', createdAt: '2026-10-01T10:00:00Z' });
+    expect(reduceCheckState(plan.enrichedPrs[0].statusCheckRollup, ['legacy']).state).toBe(expected);
+  });
+
+it('an exactly full page needs an empty next page to prove exhaustion', async () => {
+  const { defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const exec = vi.fn((_bin, args) => JSON.stringify(args[1].includes('/check-runs?')
+    ? { check_runs: args[1].includes('page=1&')
+      ? Array.from({ length: 100 }, (_, i) => ({ ...xxRuns()[0], id: i + 1 })) : [] } : []));
+  expect(defaultReadChecks({ repo: 'o/r', sha: XX_HEAD }, { exec })).toMatchObject({ rowsComplete: true });
+  expect(exec.mock.calls.map(call => call[1][1])).toEqual([
+    `repos/o/r/commits/${XX_HEAD}/check-runs?per_page=100&page=1&filter=all`,
+    `repos/o/r/commits/${XX_HEAD}/check-runs?per_page=100&page=2&filter=all`,
+    `repos/o/r/commits/${XX_HEAD}/statuses?per_page=100&page=1`,
+  ]);
+});
+
+it('a short check page contradicting total_count is incomplete', async () => {
+  const { defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const exec = vi.fn(() => JSON.stringify({ check_runs: xxRuns(), total_count: 101 }));
+  expect(defaultReadChecks({ repo: 'o/r', sha: XX_HEAD }, { exec }))
+    .toMatchObject({ rowsComplete: false, readError: 'truncated check-runs pagination' });
+  expect(exec).toHaveBeenCalledTimes(1);
+});
+
+it.each(['check-runs', 'statuses'])('a failed second %s page leaves production evidence visibly incomplete', async feed => {
+  const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const exec = vi.fn((_bin, args) => {
+    if (args[1].includes(`/${feed}?`) && args[1].includes('page=2')) throw new Error('HTTP 502 page two');
+    if (args[1].includes('/check-runs?')) return JSON.stringify({ check_runs: feed === 'check-runs'
+      ? Array.from({ length: 100 }, (_, i) => ({ ...xxRuns()[i % 4], id: i + 1 })) : xxRuns() });
+    return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: i + 1, context: `legacy-${i}`,
+      state: 'success', created_at: '2026-10-01T10:00:00Z' })));
+  });
+  const rows = defaultReadChecks({ repo: 'web-everything/web-everything', sha: XX_HEAD }, { exec });
+  expect(rows).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: false, readError: 'HTTP 502 page two' });
+  const plan = runReconcilePass({ ...xxOptions(), readChecks: () => rows });
+  expect(plan.enrichedPrs[0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
+  expect(plan.dispatch).toEqual([]);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed',
+    why: expect.stringContaining('HTTP 502 page two') }));
+});
+
+it('production pagination overflow fails closed and tells the operator to investigate', async () => {
+  const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const exec = vi.fn(() => JSON.stringify({ check_runs: Array.from({ length: 100 }, (_, i) => ({ ...xxRuns()[i % 4], id: i + 1 })) }));
+  const rows = defaultReadChecks({ repo: 'web-everything/web-everything', sha: XX_HEAD }, { exec });
+  expect(exec).toHaveBeenCalledTimes(128);
+  expect(rows).toMatchObject({ rowsHead: XX_HEAD, rowsComplete: false,
+    readError: expect.stringContaining('operator must investigate oversized evidence') });
+  const plan = runReconcilePass({ ...xxOptions(), readChecks: () => rows });
+  expect(plan.enrichedPrs[0]).toMatchObject({ rowsComplete: false, rollupIncomplete: true });
+  expect(plan.dispatch).toEqual([]);
+});
+
+it.each(['check-runs', 'statuses', 'job'])('production reader refuses a foreign head in %s', async feed => {
+  const { defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const foreign = 'b'.repeat(40);
+  const exec = vi.fn((_bin, args) => JSON.stringify(args[1].includes('/check-runs?')
+    ? { check_runs: [{ ...xxRuns()[0], head_sha: feed === 'check-runs' ? foreign : XX_HEAD,
+      ...(feed === 'job' ? { details_url: 'https://github.com/o/r/actions/runs/7/job/20' } : {}) }] }
+    : args[1].includes('/statuses?') ? [{ id: 1, context: 'legacy', state: 'success', sha: foreign,
+      created_at: '2026-10-01T10:00:00Z' }].filter(() => feed === 'statuses')
+      : { id: 20, run_id: 7, run_attempt: 1, head_sha: foreign }));
+  expect(defaultReadChecks({ repo: 'o/r', sha: XX_HEAD }, { exec }))
+    .toMatchObject({ rowsHead: XX_HEAD, rowsComplete: false, readError: expect.stringContaining('mismatch') });
+});
+
+it('xxh4zw8 malformed production read is refused and failed identical-head reads are deduplicated', async () => {
   const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
   const exec = vi.fn(() => '{not-json');
   const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [xxPr(), { ...xxPr(), number: 3337 }],
