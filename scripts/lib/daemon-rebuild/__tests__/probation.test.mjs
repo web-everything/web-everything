@@ -21,6 +21,27 @@ const proof = (pid = 101, daemonId = 'worker') => ({
 const now = ADOPTED_AT + 2;
 
 describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
+  it.each([false, true])('interacting getters cannot remove an unproven daemon (records first: %s)', async recordsFirst => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const restored = JSON.parse(JSON.stringify(freezeProbation(options)));
+    const input = recordsFirst ? { records: undefined, ...restored } : restored;
+    const owed = input.owed;
+    let reads = 0;
+    Object.defineProperty(input, 'owed', { enumerable: true, get() { reads++; return owed; } });
+    Object.defineProperty(input, 'records', { enumerable: true, get() {
+      reads++;
+      owed.pop();
+      return {};
+    } });
+    const before = Object.getOwnPropertyDescriptors(input);
+    const next = recordProof(input, 'worker', proof(), now);
+    expect(next === input).toBe(true);
+    expect(Object.getOwnPropertyDescriptors(input)).toEqual(before);
+    expect(owed).toEqual(['worker', 'review']);
+    expect(evaluateProbation(next, now).action).toBe('pending');
+    expect(reads).toBe(0);
+  });
+
   it.each(['evaluate', 'record', 'evaluate records first', 'record records first'])(
     'records getter cannot pop owed during %s', async transition => {
       const { freezeProbation, recordProof, evaluateProbation } = await core();
@@ -34,8 +55,9 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
       } });
       const result = transition.startsWith('evaluate') ? evaluateProbation(input, now)
         : evaluateProbation(recordProof(input, 'worker', proof(), now), now);
-      expect(result).toEqual({ action: 'pending', owed: ['review'] });
-      expect(reads).toBe(1);
+      expect(result.action).toBe('pending');
+      expect(input.owed).toEqual(['worker', 'review']);
+      expect(reads).toBe(0);
     },
   );
 
@@ -43,24 +65,33 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     const { freezeProbation, evaluateProbation } = await core();
     const roster = [{ id: 'worker' }, { id: 'review' }];
     const input = { readClosure: undefined, ...options, registered: roster };
+    let reads = 0;
     Object.defineProperty(input, 'readClosure', { enumerable: true, get() {
+      reads++;
       roster.pop();
       return options.readClosure;
     } });
-    expect(evaluateProbation(freezeProbation(input), now))
-      .toEqual({ action: 'pending', owed: ['worker', 'review'] });
+    expect(freezeProbation(input) === input).toBe(true);
+    expect(evaluateProbation(input, now).action).toBe('pending');
+    expect(roster).toEqual([{ id: 'worker' }, { id: 'review' }]);
+    expect(reads).toBe(0);
   });
 
   it.each(['boot', 'tick', 'nested boot', 'nested tick'])(
     'throwing evidence getter is an identity-preserving no-op: %s', async site => {
       const { freezeProbation, recordProof } = await core();
-      const input = freezeProbation(options);
+      const input = JSON.parse(JSON.stringify(freezeProbation(options)));
+      const before = JSON.stringify(input);
       const evidence = proof();
+      let reads = 0;
       const nested = site.startsWith('nested ');
       const key = site.replace('nested ', '');
       Object.defineProperty(nested ? evidence[key] : evidence, nested ? 'pid' : key,
-        { enumerable: true, get() { throw new Error('unreadable evidence'); } });
+        { enumerable: true, get() { reads++; throw new Error('unreadable evidence'); } });
       expect(recordProof(input, 'worker', evidence, now)).toBe(input);
+      expect(JSON.stringify(input)).toBe(before);
+      expect(input.owed).toEqual(['worker', 'review']);
+      expect(reads).toBe(0);
     },
   );
 
@@ -70,6 +101,25 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
       const input = { ...options };
       Object.defineProperty(input, key, { enumerable: true, get() { throw new Error('unreadable'); } });
       expect(freezeProbation(input)).toBe(input);
+    },
+  );
+
+  it.each(['array getter', 'setter only'])(
+    'accessor evidence is refused without side effects: %s', async kind => {
+      const { freezeProbation, recordProof } = await core();
+      const input = JSON.parse(JSON.stringify(freezeProbation(options)));
+      const before = JSON.stringify(input);
+      const evidence = proof();
+      let calls = 0;
+      if (kind === 'array getter') {
+        evidence.boot.extra = [0];
+        Object.defineProperty(evidence.boot.extra, '0', { get() { calls++; input.owed.pop(); return 0; } });
+      } else {
+        Object.defineProperty(evidence, 'boot', { set(_) { calls++; input.owed.pop(); } });
+      }
+      expect(recordProof(input, 'worker', evidence, now)).toBe(input);
+      expect(JSON.stringify(input)).toBe(before);
+      expect(calls).toBe(0);
     },
   );
 
@@ -87,11 +137,13 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     'unreadable closure data always leaves the daemon owed: %s', async site => {
       const { freezeProbation, evaluateProbation } = await core();
       const value = closure(GOOD);
+      let calls = 0;
       Object.defineProperty(site === 'blob' ? value.files : value,
         site === 'blob' ? 'worker.mjs' : site,
-        { enumerable: true, get() { throw new Error('unreadable closure'); } });
+        { enumerable: true, get() { calls++; throw new Error('unreadable closure'); } });
       const input = freezeProbation({ ...options, registered: [{ id: 'worker' }], readClosure: () => value });
       expect(evaluateProbation(input, now)).toEqual({ action: 'pending', owed: ['worker'] });
+      expect(calls).toBe(0);
     },
   );
 
@@ -106,7 +158,7 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     expect(calls).toBe(0);
   });
 
-  it('aliased evidence is copied once even when a getter changes on subsequent reads', async () => {
+  it('aliased evidence with an accessor is refused without reading it', async () => {
     const { freezeProbation, recordProof, evaluateProbation } = await core();
     const input = JSON.parse(JSON.stringify(freezeProbation(options)));
     const evidence = proof();
@@ -116,9 +168,10 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     const next = recordProof(input, 'worker', evidence, now);
     // Vitest's negated object identity matcher deep-compares for diagnostic hints,
     // invoking the input getter again. Compare identity before entering the matcher.
-    expect(next === input).toBe(false);
-    expect(reads).toBe(1);
-    expect(evaluateProbation(next, now)).toEqual({ action: 'pending', owed: ['review'] });
+    expect(next === input).toBe(true);
+    expect(evaluateProbation(next, now).action).toBe('pending');
+    expect(input.owed).toEqual(['worker', 'review']);
+    expect(reads).toBe(0);
   });
 
   it('oversized input fails closed with operator recovery and identity-preserving no-ops', async () => {
@@ -319,14 +372,16 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
       Object.defineProperty(s, 'owed', { enumerable: true, get: () => (++reads === 1 ? ['worker', 'review'] : ['worker']) });
       return s;
     };
-    expect(evaluateProbation(shifty(), now)).toEqual({ action: 'pending', owed: ['worker', 'review'] });
-    const next = recordProof(shifty(), 'worker', proof(101), now);
-    expect(next.owed).toEqual(['worker', 'review']);
-    expect(evaluateProbation(next, now)).toEqual({ action: 'pending', owed: ['review'] });
+    expect(evaluateProbation(shifty(), now).action).toBe('pending');
+    const input = shifty();
+    const next = recordProof(input, 'worker', proof(101), now);
+    expect(next === input).toBe(true);
+    expect(evaluateProbation(next, now).action).toBe('pending');
     const empty = shifty();
     let reads = 0;
     Object.defineProperty(empty, 'owed', { enumerable: true, get: () => (++reads === 1 ? ['worker', 'review'] : []) });
-    expect(evaluateProbation(empty, now)).toEqual({ action: 'pending', owed: ['worker', 'review'] });
+    expect(evaluateProbation(empty, now).action).toBe('pending');
+    expect(reads).toBe(0);
     const throwing = shifty();
     Object.defineProperty(throwing, 'owed', { enumerable: true, get: () => { throw new Error('unreadable'); } });
     expect(evaluateProbation(throwing, now)).toMatchObject({ action: 'pending', reason: expect.stringMatching(/^invalid-probation: state-fields/) });

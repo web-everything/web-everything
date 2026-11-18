@@ -1,6 +1,6 @@
-/** PR 7061: replay the operator's three probes against the real pure probation core.
+/** PR 7061: replay the operator's probes against the real pure probation core.
  * No production wiring is claimed. The shared-map case pins the prior round's fix;
- * records mutation and top-level boot exceptions discriminate this repair.
+ * interacting accessors and zero getter calls discriminate this repair.
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -28,25 +28,39 @@ export function replay(core = currentCore) {
   const poppingRecords = recordsFirst => {
     const restored = JSON.parse(JSON.stringify(freezeProbation(options)));
     const state = recordsFirst ? { records: undefined, ...restored } : restored;
+    let reads = 0;
     Object.defineProperty(state, 'records', { enumerable: true, get() {
+      reads++;
       state.owed.pop();
       return { worker: evidence() };
     } });
-    return evaluateProbation(state, at + 2);
+    const result = evaluateProbation(state, at + 2);
+    return { action: result.action, owed: state.owed, reads };
+  };
+  const interactingGetters = () => {
+    const original = { records: undefined, ...JSON.parse(JSON.stringify(freezeProbation(options))) };
+    const owed = original.owed;
+    let reads = 0;
+    Object.defineProperty(original, 'owed', { enumerable: true, get() { reads++; return owed; } });
+    Object.defineProperty(original, 'records', { enumerable: true, get() { reads++; owed.pop(); return {}; } });
+    const next = recordProof(original, 'worker', evidence(), at + 2);
+    return { noOp: next === original, action: evaluateProbation(next, at + 2).action, owed, reads };
   };
   const throwingBoot = nested => {
     const original = freezeProbation(options), proof = evidence();
+    let reads = 0;
     Object.defineProperty(nested ? proof.boot : proof, nested ? 'pid' : 'boot',
-      { enumerable: true, get() { throw new Error('unreadable boot'); } });
+      { enumerable: true, get() { reads++; throw new Error('unreadable boot'); } });
     try {
       const next = recordProof(original, 'worker', proof, at + 2);
-      return { noOp: next === original, action: evaluateProbation(next, at + 2).action };
+      return { noOp: next === original, action: evaluateProbation(next, at + 2).action, owed: original.owed, reads };
     } catch (error) { return { throws: error.message }; }
   };
   return {
     sharedFiles: evaluateProbation(shared, at + 2),
     recordsPopOwed: poppingRecords(false),
     recordsBeforeOwed: poppingRecords(true),
+    interactingGetters: interactingGetters(),
     throwingBoot: throwingBoot(false),
     nestedThrowingBoot: throwingBoot(true),
   };
@@ -57,7 +71,7 @@ export default {
   title: 'accessor input cannot silently discharge probation or escape as a boot exception',
   card: 'PR 7061 — R986 I1 operator send-back',
   fixedBy: { sha: 'HEAD', where: 'lane/blue-green-s2a1-owed-set', paths: [SOURCE] },
-  fixPresent(root) { return readFileSync(join(root, SOURCE), 'utf8').includes('function sanitize('); },
+  fixPresent(root) { return readFileSync(join(root, SOURCE), 'utf8').includes("throw new TypeError('Accessor probation input')"); },
   async run({ log } = {}) {
     const report = replay();
     log?.(JSON.stringify(report));
@@ -66,10 +80,11 @@ export default {
   judge(report) {
     const expected = {
       sharedFiles: { action: 'pending', owed: ['worker'] },
-      recordsPopOwed: { action: 'pending', owed: ['review'] },
-      recordsBeforeOwed: { action: 'pending', owed: ['review'] },
-      throwingBoot: { noOp: true, action: 'pending' },
-      nestedThrowingBoot: { noOp: true, action: 'pending' },
+      recordsPopOwed: { action: 'pending', owed: ['worker', 'review'], reads: 0 },
+      recordsBeforeOwed: { action: 'pending', owed: ['worker', 'review'], reads: 0 },
+      interactingGetters: { noOp: true, action: 'pending', owed: ['worker', 'review'], reads: 0 },
+      throwingBoot: { noOp: true, action: 'pending', owed: ['worker', 'review'], reads: 0 },
+      nestedThrowingBoot: { noOp: true, action: 'pending', owed: ['worker', 'review'], reads: 0 },
     };
     return Object.keys(expected).filter(key => JSON.stringify(report[key]) !== JSON.stringify(expected[key]))
       .map(key => `${key}: ${JSON.stringify(report[key])}`);

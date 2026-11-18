@@ -9,8 +9,8 @@ const rosterError = () => new Error('Probation refused: operator must recover th
 const exactKeys = (value, keys) => object(value) && Object.keys(value).length === keys.length
   && keys.every(key => Object.hasOwn(value, key));
 
-/** The sole external-data boundary. Capture the data graph before invoking accessors,
- * memoizing aliases so each enumerable getter is consumed once, regardless of key order.
+/** The sole external-data boundary. Copy plain data without ever invoking accessors,
+ * memoizing aliases and rejecting accessor descriptors regardless of key order.
  * Unlike JSON serialization,
  * retain undefined/NaN for validation and never execute toJSON. Reject functions and cycles.
  * Adoption's injected readClosure callback is the only non-data value, captured separately.
@@ -18,7 +18,7 @@ const exactKeys = (value, keys) => object(value) && Object.keys(value).length ==
  */
 function sanitize(read, callbackKey) {
   try {
-    const input = read(), copies = new WeakMap(), getters = [];
+    const input = read(), copies = new WeakMap();
     let callback, properties = 0;
     const copy = value => {
       if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint') {
@@ -30,26 +30,21 @@ function sanitize(read, callbackKey) {
       const length = array ? Object.getOwnPropertyDescriptor(value, 'length').value : 0;
       const ownKeys = array ? null : Object.keys(value);
       properties += array ? length : ownKeys.length;
-      // Also bounds a getter that keeps returning fresh objects with more getters.
       if (properties > 100_000) throw new RangeError('Probation input exceeds copy limit');
       const result = array ? new Array(length) : {};
       copies.set(value, result);
       const keys = array ? Array.from({ length }, (_, i) => String(i)) : ownKeys;
       for (const key of keys) {
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        const save = child => {
-          if (value === input && key === callbackKey) callback = child;
-          else Object.defineProperty(result, key, { value: copy(child), enumerable: true });
-        };
         if (descriptor && !Object.hasOwn(descriptor, 'value')) {
-          getters.push(() => save(descriptor.get?.call(value)));
-        } else save(descriptor?.value);
+          throw new TypeError('Accessor probation input');
+        }
+        if (value === input && key === callbackKey) callback = descriptor?.value;
+        else Object.defineProperty(result, key, { value: copy(descriptor?.value), enumerable: true });
       }
       return result;
     };
     const data = copy(input);
-    // Accessor results can themselves contain getters; drain the same queue once per getter.
-    for (let i = 0; i < getters.length; i++) getters[i]();
     const active = new WeakSet(), frozen = new WeakSet();
     const freeze = value => {
       if (value === null || typeof value !== 'object') return;
