@@ -3169,3 +3169,42 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
 });
+
+
+describe('normal candidate pipeline parity', () => {
+  const recoveryWitness = status => ({ head, newest: payload(), seats: [], markers: {},
+    rawWriter: { parsed: { status, host: 'here', pidNamespace: 'ns', pid: 123 } } });
+  const recoveryOptions = { now: 2_000_000, probe: { host: 'here', namespace: 'ns', isAlive: () => false } };
+  const fresh = { action: 'dispatch', mode: 'fresh', why: 'head never had a red-team pass' };
+  it.each([
+    ['no witness', {}, fresh, true],
+    ...['queued', 'running'].map(status => [status + ' witness recovery',
+      { readWitness: () => recoveryWitness(status), recoveryOptions },
+      { action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' }, false]),
+    ['failedRead review-unfinished', { readWitness: () => ({ ok: false, reason: 'review-unfinished' }),
+      headNeverReviewed: () => false },
+      { action: 'skip', why: 'review-unfinished', escalate: true,
+        escalationContext: 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation' }, false],
+    ['cooldown', { lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) },
+      { action: 'skip', why: 'retry cooldown active' }, true],
+    ['recovery cooldown', { readWitness: () => recoveryWitness('running'), recoveryOptions,
+      lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) },
+      { action: 'skip', why: 'retry cooldown active' }, false],
+  ])('%s preserves the decision and evidence-read boundary', (_name, overrides, expected, readsEvidence) => {
+    const readEvidence = vi.fn(() => ({ loopPayload: payload(), recorded: false }));
+    expect(decide({ readEvidence, ...overrides })).toEqual({ prNumber: pr, head, ...expected });
+    expect(readEvidence).toHaveBeenCalledTimes(readsEvidence ? 1 : 0);
+  });
+
+  it.each(['dispatch', 'review'])('preserves the %s dispatch arguments', action => {
+    const o = runFixture(action === 'review' ? {
+      rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }],
+      readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => true,
+    } : {});
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0]).toMatchObject({ action, head });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr,
+      ...(action === 'dispatch' ? { redTeamOnly: true, redTeamMode: 'fresh' } : {}) });
+    expect(out.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: action === 'dispatch' ? 'fresh' : 'review' }]);
+  });
+});
