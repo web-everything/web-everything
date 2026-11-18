@@ -405,6 +405,18 @@ describe('reclaim never destroys a lock another owner has taken since', () => {
     expect(r).toMatchObject({ ok: false, reason: 'held', heldBy: 'A' });
   });
 
+  it('releaseLockDirIf preserves a same-owner same-heartbeat replacement with a different meta.writerToken', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100, undefined, undefined, { writerToken: 'first' });
+    const expected = readLockEntry(root, 'p');
+    releaseLockDir(root, 'p');
+    reserve(root, 'p', 'A', T0, iso(T0), 100, undefined, undefined, { writerToken: 'replacement' });
+    const replacement = readLockEntry(root, 'p');
+    expect(replacement).toEqual({ ...expected, meta: { writerToken: 'replacement' } });
+    expect(releaseLockDirIf(root, 'p', expected)).toBe(false);
+    expect(readLockEntry(root, 'p')).toEqual(replacement);
+    expect(releaseLockDirIf(root, 'p', replacement)).toBe(true);
+  });
+
   it('reserve: a reclaimer that read the SAME stale entry as a faster reclaimer leaves the faster one\'s lock standing', () => {
     reserve(root, 'p', 'A', T0, iso(T0), 100);                // A: stale holder both reclaimers read
     // The probe runs right after B reads A's entry and before B removes it: C (faster) reclaims A and takes the lock.

@@ -919,8 +919,10 @@ export async function withWriteLock(root, fn, opts = {}) {
   const entryFile = join(writerRoot, lockIdFor(WRITER_KEY), 'lock.json');
   const readRecord = () => { try { return readFileSync(entryFile, 'utf8'); } catch { return null; } };
   const record = readRecord();
-  const stillOurs = () => record !== null && readRecord() === record
-    && readLockEntry(writerRoot, WRITER_KEY)?.owner === owner;
+  const writerToken = readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken;
+  const stillOurs = () => record !== null && writerToken != null && readRecord() === record
+    && readLockEntry(writerRoot, WRITER_KEY)?.owner === owner
+    && readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken === writerToken;
   let lost = false;
   const loseLock = () => {
     if (lost) return;

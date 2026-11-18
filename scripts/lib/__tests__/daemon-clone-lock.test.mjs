@@ -47,7 +47,7 @@ afterEach(() => {
 const alwaysAlive = () => 'alive';
 const alwaysDead = () => 'dead';
 
-it('stops heartbeating and logs loss once without overwriting or releasing a replacement owner/token', async () => {
+it.each(['heartbeat', 'stillHeld'])('detects a replacement meta.writerToken via %s without refreshing or releasing it', async (detection) => {
   vi.useFakeTimers();
   try {
     const checkReplacement = async (replacementOwner) => {
@@ -57,14 +57,20 @@ it('stops heartbeating and logs loss once without overwriting or releasing a rep
       const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
       const log = vi.fn();
       let replacement;
-      const result = await withWriteLock(clone, async () => {
+      const result = await withWriteLock(clone, async (stillHeld) => {
         const original = readFileSync(file, 'utf8');
         await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
         expect(readFileSync(file, 'utf8')).toBe(original);
         expect(readLockEntry(writerRoot, '<clone:writer>').heartbeatAt).toBe(new Date().toISOString());
-        replacement = JSON.stringify({ ...JSON.parse(original), owner: replacementOwner, token: 'replacement-token' });
+        const entry = JSON.parse(original);
+        expect(entry.meta.writerToken).toEqual(expect.any(String));
+        expect(entry).not.toHaveProperty('token');
+        replacement = JSON.stringify({ ...entry, owner: replacementOwner, meta: { ...entry.meta, writerToken: 'replacement-token' } });
         writeFileSync(file, replacement);
+        const replacementHeartbeat = readLockEntry(writerRoot, '<clone:writer>').heartbeatAt;
+        if (detection === 'stillHeld') expect(stillHeld()).toBe(false);
         await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(readLockEntry(writerRoot, '<clone:writer>').heartbeatAt).toBe(replacementHeartbeat);
         expect(readFileSync(file, 'utf8')).toBe(replacement);
         expect(vi.getTimerCount()).toBe(0);
         await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS * 2);
@@ -558,24 +564,26 @@ describe('acquireWrite waiting on readers', () => {
   });
 });
 
-it('does not reclaim a live replacement installed between the liveness probe and reclaim', async () => {
-  for (const replacementOwner of ['writer-c', 'writer-a']) {
-    const lockRoot = mkTmp('dcl-replaced-lockroot-');
-    const clone = mkTmp('dcl-replaced-clone-');
-    expect(await acquireWrite(clone, { owner: 'writer-a', lockRoot, probe: alwaysAlive })).toEqual({ ok: true });
-    const { writerRoot } = cloneLockDirs(clone, lockRoot);
-    const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
-    const replacement = { ...JSON.parse(readFileSync(file, 'utf8')), owner: replacementOwner, token: 'replacement-token' };
-    const probe = vi.fn(entry => {
-      if (entry?.owner !== 'writer-a') return 'alive';
-      writeFileSync(file, JSON.stringify(replacement));
-      return 'dead';
-    });
-    expect(await acquireWrite(clone, { owner: 'writer-b', lockRoot, probe }))
-      .toMatchObject({ ok: false, reason: 'concurrent-mover', heldBy: replacementOwner });
-    expect(probe).toHaveBeenCalled();
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(replacement);
-  }
+it.each(['writer-c', 'writer-a'])('does not reclaim replacement %s with the same heartbeat and a different meta.writerToken', async (replacementOwner) => {
+  const lockRoot = mkTmp('dcl-replaced-lockroot-');
+  const clone = mkTmp('dcl-replaced-clone-');
+  expect(await acquireWrite(clone, { owner: 'writer-a', lockRoot, probe: alwaysAlive })).toEqual({ ok: true });
+  const { writerRoot } = cloneLockDirs(clone, lockRoot);
+  const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
+  const original = JSON.parse(readFileSync(file, 'utf8'));
+  expect(original.meta.writerToken).toEqual(expect.any(String));
+  expect(original).not.toHaveProperty('token');
+  const replacement = { ...original, owner: replacementOwner, meta: { ...original.meta, writerToken: 'replacement-token' } };
+  expect(replacement.heartbeatAt).toBe(original.heartbeatAt);
+  const probe = vi.fn(entry => {
+    if (entry?.owner !== 'writer-a') return 'alive';
+    writeFileSync(file, JSON.stringify(replacement));
+    return 'dead';
+  });
+  expect(await acquireWrite(clone, { owner: 'writer-b', lockRoot, probe }))
+    .toMatchObject({ ok: false, reason: 'concurrent-mover', heldBy: replacementOwner });
+  expect(probe).toHaveBeenCalled();
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(replacement);
 });
 
 describe('defaultProbePidLiveness', () => {
