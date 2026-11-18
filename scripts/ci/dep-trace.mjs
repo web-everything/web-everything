@@ -46,7 +46,7 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     edges.set(key, edge);
     record(edge);
   }
-  const tracer = { add, truncated: false, snapshot: () => ({ test, edges: [...edges.values()].sort((a, b) =>
+  const tracer = { add, truncated: false, snapshot: () => ({ test, truncated: tracer.truncated, edges: [...edges.values()].sort((a, b) =>
     a.file.localeCompare(b.file) || a.kind.localeCompare(b.kind)) }), install() {
     for (const [name, kind] of Object.entries({ readFileSync: 'read', readFile: 'read', readdirSync: 'list', existsSync: 'read' })) {
       const original = io[name];
@@ -83,7 +83,9 @@ function inheritOptions(options = '') {
 /** Sorted union of per-process evidence. Missing entries remain unknown, never proof of coverage. */
 export function mergeTraces(traces) {
   const tests = new Map();
+  const incomplete = new Set(traces.filter(t => t.truncated).map(t => t.test));
   for (const { test, edges } of traces) {
+    if (incomplete.has(test)) continue; // capped evidence is unknown, never a known trace
     if (!tests.has(test)) tests.set(test, new Map());
     for (const { file, kind } of edges) {
       const files = tests.get(test);

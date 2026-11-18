@@ -103,6 +103,7 @@ describe('shadow dependency tracer', () => {
     expect(f.tracer.truncated).toBe(true);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('rerun with a larger'));
+    expect(mergeTraces([f.tracer.snapshot()])).toEqual({}); // capped evidence stays unknown
     const zero = fixture({ maxEdgesPerTest: 0 });
     zero.tracer.add('a', 'read');
     expect(zero.record).not.toHaveBeenCalled();
@@ -139,7 +140,7 @@ describe('shadow dependency tracer', () => {
     runtime.once.mock.calls[0][1]();
     expect(io.writeFileSync).toHaveBeenCalledTimes(1);
     expect(io.writeFileSync.mock.calls[0][0]).toBe(resolve(root, 'artifacts/trace-123.json'));
-    expect(JSON.parse(io.writeFileSync.mock.calls[0][1])).toEqual({ test, edges: [{ file: 'pending.mjs', kind: 'load' }] });
+    expect(JSON.parse(io.writeFileSync.mock.calls[0][1])).toEqual({ test, truncated: false, edges: [{ file: 'pending.mjs', kind: 'load' }] });
     expect(queue).toHaveLength(0);
   });
   it('merges deterministically and compares direct reachability against static, retaining unknowns', () => {
