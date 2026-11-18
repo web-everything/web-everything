@@ -20,9 +20,9 @@ export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(ru
 function bindReviewReruns(checks, { repo, headSha, run }) {
   const counts = new Map(), jobs = new Map();
   for (const check of checks) counts.set(check?.name, (counts.get(check?.name) ?? 0) + 1);
-  return checks.map(check => {
+  const bound = checks.map(check => {
     // Only the job endpoint can establish workflow identity, never fields in a check feed.
-    const { run_id: ignoredRun, run_attempt: ignoredAttempt, ...row } = check;
+    const { run_id: ignoredRun, run_attempt: ignoredAttempt, rerunJob: ignoredLineage, ...row } = check;
     if (counts.get(row.name) < 2 || row.app?.slug !== 'github-actions') return row;
     const unavailable = () => { throw new Error('rerun lineage unavailable; inspect Actions jobs before retrying review'); };
     const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(row.details_url);
@@ -38,6 +38,32 @@ function bindReviewReruns(checks, { repo, headSha, run }) {
       || job.name !== row.name || job.check_run_url !== `https://api.github.com/repos/${repo}/check-runs/${row.id}`
       || !positive(job.run_attempt)) return unavailable();
     return { ...row, run_id: job.run_id, run_attempt: job.run_attempt };
+  });
+  // Rerunning a job creates new job/check IDs. A name becomes stable lineage only
+  // when the COMPLETE job roster proves it is unique in each observed attempt.
+  const rosters = new Map();
+  return bound.map(row => {
+    if (!row.run_id || !row.run_attempt) return row;
+    const key = `${row.run_id}/${row.run_attempt}`;
+    if (!rosters.has(key)) {
+      if (rosters.size >= 20) throw new Error('rerun lineage exceeds 20 attempt rosters; inspect Actions reruns before retrying review');
+      const pages = JSON.parse(run(['api', '--paginate', '--slurp',
+        `repos/${repo}/actions/runs/${row.run_id}/attempts/${row.run_attempt}/jobs?per_page=100`]));
+      if (!Array.isArray(pages) || !pages.length || pages.some(page => !Array.isArray(page.jobs))) throw new Error('rerun job roster unreadable');
+      const roster = pages.flatMap(page => page.jobs);
+      if (pages.some(page => page.total_count !== roster.length)
+        || roster.some(job => !Number.isSafeInteger(job?.id) || job.id <= 0 || typeof job.name !== 'string' || !job.name.trim())
+        || new Set(roster.map(job => job.id)).size !== roster.length) throw new Error('rerun job roster incomplete');
+      rosters.set(key, roster);
+    }
+    const matches = rosters.get(key).filter(job => job.name === row.name);
+    const jobId = Number(/\/job\/(\d+)$/.exec(row.details_url)?.[1]);
+    const job = matches.find(job => job.id === jobId);
+    if (!job || job.run_id !== row.run_id || job.run_attempt !== row.run_attempt || job.head_sha !== headSha
+      || job.check_run_url !== `https://api.github.com/repos/${repo}/check-runs/${row.id}`) throw new Error('rerun job roster does not bind check');
+    return matches.length === 1 ? { ...row, rerunJob: {
+      headSha, runId: row.run_id, attempt: row.run_attempt, jobId, checkRunId: row.id, name: row.name,
+    } } : row;
   });
 }
 /**

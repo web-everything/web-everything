@@ -71,6 +71,11 @@ const rerunReader = (checks, jobs, calls = []) => argv => {
   calls.push(path);
   if (path.includes('/check-runs?')) return JSON.stringify([{ total_count: checks.length, check_runs: checks }]);
   if (path.includes('/status?')) return JSON.stringify([{ statuses: [{ context: 'legacy', state: 'success' }] }]);
+  const attempt = /\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs\?/.exec(path);
+  if (attempt) {
+    const roster = jobs.filter(job => job.run_id === Number(attempt[1]) && job.run_attempt === Number(attempt[2]));
+    return JSON.stringify([{ total_count: roster.length, jobs: roster }]);
+  }
   const job = jobs.find(job => path === `repos/owner/repo/actions/jobs/${job.id}`);
   if (!job) throw new Error('job evidence unavailable');
   return JSON.stringify(job);
@@ -95,6 +100,28 @@ describe('REST rerun reader-to-gate compatibility', () => {
     const other = restCheck(11, 'success', 701);
     expect(gate(args => readReviewChecks({ ...args,
       run: rerunReader([failed, other], [restJob(failed, 1), restJob(other, 2, 701)]) })))
+      .toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
+  });
+  it.each([1, 2])('duplicate matrix job names in attempt %s cannot establish rerun lineage', attempt => {
+    const sibling = restCheck(12);
+    expect(gate(args => readReviewChecks({ ...args, run: rerunReader([failed, passed],
+      [restJob(failed, 1), restJob(passed, 2), restJob(sibling, attempt)]) })))
+      .toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
+  });
+  it.each(['incomplete', 'unreadable', 'missing job'])('fails closed on an %s attempt roster', kind => {
+    const read = rerunReader([failed, passed], [restJob(failed, 1), restJob(passed, 2)]);
+    expect(gate(args => readReviewChecks({ ...args, run: argv => {
+      if (argv.at(-1).includes('/attempts/')) {
+        if (kind === 'unreadable') throw new Error('roster unavailable');
+        return JSON.stringify([{ total_count: kind === 'incomplete' ? 1 : 0, jobs: [] }]);
+      }
+      return read(argv);
+    } }))).toMatchObject({ allowed: false, reason: 'unreadable-ci' });
+  });
+  it('strips a check-feed lineage claim when the real roster is ambiguous', () => {
+    const claimed = { ...passed, rerunJob: { headSha, runId: 700, attempt: 2, jobId: 111, checkRunId: 11, name: 'test' } };
+    expect(gate(args => readReviewChecks({ ...args, run: rerunReader([failed, claimed],
+      [restJob(failed, 1), restJob(passed, 2), restJob(restCheck(12), 2)]) })))
       .toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
   });
 

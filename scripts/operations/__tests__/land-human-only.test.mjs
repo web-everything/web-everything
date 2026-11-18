@@ -23,6 +23,9 @@ import { readDrainAcceptance } from '../../merge-ai-prs.mjs';
 
 const head = 'a'.repeat(40);
 const repo = 'o/r';
+const rollupResponse = live => JSON.stringify({ data: { repository: { h0: { oid: live.headRefOid,
+  statusCheckRollup: { contexts: { nodes: live.statusCheckRollup.map(row => ({ __typename: 'CheckRun', ...row })),
+    totalCount: live.statusCheckRollup.length, pageInfo: { hasNextPage: false } } } } } } });
 
 function read(over = {}) {
   return {
@@ -464,7 +467,7 @@ describe('land-human-only — the reader', () => {
     expect(() => planLandHumanOnly(context, input())).toThrow(/change list unreadable/);
   });
 
-  async function runWithCeremony(clearedHead) {
+  async function runWithCeremony(clearedHead, complete = true) {
     const live = { number: 7, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: head,
       body: 'Land the approved workflow update.', title: 'Workflow update', headRefName: 'lane/workflow',
       labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], commits: [],
@@ -472,6 +475,10 @@ describe('land-human-only — the reader', () => {
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (_bin, args) => {
       if (args[0] === 'pr') return JSON.stringify(live);
+      if (args[0] === 'api' && args.includes('graphql')) {
+        if (!complete) throw new Error('check connection unreadable');
+        return rollupResponse(live);
+      }
       if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (args.join(' ').includes('isInMergeQueue')) return JSON.stringify({ data: { repository: {
         pullRequest: { isInMergeQueue: false, headRefOid: head },
@@ -520,6 +527,12 @@ describe('land-human-only — the reader', () => {
     expect(outcome.stopped).toBe('complete');
     expect(write).toHaveBeenCalledTimes(1);
   });
+  it('refuses a current-head ceremony when the successful listing has no completeness proof', async () => {
+    const { outcome, write } = await runWithCeremony(head, false);
+    expect(String(outcome.error?.message ?? outcome.error)).toContain('rows-incomplete');
+    expect(outcome.run.effects).toEqual([]);
+    expect(write).not.toHaveBeenCalled();
+  });
 
   it('refuses a missing clear-human ceremony with no write effects', async () => {
     const { outcome, write } = await runWithCeremony(null);
@@ -546,6 +559,7 @@ describe('land-human-only — the reader', () => {
     const exec = (bin, args) => {
       const a = args.join(' ');
       if (a.startsWith('pr view')) return JSON.stringify(live);
+      if (args[0] === 'api' && args.includes('graphql')) return rollupResponse(live);
       if (a.startsWith('repo view')) return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
       throw new Error(`unexpected ${a}`);

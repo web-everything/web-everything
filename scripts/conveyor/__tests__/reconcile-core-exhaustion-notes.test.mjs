@@ -28,7 +28,7 @@ import {
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CI_HEAL_ROUND_CAP,
 } from '../reconcile-core.mjs';
 // This historical fixture exercises the serial policy; new defaults have their own timing suite.
-const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
+const planReconcile = options => planReconcileWithTiming({ requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { noteEpisodeKey, buildNoteComment, hasPostedNoteComment } from '../reconcile-note-comment.mjs';
@@ -50,6 +50,7 @@ const finding = (text = 'a real reviewer finding') => ({ body: `🔁 human revie
 
 /** A minimal, bounced PR — the population the GENERIC round cap (REFUSAL 3) binds. */
 const prBounced = (over = {}) => ({
+  rowsHead: over.headRefOid ?? '3001'.repeat(10), rowsComplete: true,
   number: 3001,
   state: 'OPEN',
   headRefName: 'lane/xilx617-bounced',
@@ -63,6 +64,7 @@ const prBounced = (over = {}) => ({
 
 /** A `review:pending` PR with ZERO findings — the zero-findings review branch's own cap. */
 const prZeroFindingsReview = (over = {}) => ({
+  rowsHead: over.headRefOid ?? '3002'.repeat(10), rowsComplete: true,
   number: 3002,
   state: 'OPEN',
   headRefName: 'lane/xilx617-zero-findings',

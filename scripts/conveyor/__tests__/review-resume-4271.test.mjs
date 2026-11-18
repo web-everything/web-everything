@@ -33,7 +33,7 @@ const comments = fx.comments.map((c) => ({ ...c, includesCreatedEdit: false }));
 const beforeRulings = comments.slice(0, 3);
 const afterRulings = comments;
 const pr = (comments, labels = ['review:human', 'advisory:ruling-needed']) => ({
-  number: fx.pr, headRefOid: head, body: fx.body, createdAt: fx.createdAt, isDraft: false, baseRefName: 'main',
+  number: fx.pr, headRefOid: head, rowsHead: head, rowsComplete: true, body: fx.body, createdAt: fx.createdAt, isDraft: false, baseRefName: 'main',
   labels: labels.map((name) => ({ name })), comments,
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'ci' }],
 });

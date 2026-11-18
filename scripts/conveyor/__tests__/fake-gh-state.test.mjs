@@ -17,10 +17,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFakeGithub, addLabelsPure, removeLabelsPure, applyBranchDeletionPure, requirePr } from './helpers/fake-gh.mjs';
 import { git, writeLocalIdentity, DEFAULT_BRANCH } from '../../operations/__tests__/helpers/real-repo.mjs';
-import { buildOpenPrPageQuery, listOpenPrsPagedHydrated, listOpenPrsLightPaged } from '../../lib/pr-list-paged.mjs';
+import { buildOpenPrPageQuery, enrichPrRollupEvidence, listOpenPrsPagedHydrated, listOpenPrsLightPaged } from '../../lib/pr-list-paged.mjs';
 import { createGhProvider, GH_ARGV } from '../../lib/review-label-provider.mjs';
 import { readCompletePrComments } from '../pr-comments-complete.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
+import { readReviewChecks, readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
 import { buildOperatorAnswer, isOperatorAnswerStandDownSuperseded } from '../stand-down-answer-core.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -301,6 +302,46 @@ describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
     }
   });
 
+  it('serves distinct rerun jobs and complete attempt rosters to the real review gate', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-rerun-proof-');
+    const gh = makeGithub(originPath);
+    seedBranchAt(originPath, 'lane/rerun-proof');
+    const number = gh.openPr({ repo: SLUG, head: 'lane/rerun-proof', title: 'rerun proof', body: 'job lineage' });
+    const head = git(['rev-parse', DEFAULT_BRANCH], { cwd: originPath }).trim();
+    const checks = [1, 2].map(attempt => ({ name: 'test', conclusion: attempt === 1 ? 'FAILURE' : 'SUCCESS',
+      actions: { runId: 700, runAttempt: attempt, jobId: 100 + attempt, checkRunId: attempt } }));
+    gh.setChecks(SLUG, number, checks);
+    const gate = () => readReviewCiGate({ repo: SLUG, pr: number, readHead: () => head,
+      readRequired: () => ({ source: 'live', checks: ['test'] }), policy: { startAfter: 'ci-green' },
+      readChecks: args => readReviewChecks({ ...args, run: argv => ghExec(gh, argv, clonePath) }) });
+    expect(gate()).toMatchObject({ allowed: true, rowsComplete: true });
+    gh.setChecks(SLUG, number, [...checks, { name: 'test', conclusion: 'SUCCESS',
+      actions: { runId: 700, runAttempt: 2, jobId: 103, checkRunId: 3 } }]);
+    expect(gate()).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
+  });
+
+  it('serves head-bound rollup proof and exposes the 100-context cap to the real reader', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-rollup-proof-');
+    const gh = makeGithub(originPath);
+    seedBranchAt(originPath, 'lane/proof');
+    const number = gh.openPr({ repo: SLUG, head: 'lane/proof', title: 'proof', body: 'complete check evidence' });
+    const row = JSON.parse(ghExec(gh, ['pr', 'view', String(number), '--repo', SLUG,
+      '--json', 'number,headRefOid,statusCheckRollup'], clonePath));
+    const exec = (command, args, opts) => execFileSync(command, args, { ...opts, cwd: clonePath,
+      env: { ...opts.env, ...gh.env } });
+    enrichPrRollupEvidence({ repo: SLUG, rows: [row], exec });
+    expect(row.rowsComplete).toBe(true);
+    expect(row.rowsHead).toBe(row.headRefOid);
+    expect(row.statusCheckRollup).toContainEqual(expect.objectContaining({ name: 'test', conclusion: 'SUCCESS' }));
+    gh.setChecks(SLUG, number, Array.from({ length: 101 }, (_, i) => ({ name: `check-${i}`, status: 'COMPLETED', conclusion: 'SUCCESS' })));
+    enrichPrRollupEvidence({ repo: SLUG, rows: [row], exec });
+    expect(row.rowsComplete).toBe(false);
+    expect(row.statusCheckRollup).toHaveLength(100);
+    const absent = { headRefOid: 'f'.repeat(40), statusCheckRollup: [] };
+    enrichPrRollupEvidence({ repo: SLUG, rows: [absent], exec });
+    expect(absent).toMatchObject({ rowsHead: null, rowsComplete: false });
+  });
+
   it('serves paged open PRs to the real snapshot reader, with live checks and heavy hydration', () => {
     const { originPath, clonePath } = makeOrigin('fake-gh-pages-');
     const gh = makeGithub(originPath);
@@ -321,6 +362,8 @@ describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
     expect(page.totalCount).toBe(4);
     expect(page.rows.map(pr => pr.number)).toEqual([numbers[4], numbers[3], numbers[2], numbers[0]]);
     const latest = page.rows[0];
+    expect(latest.rowsComplete).toBe(true);
+    expect(latest.rowsHead).toBe(latest.headRefOid);
     expect(latest.body).toBe('body 4');
     expect(latest.comments.map(c => c.body)).toEqual(['review evidence']);
     expect(latest.labels.map(l => l.name)).toEqual(['ready-to-merge', 'review:accepted']);

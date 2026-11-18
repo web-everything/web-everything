@@ -469,6 +469,7 @@ export function setChecksPure(repoState, number, checks = []) {
   const pr = requirePr(repoState, number);
   const now = isoNow(Date.now());
   pr.checks = checks.map((c) => ({
+    ...(c.actions ? { actions: { ...c.actions } } : {}),
     name: c.name,
     status: c.status || 'COMPLETED',
     conclusion: c.conclusion || 'SUCCESS',
@@ -548,6 +549,7 @@ export function openPrPure(repoState, {
     state: 'OPEN', createdAt: nowIso, updatedAt: nowIso, closedAt: null, mergedAt: null,
     labels: [], comments: [],
     checks: checks.map((c) => ({
+      ...(c.actions ? { actions: { ...c.actions } } : {}),
       name: c.name, status: c.status || 'COMPLETED', conclusion: c.conclusion || 'SUCCESS',
       startedAt: nowIso, completedAt: nowIso,
     })),
@@ -822,6 +824,9 @@ export function buildPrGraphqlView(repoState, pr, { originPath, callerActor, fie
     labels: pr.labels.map((name) => ({ name })),
     comments: pr.comments.map((c) => ({ ...c, id: `IC_fake_${c.id}`, viewerDidAuthor: c.author.login === callerActor })),
     statusCheckRollup: pr.checks.map((c) => ({
+      ...(c.actions ? { databaseId: c.actions.checkRunId,
+        detailsUrl: `https://github.com/${repoState.slug}/actions/runs/${c.actions.runId}/job/${c.actions.jobId}`,
+        checkSuite: { app: { slug: 'github-actions', databaseId: 15368 } } } : {}),
       __typename: 'CheckRun', name: c.name, status: c.status, conclusion: c.conclusion,
       startedAt: c.startedAt, completedAt: c.completedAt,
     })),

@@ -12,6 +12,7 @@ const check = (name, conclusion = 'SUCCESS') => ({ name, status: conclusion ? 'C
 const finding = { author: { login: 'web-everything' }, createdAt: new Date(now - 60_000).toISOString(), body:
   `🔁 review — changes requested\n\nRecorded by juror via ${REVIEW_PR_CHANNEL}.\n\nRepair the unit failure.\n\n---\n\nNet basis: \`0000..${head}\` — 1 net changed file(s) vs current main\n\n_Recorded through ${REVIEW_PR_CHANNEL}._` };
 const pr = (over = {}) => ({ number: 7, state: 'OPEN', headRefOid: head, headRefName: 'lane/xabc-test',
+  rowsHead: over.headRefOid ?? head, rowsComplete: true,
   labels: labels('review:pending'), comments: [], files: [{ path: 'scripts/example.mjs' }], statusCheckRollup: [check('standards'), check('test-shard (1)'), check('test', null)], ...over });
 const plan = (row, extra = {}) => planReconcile({ prs: [row], requiredChecks: ['test'], now, ...extra });
 it('the production planner releases fast-check review while aggregate CI is pending', () => {

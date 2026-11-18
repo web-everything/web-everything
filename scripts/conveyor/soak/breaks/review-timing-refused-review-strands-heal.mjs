@@ -22,6 +22,7 @@ export default {
     for (const startAfter of ['fast-checks', 'push']) {
       for (const optional of [true, false]) {
         const pr = { number: 7, state: 'OPEN', headRefOid: head, headRefName: 'lane/xabc-test',
+          rowsHead: head, rowsComplete: true,
           labels: [{ name: 'review:pending' }], comments: [], files: [{ path: 'scripts/example.mjs' }],
           statusCheckRollup: [check('standards', 'SUCCESS'), check('test-shard (1)', 'SUCCESS'),
             check('test', optional ? 'SUCCESS' : 'FAILURE'), ...(optional ? [check('CodeQL', 'FAILURE')] : [])] };

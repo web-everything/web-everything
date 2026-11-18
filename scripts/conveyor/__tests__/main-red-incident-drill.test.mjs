@@ -53,6 +53,7 @@ const planReconcile = (o) => planReconcileCore({ requiredChecks: ['gate'], ...o 
 const lbl = (...n) => n.map((name) => ({ name }));
 const rollup = (conclusion) => [{ name: 'gate', status: 'completed', conclusion }];
 const prRow = (over) => ({ state: 'OPEN', headRefOid: 'f'.repeat(40), mergeStateStatus: 'CLEAN', labels: lbl('review:pending'),
+  rowsHead: over?.headRefOid ?? 'f'.repeat(40), rowsComplete: true,
   statusCheckRollup: rollup('success'), comments: [], ...over });
 
 let dir;

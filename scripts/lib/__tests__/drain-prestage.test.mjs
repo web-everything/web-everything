@@ -10,6 +10,7 @@ const roots = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const repo = 'owner/repo', head = 'a'.repeat(40);
 const pending = () => aiPr({ number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
+  rowsHead: head, rowsComplete: true,
   labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], mergeStateStatus: 'BLOCKED', mergeable: 'MERGEABLE',
   statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null, head_sha: head }] });
 function fixture(options = {}) {
@@ -31,6 +32,23 @@ function fixture(options = {}) {
 const green = f => { f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }; };
 
 describe('CI pre-stage', () => {
+  it.each([undefined, false])('retains cached admission and falls back when completeness is %s', async rowsComplete => {
+    const f = fixture();
+    green(f);
+    f.pr.rowsComplete = rowsComplete;
+    expect(prestageCi(f.pr, ['test'])).toBe('unknown');
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).not.toBeNull();
+  });
+  it('refuses a complete feed read for another head', async () => {
+    const f = fixture();
+    green(f);
+    f.pr.rowsHead = 'b'.repeat(40);
+    expect(prestageCi(f.pr, ['test'])).toBe('unknown');
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+  });
   it.each([{hasManifest:true}, {coupleCarrier:{num:43}}])('invalidates older unsafe cache entries (%j)', async candidate => {
     const f = fixture();
     const entry = f.cache.get(repo, 42, 30);

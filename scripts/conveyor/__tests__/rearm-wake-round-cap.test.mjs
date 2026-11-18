@@ -12,6 +12,7 @@ const rearm = hour => comment(hour, `${REARM_COMMENT_MARKER}\n\nRepaired the fin
 const oldCommit = { sha: head, parents: ['b'.repeat(40)], authoredAt: at(0), subject: 'original PR work' };
 const facts = { head, commits: [oldCommit] };
 const candidate = comments => ({ number: 6877, headRefOid: head, headRefName: 'lane/wake', baseRefName: 'main',
+  rowsHead: head, rowsComplete: true,
   isDraft: false, createdAt: at(0), labels: [{ name: 'review:pending' }], comments,
   files: [{ path: 'src/a.mjs' }],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }] });

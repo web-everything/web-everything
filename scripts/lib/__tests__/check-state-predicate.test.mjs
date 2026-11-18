@@ -677,6 +677,17 @@ describe('required check evidence contract (PR1 acceptance)', () => {
     for (const rows of orders([row('test', 'failure', { run_id: 1, run_attempt: 1, detailsUrl, id: 1 }),
       row('test', 'success', { run_id: 1, run_attempt: 2, detailsUrl, id: 2 })])) expect(resolve(rows).state).toBe('pass');
   });
+  it('a complete attempt-roster attestation binds new job IDs across a rerun', () => {
+    const checks = [1, 2].map(attempt => row('test', attempt === 1 ? 'failure' : 'success', {
+      id: attempt, run_id: 7, run_attempt: attempt, head_sha: head,
+      details_url: `https://github.com/o/r/actions/runs/7/job/${attempt + 100}`,
+      rerunJob: { headSha: head, runId: 7, attempt, jobId: attempt + 100, checkRunId: attempt, name: 'test' },
+    }));
+    for (const rows of orders(checks)) expect(resolve(rows).state).toBe('pass');
+    for (const change of [{ headSha: foreign }, { runId: 8 }, { attempt: 1 }, { jobId: 1 }, { checkRunId: 1 }, { name: 'other' }]) {
+      expect(resolve([checks[0], { ...checks[1], rerunJob: { ...checks[1].rerunJob, ...change } }]).state).toBe('fail');
+    }
+  });
   it('5: foreign success is pending, foreign failure and mismatched read heads are unknown', () => {
     expect(resolve([row('test', 'success', { head_sha: foreign })]).state).toBe('pending');
     expect(resolve([row('test', 'failure', { head_sha: foreign })]).state).toBe('unknown');

@@ -29,6 +29,7 @@ async function runCase(initialCompleted) {
       const repo = ghRepoSlug('we'), head = 'a'.repeat(40), at = Date.parse('2026-10-20T12:00:00Z');
       const iso = t => new Date(t).toISOString();
       const pr = { number: 5765, headRefOid: head, headRefName: 'lane/stalled-review',
+        rowsHead: head, rowsComplete: true,
         body: '<!-- authored-by-actor: author -->', labels: [{ name: 'review:pending' }], comments: [],
         mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
       const save = (id, start, complete, parked = false) => {

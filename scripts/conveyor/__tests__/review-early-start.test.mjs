@@ -8,7 +8,7 @@ import { liveReviewRoundBudget, runReviewTick } from '../../../skills-src/convey
 
 const headSha = 'a'.repeat(40);
 const row = (status, conclusion = null) => ({ name: 'test', head_sha: headSha, status, conclusion });
-const pr = checks => ({ number: 12, state: 'OPEN', headRefOid: headSha, headRefName: 'lane/early-review',
+const pr = checks => ({ number: 12, state: 'OPEN', headRefOid: headSha, rowsHead: headSha, rowsComplete: true, headRefName: 'lane/early-review',
   baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', body: 'Review early CI policy.',
   labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], comments: [], statusCheckRollup: checks });
 

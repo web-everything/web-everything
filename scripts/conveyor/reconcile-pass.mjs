@@ -1531,11 +1531,35 @@ export function readStackedPrCheckPolicy(env = process.env) {
   return env.WE_STACKED_PR_CHECK_POLICY === 'strict' ? 'strict' : 'await-base';
 }
 
-function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch }) {
+function hydrateChecks(prs, { repo, requiredChecks, readChecks, readRerunChecks, defaultBranch }) {
   const cache = new Map();
+  const reruns = new Map();
   const ready = [], refusals = [], notes = [], owedTriggers = [];
   const stackedPolicy = readStackedPrCheckPolicy();
-  for (const pr of prs) {
+  for (let pr of prs) {
+    // GraphQL rollups have no attempt lineage. Resolve duplicate names through
+    // the complete REST reader before review admission, once per head per pass.
+    const listed = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
+    if (readChecks === defaultReadChecks && new Set(listed.map(row => row?.name ?? row?.context)).size < listed.length) {
+      const headSha = pr.headRefOid;
+      if (!reruns.has(headSha)) {
+        try {
+          if (!isSha(headSha)) throw new Error('missing or invalid exact head SHA');
+          if (reruns.size >= 4) throw new Error('rerun evidence budget exhausted; retry a per-PR review with complete Actions job evidence');
+          const rows = readRerunChecks({ repo, headSha });
+          if (!Array.isArray(rows) || rows.rowsComplete !== true) throw new Error('incomplete rerun evidence; inspect Actions jobs before retrying review');
+          reruns.set(headSha, { rows });
+        } catch (error) { reruns.set(headSha, { error: String(error?.message ?? error) }); }
+      }
+      const result = reruns.get(headSha);
+      if (result.error) {
+        refusals.push({ kind: 'check-read-failed', prNumber: pr.number, headRefOid: headSha,
+          why: `review rerun evidence refused: ${result.error}` });
+        ready.push({ ...pr, rowsComplete: false });
+        continue;
+      }
+      pr = { ...pr, statusCheckRollup: result.rows, rowsHead: headSha, rowsComplete: true };
+    }
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = withoutImpliedRequiredChecks(requiredChecks ?? [], runs).filter(name => !runs.some(run => run?.name === name));
     if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
@@ -1725,7 +1749,7 @@ export function runReconcilePass({
   now = Date.now(), repo = null, defaultBranch = 'main', env = process.env,
   // #2748 false-red follow-up — injectable so a test can supply a fixture with no network, matching every
   // other reader in this file. Defaults to the live, cached branch-protection read.
-  readRequiredChecks = getRequiredStatusChecks, readChecks = defaultReadChecks,
+  readRequiredChecks = getRequiredStatusChecks, readChecks = defaultReadChecks, readRerunChecks = readReviewChecks,
   // #2787-live-incident (2026-09-27) — `origin/<defaultBranch>`'s own current tip, read PURELY LOCALLY (no `gh`
   // call at all): `reconcile-core.mjs#planReconcile`'s conflict-fix cap needs it to tell "the same conflict,
   // still stuck" apart from "a fresh conflict, main moved on" (see that function's own `mainSha` param).
@@ -1794,7 +1818,7 @@ export function runReconcilePass({
   // #4501 — `requiredChecks` now threaded through so this enrichment judges the SAME live-required set
   // `planReconcile` uses below, instead of silently falling back to `DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS`.
   const hydrated = step('hydrate-checks', () => hydrateChecks(rawPrs, {
-    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
+    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, readRerunChecks, defaultBranch,
   }));
   // Evidence is applied before every downstream CI reader, including main-red attribution.
   const autoProceedPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {

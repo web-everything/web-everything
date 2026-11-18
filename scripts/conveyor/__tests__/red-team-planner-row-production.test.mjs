@@ -56,3 +56,51 @@ it('exposes scope-bloat folded by the normal not-a-ci-break escalation, without 
   expect(row.refusal.reviewRefusal).not.toHaveProperty('ciHealNotCiBreak');
   expect(plan.dispatch).toEqual([]);
 });
+
+it('hydrates duplicate listing names through the complete rerun reader before classifying planner rows', () => {
+  const raw = source();
+  raw.statusCheckRollup = [check('test'), check('test', 'success')];
+  const rows = Object.assign([check('test', 'success', { head_sha: head })], { rowsComplete: true });
+  const readRerunChecks = vi.fn(() => rows);
+  const plan = runReconcilePass({ ...options(raw), readOnly: true, readRerunChecks,
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) });
+  expect(readRerunChecks).toHaveBeenCalledTimes(1);
+  expect(readRerunChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', headSha: head });
+  expect(plan.enrichedPrs[0]).toMatchObject({ rowsHead: head, rowsComplete: true, statusCheckRollup: [...rows] });
+  expect(plan.refusals.some(row => row.kind === 'check-read-failed')).toBe(false);
+});
+
+it.each([false, undefined])('an incomplete rerun read overrides successful listing proof (%s)', rowsComplete => {
+  const raw = source();
+  raw.statusCheckRollup = [check('test'), check('test', 'success')];
+  const plan = runReconcilePass({ ...options(raw), readOnly: true,
+    readRerunChecks: () => Object.assign([check('test', 'success')], { rowsComplete }),
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) });
+  expect(plan.enrichedPrs[0].rowsComplete).toBe(false);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed' }));
+  expect(plan.dispatch.some(row => row.kind === 'review')).toBe(false);
+});
+
+it('clears listing proof when rerun IO fails and keeps the retry visible', () => {
+  const raw = source();
+  raw.statusCheckRollup = [check('test'), check('test', 'success')];
+  const plan = runReconcilePass({ ...options(raw), readOnly: true,
+    readRerunChecks: () => { throw new Error('Actions unavailable'); },
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) });
+  expect(plan.enrichedPrs[0].rowsComplete).toBe(false);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed',
+    why: expect.stringContaining('Actions unavailable') }));
+  expect(plan.dispatch.some(row => row.kind === 'review')).toBe(false);
+});
+
+it('bounds rerun hydration to four heads per pass and surfaces the per-PR fallback', () => {
+  const prs = Array.from({ length: 5 }, (_, index) => ({ ...source(), number: pr + index,
+    headRefOid: String(index + 1).repeat(40), statusCheckRollup: [check('test'), check('test', 'success')] }));
+  const readRerunChecks = vi.fn(({ headSha }) => Object.assign([check('test', 'success', { head_sha: headSha })], { rowsComplete: true }));
+  const plan = runReconcilePass({ ...options(prs[0]), readPrs: () => prs, readOnly: true, readRerunChecks,
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) });
+  expect(readRerunChecks).toHaveBeenCalledTimes(4);
+  expect(plan.enrichedPrs[4].rowsComplete).toBe(false);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'check-read-failed', prNumber: pr + 4,
+    why: expect.stringContaining('retry a per-PR review') }));
+});

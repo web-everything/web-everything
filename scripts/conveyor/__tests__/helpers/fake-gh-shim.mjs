@@ -74,7 +74,7 @@ import {
   refOid, createMergeCommit, listChangedFilesNative, listChangedFilesRest,
   buildPrGraphqlView, pushCommitToRef,
 } from './fake-gh.mjs';
-import { buildOpenPrPageQuery, PAGED_LIGHT_FIELDS } from '../../../lib/pr-list-paged.mjs';
+import { buildOpenPrPageQuery, buildRollupEvidenceQuery, PAGED_LIGHT_FIELDS } from '../../../lib/pr-list-paged.mjs';
 import { GH_ARGV } from '../../../lib/review-label-provider.mjs';
 
 const STORE_PATH = process.env.FAKE_GH_STORE;
@@ -444,9 +444,38 @@ function handleLabelCreate(store, rest) {
 // `gh api` — REST-shaped (snake_case), matched by path against the endpoints this fixture supports.
 // -------------------------------------------------------------------------------------------------------
 
+function commitRollupView(view) {
+  const rows = view.statusCheckRollup;
+  return { oid: view.headRefOid, statusCheckRollup: { contexts: {
+    nodes: rows.slice(0, 100), totalCount: rows.length, pageInfo: { hasNextPage: rows.length > 100 },
+  } } };
+}
+
+function actionsJobs(repoState) {
+  return filterPrs(repoState, { state: 'open' }).flatMap(pr => {
+    const head = resolveDiffOids(repoState, pr).headOid;
+    return pr.checks.filter(check => check.actions).map(check => ({
+      id: check.actions.jobId, run_id: check.actions.runId, run_attempt: check.actions.runAttempt,
+      name: check.name, head_sha: head, status: check.status.toLowerCase(), conclusion: check.conclusion.toLowerCase(),
+      check_run_url: `https://api.github.com/repos/${repoState.slug}/check-runs/${check.actions.checkRunId}`,
+    }));
+  });
+}
+
 function handleOpenPrPage(store, rest) {
   const fields = [...flagValues(rest, '-f'), ...flagValues(rest, '-F')];
   const query = fields.find(v => v?.startsWith('query='))?.slice(6);
+  const heads = [...(query ?? '').matchAll(/h\d+:object\(oid:"([a-f0-9]{40})"\)/g)].map(match => match[1]);
+  if (heads.length && query === buildRollupEvidenceQuery(heads)) {
+    const value = key => fields.find(v => v.startsWith(`${key}=`))?.slice(key.length + 1);
+    const repoState = requireRepo(store, `${value('owner')}/${value('name')}`);
+    const views = filterPrs(repoState, { state: 'open' }).map(pr => buildPrGraphqlView(repoState, pr,
+      { originPath: repoState.originPath, callerActor: ACTOR, fields: PAGED_LIGHT_FIELDS }));
+    return jsonResult({ data: { repository: Object.fromEntries(heads.map((head, i) => {
+      const view = views.find(row => row.headRefOid === head);
+      return [`h${i}`, view ? commitRollupView(view) : null];
+    })) } });
+  }
   const countQuery = GH_ARGV.readCommentsTotalCount('owner/repo', 1).find(v => v.startsWith('query=')).slice(6);
   if (query === countQuery) {
     const value = key => fields.find(v => v.startsWith(`${key}=`))?.slice(key.length + 1);
@@ -468,7 +497,7 @@ function handleOpenPrPage(store, rest) {
   const nodes = prs.slice(offset, offset + pageSize).map(pr => {
     const view = buildPrGraphqlView(repoState, pr, { originPath: repoState.originPath, callerActor: ACTOR, fields: PAGED_LIGHT_FIELDS });
     const { labels, statusCheckRollup, ...light } = pickFields(view, PAGED_LIGHT_FIELDS.join(','));
-    return { ...light, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: statusCheckRollup } } } }] } };
+    return { ...light, labels: { nodes: labels }, commits: { nodes: [{ commit: commitRollupView(view) }] } };
   });
   return jsonResult({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
     pageInfo: { hasNextPage: offset + nodes.length < prs.length, endCursor: nodes.length ? `fake-pr-page:${offset + nodes.length}` : null } } } } });
@@ -551,6 +580,17 @@ function handleApi(store, rest) {
         html_url: `https://github.com/${slug}/pull/${num}#issuecomment-${c.id}`,
         user: c.author, body: c.body, created_at: c.createdAt })), jq, { compact: true });
     }
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/actions\/jobs\/(\d+)$/))) {
+      const job = actionsJobs(requireRepo(store, `${m[1]}/${m[2]}`)).find(job => job.id === Number(m[3]));
+      if (!job) return { stderr: 'fake-gh: unknown Actions job\n', exitCode: 1 };
+      return jsonResult(job, jq);
+    }
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs\?per_page=100$/))) {
+      const jobs = actionsJobs(requireRepo(store, `${m[1]}/${m[2]}`))
+        .filter(job => job.run_id === Number(m[3]) && job.run_attempt === Number(m[4]));
+      const page = { total_count: jobs.length, jobs };
+      return jsonResult(hasFlag(rest, '--slurp') ? [page] : page, jq);
+    }
     // Soak harness gap (PR #2821 ci-heal) — `promote-draft-pr-dispatch.mjs#defaultReadHeadCheckState` re-reads a
     // draft's checks for its EXACT head sha (`pr-status-io.mjs#checksArgv`) right before `gh pr ready`. Without
     // this route every promotion refused `stale-check-unreadable` in the simulator. Checks live per PR here (not
@@ -573,6 +613,8 @@ function handleApi(store, rest) {
       const runs = (pr.checks ?? []).map((c, index) => ({ c, id: index + 1 })).filter(({ c }) => !checkName || c.name === checkName).map(({ c, id }) => ({
         id, name: c.name, status: String(c.status).toLowerCase(), conclusion: c.conclusion ? String(c.conclusion).toLowerCase() : null,
         started_at: c.startedAt, completed_at: c.completedAt, head_sha: sha,
+        ...(c.actions ? { id: c.actions.checkRunId, app: { id: 15368, slug: 'github-actions' },
+          details_url: `https://github.com/${slug}/actions/runs/${c.actions.runId}/job/${c.actions.jobId}` } : {}),
       }));
       const page = { total_count: runs.length, check_runs: runs };
       // `--paginate --slurp` wraps every page in one array (this fixture answers a single page).

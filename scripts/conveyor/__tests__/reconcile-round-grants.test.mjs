@@ -51,6 +51,7 @@ describe('an automatic (standing-ruling) grant frees a round NOW (live #5690)', 
   // enrich call left them green. This runs the PASS, with the real enrich + scope and only the GitHub reads injected.
   describe('through runReconcilePass', () => {
     const snapshot = () => ({ number: 5169, state: 'OPEN', headRefName: 'lane/5169-repair', headRefOid: H, baseRefName: 'main',
+      rowsHead: H, rowsComplete: true,
       mergeStateStatus: 'CLEAN', labels: [{ name: 'review:changes' }], files: [{ path: 'backlog/5169-x.md' }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: H }],
       comments: [{ body: '🔁 human review — changes requested\n\nRepair the bug.' }, ...over] });

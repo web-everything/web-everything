@@ -7,11 +7,21 @@ import { classifyPr, revalidateForMerge, buildDrainVerdicts, prepareDrainVerdict
 import * as strategy from '../lib/drain-merge-strategy.mjs';
 
 const required = ['test', 'smoke'];
+const head = 'a'.repeat(40);
 const green = name => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
-const pr = (extra = {}) => ({ number: 42, title: 'Fix queue admission', body: 'Allow checked PRs into the required queue.', headRefOid: 'abc', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], reviewDecision: '', statusCheckRollup: required.map(green), ...extra });
+const pr = (extra = {}) => ({ number: 42, title: 'Fix queue admission', body: 'Allow checked PRs into the required queue.', headRefOid: head, rowsHead: head, rowsComplete: true, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], reviewDecision: '', statusCheckRollup: required.map(green), ...extra });
 const opts = { queueRequiredChecks: required };
 
 describe('required merge queue BLOCKED relief', () => {
+  it.each([{ rowsComplete: undefined }, { rowsComplete: false }, { rowsHead: 'b'.repeat(40) }])('refuses unknown evidence despite successful required names: %j', proof => {
+    expect(classifyPr(pr(proof), opts).decision).toBe('skip');
+    expect(classifyPr(pr(proof), opts)).not.toHaveProperty('queueBlockedRelief');
+  });
+  it('does not let timestamp ordering hide an unrelated failed check', () => {
+    expect(classifyPr(pr({ statusCheckRollup: [green('test'),
+      { ...green('smoke'), conclusion: 'FAILURE', completedAt: '2026-10-11T00:00:00Z' },
+      { ...green('smoke'), completedAt: '2026-10-12T00:00:00Z' }] }), opts).decision).toBe('skip');
+  });
   it.each(['', null, 'APPROVED'])('admits green uppercase CheckRuns with reviewDecision %s', reviewDecision => {
     expect(classifyPr(pr({ reviewDecision }), opts)).toMatchObject({ decision: 'merge', queueBlockedRelief: true, reason: expect.stringMatching(/BLOCKED only by the required merge queue.*all 2 required checks green.*enqueue/) });
   });
@@ -49,14 +59,14 @@ describe('required merge queue BLOCKED relief', () => {
   it('accepts legacy StatusContext rows', () => {
     expect(classifyPr(pr({ statusCheckRollup: [green('test'), { __typename: 'StatusContext', context: 'smoke', state: 'SUCCESS' }] }), opts).decision).toBe('merge');
   });
-  it('uses the latest CheckRun per name', () => {
-    const old = { ...green('smoke'), conclusion: 'FAILURE', completedAt: '2026-10-11T00:00:00Z' };
-    const latest = { ...green('smoke'), completedAt: '2026-10-12T00:00:00Z' };
+  it('uses the latest proven attempt of the same job', () => {
+    const old = { ...green('smoke'), id: 7, run_id: 1, run_attempt: 1, conclusion: 'FAILURE', completedAt: '2026-10-11T00:00:00Z' };
+    const latest = { ...green('smoke'), id: 7, run_id: 1, run_attempt: 2, completedAt: '2026-10-12T00:00:00Z' };
     expect(classifyPr(pr({ statusCheckRollup: [green('test'), latest, old] }), opts).decision).toBe('merge');
     expect(classifyPr(pr({ statusCheckRollup: [green('test'), { ...latest, conclusion: 'FAILURE' }, { ...old, conclusion: 'SUCCESS' }] }), opts).decision).toBe('skip');
   });
   it('threads relief into fresh revalidation while retaining the head pin', () => {
-    expect(revalidateForMerge(pr(), { ...opts, expectedHeadSha: 'abc' })).toMatchObject({ decision: 'merge', queueBlockedRelief: true, headSha: 'abc' });
+    expect(revalidateForMerge(pr(), { ...opts, expectedHeadSha: head })).toMatchObject({ decision: 'merge', queueBlockedRelief: true, headSha: head });
     expect(revalidateForMerge(pr(), { ...opts, expectedHeadSha: 'old' }).decision).toBe('skip');
   });
   it('reads requirements per repo when building verdicts', () => {

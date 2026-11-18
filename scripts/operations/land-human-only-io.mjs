@@ -21,6 +21,7 @@ import { workflowEditHold, requestOperatorQueueEntry, isAlreadyQueuedError, read
 export { readMergeQueueState } from '../lib/merge-queue-enqueue.mjs';
 import { readQueueRequiredChecks } from '../lib/drain-merge-strategy.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
+import { enrichPrRollupEvidence } from '../lib/pr-list-paged.mjs';
 import { labelOnGreenVerdict } from '../merge-ai-prs.mjs';
 import { loadMergeDeliveryPolicy } from '../lib/merge-delivery-policy.mjs';
 import { loadDrainGateSettings } from '../lib/codeql-gate.mjs';
@@ -163,6 +164,7 @@ export function createLandHumanOnlyReader({ exec = execFileSync, credential = ()
   return ({ repo, pr }) => {
     const num = Number(pr);
     const live = readJson(['pr', 'view', String(num), '--repo', repo, '--json', PR_FIELDS]);
+    enrichPrRollupEvidence({ repo, rows: [live], exec });
     const head = live?.headRefOid;
     let defaultBranch = null;
     try { defaultBranch = readJson(['repo', 'view', repo, '--json', 'defaultBranchRef'])?.defaultBranchRef?.name ?? null; } catch { /* gate fails closed */ }
@@ -196,7 +198,8 @@ export function createLandHumanOnlyReader({ exec = execFileSync, credential = ()
       }
     }
     const names = requiredChecks({ repo, branch: defaultBranch || 'main' });
-    const ci = Array.isArray(names) ? { names, ...reviewCiGate({ headSha: head, requiredChecks: names, checks: live?.statusCheckRollup }) } : { names: null, allowed: false };
+    const ci = Array.isArray(names) ? { names, ...reviewCiGate({ headSha: head, requiredChecks: names, checks: live?.statusCheckRollup,
+      rowsHead: live?.rowsHead, rowsComplete: live?.rowsComplete === true }) } : { names: null, allowed: false };
     return {
       repo, number: num, head, defaultBranch, nodeId: live?.id ?? null,
       pr: { state: live?.state, isDraft: live?.isDraft === true, baseRefName: live?.baseRefName, mergeable: live?.mergeable, mergeStateStatus: live?.mergeStateStatus },

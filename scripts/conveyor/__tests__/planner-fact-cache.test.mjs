@@ -363,6 +363,7 @@ describe('facts stay below live time-based decisions', () => {
   it('identical cached PR facts yield a different real plan after the hung window elapses', () => {
     const { cache, setNow } = harness({ ttlMs: 2 * HOUR });
     const row = fact({ number: 2582, labels: [{ name: 'review:pending' }],
+      rowsHead: 'a'.repeat(40), rowsComplete: true,
       statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }] });
     const key = prFactKey(row);
     cache.store(key, row, { complete: true });
@@ -416,6 +417,12 @@ describe('defaultReadPrs shadow wiring contract (round 2)', () => {
     let listing = fact({ labels: [], comments });
     const exec = vi.fn((file, args) => {
       expect(file).toBe('gh');
+      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { h0: {
+        oid: listing.headRefOid, statusCheckRollup: { contexts: {
+          nodes: listing.statusCheckRollup.map(row => ({ __typename: 'CheckRun', ...row })),
+          totalCount: listing.statusCheckRollup.length, pageInfo: { hasNextPage: false },
+        } },
+      } } } });
       expect(args.slice(0, 2)).toEqual(['pr', 'list']);
       return JSON.stringify([listing]);
     });
@@ -438,7 +445,8 @@ describe('defaultReadPrs shadow wiring contract (round 2)', () => {
     f.compare.mockClear();
     const second = f.read();
     expect(second).toEqual(first);
-    expect(f.exec).toHaveBeenCalledTimes(2);
+    expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'pr')).toHaveLength(2);
+    expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(2);
     expect(f.readCommits).toHaveBeenCalledTimes(2);
     expect(f.readComments).toHaveBeenCalledTimes(2);
     expect(f.lookup.mock.results.some(result => result.type === 'return' && result.value !== null)).toBe(true);

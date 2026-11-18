@@ -152,6 +152,17 @@ const contradictoryEvidence = row => {
 // A name/run pair alone cannot identify a matrix job. Prefer the Actions job
 // identity; otherwise require the same check-run identity, never infer lineage.
 const evidenceIdentity = row => {
+  // The REST producer attaches this only after exhausting the attempt's job
+  // roster and proving the exact job name unique; raw name/run pairs do not qualify.
+  const lineage = row?.rerunJob;
+  if (lineage && sha(lineage.headSha) === sha(row.head_sha) && sha(lineage.headSha)
+    && lineage.name === evidenceName(row) && typeof lineage.name === 'string' && lineage.name.trim()
+    && evidenceInteger(lineage.runId) !== null && evidenceInteger(lineage.runId) === evidenceInteger(row.run_id)
+    && evidenceInteger(lineage.attempt) !== null && evidenceInteger(lineage.attempt) === evidenceInteger(row.run_attempt)
+    && evidenceInteger(lineage.jobId) !== null && evidenceInteger(lineage.jobId) === evidenceInteger(evidenceJob(row))
+    && evidenceInteger(lineage.checkRunId) !== null && evidenceInteger(lineage.checkRunId) === evidenceInteger(row.id)) {
+    return `workflow-job:${lineage.name}`;
+  }
   const job = evidenceInteger(evidenceJob(row));
   if (job !== null) return `job:${job}`;
   const check = evidenceInteger(row?.check_run_id ?? row?.databaseId ?? row?.id);

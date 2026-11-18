@@ -62,11 +62,12 @@ describe('startup-failure stale merge-gate refresh', () => {
   function options(extra = {}) {
     return {
       c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
-      pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
       requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
       readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
       cloneDir: '/clone', readState: () => ({}), record: vi.fn(), statePath: join(mkdtempSync(join(tmpdir(), 'sg-ledger-')), 'ledger.json'),
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
+      pr: { rowsHead: extra.pr?.headRefOid ?? HEAD, rowsComplete: true,
+        ...(extra.pr ?? { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] }) },
     };
   }
   it('refreshes once with runId and shares the ledger bound when newHead equals head', async () => {
@@ -84,6 +85,15 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readVerdict).not.toHaveBeenCalled();
     expect(o.readFreeze).not.toHaveBeenCalled();
     expect(o.readAcceptance).not.toHaveBeenCalled();
+  });
+  it.each([
+    { rowsComplete: false }, { rowsComplete: undefined }, { rowsHead: 'b'.repeat(40) },
+  ])('never treats a missing merge-gate as startup failure with unknown evidence: %j', async proof => {
+    const o = options({ pr: { headRefOid: HEAD, rowsHead: HEAD, rowsComplete: true,
+      statusCheckRollup: [green('test')], ...proof } });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
   });
   it('refreshes when the merge-gate row is missing (startup_failure leaves no check-run)', async () => {
     const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [green('test')] } });

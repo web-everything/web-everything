@@ -238,11 +238,10 @@ export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
   const heads = [...new Set(rows.map(pr => pr.headRefOid).filter(sha => typeof sha === 'string' && SHA_RE.test(sha)))].slice(0, 200);
   for (let offset = 0; offset < heads.length; offset += 20) {
     const batch = heads.slice(offset, offset + 20);
-    const objects = batch.map((sha, i) => `h${i}:object(oid:"${sha}"){...on Commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}`).join(' ');
     try {
       const out = JSON.parse(String(exec('gh', ['api', 'graphql', '-F', `owner=${repo?.split('/')[0] || '{owner}'}`,
         '-F', `name=${repo?.split('/')[1] || '{repo}'}`, '-f',
-        `query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${objects}}}`], execOptions(execOpts))));
+        `query=${buildRollupEvidenceQuery(batch)}`], execOptions(execOpts))));
       if (out?.errors?.length) continue;
       batch.forEach((sha, i) => {
         const commit = out?.data?.repository?.[`h${i}`];
@@ -256,6 +255,12 @@ export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
     } catch { /* unknown: retain fail-closed evidence */ }
   }
   return rows;
+}
+
+export function buildRollupEvidenceQuery(heads) {
+  if (!Array.isArray(heads) || !heads.length || heads.length > 20 || heads.some(head => typeof head !== 'string' || !SHA_RE.test(head))) throw new TypeError('one to twenty full commit SHAs required');
+  const objects = heads.map((head, i) => `h${i}:object(oid:"${head}"){...on Commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}`).join(' ');
+  return `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${objects}}}`;
 }
 
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */

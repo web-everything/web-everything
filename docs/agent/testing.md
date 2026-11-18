@@ -4661,3 +4661,33 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Complete check evidence across review and landing callers
+
+Fixtures for complete PR feeds must supply `rowsComplete: true` and `rowsHead` for their
+current full SHA. Injected review check readers attest completeness on the returned array;
+historical serialized rollups remain unproven. Keep assertions about dispatch, caps, holds,
+and head races intact when migrating fixtures to this contract.
+
+Drain listings, fresh merge reads, cached prestage reads, and human landing use the shared
+head-bound rollup fetcher and forward its proof to the strict gate. Unknown prestage evidence
+falls back to the full drain without consuming cached admission. Missing merge-gate recovery
+also checks `unknown`, so incomplete evidence cannot authorize a refresh. The prestage,
+queue-blocked-relief, merge-queue-enqueue, and human-landing suites cover these closed paths.
+
+REST reruns create new job IDs. The review reader validates each job against its check-run
+and exhausts the job roster for each observed run attempt. Only a unique exact job name in
+each complete attempt earns a normalized `rerunJob` attestation. The resolver validates its
+head, run, attempt, job, check ID, and name before joining identities across attempts. Raw
+check-feed attestations are discarded. Duplicate matrix names, different runs, missing jobs,
+incomplete rosters, and unreadable evidence retain the failure or refuse review. Reads remain
+bounded to 20 individual jobs and 20 attempt rosters per head, with operator-visible refusal.
+The REST producer cases in `review-ci-completeness.test.mjs` exercise this boundary.
+
+Reconciliation hydrates duplicate listing names through that reader before planner admission,
+reusing evidence for the same head within a pass and reading at most four heads. Unreadable
+or over-budget evidence clears completeness and surfaces a `check-read-failed` refusal;
+the fallback is a per-PR review with complete Actions evidence. Planner production tests
+cover successful hydration, missing proof, and the fifth-head bound. The fake GitHub server
+models connection counts, the 100-context cap, and explicit Actions jobs/attempt rosters so
+the soak scenarios exercise the production readers without granting fabricated proof.

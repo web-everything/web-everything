@@ -547,7 +547,7 @@ describe('planReconcile — a scope-bloated PR is refreshed or held, never revie
   const NOW = Date.parse('2026-10-08T12:00:00Z');
   const plan = (prOver) => planReconcileCore({
     requiredChecks: ['gate'], agents: [], durableCounts: {}, now: NOW,
-    prs: [{ number: 4361, state: 'OPEN', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
+    prs: [{ number: 4361, state: 'OPEN', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40), rowsHead: 'a'.repeat(40), rowsComplete: true,
       labels: [{ name: 'review:pending' }], mergeStateStatus: 'CLEAN', comments: [], files: [],
       statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...prOver }],
   });

@@ -45,7 +45,7 @@ const facts = (over = {}) => ({ head: HEAD, priorHead: PRIOR, merged: 'c'.repeat
   changedFiles: ['src/a.mjs'], proven: true, ...over });
 function pr(comments, { head = HEAD, mechanicalRound = facts(), labels = ['review:pending'] } = {}) {
   return {
-    number: 7, headRefName: 'lane/x-thing', headRefOid: head, baseRefName: 'main', isDraft: false, createdAt: at(0),
+    number: 7, headRefName: 'lane/x-thing', headRefOid: head, rowsHead: head, rowsComplete: true, baseRefName: 'main', isDraft: false, createdAt: at(0),
     labels: labels.map((name) => ({ name })), files: [{ path: 'src/a.mjs' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
     comments, ...(mechanicalRound ? { mechanicalRound } : {}),
