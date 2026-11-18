@@ -3311,7 +3311,8 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     }
     const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
-    if (!remoteDecided) recordLocalReason({ lockRoot, reason: localReasonFor({ useContainer, forceLocal, bypass, decisionReason: localDecisionReason }), detail: localDecisionReason, cwd: repo ?? process.cwd(), argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now });
+    // A bypass (CI pass-through, held re-entry, admission off) takes no slot and records no duration, so it needs no reason.
+    if (!remoteDecided && !bypass) recordLocalReason({ lockRoot, reason: localReasonFor({ useContainer, forceLocal, bypass, decisionReason: localDecisionReason }), detail: localDecisionReason, cwd: repo ?? process.cwd(), argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now });
     const { exitCode } = await runUnderAdmission(runOpts);
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
