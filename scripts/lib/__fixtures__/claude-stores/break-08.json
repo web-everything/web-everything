@@ -1,0 +1,51 @@
+{
+  "break": 8,
+  "title": "malformed listing preserves positives but cannot prove absence",
+  "input": {
+    "home": "/home/test",
+    "env": {
+      "XPC_SERVICE_NAME": "com.we.worker"
+    },
+    "map": {
+      "accounts": {
+        "a": {
+          "configDir": "/home/test/.claude"
+        },
+        "b": {
+          "configDir": "/home/test/claude-b"
+        }
+      },
+      "daemons": {
+        "com.we.worker": "b"
+      },
+      "routing": {
+        "accountB": true
+      }
+    },
+    "existing": [
+      "/home/test/.claude",
+      "/home/test/claude-b"
+    ],
+    "listings": {
+      "/home/test/.claude": [
+        {
+          "sessionId": "abcdef01-1234-4567-89ab-123456789abc",
+          "id": "job-a"
+        }
+      ],
+      "/home/test/claude-b": [
+        {
+          "id": "not-a-session"
+        }
+      ]
+    },
+    "handle": "missing"
+  },
+  "expect": {
+    "status": "unknown",
+    "problemStore": "/home/test/claude-b",
+    "problemStatus": "invalid",
+    "rowCount": 1,
+    "owner": "unknown"
+  }
+}

@@ -91,6 +91,7 @@ import { PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { DAEMON_STATUS_OP } from '../daemon-status.mjs';
 import { HEAVY_QUEUE_OP } from '../heavy-queue.mjs';
 import { HOST_CAPACITY_OP } from '../host-capacity.mjs';
+import { DELIVERY_CAPACITY_OP } from '../delivery-capacity.mjs';
 import { RESOURCE_STATUS_OP } from '../resource-status.mjs';
 import { WORKER_CAPACITY_OP } from '../worker-capacity.mjs';
 import { PRE_PR_CHECK_OP } from '../pre-pr-check.mjs';
@@ -487,6 +488,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     [HEAVY_QUEUE_OP]: 'heavy-queue.mjs',
     // Read-only compute declaration; host probes are injected by run.mjs.
     [HOST_CAPACITY_OP]: 'host-capacity.mjs',
+    [DELIVERY_CAPACITY_OP]: 'delivery-capacity.mjs',
     // Card xkuflno — READ-ONLY: both steps are `compute`; the declaring module imports only `registry.mjs`,
     // `step-kinds.mjs` and the pure `../lib/resource-policy.mjs`. The snapshot/policy-file read is bound in run.mjs.
     [RESOURCE_STATUS_OP]: 'resource-status.mjs',
@@ -601,10 +603,16 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Card 105 — NOT read-only: its one `act` step is an effect (pause files, kill file, test session); the
     // declaring module is a leaf and every write lives in `maintenance-io.mjs`, behind the sink `../run.mjs` wires.
     [MAINTENANCE_OP]: 'maintenance.mjs',
+    // Writes: its one `act` step is an effect (GitHub update-branch); the host IO lives in `update-branch-io.mjs`.
+    'update-branch': 'update-branch.mjs',
     // Writes operator routing preferences; listed here for module-map coverage only.
     'routing-override': 'routing-override.mjs',
     'operator-override-set': 'operator-override.mjs',
     'operator-override-clear': 'operator-override.mjs',
+    'ruled-weakened-add': 'ruled-weakened-add.mjs',
+    'delivery-capacity-hold': 'delivery-capacity-override.mjs',
+    'delivery-capacity-pin': 'delivery-capacity-override.mjs',
+    'delivery-capacity-clear': 'delivery-capacity-override.mjs',
     'operator-override-show': 'operator-override.mjs',
   });
 
@@ -615,7 +623,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
     const readOnly = Object.keys(OPERATIONS).filter((name) => isReadOnlyOperation(resolveOperation(name).declaration));
     // Pinned, not derived: adding a read-only operation must be a deliberate edit here.
-    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', 'operator-override-show', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, AI_ROUTING_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP, DELIVERY_FLOW_OP].sort());
+    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', 'operator-override-show', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, AI_ROUTING_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, DELIVERY_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP, DELIVERY_FLOW_OP].sort());
     for (const name of readOnly) {
       const { external } = importGraph(resolvePath(OPS_DIR, DECLARING_MODULE[name]));
       expect(external, `\`${name}\` declares in ${DECLARING_MODULE[name]}, which must import nothing that can act`)
@@ -1170,7 +1178,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
   });
   it.each([
     ['reason', ''], ['reason', '   '], ['actor', ''], ['actor', '   '],
-    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '9'],
+    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '0'], ['value', '17'], // 17: just past the 1..16 range
   ])('refuses unsafe CLI %s=%j before changing the host store', async (field, value) => {
     const dir = mkdtempSync(join(tmpdir(), 'operator-cli-refusal-'));
     const file = join(dir, 'operator-overrides.json');

@@ -4,7 +4,8 @@
  * safety-net interval while healthy, and the automatic fall-back to the base interval when the feed is stale or
  * unreachable (including mid-sleep).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import * as prEvents from '../pr-events.mjs';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,62 @@ import {
 
 const quiet = { error: () => {} };
 const MIN = 60_000;
+
+const runtimeEvent = (overrides = {}) => ({
+  class: 'runtime', type: 'action-requested', repo: 'a/b', number: 5453,
+  head: 'a'.repeat(40), action: 'review', cause: 1, writer: { role: 'decider' }, ...overrides,
+});
+
+describe('runtime events — card 5453 client and consumer isolation', () => {
+  it('appendRuntimeEvent sends the event with bearer auth to POST /runtime-events', async () => {
+    expect(prEvents.appendRuntimeEvent).toBeTypeOf('function');
+    const calls = [];
+    const event = runtimeEvent({ note: 'stored as data' });
+    await prEvents.appendRuntimeEvent(event, {
+      url: 'https://events.example', token: 'internal-writer-token', timeoutMs: 1000,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return new Response(JSON.stringify({ seq: 1, duplicate: false }), {
+          status: 202, headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('https://events.example/runtime-events');
+    expect(calls[0].init.method).toBe('POST');
+    const headers = new Headers(calls[0].init.headers);
+    expect(headers.get('authorization')).toBe('Bearer internal-writer-token');
+    expect(headers.get('content-type')).toBe('application/json');
+    expect(JSON.parse(calls[0].init.body)).toEqual(event);
+  });
+
+  it.each(['action-requested', 'worker-started', 'worker-finished'])('N2: isRelevantEvent safely ignores runtime %s for every consumer', (type) => {
+    const event = runtimeEvent({ type }); // Runtime records have number, not prs.
+    for (const role of ['review', 'fix', 'drain', 'unknown-role']) {
+      expect(isRelevantEvent(event, role)).toBe(false);
+    }
+    let ruleCalled = false;
+    expect(isRelevantEvent(event, 'review', { rule: () => { ruleCalled = true; throw new Error('fact-only consumer'); } })).toBe(false);
+    expect(ruleCalled).toBe(false);
+  });
+
+  it('N2: waker consumes runtime pages without waking or forwarding to fact-only consumers', async () => {
+    const forwarded = [];
+    const r = rig((cursor, t) => page(3, cursor === 0 ? [
+      runtimeEvent({ seq: 1 }),
+      runtimeEvent({ seq: 2, type: 'worker-started', writer: { role: 'review', clone: 'lane-45' } }),
+      runtimeEvent({ seq: 3, type: 'worker-finished', writer: { role: 'review', clone: 'lane-45' } }),
+    ] : [], { lastDeliveryAt: t }), {
+      role: 'unknown-role', forward: [{ role: 'unknown-role', send: async (events) => forwarded.push(...events) }],
+    });
+    r.waker.state.cursor = 0;
+    r.waker.state.initialized = true;
+    expect(await r.waker.pollOnce()).toMatchObject({ wake: false, events: [] });
+    expect(r.waker.state.cursor).toBe(3);
+    expect(await r.waker.sleep(2 * MIN)).toMatchObject({ woke: false, reason: 'interval' });
+    expect(forwarded).toEqual([]);
+  });
+});
 
 describe('flag + config', () => {
   it('flag OFF returns the very same effects object', () => {
@@ -213,5 +270,63 @@ describe('isRelevantEvent — a caller-supplied rule (R689)', () => {
   });
   it('still honours the repo filter with a supplied rule', () => {
     expect(isRelevantEvent({ type: 'x', repo: 'a/b' }, 'p', { rule: () => true, repos: ['c/d'] })).toBe(false);
+  });
+});
+
+describe('appendRuntimeEvent failure paths — card 8370', () => {
+  const MARK = 'TOK-MARKER-7f3a9c1e';
+  const hostile = `${MARK}\nAuthorization: Bearer ${MARK}\r\nauthorization: ${MARK}`;
+  const jsonRes = (status, body) => new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+    status, headers: { 'content-type': 'application/json' },
+  });
+
+  // Run one call with every console/stdio sink captured; assert one attempt and that the marker never leaks.
+  async function attempt(fetchImpl, { timeoutMs = 1000 } = {}) {
+    let attempts = 0;
+    const sinks = [];
+    const spies = ['log', 'info', 'warn', 'error', 'debug'].map((m) => vi.spyOn(console, m).mockImplementation((...a) => { sinks.push(a); }));
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation((c) => { sinks.push(c); return true; });
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation((c) => { sinks.push(c); return true; });
+    let result;
+    try {
+      result = await prEvents.appendRuntimeEvent(runtimeEvent(), {
+        url: 'https://events.example', token: MARK, timeoutMs,
+        fetchImpl: (...args) => { attempts += 1; return fetchImpl(...args); },
+      });
+    } finally {
+      [...spies, out, err].forEach((s) => s.mockRestore());
+    }
+    expect(attempts).toBe(1);
+    expect(JSON.stringify(result)).not.toContain(MARK);
+    expect(JSON.stringify(result)).not.toMatch(/authorization/i);
+    expect(JSON.stringify(sinks)).not.toContain(MARK);
+    return result;
+  }
+
+  it('a fetch rejection makes one attempt, returns a fixed diagnostic and leaks nothing', async () => {
+    const result = await attempt(async () => { throw new Error(hostile); });
+    expect(result).toEqual({ ok: false, error: 'runtime event request failed' });
+  });
+
+  it('an abort/timeout makes one attempt and reports only the timeout', async () => {
+    const result = await attempt((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error(hostile), { name: 'AbortError' })));
+    }), { timeoutMs: 5 });
+    expect(result).toEqual({ ok: false, error: 'timeout after 5ms' });
+  });
+
+  it.each([401, 429, 500])('HTTP %s makes one attempt and reports only the status', async (status) => {
+    const result = await attempt(async () => jsonRes(status, { error: hostile }));
+    expect(result).toEqual({ ok: false, error: `HTTP ${status}` });
+  });
+
+  it('a malformed JSON body makes one attempt and leaks nothing', async () => {
+    const result = await attempt(async () => jsonRes(202, `{"seq": ${hostile}`));
+    expect(result).toEqual({ ok: false, error: 'runtime event request failed' });
+  });
+
+  it('a well-formed but invalid body makes one attempt and reports malformed response', async () => {
+    const result = await attempt(async () => jsonRes(202, { seq: hostile, duplicate: false }));
+    expect(result).toEqual({ ok: false, error: 'malformed response' });
   });
 });

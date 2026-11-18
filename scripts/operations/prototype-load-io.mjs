@@ -7,6 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
+import { readStore, storePath } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -17,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { retireRegistration } from '../daemon-overlay.mjs';
+import { assertHumanOperator, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
@@ -219,8 +221,21 @@ export function defaultDeps() {
     env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey, combinedTest: defaultCombinedTest,
     retirePlanner: defaultRetirePlanner };
 }
+/** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
+export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn }) {
+  const merged = mergeRuledWeakened(platform, tool, warn);
+  const store = readStore({ path: storePath(env), fs, warn });
+  if (store.error) warn(`WARNING: ruled-weakened store unreadable: ${store.error}; no ops waivers loaded. Restore store readability and retry.`);
+  const key = e => JSON.stringify([e.ref, e.sha.toLowerCase(), e.ruling]);
+  const seen = new Set(merged.map(key));
+  for (const entry of store.entries) {
+    if (!seen.has(key(entry))) { seen.add(key(entry)); merged.push({ ...entry, layer: 'ops' }); }
+  }
+  return merged;
+}
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null }) {
+  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
+  resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -229,8 +244,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}) => layer;
   const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
     platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
-  // ruledWeakened is the union of platform and tool layers (arrays are cascade leaves, so the tool layer would replace it).
-  const config = { ...policy.value, ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, (m) => console.warn(m)) };
+  const config = { ...policy.value, ruledWeakened: loadRuledWeakened({
+    platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env }) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
   // Preserve a stricter caller policy without forwarding overrides that could weaken file policy.
@@ -239,62 +254,64 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   if (env.WE_DAEMON_OVERLAY_DIR) childEnv.WE_DAEMON_OVERLAY_DIR = expand(env.WE_DAEMON_OVERLAY_DIR);
   const runCombinedTest = combinedTest && combinedTest !== defaultCombinedTest ? combinedTest
     : (input) => defaultCombinedTest(input, { exec, fs, env: childEnv, settings: config });
-  const execute = (command, args) => {
-    try { return { code: 0, stdout: String(exec(command, args, { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) || '') }; }
-    catch (e) { return { code: Number.isInteger(e.status) ? e.status : -1, stdout: String(e.stdout || ''), stderr: String(e.stderr || ''), error: String(e.stderr || e.message || e) }; }
-  };
-  const git = (...args) => execute('git', args);
-  const requireGit = (...args) => { const r = git(...args); if (r.code !== 0) throw new Error(r.error || `git ${args[0]} failed (${r.code})`); return r.stdout.trim(); };
-  const ancestor = (tip, sha) => { const r = git('merge-base', '--is-ancestor', tip, sha); if (![0, 1].includes(r.code)) throw new Error(r.error || 'ancestry unverifiable'); return r.code === 0; };
-  const landedByContent = (ref, candidateSha) => {
-    const cherry = git('cherry', 'origin/main', `origin/${ref}`);
-    if (cherry.code !== 0 || !cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'))) return false;
-    // Patch IDs ignore whitespace even inside string literals. Require exact tree
-    // entries for every stale-changed path in both targets; a merge result can be
-    // influenced by merge drivers. Conservative mismatches use normal stale checks.
-    const changed = git('diff', '--name-only', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv',
-      '-z', `origin/main...origin/${ref}`);
-    if (changed.code !== 0 || !changed.stdout.endsWith('\0')) return false;
-    const paths = changed.stdout.slice(0, -1).split('\0');
-    // UTF-8 decoding can replace invalid filename bytes; that pathspec could match
-    // nothing and falsely prove equality. Retain normal checking for lossy names.
-    if (paths.some((path) => !path || path.includes('\uFFFD'))) return false;
-    return ['origin/main', candidateSha].every((target) => {
-      const difference = git('--literal-pathspecs', 'diff', '--quiet', '--no-ext-diff', '--no-textconv',
-        '--no-renames', '--ignore-submodules=none', target, `origin/${ref}`, '--', ...paths);
-      return difference.code === 0 && difference.stdout === '';
-    });
-  };
-  const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])]);
-  const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
-  // A replace check proves containment and checks the new ref against the list without the replaced one.
-  const replaceCheck = (clone, ref, expectedSha, old) => {
-    const result = loader('replace', clone, ref, ['--check', `--replaces=${old}`, `--expected-sha=${expectedSha}`]);
-    const data = lastJson(result);
-    if (result.code === 0 && data?.wouldReplace === true && data.check?.ok === true && data.check.clean === true
-      && data.check.candSha === expectedSha && data.containment?.contained === true) {
-      return { files: [], conflicting: [], ...data.check, exit: 0, wouldRegister: true, containment: data.containment };
-    }
-    if (data?.refused === 'conflict' && data.check?.ok === true && data.check.clean === false) {
-      return { files: [], conflicting: [], ...data.check, exit: result.code, containment: data.containment };
-    }
-    return { ok: false, ...result, reason: data?.refused || 'incomplete loader check', containment: data?.containment ?? null };
-  };
-  const check = (clone, ref, expectedSha) => {
-    const result = loader('add', clone, ref, ['--check', ...(expectedSha ? [`--expected-sha=${expectedSha}`] : [])]);
-    const data = lastJson(result);
-    const noPrWarning = result.code === 1 && /\bWARNING\b[^\r\n]*\bNO PR\b/.test(result.stderr || '');
-    if (result.code < 0 || data?.check?.ok !== true || typeof data.check.clean !== 'boolean'
-      // A clean check carries no `files`/`conflicting` (the loader only adds them on a conflict); default them.
-      || (data.check.files !== undefined && (!Array.isArray(data.check.files) || !data.check.files.every((file) => typeof file === 'string')))
-      || (data.check.conflicting !== undefined && !Array.isArray(data.check.conflicting))
-      || (!data.check.clean && (!Array.isArray(data.check.files) || !Array.isArray(data.check.conflicting)))
-      || (expectedSha && data.check.candSha !== expectedSha)
-      // Only the known no-PR warning exit may accompany a clean check.
-      || (data.check.clean ? result.code !== 0 && !noPrWarning : result.code !== 3)) return { ok: false, ...result, reason: data?.check?.reason || 'incomplete loader check' };
-    return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
-  };
   return async function load(input) {
+    // Repository context belongs to this invocation, including concurrent loads of different daemons.
+    let gitRepo = repo;
+    const execute = (command, args, cwd = gitRepo) => {
+      try { return { code: 0, stdout: String(exec(command, args, { cwd, env: childEnv, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) || '') }; }
+      catch (e) { return { code: Number.isInteger(e.status) ? e.status : -1, stdout: String(e.stdout || ''), stderr: String(e.stderr || ''), error: String(e.stderr || e.message || e) }; }
+    };
+    const git = (...args) => execute('git', args);
+    const requireGit = (...args) => { const r = git(...args); if (r.code !== 0) throw new Error(r.error || `git ${args[0]} failed (${r.code})`); return r.stdout.trim(); };
+    const ancestor = (tip, sha) => { const r = git('merge-base', '--is-ancestor', tip, sha); if (![0, 1].includes(r.code)) throw new Error(r.error || 'ancestry unverifiable'); return r.code === 0; };
+    const landedByContent = (ref, candidateSha) => {
+      const cherry = git('cherry', 'origin/main', `origin/${ref}`);
+      if (cherry.code !== 0 || !cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'))) return false;
+      // Patch IDs ignore whitespace even inside string literals. Require exact tree
+      // entries for every stale-changed path in both targets; a merge result can be
+      // influenced by merge drivers. Conservative mismatches use normal stale checks.
+      const changed = git('diff', '--name-only', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv',
+        '-z', `origin/main...origin/${ref}`);
+      if (changed.code !== 0 || !changed.stdout.endsWith('\0')) return false;
+      const paths = changed.stdout.slice(0, -1).split('\0');
+      // UTF-8 decoding can replace invalid filename bytes; that pathspec could match
+      // nothing and falsely prove equality. Retain normal checking for lossy names.
+      if (paths.some((path) => !path || path.includes('\uFFFD'))) return false;
+      return ['origin/main', candidateSha].every((target) => {
+        const difference = git('--literal-pathspecs', 'diff', '--quiet', '--no-ext-diff', '--no-textconv',
+          '--no-renames', '--ignore-submodules=none', target, `origin/${ref}`, '--', ...paths);
+        return difference.code === 0 && difference.stdout === '';
+      });
+    };
+    const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])], repo);
+    const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
+    // A replace check proves containment and checks the new ref against the list without the replaced one.
+    const replaceCheck = (clone, ref, expectedSha, old) => {
+      const result = loader('replace', clone, ref, ['--check', `--replaces=${old}`, `--expected-sha=${expectedSha}`]);
+      const data = lastJson(result);
+      if (result.code === 0 && data?.wouldReplace === true && data.check?.ok === true && data.check.clean === true
+        && data.check.candSha === expectedSha && data.containment?.contained === true) {
+        return { files: [], conflicting: [], ...data.check, exit: 0, wouldRegister: true, containment: data.containment };
+      }
+      if (data?.refused === 'conflict' && data.check?.ok === true && data.check.clean === false) {
+        return { files: [], conflicting: [], ...data.check, exit: result.code, containment: data.containment };
+      }
+      return { ok: false, ...result, reason: data?.refused || 'incomplete loader check', containment: data?.containment ?? null };
+    };
+    const check = (clone, ref, expectedSha) => {
+      const result = loader('add', clone, ref, ['--check', ...(expectedSha ? [`--expected-sha=${expectedSha}`] : [])]);
+      const data = lastJson(result);
+      const noPrWarning = result.code === 1 && /\bWARNING\b[^\r\n]*\bNO PR\b/.test(result.stderr || '');
+      if (result.code < 0 || data?.check?.ok !== true || typeof data.check.clean !== 'boolean'
+        // A clean check carries no `files`/`conflicting` (the loader only adds them on a conflict); default them.
+        || (data.check.files !== undefined && (!Array.isArray(data.check.files) || !data.check.files.every((file) => typeof file === 'string')))
+        || (data.check.conflicting !== undefined && !Array.isArray(data.check.conflicting))
+        || (!data.check.clean && (!Array.isArray(data.check.files) || !Array.isArray(data.check.conflicting)))
+        || (expectedSha && data.check.candSha !== expectedSha)
+        // Only the known no-PR warning exit may accompany a clean check.
+        || (data.check.clean ? result.code !== 0 && !noPrWarning : result.code !== 3)) return { ok: false, ...result, reason: data?.check?.reason || 'incomplete loader check' };
+      return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
+    };
     // R503: the live head's net-diff fingerprint, computed once and only when some evidence for another sha stores one.
     // Any git failure is no carry (null), never a throw.
     let liveFpMemo;
@@ -320,7 +337,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // tracking refspec also works in single-branch clones. This is read-only
         // remote access, never registration, retirement or publication.
         requireGit('fetch', 'origin', `+refs/heads/${input.branch}:refs/remotes/origin/${input.branch}`);
-        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
+        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(gitRepo, b, h, { exec })))('origin/main', input.sha) || null;
       } catch { liveFpMemo = null; }
       return liveFpMemo;
     };
@@ -384,6 +401,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       if (resolved.key !== input.daemon) { out.requestedDaemon = input.daemon; input = { ...input, daemon: resolved.key }; out.daemon = resolved.key; }
       const daemon = config.daemons[resolved.key];
+      gitRepo = daemon.repo ? resolve(expand(config.workspaceRoot), expand(daemon.repo)) : repo;
       // A daemon whose self-sync can never adopt an overlay (e.g. main-only) refuses up front, before any plist/git work or registration.
       if (typeof daemon.unsupported === 'string' && daemon.unsupported) {
         return stop('unsupported-daemon', { detail: `unsupported-daemon:${resolved.key}`,
@@ -393,7 +411,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.clone = resolve(expand(config.workspaceRoot), expand(daemon.clone));
         out.cloneSource = `settings:prototype-load.json#daemons.${input.daemon}.clone`;
       } else {
-        const plist = execute('plutil', ['-convert', 'json', '-o', '-', join(expand(config.launchAgentsDir), `${daemon.label}.plist`)]);
+        const plist = execute('plutil', ['-convert', 'json', '-o', '-', join(expand(config.launchAgentsDir), `${daemon.label}.plist`)], repo);
         if (plist.code !== 0) return stop('bad-input', { resolution: plist });
         const wd = JSON.parse(plist.stdout).WorkingDirectory;
         if (typeof wd !== 'string' || !wd.startsWith('/')) return stop('bad-input', { resolution: 'missing absolute WorkingDirectory' });
@@ -415,6 +433,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (!safeRegistrationRef(input.remove) || !input.reason?.trim() || input.branch || input.replace || input.retire)
           return stop('bad-input', { detail: '--remove requires --reason and no add/replace/retire' });
         stage = 'remove-refused';
+        let actor;
+        if (input.actor) {
+          try { actor = assertHumanOperator(await operatorIdentity({ env }), input.actor); }
+          catch (error) {
+            return stop('operator-identity-refused', { detail: String(error.message || error),
+              fallback: 'Authenticate as a human operator on OPERATOR_LOGINS and retry --remove with the matching --actor.' });
+          }
+        }
         const listed = listRows();
         if (!listed.ok) return stop('remove-refused', { detail: 'unreadable-registry' });
         if (listed.rows.some((r) => r.stackBases !== undefined && (!Array.isArray(r.stackBases) || !r.stackBases.every(safeRegistrationRef))))
@@ -449,7 +475,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             },
             tip: (ref) => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0],
           } }));
-        const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load' });
+        const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load',
+          ...(actor ? { actor } : {}) });
         if (data?.retired !== true) return stop('remove-refused', {
           detail: data?.refused || 'removal-unproved', fallback: 'Retain the entry; resolve changed entry/tip or stacked dependents, then retry --remove.' });
         out.removed = [input.remove]; out.ok = true; return out;
@@ -504,7 +531,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
       const readTestCheck = testCheck || (({ sha }) => {
         const gh = (args) => {
-          try { return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: repo, env: childEnv,
+          try { return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: gitRepo, env: childEnv,
             encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024, throttle: { caller: 'prototype-load', ...(exec !== execFileSync ? { exec: (ghArgs, ghOpts) => exec('gh', ghArgs, ghOpts) } : {}) } })) }; }
           catch { return { code: 1, stdout: '' }; }
         };
@@ -546,6 +573,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const dispatchFiles = matchDispatchPaths(own, DISPATCH_PATH_DEFAULTS);
       if (dispatchFiles.length) {
         stage = 'dispatch-smoke-failed';
+        // The smoke runs only against the WE checkout; a non-WE repo touching dispatch paths cannot be proven, so it refuses.
+        if (gitRepo !== repo) return stop('dispatch-smoke-failed', { fallback: 'Dispatch-path changes in a non-WE repository have no SHA-bound smoke; land them through a normal PR.' });
         if (dispatchSmoke) out.dispatchSmoke = await dispatchSmoke({ sha: input.sha, files: dispatchFiles });
         else {
           const scratch = fs.mkdtempSync(join(env.TMPDIR || tmpdir(), 'prototype-dispatch-smoke-'));
@@ -682,6 +711,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         let passed = false;
         let failure;
         try {
+          if (gitRepo !== repo) throw new Error('combined tests unsupported for non-WE repo');
           const evidence = await runCombinedTest({ clone: out.clone, candidateSha: out.effectiveSha,
             changedFiles: [...combinedChanged].sort(), refs: overlapping });
           if (!evidence || typeof evidence.ok !== 'boolean') throw new Error('incomplete combined-test evidence');

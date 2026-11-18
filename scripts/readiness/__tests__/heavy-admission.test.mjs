@@ -1507,6 +1507,8 @@ describe('the `load-status` CLI mode as a real process (#4343)', () => {
 // scanned a different slot range, so the daemon's slot-3…5 holders were invisible to the rest of the host.
 
 const bigSelectedArgv = ['npx', 'vitest', 'run', ...Array.from({length:DEFAULT_FAST_MAX_FILES + 1}, (_, i) => `selected-${i}.test.mjs`)];
+// A size-promoted explicit file list chained with a filterless whole-suite segment: the list must not hide the suite.
+const bigSelectedThenSuiteArgv = ['sh', '-c', `${bigSelectedArgv.join(' ')} && npx vitest run`];
 const quotedFilterlessArgv = [
   ['npm test-name containing a test filename', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts']],
   ['Vitest test-name containing a test filename', ['npx', 'vitest', 'run', '-t', 'loads a.test.ts']],
@@ -2620,12 +2622,12 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     return f;
   }
   const go = (f, extra = {}) => f.run({ argv: f.argv, policy: f.policy, cwd: f.cwd, env: f.env, lockRoot: f.lockRoot, clock: f.clock, readTelemetry: f.readTelemetry, remoteExec: f.remoteExec, log: f.log, sleep: f.sleep, ...extra });
-  const health = (f) => JSON.parse(readFileSync(join(f.cwd, 'remote', 'health.json'), 'utf8'));
+  const health = (f) => JSON.parse(readFileSync(join(f.cwd, 'remote', 'health-g2.json'), 'utf8'));
   const remoteMarkers = (f) => readdirSync(join(f.cwd, 'remote')).filter((n) => n.endsWith('.unconfirmed'));
   // Anything a local heavy slot would leave behind under the admission lock root.
   const localEntries = (f) => (existsSync(f.lockRoot) ? readdirSync(f.lockRoot) : []).filter((n) => /slot/.test(n));
 
-  const fullCommandCases = [['whole suite', ['npx', 'vitest', 'run']], ['big selected list', bigSelectedArgv], ...quotedFilterlessArgv];
+  const fullCommandCases = [['whole suite', ['npx', 'vitest', 'run']], ['big selected list chained with a whole suite', bigSelectedThenSuiteArgv], ...quotedFilterlessArgv];
   const fullCases = reasons => reasons.flatMap(reason => fullCommandCases.map(([label, argv]) => [reason, label, argv]));
   const refusalReasons = ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'];
   const retryableReasons = ['sibling-inventory-failed', 'git-head-unavailable'];
@@ -2741,12 +2743,10 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     expect(result).toEqual({handled:true, exitCode:125});
   });
 
-  // The `kind === 'coverage'` arms of the same guard: a coverage run is as heavy as a whole suite, so it never falls back
-  // to a local run on these reasons either. Every FULL test above uses a plain suite; these use coverage commands.
+  // Unfiltered coverage commands retain the same whole-suite refusal and retry policy.
   const coverageCommandCases = [
     ['bare --coverage', ['npx', 'vitest', 'run', '--coverage']],
     ['test:coverage script', ['npm', 'run', 'test:coverage']],
-    ['--coverage naming a test file', ['npx', 'vitest', 'run', '--coverage', 'a.test.mjs']],
   ];
   const coverageCases = reasons => reasons.flatMap(reason => coverageCommandCases.map(([label, argv]) => [reason, label, argv]));
 
@@ -2805,17 +2805,40 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
   });
 
   it.each(refusalReasons.flatMap(reason => [
-    [reason, 'selected file', ['npx', 'vitest', 'run', 'a.test.mjs']],
-    [reason, 'quoted option and selected file', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts', 'real.test.ts']],
-  ]))('non-FULL unit kind keeps local fallback on %s without retry (%s)', async (reason, _label, argv) => {
+    [reason, 'selected file', ['npx', 'vitest', 'run', 'a.test.mjs'], 'files'],
+    [reason, 'quoted option and selected file', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts', 'real.test.ts'], 'files'],
+    [reason, 'size-promoted explicit file list', bigSelectedArgv, 'FULL'],
+    [reason, 'coverage naming a test file', ['npx', 'vitest', 'run', '--coverage', 'a.test.mjs'], 'coverage'],
+  ]))('targeted command keeps local admission fallback on %s without retry (%s)', async (reason, _label, argv, kind) => {
     const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
     f.argv = argv;
     f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
     expect(await go(f)).toEqual({handled:false});
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.state.sleeps).toEqual([]);
-    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind:'files'})]);
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind})]);
+    expect(f.remoteExec.mock.calls[0][0].argv).toEqual(argv);
+    expect(remoteMarkers(f)).toEqual([]);
     expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('refusing local fallback'));
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+  });
+
+  it.each(refusalReasons)('size-promoted fallback queues every selected file unchanged after remote refusal on %s', async (reason) => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = bigSelectedArgv;
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
+    expect(await go(f)).toEqual({handled:false});
+    // The CLI hands the same argv to local admission; the queued child must receive the whole list, in order.
+    const command = bigSelectedArgv.map(shellQuoteWord).join(' ');
+    const exec = vi.fn();
+    const r = await runUnderAdmission({lockRoot:f.lockRoot, cap:2, owner:'handoff', command, cwd:f.cwd, exec, log:vi.fn(), env:{},
+      now:() => NOW, sleep:async () => {}});
+    expect(r.exitCode).toBe(0);
+    expect(exec).toHaveBeenCalledTimes(1);
+    const ran = exec.mock.calls[0][0];
+    expect(ran).toBe(command);
+    for (const file of bigSelectedArgv.slice(3)) expect(ran).toContain(file);
+    expect(ran.split(' ').slice(3)).toEqual(bigSelectedArgv.slice(3));
   });
 
   it('FULL kind keeps local fallback on unrelated forge-busy-after-wait after exhausting the busy budget', async () => {

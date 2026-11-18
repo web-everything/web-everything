@@ -43,17 +43,19 @@ beforeEach(async () => {
 afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
 const ranges = [
-  ['reviewConcurrency.maxLiveReviewRounds', 1, 8],
+  ['reviewConcurrency.maxLiveReviewRounds', 1, 16],
   ['host.maxReviewDispatchPerTick', 1, 8],
   ['resourceGate.fixCap.floor', 1, 12],
   ['resourceGate.fixCap.ceiling', 1, 12],
   ['resourceGate.fixCap.raiseMinMemFreePct', 25, 60],
   ['redTeamQueue.minConcurrent', 0, 12],
+  ['deliveryCapacity.pinUnits', 1, 200],
 ];
+const EXPIRY_LEAVES = ['deliveryCapacity.pinUntil', 'deliveryCapacity.holdUntil']; // epoch-ms expiries, covered by delivery-capacity-override tests
 
 describe('capacity-only operator store', () => {
   it('exports exactly the closed capacity allowlist', () => {
-    expect(Object.keys(store.CAPACITY_LEAVES).sort()).toEqual(ranges.map(([k]) => k).sort());
+    expect(Object.keys(store.CAPACITY_LEAVES).sort()).toEqual([...ranges.map(([k]) => k), ...EXPIRY_LEAVES].sort());
   });
   it.each(ranges)('%s declares a safe direction and finite fail-closed fallback', key => {
     const leaf = store.CAPACITY_LEAVES[key];

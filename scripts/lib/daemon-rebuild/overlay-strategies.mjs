@@ -3,6 +3,7 @@
  */
 
 import { FULL_SHA_RE, verifyRev, rebuildCommitEnv } from './shared.mjs';
+import { resolveAdvisoryConflicts } from './advisory-merge.mjs';
 
 /** Ordered: first strategy that returns a result wins; a failed strategy leaves the next one available. */
 export const OVERLAY_CONFLICT_STRATEGIES = Object.freeze([
@@ -59,6 +60,13 @@ export const OVERLAY_CONFLICT_STRATEGIES = Object.freeze([
     }
   } catch { /* report the original conflict */ }
       return null;
+    },
+  },
+  {
+    name: 'advisory-merge',
+    run(ctx) {
+      ctx.tried.push('advisory-merge');
+      return resolveAdvisoryConflicts(ctx);
     },
   },
 ]);

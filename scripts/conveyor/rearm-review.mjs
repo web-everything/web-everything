@@ -32,6 +32,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
+import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
 // fix-agent brief's entrypoint and the pinned tests keep importing it from here (it is single-sourced next door).
@@ -39,12 +40,22 @@ export { presentRemoveLabels };
 
 /**
  * we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER — the stable FIRST LINE of the durable re-arm comment.
- * It is single-sourced HERE and used two ways: the CLI POSTS a comment starting with it on every re-arm, and
+ * It is single-sourced in rearm-round-count.mjs and used two ways: the CLI POSTS it on every re-arm, and
  * {@link countRearmComments} MATCHES it to recover the attempt count from the PR (#2643). Build and count share
  * ONE marker so they can never drift. Treat this line as fixed: changing it orphans the count on every open fix
  * PR's existing history (an already-burned PR would read as zero attempts again — the very reset #2643 fixes).
  */
-export const REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
+export { REARM_COMMENT_MARKER };
+
+/** Trailer line of a same-head pause wake. The wake starts with {@link REARM_COMMENT_MARKER} (that is what wakes the hold) but is not a fix round, so the count skips it. */
+export { SAME_HEAD_WAKE_TRAILER };
+
+/** The wake comment `run.mjs rearm` posts on a `review:pending` PR whose same-head hold is spent. Labels are untouched. */
+export function buildSameHeadWakeComment({ actor, key }) {
+  const who = neutralizeCommentMarkers(String(actor ?? '').replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, ' ')).slice(0, 200);
+  const id = String(key ?? '').replace(/[^\w:@./+-]+/g, '').slice(0, 300);
+  return [REARM_COMMENT_MARKER, '', `${who} woke the same-head review pause: a fresh independent review is requested for this head. Labels were not changed. Action ${id}`, '', SAME_HEAD_WAKE_TRAILER].join('\n');
+}
 
 /**
  * we:scripts/conveyor/rearm-review.mjs#countRearmComments — the DURABLE, restart-surviving auto-fix attempt count
@@ -63,10 +74,9 @@ export const REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-revie
 export function countRearmComments(comments) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
-  for (const c of comments) {
-    const body = typeof c === 'string' ? c : c?.body;
-    // #3383 — a forged re-arm marker from an untrusted login must not inflate the negotiation-round cap.
-    if (typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER) && isTrustedMarkerAuthor(c)) n += 1;
+  // #3383 — a forged re-arm marker from an untrusted login must not inflate the negotiation-round cap.
+  for (const c of comments.filter(isTrustedMarkerAuthor)) {
+    if (isFixRoundRearmComment(c)) n += 1;
   }
   return n;
 }

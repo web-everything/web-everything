@@ -122,3 +122,12 @@ describe('CLI — live PreToolUse payloads', () => {
     expect(run('sleep 5 && curl -sf http://localhost:4000/', { agent_id: 'a1' })).toBeNull();
   });
 });
+
+describe('await-checks op vs raw --watch', () => {
+  it('allows the declared await-checks op and still refuses raw --watch', () => {
+    const op = 'node scripts/operations/run.mjs await-checks --pr=6873 --repo=web-everything/web-everything --check=test --timeoutMin=60';
+    expect(waitPollKind(op)).toBeNull();
+    expect(waitPollKind('gh pr checks 6873 --watch')).toBe('pr-ci');
+    expect(waitPollKind(op + ' && gh pr checks 6873 --watch')).toBe('pr-ci');
+  });
+});

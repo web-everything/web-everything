@@ -238,13 +238,13 @@ describe('pidToCwd — the REAL default `lsof` shell-out (#3478 review: never ex
   });
 
   it('shells the real default execFn (no override) — a fake `lsof` on PATH answering cleanly resolves', () => {
-    writeFileSync(join(fakeBin, 'lsof'), '#!/usr/bin/env node\nprocess.stdout.write("p1\\nn/from/real/lsof\\n");\n', 'utf8');
+    writeFileSync(join(fakeBin, 'lsof'), '#!/bin/sh\nprintf "p1\\nn/from/real/lsof\\n"\n' /* sh, not node: no cold-start under CI shard load (main-fix 74fcb99b7) */, 'utf8');
     chmodSync(join(fakeBin, 'lsof'), 0o755);
     expect(pidToCwd(4242)).toBe('/from/real/lsof');
   });
 
   it('a `lsof` that exits non-zero (pid gone / unsupported flags) resolves to null, never throws', () => {
-    writeFileSync(join(fakeBin, 'lsof'), '#!/usr/bin/env node\nprocess.exit(1);\n', 'utf8');
+    writeFileSync(join(fakeBin, 'lsof'), '#!/bin/sh\nexit 1\n', 'utf8');
     chmodSync(join(fakeBin, 'lsof'), 0o755);
     expect(pidToCwd(4242)).toBe(null);
   });
@@ -328,13 +328,13 @@ describe('verifyRunnerProcess — the REAL default `ps` shell-out (#3478 review,
   });
 
   it('shells the real default execFn (no override) — a fake `ps` on PATH naming the runner verifies true', () => {
-    writeFileSync(join(fakeBin, 'ps'), '#!/usr/bin/env node\nprocess.stdout.write("node skills-src/conveyor/runner.mjs --json\\n");\n', 'utf8');
+    writeFileSync(join(fakeBin, 'ps'), '#!/bin/sh\nprintf "node skills-src/conveyor/runner.mjs --json\\n"\n' /* sh, not node: the failing CI case (74fcb99b7) */, 'utf8');
     chmodSync(join(fakeBin, 'ps'), 0o755);
     expect(verifyRunnerProcess(4242)).toBe(true);
   });
 
   it('a fake `ps` naming an unrelated process verifies false', () => {
-    writeFileSync(join(fakeBin, 'ps'), '#!/usr/bin/env node\nprocess.stdout.write("node some-other-script.mjs\\n");\n', 'utf8');
+    writeFileSync(join(fakeBin, 'ps'), '#!/bin/sh\nprintf "node some-other-script.mjs\\n"\n', 'utf8');
     chmodSync(join(fakeBin, 'ps'), 0o755);
     expect(verifyRunnerProcess(4242)).toBe(false);
   });

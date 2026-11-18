@@ -37,6 +37,7 @@ export function controlFingerprint(name, read, input) {
   if (name === 'clear-claim') return stateDigest(read.claims ?? []);
   if (name === 'ci-heal-reset') return stateDigest({ head: read.head, awaitVerify: read.awaitVerify });
   return stateDigest({ head: read.head, state: read.state, labels: [...(read.labels ?? [])].sort(),
+    ...(name === 'rearm' && read.sameHeadHold ? { sameHeadHold: [read.sameHeadHold.kind, read.sameHeadHold.head] } : {}),
     ...(name === 'refresh' ? { main: read.main, containsMain: read.containsMain, crossRepo: read.crossRepo, headRef: read.headRef, requiredCheck: read.requiredCheck } : {}),
     ...(name === 'grant-rounds' ? { granted: countGrantedRoundExtensions(read.comments, input) } : {}) });
 }
@@ -58,7 +59,7 @@ export function validateControlInput(name, input) {
 export function planOperatorControl(name, read, input) {
   validateControlInput(name, input);
   const attribution = validateOperatorAttribution(input), target = input.item ? `item:${input.item}` : input.file ? `file:${input.file}` : `pr:${input.pr}`;
-  let why = '', steps = [], undo = '', extension, resets;
+  let why = '', steps = [], undo = '', extension, resets, wake = false;
   if (name === 'unpark') {
     undo = input.item ? 'the daemon re-parks on the next failure; to re-hold now: placeBuildDispatchHold' : 'restore review:human through the review ceremony';
     if (input.item) {
@@ -78,8 +79,15 @@ export function planOperatorControl(name, read, input) {
     undo = 'request changes again through review-set-label.mjs --to=changes';
     const decision = decideRearm({ currentLabels: read.labels });
     if (read.state !== 'OPEN') why = 'PR is not open';
-    else if (!decision.allowed) why = decision.reason;
-    else steps.push(`rearm-review.mjs ${input.pr} --actor=${attribution.actor}; add ${decision.addLabel || 'no label'}; remove ${(decision.removeLabels ?? []).filter(label => read.labels.includes(label)).join(', ') || 'no labels'}; keep the human hold`);
+    else if (!decision.allowed) {
+      // A review:pending PR whose same-head pause is spent: wake it with a comment. Only the same-head kind on the live head
+      // (never a referral hold) and never beside review:human; labels stay untouched.
+      const hold = read.sameHeadHold, labels = read.labels ?? [];
+      if (labels.includes('review:pending') && !labels.includes('review:human') && hold?.kind === 'same-head' && hold.noVerdict && hold.head === read.head) {
+        wake = true;
+        steps.push(`post the re-arm wake comment (same-head pause on ${String(read.head).slice(0, 9)}); no label change`);
+      } else why = decision.reason;
+    } else steps.push(`rearm-review.mjs ${input.pr} --actor=${attribution.actor}; add ${decision.addLabel || 'no label'}; remove ${(decision.removeLabels ?? []).filter(label => read.labels.includes(label)).join(', ') || 'no labels'}; keep the human hold`);
   } else if (name === 'refresh') {
     undo = 'restore the previous head only through a reviewed content-preserving git repair';
     if (read.crossRepo) throw new Error('refresh refuses cross-repo heads');
@@ -127,7 +135,7 @@ export function planOperatorControl(name, read, input) {
   const records = name === 'clear-claim' ? (read.claims ?? []).map(c => ({ ...record, pr: c.meta.pr, key: `${name}:${input.repo}:pr:${c.meta.pr}:${planKey(stateDigest(c))}`, details: { ...record.details, kind: c.meta.kind } })) : [record];
   if (!why) steps.push(input.item ? 'append operator-action record to operator-actions.jsonl' : 'post one operator-action comment per PR target');
   return { op: name, target, action: why ? 'noop' : 'apply', ...(why ? { why } : {}), steps, undo, record, records,
-    body: buildOperatorActionComment(record), fingerprint, input, claims: read.claims, extension, ...(name === 'refresh' ? { refreshExpect: { head: read.head, main: read.main } } : {}), ...(resets ? { resets } : {}) };
+    body: buildOperatorActionComment(record), ...(wake ? { wake } : {}), fingerprint, input, claims: read.claims, extension, ...(name === 'refresh' ? { refreshExpect: { head: read.head, main: read.main } } : {}), ...(resets ? { resets } : {}) };
 }
 export function operatorControlOperation(name, { readContext } = {}) {
   const optional = (type, value) => ({ type, required: false, default: value });

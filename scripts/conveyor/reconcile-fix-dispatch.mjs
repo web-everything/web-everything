@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { refreshMqFailureHeadSync, mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
@@ -225,7 +226,9 @@ export function fixBriefPath(root = REPO_ROOT) {
 
 /** The fix brief `dispatchFix` sends by default: the template, its context pack, then the build requirements once. */
 export function readFixBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
-  return appendBuildRequirements(pack(readFileSync(fixBriefPath(root), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
+  const template = assertBriefTaskContent(readFileSync(fixBriefPath(root), 'utf8'));
+  const packed = assertBriefTaskContent(pack(template));
+  return appendBuildRequirements(packed, { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
 }
 
 /** we:scripts/conveyor/reconcile-fix-dispatch.mjs#RESUME_CONFIRM_MAX_ATTEMPTS — hardening (2) from the
@@ -543,6 +546,26 @@ function roundFields(entry) {
 // importers of this file (this module's own three call sites above, and this file's own tests) see no change.
 export { isSafeFallbackScopeEntry };
 
+// Union of the fallback, idle-restack and replay projections. Allocate a new reader for every pass.
+const FIX_PR_VIEW_FIELDS = 'number,headRefName,headRefOid,baseRefName,labels,state,files,body,isCrossRepository';
+export function createFixPassPrReader({ exec = execFileSyncThrottled, root = REPO_ROOT, repo = null } = {}) {
+  const views = new Map();
+  return (pr, targetRepo = repo) => {
+    targetRepo = targetRepo == null ? null : ghRepoSlug(targetRepo);
+    const key = JSON.stringify([targetRepo ?? null, String(pr)]);
+    if (!views.has(key)) {
+      try {
+        const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(targetRepo ? ['--repo', targetRepo] : []), '--json', FIX_PR_VIEW_FIELDS],
+          { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 8 * 1024 * 1024 }));
+        views.set(key, { view });
+      } catch (error) { views.set(key, { error }); }
+    }
+    const cached = views.get(key);
+    if (cached.error) throw cached.error;
+    return cached.view;
+  };
+}
+
 /**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#fetchPrDiffScope — `#3634`'s real fallback-scope reader: ONE
  * `gh pr diff <pr> --name-only` call, reduced to the `we:`-prefixed path list {@link planFixesFromReconcile}'s
@@ -564,10 +587,10 @@ export { isSafeFallbackScopeEntry };
  *   (today's only reachable case) still resolves to `'we'`, so existing callers see byte-identical output.
  * @returns {string[]|null} `null` on a failed read (see above); `[]` only for a genuinely empty diff.
  */
-export function fetchPrDiffScope(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null } = {}) {
+export function fetchPrDiffScope(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null, readPrView } = {}) {
   const profile = repoProfile(repo ?? 'we');
   const prefix = profile ? profile.canonicalPrefix : 'we';
-  const paths = fetchPrDiffPaths(pr, { exec, root, repo });
+  const paths = fetchPrDiffPaths(pr, { exec, root, repo, readPrView });
   return paths === null ? null : paths.map((p) => `${prefix}:${p}`);
 }
 
@@ -591,7 +614,7 @@ export function fetchPrDiffScope(pr, { exec = execFileSyncThrottled, root = REPO
  *   `planFixesFromReconcile`'s own per-entry wrappers are what actually SURFACE the distinction to a refusal
  *   kind (`scope-read-failed` vs `no-scope`) instead of merely swallowing it one level deeper.
  */
-export function fetchPrDiffPaths(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null } = {}) {
+export function fetchPrDiffPaths(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null, readPrView = createFixPassPrReader({ exec, root, repo }) } = {}) {
   const opts = (maxBuffer) => ({
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, cwd: root,
     timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
@@ -608,7 +631,7 @@ export function fetchPrDiffPaths(pr, { exec = execFileSyncThrottled, root = REPO
     // never succeed, yet it used to degrade to `null` (= "transient, retry next pass") forever. Read the same
     // file list through the paginated REST endpoints instead; only if those fail too is the refusal permanent.
     if (!isDiffTooLargeError(err)) return null;
-    const paged = fetchPrFilesPaginated(pr, { exec, root, repo, opts });
+    const paged = fetchPrFilesPaginated(pr, { exec, root, repo, opts, readPrView });
     if (paged) return paged;
     throw new PermanentScopeReadError(`PR #${pr}: \`gh pr diff\` is too large (HTTP 406, over 300 files) and the paginated file-list fallbacks failed or were capped (possibly truncated) too`);
   }
@@ -655,7 +678,7 @@ export function completeCompareFiles(names) {
  * ({@link completeCompareFiles}) falls through to `pulls/<n>/files`, and a `pulls/<n>/files` list that reaches
  * {@link MAX_PAGINATED_FILES} is refused rather than returned as a partial scope.
  */
-export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null, opts } = {}) {
+export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null, opts, readPrView = createFixPassPrReader({ exec, root, repo }) } = {}) {
   const o = opts || (() => ({
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, cwd: root,
     timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
@@ -663,9 +686,7 @@ export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root =
   const slug = repo || '{owner}/{repo}';
   const lines = (out) => [...new Set(String(out || '').split('\n').map((s) => s.trim()).filter(Boolean))];
   try {
-    const viewArgv = ['pr', 'view', String(pr), '--json', 'baseRefName,headRefOid', '--jq', '.baseRefName + " " + .headRefOid'];
-    if (repo) viewArgv.push('--repo', repo);
-    const [base, head] = String(exec('gh', viewArgv, o(1024 * 1024)) || '').trim().split(' ');
+    const { baseRefName: base, headRefOid: head } = readPrView(pr);
     if (base && head) {
       // ONE page, never `--paginate`: compare paginates commits and lists the changed files on the first page only.
       // The projection keeps a missing/null `files` field (`null`) and a nameless entry (`null` in the array) visible,
@@ -973,7 +994,7 @@ export function tryResumeFix(planned, {
       const permissions = grantConflictHelper(candidateCwd);
       if (permissions?.ok !== true) throw new Error(`repair-helper permissions unwritten (${permissions?.reason ?? 'no result'})`);
     },
-    prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
+    prompt: renderNoPromptCommandRules(withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned), 'fix'),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
 }
@@ -1648,7 +1669,7 @@ export function dispatchFix(planned, {
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: withPlannedContext(prompt, planned), sessionSlug, launchKind: 'fix' },
+      payload: { prompt: renderNoPromptCommandRules(withPlannedContext(prompt, planned), 'fix'), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
@@ -1816,6 +1837,9 @@ export function runReconcileFixDispatch({
   dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   root = REPO_ROOT,
   repo = null,
+  // This pass targets WE when repo is omitted, including idle restacks. Pin the shared
+  // snapshot once so fallback and restack reads cannot split into two cache entries.
+  readPrView = createFixPassPrReader({ root, repo: repo ?? CONSTELLATION_REPOS.we.slug }),
   findItemFn = findItem,
   loadItems = () => defaultLoadItems(root),
   pickFreeLanes = null,
@@ -1837,10 +1861,7 @@ export function runReconcileFixDispatch({
   writeStacks = prStack === readStacksForPass ? writeRemembered : null,
   readPrForRestack = prStack === readStacksForPass ? (pr) => {
     try {
-      const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
-      const data = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo',
-        CONSTELLATION_REPOS[repoKey].slug, '--json', 'number,headRefName,headRefOid,labels,body,isCrossRepository'],
-      { cwd: root, encoding: 'utf8', timeout: 30e3 }));
+      const data = readPrView(pr);
       return { kind: 'fix', prNumber: data.number, headRefName: data.headRefName,
         headRefOid: data.headRefOid, labels: data.labels.map(label => label.name), body: data.body,
         isCrossRepository: data.isCrossRepository !== false };
@@ -1848,11 +1869,11 @@ export function runReconcileFixDispatch({
   } : null,
   // Origin's lane/* tips, to verify an idle restack target at dispatch time (the push-capable step).
   readLaneTips = readOriginLaneTips,
-  resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo }),
+  resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo, readPrView }),
   // #xmtbdgs multi-repo slice 6 — the item-less diff read; UN-prefixed (see `planFixesFromReconcile`'s own
   // docblock for why this is a distinct binding from `resolveFallbackScope` above, which IS prefixed). #xcla4iv
   // — ALSO now reused for the named-item branch's card-in-diff check (see that call site's own comment).
-  fetchItemlessDiffPaths = (pr) => fetchPrDiffPaths(pr, { root, repo }),
+  fetchItemlessDiffPaths = (pr) => fetchPrDiffPaths(pr, { root, repo, readPrView }),
   // #xcla4iv — reads one backlog card's own committed `scope:` at a specific ref, for the file-item-in-PR
   // population {@link planFixesFromReconcile}'s docblock describes.
   resolveCardScopeAtRef = (path, ref) => fetchCardScopeAtRef(path, ref, { root, repo }),
@@ -2414,11 +2435,12 @@ export function recordQueueCapRefusal({
 export function planFixDispatchClaimStatus({
   root = REPO_ROOT,
   repo = null,
+  readPrView = createFixPassPrReader({ root, repo }),
   findItemFn = findItem,
   loadItems = () => defaultLoadItems(root),
   reconcile = runReconcilePass,
-  resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo }),
-  fetchItemlessDiffPaths = (pr) => fetchPrDiffPaths(pr, { root, repo }),
+  resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo, readPrView }),
+  fetchItemlessDiffPaths = (pr) => fetchPrDiffPaths(pr, { root, repo, readPrView }),
   resolveCardScopeAtRef = (path, ref) => fetchCardScopeAtRef(path, ref, { root, repo }),
   resolveProfile = repoProfile,
   checkStaleness,
@@ -2451,10 +2473,10 @@ export function replayFixLaunch({
   pr, round = null, repo = 'we', root = REPO_ROOT, exec = execFileSyncThrottled,
   readComments = (n, slug) => readCompletePrComments(n, { repo: slug }),
   fixSettings = resolveFixSettings(), resumeRound = tryResumeRoundFix, loadLadder = () => loadFixerLadder(),
+  readPrView = createFixPassPrReader({ exec, root, repo: ghRepoSlug(repo) }),
 } = {}) {
   const slug = ghRepoSlug(repo);
-  const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', slug, '--json', 'number,headRefName,headRefOid,baseRefName,labels,state,files'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
+  const view = readPrView(pr);
   let attempts;
   if (Number.isInteger(round) && round >= 1) attempts = round - 1;
   else {

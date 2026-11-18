@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -620,5 +620,16 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
     const stop2 = { id: 'IC_300', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'again?' }) };
     const twice = [...seq, ans('IC_200', 'IC_106', 'rearm-review'), begin('IC_210'), stop2, ans('IC_301', 'IC_300', 'rearm-review')];
     expect(decideEmptyFixRound({ comments: twice, liveHead: HEAD }).empty).toBe(true);
+  });
+});
+
+describe('buildSameHeadWakeComment — the same-head pause wake', () => {
+  it('starts with the re-arm marker so the hold wakes, but never counts as a fix round', () => {
+    const body = buildSameHeadWakeComment({ actor: 'chalbert', key: 'k1' });
+    expect(body.startsWith(REARM_COMMENT_MARKER)).toBe(true);
+    expect(body).toContain('k1');
+    expect(countRearmComments([{ body, author: { login: 'chalbert' } }])).toBe(0);
+    const quoted = `${REARM_COMMENT_MARKER}\n\nquoted ${SAME_HEAD_WAKE_TRAILER} mid-body`;
+    expect(countRearmComments([{ body: quoted, author: { login: 'chalbert' } }])).toBe(1);
   });
 });

@@ -173,6 +173,17 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     expect(result.stderr).toContain('stray-cache.tmp');
     expect(result.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f]/);
   });
+  it('runs a clean clone whose tracked-file listing is over 1 MB (git() maxBuffer)', () => {
+    const f = fixture();
+    const dir = join(f.clone, 'big');
+    mkdirSync(dir);
+    // ~5,000 paths of ~210 bytes each: `git ls-files -v -z` prints just over 1 MB.
+    for (let i = 0; i < 5000; i++) writeFileSync(join(dir, `${'x'.repeat(200)}-${i}`), '');
+    commitClone(f, 'large listing');
+    const listing = spawnSync('git', ['-C', f.clone, 'ls-files', '-v', '-z'], { maxBuffer: 64 * 1024 * 1024 });
+    expect(listing.stdout.length).toBeGreaterThan(1024 * 1024);
+    expect(f.launch()).toMatchObject({ status: 0 });
+  }, 60_000);
   it('does not deny a clean clone whose index stat data is stale (chmod after sync changes ctime)', () => {
     const f = fixture();
     const target = join(f.clone, 'scripts/guard-bash.mjs');

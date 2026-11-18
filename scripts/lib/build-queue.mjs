@@ -22,6 +22,10 @@ import { isTerminalStatus } from './backlog-status.cjs';
 import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES, PRIORITY_SETTINGS_OFF } from './delivery-priority.mjs';
 import { platformPreference, logCascadeSources, resolveCascade, cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 const BUILD_PRIORITY_ID = /^(\d+|x[0-9a-z]{6,})$/;
 function normalizeBuildPriority(value) {
@@ -51,8 +55,38 @@ export function resolveBuildPriority({ platform, tool, env } = {}) {
   }));
 }
 
-/** IO: resolve build.priority through the shared cascade and log its source. Never throws. */
-export function readBuildPrioritySettings({ env = process.env, read = readSettings } = {}) {
+/**
+ * IO: standard → platform → tool → runtime → valid env. Never throws; only ENOENT omits runtime.
+ * Runtime JSON contains ids, mode (only|lift), setBy, ISO at, and finite nonnegative ttlHours.
+ * Expiry warns but keeps the list; malformed/unreadable evidence holds all new candidates.
+ * @param {{env?:object, read?:Function, runtimePath?:string, readRuntime?:Function, now?:Function|number}} options
+ * @returns {{ids:string[], source:string, mode?:string, only?:boolean, held?:boolean, runtime?:object}}
+ */
+export function readBuildPrioritySettings({ env = process.env, read = readSettings, runtimePath, readRuntime = readFileSync, now = Date.now } = {}) {
+  // A valid explicit environment override wins even over an unreadable runtime layer.
+  const envPriority = buildPriorityEnv(env).priority;
+  if (envPriority === undefined || envPriority === null) {
+    try {
+      const path = runtimePath ?? env.WE_BUILD_PRIORITY_RUNTIME_FILE ?? join(resolveCoordinationRoot({ env }), 'build-priority.runtime.json');
+      const runtime = JSON.parse(readRuntime(path, 'utf8'));
+      const ids = normalizeBuildPriority(runtime?.ids);
+      const at = typeof runtime?.at === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(runtime.at) ? Date.parse(runtime.at) : NaN;
+      if (!ids || !['only', 'lift'].includes(runtime?.mode) || typeof runtime.setBy !== 'string'
+          || !Number.isFinite(at) || typeof runtime.ttlHours !== 'number'
+          || !Number.isFinite(runtime.ttlHours) || runtime.ttlHours < 0) throw new Error('invalid runtime settings');
+      const ageMs = (typeof now === 'function' ? now() : now) - at;
+      if (!Number.isFinite(ageMs)) throw new Error('invalid runtime clock');
+      const hash = createHash('sha256').update(JSON.stringify({ ids, mode: runtime.mode })).digest('hex').slice(0, 12);
+      const expired = ageMs > runtime.ttlHours * 60 * 60 * 1000;
+      return { ids, source: 'runtime', mode: runtime.mode, only: runtime.mode === 'only', runtime: {
+        hash, ageMs, appliedCount: ids.length, expired, setBy: runtime.setBy,
+        line: `${expired ? 'WARNING expired ' : ''}build.priority (runtime): list=${hash} ageMs=${ageMs} applied=${ids.length}${expired ? '; list still applied; refresh runtime settings' : ''}`,
+      } };
+    } catch (error) {
+      if (error?.code !== 'ENOENT') return { ids: [], source: 'runtime-malformed', only: true, held: true,
+        runtime: { malformed: true, warning: 'WARNING build.priority runtime malformed or unreadable; new candidates held; repair or remove the runtime file' } };
+    }
+  }
   let tool;
   try { tool = read()?.build; } catch { /* unreadable tool settings leave the lower layers intact */ }
   try {
@@ -62,6 +96,27 @@ export function readBuildPrioritySettings({ env = process.env, read = readSettin
       envValues: buildPriorityEnv(env), valid: BUILD_PRIORITY_VALID, env,
     }));
   } catch { return { ids: [], source: 'standard' }; }
+}
+
+/**
+ * PURE: filter NEW candidates only. In-flight builds are never cancelled; no in-flight list is accepted.
+ * @param {string[]} ids
+ * @param {{ids:string[], only?:boolean, held?:boolean}} settings
+ * @returns {string[]} Unrestricted input is returned by identity; input is never mutated.
+ */
+export function filterIdsToRuntimeOnly(ids, settings) {
+  if (settings.held) return [];
+  if (!settings.only) return ids;
+  const allowed = new Set(settings.ids);
+  return ids.filter(id => allowed.has(id));
+}
+
+/** PURE: top id eligible for an extra NEW prepare slot, or null. Never affects in-flight work.
+ * @param {{ids:string[], only?:boolean, held?:boolean}} settings
+ * @returns {string|null}
+ */
+export function extraPrepareSlot(settings) {
+  return settings.only && !settings.held ? settings.ids[0] ?? null : null;
 }
 
 /** PURE policy cascade: standard defaults → platform preference → tool override → environment. */

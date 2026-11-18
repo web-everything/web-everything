@@ -6,7 +6,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
@@ -192,6 +193,10 @@ function fixture(options = {}) {
       return options.cherry?.[ref] ?? `+ ${SHA}\n`;
     }
     if (args[0] === 'merge-base') {
+      // Model repositories independently: a base known to WE is not proof for plateau-app.
+      if (options.auditBasesByRepo && args[1] === '--is-ancestor' && args[3] === 'origin/main') {
+        return options.auditBasesByRepo[config.cwd]?.includes(args[2]) ? '' : fail(1);
+      }
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
       if (args[2] === 'e'.repeat(40) && args[3] === 'origin/main') return '';
       if (options.auditBaseInMain && args[3] === 'origin/main' && args[2] === options.auditBaseInMain) return '';
@@ -260,6 +265,103 @@ const auditRecord = (overrides = {}) => ({
   questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], ...overrides,
 });
 const auditLines = (records) => records.map(record => JSON.stringify(record)).join('\n') + '\n';
+
+describe('prototype-load daemon code repository routing', () => {
+  const weRepo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+  const plateauRepo = '/home/test/workspace/plateau-app';
+  const daemon = { repo: 'plateau-app', clone: 'plateau-drain-daemon' };
+  const routedSettings = { daemons: { ...settings.daemons, 'drain-plateau': daemon } };
+  const ancestryArgs = ['merge-base', '--is-ancestor', TREE, 'origin/main'];
+  const gitCalls = (f) => f.calls.filter(({ cmd }) => cmd === 'git');
+
+  it('accepts a canonical audit whose base is in plateau-app origin/main and runs every git call there', async () => {
+    const f = fixture({ settings: routedSettings, audits: auditLines([auditRecord()]),
+      auditBasesByRepo: { [plateauRepo]: [TREE] } });
+    const out = await f.run({ daemon: 'drain-plateau', dryRun: true });
+    expect(gitCalls(f)).toContainEqual(expect.objectContaining({ args: ancestryArgs,
+      config: expect.objectContaining({ cwd: plateauRepo }) }));
+    expect(out).toMatchObject({ ok: true, dryRun: true, canonicalAudit: { ok: true }, stopReason: null });
+    expect(gitCalls(f).every(({ config }) => config.cwd === plateauRepo)).toBe(true);
+  });
+
+  it('refuses drain-plateau when its canonical audit is missing', async () => {
+    const testCheck = vi.fn();
+    const f = fixture({ settings: routedSettings, audits: '', testCheck });
+    expect(await f.run({ daemon: 'drain-plateau', dryRun: true })).toMatchObject({
+      ok: false, registered: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false },
+    });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+    expect(testCheck).not.toHaveBeenCalled();
+    expect(f.calls.filter(({ cmd }) => cmd === 'node')).toEqual([]);
+  });
+
+  it('refuses a base absent from plateau-app origin/main even when WE contains it', async () => {
+    const f = fixture({ settings: routedSettings, audits: auditLines([auditRecord()]),
+      auditBasesByRepo: { [weRepo]: [TREE], [plateauRepo]: [] } });
+    const out = await f.run({ daemon: 'drain-plateau', dryRun: true });
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { ok: false, reason: 'no-record' } });
+    expect(gitCalls(f)).toContainEqual(expect.objectContaining({ args: ancestryArgs,
+      config: expect.objectContaining({ cwd: plateauRepo }) }));
+    expect(f.calls.filter(({ cmd }) => cmd === 'node')).toEqual([]);
+  });
+
+  it('refuses drain-plateau when changed paths match the WE dispatch-smoke paths (no skip for non-WE repos)', async () => {
+    const f = fixture({ settings: routedSettings, audits: auditLines([auditRecord()]), auditBasesByRepo: { [plateauRepo]: [TREE] },
+      ownDiff: 'M\0scripts/operations/dispatch-lane.mjs\0', diff: 'M\0scripts/operations/dispatch-lane.mjs\0' });
+    expect(await f.run({ daemon: 'drain-plateau', dryRun: true })).toMatchObject({ ok: false, registered: false, stopReason: 'dispatch-smoke-failed' });
+  });
+  it.each(['drain', 'review'])('keeps every git call in the WE repo for %s', async (key) => {
+    const f = fixture();
+    expect(await f.run({ daemon: key, dryRun: true })).toMatchObject({ ok: true, stopReason: null });
+    expect(gitCalls(f).length).toBeGreaterThan(0);
+    for (const { config } of gitCalls(f)) expect(config.cwd).toBe(weRepo);
+  });
+
+  it('keeps the overlay CLI path and cwd in WE for an explicitly supported non-WE daemon', async () => {
+    const f = fixture({ settings: routedSettings });
+    const out = await f.run({ daemon: 'drain-plateau', dryRun: true });
+    expect(out).toMatchObject({ ok: true, clone: '/home/test/workspace/plateau-drain-daemon' });
+    const overlays = f.calls.filter(({ cmd }) => cmd === 'node');
+    expect(overlays.length).toBeGreaterThan(0);
+    for (const { args, config } of overlays) {
+      expect(args[0]).toBe(join(weRepo, settings.loaderCli));
+      expect(args).toContain('--clone=/home/test/workspace/plateau-drain-daemon');
+      expect(config.cwd).toBe(weRepo);
+    }
+  });
+
+  describe.each(['drain-plateau', 'plateau-drain-daemon'])('shipped unsupported plateau target %s', (name) => {
+    it.each([
+      ['normal registration', { waitAdoptionMs: undefined }],
+      ['dry-run', { dryRun: true }],
+      ['explicit adoption wait', { waitAdoptionMs: 30 }],
+      ['retire-only', { retire: true }],
+    ])('refuses %s before any subprocess or overlay access', async (_mode, input) => {
+      const shipped = JSON.parse(nodeFs.readFileSync(join(weRepo, 'scripts/settings/prototype-load.json'), 'utf8'));
+      const f = fixture({ settings: { daemons: shipped.daemons, daemonAliases: shipped.daemonAliases } });
+      expect(await f.run({ daemon: name, ...input })).toMatchObject({
+        ok: false, daemon: 'drain-plateau', registered: false, adopted: false,
+        stopReason: 'unsupported-daemon', detail: 'unsupported-daemon:drain-plateau',
+        fallback: expect.stringMatching(/main-only.*normal PR/),
+      });
+      expect(f.calls).toEqual([]);
+      expect(f.cloneRoots).toEqual([]);
+      expect([...f.registrations]).toEqual([]);
+      expect(f.records).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ stopReason: 'unsupported-daemon' });
+    });
+
+    it('leaves an existing registration untouched when retirement is requested', async () => {
+      const shipped = JSON.parse(nodeFs.readFileSync(join(weRepo, 'scripts/settings/prototype-load.json'), 'utf8'));
+      const f = fixture({ list: [BASE.branch], settings: { daemons: shipped.daemons, daemonAliases: shipped.daemonAliases } });
+      expect(await f.run({ daemon: name, retire: true })).toMatchObject({ ok: false, stopReason: 'unsupported-daemon' });
+      expect(f.calls).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual([BASE.branch]);
+    });
+  });
+});
+
 function auditedFixture(mode, options = {}) {
   // Historical warn-era success fixtures now supply real canonical evidence explicitly.
   let audits = '';
@@ -313,10 +415,10 @@ describe('canonicalAuditEvidence', () => {
     expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ verdict: 'WEAKENED' })], SHA))
       .toEqual({ ok: false, reason: 'weakened' });
   });
-  it.each([false, true])('latest timestamp defeats an older pass regardless of file order (reverse=%s)', reverse => {
-    const records = [auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })];
-    expect(prototypeLoad.canonicalAuditEvidence(reverse ? records.reverse() : records, SHA))
-      .toEqual({ ok: false, reason: 'weakened' });
+  it('the later-appended record decides, whatever timestamps it reports', () => {
+    const pass = auditRecord(), weak = auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' });
+    expect(prototypeLoad.canonicalAuditEvidence([pass, weak], SHA)).toEqual({ ok: false, reason: 'weakened' });
+    expect(prototypeLoad.canonicalAuditEvidence([weak, pass], SHA).ok).toBe(true);
   });
   it('a pass over another base never masks a WEAKENED audit of a different base (fail closed)', () => {
     const later = auditRecord({ at: '2026-10-21T12:00:00Z', base: MERGE });
@@ -2125,7 +2227,7 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   // eligibility (a missing or differing fingerprint) dropped that current record from the eligible set.
   describe('prior-question pass vs an ineligible current-question record', () => {
     const PRIOR = 'c'.repeat(64);
-    const opts = { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-21T00:00:00Z') };
+    const opts = { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-22T13:00:00Z') };
     const prior = () => old({ questionHash: PRIOR });
     const carry = (...records) => prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP, opts);
     it('the carried prior pass alone is a pass (the setting is live in this path)', () => {

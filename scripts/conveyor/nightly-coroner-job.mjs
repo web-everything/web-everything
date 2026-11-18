@@ -20,7 +20,7 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { feedPath, appendLines, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { scrubText } from './health-watch-core.mjs';
 import { prSweepTickAllowed } from './pr-sweep-job.mjs';
-import { runCoronerJudge, rankFrictions, renderHeldEntry, validateCoronerCoverage } from '../operations/coroner-judge.mjs';
+import { judgeFrictions, fileNewCards, rankFrictions, renderHeldEntry, validateCoronerCoverage } from '../operations/coroner-judge.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { fenceUntrusted } from '../lib/mandate-fence.mjs';
 
@@ -229,28 +229,92 @@ const sweepCoronerLeases = (root, sourceRoot, session, run = command) => run([jo
 /** The exact argv both extractor CLIs receive; each declares --since, --until and --json (contract-tested). */
 export const coronerExtractorArgs = (since, until) => ['--since', since, '--until', until, '--json'];
 
+const COVERAGE_TOTAL_BYTES = 4 * 1024 * 1024;
+const HELD_CHUNK_BYTES = 512 * 1024;
+const CARD_CHUNK_BYTES = 32 * 1024;
+const coverageCeiling = () => { throw new Error('coroner coverage exceeds total ceiling; run manual /coroner'); };
+
 /** Production evidence is read only when the default judge port is invoked. Injected judges own their IO.
- * No partial coverage: missing files, saturated PR bound or oversized evidence defer to manual /coroner.
+ * recentCards covers only the newest 80 cards: this bounded-window limitation is unchanged by chunking.
+ * Missing files, saturated PR bound or the total evidence ceiling defer to manual /coroner.
  */
-function readJudgeCoverage(sourceRoot, home) {
-  const boundedRead = (path, cap) => {
-    if (statSync(path).size > cap) throw new Error('coroner coverage exceeds byte bound; run manual /coroner');
-    return readFileSync(path, 'utf8');
+export function readJudgeCoverage(sourceRoot, home, gh = runGhSync) {
+  let bytes = 0;
+  const boundedRead = (path) => {
+    if (bytes + statSync(path).size > COVERAGE_TOTAL_BYTES) coverageCeiling();
+    const value = readFileSync(path, 'utf8');
+    bytes += Buffer.byteLength(value);
+    if (bytes > COVERAGE_TOTAL_BYTES) coverageCeiling();
+    return value;
   };
   let held = ''; // a missing held list means nothing is held yet
-  try { held = boundedRead(join(home, 'cards-to-file.md'), 512 * 1024); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const openPrs = JSON.parse(runGhSync(['pr', 'list', '--repo', ghRepoSlug(DEFAULT_REPO_KEY), '--state', 'open', '--limit', '201', '--json', 'number,title'],
+  try { held = boundedRead(join(home, 'cards-to-file.md')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const openPrs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug(DEFAULT_REPO_KEY), '--state', 'open', '--limit', '201', '--json', 'number,title'],
     { cwd: sourceRoot, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 }));
   if (!Array.isArray(openPrs) || openPrs.length > 200 || openPrs.some((p) => !Number.isSafeInteger(p.number) || typeof p.title !== 'string')) {
     throw new Error('coroner PR coverage incomplete or exceeds 200; run manual /coroner');
   }
+  bytes += Buffer.byteLength(JSON.stringify(openPrs));
+  if (bytes > COVERAGE_TOTAL_BYTES) coverageCeiling();
   const backlog = join(sourceRoot, 'backlog');
   const names = readdirSync(backlog).filter((name) => name.endsWith('.md'));
   if (names.length > 20000) throw new Error('coroner backlog exceeds 20000 entries; run manual /coroner');
   const recentCards = names.map((name) => ({ name, at: statSync(join(backlog, name)).mtimeMs }))
     .sort((a, b) => b.at - a.at || a.name.localeCompare(b.name)).slice(0, 80)
-    .map(({ name }) => ({ id: name, content: boundedRead(join(backlog, name), 32 * 1024) }));
+    .map(({ name }) => ({ id: name, content: boundedRead(join(backlog, name)) }));
   return { held, openPrs, recentCards };
+}
+/** Stay below the held renderer's bound after escaping, with an equal preview budget per proposal. */
+function budgetCoronerProposals(proposals) {
+  const limit = 1499;
+  const fits = (text) => text.length <= limit && renderHeldEntry({ key: 'proposal-budget', proposedFix: text },
+    { night: '2000-01-01' }).body.match(/\nFix idea: ([^\n]*)\n/)[1].length <= limit;
+  const full = proposals.length === 1 ? proposals[0] : proposals.map((p, i) => `Proposal ${i + 1}: ${p}`).join('\n');
+  if (fits(full)) return full;
+  for (let count = proposals.length; count > 0; count--) {
+    const labels = Array.from({ length: count }, (_, i) => `Proposal ${i + 1}: `);
+    const omitted = count < proposals.length ? `\n+${proposals.length - count} more proposals omitted; see coroner report` : '';
+    const overhead = labels.join('\n').length + omitted.length;
+    if (!fits(labels.map((label) => label + '…').join('\n') + omitted)) continue;
+    // Escaping can expand previews, so measure them through the real renderer before accepting.
+    for (let budget = Math.floor((limit - overhead) / count); budget > 0; budget--) {
+      const text = labels.map((label, i) => label + (proposals[i].length <= budget ? proposals[i]
+        : proposals[i].slice(0, budget - 1).replace(/[\uD800-\uDBFF]$/, '') + '…')).join('\n') + omitted;
+      if (fits(text)) return text;
+    }
+  }
+  return `+${proposals.length} more proposals omitted; see coroner report`;
+}
+
+/** Pack complete entries; never separate identifying context from the covering fix. */
+function packCoverageEntries(entries, cap, content = (entry) => entry) {
+  const chunks = [];
+  let batch = [], bytes = 0;
+  for (const entry of entries) {
+    const size = Buffer.byteLength(content(entry));
+    if (size > cap) throw new Error('coroner coverage entry exceeds chunk cap; run manual /coroner');
+    if (batch.length && bytes + size > cap) { chunks.push(batch); batch = []; bytes = 0; }
+    batch.push(entry); bytes += size;
+  }
+  if (batch.length) chunks.push(batch);
+  return chunks;
+}
+
+function chunkJudgeCoverage(coverage) {
+  validateCoronerCoverage(coverage);
+  if (Buffer.byteLength(JSON.stringify(coverage)) > COVERAGE_TOTAL_BYTES) coverageCeiling();
+  // Each numbered heading owns all continuation lines up to the next numbered heading.
+  // Unnumbered preamble is also kept whole; array inputs already provide entry boundaries.
+  const entries = typeof coverage.held === 'string' ? coverage.held.split(/(?=^\d+\.\s)/m)
+    : coverage.held.map((entry, i) => JSON.stringify(entry) + (i < coverage.held.length - 1 ? '\n' : ''));
+  const held = packCoverageEntries(entries, HELD_CHUNK_BYTES).map((batch) => batch.join(''));
+  for (const card of coverage.recentCards) {
+    if (!card || typeof card.content !== 'string') throw new Error('coroner card coverage malformed; run manual /coroner');
+  }
+  const cards = packCoverageEntries(coverage.recentCards, CARD_CHUNK_BYTES, (card) => card.content);
+  const count = Math.max(1, held.length, cards.length);
+  if (count > 160) coverageCeiling();
+  return Array.from({ length: count }, (_, i) => ({ held: held[i] ?? '', openPrs: coverage.openPrs, recentCards: cards[i] ?? [] }));
 }
 const etTimeNy = (date) => { const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(date).map(({ type, value }) => [type, value])); return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; };
 /** Held-list sink shared by fresh filings and crash recovery. The key line is the durable receipt. */
@@ -404,8 +468,8 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
         const extraction = report.match(/## Extraction[^\n]*\n\s*```json\n([\s\S]*?)\n```/);
         if (!extraction) throw new Error('coroner report lacks extraction evidence');
         const metrics = JSON.parse(extraction[1]);
-        const coverage = judge ? { held: [], openPrs: [], recentCards: [] } : readCoverage(sourceRoot, home);
-        validateCoronerCoverage(coverage);
+        const coverage = judge && readCoverage === readJudgeCoverage ? { held: [], openPrs: [], recentCards: [] } : readCoverage(sourceRoot, home);
+        const chunks = chunkJudgeCoverage(coverage);
         signal?.throwIfAborted();
         // judgeSpawn enforces the schema and --tools ""; no provider fallback is permitted.
         const judgePort = judge ?? ((request) => spawnToolFreeCoronerJudge({ ...request, timeoutMs: 5 * 60000 }, { load: loadJudgeSpawn }));
@@ -417,11 +481,38 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
         };
         const cap = nightly.judge?.maxCards ?? NIGHTLY_DEFAULTS.judge.maxCards;
         if (!positiveInt(cap)) throw new Error('invalid coroner judge maxCards');
-        const result = rankFrictions(metrics).length ? await runCoronerJudge({ metrics, state, judge: judgePort, fileItem, signal, save,
-          ...coverage, maxCards: cap, log: () => {} })
-          : { ranked: [], verdicts: [], filed: [], error: null };
+        // runCoronerJudge files immediately; use its judge-only path until all coverage is merged.
+        const ranked = rankFrictions(metrics);
+        const result = { ranked, verdicts: [], filed: [], error: null };
+        const byKey = new Map(), newCounts = new Map(), proposalsByKey = new Map();
+        if (ranked.length) for (const chunk of chunks) {
+          signal?.throwIfAborted();
+          const verdicts = await judgeFrictions({ ranked, judge: judgePort, ...chunk,
+            log: (message) => { result.error ??= message; } });
+          for (const verdict of verdicts) {
+            // Coverage found anywhere vetoes NEW, regardless of chunk order.
+            if (!byKey.has(verdict.key) || verdict.verdict === 'COVERED-BY') byKey.set(verdict.key, verdict);
+            if (verdict.verdict === 'NEW') {
+              newCounts.set(verdict.key, (newCounts.get(verdict.key) ?? 0) + 1);
+              if (!proposalsByKey.has(verdict.key)) proposalsByKey.set(verdict.key, new Set());
+              proposalsByKey.get(verdict.key).add(verdict.proposedFix);
+            }
+          }
+        }
         signal?.throwIfAborted();
         if (result.error) throw new Error(result.error);
+        // Omission is uncertainty, so NEW requires affirmative judgment from every chunk.
+        result.verdicts = [...byKey.values()].filter((v) => v.verdict === 'COVERED-BY' || newCounts.get(v.key) === chunks.length)
+          .map((verdict) => {
+            if (verdict.verdict !== 'NEW') return verdict;
+            const proposals = [...proposalsByKey.get(verdict.key)];
+            // Preserve every distinct suggestion; choosing between alternatives belongs to the operator.
+            return { ...verdict, proposedFix: budgetCoronerProposals(proposals) };
+          });
+        // Full suggestions remain available even when held-card previews must be shortened or omitted.
+        result.proposals = Object.fromEntries([...proposalsByKey].map(([key, proposals]) => [key, [...proposals]]));
+        result.filed = await fileNewCards({ ranked, verdicts: result.verdicts, state, fileItem, maxCards: cap, signal, save });
+        signal?.throwIfAborted();
         report = report.replace('Deterministic extraction is ready. Operator judgment is pending; no agent session was launched.',
           'Deterministic extraction is ready. Automated coverage judgment completed; manual analysis remains available.');
         atomicWrite(reportPath, `${report}\n## Automated coverage judgment\n\n${fenceUntrusted('material', JSON.stringify(result))}\n`);

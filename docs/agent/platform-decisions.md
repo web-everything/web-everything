@@ -6662,3 +6662,35 @@ detector (fixer diff journal or later re-rate); a traced defect drops the mode b
 `healDeltaReview` (5472) are unchanged. Mechanics: story `7618`.
 
 **Lineage:** `7617` (R370). Builds on 5471.
+
+
+### Conveyor flows are executable configuration; step logic stays code the flow calls {#conveyor-flows-executable-config}
+
+**Ratified 2026-11-15 by orchestrator under operator delegation (R939, 2026-11-15 08:45 ET 'I delegate to you'), all five forks at the card's default (`#4219`).** Consistent with epic #5452 N2 (no durable per-PR workflow engine).
+
+Every daemon, pass and dispatch lifecycle of the conveyor executes from a declared flow file, with no
+always-running engine process on the critical path. A flow owns its states, transitions, owners, waits and
+timeouts, retry caps, escalation, assumed and provided facts and hand-offs. Code owns guards, judges, effects
+and fact probes, each a declared operation. A guard classifies observations into one value of a closed set;
+transitions match those values in declared order; flow files hold no expressions. A flow's current state is
+derived each tick from live observations. Its record keeps only deadlines, job handles and a transition log, and
+retry counts come from their durable source. The engine runs inside the daemon that owns each state. Hand-offs
+travel through live state, and slow actions are [#daemon-jobs](#daemon-jobs) jobs. The flow checker is the
+engine's admission test. A flow with an unacknowledged finding does not load, and an executing flow may not
+waive an unbounded wait, an uncapped retry or an unowned state. Every migrated flow keeps its previous path
+behind an off / shadow / on switch and falls back to it on any engine failure, notifying the operator. The exception is a flow that
+writes `main`: it fails closed and alerts. The daemon-rebuild flow is never driven by the engine; it runs in
+permanent shadow.
+
+This extends [#operations-declared-once-callers-generated](#operations-declared-once-callers-generated) clause 2
+from one operation to a lifecycle: no new step kinds, a fact probe is a `compute`, and a wait is a state
+property. It amends
+[#conveyor-orchestration-mechanics-not-per-lane-agent](#conveyor-orchestration-mechanics-not-per-lane-agent)
+clause 1: once build-dispatch migrates, "the tested tick-core state machine" is the build-dispatch flow file
+plus its tested guards. It composes with [#deterministic-core-thin-judgment](#deterministic-core-thin-judgment)
+(the flow file and its guards are the single-sourced deterministic core; cross-repo hosts shell it),
+[#state-lives-where-its-nature-dictates](#state-lives-where-its-nature-dictates) (PR state stays on GitHub) and
+[#daemon-jobs](#daemon-jobs). It does not relax #daemon-jobs: job attempt caps stay with the job record, and
+writers to `main` keep no unlocked fallback.
+
+**Lineage:** `#4219`.

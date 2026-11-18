@@ -4,6 +4,16 @@ import { vi, it, expect, describe } from 'vitest';
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
+vi.mock('../../lib/pid-alive.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  const { execFileSync } = await import('node:child_process');
+  return {
+    ...actual,
+    // pid-alive can already be loaded by the test setup, before the subprocess mock.
+    // Keep its real parser and the default probe wiring; inject only the ps reader.
+    pidIdentity: (pid, opts) => actual.pidIdentity(pid, { exec: execFileSync, ...opts }),
+  };
+});
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
   return {
@@ -1219,12 +1229,13 @@ it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads
 it('xe8y12n real PR read shell enriches the reported missing-family shape from commit evidence', async () => {
   const { defaultReadPrs } = await import('../reconcile-pass.mjs');
   const { planReconcile } = await import('../reconcile-core.mjs');
-  const calls = [];
-  const prs = defaultReadPrs({ repo: 'o/r', exec: (_bin, args) => {
+  const calls = [], steps = [];
+  const prs = defaultReadPrs({ step: (name, fn) => { steps.push(name); return fn(); }, repo: 'o/r', exec: (_bin, args) => {
     calls.push(args);
     return JSON.stringify(args[1] === 'list' ? [{ number: 3239, labels: [], comments: [], statusCheckRollup: [] }]
       : { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { messageHeadline: 'repair', authors: { nodes: [{ name: 'Claude' }] } } }] } } } } });
   } });
+  expect(steps).toContain('planner-cache-diff');
   expect(calls.some(args => args.some(arg => arg.includes('commits(first:')))).toBe(true);
   expect(planReconcile({ prs }).notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
 });
@@ -1701,23 +1712,45 @@ describe('pid reuse: a process that started after the session registered is not 
 
 it('enrichAgents default probe path: reused pid (process newer than session) is marked pidAlive:false', async () => {
   const { enrichAgents } = await import('../reconcile-pass.mjs');
-  // pid of THIS test process; claim a session that registered long before this process started.
+  const { execFileSync } = await import('node:child_process');
+  // Keep the default probe/identity wiring, supplying ps through this file's subprocess mock.
+  // The current pid exists; the fixture process started after the registered session.
+  execFileSync.mockReturnValueOnce('S Tue Nov  3 15:00:00 2026 claude bg-spare x\n');
   const out = enrichAgents([{ pid: process.pid, startedAt: Date.parse('2020-01-01T00:00:00Z'), state: 'working' }],
     { readLaneHead: () => null })[0];
   expect(out.pidAlive).toBe(false);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
 });
 
 it('enrichAgents reads ISO-string and numeric-string startedAt for the reuse guard', async () => {
   const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
   for (const startedAt of ['2020-01-01T00:00:00Z', String(Date.parse('2020-01-01T00:00:00Z'))]) {
+    execFileSync.mockReturnValueOnce('S Tue Nov  3 15:00:00 2026 claude bg-spare x\n');
     expect(enrichAgents([{ pid: process.pid, startedAt, state: 'working' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+    expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
   }
+});
+
+it.each(['malformed ps output', new Error('ps unavailable')])('enrichAgents default probe keeps unreadable identity unknown (%s)', async snapshot => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
+  execFileSync.mockImplementationOnce(() => {
+    if (snapshot instanceof Error) throw snapshot;
+    return snapshot;
+  });
+  const row = { pid: process.pid, pidAlive: true, startedAt: '2020-01-01T00:00:00Z', state: 'working' };
+  const out = enrichAgents([row], { readLaneHead: () => null })[0];
+  expect(out).not.toHaveProperty('pidAlive');
+  expect(out).toMatchObject({ pid: process.pid, startedAt: row.startedAt, state: 'working' });
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
 });
 
 // Red-team round 5 (PR #6346): a wrapped worker resumed by the harness keeps its first-launch startedAt while its new
 // child pid started later. The reuse guard must not call that live child a recycled pid.
 it('enrichAgents keeps a resumed wrapped worker alive: its startedAt is the first launch, its child pid is newer', async () => {
   const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
   const { wrappedRecordToAgentRow } = await import('../../operations/worker-wrapper-launch.mjs');
   const { COMPLETION_RECORD_V2 } = await import('../../operations/completion-store.mjs');
   const firstLaunch = Date.parse('2020-01-01T00:00:00Z');
@@ -1726,9 +1759,14 @@ it('enrichAgents keeps a resumed wrapped worker alive: its startedAt is the firs
     startedAt: new Date(firstLaunch).toISOString(), cwd: '/lane',
   }, { isAlive: () => true });
   expect(row).toMatchObject({ kind: 'wrapped-worker', pid: process.pid, startedAt: firstLaunch });
+  const snapshot = 'S Tue Nov  3 15:00:00 2026 claude bg-spare x\n';
+  execFileSync.mockReturnValueOnce(snapshot);
   expect(enrichAgents([row], { readLaneHead: () => null })[0].pidAlive).toBe(true);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
   // the same pid on a NON-wrapped row with the same old start is still a reused pid (the guard stays armed there)
+  execFileSync.mockReturnValueOnce(snapshot);
   expect(enrichAgents([{ ...row, kind: 'bg' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
 });
 
 it('holderStartedBy: null for a wrapped worker, the parsed start for any other row, null when unreadable', async () => {
@@ -1821,6 +1859,50 @@ describe('defaultReadAgents — the production default wires the reconcile-only 
   });
 });
 
+it.each([true, false])('CLI preserves failure output and publishes planner timings only on success (fail=%s)', async fail => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, resolve } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'reconcile-cli-timings-'));
+  const prsPath = join(dir, 'prs.json');
+  const agentsPath = join(dir, 'agents.json');
+  writeFileSync(prsPath, '[]');
+  writeFileSync(agentsPath, '[]');
+  const savedArgv = process.argv;
+  const stopped = new Error('CLI exited');
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw stopped; });
+  try {
+    vi.resetModules();
+    if (fail) {
+      const { getRequiredStatusChecks } = await import('../../lib/required-status-checks.mjs');
+      getRequiredStatusChecks.mockImplementationOnce(() => { throw new Error('HTTP 502: Bad Gateway'); });
+    }
+    process.argv = [process.execPath, resolve('scripts/conveyor/reconcile-pass.mjs'), '--json',
+      `--prs-file=${prsPath}`, `--agents-file=${agentsPath}`];
+    const cli = import('../reconcile-pass.mjs');
+    if (fail) {
+      await expect(cli).rejects.toBe(stopped);
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(stderr.mock.calls.map(([line]) => line).join('')).toBe('✗ reconcile pass could not read state: HTTP 502: Bad Gateway\n');
+      expect(logs.mock.calls.flat().join('\n')).not.toContain('planner-step');
+      expect(stdout).not.toHaveBeenCalled();
+    } else {
+      await cli;
+      expect(logs.mock.calls.flat().join('\n')).toContain('planner-step name=read-prs ');
+      expect(logs.mock.calls.flat().join('\n')).toContain('planner-step name=plan ');
+      expect(JSON.parse(stdout.mock.calls.map(([line]) => line).join('')).prs).toBe(0);
+      expect(exit).not.toHaveBeenCalled();
+    }
+  } finally {
+    process.argv = savedArgv;
+    exit.mockRestore(); logs.mockRestore(); stdout.mockRestore(); stderr.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60_000);
+
 it('logs one timing line per planner step (name, repo, ms, startedAt) so a slow step is visible', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   let time = 1000;
@@ -1834,5 +1916,150 @@ it('logs one timing line per planner step (name, repo, ms, startedAt) so a slow 
   expect(text).toMatch(/planner-step name=enrich-timeouts repo=we ms=4000 startedAt=/);
   expect(text).toMatch(/planner-step name=enrich-main-red repo=we ms=250 startedAt=/);
   expect(text).toMatch(/planner-step name=read-agents repo=we ms=7 startedAt=/);
-  for (const name of ['required-checks', 'hydrate-checks', 'plan']) expect(text).toContain(`planner-step name=${name} `);
+  for (const name of ['read-prs', 'required-checks', 'hydrate-checks', 'enrich-already-landed', 'enrich-base-ref', 'enrich-system-fix', 'enrich-fix-claims', 'enrich-referral-holds', 'enrich-ledger-holds', 'plan']) expect(text).toContain(`planner-step name=${name} `);
+});
+
+
+// Frozen raw-reader verdicts replay the old serial map, including its live infra policy.
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from '../timeout-evidence-pool.mjs';
+import { writeFileSync as evidenceWrite, existsSync as evidenceExists, readFileSync as evidenceRead } from 'node:fs';
+import { join as evidenceJoin } from 'node:path';
+const recordedTimeouts = JSON.parse(evidenceRead('scripts/conveyor/__tests__/fixtures/timeout-evidence-verdicts.json', 'utf8'));
+const evidenceRepo = 'fixture/repo';
+const evidenceOptions = { repo: evidenceRepo, enabled: true, readBudget: () => ({ confirmed: 0, pending: false }),
+  readCheckOrigin: () => null, log: () => {} };
+const fixtureRead = pr => structuredClone(recordedTimeouts.find(row => row.pr.number === pr.number).raw);
+function oldTimeoutMap(prs, mode) {
+  return prs.map(pr => {
+    if (!pr.statusCheckRollup.some(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
+    const timeoutRetryBudget = evidenceOptions.readBudget();
+    if (!pr.statusCheckRollup.some(c => c.detailsUrl?.startsWith(`https://github.com/${evidenceRepo}/actions/runs/`))) {
+      return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
+    }
+    let timeoutRetry = fixtureRead(pr);
+    if (timeoutRetry?.infraCancelled) timeoutRetry = mode === 'rerun'
+      ? { ...timeoutRetry, cap: timeoutRetry.cancelledShard ? 1 : 2 }
+      : { eligible: false, reason: 'infra-cancelled-heal-mode' };
+    return { ...pr, timeoutRetry, timeoutRetryBudget };
+  });
+}
+describe('timeout evidence bounded readers', () => {
+  it.each(['rerun', 'heal'])('matches recorded old serial and pooled output in order (%s)', mode => {
+    const prs = recordedTimeouts.map(row => row.pr), expected = oldTimeoutMap(prs, mode);
+    const opts = { ...evidenceOptions, infraMode: mode, infraMaxReruns: 2 };
+    const read = vi.fn(fixtureRead);
+    expect(enrichPrsWithTimeoutEvidence(prs, { ...opts, read, concurrency: 1 })).toEqual(expected);
+    expect(read.mock.calls.map(([pr]) => pr.number)).toEqual(recordedTimeouts.filter(row => row.raw).map(row => row.pr.number));
+    read.mockClear();
+    expect(enrichPrsWithTimeoutEvidence(prs, { ...opts, read, concurrency: 1 })).toEqual(expected);
+    expect(read.mock.calls.map(([pr]) => pr.number)).toEqual(recordedTimeouts.filter(row => row.raw).map(row => row.pr.number));
+    const poolRunner = vi.fn(rows => rows.map(fixtureRead));
+    expect(enrichPrsWithTimeoutEvidence(prs, { ...opts, concurrency: 3, poolRunner })).toEqual(expected);
+    expect(poolRunner.mock.calls[0][0].map(pr => pr.number)).toEqual(recordedTimeouts.filter(row => row.raw).map(row => row.pr.number));
+    expect(poolRunner.mock.calls[0][1].concurrency).toBe(3);
+  });
+  it('logs the exact timeout-evidence summary without cache counters', () => {
+    const log = vi.fn();
+    enrichPrsWithTimeoutEvidence([recordedTimeouts[0].pr], { ...evidenceOptions, read: fixtureRead, concurrency: 1, clock: () => 10, log });
+    expect(log.mock.calls.at(-1)).toEqual(['timeout-evidence prs=1 read=1 concurrency=1 ms=0']);
+  });
+  it('keeps injected reads serial and ordered even with concurrency eight', () => {
+    const read = vi.fn(fixtureRead), poolRunner = vi.fn();
+    enrichPrsWithTimeoutEvidence(recordedTimeouts.slice(0, 3).map(row => row.pr), { ...evidenceOptions, read, concurrency: 8, poolRunner });
+    expect(read.mock.calls.map(([pr]) => pr.number)).toEqual([7100, 7101, 7102]);
+    expect(poolRunner).not.toHaveBeenCalled();
+  });
+  it('returns the original array untouched when WE_CI_TIMEOUT_RERUN_ENABLED=0', () => {
+    vi.stubEnv('WE_CI_TIMEOUT_RERUN_ENABLED', '0');
+    try {
+      const prs = recordedTimeouts.map(row => row.pr), read = vi.fn(), poolRunner = vi.fn();
+      expect(enrichPrsWithTimeoutEvidence(prs, { repo: evidenceRepo, read, poolRunner })).toBe(prs);
+      expect(read).not.toHaveBeenCalled(); expect(poolRunner).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('resolves standard/platform/tool/env concurrency with bounds and provenance', () => {
+    const resolve = opts => resolveTimeoutEvidenceConcurrency({ env: {}, settings: {}, platform: {}, ...opts });
+    expect(resolve({})).toEqual({ value: 4, source: 'standard' });
+    expect(resolve({ platform: { timeoutEvidenceConcurrency: 2 } })).toEqual({ value: 2, source: 'platform' });
+    expect(resolve({ platform: { timeoutEvidenceConcurrency: 2 }, settings: { ci: { timeoutEvidenceConcurrency: 3 } } })).toEqual({ value: 3, source: 'tool' });
+    expect(resolve({ env: { WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY: '8' } })).toEqual({ value: 8, source: 'env' });
+    for (const raw of ['0', '9', '1.5', 'bad']) expect(resolve({ env: { WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY: raw } }).value).toBe(4);
+  });
+  it('bounds live children, preserves slots on failure/deadline and cleans files and whole process groups', () => {
+    const children = new Map(); let peak = 0, pid = 2000000000, now = 0, folder;
+    const kill = vi.spyOn(process, 'kill').mockImplementation((target, signal) => {
+      if (signal === 'SIGKILL') children.delete(-target);
+      else if (!children.has(target)) throw new Error('gone');
+      return true;
+    });
+    const launch = (_node, args, opts) => {
+      expect(opts.stdio.slice(1).every(Number.isInteger)).toBe(true);
+      expect(args[4]).toContain('readTimeoutEvidence');
+      expect(opts.detached).toBe(true);
+      const output = args.at(-1); folder = evidenceJoin(output, '..');
+      const child = { pid: pid++, on: () => {} };
+      children.set(child.pid, { output, input: args.at(-2) }); peak = Math.max(peak, children.size);
+      return child;
+    };
+    try {
+      const prs = Array.from({ length: 11 }, (_, number) => ({ number }));
+      const results = runTimeoutEvidencePool(prs, { concurrency: 3, probe: () => true, launch, groupAlive: pid => children.has(pid), now: () => now, pause: () => {
+        now += 20;
+        for (const { output, input } of children.values()) {
+          const number = JSON.parse(evidenceRead(input, 'utf8')).pr.number;
+          if (number !== 10) evidenceWrite(output, number === 9 ? '{bad' : JSON.stringify({ eligible: true, number }));
+        }
+      }, deadlineMs: 100 });
+      expect(peak).toBe(3);
+      expect(results.slice(0, 9).map(v => v.number)).toEqual([0,1,2,3,4,5,6,7,8]);
+      expect(results[9]).toBeUndefined(); expect(results[10]).toBeUndefined();
+      expect(children.size).toBe(0); expect(evidenceExists(folder)).toBe(false);
+      expect(kill.mock.calls.filter(([, s]) => s === 'SIGKILL').every(([p]) => p <= -2000000000)).toBe(true);
+    } finally { kill.mockRestore(); }
+  });
+});
+
+it('serially falls back through the throttle when the pool fails or returns a missing slot', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+  execFileSync.mockImplementation(() => { throw new Error('fixture-transient-read-error'); });
+  const pr = recordedTimeouts[0].pr;
+  const expected = enrichPrsWithTimeoutEvidence([pr], { ...evidenceOptions, concurrency: 1 });
+  execFileSyncThrottled.mockClear();
+  for (const poolRunner of [() => [], () => { throw new Error('worker failure'); }]) {
+    const log = vi.fn();
+    expect(enrichPrsWithTimeoutEvidence([pr], { ...evidenceOptions, concurrency: 4, poolRunner, log })).toEqual(expected);
+    expect(log.mock.calls.flat().join('\n')).toContain('serial-fallback');
+  }
+  expect(execFileSyncThrottled).toHaveBeenCalled();
+  expect(execFileSyncThrottled.mock.calls.every(([file]) => file === 'gh')).toBe(true);
+  execFileSync.mockReset();
+});
+it('runs the file-based synchronous pool with real child processes and cleans its temp directory', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const lockRoot = mkdtempSync(evidenceJoin(tmpdir(), 'timeout-pool-throttle-'));
+  const { spawn, execFileSync: realExec } = await vi.importActual('node:child_process');
+  const groupAlive = pid => realExec('ps', ['-axo', 'pgid=,stat='], { encoding: 'utf8' }).split('\n').some(line => {
+    const [group, state] = line.trim().split(/\s+/);
+    return Number(group) === pid && state && !state.startsWith('Z');
+  });
+  let folder;
+  const launch = (node, args, opts) => {
+    folder = evidenceJoin(args.at(-1), '..');
+    const script = `import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+      const [input, output] = process.argv.slice(1);
+      const { pr } = JSON.parse(readFileSync(input, 'utf8'));
+      writeFileSync(output + '.tmp', JSON.stringify({ eligible: true, number: pr.number }));
+      renameSync(output + '.tmp', output); ${keepAliveScript({ maxLifetimeMs: 10_000 })}`;
+    return spawn(process.execPath, ['--input-type=module', '-e', script, ...args.slice(-2)], opts);
+  };
+  try {
+    expect(runTimeoutEvidencePool([{ number: 1 }, { number: 2 }, { number: 3 }], {
+      launch, groupAlive, concurrency: 2, deadlineMs: 3000,
+      env: { ...process.env, WE_GH_THROTTLE_LOCK_ROOT: lockRoot, WE_GH_THROTTLE_CAP: '4' },
+    })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
+    expect(evidenceExists(folder)).toBe(false);
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });

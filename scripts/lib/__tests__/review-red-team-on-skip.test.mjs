@@ -18,9 +18,10 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
   readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -46,6 +47,59 @@ function fixture(over = {}) {
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('unfinished CI-held record retry', () => {
+  const saved = (attempts = 1, error = 'review held: CI still pending on reviewed head', counters = {}) => reviewRunEvidence({
+    id: 'review-pr-ci-held', op: 'review-pr', pending: { kind: 'effect', step: 'record' },
+    findings: { read: { repo, pr, netBasis: { rev: head } } },
+    stepTimings: [{ step: 'read', startedAt: new Date(1).toISOString() }],
+    effects: [{ type: 'review.label-swap', status: 'failed', error, unknownAttempts: attempts }],
+    ...counters,
+  });
+  const options = (row = saved(), max = 3) => ({
+    readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => false,
+    readReviewRuns: () => [row], setting: { enabled: true, retryCooldownMin: 30, ciHeldRecordRetryMax: max },
+  });
+  it.each([1, 3])('dispatches a bounded resume at attempt %s', attempts => {
+    const o = runFixture(options(saved(attempts)));
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
+      why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+  });
+  it.each([
+    ['off at zero', () => options(saved(), 0)],
+    ['exceeds bound', () => options(saved(4))],
+    ['resume budget exhausted', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1, resumeAttempts: RESUME_MAX_ATTEMPTS } })],
+    ['resume budget exceeded', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1, resumeAttempts: RESUME_MAX_ATTEMPTS + 1 } })],
+    ['old projection missing resume evidence', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1 } })],
+    ['non-CI failure', () => options(saved(1, 'network timeout'))],
+    ['operator wake', () => ({ ...options(), rawPrs: [{ number: pr, headRefOid: head, reviews: [],
+      comments: [{ body: 'fresh review', createdAt: new Date(2).toISOString(), author: { login: 'chalbert' } }] }] })],
+  ])('escalates review-unfinished for %s without dispatch', (_, make) => {
+    const o = runFixture(make());
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['recordEffectResumeAttempts', 'unknownAttempts'].flatMap(field =>
+    ['corrupt', -1, 1.5, null, Number.MAX_SAFE_INTEGER + 1].map(value => [field, value])))(
+    'escalates review-unfinished without dispatch for malformed %s=%s (null is persisted NaN)', (field, value) => {
+      const row = field === 'unknownAttempts' ? saved(value) : saved(1, undefined, { [field]: value });
+      const o = runFixture(options(row));
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it('retains the early unreadable-thread hold without dispatch', () => {
+    const o = runFixture({ ...options(), rawPrs: [{ number: pr, headRefOid: head, reviews: [], comments: null }] });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'PR comments unreadable' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('keeps the dispatch retry cooldown for CI-held records', () => {
+    const o = options();
+    const first = decide(o);
+    expect(first.action).toBe('review');
+    expect(decide({ ...o, lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) }).action).toBe('skip');
+  });
+});
 
 describe('unfinished retryable record effect', () => {
   const options = (rows) => ({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
@@ -1017,10 +1071,26 @@ describe('planRedTeamOnSkip', () => {
 });
 
 describe('settings cascade', () => {
+  it.each(['0', '3', '10'])('resolves CI-held maximum %s with environment provenance', value => {
+    resetCascadeLogForTest(); const log = vi.fn();
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy',
+      WE_POLICY_CASCADE_LOG: '1', WE_REVIEW_RED_TEAM_ON_SKIP_CI_HELD_RECORD_RETRY_MAX: value },
+      readFile: () => '{"ciHeldRecordRetryMax":2}', log });
+    expect(resolved.value.ciHeldRecordRetryMax).toBe(Number(value));
+    expect(resolved.sources.ciHeldRecordRetryMax).toBe('env');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`ciHeldRecordRetryMax=${value} (env)`));
+  });
+  it.each(['-1', '11', '1.5', 'bad'])('rejects invalid CI-held maximum %s', value => {
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy',
+      WE_REVIEW_RED_TEAM_ON_SKIP_CI_HELD_RECORD_RETRY_MAX: value }, readFile: () => '{"ciHeldRecordRetryMax":11}' });
+    expect(resolved.value.ciHeldRecordRetryMax).toBe(3);
+    expect(resolved.sources.ciHeldRecordRetryMax).toBe('standard');
+  });
+
   it('loads the default tool settings from the filesystem under Vite', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' } });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
-    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool', staleRedispatchDailyCap: 'tool' });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3, ciHeldRecordRetryMax: 3 });
+    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool', staleRedispatchDailyCap: 'tool', ciHeldRecordRetryMax: 'tool' });
   });
   it('environment disables recovery and logs its source', () => {
     resetCascadeLogForTest(); const log = vi.fn();
@@ -1048,7 +1118,7 @@ describe('settings cascade', () => {
   it('malformed tool and environment values retain lower layers', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_REVIEW_RED_TEAM_ON_SKIP: 'garbage', WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN: '-1', WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' },
       readFile: () => '{"enabled":"bad","retryCooldownMin":-1}' });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3, ciHeldRecordRetryMax: 3 });
   });
 });
 
@@ -1699,37 +1769,29 @@ describe('proveCardOnlyHeadMove', () => {
     } finally { detector.mockRestore(); }
   });
   it('carries a renumber plus docs id rewrite through the real numbering detector', () => {
-    const zero = '0'.repeat(40), beforeOid = '1'.repeat(40), afterOid = '2'.repeat(40);
-    const docBeforeOid = '3'.repeat(40), docAfterOid = '4'.repeat(40);
-    const blobs = new Map([[beforeOid, '---\ntitle: card\n---\n'], [afterOid, '---\nbornAs: xabcdef\ntitle: card\n---\n'],
-      [docBeforeOid, 'See xabcdef.\n'], [docAfterOid, 'See 123.\n']]);
-    const exec = vi.fn((file, args, options) => {
-      expect(file).toBe('git');
-      expect(options.cwd).toBe('checkout');
-      let output;
-      if (args[0] === 'cat-file') {
-        if (args[1] === '-e') output = '';
-        else {
-          const blob = blobs.get(args[2]);
-          if (blob === undefined) throw Error('unknown blob');
-          output = args[1] === '-t' ? 'blob\n' : args[1] === '-s' ? `${Buffer.byteLength(blob)}\n` : blob;
-        }
-      } else if (args[0] === 'rev-parse') output = fromSha;
-      else if (args[0] === 'rev-list') output = `${toSha} ${fromSha}\n`;
-      else if (args[0] === 'log') output = 'drain: JIT-number xabcdef→#123 at land (#2288)\n';
-      else if (['ls-tree', 'grep'].includes(args[0])) output = '';
-      else if (args[0] === 'diff-tree') output = [
-        `:100644 000000 ${beforeOid} ${zero} D\0backlog/xabcdef-card.md\0`,
-        `:000000 100644 ${zero} ${afterOid} A\0backlog/123-card.md\0`,
-        `:100644 100644 ${docBeforeOid} ${docAfterOid} M\0docs/agent/testing.md\0`,
-      ].join('');
-      else throw Error(`unexpected Git read: ${args[0]}`);
-      return options.encoding === null ? Buffer.from(output) : output;
-    });
-    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'fixture/main' }))
-      .toMatchObject({ ok: true, commits: [toSha], pairs: [['xabcdef', '123']] });
-    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['ls-tree', 'fixture/main']), expect.anything());
-    expect(exec.mock.calls.some(([, args]) => args[0] === 'merge-base')).toBe(false);
+    const cwd = mkdtempSync(join(tmpdir(), 'red-team-numbering-'));
+    const git = args => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      git(['init', '-q']);
+      git(['config', 'user.name', 'Numbering Test']);
+      git(['config', 'user.email', 'test@example.com']);
+      mkdirSync(join(cwd, 'backlog'));
+      mkdirSync(join(cwd, 'docs', 'agent'), { recursive: true });
+      writeFileSync(join(cwd, 'backlog/xabcdef-card.md'), '---\ntitle: card\n---\n');
+      writeFileSync(join(cwd, 'docs/agent/testing.md'), 'See xabcdef.\n');
+      git(['add', '-A']); git(['commit', '-q', '-m', 'base']);
+      const fromSha = git(['rev-parse', 'HEAD']);
+      git(['update-ref', 'refs/remotes/fixture/main', fromSha]);
+      git(['mv', 'backlog/xabcdef-card.md', 'backlog/123-card.md']);
+      writeFileSync(join(cwd, 'backlog/123-card.md'), '---\nbornAs: xabcdef\ntitle: card\n---\n');
+      writeFileSync(join(cwd, 'docs/agent/testing.md'), 'See 123.\n');
+      git(['add', '-A']); git(['commit', '-q', '-m', 'drain: JIT-number xabcdef→#123 at land (#2288)']);
+      const toSha = git(['rev-parse', 'HEAD']);
+      const exec = vi.fn(() => { throw Error('numbering proof must own its Git reader'); });
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd, mainRef: 'fixture/main' }))
+        .toMatchObject({ ok: true, commits: [toSha], pairs: [['xabcdef', '123']] });
+      expect(exec).not.toHaveBeenCalled();
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
   const c1 = 'c'.repeat(40);
   const fake = ({ ancestor = true, revList = `${c1} ${fromSha}`, tree }) => vi.fn((file, args) => {

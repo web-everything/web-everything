@@ -1,0 +1,114 @@
+{
+  "break": 11,
+  "title": "every launch refusal releases the lane via notApplied",
+  "input": {
+    "home": "/home/test",
+    "env": {
+      "XPC_SERVICE_NAME": "com.we.worker"
+    },
+    "map": {
+      "accounts": {
+        "a": {
+          "configDir": "/home/test/.claude"
+        },
+        "b": {
+          "configDir": "/home/test/claude-b"
+        }
+      },
+      "daemons": {
+        "com.we.worker": "b"
+      },
+      "routing": {
+        "accountB": true
+      }
+    },
+    "existing": [
+      "/home/test/.claude",
+      "/home/test/claude-b"
+    ],
+    "listings": {
+      "/home/test/.claude": [
+        {
+          "sessionId": "abcdef01-1234-4567-89ab-123456789abc",
+          "id": "job-a"
+        }
+      ],
+      "/home/test/claude-b": [
+        {
+          "sessionId": "abcdef02-1234-4567-89ab-123456789abc",
+          "id": "job-b"
+        }
+      ]
+    },
+    "badMaps": [
+      null,
+      {},
+      {
+        "accounts": {
+          "a": {
+            "configDir": "/home/test/.claude"
+          },
+          "b": {
+            "configDir": "/home/test/claude-b"
+          }
+        },
+        "daemons": {
+          "com.we.worker": "b"
+        },
+        "routing": {
+          "accountB": 1
+        }
+      },
+      {
+        "accounts": {
+          "a": {
+            "configDir": "/home/test/.claude"
+          },
+          "b": {
+            "configDir": "/home/test/claude-b"
+          }
+        },
+        "daemons": {
+          "com.we.worker": [
+            "b"
+          ]
+        },
+        "routing": {
+          "accountB": true
+        }
+      },
+      {
+        "accounts": {
+          "b": {
+            "configDir": "secret-relative-input"
+          }
+        },
+        "daemons": {
+          "com.we.worker": "b"
+        },
+        "routing": {
+          "accountB": true
+        }
+      },
+      {
+        "accounts": {
+          "a": {
+            "configDir": "/home/test/.claude"
+          },
+          "b": {
+            "configDir": "/home/test/claude-b"
+          }
+        },
+        "daemons": {},
+        "routing": {
+          "accountB": true
+        },
+        "enforce": true,
+        "*": "refuse"
+      }
+    ]
+  },
+  "expect": {
+    "notApplied": true
+  }
+}

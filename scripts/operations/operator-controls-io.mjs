@@ -15,6 +15,9 @@ import { refreshOntoMain } from '../conveyor/ci-red-recovery-watch.mjs';
 import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueSettings } from '../lib/merge-queue-hook.mjs';
 import { createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { enrichPrsWithReferralHolds } from '../conveyor/review-referral-hold.mjs';
+import { buildSameHeadWakeComment, REARM_COMMENT_MARKER } from '../conveyor/rearm-review.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { listStoredAwaitVerify, writeStoredAwaitVerify } from '../conveyor/await-verify.mjs';
 import { planOperatorControl, validateOperatorAttribution, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
@@ -27,6 +30,11 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
   readHolds = () => listBuildDispatchHolds({ lockRoot: join(coord, 'build-dispatch-holds') }),
   listClaims = () => listFixDispatchClaims(join(coord, 'fix-dispatch-claims')),
   listAwaitVerify = listStoredAwaitVerify,
+  // The daemon's own enrichment decides which hold applies (referral outranks same-head): only a same-head hold is returned.
+  readSameHeadHold = ({ repo, pr, head, labels, comments }) => {
+    const [row] = enrichPrsWithReferralHolds([{ number: pr, headRefOid: head, labels: labels.map(name => ({ name })), comments }], { repo, readComments: () => comments });
+    return row.referralHold?.kind === 'same-head' ? row.referralHold : null;
+  },
   readClaim = args => readFixDispatchClaim({ ...args, lockRoot: join(coord, 'fix-dispatch-claims') }),
   readAgents = () => JSON.parse(execFileSync('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000 })),
   readCheck = (repo, head) => {
@@ -66,6 +74,10 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
     }
     const p = readPr(input.repo, input.pr);
     if (name === 'ci-heal-reset') return { ...p, awaitVerify: listAwaitVerify().filter(({ record }) => record.repo === input.repo && record.pr === input.pr), now: at };
+    if (name === 'rearm' && p.state === 'OPEN' && p.labels.includes('review:pending') && !p.labels.includes('review:human')) {
+      // Fail closed: an unreadable run store means no hold is proven, so rearm stays a noop.
+      try { p.sameHeadHold = readSameHeadHold({ repo: input.repo, pr: input.pr, head: p.head, labels: p.labels, comments: p.comments }); } catch { p.sameHeadHold = null; }
+    }
     if (name === 'refresh' && p.state === 'OPEN' && !p.crossRepo) {
       const checkout = input.checkout || root;
       // Read the repository's live main, not a potentially stale local tracking ref.
@@ -151,7 +163,8 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
         const result = await writeAwaitVerify({ ...record, resumeFailures: 0, operatorResets: (record.operatorResets ?? 0) + 1 });
         if (result?.ok !== true) throw new Error(`await-verify write failed: ${result?.reason ?? 'unconfirmed'}`);
       }
-    } else if (name === 'rearm') child('scripts/conveyor/rearm-review.mjs', [String(i.pr), ...attribution]);
+    } else if (name === 'rearm' && p.wake) runGh(['pr', 'comment', String(i.pr), '--repo', i.repo, '--body', buildSameHeadWakeComment({ actor: i.actor, key: p.record.key })]);
+    else if (name === 'rearm') child('scripts/conveyor/rearm-review.mjs', [String(i.pr), ...attribution]);
     else if (name === 'refresh') {
       const before = await readContext(name, i);
       if (controlFingerprint(name, before, i) !== p.fingerprint) throw new Error('refresh state changed before mutation');
@@ -186,6 +199,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     if (p.op === 'refresh') return after.state === 'OPEN' && after.containsMain;
     if (p.op === 'grant-rounds') return true; // wrapped extension sink proves the trusted count and exact body
     if (p.op === 'clear-claim') return !after.claims.some(c => p.claims.some(old => old.meta.repo === c.meta.repo && old.meta.pr === c.meta.pr && old.meta.kind === c.meta.kind));
+    if (p.op === 'rearm' && p.wake) return (after.comments ?? []).some(c => isTrustedMarkerAuthor(c) && Number.isFinite(Date.parse(c.updatedAt ?? c.createdAt)) && String(c?.body ?? '').trimStart().startsWith(REARM_COMMENT_MARKER) && String(c.body).includes(p.record.key));
     if (p.op === 'rearm') return !after.labels.includes('review:changes') && (after.labels.includes('review:pending') || after.labels.includes('review:human'));
     if (p.op === 'unpark') return p.input.item ? !after.holds.length && !after.failures.length : !after.labels.includes('review:human');
     return !after.failures.some(f => f.held && !f.completed) && !after.holds.some(isPrepareHold);

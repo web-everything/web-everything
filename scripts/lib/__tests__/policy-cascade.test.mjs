@@ -43,6 +43,7 @@ import {
 import * as operatorStore from '../operator-override-reader.mjs';
 import { readBuildQueuePrioritySettings } from '../build-queue.mjs';
 import { readOpenPrCapScope } from '../open-pr-cap-scope.mjs';
+import { resolveDeliveryCapacity } from '../delivery-capacity.mjs';
 import { readPrLimitScope } from '../pr-limit.mjs';
 import { loadDrainFactsSettings } from '../drain-facts-source.mjs';
 import { resolvePrStackSettings } from '../../conveyor/pr-stack.mjs';
@@ -112,6 +113,24 @@ describe('R907 test flags never bypass operator-store reads', () => {
  * `read(env, tool)` (the real reader), and the expected platform / tool values.
  */
 const ROWS = [
+  ...[
+    ['mode', { mode: 'units' }, { mode: 'count' }, 'units', 'count'],
+    ['population', { population: 'builder' }, { population: 'all' }, 'builder', 'all'],
+    ['openPrCap', { openPrCap: 24 }, { openPrCap: 12 }, 24, 12],
+    ['unitCap', { unitCap: 40 }, { unitCap: 20 }, 40, 20],
+    ['weights.cards', { weights: { cards: 0.75 } }, { weights: { cards: 0.25 } }, 0.75, 0.25],
+    ['sizeLines.S', { sizeLines: { S: 180 } }, { sizeLines: { S: 120 } }, 180, 120],
+    ['acceptedWeight', { acceptedWeight: 0.5 }, { acceptedWeight: 0 }, 0.5, 0],
+    ['heldCap', { heldCap: 6 }, { heldCap: 3 }, 6, 3],
+    ['idleMinPct', { idleMinPct: 20 }, { idleMinPct: 10 }, 20, 10],
+    ['memMinGb', { memMinGb: 6 }, { memMinGb: 3 }, 6, 3],
+    ['maxStartsPerCheck', { maxStartsPerCheck: 6 }, { maxStartsPerCheck: 2 }, 6, 2],
+  ].map(([leaf, platform, tool, platformValue, toolValue]) => ({
+    setting: `deliveryCapacity.${leaf}`, platform: { deliveryCapacity: platform }, tool,
+    read: (env, tool) => leaf.split('.').reduce((value, key) => value[key],
+      resolveDeliveryCapacity({ env, read: settingsReader({ deliveryCapacity: tool }) }).value),
+    platformValue, toolValue,
+  })),
   { setting: 'buildQueuePriority.mode', platform: { deliveryPriority: { mode: 'enforce' } }, tool: { mode: 'shadow' },
     read: (env, tool) => readBuildQueuePrioritySettings({ env, read: settingsReader({ buildQueuePriority: tool }) }).mode, platformValue: 'enforce', toolValue: 'shadow' },
   { setting: 'buildQueuePriority.requestsFirstInClass', platform: { deliveryPriority: { requestsFirstInClass: false } }, tool: { requestsFirstInClass: true },
@@ -383,9 +402,18 @@ it('review daemon budget never returns uncapped concurrency on corrupt operator 
 
 
 describe('R907 malformed review capacity evidence', () => {
+  it('accepts an operator live-review cap of 16 with operator provenance', () => {
+    operatorEnv(file({ 'reviewConcurrency.maxLiveReviewRounds': 16 }));
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '8' },
+      listCommands: () => '', toolPath: file({ maxLiveReviewRounds: 8 }) });
+    expect(budget).toMatchObject({ max: 16, live: 0, left: 16 });
+    expect(budget.reason).toContain('maxLiveReviewRounds=16 (operator-db)');
+  });
+
   it.each([
     ['wrong type', 'reviewConcurrency.maxLiveReviewRounds', '1'],
-    ['out of range', 'reviewConcurrency.maxLiveReviewRounds', 9],
+    ['above hard cap', 'reviewConcurrency.maxLiveReviewRounds', 17],
+    ['below hard floor', 'reviewConcurrency.maxLiveReviewRounds', 0],
     ['unknown key', 'reviewConcurrency.unknown', 1],
     ['non-allowlisted guard', 'reviewConcurrency.enabled', false],
   ])('%s fails closed for both cascade results and daemon budget', (_label, key, value) => {

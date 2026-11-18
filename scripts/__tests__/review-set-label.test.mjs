@@ -4717,7 +4717,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     expect(result.ledger).toHaveLength(1);
     expect(result.ledger[0].coverage.headSha).toBe(healedHead);
     // Every carry reads the formal reviews first (PR #4631 round 11), agent accept or operator clearance alike.
-    expect(result.calls.map(a => a[0] === 'api' ? 'reviews' : a[1])).toEqual(['view', 'reviews', 'view', 'comment', 'view']);
+    expect(result.calls.map(a => a[0] === 'api' ? 'reviews' : a[1])).toEqual(['view', 'reviews', 'view', 'comment', 'reviews', 'view']); // the extra read is the post-restamp merge-gate refresh's check-run read (fake gh: refresh fails closed, loud)
   });
 
   it('refuses a human clearance when base movement changes the net reviewed diff under the default', () => {

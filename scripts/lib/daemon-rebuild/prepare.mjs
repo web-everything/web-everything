@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, reportDiscardedCandidate,
+  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -579,6 +579,10 @@ export async function prepareRebuild({
         leftForMain: (a, build) => overlayGraduated({
           readyAt: ready.at ?? ready.passedAt,
           ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
+        }),
+        retiredByOperator: (a) => overlayRetiredByOperator({
+          ref: a.ref, sha: a.sha, events: readOverlayEvents(),
+          registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r),
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),

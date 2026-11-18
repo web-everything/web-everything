@@ -7,12 +7,13 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
@@ -1574,9 +1575,13 @@ describe('direct task routes', () => {
 
 
 describe('direct CLI flags reach the actual spawn and JSON result', () => {
-  it('threads the schema from CLI through the task and exec spawn as a resolved path', () => {
+  it.each(['--task', '--task-file'])('%s records the brief metadata and threads the schema through the task and exec spawn as a resolved path', taskFlag => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-schema-'));
     const argvFile = join(dir, 'spawn-argv.json');
+    const task = `  Review café\n${'brief text '.repeat(30)}\n`;
+    const taskFile = join(dir, 'brief.txt');
+    writeFileSync(taskFile, task);
+    const taskArg = taskFlag === '--task-file' ? `${taskFlag}=${relative(process.cwd(), taskFile)}` : `${taskFlag}=${task}`;
     const schemaFile = 'seat schema.json';
     const preload = `import cp from 'node:child_process';
       import { writeFileSync } from 'node:fs';
@@ -1597,11 +1602,16 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       syncBuiltinESMExports();`;
     try {
       const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
-        'scripts/codex-direct-task.mjs', '--task=review', `--dir=${dir}`, `--output-schema-file=${schemaFile}`,
+        'scripts/codex-direct-task.mjs', taskArg, `--dir=${dir}`, `--output-schema-file=${schemaFile}`,
         '--json', '--no-stream', '--review'], { encoding: 'utf8' });
       const argv = JSON.parse(readFileSync(argvFile, 'utf8'));
       expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', resolve(schemaFile)]);
       expect(JSON.parse(stdout).argv).toEqual(argv);
+      expect(JSON.parse(stdout)).toMatchObject({
+        taskFile: taskFlag === '--task-file' ? resolve(taskFile) : null,
+        taskSha256: createHash('sha256').update(task).digest('hex'),
+        taskHead: task.slice(0, 200),
+      });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -1700,6 +1710,24 @@ describe('detached jobs', () => {
   let jobsDir;
   beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'codex-jobs-test-')); });
   afterEach(() => { rmSync(jobsDir, { recursive: true, force: true }); });
+
+  it('reads legacy job records without brief metadata', () => {
+    const record = { id: 'legacy', pid: 123, status: 'done', exitCode: 0, resultPath: 'legacy.result.json' };
+    writeJobRecord(record, { jobsDir });
+    expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+  });
+
+  it.each([
+    { taskFile: 123 },
+    { taskSha256: 'not-a-sha256' },
+    { taskSha256: 123 },
+    { taskHead: 123 },
+    { taskHead: 'x'.repeat(201) },
+  ])('rejects malformed persisted brief metadata %j', metadata => {
+    writeJobRecord({ id: 'bad-brief', pid: 123, status: 'done', exitCode: 0,
+      resultPath: 'bad-brief.result.json', ...metadata }, { jobsDir });
+    expect(() => readJobRecord('bad-brief', { jobsDir })).toThrow('incomplete job record');
+  });
 
   function fixture({ pid = 123 } = {}) {
     let time = 0;
@@ -2521,10 +2549,19 @@ describe('detached jobs', () => {
         maxMs: ${maxMs}, isAlive: () => false });
       process.stdout.write(JSON.stringify(result));
       process.exit(result.code);`;
-    const child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
-      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
-    });
+    // Exit 75 is the documented "wait again" signal: on a loaded CI host a cold child can spend its
+    // whole 250 ms budget on real IO before the dead-PID probe settles (red main @ d56edc4bd, shard 8).
+    // Honour that contract with a bounded re-wait. Every attempt keeps the sync-fs guard armed (a
+    // synchronous call still throws and exits 1 with a different result), and 75 never writes the record.
+    let child;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
+        encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+      });
+      if (child.status !== 75) break;
+      expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
+    }
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(1);
     expect(JSON.parse(child.stdout)).toEqual({ status: 'failed', exitCode: 1, resultPath: record.resultPath, code: 1 });
@@ -2704,7 +2741,8 @@ describe('detached jobs', () => {
       nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {}, readStart });
     expect(readStart).toHaveBeenCalledWith(321);
     expect(job).toEqual({ id: '0-random', pid: 321, pidStart: 'Fri Oct 23 20:10:13 2026', status: 'running', startedAt: new Date(0).toISOString(),
-      resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json') });
+      resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json'),
+      taskFile: null, taskSha256: createHash('sha256').update('literal $(no-shell)').digest('hex'), taskHead: 'literal $(no-shell)' });
     const { recordPath, ...record } = job;
     expect(readJobRecord(job.id, { jobsDir })).toEqual(record);
     expect(child.unref).toHaveBeenCalledOnce();
@@ -2726,10 +2764,19 @@ describe('detached jobs', () => {
     { flags: [], runCode: 7 },
     { flags: [], runCode: 0, install: 'ci' },
     { flags: [], runCode: 0, install: 'install' },
-  ])('detached CLI writes one JSON report and logs events with $flags and exit $runCode and install $install', async ({ flags, runCode, install }) => {
+    { flags: [], runCode: 0, taskFromFile: true },
+  ])('detached CLI records brief metadata, writes one JSON report and logs events with $flags and exit $runCode and install $install and taskFromFile $taskFromFile', async ({ flags, runCode, install, taskFromFile }) => {
     const preload = join(jobsDir, 'result-preload.mjs');
     const logFile = join(jobsDir, 'events.jsonl');
     const installed = join(jobsDir, 'installed');
+    const task = `  Detached café\n${'brief text '.repeat(30)}\n`;
+    const taskFile = join(jobsDir, 'brief.txt');
+    writeFileSync(taskFile, task);
+    const metadata = {
+      taskFile: taskFromFile ? resolve(taskFile) : null,
+      taskSha256: createHash('sha256').update(task).digest('hex'),
+      taskHead: task.slice(0, 200),
+    };
     writeFileSync(preload, `
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
@@ -2770,7 +2817,7 @@ describe('detached jobs', () => {
       syncBuiltinESMExports();
     `);
     const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
-      '--task=fixture', ...(install ? [`--repo-root=${jobsDir}`] : [`--dir=${jobsDir}`]),
+      taskFromFile ? `--task-file=${taskFile}` : `--task=${task}`, ...(install ? [`--repo-root=${jobsDir}`] : [`--dir=${jobsDir}`]),
       '--gate=none', '--no-self-review', `--log=${logFile}`, ...flags], {
       encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
       env: { ...process.env, CODEX_JOBS_DIR: jobsDir, NODE_OPTIONS: `--import=${preload}` },
@@ -2779,14 +2826,19 @@ describe('detached jobs', () => {
     expect(launcher.status, launcher.stderr).toBe(0);
     const job = readJobRecord(JSON.parse(launcher.stdout).id, { jobsDir });
     try {
-      expect(await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000 })).toMatchObject({
+      // The launcher never reads a --task-file; the worker fills sha/head in once it starts.
+      expect(job).toMatchObject(taskFromFile ? { taskFile: metadata.taskFile } : metadata);
+      const outcome = await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000 });
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({
         status: runCode === 0 ? 'done' : 'failed', exitCode: runCode, code: runCode,
       });
       expect(readFileSync(logFile, 'utf8')).toContain('{"type":"turn.completed"}');
       const result = JSON.parse(readFileSync(job.resultPath, 'utf8'));
       expect(result).toMatchObject({
         exitCode: runCode, events: { terminal: 'turn.completed' },
+        ...metadata,
       });
+      expect(readJobRecord(job.id, { jobsDir })).toMatchObject(metadata);
       if (install) {
         expect(result.scratch.depsInstall.args).toEqual([install]);
         expect(readFileSync(installed, 'utf8')).toBe('installed');
@@ -2988,6 +3040,7 @@ describe('detached jobs', () => {
       expect(elapsed).toBeLessThan(4000);
       const running = readJobRecord(job.id, { jobsDir });
       expect(running).toMatchObject({ status: 'running', exitCode: null });
+      expect(running).toMatchObject({ taskFile: join(jobsDir, 'nonexistent-task.txt'), taskSha256: null, taskHead: null });
       expect(() => process.kill(running.pid, 0)).not.toThrow();
       const waiter = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait',
         `--job=${job.id}`, '--max-ms=20000'], { ...options, timeout: 25000 });

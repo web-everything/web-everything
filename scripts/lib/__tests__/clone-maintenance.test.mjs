@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { acquireRead, acquireWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
-import { maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { LEGACY_SKIP_REASONS, readCloneMaintenanceEventNear, readLastCloneMaintenanceEvent, maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
 import { withSelfSync } from '../daemon-self-sync.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -141,9 +142,22 @@ describe('clone maintenance', () => {
   });
   it('never runs gc if the attempt stamp cannot be persisted', async () => {
     const f = fixture();
-    writeFileSync(f.env.WE_DAEMON_STATE_DIR, 'not a directory');
-    expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true });
+    mkdirSync(`${maintenanceStampPath(f.root, f.env)}.${process.pid}.tmp`, { recursive: true });
+    expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'stamp-write-failed' });
     expect(f.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(false);
+  });
+  it('persists the full-attempt stamp before invoking gc', async () => {
+    const f = fixture();
+    const run = vi.fn(async (args, opts) => {
+      if (args.includes('gc')) {
+        expect(JSON.parse(readFileSync(maintenanceStampPath(f.root, f.env), 'utf8'))).toEqual({ at: f.now(), ran: true });
+      }
+      return f.run(args, opts);
+    });
+    const result = await maybeMaintainClone({ ...f.o, run });
+    expect(result).toMatchObject({ freed: 8192 });
+    expect(result.reason).toBeUndefined(); // assertion failures inside run must not disappear into gc-failed
+    expect(run.mock.calls.some(([args]) => args.includes('gc'))).toBe(true);
   });
   it('resolves interval through standard, platform, tool, env; rejects oversized values', () => {
     expect(resolveCloneMaintenanceSettings({ env: {}, tool: {}, platform: {} }).value.intervalMs).toBe(86400000);
@@ -278,6 +292,16 @@ describe('clone maintenance gc-failed cause (B13)', () => {
     expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'prune-expire-unreadable' });
     expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(false);
   });
+  it('runs card salvage under the clone lock before the rate limit and reports counts; a salvage throw never blocks gc', async () => {
+    const f = fixture();
+    const salvageCards = vi.fn(async () => ({ moved: 2, kept: 1, failed: 0 }));
+    expect(await maybeMaintainClone({ ...f.o, salvageCards })).toMatchObject({ cardSalvage: { moved: 2, kept: 1, failed: 0 } });
+    expect(salvageCards).toHaveBeenCalledWith(expect.objectContaining({ root: f.root }));
+    const g = fixture();
+    const r = await maybeMaintainClone({ ...g.o, salvageCards: async () => { throw new Error('boom'); } });
+    expect(r.skipped).not.toBe(true);
+    expect(g.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(true);
+  });
   it('never runs gc while Git is busy in the clone (or the evidence is unreadable)', async () => {
     for (const isBusy of [() => true, () => { throw new Error('unreadable process table'); }]) {
       const f = fixture();
@@ -287,3 +311,309 @@ describe('clone maintenance gc-failed cause (B13)', () => {
     }
   });
 });
+
+// B13 follow-up (R928): the busy check ran AFTER the 24h stamp write, so one busy tick burned the whole window.
+describe('a skipped attempt never burns the 24h window', () => {
+  const MIN = 60_000;
+  it('busy at run 1 -> no gc; run 2 at +10 min is still backing off; run 3 at +31 min runs gc', async () => {
+    const f = fixture();
+    let busy = true;
+    const o = { ...f.o, isBusy: () => busy };
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'git-busy' });
+    expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(false);
+    busy = false;
+    f.advance(10 * MIN);
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+    f.advance(21 * MIN);
+    const r = await maybeMaintainClone(o);
+    expect(r.skipped).not.toBe(true);
+    expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(true);
+  });
+  it('an unreadable gc.pruneExpire also backs off 30 min, not 24h', async () => {
+    const f = fixture();
+    let unreadable = true;
+    f.run.mockImplementation(async (args) => (args.includes('config')
+      ? (unreadable ? { status: 1, stdout: '', exit: null } : { status: 1, stdout: '', exit: 1 })
+      : args.includes('gc') ? { status: 0, stdout: '' } : { status: 0, stdout: 'size: 10\nsize-pack: 1\n' }));
+    expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'prune-expire-unreadable' });
+    unreadable = false;
+    f.advance(31 * MIN);
+    expect((await maybeMaintainClone(f.o)).skipped).not.toBe(true);
+  });
+  it('a real attempt (gc ran) still limits to the configured interval', async () => {
+    const f = fixture();
+    await maybeMaintainClone(f.o);
+    f.advance(31 * MIN);
+    expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it('a busy skip with a short configured interval never delays beyond that interval', async () => {
+    const f = fixture();
+    const o = { ...f.o, isBusy: () => true, settings: { value: { intervalMs: 5 * MIN } } };
+    await maybeMaintainClone(o);
+    f.advance(6 * MIN);
+    expect((await maybeMaintainClone({ ...o, isBusy: () => false })).skipped).not.toBe(true);
+  });
+});
+
+describe('fresh skip backoff guarantees', () => {
+  function skipping(f, reason) {
+    const run = vi.fn(async (args, opts) => {
+      if (reason === 'measurement-failed' && args.includes('count-objects')) return { status: 1, stdout: '' };
+      if (reason === 'prune-expire-unreadable' && args.includes('config')) return { status: 1, stdout: '', exit: null };
+      return f.run(args, opts);
+    });
+    return { ...f.o, run, isBusy: () => reason === 'git-busy' };
+  }
+  it.each([...LEGACY_SKIP_REASONS])('new %s skip writes its marker, backs off at 10 minutes and retries at 31 minutes', async (reason) => {
+    const f = fixture();
+    const o = skipping(f, reason);
+    const at = f.now();
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason });
+    expect(JSON.parse(readFileSync(maintenanceStampPath(f.root, f.env), 'utf8'))).toEqual({ at, skip: reason });
+    expect(o.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(false);
+    o.run.mockClear();
+    f.advance(10 * 60_000);
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+    expect(o.run).not.toHaveBeenCalled();
+    f.advance(21 * 60_000);
+    const result = await maybeMaintainClone(f.o); // transient cause recovered
+    expect(result.reason).toBeUndefined();
+    expect(f.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(true);
+  });
+  it.each([...LEGACY_SKIP_REASONS])('a failed %s backoff stamp write fails closed with no gc', async (reason) => {
+    const f = fixture();
+    mkdirSync(`${maintenanceStampPath(f.root, f.env)}.${process.pid}.tmp`, { recursive: true });
+    const o = skipping(f, reason);
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'stamp-write-failed' });
+    expect(o.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(false);
+    expect(inspectCloneLock(f.root, { lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT }).writer).toBeNull();
+  });
+  it('measurement failure after gc preserves the full-attempt stamp and interval', async () => {
+    const f = fixture();
+    const run = vi.fn(async (args, opts) => {
+      const r = await f.run(args, opts);
+      return args.includes('count-objects') && run.mock.calls.filter(([a]) => a.includes('count-objects')).length === 2
+        ? { status: 1, stdout: '' } : r;
+    });
+    expect(await maybeMaintainClone({ ...f.o, run })).toMatchObject({ reason: 'measurement-failed' });
+    expect(JSON.parse(readFileSync(maintenanceStampPath(f.root, f.env), 'utf8'))).toEqual({ at: f.now(), ran: true });
+    f.run.mockClear();
+    f.advance(31 * 60_000);
+    expect(await maybeMaintainClone(f.o)).toMatchObject({ reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+});
+
+// Legacy stamps (written before skip markers) from the 2026-11-14 23:02 ET busy skip on the live fix clone.
+describe('legacy stamps without an outcome marker (R928)', () => {
+  const MIN = 60_000;
+  const LEGACY_AT = 1794715341597; // today's exact live stamp: {"at":1794715341597}
+  const busyEvent = (clone, reason = 'git-busy', at = new Date(LEGACY_AT + 240).toISOString()) => ({ at, kind: 'clone-maintenance', daemon: 'clone', detail: { clone, skipped: true, reason } });
+  function legacy(f, at = LEGACY_AT) {
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at }));
+  }
+  it('a legacy stamp whose latest event is a git-busy skip is retryable after 30 min, not 24h', async () => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => busyEvent(f.root) };
+    const r = await maybeMaintainClone(o);
+    expect(r.skipped).not.toBe(true);
+    expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(true);
+  });
+  it('is still backing off inside the 30 min window', async () => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 10 * MIN, readLastEvent: () => busyEvent(f.root) };
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it.each(['prune-expire-unreadable', 'measurement-failed'])('also treats a legacy %s skip as retryable', async (why) => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => busyEvent(f.root, why) };
+    expect((await maybeMaintainClone(o)).skipped).not.toBe(true);
+  });
+  it.each([
+    ['a gc run (freed event)', () => ({ kind: 'clone-maintenance', detail: { skipped: undefined, freed: 5, bytesBefore: 9, bytesAfter: 4 } })],
+    ['a gc-failed run', () => ({ kind: 'clone-maintenance', detail: { reason: 'gc-failed' } })],
+    ['no event at all', () => null],
+    ['an unreadable event log', () => { throw new Error('unreadable'); }],
+  ])('keeps the full interval for a legacy stamp when the latest event is %s', async (_n, ev) => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: ev };
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it('an older skip event (not within 5 min of the stamp) never reclassifies the stamp', async () => {
+    const f = fixture();
+    legacy(f);
+    const old = busyEvent(f.root, 'git-busy', new Date(LEGACY_AT - 60 * MIN).toISOString());
+    expect(await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => old })).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it('a preceding unstamped measurement failure cannot reclassify a real legacy GC stamp', async () => {
+    const f = fixture();
+    legacy(f);
+    const old = busyEvent(f.root, 'measurement-failed', new Date(LEGACY_AT - MIN).toISOString());
+    const file = join(f.root, '..', 'events.jsonl');
+    writeFileSync(file, JSON.stringify(old) + '\n'); // the later GC outcome append failed
+    const env = { ...f.env, WE_DAEMON_EVENTS: file };
+    expect(await maybeMaintainClone({ ...f.o, env, now: () => LEGACY_AT + 31 * MIN })).toMatchObject({ skipped: true, reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+  it('an injected preceding failure cannot reclassify a legacy GC stamp either', async () => {
+    const f = fixture();
+    legacy(f);
+    const old = busyEvent(f.root, 'measurement-failed', new Date(LEGACY_AT - 1).toISOString());
+    expect(await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => old })).toMatchObject({ reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+  it.each([[{ skip: 'whatever' }], [{ skip: 'git-busy', ran: true }]])('an inconsistent stamp %j keeps the full interval', async (extra) => {
+    const f = fixture();
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: LEGACY_AT, ...extra }));
+    expect(await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => null })).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it('writes a skip marker on a new busy skip and an outcome marker when gc runs', async () => {
+    const f = fixture();
+    await maybeMaintainClone({ ...f.o, isBusy: () => true });
+    expect(JSON.parse(readFileSync(maintenanceStampPath(f.root, f.env), 'utf8'))).toMatchObject({ skip: 'git-busy' });
+    const g = fixture();
+    await maybeMaintainClone(g.o);
+    expect(JSON.parse(readFileSync(maintenanceStampPath(g.root, g.env), 'utf8'))).toMatchObject({ ran: true });
+  });
+  it('a stamp carrying a skip marker never needs the event log', async () => {
+    const f = fixture();
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: LEGACY_AT, skip: 'git-busy' }));
+    const readLastEvent = vi.fn(() => { throw new Error('must not be read'); });
+    expect((await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent })).skipped).not.toBe(true);
+    expect(readLastEvent).not.toHaveBeenCalled();
+  });
+  it('expired stamps do not read event history', async () => {
+    const f = fixture();
+    legacy(f);
+    const readLastEvent = vi.fn();
+    expect((await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 24 * 60 * MIN, readLastEvent })).skipped).not.toBe(true);
+    expect(readLastEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('readLastCloneMaintenanceEvent', () => {
+  it('returns the latest event for THIS clone from the real events file, tolerating corrupt lines and other clones', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-events-'));
+    dirs.push(dir);
+    const file = join(dir, 'events.jsonl');
+    const line = (clone, reason) => JSON.stringify({ kind: 'clone-maintenance', detail: { clone, skipped: true, reason } });
+    writeFileSync(file, [line('/a', 'rate-limited'), line('/b', 'git-busy'), 'not json "clone-maintenance"', line('/a', 'git-busy'), line('/b', 'rate-limited')].join('\n') + '\n');
+    const env = { WE_DAEMON_EVENTS: file };
+    expect(readLastCloneMaintenanceEvent('/a', env).detail.reason).toBe('git-busy');
+    expect(readLastCloneMaintenanceEvent('/b', env).detail.reason).toBe('rate-limited');
+    expect(readLastCloneMaintenanceEvent('/c', env)).toBeNull();
+  });
+});
+
+// Live 2026-11-15: the 04:02Z git-busy event was buried under 3.5h of later `rate-limited` events and ~40 MB of other
+// daemons' traffic, so "the latest event" was never the skip that wrote the legacy stamp.
+describe('legacy stamp: the skip event is found near the stamp time, not as the latest event (live miss)', () => {
+  const MIN = 60_000;
+  const STAMP_AT = 1794715341597;
+  it('finds the git-busy event at stamp time under later rate-limited events and bulk traffic from other daemons', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-near-'));
+    dirs.push(dir);
+    const file = join(dir, 'events.jsonl');
+    const ev = (atMs, reason, clone = '/live') => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'clone-maintenance', detail: { clone, skipped: true, reason } });
+    const noise = (atMs) => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'tick', detail: { pad: 'x'.repeat(200) } });
+    const lines = [ev(STAMP_AT - 30 * MIN, 'rate-limited'), ev(STAMP_AT + 240, 'git-busy'), ev(STAMP_AT + 2 * MIN, 'rate-limited')];
+    for (let i = 0; i < 12000; i += 1) lines.push(noise(STAMP_AT + MIN + i * 1000)); // ~2.5 MB of later traffic
+    lines.push(ev(STAMP_AT + 60 * MIN, 'rate-limited'), ev(STAMP_AT + 120 * MIN, 'rate-limited'));
+    writeFileSync(file, lines.join('\n') + '\n');
+    const e = readCloneMaintenanceEventNear('/live', { WE_DAEMON_EVENTS: file }, STAMP_AT, 5 * MIN);
+    expect(e.detail.reason).toBe('git-busy');
+  });
+  it('returns null when no event for this clone lies within the window (other clones ignored)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-near-'));
+    dirs.push(dir);
+    const file = join(dir, 'events.jsonl');
+    const ev = (atMs, clone) => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'clone-maintenance', detail: { clone, skipped: true, reason: 'git-busy' } });
+    writeFileSync(file, [ev(STAMP_AT + 1000, '/other'), ev(STAMP_AT + 60 * MIN, '/live')].join('\n') + '\n');
+    expect(readCloneMaintenanceEventNear('/live', { WE_DAEMON_EVENTS: file }, STAMP_AT, 5 * MIN)).toBeNull();
+  });
+  it('maybeMaintainClone asks for the event NEAR the stamp (default reader) and retries after 30 min', async () => {
+    const f = fixture();
+    const file = join(f.env.WE_DAEMON_STATE_DIR, '..', 'events.jsonl');
+    const ev = (atMs, reason) => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, skipped: true, reason } });
+    writeFileSync(file, [ev(STAMP_AT + 240, 'git-busy'), ev(STAMP_AT + 90 * MIN, 'rate-limited')].join('\n') + '\n');
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: STAMP_AT }));
+    const env = { ...f.env, WE_DAEMON_EVENTS: file };
+    const r = await maybeMaintainClone({ ...f.o, env, now: () => STAMP_AT + 100 * MIN });
+    expect(r.skipped).not.toBe(true);
+  });
+  it('legacy busy skip survives real rate-limited ticks within five minutes', async () => {
+    const f = fixture();
+    const env = { ...f.env, WE_DAEMON_EVENTS: join(f.root, '..', 'events.jsonl') };
+    const emitEvent = (event) => appendDaemonEvent(event, { env, now: () => new Date(f.now()) });
+    const o = { ...f.o, env, emitEvent };
+    const at = f.now();
+    expect(await maybeMaintainClone({ ...o, isBusy: () => true })).toMatchObject({ reason: 'git-busy' });
+    const stamp = maintenanceStampPath(f.root, env);
+    writeFileSync(stamp, JSON.stringify({ at })); // simulate the pre-marker writer
+    for (let i = 0; i < 2; i += 1) {
+      f.advance(MIN);
+      expect(await maybeMaintainClone(o)).toMatchObject({ reason: 'rate-limited' });
+    }
+    f.advance(29 * MIN);
+    const result = await maybeMaintainClone(o);
+    expect(result.reason).toBeUndefined();
+    expect(f.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(true);
+  });
+  it.each([
+    [0, 'git-busy', 1000, 'gc-failed', 'git-busy'],
+    [0, 'gc-failed', 1000, 'git-busy', 'gc-failed'],
+    [0, 'git-busy', 0, 'gc-failed', 'gc-failed'],
+    [0, 'gc-failed', 0, 'git-busy', 'gc-failed'],
+    [0, 'unknown-skip', 0, 'git-busy', 'unknown-skip'],
+  ])('selects the closest outcome after the stamp (%s/%s then %s/%s)', (firstAt, firstReason, secondAt, secondReason, expected) => {
+    const f = fixture();
+    const file = join(f.root, '..', 'events.jsonl');
+    const ev = (delta, reason) => JSON.stringify({ at: new Date(STAMP_AT + delta).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, ...(reason === 'gc-failed' ? {} : { skipped: true }), reason } });
+    writeFileSync(file, [ev(firstAt, firstReason), ev(secondAt, secondReason)].join('\n') + '\n');
+    expect(readCloneMaintenanceEventNear(f.root, { WE_DAEMON_EVENTS: file }, STAMP_AT).detail.reason).toBe(expected);
+  });
+  it.each([['default 64 MiB', undefined, 64 * 1024 * 1024], ['partial final chunk', 1024 * 1024 + 17, 1024 * 1024 + 17]])('caps event-log reads: %s', (_name, maxBytes, expectedCap) => {
+    const f = fixture();
+    const file = join(f.root, '..', 'events.jsonl');
+    const target = JSON.stringify({ at: new Date(STAMP_AT).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, skipped: true, reason: 'git-busy' } }) + '\n';
+    const padding = 'x'.repeat(1023) + '\n';
+    const chunk = padding.repeat(256);
+    const fd = openSync(file, 'w');
+    let size = 0;
+    try {
+      size += writeSync(fd, target);
+      while (size <= expectedCap + 256 * 1024) size += writeSync(fd, chunk);
+    } finally { closeSync(fd); }
+    const read = vi.fn(readSync);
+    expect(readCloneMaintenanceEventNear(f.root, { WE_DAEMON_EVENTS: file }, STAMP_AT, 5 * MIN, { maxBytes, read })).toBeNull();
+    const ranges = read.mock.calls.map(([, , , length, position]) => ({ length, position }));
+    expect(ranges.length).toBeGreaterThan(0);
+    expect(ranges.reduce((sum, { length }) => sum + length, 0)).toBe(expectedCap);
+    expect(Math.min(...ranges.map(({ position }) => position))).toBe(size - expectedCap);
+    expect(ranges.every(({ length, position }) => length <= 1024 * 1024 && position >= size - expectedCap && position + length <= size)).toBe(true);
+    ranges.forEach(({ length, position }, index) => expect(position + length).toBe(index === 0 ? size : ranges[index - 1].position));
+  });
+  it('incomplete event-log reads preserve the full legacy interval', async () => {
+    const f = fixture();
+    const file = join(f.root, '..', 'events.jsonl');
+    const env = { ...f.env, WE_DAEMON_EVENTS: file };
+    writeFileSync(file, JSON.stringify({ at: new Date(STAMP_AT).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, skipped: true, reason: 'git-busy' } }) + '\n');
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, env), JSON.stringify({ at: STAMP_AT }));
+    const read = vi.fn((_fd, _buf, _offset, length) => length - 1);
+    const readLastEvent = () => readCloneMaintenanceEventNear(f.root, env, STAMP_AT, 5 * MIN, { read });
+    expect(readLastEvent).toThrow('incomplete event log read');
+    expect(await maybeMaintainClone({ ...f.o, env, readLastEvent, now: () => STAMP_AT + 31 * MIN })).toMatchObject({ skipped: true, reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalled();
+  });
+});
+

@@ -850,6 +850,13 @@ function tail(text, n = 400) {
  *   loopOutcome:(string|null), runId:(string|null), lanePath:(string|null), label:(string|null), refused?:boolean,
  *   timings:{acquireMs:(number|null), loopMs:(number|null), totalMs:number}}}
  */
+/** Bounded single-line ` (reason)` suffix naming the red-team result-comment error; absent/empty reason adds nothing. PURE. */
+export function commentReasonSuffix(value, text = (v, fb) => { try { return String(v ?? fb); } catch { return fb; } }) {
+  if (value === undefined || value === null) return '';
+  const line = text(value, '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return line ? ` (${line})` : '';
+}
+
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const seatsBox = {};
   // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
@@ -944,7 +951,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
       // A completion claim remains unpublished until all derivations and live evidence succeed.
       settlementOutcome = completed
-        ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
+        ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}${commentReasonSuffix(redTeam?.comment?.reason, diagnosticText)}` }
         : redTeam;
       // A stored review run is not evidence of an unpublished red-team run.
       const reviewOnly = completed && !deferred && reviewOnlyRedTeamResult(redTeam);

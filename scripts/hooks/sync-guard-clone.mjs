@@ -80,6 +80,71 @@ export function legacyOwnerAlive(ownerPath) {
 }
 const nonce = () => `${process.pid}-${randomBytes(6).toString('hex')}`;
 
+/** Copies retain read-only directories. Restore directory access only for disposal;
+ * never follow copied symlinks into paths outside the snapshot. */
+function removeSnapshot(path) {
+  const writable = entry => {
+    const stat = lstatSync(entry);
+    if (!stat.isDirectory()) return;
+    chmodSync(entry, stat.mode | 0o700);
+    for (const name of readdirSync(entry)) writable(join(entry, name));
+  };
+  try { writable(path); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  rmSync(path, { recursive: true, force: true });
+}
+
+function sweepSnapshots(clone) {
+  const prefix = `${basename(clone)}.guard-good.`;
+  for (const name of readdirSync(dirname(clone))) {
+    if (name.startsWith(`${prefix}tmp-`) || name.startsWith(`${prefix}old-`)) {
+      removeSnapshot(join(dirname(clone), name));
+    }
+  }
+}
+
+/** Called only after pristine verification, with the exclusive sync lock still held. */
+function publishSnapshot(clone, sha, syncedAt) {
+  const snapshot = `${clone}.guard-good`;
+  const id = nonce();
+  const staging = `${snapshot}.tmp-${id}`;
+  const old = `${snapshot}.old-${id}`;
+  mkdirSync(staging);
+  for (const name of readdirSync(clone)) {
+    if (name === '.git') continue;
+    const source = join(clone, name);
+    const target = join(staging, name);
+    const copy = flags => execFileSync('cp', [...flags, source, target], {
+      timeout: 120_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (process.platform === 'darwin') {
+      try { copy(['-c', '-R']); }
+      catch { removeSnapshot(target); copy(['-R']); }
+    } else copy(['-R']);
+  }
+  // The marker is the final write, so a copy failure cannot publish trusted evidence.
+  writeFileSync(join(staging, '.guard-good.json'), JSON.stringify({ sha, syncedAt }));
+  const publishing = `${clone}.guard-snapshot-lock`;
+  const owner = `${process.pid} ${STARTED} ${nonce()}\n`;
+  acquireLock(publishing, owner);
+  try {
+    // Block new snapshot selections before draining existing readers. A bounded refusal
+    // leaves the old snapshot in place and is reported as a non-fatal publication warning.
+    drainLeases(`${clone}.guard-snapshot-readers`);
+    let moved = false;
+    try { renameSync(snapshot, old); moved = true; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    try { renameSync(staging, snapshot); }
+    catch (error) {
+      if (moved) renameSync(old, snapshot);
+      throw error;
+    }
+    if (moved) removeSnapshot(old);
+  } finally {
+    if (readRecord(publishing) === owner) rmSync(publishing, { force: true });
+  }
+}
+
 /** Create `path` holding `record`, atomically; false when it already exists. */
 function publish(path, record) {
   const staging = `${path}.new-${nonce()}`;
@@ -218,7 +283,7 @@ try {
     cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const gitRaw = (cwd, ...argv) => gitBounded(1024 * 1024, cwd, ...argv);
+  const gitRaw = (cwd, ...argv) => gitBounded(64 * 1024 * 1024, cwd, ...argv);
   const git = (cwd, ...argv) => gitRaw(cwd, ...argv).trim();
   // The tracked-file listing grows with the repository (about 1 MB at 16k files), so it has
   // its own, far larger bound. Past it sync refuses by name instead of trusting a cut-off list.
@@ -368,6 +433,8 @@ try {
   acquireLock(lockPath, owner);
   lock = lockPath;
   lockStartedAt = Date.now();
+  try { sweepSnapshots(clone); }
+  catch (error) { process.stderr.write(`Guard clone sync: snapshot debris cleanup warning: ${error.message}\n`); }
   drainLeases(`${clone}.guard-readers`);
   if (fresh) {
     git(process.cwd(), 'clone', '--single-branch', '--branch', 'main', '--no-tags', '--', origin, clone);
@@ -460,6 +527,8 @@ try {
   closeSync(openSync(fetchHead, 'a'));
   const syncedAt = new Date();
   utimesSync(fetchHead, syncedAt, syncedAt);
+  try { publishSnapshot(clone, git(clone, 'rev-parse', 'HEAD'), syncedAt.getTime()); }
+  catch (error) { process.stderr.write(`Guard clone sync: last-good snapshot publication warning: ${error.message}\n`); }
   process.stdout.write('Guard clone synchronized to origin/main.\n');
 } catch (error) {
   process.stderr.write(`Guard clone sync refused/failed: ${error.message}\n`);

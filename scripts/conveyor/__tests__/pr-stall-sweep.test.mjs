@@ -46,7 +46,7 @@ const PRS = [
   { number: 12, state: 'OPEN', title: 'at the cap', url: 'u', isDraft: false, headRefOid: 'b'.repeat(40), updatedAt: old, createdAt: old, body: '', labels: [{ name: 'status:at-round-limit' }], statusCheckRollup: [] },
 ];
 /** A fake `gh` that answers the read verbs and records every call. */
-function fakeGh({ prs = PRS, truncated = false } = {}) {
+function fakeGh({ prs = PRS, truncated = false, fileCount = 1, changedFiles = truncated ? 150 : fileCount } = {}) {
   const calls = [];
   const gh = (_bin, args) => {
     calls.push(args);
@@ -58,7 +58,12 @@ function fakeGh({ prs = PRS, truncated = false } = {}) {
       const pr = prs.find((p) => String(p.number) === String(args[2]));
       return JSON.stringify({ commits: [{ oid: pr?.commitOid ?? pr?.headRefOid, committedDate: old }] });
     }
-    if (args[0] === 'pr' && args[1] === 'view' && args.some((x) => String(x).startsWith('files'))) return JSON.stringify({ files: [{ path: 'scripts/foo.mjs' }], changedFiles: truncated ? 150 : 1 });
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('changedFiles')) return JSON.stringify({ changedFiles });
+    if (args[0] === 'api' && /\/files\?/.test(String(args.at(-1)))) {
+      const page = Number(new URLSearchParams(args.at(-1).split('?')[1]).get('page'));
+      const start = (page - 1) * 100;
+      return JSON.stringify(Array.from({ length: Math.max(0, Math.min(100, fileCount - start)) }, (_, i) => ({ filename: `scripts/file-${start + i}.mjs` })));
+    }
     if (args[0] === 'api') return JSON.stringify([[]]);
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
@@ -203,7 +208,7 @@ describe('the shadow pass', () => {
     const { gh, calls } = fakeGh(); const dir = auditDir();
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir, log: () => {} });
     expectReadOnly(calls);
-    expect(calls.some((a) => a.includes('files,changedFiles'))).toBe(true); // the judged row read its file list
+    expect(calls.some((a) => a[0] === 'api' && /\/pulls\/12\/files\?per_page=100&page=1$/.test(a.at(-1)))).toBe(true); // the judged row read its file list
     const recs = lines(dir);
     expect(recs.map((r) => r.phase).sort()).toEqual(['operator', 'pass', 'would-do']);
     expect(recs.find((r) => r.phase === 'would-do')).toMatchObject({ lane: 'system', action: 'tooling-card', pr: 11, mode: 'shadow' });
@@ -293,6 +298,59 @@ describe('the shadow pass', () => {
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: auditDir(), log: () => {} });
     expect(out.act).toEqual([]); expect(out.errors.join(' ')).toMatch(/truncated/);
   });
+  it('pages the file list past 100 files', async () => {
+    const { gh, calls } = fakeGh({ prs: [PRS[1]], fileCount: 129 });
+    const judge = vi.fn(judgeRound);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), judge, dir: auditDir(), log: () => {} });
+    const expected = Array.from({ length: 129 }, (_, i) => `scripts/file-${i}.mjs`);
+    expect(judge).toHaveBeenCalledOnce();
+    expect(judge.mock.calls[0][0].files).toEqual(expected);
+    expect(calls.filter(a => /\/files\?/.test(String(a.at(-1)))).map(a => a.at(-1))).toEqual([
+      `repos/${REPO}/pulls/12/files?per_page=100&page=1`, `repos/${REPO}/pulls/12/files?per_page=100&page=2`,
+    ]);
+    expect(out.errors).toEqual([]);
+    expect(JSON.stringify(out)).not.toMatch(/not an object/);
+    expectReadOnly(calls);
+  });
+  it('ends file pagination on an empty page after a full page', async () => {
+    const { gh, calls } = fakeGh({ prs: [PRS[1]], fileCount: 100 });
+    const judge = vi.fn(judgeRound);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), judge, dir: auditDir(), log: () => {} });
+    expect(judge.mock.calls[0][0].files).toHaveLength(100);
+    expect(calls.filter(a => /\/files\?/.test(String(a.at(-1))))).toHaveLength(2);
+    expect(out.errors).toEqual([]);
+  });
+  it.each([3000, 3001, 2999])('surfaces a file list over the 3000-file cap as file-list-over-cap, not a null verdict', async changedFiles => {
+    // Counts at/above the ceiling park immediately; a list reaching it also parks even if the count was lower.
+    const { gh, calls } = fakeGh({ fileCount: 3000, changedFiles });
+    const dir = auditDir(); const judge = vi.fn(judgeRound);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), judge, dir, log: () => {} });
+    expect(judge).not.toHaveBeenCalled();
+    expect(out.incomplete).toBe(true);
+    expect(out.act).toEqual([]);
+    const item = out.items.find(i => i.pr === 12);
+    expect(item).toMatchObject({ repo: REPO, head: PRS[1].headRefOid, state: 'at-round-limit', title: 'at the cap',
+      lane: 'operator', action: 'ruling-needed', reason: expect.stringContaining('file-list-over-cap'),
+      fileList: { state: 'file-list-over-cap', cap: 3000, changedFiles, listedFiles: changedFiles >= 3000 ? 0 : 3000 } });
+    expect(item.key).toBe(`${item.prHead}:file-list-over-cap`);
+    expect(lines(dir).find(r => r.phase === 'pass')).toMatchObject({ incomplete: true, readFailed: true });
+    expect(lines(dir).find(r => r.phase === 'operator')).toMatchObject(item);
+    expect(out.records.find(r => r.phase === 'operator')).toMatchObject(item);
+    expect(JSON.stringify(out)).not.toMatch(/not an object/);
+    expect(calls.filter(a => /\/files\?/.test(String(a.at(-1))))).toHaveLength(changedFiles >= 3000 ? 0 : 30);
+    expectReadOnly(calls);
+  });
+  it.each([{}, [{ filename: 42 }], [{ path: 'scripts/foo.mjs' }], [{ filename: '' }], Array(101).fill({ filename: 'x' })].map(page => [page]))(
+    'a malformed file page fails closed through the strict gh seam (%j)', async page => {
+      const { gh } = fakeGh(); const judge = vi.fn(judgeRound);
+      const wrapped = (bin, args, opts) => /\/files\?/.test(String(args.at(-1))) ? JSON.stringify(page) : gh(bin, args, opts);
+      expect(() => strictGh(wrapped)('gh', ['api', `repos/${REPO}/pulls/12/files?per_page=100&page=1`])).toThrow(/malformed gh response/);
+      const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(gh), judge, dir: auditDir(), log: () => {} });
+      expect(judge).not.toHaveBeenCalled();
+      expect(out.incomplete).toBe(true);
+      expect(out.act).toEqual([]);
+      expect(out.errors.join(' ')).toMatch(/malformed gh response/);
+    });
   it('a malformed drain skip row makes the drain log unreadable', () => {
     const line = (rows) => `x\n2026 merge-ai-prs · skip-reasons: ${JSON.stringify(rows)}\n`;
     expect(strictDrainText(() => line([{ num: 11, kind: 'not-certified' }]))('p')).toMatch(/skip-reasons/);

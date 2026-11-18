@@ -5,14 +5,15 @@
  * Locking: hooks run in parallel (six share the Edit|Write matcher), so each launcher takes only a
  * shared lease, a `<clone>.guard-readers/<pid>-<nonce>` file holding its start time. Only sync
  * takes the exclusive `<clone>.guard-lock` file; it waits for live leases to drain before it
- * changes the clone. A launcher waits a bounded time for a live sync. A lock or lease whose owner
+ * changes the clone. During a live sync, a launcher uses its verified last-good snapshot, or
+ * waits a bounded time if snapshot evidence is unavailable. A lock or lease whose owner
  * process has exited (or whose pid now names a process with another start time) is ignored here
  * and reclaimed by the next sync, so a killed process never wedges the hooks. The lease names the
  * launcher's pid: a launcher killed outright orphans its guard, which then runs unprotected.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -23,7 +24,7 @@ for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
 const gitEnv = { ...env, LC_ALL: 'C', LANGUAGE: 'C' };
 function git(...args) {
   return execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...args], {
-    env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
@@ -102,6 +103,95 @@ function legacyOwnerAlive(ownerPath) {
   return started === null || started <= lstatSync(ownerPath).mtimeMs + 3_000;
 }
 
+/** Compare the entire copy, including dependencies and extra files, with immutable Git blobs.
+ * Use object reads only: sync may be changing HEAD and the index under its exclusive lock. */
+function verifySnapshot(clone, snapshot, sha) {
+  if (process.env.WE_GUARD_ORIGIN !== undefined &&
+      git('-C', clone, 'config', '--get-all', 'remote.origin.url') !== process.env.WE_GUARD_ORIGIN) return false;
+  git('--git-dir', join(clone, '.git'), 'merge-base', '--is-ancestor', sha, 'refs/remotes/origin/main');
+  const listing = execFileSync('git', ['--git-dir', join(clone, '.git'), 'ls-tree', '-r', '-z', '--full-tree', `${sha}^{tree}`], {
+    env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 256 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const entries = listing.split('\0');
+  if (entries.pop() !== '' || listing.includes('\ufffd')) return false;
+  const files = new Map();
+  const directories = new Set();
+  for (const entry of entries) {
+    const match = /^(100644|100755|120000) blob ([0-9a-f]{40})\t([\s\S]+)$/.exec(entry);
+    if (!match) return false;
+    const [, mode, hash, name] = match;
+    if (name.split('/').some(part => !part || part === '.' || part === '..' || part === '.git') || name === '.guard-good.json') return false;
+    files.set(name, { mode, hash });
+    for (let parent = dirname(name); parent !== '.'; parent = dirname(parent)) directories.add(parent);
+  }
+  const visit = (path, prefix = '') => {
+    for (const name of readdirSync(path)) {
+      if (!prefix && name === '.guard-good.json') continue;
+      const relativePath = prefix ? `${prefix}/${name}` : name;
+      const absolute = join(path, name);
+      const stat = lstatSync(absolute);
+      if (stat.isDirectory()) {
+        if (!directories.delete(relativePath) || !visit(absolute, relativePath)) return false;
+        continue;
+      }
+      const expected = files.get(relativePath);
+      if (!expected) return false;
+      let bytes;
+      if (expected.mode === '120000') {
+        if (!stat.isSymbolicLink()) return false;
+        // A tracked link cannot import unverified code from outside the copy.
+        const resolved = realpathSync(absolute);
+        const inside = relative(snapshot, resolved);
+        if (!inside || inside === '..' || inside.startsWith(`..${sep}`) || isAbsolute(inside)) return false;
+        bytes = readlinkSync(absolute, { encoding: 'buffer' });
+      } else {
+        if (!stat.isFile() || Boolean(stat.mode & 0o111) !== (expected.mode === '100755')) return false;
+        bytes = readFileSync(absolute);
+      }
+      if (createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') !== expected.hash) return false;
+      files.delete(relativePath);
+    }
+    return true;
+  };
+  return visit(snapshot) && files.size === 0 && directories.size === 0;
+}
+
+/** Only the published directory is eligible; incomplete staging/aside trees never are.
+ * The publication mutex/reader handshake pins this name through the child's last import. */
+function lastGood(clone, script) {
+  let reader;
+  let retained = false;
+  try {
+    const publishing = `${clone}.guard-snapshot-lock`;
+    if (syncRunning(publishing)) return null;
+    const readers = `${clone}.guard-snapshot-readers`;
+    mkdirSync(readers, { recursive: true });
+    if (!lstatSync(readers).isDirectory()) return null;
+    reader = join(readers, `${process.pid}-${randomBytes(6).toString('hex')}`);
+    writeFileSync(reader, String(STARTED), { flag: 'wx' });
+    if (syncRunning(publishing)) return null;
+    const snapshot = `${clone}.guard-good`;
+    if (!lstatSync(snapshot).isDirectory() || realpathSync(snapshot) !== snapshot) return null;
+    const marker = join(snapshot, '.guard-good.json');
+    if (!lstatSync(marker).isFile()) return null;
+    const { sha, syncedAt } = JSON.parse(readFileSync(marker, 'utf8'));
+    const now = Date.now();
+    if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/i.test(sha) ||
+        !Number.isFinite(syncedAt) || syncedAt <= 0 || syncedAt > now ||
+        now - syncedAt > 24 * 60 * 60 * 1000) return null;
+    const scripts = join(snapshot, 'scripts');
+    const target = realpathSync(join(snapshot, script));
+    const withinScripts = relative(scripts, target);
+    if (!withinScripts || withinScripts === '..' || withinScripts.startsWith(`..${sep}`) ||
+        isAbsolute(withinScripts) || !statSync(target).isFile()) return null;
+    if (!verifySnapshot(clone, snapshot, sha)) return null;
+    retained = true;
+    return { target, sha, reader };
+  } catch { return null; }
+  finally { if (reader && !retained) rmSync(reader, { force: true }); }
+}
+
 const argv = process.argv.slice(2);
 // Stop and SubagentStop wrappers pass --stop-hook. There exit 2 means "keep going", and an
 // infrastructure failure would recur on every retry, so it exits 1 (non-blocking) instead.
@@ -128,6 +218,7 @@ try {
   const waitMs = lockWaitMs();
   const deadline = Date.now() + waitMs;
   let announced = false;
+  let good;
   for (;;) {
     if (!syncRunning(lockPath)) {
       writeFileSync(marker, String(STARTED), { flag: 'wx' });
@@ -137,6 +228,12 @@ try {
       if (!syncRunning(lockPath)) break;
       rmSync(marker, { force: true });
       lease = undefined;
+    }
+    good = lastGood(clone, script);
+    if (good) {
+      lease = good.reader;
+      process.stderr.write(`Pinned guard: using last-good snapshot ${good.sha}\n`);
+      break;
     }
     if (Date.now() >= deadline) {
       throw new Error('guard clone sync is in progress; retry the hook');
@@ -149,62 +246,65 @@ try {
     pause(50);
   }
   const scripts = join(clone, 'scripts');
-  const target = realpathSync(join(clone, script));
-  const withinScripts = relative(scripts, target);
-  if (!withinScripts || withinScripts === '..' || withinScripts.startsWith(`..${sep}`) ||
-      isAbsolute(withinScripts) || !statSync(target).isFile()) {
-    throw new Error('clone guard must be a regular file inside clone/scripts');
-  }
-  // Freshness is not repository evidence. Pin Git's metadata path so it cannot
-  // discover a parent checkout when this clone is damaged or incomplete.
-  git('--git-dir', join(clone, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}');
-  // --ignored: a file hidden by .gitignore or info/exclude (e.g. a planted node_modules
-  // package shadowing a bare import) is not part of the pinned revision either.
-  // A reader can race the index refresh after a sync (index.lock held by a sibling launcher,
-  // stat data stale after chmod): re-check a few times before denying. Real dirt persists
-  // across every attempt and still denies.
-  for (let attempt = 1; ; attempt++) {
-    try {
-      // All evidence is re-read on every attempt: a pass needs every check clean on the same attempt.
-      const entries = git('-C', clone, 'ls-files', '-v', '-z').split('\0');
-      if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
-      const hidden = entries.slice(0, -1).filter(entry => !entry.startsWith('H '));
-      const dirty = git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored');
-      if (hidden.length || dirty) {
-        // Name the first offenders (capped, control characters stripped) so the next occurrence
-        // identifies the writer without a repair destroying the evidence. The check stays strict.
-        const named = [...hidden, ...dirty.split('\n').filter(Boolean)].slice(0, 5)
-          .map(line => line.replace(/[^\x20-\x7e]/g, '?').slice(0, 200)).join('; ');
-        throw new Error(`guard clone is not pristine (${named}); run scripts/hooks/sync-guard-clone.mjs to repair it`);
-      }
-      git('-C', clone, 'diff-index', '--quiet', 'HEAD', '--');
-      break;
-    } catch (error) {
-      if (attempt >= 5) throw error;
-      pause(200);
+  const target = good?.target ?? realpathSync(join(clone, script));
+  // Snapshot bytes were checked against Git objects; only live-clone reads need index checks.
+  if (!good) {
+    const withinScripts = relative(scripts, target);
+    if (!withinScripts || withinScripts === '..' || withinScripts.startsWith(`..${sep}`) ||
+        isAbsolute(withinScripts) || !statSync(target).isFile()) {
+      throw new Error('clone guard must be a regular file inside clone/scripts');
     }
-  }
-  if (git('-C', clone, 'rev-parse', 'HEAD') !== git('-C', clone, 'rev-parse', 'refs/remotes/origin/main')) {
-    throw new Error('guard clone HEAD differs from origin/main; run scripts/hooks/sync-guard-clone.mjs to repair it');
-  }
-  if (process.env.WE_GUARD_ORIGIN !== undefined &&
-      git('-C', clone, 'config', '--get-all', 'remote.origin.url') !== process.env.WE_GUARD_ORIGIN) {
-    throw new Error('guard clone origin differs from WE_GUARD_ORIGIN; restore the expected origin before syncing');
-  }
-  const syncHelp = `run node ${join(clone, 'scripts/hooks/sync-guard-clone.mjs')}; launchd template: ${join(clone, 'scripts/hooks/com.we.guard-main-sync.plist.template')}`;
-  let fetchTime;
-  try {
-    const fetchHead = statSync(join(clone, '.git/FETCH_HEAD'));
-    if (!fetchHead.isFile()) throw new Error('not a regular file');
-    fetchTime = fetchHead.mtimeMs;
-  } catch {
-    throw new Error(`cannot read FETCH_HEAD sync freshness; ${syncHelp}`);
-  }
-  if (!Number.isFinite(fetchTime) || fetchTime <= 0 || fetchTime > Date.now()) {
-    throw new Error(`cannot determine clone sync freshness; ${syncHelp}`);
-  }
-  if (Date.now() - fetchTime > 24 * 60 * 60 * 1000) {
-    throw new Error(`guard clone is stale: last sync was more than 24h ago (FETCH_HEAD mtime); ${syncHelp}`);
+    // Freshness is not repository evidence. Pin Git's metadata path so it cannot
+    // discover a parent checkout when this clone is damaged or incomplete.
+    git('--git-dir', join(clone, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}');
+    // --ignored: a file hidden by .gitignore or info/exclude (e.g. a planted node_modules
+    // package shadowing a bare import) is not part of the pinned revision either.
+    // A reader can race the index refresh after a sync (index.lock held by a sibling launcher,
+    // stat data stale after chmod): re-check a few times before denying. Real dirt persists
+    // across every attempt and still denies.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        // All evidence is re-read on every attempt: a pass needs every check clean on the same attempt.
+        const entries = git('-C', clone, 'ls-files', '-v', '-z').split('\0');
+        if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
+        const hidden = entries.slice(0, -1).filter(entry => !entry.startsWith('H '));
+        const dirty = git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored');
+        if (hidden.length || dirty) {
+          // Name the first offenders (capped, control characters stripped) so the next occurrence
+          // identifies the writer without a repair destroying the evidence. The check stays strict.
+          const named = [...hidden, ...dirty.split('\n').filter(Boolean)].slice(0, 5)
+            .map(line => line.replace(/[^\x20-\x7e]/g, '?').slice(0, 200)).join('; ');
+          throw new Error(`guard clone is not pristine (${named}); run scripts/hooks/sync-guard-clone.mjs to repair it`);
+        }
+        git('-C', clone, 'diff-index', '--quiet', 'HEAD', '--');
+        break;
+      } catch (error) {
+        if (attempt >= 5) throw error;
+        pause(200);
+      }
+    }
+    if (git('-C', clone, 'rev-parse', 'HEAD') !== git('-C', clone, 'rev-parse', 'refs/remotes/origin/main')) {
+      throw new Error('guard clone HEAD differs from origin/main; run scripts/hooks/sync-guard-clone.mjs to repair it');
+    }
+    if (process.env.WE_GUARD_ORIGIN !== undefined &&
+        git('-C', clone, 'config', '--get-all', 'remote.origin.url') !== process.env.WE_GUARD_ORIGIN) {
+      throw new Error('guard clone origin differs from WE_GUARD_ORIGIN; restore the expected origin before syncing');
+    }
+    const syncHelp = `run node ${join(clone, 'scripts/hooks/sync-guard-clone.mjs')}; launchd template: ${join(clone, 'scripts/hooks/com.we.guard-main-sync.plist.template')}`;
+    let fetchTime;
+    try {
+      const fetchHead = statSync(join(clone, '.git/FETCH_HEAD'));
+      if (!fetchHead.isFile()) throw new Error('not a regular file');
+      fetchTime = fetchHead.mtimeMs;
+    } catch {
+      throw new Error(`cannot read FETCH_HEAD sync freshness; ${syncHelp}`);
+    }
+    if (!Number.isFinite(fetchTime) || fetchTime <= 0 || fetchTime > Date.now()) {
+      throw new Error(`cannot determine clone sync freshness; ${syncHelp}`);
+    }
+    if (Date.now() - fetchTime > 24 * 60 * 60 * 1000) {
+      throw new Error(`guard clone is stale: last sync was more than 24h ago (FETCH_HEAD mtime); ${syncHelp}`);
+    }
   }
   const hookRoot = operatedRoot(clone);
   // Run the canonical entry point in place so Node's module URL and argv[1]
