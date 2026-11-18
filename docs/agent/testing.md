@@ -4580,3 +4580,12 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Bundle public-content exemption scans
+
+Use `credentialContentFindings` for the public-blob exemption: a first-finding scan can hide
+a non-public credential class behind an exempt GitHub token or key marker. Keep collection
+on the shared scanner paths, including byte views, escape decoding, JSON literals and joined
+scalar continuations. `git-bundle-transport.test.mjs` covers public GitHub/AWS mixtures in raw,
+UTF-16, escaped, JSON and folded-scalar forms; `forge-exec-manifest.test.mjs` pins collection
+and preserves the ordinary first-finding API. Unreadable evidence still refuses exemption.

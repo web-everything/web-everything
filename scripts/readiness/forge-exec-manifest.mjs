@@ -117,7 +117,13 @@ export const secretText=[
   [/npm_[A-Za-z0-9]{36}/,'npm-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
-const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+// Collection mode records every pattern and returns null so callers keep scanning later views.
+// Ordinary callers retain the first-finding contract and its short circuits.
+const textFinding=(text,findings)=>{
+  if(!findings)return secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+  for(const [pattern,name] of secretText)if(pattern.test(text))findings.add(name);
+  return null;
+};
 // R824/R825: in test files only, a name:value whose value is a code expression
 // (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
 // strings are stripped first, so a literal that merely contains `(` still hits.
@@ -200,14 +206,14 @@ const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|
 const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 const maxExpressionValue=1024;
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
-export function credentialBufferFinding(content) {
+export function credentialBufferFinding(content,findings) {
   for(const encoding of ['latin1','utf8','utf16le']) {
-    const finding=textFinding(content.toString(encoding));
+    const finding=textFinding(content.toString(encoding),findings);
     if(finding)return finding;
   }
   // swap16 requires whole code units; a trailing byte cannot encode a token character.
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
-  return textFinding(swapped.toString('utf16le'));
+  return textFinding(swapped.toString('utf16le'),findings);
 }
 
 function entropy(text) {
@@ -234,7 +240,7 @@ const decodeEscapes=text=>text.replace(escapeSequence,(all,x,u,U,braced,octal,ch
   return char===undefined?'':escapeChars[char]??char;
 });
 // Linear: three views of the same text (raw, decoded, backslashes dropped).
-const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(text.replace(/\\/g,''));
+const decodedFinding=(text,findings)=>textFinding(text,findings)??textFinding(decodeEscapes(text),findings)??textFinding(text.replace(/\\/g,''),findings);
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
 // line that is not. Returns null when more than maxContinuationLines remain (caller blocks).
 function continuationLines(text,from,indent) {
@@ -249,19 +255,26 @@ function continuationLines(text,from,indent) {
   return Object.assign(lines,{end:text.length});
 }
 // Credential formats and unreadable evidence block. Readable generic evidence is advisory.
-export function credentialContentFinding(path,content) {
+/** All blocking findings, including views normally masked by an earlier match. */
+export function credentialContentFindings(path,content) {
+  const findings=new Set();
+  const finding=credentialContentFinding(path,content,findings);
+  if(finding)findings.add(finding);
+  return [...findings];
+}
+export function credentialContentFinding(path,content,findings) {
   // Unreadable bytes must never hide a credential in another decoded view.
-  const raw=credentialBufferFinding(content);
+  const raw=credentialBufferFinding(content,findings);
   if(raw)return raw;
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
-  const escaped=decodedFinding(text);
+  const escaped=decodedFinding(text,findings);
   if(escaped)return escaped;
   const leaf=classifyManifestPath(path).names.at(-1);
-  if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
+  if(/\.json$/.test(leaf))return designTokenSecretFinding(content,{findings});
   // Block-only mode returns an unbounded continuation or a credential format split across scalar lines.
-  return assignmentFinding(text,true,path);
+  return assignmentFinding(text,true,path,findings);
 }
 // Field names are diagnostic data too; never echo a credential-bearing or unbounded name.
 const findingField=field=>textFinding(field)||field.length>80?`field-sha256-${sha(field).slice(0,12)}`:field;
@@ -276,7 +289,7 @@ export function credentialContentWarning(path,content) {
 }
 // blockOnly: report only blocking evidence (unbounded continuation); generic findings never mask it.
 // `path` selects the test-file and source/prose exemptions (R824/R825); without it none applies.
-function assignmentFinding(text,blockOnly=false,path='') {
+function assignmentFinding(text,blockOnly=false,path='',findings) {
   const leaf=path?classifyManifestPath(path).names.at(-1):'';
   const testSource=path?isTestFile(path):false;
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
@@ -303,7 +316,7 @@ function assignmentFinding(text,blockOnly=false,path='') {
       // A folded, plain or quoted multi-line scalar can split a credential format across lines.
       // A key nested inside an already-joined block is a substring of that join: scan each block once (linear).
       if(blockOnly&&continuation.length&&match.index>=joinedUntil) {
-        const joined=decodedFinding(literal+continuation.join(''));
+        const joined=decodedFinding(literal+continuation.join(''),findings);
         if(joined)return joined;
         joinedUntil=continuation.end;
       }
@@ -348,16 +361,16 @@ function assignmentFinding(text,blockOnly=false,path='') {
   return null;
 }
 // Scan decoded JSON literals as well as raw text; duplicate keys remain visible.
-export function designTokenSecretFinding(content,{warnings=false}={}) {
+export function designTokenSecretFinding(content,{warnings=false,findings}={}) {
   let text;
-  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return warnings?null:credentialBufferFinding(content)??'unsupported-text-encoding';}
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return warnings?null:credentialBufferFinding(content,findings)??'unsupported-text-encoding';}
   if(!warnings) {
-    const raw=textFinding(text);
+    const raw=textFinding(text,findings);
     if(raw)return raw;
     // Inspect decoded literals too, including duplicate fields and malformed documents.
     for(const [literal] of text.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
       let value;try {value=JSON.parse(literal);} catch {continue;}
-      const decoded=textFinding(value);if(decoded)return decoded;
+      const decoded=textFinding(value,findings);if(decoded)return decoded;
     }
   }
   if(text.includes('\0'))return warnings?null:'unsupported-text-encoding';

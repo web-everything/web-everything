@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { credentialContentFinding, credentialContentWarning } from '../forge-exec-manifest.mjs';
+import { credentialContentFinding, credentialContentFindings, credentialContentWarning } from '../forge-exec-manifest.mjs';
 
 const path=Buffer.from('.github/workflows/ci.yml');
 const scan=text=>{
@@ -176,6 +176,30 @@ describe('credentialContentFinding code expressions in test files (R824)', () =>
 });
 
 describe('credential format byte views', () => {
+  const github = 'ghp_' + 'a'.repeat(36);
+  const aws = 'AKIA' + 'ABCDEFGHIJKLMNOP';
+  it.each(['latin1', 'utf8', 'utf16le', 'utf16be'])('collects every token class from %s while preserving the first finding', encoding => {
+    const text = `${github}\n${aws}`;
+    const content = Buffer.from(text, encoding === 'utf16be' ? 'utf16le' : encoding);
+    if (encoding === 'utf16be') content.swap16();
+    expect(credentialContentFinding(path, content)).toBe('github-token');
+    expect(credentialContentFindings(path, content)).toEqual(expect.arrayContaining(['github-token', 'aws-access-key']));
+  });
+  it('collects escaped credentials masked by a raw token', () => {
+    const content = Buffer.from(`${github}\n\\u0041${aws.slice(1)}`);
+    expect(credentialContentFinding(path, content)).toBe('github-token');
+    expect(credentialContentFindings(path, content)).toEqual(['github-token', 'aws-access-key']);
+  });
+  it('collects escaped credentials in duplicate JSON fields masked by a raw token', () => {
+    const content = Buffer.from(`{"fixture":"${github}","value":"\\u0041${aws.slice(1)}","value":"clean"}`);
+    expect(credentialContentFindings(Buffer.from('fixture.json'), content)).toEqual(['github-token', 'aws-access-key']);
+  });
+  it('retains unreadable structured evidence masked by a public token', () => {
+    expect(credentialContentFindings(Buffer.from('fixture.json'), Buffer.from(github)))
+      .toEqual(['github-token', 'unparseable-json']);
+    expect(credentialContentFindings(path, Buffer.concat([Buffer.from(github), Buffer.from([255])])))
+      .toEqual(['github-token', 'unsupported-text-encoding']);
+  });
   it.each(['latin1', 'utf8', 'utf16le', 'utf16be'])('blocks a GitHub token decoded from %s', encoding => {
     const token = 'ghp_' + 'a'.repeat(36);
     const content = encoding === 'utf16be' ? Buffer.from(token, 'utf16le').swap16() : Buffer.from(token, encoding);

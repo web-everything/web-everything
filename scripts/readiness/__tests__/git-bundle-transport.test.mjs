@@ -452,6 +452,24 @@ describe('bundle scan public origin/main history exemptions', () => {
       await publishHistory(path, text);
       expect(await scan(await put(path, text))).toMatchObject({ path, finding: 'github-token' });
     });
+  it.each(['unicode', 'hex', 'octal', 'quoted-character', 'dropped-backslash', 'json', 'folded-scalar'])(
+    'does not let a public GitHub token hide an encoded AWS access key (%s)', async encoding => {
+      const aws = 'AKIA' + 'ABCDEFGHIJKLMNOP';
+      const encoded = {
+        unicode: '\\u0041' + aws.slice(1),
+        hex: '\\x41' + aws.slice(1),
+        octal: '\\101' + aws.slice(1),
+        'quoted-character': '\\A' + aws.slice(1),
+        'dropped-backslash': 'A\\K' + aws.slice(2),
+        json: '\\u0041' + aws.slice(1),
+      }[encoding];
+      const path = encoding === 'json' ? 'mixed.json' : encoding === 'folded-scalar' ? 'mixed.yml' : 'mixed.test.mjs';
+      const text = encoding === 'json' ? `{"fixture":"${token}","value":"${encoded}"}`
+        : encoding === 'folded-scalar' ? `fixture: ${token}\nsecret: >\n  ${aws.slice(0, 2)}\n  ${aws.slice(2)}\n`
+        : `${token}\n${encoded}\n`;
+      await publishHistory(path, text);
+      expect(await scan(await put(path, text))).toMatchObject({ path, finding: 'github-token' });
+    });
   it('does not exempt excluded paths even when their exact blob is public', async () => {
     await publishHistory('credentials.txt', token);
     expect(await scan(await put('credentials.txt', token))).toMatchObject({ finding: 'excluded-path' });

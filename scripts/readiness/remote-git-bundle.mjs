@@ -8,7 +8,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { classifyManifestPath, credentialTextFinding, secretText, credentialBufferFinding, credentialContentFinding, credentialContentWarning, excludedDotFile, secretFileName, unsafeComponentName } from './forge-exec-manifest.mjs';
+import { classifyManifestPath, credentialTextFinding, secretText, credentialBufferFinding, credentialContentFinding, credentialContentFindings, credentialContentWarning, excludedDotFile, secretFileName, unsafeComponentName } from './forge-exec-manifest.mjs';
 
 // A commit message names things in prose (for example a fix titled with the key-label words). The bare words are not key material, so the
 // message-only rule drops the bare-words pattern; an armour line stays caught by pem-header, and a DER key
@@ -202,11 +202,13 @@ async function isPublicBlob({ git, base, label, sha }) {
   } catch { return false; }
 }
 const PUBLIC_CONTENT_FINDINGS = new Set(['github-token', 'private-key', 'pem-header']);
-function publicContentFindings(content, findings) {
+function publicContentFindings(path, content, findings) {
   const present = new Set(findings.filter(Boolean));
+  try {
+    for (const finding of credentialContentFindings(path, content)) present.add(finding);
+  } catch { present.add('content-scan-error'); }
   const swapped = Buffer.from(content.subarray(0, content.length - content.length % 2)).swap16();
   for (const text of [content.toString('latin1'), content.toString('utf8'), content.toString('utf16le'), swapped.toString('utf16le')]) {
-    for (const [pattern, name] of secretText) if (pattern.test(text)) present.add(name);
     if (KEY_BODY.test(text)) present.add(KEY_RULE);
   }
   return [...present];
@@ -437,7 +439,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
         const hit = policy ?? finding;
         if (hit) {
           const publicContent = path.equals(Buffer.from(label))
-            && publicContentFindings(content, [policy, finding]).every(f => PUBLIC_CONTENT_FINDINGS.has(f))
+            && publicContentFindings(path, content, [policy, finding]).every(f => PUBLIC_CONTENT_FINDINGS.has(f))
             && await isPublicBlob({ git, base: publicMain, label, sha });
           const reviewed = !publicContent && allowedFindings(allowed, label, content, [policy, finding])
             && await isPublicBlob({ git, base: prerequisite, label, sha });
