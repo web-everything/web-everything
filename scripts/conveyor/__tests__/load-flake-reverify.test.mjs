@@ -401,6 +401,14 @@ describe('a pushed fix owes its re-arm (#4361)', () => {
     expect(fake.rearm).toHaveBeenCalledWith('web-everything/web-everything', 4361);
     expect(out.rearmed).toEqual([{ pr: 4361, sha: 'bbb2222', result: 'rearmed' }]);
   });
+  it('a fix-disabled repo still catches up the re-arm of an already-pushed fix', async () => {
+    const fake = io(stuck());
+    const out = await runLoadFlakeReverify({ repo: 'frontierui', resolveProfile: () => ({ capabilities: { fix: false } }) }, fake);
+    expect(fake.rearm).toHaveBeenCalledWith('frontier-ui/frontierui', 4361);
+    expect(out.rearmed).toEqual([{ pr: 4361, sha: 'bbb2222', result: 'rearmed' }]);
+    expect(fake.verify).not.toHaveBeenCalled();
+    expect(fake.push).not.toHaveBeenCalled();
+  });
   it('catch-up runs even when host load defers verification, and never in dry-run', async () => {
     const fake = io(stuck()); fake.loadavg = () => [50, 50];
     expect(await runLoadFlakeReverify({ config: reverifyConfig({}) }, fake)).toMatchObject({ deferred: 'host-load', rearmed: [expect.objectContaining({ pr: 4361 })] });
@@ -539,10 +547,23 @@ describe('defaultReverifyIo admission decision source (x9xkupj)', () => {
   });
 });
 
-it('does not read PRs or verify for a fix-disabled repo', async () => {
+it('reads lifecycle evidence but does not verify or push for a fix-disabled repo', async () => {
   const { io } = fixture();
   const out = await runLoadFlakeReverify({ repo: 'frontierui', resolveProfile: () => ({ capabilities: { fix: false } }) }, io);
   expect(out.deferred).toBe('unsupported-repo');
-  expect(io.listPrs).not.toHaveBeenCalled();
+  expect(io.listPrs).toHaveBeenCalledWith('frontier-ui/frontierui');
   expect(io.verify).not.toHaveBeenCalled();
+  expect(io.acquire).not.toHaveBeenCalled();
+  expect(io.push).not.toHaveBeenCalled();
+});
+
+
+it('ends an exhausted load-flake hold even when fix dispatch is disabled', async () => {
+  const { io } = fixture([red('2026-10-04T19:00:00Z'), red('2026-10-04T20:00:00Z'), red('2026-10-04T21:00:00Z')]);
+  const out = await runLoadFlakeReverify({ resolveProfile: () => ({ capabilities: { fix: false } }), config: reverifyConfig({}) }, io);
+  expect(out).toEqual({ result: 'exhausted' });
+  expect(io.comment).toHaveBeenCalledWith('web-everything/web-everything', 3881, expect.stringContaining('result=exhausted'));
+  expect(io.acquire).not.toHaveBeenCalled();
+  expect(io.verify).not.toHaveBeenCalled();
+  expect(io.push).not.toHaveBeenCalled();
 });

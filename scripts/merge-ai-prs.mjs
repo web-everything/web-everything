@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { constellationRepoKeysWith, repoHasCapability, repoProfile } from './lib/repo-profile.mjs';
+import { repoHasCapability, repoProfile } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -3799,26 +3799,26 @@ function normalizeExplicitRepos(repos, self) {
  * @param {{repos?:string|null, singleRepo?:boolean, self?:string|null}} o
  * @returns {Array<string|null>}
  */
-export function resolveRepos({ repos, singleRepo, self: rawSelf, resolveProfile = repoProfile } = {}) {
+// Lifecycle scope follows operator scoping but never a dispatch capability.
+export function resolveLifecycleRepos({ repos, singleRepo, self: rawSelf } = {}) {
   const self = typeof rawSelf === 'string' ? canonicalizeSlug(rawSelf) : rawSelf;
-  const reviewEnabled = repo => repoHasCapability(repo, 'review', { resolveProfile });
   if (typeof repos === 'string' && repos.trim()) {
     const list = normalizeExplicitRepos(repos, self);
-    if (list.length) return list.filter(reviewEnabled);
+    if (list.length) return list;
   }
-  // #2287 — the constellation is the DEFAULT (the backlog is WE-global, so cross-repo blockedBy needs one
-  // global cascade). Opt OUT with `--this-repo` for a deliberately scoped single-repo drain.
-  if (singleRepo) return reviewEnabled(self) ? [null] : [];
-  // The constellation spans ONE ORG PER REPO since the 2026-10-03 move, so when self IS a constellation repo the
-  // default set is the declared slugs themselves — never "self's owner x names", which would invent
-  // `web-everything/frontierui`. A non-constellation self (a fork) keeps the owner-times-names derivation.
-  const declared = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug);
+  if (singleRepo) return [null];
+  const declared = Object.values(CONSTELLATION_REPOS).map(r => r.slug);
   if (self && repoKeyForSlug(self) && !declared.includes(self)) return declared;
-  if (self && declared.includes(self)) return [self, ...declared.filter((s) => s !== self)];
+  if (self && declared.includes(self)) return [self, ...declared.filter(s => s !== self)];
   const owner = self && self.includes('/') ? self.split('/')[0] : null;
-  if (!owner) return reviewEnabled(self) ? [null] : []; // unknown dispatch targets fail closed
-  const slugs = CONSTELLATION_REPO_NAMES.map((n) => `${owner}/${n}`);
-  return [...new Set([self, ...slugs.filter((s) => s !== self)])].filter(reviewEnabled); // self first (the local clone), then the rest
+  if (!owner) return [null];
+  const slugs = CONSTELLATION_REPO_NAMES.map(n => `${owner}/${n}`);
+  return [...new Set([self, ...slugs.filter(s => s !== self)])];
+}
+
+// This is the action scope only. Listing, queue eviction and CI lifecycle reconciliation use the full scope.
+export function resolveRepos({ resolveProfile = repoProfile, ...scope } = {}) {
+  return resolveLifecycleRepos(scope).filter(repo => repoHasCapability(repo ?? scope.self, 'review', { resolveProfile }));
 }
 
 /**
@@ -4847,6 +4847,7 @@ async function runCli() {
   // constellation (the #2287 default; `--all-repos` is accepted as a harmless no-op alias of the default).
   const localSlug = localRepoSlug(); // #3440 — also THIS run's whole-process drain-lease repoKey (below)
   const REPOS = resolveRepos({ repos: typeof flags.repos === 'string' ? flags.repos : null, singleRepo: !!flags['this-repo'], self: localSlug });
+  const LIFECYCLE_REPOS = resolveLifecycleRepos({ repos: typeof flags.repos === 'string' ? flags.repos : null, singleRepo: !!flags['this-repo'], self: localSlug });
   // #xc7p3q9 (Fix 1 / B8) — the CONTEXT repo set for `collectOpenPrContext` is the FULL constellation, UNION'd
   // with REPOS, regardless of `--only`/`--repos`/`--this-repo` narrowing. The couple gate reads carrier HEALTH
   // (held / nameable / degraded) out of this blind context, so a WE carrier NARROWED out of a `--repos=<impl>` /
@@ -4857,7 +4858,7 @@ async function runCli() {
   const CONTEXT_REPOS = resolveContextRepos(REPOS, localSlug, flags.repos);
   // #2458 — THIS run's repo scope (`null` = the cwd repo → normalize to localSlug), recorded in the drain
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
-  const leaseScope = [...new Set(REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
+  const leaseScope = [...new Set(LIFECYCLE_REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
   const repoFlag = (repo) => (repo ? ['--repo', repo] : []);      // a slug → scope the gh call; null → cwd repo
   // Provisioning receives the memo identity as --repo. Match implicit PR edits: honour GH_REPO, then
   // let gh resolve its default remote (which may differ from origin). Resolve once, only when needed;
@@ -5756,7 +5757,7 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
     }
   };
-  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)))]));
+  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(LIFECYCLE_REPOS, LIFECYCLE_REPOS.length, listOne), __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)))]));
   if (listingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));
   // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
   // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
@@ -5839,7 +5840,7 @@ async function runCli() {
   }));
   // #2421 (generalizes #2216) — total ci-lifecycle relabel first, per swept repo.
   const __gateReadsT0 = __t.mark();
-  for (const repo of REPOS) reconciledLabels.push(...reconcileCiLifecycleLabels(repo, openPrContext));
+  for (const repo of LIFECYCLE_REPOS) reconciledLabels.push(...reconcileCiLifecycleLabels(repo, openPrContext));
   try {
     const settings = resolveRefreshSettings(), log = AS_JSON ? { write() {} } : process.stderr;
     logRefreshSettings(settings, log);
@@ -7870,7 +7871,7 @@ async function runCli() {
   // plateau-app-side passthrough change (see this PR's own body for why it isn't bundled here).
   // #gh-graphql-budget — this pass's own writes (merges, label flips, parks) go straight to `gh`, not through the
   // throttle that marks the shared open-PR snapshot dirty on a write — so mark it here, once, when anything moved.
-  if (merged.length || reconciledLabels.length || parked.length) for (const r of REPOS) markPrSnapshotDirty({ repo: r || localSlug });
+  if (merged.length || reconciledLabels.length || parked.length) for (const r of LIFECYCLE_REPOS) markPrSnapshotDirty({ repo: r || localSlug });
   const passTotalMs = Date.now() - __passStart;
   const timingSteps = __t.snapshot();
   const timings = { ...timingSteps, total: passTotalMs };

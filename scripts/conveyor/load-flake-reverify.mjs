@@ -1,7 +1,7 @@
 /** Local verify / host-load counterpart to #4999 (CI per-test flake scoring and quarantine).
  * Pure planning plus injectable IO. A quiet host retries one saved fix, never force-pushing.
  */
-import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
+import { repoHasCapability, repoProfile } from '../lib/repo-profile.mjs';
 import os from 'node:os';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -95,7 +95,7 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
 
 /** Programmatic default stays WE; the CLI sweeps the constellation when no repo is specified. */
 export const REVERIFY_DEFAULT_REPO = 'we';
-export const REVERIFY_SWEEP_REPOS = constellationRepoKeysWith('fix');
+export const REVERIFY_SWEEP_REPOS = Object.keys(CONSTELLATION_REPOS);
 
 export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig(), resolveProfile = repoProfile } = {}, io = defaultReverifyIo(config)) {
   const now = io.now();
@@ -103,7 +103,6 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   const cores = io.cpuCount();
   const key = repoKeyForSlug(repo);
   if (!key) throw new Error(`unknown repo: ${repo}`);
-  if (!constellationRepoKeysWith('fix', { resolveProfile }).includes(key)) return { repo, deferred: 'unsupported-repo' };
   const slug = CONSTELLATION_REPOS[key].slug;
   const prs = await io.listPrs(slug);
   // One shared decision per run (x9xkupj). An admission probe that throws or answers nothing leaves the legacy rule.
@@ -134,14 +133,14 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   // Cheap redispatches all run first; then the saved-fix path still stops after one progress outcome.
   for (const candidate of plan.candidates.filter((c) => c.hold.redispatch)) {
     try {
-      redispatched.push({ pr: candidate.pr.number, ...await reverifyCandidate({ candidate, key, slug, config, load, cores, admission }, io) });
+      redispatched.push({ pr: candidate.pr.number, ...await reverifyCandidate({ candidate, key, slug, config, load, cores, admission, resolveProfile }, io) });
     } catch (e) {
       redispatched.push({ pr: candidate.pr.number, error: String(e?.message ?? e) });
     }
   }
   for (const candidate of plan.candidates.filter((c) => !c.hold.redispatch)) {
     try {
-      const out = await reverifyCandidate({ candidate, key, slug, config }, io);
+      const out = await reverifyCandidate({ candidate, key, slug, config, resolveProfile }, io);
       if (!NON_PROGRESS.has(out.deferred)) return finish(out);
       lastDeferral = out;
     } catch (e) {
@@ -181,7 +180,7 @@ export async function rearmPushedFixes({ prs = [], slug }, io) {
   return out;
 }
 
-async function reverifyCandidate({ candidate, key, slug, config, load, cores, admission }, io) {
+async function reverifyCandidate({ candidate, key, slug, config, load, cores, admission, resolveProfile }, io) {
   const { pr, hold, attempts } = candidate;
   let mergeMain = null;
   const post = (result, text = '') => {
@@ -205,6 +204,10 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
   };
   let refusal = await check();
   if (refusal) return refusal;
+  // Exhaustion ends a hold without starting a repair; capability never suppresses that cleanup.
+  if (attempts >= config.maxAttempts) { await post('exhausted'); return { result: 'exhausted', ...(hold.redispatch ? { pr: pr.number } : {}) }; }
+  const unsupported = () => !repoHasCapability(key, 'fix', { resolveProfile });
+  if (unsupported()) return { deferred: 'unsupported-repo' };
   // #xg0rkxn (live plateau #220): a re-dispatch on the old head re-runs without whatever main fixed meanwhile (#221, the
   // very timing tests that flaked). Merge main into the head first; a conflict is left to the conflict-fix path.
   if (hold.redispatch && attempts < config.maxAttempts && config.mergeMainBeforeRetry && typeof io.mergeMain === 'function') {
@@ -212,7 +215,8 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
     if (mergeMain?.result !== 'up-to-date') console.error(`load-flake reverify: ${slug}#${pr.number} main ${mergeMain?.result}${mergeMain?.sha ? ` → ${mergeMain.sha.slice(0, 9)}` : ''} before the retry`);
   }
   if (hold.redispatch) {
-    const result = attempts >= config.maxAttempts ? 'exhausted' : 'redispatched';
+    if (unsupported()) return { deferred: 'unsupported-repo' };
+    const result = 'redispatched';
     const loadText = `${load.slice(0, 2).map((n) => Math.round(n * 100) / 100).join('/')} on ${cores} cores`;
     const why = admission
       ? `resource admission ${admission.verdict} (${admission.reason}); load ${loadText} is comparison only`
@@ -221,7 +225,6 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
       ? `${why}; the fix loop re-dispatches a fixer against the same review findings (attempt ${attempts + 1} of ${config.maxAttempts})` : '');
     return { result, pr: pr.number };
   }
-  if (attempts >= config.maxAttempts) { await post('exhausted'); return { result: 'exhausted' }; }
   // Legacy holds have no recorded head: the fresh discovery head is still required as an ancestor.
   try {
     await io.prepare(slug, hold.alt.branch, pr.headRefName);
@@ -247,6 +250,7 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
       return { deferred: 'lane-head-mismatch' };
     }
     if (config.mode !== 'ci') {
+      if (unsupported()) return { deferred: 'unsupported-repo' };
       const verification = await io.verify(lane.path);
       if (!verification.ok) {
         // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
@@ -261,6 +265,7 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
     }
     refusal = await check();
     if (refusal) return refusal;
+    if (unsupported()) return { deferred: 'unsupported-repo' };
     await io.push(lane.path, hold.alt.sha, pr.headRefName);
     await post('pushed', config.mode === 'ci'
       ? "Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it." : '');

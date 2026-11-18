@@ -12,7 +12,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { labelOnGreenVerdict, isRequiredCheckGreen, isRequiredCheckFailed, isRequiredCheckPending, hasLabel, classifyPr, isRebaseDropCandidate, needsManifestStripBeforeMerge, restampAcceptance, spawnReviewSetLabel, isStackedWeCoupleHalf, shouldRepollForLabelLag, shouldLabelOnGreen, resolveRepos, siblingCloneName, regenDerivedOnLand, pushNumberingOnLand, resolvePrimaryPath, syncPrimaryOnLand, resyncDetachedCwdForLand, drainReasonMarker, buildDrainReasonComment, buildHeldReviewHoldReason, hasDrainReasonComment, shouldPostParkReasonComment, LAND_REASON, MERGE_TRACE_KIND, buildMergeTraceReason, CI_LIFECYCLE_LABELS, CI_LIFECYCLE_LABEL_META, lifecycleLabelFromCiTruth, planCiLifecycleLabelUpdate, hasStaleReviewPendingBesideAccept, remoteManifestApiArgs, landedIdsForCandidate, isAiGeneratedPr, isMechanicalMergeCommit } from '../merge-ai-prs.mjs';
+import { labelOnGreenVerdict, isRequiredCheckGreen, isRequiredCheckFailed, isRequiredCheckPending, hasLabel, classifyPr, isRebaseDropCandidate, needsManifestStripBeforeMerge, restampAcceptance, spawnReviewSetLabel, isStackedWeCoupleHalf, shouldRepollForLabelLag, shouldLabelOnGreen, resolveLifecycleRepos, resolveRepos, siblingCloneName, regenDerivedOnLand, pushNumberingOnLand, resolvePrimaryPath, syncPrimaryOnLand, resyncDetachedCwdForLand, drainReasonMarker, buildDrainReasonComment, buildHeldReviewHoldReason, hasDrainReasonComment, shouldPostParkReasonComment, LAND_REASON, MERGE_TRACE_KIND, buildMergeTraceReason, CI_LIFECYCLE_LABELS, CI_LIFECYCLE_LABEL_META, lifecycleLabelFromCiTruth, planCiLifecycleLabelUpdate, hasStaleReviewPendingBesideAccept, remoteManifestApiArgs, landedIdsForCandidate, isAiGeneratedPr, isMechanicalMergeCommit } from '../merge-ai-prs.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { claudeCommit, humanCommit, greenRollup, aiPr } from './fixtures/merge-ai-prs-fixtures.mjs';
 
@@ -1503,4 +1503,18 @@ it('filters review-disabled self and derived repos in the owner-times-names fall
     ? { capabilities: { review: false } } : { capabilities: { review: true } };
   expect(resolveRepos({ self: 'acme/fork', resolveProfile })).toEqual(['acme/web-everything', 'acme/plateau-app']);
   expect(resolveRepos({ self: 'acme/web-everything', resolveProfile })).toEqual(['acme/web-everything', 'acme/plateau-app']);
+});
+
+
+it('keeps review-disabled repos in the drain lifecycle scope for label reconciliation and queue eviction', () => {
+  const resolveProfile = () => ({ capabilities: { review: false } });
+  const scope = { self: 'frontier-ui/frontierui', resolveProfile };
+  expect(resolveRepos(scope)).toEqual([]);
+  expect(resolveLifecycleRepos(scope)).toEqual([
+    'frontier-ui/frontierui', 'web-everything/web-everything', 'plateauapp/plateau-app',
+  ]);
+  const explicit = { ...scope, repos: 'frontierui,longshore', singleRepo: true };
+  expect(resolveRepos(explicit)).toEqual([]);
+  expect(resolveLifecycleRepos(explicit)).toEqual(['frontier-ui/frontierui', 'longshoreai/longshore']);
+  expect(resolveLifecycleRepos({ ...scope, singleRepo: true })).toEqual([null]);
 });

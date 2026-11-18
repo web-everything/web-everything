@@ -313,8 +313,8 @@ export async function runReconcileCiHealDispatchAllRepos({ resolveProfile = repo
  *   refusals:Array<object>, reconcileRefusals:Array<object>}} same shape as
  *   {@link runReconcileCiHealDispatchAllRepos}'s own return, repo-tagged the same way.
  */
-export function runPromoteDraftDispatchAllRepos({ resolveProfile = repoProfile, repos = reposWith('review', resolveProfile), tick = runReconcilePromoteDraftDispatch, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(eligibleRepos(repos, 'review', resolveProfile), (repo) => tick({ ...tickOpts, repo }));
+export function runPromoteDraftDispatchAllRepos({ resolveProfile = repoProfile, repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcilePromoteDraftDispatch, ...tickOpts } = {}) {
+  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, resolveProfile }));
   const dispatched = [];
   const refusals = [];
   const reconcileRefusals = [];

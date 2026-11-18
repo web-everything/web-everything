@@ -487,7 +487,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+              ? { repo: 'repo-a', ...(['ci-heal', 'promote-draft'].includes(step) ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
     expect(readPrs).toHaveBeenCalledTimes(1);
@@ -503,7 +503,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     // R242 audit round 3: preserve durable flush ordering and fresh-evidence writes.
     for (const step of ['ci-heal', 'notes']) {
       expect(opts[steps[step]]).toHaveBeenCalledTimes(1);
-      expect(opts[steps[step]]).toHaveBeenCalledWith({ repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+      expect(opts[steps[step]]).toHaveBeenCalledWith({ repo: 'repo-a', ...(['ci-heal', 'promote-draft'].includes(step) ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
       expect(result.skippedSteps).not.toContain(step);
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
@@ -660,7 +660,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+              ? { repo: 'repo-a', ...(['ci-heal', 'promote-draft'].includes(step) ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
     expect(result.skippedSteps ?? []).toEqual([]);
     expect(skipLines(log)).toEqual([]);
@@ -767,7 +767,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+              ? { repo: 'repo-a', ...(['ci-heal', 'promote-draft'].includes(step) ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
   });
 
@@ -839,7 +839,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       // R242 audit round 3 reverses earlier sharing expectations: these owners
       // must always run their historical paths for flush ordering and fresh writes.
       if (['ci-heal', 'notes'].includes(step)) {
-        expect(options).toEqual({ repo: options.repo, ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), deadlineAt: expect.any(Number), cursor: undefined, now: expect.any(Function) });
+        expect(options).toEqual({ repo: options.repo, ...(['ci-heal', 'promote-draft'].includes(step) ? { resolveProfile: fixtureProfile } : {}), deadlineAt: expect.any(Number), cursor: undefined, now: expect.any(Function) });
         seen.push([step, options.repo]);
         return fallback();
       }
@@ -2946,7 +2946,7 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
 
 import { repoProfile as capabilityProfile } from '../../../scripts/lib/repo-profile.mjs';
 it.each([
-  [runPromoteDraftDispatchAllRepos, 'review'], [runHungCiRecoveryAllRepos, 'ciHeal'],
+  [runHungCiRecoveryAllRepos, 'ciHeal'],
   [runMainRedRebaseAllRepos, 'ciHeal'], [runMissingRunRecoveryAllRepos, 'ciHeal'],
 ])('filters disabled repos from each stage default roster (%s, %s)', async (run, capability) => {
   const resolveProfile = key => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, [capability]: key !== 'frontierui' } });
@@ -2959,7 +2959,7 @@ it.each([
 });
 
 it.each([
-  [runPromoteDraftDispatchAllRepos, 'review'], [runHungCiRecoveryAllRepos, 'ciHeal'],
+  [runHungCiRecoveryAllRepos, 'ciHeal'],
   [runMainRedRebaseAllRepos, 'ciHeal'], [runMissingRunRecoveryAllRepos, 'ciHeal'],
 ])('refuses explicit pending and disabled targets and unknown targets (%s, %s)', async (run, capability) => {
   const tick = vi.fn(() => ({}));
@@ -2970,7 +2970,7 @@ it.each([
 });
 
 
-it.each([[runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal']])(
+it.each([[runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal'], [runPromoteDraftDispatchAllRepos, 'review']])(
   'ticks every repo regardless of %s capability', async (run, capability) => {
     const resolveProfile = () => ({ capabilities: { [capability]: false } });
     const tick = vi.fn(() => ({}));
@@ -3008,4 +3008,33 @@ it('flushes owed writes and timeout follow-ups for a ciHeal-disabled repo withou
     expect(result.refusals).toEqual([expect.objectContaining({ kind: 'unsupported-repo', prNumber: 7 })]);
     expect(dispatch).not.toHaveBeenCalled();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+it.each([false, null, 'throws'])('review-disabled or unreadable profile (%s) restores holds and closes superseded PRs without promotion', capability => {
+  const ready = vi.fn(), addLabel = vi.fn(), removeLabel = vi.fn(), closePr = vi.fn();
+  const clearAwaitingCi = vi.fn();
+  const repo = 'frontier-ui/frontierui';
+  const result = runPromoteDraftDispatchAllRepos({
+    repos: [repo], resolveProfile: () => {
+      if (capability === 'throws') throw new Error('profile unreadable');
+      return capability === null ? null : { capabilities: { review: capability } };
+    },
+    root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+    reconcile: () => ({ dispatch: [
+      { kind: 'promote-draft', prNumber: 1, headRefOid: 'abc' },
+      { kind: 'restore-review-label', prNumber: 2, variant: 'stuck' },
+      { kind: 'close-superseded', prNumber: 3, operatorAnswer: {} },
+    ], refusals: [] }),
+    provider: { ready }, readHeadCheckState: () => ({ state: 'green' }),
+    readPrLabels: ({ prNumber }) => prNumber === 2 ? ['ready-to-merge'] : [],
+    readCardsOnMain: () => [], addLabel, removeLabel, closePr, clearAwaitingCi,
+  });
+  expect(addLabel).toHaveBeenCalledWith({ repoSlug: repo, prNumber: 2, label: 'review:pending' });
+  expect(removeLabel).toHaveBeenCalledWith({ repoSlug: repo, prNumber: 2, label: 'ready-to-merge' });
+  expect(closePr).toHaveBeenCalledWith(expect.objectContaining({ repoSlug: repo, prNumber: 3 }));
+  expect(result.dispatched.map(row => row.kind)).toEqual(['restore-review-label', 'close-superseded']);
+  expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1, kind: 'unsupported-repo' }));
+  expect(ready).not.toHaveBeenCalled();
+  expect(clearAwaitingCi).not.toHaveBeenCalled();
 });

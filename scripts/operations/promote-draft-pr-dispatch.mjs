@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { repoHasCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
@@ -268,6 +269,7 @@ export function ownedCards(cards, view = {}) {
 export function runReconcilePromoteDraftDispatch({
   root = process.cwd(),
   repo = null,
+  resolveProfile = repoProfile,
   reconcile = runReconcilePass,
   prsFile,
   provider,
@@ -408,6 +410,11 @@ export function runReconcilePromoteDraftDispatch({
         pr: entry.prNumber, kind: redTeamHold === 'red-team:blocked' ? 'red-team-blocked' : 'red-team-pending', headSha: sha,
         why: `${redTeamHold} — a draft held by red team is never promoted`,
       });
+      continue;
+    }
+    // Capability controls promotion only; review holds and operator closures below always run.
+    if (!repoHasCapability(repoSlug, 'review', { resolveProfile })) {
+      refusals.push({ pr: entry.prNumber, kind: 'unsupported-repo', why: 'review capability unavailable — operator must re-enable it before promotion' });
       continue;
     }
     try {
