@@ -22,6 +22,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import {
   JUDGE_CLI,
@@ -764,14 +765,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       .rejects.toThrow(/exceeded 5ms and was killed/);
   });
 
-  /**
-   * #3203 — THE WALL IS NO LONGER TOTAL LOSS.
-   *
-   * The kill used to `reject`, discarding every byte the juror had already written. A tool-bearing juror at
-   * the wall has usually done most of the review, so the round cost full price and delivered nothing, could
-   * not resume, and — because which round dies depends on how much work the juror chose to do — read as
-   * flakiness rather than as a bound being hit. Two of ten measured rounds on 2026-08-19 died this way.
-   */
+  // Timeout output remains diagnostic evidence, never an accepted verdict.
   describe('a juror that hits the wall', () => {
     // A child that emits a COMPLETE answer and then never exits: the exact shape the old code threw away.
     const answeringChild = (payload) => {
@@ -795,24 +789,39 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       structured_output: { verdict: 'reject', findings: ['found it just before the wall'] },
     };
 
-    it('returns the review the juror had already produced, instead of discarding it', async () => {
-      const r = await judgeSpawn({
+    it('rejects a valid verdict with JudgeTimeoutError when only the grace timer settles', async () => {
+      const err = await judgeSpawn({
         mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, timeoutMs: 5,
         spawnFn: () => answeringChild(ANSWER),
-      });
-      expect(r.value).toEqual({ verdict: 'reject', findings: ['found it just before the wall'] });
-      expect(r.costUsd).toBe(1.42);
+      }).catch(e => e);
+      expect(err).toBeInstanceOf(JudgeTimeoutError);
+      expect(err.timedOut).toBe(true);
+      expect(JSON.parse(err.partialStdout)).toEqual(ANSWER);
     });
 
-    // "Hit the bound" and "crashed" are different facts about a review, and before this they arrived
-    // identically. A caller that cannot tell them apart learns to retry rather than to look.
-    it('marks the result as timed out, so the record can say which happened', async () => {
-      const r = await judgeSpawn({
-        mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, timeoutMs: 5,
-        spawnFn: () => answeringChild(ANSWER),
-      });
-      expect(r.timedOut).toBe(true);
-    });
+    it.each(['timeout', 'SIGTERM'])(
+      'rejects a fake CLI that prints a valid verdict then exits by %s', async (termination) => {
+        const stdout = JSON.stringify(ANSWER);
+        const script = `process.stdout.write(${JSON.stringify(stdout)}, () => {
+          ${termination === 'timeout' ? 'setInterval(() => {}, 1000);' : "process.kill(process.pid, 'SIGTERM');"}
+        });`;
+        let child;
+        const err = await judgeSpawn({
+          mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+          timeoutMs: 1500, retries: 0,
+          spawnFn: (_cli, _argv, options) => (child = spawn(process.execPath, ['-e', script], options)),
+        }).catch(e => e);
+        expect(err).toBeInstanceOf(termination === 'timeout' ? JudgeTimeoutError : JudgeUnparseableError);
+        expect(child.signalCode).toBe(termination === 'timeout' ? 'SIGKILL' : 'SIGTERM');
+        if (termination === 'timeout') {
+          expect(err.partialStdout).toBe(stdout);
+        } else {
+          expect(err).toMatchObject({ exitCode: null, signal: 'SIGTERM' });
+          expect(err.failedAttempts[0].stdoutBytes).toBe(stdout.length);
+          expect(err.message).toContain('juror process failed');
+        }
+      },
+    );
 
     it('marks an ordinary completed juror as NOT timed out', async () => {
       const spawnFn = () => {
@@ -1486,6 +1495,19 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     expect(err.message).not.toContain('stdout[0..600]');
     expect(err.failedAttempts).toHaveLength(2);
     expect(err.failedAttempts[0].reason).toMatch(violation);
+  });
+
+  it.each([
+    [null, null],
+    [null, 'SIGTERM'],
+    [0, 'SIGTERM'],
+  ])('rejects a valid verdict with exit code %s and signal %s', async (code, signal) => {
+    const { fn } = scriptedSpawn([{ stdout: ANSWER_JSON, code, signal }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 0, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err).toMatchObject({ exitCode: code, signal });
+    expect(err.message).toContain('juror process failed');
   });
 
   it('rejects a parsed verdict after nonzero exit and records bounded failure evidence', async () => {

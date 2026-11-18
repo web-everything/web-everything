@@ -261,7 +261,7 @@ export class JudgeUnparseableError extends Error {
 }
 
 /**
- * A juror that hit the wall AND left nothing parseable behind.
+ * A juror that hit the wall, regardless of any output it left behind.
  *
  * A DISTINCT TYPE because the run record must distinguish "hit the bound" from "crashed", and before this it
  * could not (#3203, Done-when 3): both arrived as a bare `Error`, so a wall-clock kill read as a juror
@@ -272,7 +272,7 @@ export class JudgeTimeoutError extends Error {
   constructor({ timeoutMs, wallMs, stdout = '', stderr = '' }) {
     super(
       `judge-spawn: the juror exceeded ${timeoutMs}ms and was killed (ran ${wallMs}ms). `
-      + 'Its output did not parse, so no partial verdict is available — but this is a BOUND being hit, not a '
+      + 'Its output cannot count as a verdict — this is a BOUND being hit, not a '
       + `crash: see JUDGE_TIMEOUT_MS for what the bound was derived from.\n`
       + `stdout[0..600]: ${String(stdout).slice(0, 600)}\n`
       + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`,
@@ -924,9 +924,8 @@ export async function judgeSpawn({
 
     const startedAt = Date.now();
     // THE KILL RESOLVES, IT DOES NOT REJECT (#3203). It used to reject, which threw away every byte the juror had
-    // already written — and a tool-bearing juror at the wall has usually done most of the review. Killing and
-    // then settling with the accumulated streams turns total loss into a parse attempt: often the answer IS
-    // there and only the process failed to exit.
+    // already written. Settle with the accumulated streams so the timeout error retains diagnostic evidence;
+    // output from a killed juror cannot count as a verdict.
     const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
       let child;
       try {
@@ -975,6 +974,7 @@ export async function judgeSpawn({
 
     const thisAttemptMs = Date.now() - startedAt;
     wallMs += thisAttemptMs;
+    if (timedOut) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
     let outcome;
     try {
       // Preserve explicit CLI failures (including quota and budget errors).
@@ -989,16 +989,13 @@ export async function judgeSpawn({
         error.verdictIntegrity = true;
         throw error;
       }
-      if ((code !== null && code !== 0) || (!timedOut && signal)) {
+      if (code !== 0 || signal != null) {
         const error = new Error(`juror process failed (exit ${code ?? 'none'}, signal ${signal ?? 'none'})`);
         error.unparseableStdout = true;
         error.verdictIntegrity = true;
         throw error;
       }
     } catch (error) {
-      if (timedOut && !error.verdictIntegrity) {
-        throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
-      }
       if (error.unparseableStdout !== true) throw error;
       const reason = error.verdictIntegrity ? error.message : null;
       failedAttempts.push({
