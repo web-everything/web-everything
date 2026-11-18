@@ -27,6 +27,7 @@
  * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
+import { trustedAdvisoryComments } from '../lib/advisory-labels.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -99,22 +100,26 @@ export const STATUS_LABEL_RE = /^review-status:(reviewing|review-stalled|fixing|
 const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
 
 /** Head-bound acceptance is complete only with an unambiguous red-team clearance. */
-export function reviewConcluded(labels) {
-  if (!Array.isArray(labels)) return false;
+export function reviewConcluded(labels, subject) {
+  const head = subject?.headRefOid;
+  if (!Array.isArray(labels) || typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return false;
   const names = Array.from(labels, l => typeof l === 'string' ? l : l?.name);
   if (names.some(name => typeof name !== 'string' || !name)) return false;
   return names.includes('review:accepted') && names.includes('red-team:clear')
     && !names.some(name => ['review:pending', 'review:changes', 'review:human',
-      'red-team:pending', 'red-team:blocked', 'review-status:draft-withdrawn'].includes(name));
+      'red-team:pending', 'red-team:blocked', 'review-status:draft-withdrawn'].includes(name))
+    && trustedAdvisoryComments(subject?.comments).some(comment => typeof comment.body === 'string'
+      && [...comment.body.matchAll(/<!-- we:red-team-gate pr=\d+ rev=([a-f0-9]{40})\s[^<>]*-->/gi)]
+        .some(match => match[1].toLowerCase() === head.toLowerCase()));
 }
 
 // A newly dispatched review can briefly coexist with the preceding verdict labels.
 // Preserve its visible reviewing hold for two minutes; malformed/future dates keep that hold
-// until the evidence is repaired. Older timestamp-less rows rely on the head-bound labels alone.
+// until the evidence is repaired. Timestamp-less rows also keep that hold.
 const REVIEW_START_GRACE_MS = 120_000;
 function concludedReviewRow(row, now) {
   const stamps = [row.startedAt, row.updatedAt].filter(value => value !== undefined);
-  return stamps.every(value => {
+  return stamps.length > 0 && stamps.every(value => {
     const ms = typeof value === 'number' ? value : typeof value === 'string'
       ? (/^\d+$/.test(value.trim()) ? Number(value) : Date.parse(value)) : NaN;
     return Number.isFinite(ms) && ms > 0 && Number.isFinite(now) && now - ms >= REVIEW_START_GRACE_MS;
@@ -299,7 +304,7 @@ export function tagReviewStatus({
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
-    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: reviewConcluded(currentLabels) });
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: reviewConcluded(currentLabels, subject) });
   const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
     add: null,
     remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)

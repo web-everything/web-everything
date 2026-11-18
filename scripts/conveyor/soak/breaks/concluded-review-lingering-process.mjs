@@ -20,15 +20,24 @@ export default {
       log?.(`${name}: ${ok ? 'pass' : 'FAIL'}`);
     };
     const accepted = ['review:accepted', 'red-team:clear'];
-    for (const [verdict, expectedReview, expectedStatus] of [
+    const headRefOid = 'a'.repeat(40);
+    const comments = [{ author: { login: 'chalbert' },
+      body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` }];
+    for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}] of [
       [accepted, null, 'ready-to-merge'],
+      [accepted, 'reviewing', 'red-team', { headRefOid: 'b'.repeat(40) }],
+      [accepted, 'reviewing', 'red-team', { headRefOid: undefined }],
+      [accepted, 'reviewing', 'red-team', { comments: undefined }],
+      [accepted, 'reviewing', 'red-team', {}, { startedAt: undefined }],
+      [accepted, 'review-stalled', 'red-team', { comments: [] }, { state: 'blocked' }],
+      [accepted, 'review-stalled', 'red-team', {}, { state: 'blocked', startedAt: undefined }],
       [['review:accepted'], 'reviewing', 'red-team'],
       [[...accepted, 'review:pending'], 'reviewing', 'red-team'],
       [[...accepted, 'review:human'], 'reviewing', 'red-team'],
       [['review:pending'], 'reviewing', 'awaiting-review'],
       [['review:human'], 'reviewing', 'awaiting-review'],
     ]) {
-      let labels = [...verdict, 'review-status:reviewing', 'status:awaiting-review'];
+      let labels = [...verdict, `review-status:${agentFields.state === 'blocked' ? 'review-stalled' : 'reviewing'}`, 'status:awaiting-review'];
       const provider = {
         readLabels: () => labels.map(name => ({ name })), ensureLabel: () => {},
         setLabels: (_repo, _pr, { add, remove }) => {
@@ -38,14 +47,14 @@ export default {
       };
       const result = tagReviewStatus({ pr: 7099, repo: 'we', provider,
         agents: [{ name: 'review-7099', state: 'working', pid: 7099,
-          startedAt: Date.now() - 600_000 }],
+          startedAt: Date.now() - 600_000, ...agentFields }],
         prState: { number: 7099, state: 'OPEN', isDraft: false, baseRefName: 'main',
-          headRefOid: 'a'.repeat(40), mergeable: 'MERGEABLE', comments: [],
-          statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] },
+          headRefOid, mergeable: 'MERGEABLE', comments,
+          statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...prFields },
         readFixClaim: () => null, planRows: [], requiredChecks: ['test'],
         prStatusSettings: { acceptedRedTeamStatus: 'red-team' }, signalFix: () => {},
       });
-      const name = verdict.join(',');
+      const name = `${verdict.join(',')} head=${prFields.headRefOid ?? headRefOid} evidence=${JSON.stringify([prFields, agentFields])}`;
       check(result.label === (expectedReview ? `review-status:${expectedReview}` : null), `${name}: review result`);
       check(JSON.stringify(labels.filter(label => label.startsWith('review-status:')))
         === JSON.stringify(expectedReview ? [`review-status:${expectedReview}`] : []), `${name}: review labels`);

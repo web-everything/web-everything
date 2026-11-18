@@ -549,26 +549,41 @@ it('uses the PR snapshot to tag awaiting-base and clears it on promotion', () =>
 
 describe('concluded head review with a lingering process', () => {
   const accepted = ['review:accepted', 'red-team:clear'];
+  const headRefOid = 'ad05aa50' + 'a'.repeat(32);
+  const comment = { author: { login: 'chalbert' },
+    body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=clear -->` };
+  const subject = { headRefOid, comments: [comment] };
   const now = Date.parse('2026-11-18T12:00:00Z');
-  const row = { name: 'review-7099', state: 'working', pid: 12345 };
+  const row = { name: 'review-7099', state: 'working', pid: 12345, startedAt: now - 600_000 };
   const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
     reviewConcluded: true, now, agents: [{ ...row, ...fields }], ...options });
 
   it('requires both labels in either supported label shape', () => {
-    expect(reviewConcluded(accepted)).toBe(true);
-    expect(reviewConcluded(accepted.map(name => ({ name })))).toBe(true);
+    expect(reviewConcluded(accepted, subject)).toBe(true);
+    expect(reviewConcluded(accepted.map(name => ({ name })), subject)).toBe(true);
+    expect(reviewConcluded(accepted, { ...subject, headRefOid: headRefOid.toUpperCase() })).toBe(true);
   });
   it.each(['review:pending', 'review:changes', 'review:human', 'red-team:pending',
     'red-team:blocked', 'review-status:draft-withdrawn'])('fails closed on %s alongside acceptance', blocker => {
-    expect(reviewConcluded([...accepted, blocker])).toBe(false);
+    expect(reviewConcluded([...accepted, blocker], subject)).toBe(false);
   });
   it.each([undefined, null, {}, [], ['review:accepted'], ['red-team:clear'],
     [...accepted, null], [...accepted, {}]])('fails closed on incomplete or malformed labels %j', labels => {
-    expect(reviewConcluded(labels)).toBe(false);
+    expect(reviewConcluded(labels, subject)).toBe(false);
   });
-  it('ignores a concluded timestamp-less working or blocked review, but defaults to live', () => {
-    expect(derive()).toBeNull();
-    expect(derive({ state: 'blocked' })).toBeNull();
+  it.each([undefined, {}, { comments: [comment] }, { ...subject, headRefOid: '' },
+    { ...subject, headRefOid: headRefOid.slice(0, 8) }, { ...subject, headRefOid: headRefOid + 'a' },
+    { headRefOid }, { headRefOid, comments: [] }, { headRefOid, comments: {} },
+    { ...subject, headRefOid: 'b'.repeat(40) },
+    { headRefOid, comments: [{ ...comment, author: { login: 'stranger' } }] },
+    { headRefOid, comments: [{ body: comment.body }] },
+    { headRefOid, comments: [{ ...comment, body: comment.body.replace(headRefOid, headRefOid.slice(0, 8)) }] },
+  ])('fails closed on missing, stale, partial or untrusted head evidence %j', pr => {
+    expect(reviewConcluded(accepted, pr)).toBe(false);
+  });
+  it('keeps timestamp-less working and blocked rows live despite current-head clearance', () => {
+    expect(derive({ startedAt: undefined })?.state).toBe('reviewing');
+    expect(derive({ startedAt: undefined, state: 'blocked' })?.state).toBe('review-stalled');
     expect(derive({}, { reviewConcluded: false })).toEqual({ role: 'review', state: 'reviewing' });
     expect(derive({}, { reviewConcluded: 'true' })?.state).toBe('reviewing');
   });
@@ -601,7 +616,7 @@ describe('concluded head review with a lingering process', () => {
     })).toThrow('labels unavailable');
     expect(writes).toEqual([]);
   });
-  it('a tick removes stale reviewing and awaiting-review labels after acceptance', async () => {
+  it('ticks keep stale-head, missing-head, unstamped and blocked reviews live; current-head old rows become ready', async () => {
     const { default: scenario } = await import('../soak/breaks/concluded-review-lingering-process.mjs');
     expect(scenario.judge(await scenario.run({}))).toEqual([]);
   });
