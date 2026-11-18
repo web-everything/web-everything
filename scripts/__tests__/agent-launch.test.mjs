@@ -170,6 +170,8 @@ describe('resume validation across execution forms', () => {
   // Everything after the `--` end-of-options delimiter is prompt text, never a resume flag.
   const afterDelimiter = [
     ['claude', ['-p', '--', '--resume']],
+    ['claude', ['--print', '--', '--resume']],
+    ['claude', ['--bg', '--verbose', '--', '--resume', SID]],
     ['claude', ['-p', '--', '--resume', SID]],
     ['claude', ['-p', '--', '-r', SID]],
     ['claude', ['-p', '--', '--session-id', SID]],
@@ -193,6 +195,9 @@ describe('resume validation across execution forms', () => {
     ['env', ['--', 'claude', '-r', 'other-id']],
     ['claude', ['--append-system-prompt', '--', '--resume', 'other-id']],
     ['claude', ['--model', '--', '-r', 'other-id']],
+    ['claude', ['--mcp-config', '--', '--resume', 'other-id']],
+    ['codex', ['--profile', '--', 'exec', 'resume', 'other-id']],
+    ['claude', ['--some-future-option', '--', '--resume', 'other-id']],
     ['npx -- claude --resume other-id'],
   ])('still refuses a real resume hidden behind a non-delimiter -- (%j)', (...args) => {
     const primitive = vi.fn(), log = vi.fn();

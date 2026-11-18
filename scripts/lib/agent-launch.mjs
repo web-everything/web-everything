@@ -39,13 +39,12 @@ export function agentResumeId(argv = []) {
   return resumeIds(typeof argv === 'string' ? shellWords(argv) : argv)[0] ?? null;
 }
 
-// Options that consume the next word, so a `--` right after one is that option's value, not the delimiter.
-const VALUE_OPTIONS = new Set([
-  '--append-system-prompt', '--system-prompt', '--model', '--allowedTools', '--allowed-tools', '--disallowedTools',
-  '--disallowed-tools', '--add-dir', '--mcp-config', '--settings', '--permission-mode', '--output-format',
-  '--input-format', '--max-turns', '--agent', '--agents', '--plugin-dir', '--fallback-model', '--name', '-n', '-m',
-  '--profile', '--sandbox', '-s', '-C', '--cd', '--config', '--effort',
-]);
+// A `--` right after an option that consumes the next word is that option's VALUE, not the delimiter.
+// Fail closed: any long option not known to be a plain switch is assumed to take a value (the unknown case
+// scans more, so it can only over-refuse), and so are the short value options below.
+const SWITCH_OPTIONS = new Set(['--print', '--bg', '--verbose', '--continue', '--restricted', '--json', '--help', '--version', '--debug']);
+const SHORT_VALUE_OPTIONS = new Set(['-n', '-m', '-s', '-C']);
+const takesValue = (word) => SHORT_VALUE_OPTIONS.has(word) || (typeof word === 'string' && /^--[\w-]+$/.test(word) && !SWITCH_OPTIONS.has(word));
 
 function resumeIds(allWords) {
   // `--` ends the launched claude/codex's option parsing: everything after it is prompt text, never a
@@ -53,7 +52,7 @@ function resumeIds(allWords) {
   // Only a `--` AFTER the claude/codex binary word counts (a wrapper's own `--` — `npx -- claude -r X` —
   // must not hide the real command), and a `--` that is an option's value never counts.
   const binary = allWords.findIndex(w => typeof w === 'string' && /(?:^|[/\\])(?:claude|codex)$/.test(w));
-  const delimiter = allWords.findIndex((w, i) => w === '--' && i > binary && !VALUE_OPTIONS.has(allWords[i - 1]));
+  const delimiter = allWords.findIndex((w, i) => w === '--' && i > binary && !takesValue(allWords[i - 1]));
   const argv = delimiter < 0 ? allWords : allWords.slice(0, delimiter);
   let hasExec = false;
   return argv.flatMap((word, i) => {
