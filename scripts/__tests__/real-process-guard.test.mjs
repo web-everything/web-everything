@@ -60,8 +60,33 @@ export function scansRealProcess(source) {
  *  spawn/git helper import. A rename to `*.real.test.mjs` alone must not move a mock test out of PR validation. */
 export function startsRealProcess(source) {
   if (scansRealProcess(source)) return true;
-  if (/(?:from\s+|require\(\s*)['"](?:node:)?child_process['"]/.test(source)) return true;
-  return /(?:from\s+|require\(\s*)['"][^'"]*(?:spawn|run-?git|git-?run|exec-?file)[^'"]*['"]/i.test(source);
+  // AST only (comments and strings never count): a child_process or spawn-helper binding must be CALLED.
+  const tree = ts.createSourceFile('test.ts', source, ts.ScriptTarget.Latest, true);
+  const helper = (text) => /^(node:)?child_process$/.test(text) || /(spawn|run-?git|git-?run|exec-?file)/i.test(text);
+  const bound = new Set();
+  const walk = (node, visit) => { visit(node); ts.forEachChild(node, (child) => walk(child, visit)); };
+  walk(tree, (node) => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && helper(node.moduleSpecifier.text)) {
+      const clause = node.importClause;
+      if (clause?.name) bound.add(clause.name.text);
+      if (clause?.namedBindings && ts.isNamespaceImport(clause.namedBindings)) bound.add(clause.namedBindings.name.text);
+      if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) for (const e of clause.namedBindings.elements) bound.add(e.name.text);
+    }
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer)
+      && node.initializer.expression.getText(tree) === 'require' && ts.isStringLiteral(node.initializer.arguments[0] ?? node)
+      && helper(node.initializer.arguments[0].text)) {
+      if (ts.isIdentifier(node.name)) bound.add(node.name.text);
+      if (ts.isObjectBindingPattern(node.name)) for (const e of node.name.elements) bound.add(e.name.getText(tree));
+    }
+  });
+  let called = false;
+  walk(tree, (node) => {
+    if (!ts.isCallExpression(node)) return;
+    let callee = node.expression;
+    while (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) callee = callee.expression;
+    if (ts.isIdentifier(callee) && bound.has(callee.text)) called = true;
+  });
+  return called;
 }
 
 /** PURE: problems with the real tier given tracked `*.real.test.mjs` files, the manifest list and a source reader. */
@@ -78,12 +103,18 @@ export function realTierProblems(tracked, manifest, read) {
 
 describe('real-tier manifest guard', () => {
   it('fails an unlisted rename, a listed file that starts no process, and a stale manifest entry', () => {
-    const sources = { 'a.real.test.mjs': `import { it } from 'vitest'; it('x', () => {});`, 'b.real.test.mjs': `import { spawnSync } from 'node:child_process';` };
+    const sources = { 'a.real.test.mjs': `import { it } from 'vitest'; it('x', () => {});`, 'b.real.test.mjs': `import { spawnSync } from 'node:child_process'; spawnSync(cmd, []);` };
     const read = (file) => sources[file];
     expect(realTierProblems(['a.real.test.mjs', 'b.real.test.mjs'], ['a.real.test.mjs'], read).join('\n')).toContain('b.real.test.mjs: real-tier file not listed');
     expect(realTierProblems(['a.real.test.mjs'], ['a.real.test.mjs'], read).join('\n')).toContain('never starts a real process');
     expect(realTierProblems([], ['gone.real.test.mjs'], read).join('\n')).toContain('not a tracked');
     expect(realTierProblems(['b.real.test.mjs'], ['b.real.test.mjs'], read)).toEqual([]);
+  });
+  it('a comment, string or unused import never counts as starting a process', () => {
+    expect(startsRealProcess(`// import { spawn } from 'node:child_process'\nimport { it } from 'vitest';`)).toBe(false);
+    expect(startsRealProcess(`import { spawnSync } from 'node:child_process'; const x = 1;`)).toBe(false);
+    expect(startsRealProcess(`import { spawnSync } from 'node:child_process'; spawnSync(cmd, []);`)).toBe(true);
+    expect(startsRealProcess(`import { runGit } from './helpers/run-git.mjs'; runGit(['status']);`)).toBe(true);
   });
   it('every tracked *.real.test.mjs is listed in the manifest and starts a real process', () => {
     const root = process.cwd();
