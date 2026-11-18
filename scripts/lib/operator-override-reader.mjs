@@ -7,13 +7,16 @@ import { dirname, join } from 'node:path';
 const epochMs = v => Number.isSafeInteger(v) && v > 0 && v <= Date.now() + 72 * 3600000;
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
 const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze({ validate, direction, failClosedFallback });
+// R1040/R1045: pure capacity raises are accepted up to these hard bounds; lowering stays allowed.
+// These are operator limits, not defaults or fail-closed fallbacks, and grant no guard-leaf authority.
+export const OPERATOR_CAPACITY_MAX = Object.freeze({ fix: 24, review: 16, redTeam: 24 });
 export const CAPACITY_LEAVES = Object.freeze({
-  'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, 8), 'cap', 3),
-  'host.maxReviewDispatchPerTick': capacityLeaf(integer(1, 8), 'cap', 2),
-  'resourceGate.fixCap.floor': capacityLeaf(integer(1, 12), 'cap', 2),
-  'resourceGate.fixCap.ceiling': capacityLeaf(integer(1, 12), 'cap', 6),
+  'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 3),
+  'host.maxReviewDispatchPerTick': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 2),
+  'resourceGate.fixCap.floor': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.fix), 'cap', 2),
+  'resourceGate.fixCap.ceiling': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.fix), 'cap', 6),
   'resourceGate.fixCap.raiseMinMemFreePct': capacityLeaf(v => Number.isFinite(v) && v >= 25 && v <= 60, 'threshold', 40),
-  'redTeamQueue.minConcurrent': capacityLeaf(integer(0, 12), 'cap', 0),
+  'redTeamQueue.minConcurrent': capacityLeaf(integer(0, OPERATOR_CAPACITY_MAX.redTeam), 'cap', 0),
   'deliveryCapacity.pinUnits': capacityLeaf(integer(1, 200), 'cap', 1),
   'deliveryCapacity.pinUntil': capacityLeaf(epochMs, 'cap', 0),
   'deliveryCapacity.holdUntil': capacityLeaf(epochMs, 'threshold', Number.MAX_SAFE_INTEGER),

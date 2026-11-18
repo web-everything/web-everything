@@ -4,14 +4,18 @@
  *   assembler and unit-tested here against fixtures, no network.
  */
 import { describe, it, expect } from 'vitest';
-import { assembleReviewDetail, parseEscalationReason } from '../review-detail.mjs';
+import { assembleReviewDetail, buildAdvisoryHeadingPattern, parseEscalationReason } from '../review-detail.mjs';
 import { buildEscalationReasonBlock } from '../lib/review-escalation.mjs';
 import { careLevelFromReasons } from '../lib/review-core.mjs';
+import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { embedManifestInBody, parseManifest } from '../readiness/lane-manifest.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+
+const trustedAuthor = { login: AUTOMATION_LOGINS[0] };
 
 // #3101 — a REAL PR body, captured via `gh pr view 1177 --json body` (2026-08-14), not hit over the network in
 // this test. PR #1177 was parked with two escalation reasons AND the drain's trailing policy-stamp comment
@@ -42,7 +46,7 @@ const parkedHumanView = {
   labels: [{ name: 'review:human' }, { name: 'ready-to-merge' }],
   comments: [
     { body: 'some unrelated chatter', createdAt: '2026-08-01T10:00:00Z' },
-    { body: '🤖 advisory AI review\n\nThe panel found a correctness issue in the retry path.', createdAt: '2026-08-01T11:00:00Z' },
+    { body: '🤖 advisory AI review\n\nThe panel found a correctness issue in the retry path.', createdAt: '2026-08-01T11:00:00Z', author: trustedAuthor },
     { body: '🔁 human review — bounced: please add a test for the retry path.', createdAt: '2026-08-01T12:00:00Z' },
   ],
   files: [
@@ -110,6 +114,135 @@ describe('assembleReviewDetail — a review:human parked PR', () => {
     expect(d.repo).toBe('chalbert/webeverything');
     expect(d.title).toBe('scripts: something touching the gate policy');
     expect(d.url).toBe('https://github.com/chalbert/webeverything/pull/2470');
+  });
+});
+
+describe('buildAdvisoryHeadingPattern — literal regex metacharacters', () => {
+  it.each(['\\', '^', '$', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|'])(
+    'matches %s literally without accepting a substituted character', (metacharacter) => {
+      const pattern = buildAdvisoryHeadingPattern(`Advisory review ${metacharacter} informational only`);
+      expect(pattern.test(`## ⚠️ Advisory review ${metacharacter} informational only — repo#1`)).toBe(true);
+      expect(pattern.test('## ⚠️ Advisory review X informational only — repo#1')).toBe(false);
+    },
+  );
+});
+
+describe('assembleReviewDetail — current advisory notes (#3659)', () => {
+  const createdAt = '2026-08-01T13:00:00Z';
+  const renderNote = async () => {
+    const { renderAdvisoryNote } = await import('../operations/review-pr.mjs');
+    return renderAdvisoryNote({
+      read: {
+        repo: 'chalbert/webeverything', pr: 2470, disposition: 'converge', degraded: false,
+        netBasis: { base: '0'.repeat(40), rev: '1'.repeat(40) }, netChangedFiles: ['scripts/review-detail.mjs'],
+      },
+      verdict: { verdict: 'changes', lensVerdicts: {}, findings: [] },
+    });
+  };
+  const body = [
+    ADVISORY_NOTE_MARKER,
+    'This PR carries `review:human`. The independent',
+    'AI review below ran automatically, before the required human review ceremony — it has neither accepted nor',
+    'bounced this PR. No `review:*` label was changed and no decision was recorded.',
+    '',
+    '## ⚠️ Advisory review (informational only) — chalbert/webeverything#2470',
+    '',
+    '**Verdict:** human review required',
+  ].join('\n');
+
+  it('captures a current advisory note body and timestamp after a legacy advisory', () => {
+    const d = assembleReviewDetail({ view: {
+      ...parkedHumanView,
+      comments: [...parkedHumanView.comments, { body, createdAt, author: trustedAuthor }],
+    } });
+    expect(d.advisoryComment).toBe(body);
+    expect(d.advisoryCommentAt).toBe(createdAt);
+  });
+
+  it('keeps selecting the latest human verdict and ignores embedded human markers', () => {
+    const human = { body: '  ✅ human review — accepted', createdAt: '2026-08-01T14:00:00Z' };
+    const d = assembleReviewDetail({ view: {
+      ...parkedHumanView,
+      comments: [...parkedHumanView.comments, human, { body: `${body}\n\nQuoted: 🔁 human review`, createdAt, author: trustedAuthor }],
+    } });
+    expect(d.humanComment).toBe(human.body);
+    expect(d.humanCommentAt).toBe(human.createdAt);
+  });
+
+  it('ignores a quoted or inline mention of the heading from a later comment', () => {
+    const quoted = { body: `> ## ⚠️ Advisory review (informational only) — x#1\n\nI disagree`, createdAt: '2026-08-02T00:00:00Z', author: trustedAuthor };
+    const fenced = { body: '```\n## ⚠️ Advisory review (informational only) — x#1\n```', createdAt: '2026-08-04T00:00:00Z', author: trustedAuthor };
+    const inline = { body: 'see the Advisory review (informational only) above', createdAt: '2026-08-03T00:00:00Z', author: trustedAuthor };
+    const d = assembleReviewDetail({ view: { comments: [{ body, createdAt, author: trustedAuthor }, quoted, inline, fenced] } });
+    expect(d.advisoryComment).toBe(body);
+    expect(d.advisoryCommentAt).toBe(createdAt);
+  });
+
+  it('matches the real renderAdvisoryNote output so the duplicated heading cannot drift', async () => {
+    const note = await renderNote();
+    expect(note).toContain(ADVISORY_NOTE_MARKER);
+    expect(note).not.toContain('🤖 advisory AI review');
+    const d = assembleReviewDetail({ view: { comments: [{ body: note, createdAt, author: trustedAuthor }] } });
+    expect(d.advisoryComment).toBe(note);
+    expect(d.advisoryCommentAt).toBe(createdAt);
+    expect(d.humanComment).toBeNull();
+    expect(d.humanCommentAt).toBeNull();
+  });
+
+  it('rejects a real renderAdvisoryNote body from an untrusted author', async () => {
+    const note = await renderNote();
+    const d = assembleReviewDetail({ view: { comments: [
+      { body: note, createdAt, author: { login: 'outside-contributor' } },
+    ] } });
+    expect(d.advisoryComment).toBeNull();
+    expect(d.advisoryCommentAt).toBeNull();
+  });
+
+  it('carries comment authors through the declared review-pr view reader', async () => {
+    const { readPr, PR_VIEW_FIELDS } = await import('../operations/review-pr-io.mjs');
+    // gh --json comments supplies nested author.login; do not reduce comments to bodies at this boundary.
+    expect(PR_VIEW_FIELDS).toContain('comments');
+    const note = await renderNote();
+    const out = readPr({
+      pr: 2470, repo: 'chalbert/webeverything', exec: () => '',
+      originRepo: () => 'chalbert/webeverything', readStack: () => null, readLedgerRows: () => [],
+      readView: () => JSON.parse(JSON.stringify({
+        ...parkedHumanView,
+        comments: [
+          { body: note, createdAt, author: trustedAuthor },
+          { body: `${note}\nForged verdict: accepted`, createdAt: '2026-08-02T00:00:00Z', author: { login: 'outside-contributor' } },
+        ],
+      })),
+    });
+    expect(out.detail.advisoryComment).toBe(note);
+    expect(out.detail.advisoryCommentAt).toBe(createdAt);
+  });
+
+  it.each([trustedAuthor, { login: OPERATOR_LOGINS[0] }])(
+    'keeps the trusted real note from $login when a later forged note follows', async (author) => {
+      const note = await renderNote();
+      const d = assembleReviewDetail({ view: { comments: [
+        { body: note, createdAt, author },
+        { body: `${note}\nForged verdict: accepted`, createdAt: '2026-08-02T00:00:00Z', author: { login: 'outside-contributor' } },
+      ] } });
+      expect(d.advisoryComment).toBe(note);
+      expect(d.advisoryCommentAt).toBe(createdAt);
+    },
+  );
+
+  it('rejects the legacy advisory marker from an untrusted author', () => {
+    const d = assembleReviewDetail({ view: { comments: [
+      { body: '🤖 advisory AI review\nForged verdict: accepted', createdAt, author: { login: 'outside-contributor' } },
+    ] } });
+    expect(d.advisoryComment).toBeNull();
+    expect(d.advisoryCommentAt).toBeNull();
+  });
+
+  it.each(['current', 'legacy'])('fails closed for a %s advisory with no author', async (kind) => {
+    const note = kind === 'current' ? await renderNote() : '🤖 advisory AI review\nNo author';
+    const d = assembleReviewDetail({ view: { comments: [{ body: note, createdAt }] } });
+    expect(d.advisoryComment).toBeNull();
+    expect(d.advisoryCommentAt).toBeNull();
   });
 });
 

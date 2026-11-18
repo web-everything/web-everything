@@ -603,10 +603,13 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Card 105 — NOT read-only: its one `act` step is an effect (pause files, kill file, test session); the
     // declaring module is a leaf and every write lives in `maintenance-io.mjs`, behind the sink `../run.mjs` wires.
     [MAINTENANCE_OP]: 'maintenance.mjs',
+    // Writes: its one `act` step is an effect (GitHub update-branch); the host IO lives in `update-branch-io.mjs`.
+    'update-branch': 'update-branch.mjs',
     // Writes operator routing preferences; listed here for module-map coverage only.
     'routing-override': 'routing-override.mjs',
     'operator-override-set': 'operator-override.mjs',
     'operator-override-clear': 'operator-override.mjs',
+    'ruled-weakened-add': 'ruled-weakened-add.mjs',
     'delivery-capacity-hold': 'delivery-capacity-override.mjs',
     'delivery-capacity-pin': 'delivery-capacity-override.mjs',
     'delivery-capacity-clear': 'delivery-capacity-override.mjs',
@@ -1175,7 +1178,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
   });
   it.each([
     ['reason', ''], ['reason', '   '], ['actor', ''], ['actor', '   '],
-    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '9'],
+    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '0'], ['value', '17'], // 17: just past the 1..16 range
   ])('refuses unsafe CLI %s=%j before changing the host store', async (field, value) => {
     const dir = mkdtempSync(join(tmpdir(), 'operator-cli-refusal-'));
     const file = join(dir, 'operator-overrides.json');

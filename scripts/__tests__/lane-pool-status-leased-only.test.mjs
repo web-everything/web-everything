@@ -129,11 +129,16 @@ describe('status --leased-only (#4345)', () => {
     expect(JSON.parse(skipped.out).lanes).toEqual([expect.objectContaining({ lane: 3, leased: false })]);
     expect(JSON.parse(skipped.out).lanes[0]).not.toHaveProperty('clean');
     expect(laneSpawns()).toEqual([]);
-    for (const lane of ['999', 'unknown']) {
-      const missing = runPool(['status', ...poolArgs(), '--json', `--lane=${lane}`], env);
-      expect(missing.code).toBe(0);
-      expect(JSON.parse(missing.out).lanes).toEqual([]);
-    }
+    const missing = runPool(['status', ...poolArgs(), '--json', '--lane=999'], env);
+    expect(missing.code).toBe(0);
+    expect(JSON.parse(missing.out).lanes).toEqual([]);
+    expect(laneSpawns()).toEqual([]);
+
+    // Malformed selectors fail before dispatch; a valid but absent lane still returns no rows.
+    const invalid = runPool(['status', ...poolArgs(), '--json', '--lane=unknown'], env);
+    expect(invalid.code).not.toBe(0);
+    expect(invalid.err).toContain('--lane requires a lane number');
+    expect(invalid.out).toBe('');
     expect(laneSpawns()).toEqual([]);
   });
 

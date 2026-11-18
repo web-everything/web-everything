@@ -8,7 +8,17 @@
 the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
 Admission reads complete comments and live head/labels; missing or unreadable evidence retains
 the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
-exceeding either limit asks the operator to re-approve the current head or queue it.
+exceeding either limit asks the operator to re-approve the current head or queue it. All license
+and numbering Git reads share `numberingGitRunner`, which discovers and disables every promisor
+before reading objects, denies transports and lazy fetch, and isolates global config and replacement
+objects. Caller `exec` handles only GitHub evidence. The runner's `readFailed` flag blocks license
+fallback even when optional alias reads fail; only grep status 1 and config `--get-regexp` status 1
+mean absent optional evidence. Keep real missing/corrupt objects, output overflow, and marker-writing
+promisor helpers in the license/numbering suites. Drive the actual proofs through their internal runner
+seams with a spy wrapping real Git: assert every call's explicit 5-second timeout and exact 8 MiB
+output / 1 MiB numbering-blob caps, environment and pins. Replaying commands through factory defaults
+does not verify proof call sites. The structural AST test ignores comments and allows only the shared
+runner's Git process site and the license's `gh pr view`; its inline bypass samples must fail.
 `drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
 Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
 
@@ -595,6 +605,14 @@ prior status/result); only a trusted result already on the head is terminal. Reg
 **a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible**
 and **a confirmed-dead queued/ran prior admits and reaches the shared resume path without a model call**.
 Recovery shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
+`reviewConcurrency.maxLiveReviewRounds` accepts 1..16 (configured default 8); the host per-tick
+start burst remains independently bounded at 1..8. The review daemon's production lane scan budgets
+two acquirable lanes per ordinary round. Red-team-only recovery starts need one lane each and use
+the unhalved free lane count, less starts already accounted for in the tick (minimum zero); a failed
+recovery lane read gives recovery zero lanes and never aborts ordinary dispatch.
+Excess owed ordinary reviews, including a pool with only one lane left, stay
+queued with the existing lane deferral / `poolExhaustion` reason. The focused live-cap-16 pool-fit
+cases in `review-daemon.test.mjs` cover empty, single-lane, even and odd pools without dispatch failures.
 Ordinary and recovery starts share the remaining host per-tick allowance; confirmed starts and
 unknown outcomes consume the cross-repo host budget, while confirmed non-starts do not.
 Recovery defaults to a 30-minute retry cooldown through
@@ -847,6 +865,12 @@ clearances remain confined to the explicitly requested numbering-only proof. Tes
 commits and changed trees through the writer, alongside refusal cases with zero writer calls.
 
 ## Human clearance across drain numbering
+
+`proveNumberingOnlyMove` owns its hardened local Git runner; its compatibility `exec` argument
+is ignored. Pass `cwd` explicitly through callers. Use real repositories and remove loose objects
+to test unreadable evidence; use Trace2 only to observe reads, never to replace them. Promisor
+regressions also run without `GIT_TRACE*` and assert no upload-pack marker is written. Missing
+objects refuse with `retryable: true`; restore local evidence before retrying.
 
 An approved human-surface head hold suppresses rebasing, never pending-card numbering before
 enqueue. Regress that preparation predicate with an approved human-only head carrying a hash card,
@@ -2161,6 +2185,43 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Forge client telemetry and remote admission
 
+Admission reaper fixtures pass through the real telemetry parser: use `easternTimestamp()` for
+timestamps and include receipt `stageMs: {install, run}`. Reaper-only fixtures do not prove that
+health admission accepts the same sample. Release logs keep their original five-key JSON and
+byte order for markers without new provenance or exit evidence; PID accompanies new evidence,
+and unknown optional values are omitted rather than logged as null or `no-exit-record`.
+
+R1017 (under R1012): for a host-bound marker with a provably dead local owner, preserve the
+marker grace and death-sample margin. With a persisted 32-hex nonce and fresh integer receipt
+(including 97/254) still listed active, finish on the owner's behalf before claiming/removing
+the marker. Bound SSH and output; failed or timed-out finishes retain capacity, log once and
+retry no faster than 30 seconds per run. Legacy nonce-less markers keep their existing rules.
+For 97/254, finishing on behalf requires a persisted numbered worker slot (`forge-exec-N`, N >= 1), since only that finish path proves descendant cleanup; missing, legacy or malformed slots keep the marker held.
+A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
+rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
+old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and
+a parseable start in `recent` for EVERY active id, strictly outside the inclusive ownership
+window `[marker.at - CLOCK_SKEW_MS, diedBy + CLOCK_SKEW_MS]`. Any in-window null-code or 97/254
+receipt retains the marker.
+
+The accepted residual risk is a request the dead client already dispatched that Forge starts
+MORE than 15 minutes after owner death. Observed start lag is about one minute; client SSH
+calls are short and bounded by `ConnectTimeout`. The dead client never issues `run`, so only
+a prepared run can exist. The grace is an operator ruling, not an enforced remote start
+deadline. If this residual occurs, the consequence is one extra concurrent Forge run until it
+finishes (Forge enforces its own cap). No run is killed and no result is lost: the owner is dead
+and cannot collect one. Pin that accepted behaviour explicitly: release at 15 minutes even if
+a delayed request starts later and remains active at 28 minutes.
+
+Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
+operator-confirmed cleanup remain the fallback while capacity is retained.
+Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
+finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
+lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
+and stuck-slot detail carry these tags plus the exit record, or `no-exit-record` for a client
+that had no chance to log. Remove `.exit` with its marker; operator-confirmed cleanup remains
+the fallback when evidence stays incomplete.
+
 For selected `npx vitest run` phases, verify-lane's remote admission plan rewrites plain
 arguments to `npm run test:unit -- ...`; spawn that planned command without a local slot
 or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and local fallback.
@@ -2259,6 +2320,16 @@ telemetry sample taken after the failure; a bounded probe that stalls or returns
 keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
 Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
 
+After a run timeout, allow 30 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
+validated as a nonnegative integer and capped at 90 seconds), probing fresh per-run telemetry
+about every two seconds while also waiting for the executor. R989 accepts a late receipt-verified
+`mode: 'remote'` answer with an integer code 0–254 only inside this cancel wait and only when
+its string `run` strictly matches the non-null execution run recorded by `onRun` for this dispatch;
+return its exit code (including failures), record it, and release the slot and both marker files.
+Missing/mismatched run IDs, invalid codes, executor rejection and other ambiguous answers must
+not stop telemetry probes. A client signal still wins. Only confirmed cancellation
+or fresh `finished` telemetry permits local fallback; deadline expiry
+keeps exit 124 and both marker files.
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
@@ -4424,3 +4495,95 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Drain freeze read recovery
+
+The named failed-cache-replacement regression seeds a clear, observes a live freeze while replacement fails, then forces a transient read before TTL expiry. Failed writes remove old evidence and block reuse in-process even when removal fails; only a successful cache write restores eligibility.
+
+`freeze-last-good.test.mjs` exercises transient-read retries and persistent successful reads with an injected clock, sleep and temporary cache path. Reused evidence must keep its original fetch timestamp: rewriting it during reuse would let an outage extend a cached clear indefinitely. Expired, future-dated, corrupt or missing evidence holds the line. Permanent errors never reuse the cache. `freeze-unreadable-hold` retains the `red-main-hold` skip kind and `redMainHold` flag so pass-level admission and PR-comment suppression still apply. Run these tests through heavy admission.
+## Canonical audit admission regression fixtures
+
+Keep the default canonical checker in producer integration tests and replace only filesystem and
+Git effects. Exercise both `open-pr` and direct `pr-land`, including dry runs, with a docs-only
+changed-file list and missing evidence; refusal must precede publication. First-open fixtures need
+an unpublished local head, an exact-head pass, and another head's fingerprinted history: fingerprint
+the resolved local SHA without fetching the unpublished lane ref. A failed diff or main fetch still
+refuses. Include valid JSON negative records with invalid timestamps or contradictory findings next
+to an older pass, plus carried and waived paths; malformed records require repair before re-auditing.
+
+## Canonical audit before opening PRs
+
+`open-pr` and direct `pr-land` require the canonical codex-audit JSONL evidence, including in dry runs
+and for docs-only changes. They resolve the local PR source to a full SHA and use the shared canonical
+evaluator and origin/main coverage check. The record file comes from the same settings the audit writer
+reads (`scripts/settings/prototype-load.json` beside these scripts), never the target checkout's, so
+sibling-repo PRs work. WEAKENED requires a `ruledWeakened` waiver matching ref, full SHA and findings
+exactly, from the same layers `prototype-load` reads: those settings, platform preferences, or the
+operator ops store (`ruled-weakened-add`). Another head cannot supply the audit.
+
+## Bounded red-team probe fairness
+
+`red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
+least-recently-probed turns persisted as optional `lastProbeTurn` entry fields.
+Keep historical entries without the field loadable, reject malformed turns, and
+exercise five still-blocked entries across three ticks with a reload between ticks.
+Probe selection must preserve runnable FIFO admission and distinguish waiting for
+a probe turn from disabled probes and runnable capacity holds.
+Newly blocked entries (including runnable entries with an old turn) must join the
+tail using the same overflow rebase as probe admission. Keep a probe's current turn
+when it stays blocked. Replay two new planner skips per tick alongside four blocked
+heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
+new arrivals must never overtake heads already waiting in the rotation.
+
+## Timeout evidence synchronous worker pool
+
+`timeout-evidence-pool.mjs` runs the unchanged collector once per red PR per pass,
+with bounded child process groups and serial fallback for unavailable worker results.
+`ci.timeoutEvidenceConcurrency` defaults to 4; 1 preserves the serial path, and
+`WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY` overrides the setting (valid range: 1–8).
+`timeout-evidence-pool.test.mjs` uses the production worker and a local gh executable
+to exercise throttle parity, exit markers and process-group cleanup.
+Each detached group carries a watchdog with a pool-deadline-plus-five-second lifetime.
+Planner SIGKILL/SIGTERM regressions wait for two real stub-gh workers, kill the planner,
+then inspect non-zombie process-group members and the exact pool directory. A SIGSTOP
+case keeps the planner alive to exercise the watchdog's independent lifetime bound.
+The planner subprocess import uses Node's URL implementation, independent of the DOM
+test environment. It waits at most three seconds for both gh stubs and their child PIDs
+before atomically renaming the readiness record; the parent polls for at most eight
+seconds and includes bounded planner stderr and exit details in readiness failures.
+Liveness checks inspect `ps` states: absent processes and zombies are acceptable;
+EPERM alone never proves termination. Unverifiable group cleanup propagates through
+enrichment without serial fallback. Temp-directory removal is always attempted;
+removal failures are logged without changing the result or cleanup error.
+Run these tests with `reconcile-pass.test.mjs` through heavy-admission on a host
+permitting process-group signals and process inspection.
+
+The timeout-evidence pool fails closed before spawning: planner and worker probes mkdir
+the throttle root and attempt to acquire/release a real sync slot. Machinery errors or
+failed release after acquisition select serial evidence reads; a busy slot or timeout is
+healthy and preserves worker admission. Worker probe failure exits before calling gh.
+Worker fixtures use a scratch `WE_GH_THROTTLE_LOCK_ROOT` and explicit throttle cap so
+host traffic and inherited capacity settings cannot change whether workers launch.
+Probe refusal may emit no stderr: assert forwarding against worker stderr file sizes
+captured before cleanup, with an explicit empty-file case that forwards nothing.
+The pool is capped
+by the live throttle cap. Result/stderr degradation cancels all active groups with the
+same verified cleanup before serial fallback, and workers exit inside fail-open warnings
+before the throttle can continue ungated. Named pool regressions cover zero-launch
+planner refusal, zero-gh worker refusal, both degradation signals and cap bounds.
+
+
+### Reconcile CLI timing diagnostics
+
+Buffer planner-step timing lines at the reconcile CLI boundary and publish them only
+after the whole pass succeeds. Suppressing only the throwing step is insufficient:
+a successful earlier step can displace the failure summary used by live-smoke
+classification. The CLI timing regression covers a failed read after a successful
+step and successful JSON output; the GitHub-outage soak must hold as
+`smoke-env-unavailable` without writing a smoke rejection.
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.

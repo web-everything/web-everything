@@ -44,6 +44,7 @@ import { stageOnTransportBranch, readFromTransportBranch } from './git-transport
 import { loadMergeDeliveryPolicy } from './merge-delivery-policy.mjs';
 import { readSettings } from './settings-files.mjs';
 import { DrainReadError, resolveDrainReadsSource, readFileAtRef, unwrap } from './drain-api-reads.mjs';
+import { goodFreezeRead, resolveFreezeLastGoodPath, readFreezeLastGood, writeFreezeLastGood } from './freeze-last-good.mjs';
 
 export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 /** How many times the CLI hook tries to land one publish before it reports failure. */
@@ -254,13 +255,21 @@ const DRAIN_FREEZE_SETTINGS = {
   redMainUnpublishedDequeue: ['WE_DRAIN_RED_MAIN_UNPUBLISHED_DEQUEUE', 'on', 'off'],
   redMainLocalAutoFreeze: ['WE_DRAIN_RED_MAIN_LOCAL_AUTO_FREEZE', 'fix-exempt', 'manual'],
   redMainManualFreezeFixPr: ['WE_DRAIN_RED_MAIN_MANUAL_FREEZE_FIX_PR', 'hold', 'exempt'],
+  freezeReadLastGoodTtlMin: ['WE_DRAIN_RED_MAIN_FREEZE_LAST_GOOD_TTL_MIN', 10],
 };
 
 /** Same scalar cascade as redMainHold; injected layers avoid filesystem reads. */
 function resolveFreezeScalar(key, { env = process.env, file = RED_MAIN_HOLD_SETTINGS_FILE, tool, platform } = {}) {
   if (tool === undefined) { try { tool = JSON.parse(readFileSync(file, 'utf8')); } catch { tool = {}; } }
   const [envKey, builtIn, alternative] = DRAIN_FREEZE_SETTINGS[key];
-  const norm = v => { const s = String(v ?? '').trim().toLowerCase(); return [builtIn, alternative].includes(s) ? s : null; };
+  const norm = v => {
+    if (key === 'freezeReadLastGoodTtlMin') {
+      if ((typeof v !== 'number' && typeof v !== 'string') || String(v).trim() === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 && Number.isFinite(n * 60_000) ? n : null;
+    }
+    const s = String(v ?? '').trim().toLowerCase(); return [builtIn, alternative].includes(s) ? s : null;
+  };
   const c = cascadePolicy(key, tool?.[key], { env, standard: builtIn, platform: platform === undefined ? undefined : platform[key] ?? null, envValues: { '': norm(env[envKey]) ?? undefined }, valid: v => norm(v) !== null });
   return { value: norm(c.value), source: ({ tool: 'settings', standard: 'default' })[c.sources['']] ?? c.sources[''] };
 }
@@ -279,6 +288,7 @@ export function resolveDrainFreezeSettings(o = {}) {
     redMainUnpublishedDequeue: resolveRedMainUnpublishedDequeue(o),
     redMainLocalAutoFreeze: resolveRedMainLocalAutoFreeze(o),
     redMainManualFreezeFixPr: resolveRedMainManualFreezeFixPr(o),
+    freezeReadLastGoodTtlMin: resolveFreezeScalar('freezeReadLastGoodTtlMin', o),
   };
 }
 
@@ -307,7 +317,10 @@ export function drainFreezeSignal({ state, mainRedState, priority, now, holdOn =
   if (state.auto && holdOn && !stopAll) { signal.red = true; signal.sources.push('local-auto'); }
   if (stopAll) signal.fixPrs = [];
   // An unreadable freeze is NOT a manual freeze and NOT a red main: it gets its own source so the hold reason says so (and alerts).
-  if (state.error && !state.manual && state.local == null && signal.sources.includes('manual')) signal.sources = signal.sources.map(x => (x === 'manual' ? 'freeze-unreadable' : x));
+  if (state.error && !state.manual && state.local == null && signal.sources.includes('manual')) {
+    // A fix-PR priority alone is not red-main evidence when the freeze cannot be read.
+    signal.sources = signal.sources.filter(x => x !== 'priority').map(x => (x === 'manual' ? 'freeze-unreadable' : x));
+  }
   return signal;
 }
 
@@ -354,18 +367,40 @@ export function dequeueUnpublishedFreeze({ repo, branch, dryRun = false, exec = 
   } catch (e) { report(e); }
 }
 
-/** One pass of IO around the pure decision. Retry once, then reuse the new shared read. */
-export async function prepareDrainFreeze({ local = null, settings = resolveDrainFreezeSettings(), shared, readShared = readSharedFreeze, publish = publishFreezeFromCli, env = process.env, repo, branch, enqueues = false, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s), logSettings = true } = {}) {
+/** One pass of IO: transient reads retry twice; only fresh successful evidence may bridge an outage. */
+export async function prepareDrainFreeze({ local = null, settings, shared, readShared = readSharedFreeze, publish = publishFreezeFromCli, env = process.env, repo, branch, enqueues = false, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s), logSettings = true,
+  sleep = ms => new Promise(r => setTimeout(r, ms)), backoffMs = [500, 1500], nowMs = Date.now, lastGoodFile = resolveFreezeLastGoodPath(env) } = {}) {
+  settings ??= resolveDrainFreezeSettings({ env });
   if (logSettings) for (const [key, setting] of Object.entries(settings)) stderr(`red-main freeze: ${key} setting ${setting.value} via ${setting.source}\n`);
-  const read = () => { try { return readShared(); } catch (e) { return { error: flatText(e?.message ?? e) }; } };
-  if (settings.redMainFreezeReader.value === 'shared-first' && shared === undefined) shared = read();
+  const readOnce = async () => { try { return await readShared(); } catch (e) { return { error: flatText(e?.message ?? e), transient: e instanceof DrainReadError && e.transient === true }; } };
+  let retries = 0; // Shared by initial read and the post-publication read: at most two extra reads per pass.
+  const read = async (initial) => {
+    let result = initial === undefined ? await readOnce() : initial;
+    while (result?.error && result.transient === true && retries < 2) {
+      const delay = backoffMs[retries];
+      await sleep(Number.isFinite(delay) && delay >= 0 ? Math.min(delay, 1500) : [500, 1500][retries]);
+      retries++;
+      result = await readOnce();
+    }
+    if (goodFreezeRead(result)) writeFreezeLastGood(lastGoodFile, result, nowMs());
+    else if (result?.error && result.transient === true) {
+      const cached = readFreezeLastGood(lastGoodFile, { now: nowMs(), ttlMin: settings.freezeReadLastGoodTtlMin?.value ?? 10, source: result.source });
+      if (cached) {
+        stderr(`freeze read transient, reusing last good read ${Math.floor(cached.ageMs / 1000)}s old\n`);
+        return cached.result;
+      }
+    }
+    return result;
+  };
+  // An injected shared result is already fetched evidence; do not refresh its persisted timestamp on reuse.
+  if (settings.redMainFreezeReader.value === 'shared-first' && (shared === undefined || shared?.error)) shared = await read(shared);
   let state = evaluateDrainFreeze({ local, shared, settings });
   if (state.unpublished) {
     stderr(`red-main freeze: ⚠ UNPUBLISHED MANUAL FREEZE: ${flatText(local.reason ?? 'active')} at ${flatText(local.at ?? '?')}; CI's merge-gate cannot see it — ${dryRun ? 'would retry publish' : 'retrying publish'}\n`);
     if (!dryRun) {
       try { await publish({ marker: local, setExitCode: () => {}, env, stderr, attempts: 1 }); }
       catch (e) { stderr(`red-main freeze: ✗ publish failed: ${flatText(e?.message ?? e)}\n`); }
-      shared = read();
+      shared = await read();
       state = evaluateDrainFreeze({ local, shared, settings });
     }
     if (state.refuse && enqueues && settings.redMainUnpublishedDequeue.value === 'on') dequeueUnpublishedFreeze({ repo, branch, dryRun, exec, stderr });
