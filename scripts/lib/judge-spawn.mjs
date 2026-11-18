@@ -826,9 +826,12 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
       failure ??= fail('judge-spawn: invalid JSON event: expected a JSON object (content redacted); no verdict.');
       continue;
     }
-    const isResult = event.type === 'result' || 'structured_output' in event || 'session_id' in event
-      || (event.type === undefined
+    const isResult = event.type === 'result' || (event.type === undefined
       && ('structured_output' in event || 'is_error' in event || 'session_id' in event || 'result' in event || 'stop_reason' in event));
+    // Session identity also appears on normal system/init and assistant events.
+    // Error envelopes carrying result evidence still need validation, without counting as results.
+    const needsResultValidation = isResult || (event.type === 'error'
+      && ('structured_output' in event || 'session_id' in event));
     const bad = event.type === 'error' || event.is_error || event.error
       || (isResult && 'subtype' in event && event.subtype !== 'success');
     if (bad) {
@@ -871,8 +874,7 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
             + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`)
         : fail('judge-spawn: the juror emitted a JSON error event or unsuccessful result (content redacted); no verdict.');
     } else otherEvents += 1;
-    if (isResult) {
-      results += 1; result ??= event;
+    if (needsResultValidation) {
       // A quota message never bypasses the same complete result validation.
       // Failed result envelopes (including contradictory verdicts) remain countable.
       if (!bad || quotaOnlyEvent(event)) {
@@ -882,6 +884,9 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
           if (!bad && ['result-keys', 'result-envelope'].includes(error.kind)) failure ??= error;
         }
       }
+    }
+    if (isResult) {
+      results += 1; result ??= event;
     }
     else if (results && !['system', 'rate_limit_event', 'rate_limit'].includes(event.type)) {
       // Error events were already classified above; do not count a quota envelope twice.

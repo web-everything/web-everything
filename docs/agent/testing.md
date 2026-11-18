@@ -4590,3 +4590,6 @@ are terminal failures. Preserve captured structure when adding fixtures, replaci
 only session/UUID/credential-expiry identifiers. Quota result envelopes undergo the
 same session, schema and success checks, so contradictory verdicts remain countable.
 Stderr warnings are allowed; only `JUROR_FATAL_STDERR` classes invalidate a clean exit.
+Keep a complete-stream fixture with session-bearing system/init and assistant events
+before the terminal result: `session_id` identifies a session, not a result envelope.
+Error envelopes carrying result evidence still require the full result checks.

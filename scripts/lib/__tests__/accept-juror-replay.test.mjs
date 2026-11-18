@@ -15,6 +15,15 @@ const run = (result, stderr = '') => acceptJurorStream(JSON.stringify(result), {
 const quotaText = "You've hit your weekly limit · resets tomorrow";
 
 describe('captured juror result replay', () => {
+  it('accepts system/init and assistant events carrying session_id before a successful result', () => {
+    const stream = [
+      { type: 'system', subtype: 'init', session_id: sessionId, tools: [], model: 'claude-opus-5-5' },
+      { type: 'assistant', session_id: sessionId,
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Review complete.' }] } },
+      captures[0],
+    ].map(event => JSON.stringify(event)).join('\n');
+    expect(acceptJurorStream(stream, { sessionId, schema, exit }).value).toEqual({ verdict: 'accept' });
+  });
   it.each(captures)('accepts the real successful capture with duration $duration_ms', capture => {
     expect(Object.keys(capture).sort()).toEqual([...JUROR_RESULT_KEYS].sort());
     expect(run(capture).value).toEqual({ verdict: 'accept' });
@@ -56,9 +65,13 @@ describe('captured juror result replay', () => {
     expect(error).toMatchObject({ quota: true, telemetry: { quotaOnly: false, failureKind: 'mixed-failure' } });
     expect(error.telemetry.otherFailures).toEqual(expect.arrayContaining([expect.objectContaining({ kind })]));
   });
-  it('does not exempt an error envelope carrying a mismatched result session', () => {
+  it.each([
+    { session_id: 'wrong' },
+    { structured_output: { verdict: 'accept' } },
+    { session_id: 'wrong', structured_output: { verdict: 'accept' } },
+  ])('does not exempt an error envelope carrying result evidence: %j', evidence => {
     let error;
-    try { run({ type: 'error', message: quotaText, session_id: 'wrong', structured_output: { verdict: 'accept' } }); } catch (caught) { error = caught; }
+    try { run({ type: 'error', message: quotaText, ...evidence }); } catch (caught) { error = caught; }
     expect(error).toMatchObject({ quota: true, telemetry: { quotaOnly: false } });
   });
   it('retains legacy quota error events with warnings and rejects fatal stderr', () => {
