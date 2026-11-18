@@ -52,7 +52,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { hostname, platform, release } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { buildJudgeArgv, deriveSessionId, parseJudgeOutcome, loadedContextTokens } from './lib/judge-spawn.mjs';
+import { buildJudgeArgv, deriveSessionId, acceptJurorStream, loadedContextTokens } from './lib/judge-spawn.mjs';
 
 // ── The fixed stimulus. Held constant across both arms and across runs, so the only variable is the flags. ──
 
@@ -92,10 +92,10 @@ function runOnce(argv, { cwd, cli }) {
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
     child.on('error', (e) => resolve({ error: `could not start ${cli}: ${e.message}`, wallMs: Date.now() - startedAt }));
-    child.on('close', () => {
+    child.on('close', (code, signal) => {
       const wallMs = Date.now() - startedAt;
       try {
-        const o = parseJudgeOutcome(out, err);
+        const o = acceptJurorStream(out, { sessionId: argv[argv.indexOf('--session-id') + 1], schema: SHAPE, exit: { code, signal, stderr: err } });
         resolve({ wallMs, tokens: loadedContextTokens(o.usage), costUsd: o.costUsd, apiMs: o.durationMs, usage: o.usage });
       } catch (e) {
         resolve({ error: e.message.slice(0, 400), wallMs });

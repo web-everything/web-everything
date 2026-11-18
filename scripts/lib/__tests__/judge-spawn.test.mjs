@@ -22,6 +22,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import {
   JUDGE_CLI,
@@ -35,7 +36,7 @@ import {
   deriveSessionId,
   sessionSeed,
   buildJudgeArgv,
-  parseJudgeOutcome,
+  acceptJurorStream,
   loadedContextTokens,
   judgeSpawn,
   assertLaneCwd,
@@ -50,6 +51,13 @@ import {
   UNPARSEABLE_RETRY_SETTING,
   retrySessionId,
 } from '../judge-spawn.mjs';
+
+function parseJudgeOutcome(stdout, stderr = '', budget = null) {
+  let sessionId;
+  try { sessionId = JSON.parse(stdout).session_id; } catch { sessionId = 's'; }
+  return acceptJurorStream(stdout, { sessionId, schema: { type: 'object' },
+    exit: { code: 0, signal: null, stderr, budget } });
+}
 
 const SHAPE = {
   type: 'object',
@@ -352,7 +360,7 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
   const ok = {
     is_error: false,
     stop_reason: 'tool_use',
-    session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+    session_id: SID,
     total_cost_usd: 0.014,
     duration_ms: 2100,
     num_turns: 1,
@@ -367,7 +375,7 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
   });
 
   it('surfaces the spawned session id, so a caller can RECORD which actor judged', () => {
-    expect(parseJudgeOutcome(JSON.stringify(ok)).sessionId).toBe('aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee');
+    expect(parseJudgeOutcome(JSON.stringify(ok)).sessionId).toBe(SID);
   });
 
   it('reports cost, duration, turns and the forced-tool stop reason', () => {
@@ -390,7 +398,7 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
   });
 
   it('throws when the enforced shape did not land, naming the stop reason it saw instead', () => {
-    const noShape = { is_error: false, stop_reason: 'end_turn', result: 'here are my thoughts' };
+    const noShape = { is_error: false, session_id: SID, stop_reason: 'end_turn', result: 'here are my thoughts' };
     expect(() => parseJudgeOutcome(JSON.stringify(noShape))).toThrow(/structured_output/);
     expect(() => parseJudgeOutcome(JSON.stringify(noShape))).toThrow(/end_turn/);
   });
@@ -427,7 +435,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       seen.cli = cli; seen.argv = argv; seen.opts = opts;
       const handlers = {};
       const child = {
-        stdout: { on: (e, cb) => { if (e === 'data') setTimeout(() => cb(stdout), 0); } },
+        stdout: { on: (e, cb) => { if (e === 'data') setTimeout(() => cb(stdout === okJson ? JSON.stringify({ ...JSON.parse(stdout), session_id: flagValue(argv, '--session-id') }) : stdout), 0); } },
         stderr: { on: (e, cb) => { if (e === 'data' && stderr) setTimeout(() => cb(stderr), 0); } },
         stdin: { on: () => {}, end: (d) => { seen.stdin = d; } },
         on: (e, cb) => { handlers[e] = cb; if (e === 'close') setTimeout(() => cb(code), 1); },
@@ -441,7 +449,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   const okJson = JSON.stringify({
     is_error: false,
     stop_reason: 'tool_use',
-    session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+    session_id: SID,
     total_cost_usd: 0.02,
     duration_ms: 1900,
     num_turns: 1,
@@ -478,7 +486,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   it('returns the spawned session id and the loaded-context total alongside the answer', async () => {
     const { fn } = fakeSpawn(okJson);
     const r = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'care', spawnFn: fn });
-    expect(r.sessionId).toBe('aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee');
+    expect(r.sessionId).toBe(deriveSessionId(sessionSeed(['run-7', 'care'])));
     expect(r.loadedContextTokens).toBe(1005);
     expect(r.costUsd).toBe(0.02);
     expect(typeof r.wallMs).toBe('number');
@@ -561,7 +569,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   });
 
   it('throws the juror\'s OWN failure text rather than a paraphrase', async () => {
-    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), { code: 1 });
+    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), { code: 0 });
     await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn }))
       .rejects.toThrow('Not logged in · Please run /login');
   });
@@ -579,7 +587,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
         .catch(e => e);
       expect(error).toBeInstanceOf(Error);
       expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
-      expect(error.telemetry).toMatchObject({ failureKind: 'provider-quota' });
+      expect(error.telemetry).toMatchObject({ failureKind: 'mixed-failure', quotaOnly: false,
+        otherFailures: [{ kind: 'process-failure', message: expect.any(String), redacted: true }] });
       expect(error.telemetry.failureText).toContain(result);
       expect(error.quota).toBe(true);
       expect(error.holdRow).toEqual({ provider: 'claude', status: 'quota-exhausted',
@@ -653,7 +662,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     'RESOURCE_EXHAUSTED: Out of memory', 'TypeError: rate limit is not a function',
     'build log mentions HTTP 429 in a fixture', 'disk quota exceeded',
   ])('leaves non-quota failure %j untagged and countable', async result => {
-    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
+    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 0 });
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
       .catch(e => e);
     expect(error).toBeInstanceOf(Error);
@@ -678,7 +687,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
       sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
     const original = new JudgeUnparseableError({ attempt: 1, attempts: 1, exitCode: 1,
-      signal: null, stdout, stderr, wallMs: 0, sessionId: SID, failedAttempts: [] });
+      signal: null, stdout, stderr, wallMs: 0, sessionId: SID, failedAttempts: [],
+      reason: 'juror process failed (exit 1, signal none)' });
     expect(error).toBeInstanceOf(JudgeUnparseableError);
     expect(error.message).toBe(original.message);
     expect(error.telemetry).toMatchObject({
@@ -696,11 +706,12 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     const result = 'schema invalid';
     const parsed = JSON.stringify({ is_error: true, result });
     const { fn } = fakeSpawn(source === 'stdout' ? `${text}\n${parsed}` : parsed,
-      { code: 1, stderr: source === 'stderr' ? text : '' });
+      { code: 0, stderr: source === 'stderr' ? text : '' });
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
       sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
     expect(error).toBeInstanceOf(Error);
-    expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+    if (source === 'stdout') expect(error.message).toMatch(/malformed JSON object line/);
+    else expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
     expect(error.telemetry ?? {}).not.toHaveProperty('failureKind');
     expect(error).not.toHaveProperty('quota');
     expect(error).not.toHaveProperty('holdRow');
@@ -764,14 +775,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       .rejects.toThrow(/exceeded 5ms and was killed/);
   });
 
-  /**
-   * #3203 — THE WALL IS NO LONGER TOTAL LOSS.
-   *
-   * The kill used to `reject`, discarding every byte the juror had already written. A tool-bearing juror at
-   * the wall has usually done most of the review, so the round cost full price and delivered nothing, could
-   * not resume, and — because which round dies depends on how much work the juror chose to do — read as
-   * flakiness rather than as a bound being hit. Two of ten measured rounds on 2026-08-19 died this way.
-   */
+  // Timeout output remains diagnostic evidence, never an accepted verdict.
   describe('a juror that hits the wall', () => {
     // A child that emits a COMPLETE answer and then never exits: the exact shape the old code threw away.
     const answeringChild = (payload) => {
@@ -787,7 +791,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     const ANSWER = {
       is_error: false,
       stop_reason: 'tool_use',
-      session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+      session_id: SID,
       total_cost_usd: 1.42,
       duration_ms: 899_000,
       num_turns: 31,
@@ -795,24 +799,38 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       structured_output: { verdict: 'reject', findings: ['found it just before the wall'] },
     };
 
-    it('returns the review the juror had already produced, instead of discarding it', async () => {
-      const r = await judgeSpawn({
+    it('rejects a valid verdict with JudgeTimeoutError when only the grace timer settles', async () => {
+      const err = await judgeSpawn({
         mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, timeoutMs: 5,
         spawnFn: () => answeringChild(ANSWER),
-      });
-      expect(r.value).toEqual({ verdict: 'reject', findings: ['found it just before the wall'] });
-      expect(r.costUsd).toBe(1.42);
+      }).catch(e => e);
+      expect(err).toBeInstanceOf(JudgeTimeoutError);
+      expect(err.timedOut).toBe(true);
+      expect(JSON.parse(err.partialStdout)).toEqual(ANSWER);
     });
 
-    // "Hit the bound" and "crashed" are different facts about a review, and before this they arrived
-    // identically. A caller that cannot tell them apart learns to retry rather than to look.
-    it('marks the result as timed out, so the record can say which happened', async () => {
-      const r = await judgeSpawn({
-        mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, timeoutMs: 5,
-        spawnFn: () => answeringChild(ANSWER),
-      });
-      expect(r.timedOut).toBe(true);
-    });
+    it.each(['timeout', 'SIGTERM'])(
+      'rejects a fake CLI that prints a valid verdict then exits by %s', async (termination) => {
+        const stdout = JSON.stringify(ANSWER);
+        const script = `process.stdout.write(${JSON.stringify(stdout)}, () => {
+          ${termination === 'timeout' ? 'setInterval(() => {}, 1000);' : "process.kill(process.pid, 'SIGTERM');"} // keepalive-helper-ok: fixture hangs until the timeout under test kills it
+        });`;
+        let child;
+        const err = await judgeSpawn({
+          mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+          timeoutMs: 1500, retries: 0,
+          spawnFn: (_cli, _argv, options) => (child = spawn(process.execPath, ['-e', script], options)),
+        }).catch(e => e);
+        expect(err).toBeInstanceOf(JudgeTimeoutError);
+        expect(child.signalCode).toBe(termination === 'timeout' ? 'SIGKILL' : 'SIGTERM');
+        if (termination === 'timeout') {
+          expect(err.partialStdout).toBe(stdout);
+        } else {
+          expect(err).toMatchObject({ exitCode: null, signal: 'SIGTERM' });
+          expect(err.partialStdout).toBe(stdout);
+        }
+      },
+    );
 
     it('marks an ordinary completed juror as NOT timed out', async () => {
       const spawnFn = () => {
@@ -1275,7 +1293,7 @@ describe('#3187 (a) — end to end, over a fake CLI that ENFORCES the ceiling th
         : {
           is_error: false,
           stop_reason: 'tool_use',
-          session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+          session_id: flagValue(argv, '--session-id'),
           total_cost_usd: spendUsd,
           duration_ms: 1900,
           num_turns: 4,
@@ -1444,7 +1462,7 @@ function fakeSpawnAtTopLevel(stdout, { code = 0, stderr = '' } = {}) {
  */
 describe('judgeSpawn — an unparseable stdout is retried once with a fresh session id (held item 223)', () => {
   const ANSWER_JSON = JSON.stringify({
-    is_error: false, stop_reason: 'tool_use', session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee', total_cost_usd: 0.3,
+    is_error: false, stop_reason: 'tool_use', session_id: SID, total_cost_usd: 0.3,
     duration_ms: 40_000, num_turns: 3, usage: { input_tokens: 4 }, structured_output: { verdict: 'accept', findings: [] },
   });
 
@@ -1455,7 +1473,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
       const c = children[Math.min(calls.length, children.length - 1)];
       calls.push({ cli, argv, opts });
       return {
-        stdout: { on: (e, cb) => { if (e === 'data' && c.stdout) setTimeout(() => cb(c.stdout), 0); } },
+        stdout: { on: (e, cb) => { if (e === 'data' && c.stdout) setTimeout(() => cb(c.stdout === ANSWER_JSON ? JSON.stringify({ ...JSON.parse(c.stdout), session_id: flagValue(argv, '--session-id') }) : c.stdout), 0); } },
         stderr: { on: (e, cb) => { if (e === 'data' && c.stderr) setTimeout(() => cb(c.stderr), 0); } },
         stdin: { on: () => {}, end: () => {} },
         on: (e, cb) => { if (e === 'close') setTimeout(() => cb(c.code ?? null, c.signal ?? null), 1); },
@@ -1466,19 +1484,328 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   }
   const sidOf = (argv) => flagValue(argv, '--session-id');
 
+  const genericFailure = { type: 'error', error: 'transient failure' };
+  const malformedLine = '{"type":"error","message":"private-juror-content';
+  const spendingFailures = [
+    ['budget', { type: 'result', is_error: true, stop_reason: 'tool_use', total_cost_usd: 0.596, result: '' }],
+    ['quota', { type: 'result', is_error: true, result: "You've hit your weekly limit · resets tomorrow" }],
+  ];
+  // Error event envelopes are failure evidence even without the optional is_error flag.
+  spendingFailures.push(
+    ['quota', { type: 'error', message: spendingFailures[1][1].result }],
+    ['quota', { type: 'result', subtype: 'error_during_execution', is_error: false,
+      result: spendingFailures[1][1].result }],
+    ['quota', { type: 'error', error: { message: spendingFailures[1][1].result } }],
+    ['budget', { type: 'error', stop_reason: 'tool_use', total_cost_usd: 0.596 }],
+    ['budget', { type: 'result', subtype: 'error_max_budget_usd', total_cost_usd: 0.596 }],
+    ['budget', { type: 'error', error: { code: 'budget_exhausted' }, total_cost_usd: 0.596 }],
+    ['budget', { type: 'error', message: 'Budget exhausted', total_cost_usd: 0.596 }],
+  );
+  it('preserves quota hold metadata for an error event without is_error followed by a valid verdict', async () => {
+    const text = spendingFailures[1][1].result;
+    const stdout = `${JSON.stringify({ type: 'error', message: text })}\n${ANSWER_JSON}`;
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+      retries: 2, log: () => {}, spawnFn: fn }).catch(e => e);
+    expect(error).toMatchObject({ quota: true,
+      holdRow: { provider: 'claude', status: 'quota-exhausted', scoredAt: expect.any(String), quotaResetsAt: null },
+      telemetry: { failureKind: 'provider-quota', failureText: text } });
+    expect(calls).toHaveLength(1);
+  });
+
+  const expectSpendingFailure = (error, kind) => {
+    if (kind === 'budget') {
+      expect(error).toBeInstanceOf(JudgeBudgetError);
+      expect(error).toMatchObject({ budgetExceeded: true, budget: 0.5, costUsd: 0.596 });
+    } else {
+      expect(error).toMatchObject({ quota: true,
+        holdRow: { provider: 'claude', status: 'quota-exhausted', scoredAt: expect.any(String), quotaResetsAt: null },
+        telemetry: { failureKind: 'mixed-failure', quotaOnly: false, failureText: spendingFailures[1][1].result } });
+    }
+  };
+
+  it.each(['budget then quota', 'quota then budget'])
+    ('preserves quota hold metadata without retrying for %s', async order => {
+      const budget = spendingFailures[0][1];
+      const quota = spendingFailures[1][1];
+      const events = order === 'budget then quota' ? [budget, quota] : [quota, budget];
+      const stdout = events.map(event => JSON.stringify(event)).join('\n');
+      const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+      expectSpendingFailure(error, 'quota');
+      expect(calls).toHaveLength(1);
+    });
+
+  it('prioritizes quota and keeps hold metadata when one event reports both limits', async () => {
+    const stdout = JSON.stringify({ ...spendingFailures[0][1], result: spendingFailures[1][1].result });
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+      budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+    expectSpendingFailure(error, 'quota');
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each(spendingFailures.flatMap(([kind, failure]) => ['before', 'after'].map(position => [kind, position, failure])))
+    ('preserves %s metadata and never retries with a generic error %s', async (kind, position, failure) => {
+      const events = position === 'before' ? [genericFailure, failure] : [failure, genericFailure];
+      const stdout = [...events.map(event => JSON.stringify(event)), ANSWER_JSON].join('\n');
+      const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+      expectSpendingFailure(error, kind);
+      expect(calls).toHaveLength(1);
+    });
+
+  it.each([...spendingFailures, ['generic', genericFailure]])
+    ('ranks %s failure against timeout without retrying', async (kind, failure) => {
+      let spawns = 0;
+      const spawnFn = () => {
+        spawns += 1;
+        let close;
+        return {
+          stdout: { on: (event, cb) => { if (event === 'data') cb([genericFailure, failure].map(value => JSON.stringify(value)).join('\n')); } },
+          stderr: { on: () => {} }, stdin: { on: () => {}, end: () => {} },
+          on: (event, cb) => { if (event === 'close') close = cb; },
+          kill: () => { close(null, 'SIGKILL'); },
+        };
+      };
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, timeoutMs: 5, retries: 1, log: () => {}, spawnFn }).catch(e => e);
+      if (kind === 'generic') expect(error).toBeInstanceOf(JudgeTimeoutError);
+      else expectSpendingFailure(error, kind);
+      expect(spawns).toBe(1);
+    });
+
+  it.each(spendingFailures.flatMap(([kind, failure]) => ['before', 'after'].map(position => [kind, position, failure])))
+    ('preserves %s metadata and never retries with a malformed line %s', async (kind, position, failure) => {
+      const line = JSON.stringify(failure);
+      const stdout = position === 'before' ? `${malformedLine}\n${line}` : `${line}\n${malformedLine}`;
+      const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+      expectSpendingFailure(error, kind);
+      expect(calls).toHaveLength(1);
+    });
+
+  it.each([...spendingFailures, ['malformed-only', null]])
+    ('ranks %s with malformed output against timeout without retrying', async (kind, failure) => {
+      let spawns = 0;
+      const spawnFn = () => {
+        spawns += 1;
+        let close;
+        return {
+          stdout: { on: (event, cb) => { if (event === 'data') cb(`${malformedLine}\n${JSON.stringify(failure)}`); } },
+          stderr: { on: () => {} }, stdin: { on: () => {}, end: () => {} },
+          on: (event, cb) => { if (event === 'close') close = cb; },
+          kill: () => { close(null, 'SIGKILL'); },
+        };
+      };
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, timeoutMs: 5, retries: 1, log: () => {}, spawnFn }).catch(e => e);
+      if (kind === 'malformed-only') expect(error).toBeInstanceOf(JudgeTimeoutError);
+      else expectSpendingFailure(error, kind);
+      expect(spawns).toBe(1);
+    });
+
+  it.each([
+    ['malformed-only output', malformedLine, /malformed JSON object line.*content redacted/],
+    ['explicit CLI error event', JSON.stringify(genericFailure), /JSON error event/],
+    ['missing structured_output', JSON.stringify({ type: 'result', subtype: 'success', session_id: SID }), /expected an object/],
+    ['invalid schema', JSON.stringify({ session_id: SID, structured_output: {} }), /schema violation/],
+  ].flatMap(([name, stdout, reason]) => [0, 1].map(code => [name, code, stdout, reason])))
+  ('treats %s at exit %s as terminal even when the next verdict would be valid', async (_name, code, stdout, reason) => {
+    const { fn, calls } = scriptedSpawn([
+      { stdout, code }, { stdout: ANSWER_JSON, code: 0 },
+    ]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+      retries: 2, log: () => {}, spawnFn: fn }).catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(calls).toHaveLength(1);
+    expect(err.attempts).toBe(1);
+    expect(err).not.toHaveProperty('value');
+    expect(err.failedAttempts).toHaveLength(1);
+    expect(err.failedAttempts[0].reason).toMatch(code === 0 ? reason : /juror process failed/);
+    expect(err.message).not.toContain('private-juror-content');
+  });
+
+  it.each([
+    { type: 'object', format: 'uri' },
+    { type: 'object', properties: { url: { type: 'string', format: 'uri' } } },
+    { type: 'object', allOf: [{ properties: { url: { type: 'string', format: 'uri' } } }] },
+    { type: 'object', definitions: { unused: { type: 'string', format: 'uri' } } },
+  ])('refuses an unvalidatable format constraint anywhere in schema %j before spawning', async shape => {
+    const { fn, calls } = scriptedSpawn([{
+      stdout: JSON.stringify({ structured_output: { url: 'not a URI' } }), code: 0,
+    }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 2, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err.message).toMatch(/keyword (format|allOf|definitions)/);
+    expect(err.message).toContain('no verdict');
+    expect(err).not.toHaveProperty('value');
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    ['unsupported keyword', { type: 'object', unevaluatedProperties: false }],
+    ['$async', { type: 'object', $async: true }],
+    ['invalid keyword value', { type: 'object', properties: { verdict: { type: 'not-a-type' } } }],
+    ['oversized unsupported keyword', { type: 'object', ['private-schema-content' + 'x'.repeat(10_000)]: false }],
+  ])('refuses %s before spawning with a bounded no-verdict compile error', async (_name, shape) => {
+    const { fn, calls } = scriptedSpawn([{ stdout: ANSWER_JSON, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 1, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err.message).toMatch(/schema compilation failed/);
+    expect(err.message).toContain('correct the schema before retrying; no verdict');
+    expect(err.message).not.toContain('private-schema-content');
+    expect(err.message.length).toBeLessThan(600);
+    expect(err).not.toHaveProperty('value');
+    expect(err.attempts).toBe(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each(['before', 'after'])('rejects a truncated error object %s success with bounded redacted diagnostics', async position => {
+    const truncated = '  {"type":"error","message":"private-juror-content' + 'x'.repeat(10_000);
+    const stdout = position === 'before' ? `${truncated}\n${ANSWER_JSON}` : `${ANSWER_JSON}\n${truncated}`;
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 2, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err).not.toHaveProperty('value');
+    expect(err.message).toMatch(/malformed JSON object line.*content redacted/);
+    expect(err.message).toContain('no verdict');
+    expect(err.message).not.toContain('private-juror-content');
+    expect(err.message).not.toContain('stdout[0..600]');
+    expect(err.message.length).toBeLessThan(1200);
+    expect(err.failedAttempts[0].reason).toMatch(/malformed JSON object line/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    ['is_error result', { type: 'result', is_error: true, result: 'review failed' }],
+    ['is_error event', { type: 'system', is_error: true, result: 'review failed' }],
+    ['string is_error event', { is_error: 'true' }],
+    ['numeric is_error event', { is_error: 1 }],
+    ['error event', { type: 'error', error: 'x' }],
+    ['unsuccessful subtype with output', { type: 'result', subtype: 'error_during_execution', is_error: false,
+      structured_output: { verdict: 'accept', findings: [], private: 'private-juror-content' } }],
+    ['null subtype', { type: 'result', subtype: null, is_error: false }],
+    ['is_error with output and no result text', { type: 'result', is_error: true,
+      structured_output: { verdict: 'accept', findings: [], private: 'private-juror-content' } }],
+  ].flatMap(([name, event]) => ['alone', 'before success', 'after success'].map(position => [name, event, position])))
+  ('rejects %s %s at exit 0 without a verdict or raw output', async (_name, event, position) => {
+    // Every structured_output is schema-valid, so failure must come from the CLI envelope.
+    const shape = { type: 'object', required: ['verdict', 'findings'] };
+    const line = JSON.stringify(event);
+    const stdout = position === 'alone' ? line : position === 'before success'
+      ? `${line}\n${ANSWER_JSON}` : `${ANSWER_JSON}\n${line}`;
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 2, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err instanceof JudgeUnparseableError || err.message.startsWith('judge-spawn: the juror failed')).toBe(true);
+    expect(err).not.toHaveProperty('value');
+    expect(err).not.toHaveProperty('structured_output');
+    expect(err.message).not.toContain('private-juror-content');
+    expect(err.message).not.toContain('stdout[0..600]');
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([undefined, 'success'])('accepts a single legitimate result with subtype %s', async subtype => {
+    const stdout = JSON.stringify({ ...JSON.parse(ANSWER_JSON), type: 'result', subtype });
+    const { fn } = scriptedSpawn([{ stdout, code: 0 }]);
+    const result = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 0, spawnFn: fn });
+    expect(result.value).toEqual({ verdict: 'accept', findings: [] });
+  });
+
+  it.each([
+    ['empty object', {}, SHAPE, /required/],
+    ['missing field', { verdict: 'private-juror-content' }, SHAPE, /required/],
+    ['numeric verdict', { verdict: 123, findings: [] }, SHAPE, /type/],
+    ['wrong type', { verdict: 'private-juror-content', findings: 'private-juror-content' }, SHAPE, /type/],
+    ['extra property', { verdict: 'private-juror-content', findings: [], extra: true }, SHAPE, /additionalProperties/],
+    ['empty object with permissive schema', {}, { type: 'object' }, /nonempty object/],
+    ['missing output', undefined, SHAPE, /expected an object/],
+  ])('rejects %s as no verdict with a schema violation and no raw output', async (_name, value, shape, violation) => {
+    const stdout = JSON.stringify({ session_id: SID, structured_output: value, result: 'private-juror-content' });
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(calls).toHaveLength(1);
+    expect(err.attempts).toBe(1);
+    expect(err.message).toMatch(/structured_output schema violation/);
+    expect(err.message).toMatch(violation);
+    expect(err.message).not.toContain('private-juror-content');
+    expect(err.message).not.toContain('stdout[0..600]');
+    expect(err.failedAttempts).toHaveLength(1);
+    expect(err.failedAttempts[0].reason).toMatch(violation);
+  });
+
+  it.each([
+    [7, null],
+    [null, null],
+    [null, 'SIGTERM'],
+    [0, 'SIGTERM'],
+  ])('rejects a valid verdict with exit code %s and signal %s', async (code, signal) => {
+    const { fn, calls } = scriptedSpawn([{ stdout: ANSWER_JSON, code, signal }, { stdout: ANSWER_JSON, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 2, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(code == null || signal ? JudgeTimeoutError : JudgeUnparseableError);
+    expect(err).toMatchObject({ exitCode: code, signal });
+    expect(calls).toHaveLength(1);
+    expect(err.message).toContain(code == null || signal ? 'JUDGE_TIMEOUT_MS' : 'juror process failed');
+  });
+
+  it.each(['', 'not json'].flatMap(stdout => [
+    [stdout, null, 'SIGTERM'],
+    [stdout, 0, 'SIGTERM'],
+    [stdout, 1, null],
+    [stdout, null, null],
+  ]))('never retries unparseable stdout %j with exit %s and signal %s', async (stdout, code, signal) => {
+    const { fn, calls } = scriptedSpawn([{ stdout, code, signal }, { stdout: ANSWER_JSON, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+      retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+    expect(err).toBeInstanceOf(code == null || signal ? JudgeTimeoutError : JudgeUnparseableError);
+    expect(err).toMatchObject({ exitCode: code, signal });
+    if (code != null && !signal) expect(err.failedAttempts[0].reason).toBe(`juror process failed (exit ${code}, signal none)`);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('fails immediately after nonzero exit and records bounded failure evidence', async () => {
+    const stderr = 'x'.repeat(2000) + 'stderr-tail';
+    const { fn, calls } = scriptedSpawn([{ stdout: ANSWER_JSON, code: 7, signal: null, stderr }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(calls).toHaveLength(1);
+    expect(err).toMatchObject({ exitCode: 7, signal: null, attempts: 1, stderrTail: stderr.slice(-1000) });
+    expect(err.message).toMatch(/juror process failed \(exit 7, signal none\)/);
+    expect(err.message).not.toContain('stdout[0..600]');
+    expect(err.failedAttempts).toHaveLength(1);
+    expect(err.failedAttempts[0]).toMatchObject({
+      exitCode: 7, signal: null, stderrTail: stderr.slice(-1000),
+      reason: 'juror process failed (exit 7, signal none)',
+    });
+    expect(err.message.length).toBeLessThan(1200);
+  });
+
   it('retries an EMPTY stdout once and returns the second attempt\'s answer', async () => {
-    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
     const r = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn });
     expect(calls).toHaveLength(2);
     expect(r.value).toEqual({ verdict: 'accept', findings: [] });
     expect(r.attempts).toBe(2);
     // The failed attempt is carried on the result, so a caller can see a retry happened and why.
     expect(r.failedAttempts).toHaveLength(1);
-    expect(r.failedAttempts[0]).toMatchObject({ attempt: 1, exitCode: 1, signal: null, stdoutBytes: 0 });
+    expect(r.failedAttempts[0]).toMatchObject({ attempt: 1, exitCode: 0, signal: null, stdoutBytes: 0 });
   });
 
   it('gives each attempt its OWN derived session id — distinct, deterministic, never the first one reused', async () => {
-    const { fn, calls } = scriptedSpawn([{ stdout: 'not json', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const { fn, calls } = scriptedSpawn([{ stdout: 'not json', code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
     await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn });
     const [first, second] = calls.map((c) => sidOf(c.argv));
     expect(first).toBe(SID);
@@ -1492,30 +1819,30 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   it('still unparseable after the retry → a typed JudgeUnparseableError carrying exit code, signal and a bounded stderr tail', async () => {
     const bigStderr = `${'x'.repeat(5000)}\nTHE-LAST-STDERR-LINE`;
     const { fn, calls } = scriptedSpawn([
-      { stdout: '', stderr: 'first attempt died', code: null, signal: 'SIGTERM' },
-      { stdout: '', stderr: bigStderr, code: null, signal: 'SIGTERM' },
+      { stdout: '', stderr: 'first output lost', code: 0, signal: null },
+      { stdout: '', stderr: bigStderr, code: 0, signal: null },
     ]);
     const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn })
       .then(() => null, (e) => e);
     expect(calls).toHaveLength(2);
     expect(err).toBeInstanceOf(JudgeUnparseableError);
-    expect(err.exitCode).toBe(null);
-    expect(err.signal).toBe('SIGTERM');
+    expect(err.exitCode).toBe(0);
+    expect(err.signal).toBe(null);
     expect(err.attempts).toBe(2);
     expect(err.stderrTail).toContain('THE-LAST-STDERR-LINE');
     expect(err.stderrTail.length).toBeLessThanOrEqual(1000);
-    expect(err.failedAttempts.map((a) => a.signal)).toEqual(['SIGTERM', 'SIGTERM']);
+    expect(err.failedAttempts.map((a) => a.signal)).toEqual([null, null]);
     // The FIRST LINE keeps the old wording (so existing labels still match) and now names the evidence, because a
     // caller that keeps only the first line (the review job's label) must still learn exit code and signal.
     const firstLine = err.message.split('\n')[0];
     expect(firstLine).toMatch(/^judge-spawn: the juror did not emit parseable JSON on stdout/);
     expect(firstLine).toMatch(/attempt 2\/2/);
-    expect(firstLine).toMatch(/signal SIGTERM/);
+    expect(firstLine).toMatch(/signal none/);
     expect(firstLine).toMatch(/THE-LAST-STDERR-LINE/);
     expect(firstLine.length).toBeLessThanOrEqual(400);
     // The run record's telemetry row is built from `err.telemetry`: it names the failure and the last actor.
     expect(err.telemetry).toMatchObject({
-      sessionId: retrySessionId(SID, 2), exitCode: null, signal: 'SIGTERM', attempts: 2, failure: 'unparseable-stdout',
+      sessionId: retrySessionId(SID, 2), exitCode: 0, signal: null, attempts: 2, failure: 'unparseable-stdout',
     });
     expect(typeof err.telemetry.wallMs).toBe('number');
     expect(err.telemetry.stderrTail).toContain('THE-LAST-STDERR-LINE');
@@ -1532,7 +1859,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   });
 
   it('retries: 0 spawns exactly once', async () => {
-    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
     await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 0, log: () => {}, spawnFn: fn }))
       .rejects.toBeInstanceOf(JudgeUnparseableError);
     expect(calls).toHaveLength(1);
@@ -1541,7 +1868,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   it('rejects an invalid caller-supplied retry count BEFORE spawning — never resolves undefined', async () => {
     const bad = [-1, Number.NaN, 0.5, 1.5, UNPARSEABLE_RETRY_SETTING.max + 1, Infinity, -Infinity, '1', null, true, {}, []];
     for (const retries of bad) {
-      const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const { fn, calls } = scriptedSpawn([{ stdout: '', code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
       const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries, log: () => {}, spawnFn: fn })
         .then((r) => ({ resolved: r }), (e) => e);
       expect(err, `retries=${String(retries)}`).toBeInstanceOf(RangeError);
@@ -1552,7 +1879,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
 
   it('accepts every integer retry count in 0..max, and spawns 1 + retries times when all fail', async () => {
     for (let retries = 0; retries <= UNPARSEABLE_RETRY_SETTING.max; retries += 1) {
-      const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }]);
+      const { fn, calls } = scriptedSpawn([{ stdout: '', code: 0 }]);
       await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries, log: () => {}, spawnFn: fn }))
         .rejects.toBeInstanceOf(JudgeUnparseableError);
       expect(calls).toHaveLength(1 + retries);
@@ -1560,7 +1887,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   });
 
   it('does NOT retry a juror that answered with its own error text (a real failure, not a lost output)', async () => {
-    const { fn, calls } = scriptedSpawn([{ stdout: JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), code: 1 }]);
+    const { fn, calls } = scriptedSpawn([{ stdout: JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), code: 0 }]);
     await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn }))
       .rejects.toThrow('Not logged in');
     expect(calls).toHaveLength(1);
@@ -1568,7 +1895,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
 
   it('logs the retry with the setting\'s value AND where that value came from', async () => {
     const lines = [];
-    const { fn } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const { fn } = scriptedSpawn([{ stdout: '', code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
     await judgeSpawn({
       mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', log: (l) => lines.push(l), spawnFn: fn,
       env: { [UNPARSEABLE_RETRY_SETTING.env]: '1' },
@@ -1578,7 +1905,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   });
 
   it('takes the retry count from the cascade when the caller passes none (env 0 → no retry)', async () => {
-    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
     await expect(judgeSpawn({
       mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, log: () => {}, spawnFn: fn, env: { [UNPARSEABLE_RETRY_SETTING.env]: '0' },
     })).rejects.toBeInstanceOf(JudgeUnparseableError);
@@ -1608,10 +1935,10 @@ describe('resolveUnparseableRetries — the retry count is a cascade setting wit
   });
 });
 
-describe('parseJudgeOutcome — a stray line around the result object does not lose the answer', () => {
-  it('reads the last line that is a JSON result object when the whole stdout is not one document', () => {
+describe('parseJudgeOutcome — every non-blank line must be a JSON object', () => {
+  it('rejects a warning line even when followed by a valid result object', () => {
     const answer = JSON.stringify({ is_error: false, stop_reason: 'tool_use', session_id: 's', structured_output: { verdict: 'accept', findings: [] } });
-    expect(parseJudgeOutcome(`some warning printed to stdout\n${answer}\n`).value).toEqual({ verdict: 'accept', findings: [] });
+    expect(() => parseJudgeOutcome(`some warning printed to stdout\n${answer}\n`)).toThrow(/malformed JSON object line/);
   });
   it('still throws the unparseable error, marked as such, when no line is a result object', () => {
     let err;
