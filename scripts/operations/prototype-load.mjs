@@ -5,7 +5,8 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
+import { QUESTION_HASH, legacyFindAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
+import { evaluateAudit } from '../lib/audit-ledger.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
@@ -89,7 +90,7 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
       && Array.isArray(ruledWeakened) && ruledWeakened.find((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
         && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
         && e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i]));
-    return match ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: r.auditDisclosed, ...(match.layer ? { layer: match.layer } : {}) } } : null;
+    return match ? { source: 'ready-record', record: r, ruledWeakened: { ...(match.auditId ? { auditId: match.auditId } : {}), ruling: r.auditRuling, findings: r.auditDisclosed, ...(match.layer ? { layer: match.layer } : {}) } } : null;
   };
   // Precedence (R503 red team rounds 1–2). The records file is append-only, so file order is time order:
   //  - per sha, only its LATEST record counts (a superseded WEAKENED or red record never blocks forever);
@@ -129,7 +130,7 @@ export function readyRecordSpeaksFor(records, input, liveFp = null) {
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
  * whole change, not just its last commit). */
-export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null, auditOptions = {}) {
+export function legacyCanonicalAuditEvidence(records, sha, covers = () => true, liveFp = null, auditOptions = {}) {
   // R503: an audit of an older head also speaks for this head when its stored net-diff fingerprint equals the live one.
   // No stored or live fingerprint, or any difference, means no carry (a real code change always re-audits).
   // Eligibility is per RECORD: each carried record must itself hold the matching fingerprint, so one carried record
@@ -150,7 +151,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     return copy;
   });
   const decisions = (head) => [...new Set(list.filter((r) => r?.head === head && r.base !== head).map((r) => r.base))]
-    .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH, ...auditOptions }) })).filter((d) => d.record);
+    .map((base) => ({ base, record: legacyFindAudit(list, { head, base, questionHash: QUESTION_HASH, ...auditOptions }) })).filter((d) => d.record);
   const own = decisions(sha);
   // Only string heads carry (main #6353): a non-string head that stringifies to a sha never aliases a real one, and
   // findAudit refuses non-string head/base, so a non-string base never decides either.
@@ -197,7 +198,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const priorOnly = list.filter((r) => r?.questionHash !== QUESTION_HASH);
   const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
     && !carried.some((d) => d.record.head === r.head && d.base === r.base)
-    && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
+    && legacyFindAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
   const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED' && !ruled(d.record));
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(text(d.record.at))));
@@ -214,6 +215,10 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     if (covered(base) && (!pass || Date.parse(text(record.at)) >= Date.parse(text(pass.at)))) pass = record;
   }
   return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };
+}
+/** Compatibility wrapper shared with file-backed readers. */
+export function canonicalAuditEvidence(records, head, covers = () => true, liveFp = null, options = {}) {
+  return evaluateAudit(records, { ...options, head, covers, liveFp });
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 /** Resolve a worker-supplied daemon name to its settings key (R502 item 1: workers guessed wrong 3 times).

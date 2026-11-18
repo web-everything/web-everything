@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { stripVTControlCharacters } from 'node:util';
+import { evaluateAudit } from '../lib/audit-ledger.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
@@ -62,7 +63,7 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
 
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
-export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
+export function legacyFindAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
   if (typeof base !== 'string' || typeof head !== 'string' || !SHA.test(base) || !SHA.test(head) || questionHash !== QUESTION_HASH) return null;
   let latest = null, prior = null, sawCurrent = false;
   for (const record of records) {
@@ -78,6 +79,11 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   }
   // A current-question record always decides; a prior-question record only speaks when no current-question record exists (even an unusable one blocks the fallback).
   return sawCurrent ? latest : prior;
+}
+
+/** Compatibility reader; raw ledgers retain their original hash bytes. */
+export function findAudit(records, options) {
+  return evaluateAudit(records, { ...options, lookup: true }).record ?? null;
 }
 
 /** Inject resolveSha, runCodex, appendRecord, now, stdout and stderr for hermetic execution. */

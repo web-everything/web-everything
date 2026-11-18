@@ -7,10 +7,11 @@ export function storePath(env = process.env) {
   return join(env.HOME, 'workspace/.operations/coordination/ruled-weakened.jsonl');
 }
 const nonblank = (v) => typeof v === 'string' && v.trim().length > 0;
-const entryFields = new Set(['ref', 'sha', 'ruling', 'findings', 'actor', 'at', 'quote']);
+const entryFields = new Set(['ref', 'sha', 'ruling', 'findings', 'actor', 'at', 'quote', 'auditId']);
 export function validateEntry(e) {
   return !!e && typeof e === 'object' && !Array.isArray(e)
     && Object.keys(e).every(key => entryFields.has(key))
+    && (e.auditId === undefined || nonblank(e.auditId))
     && nonblank(e.ref) && typeof e.sha === 'string' && /^[a-f0-9]{40}$/i.test(e.sha)
     && typeof e.ruling === 'string' && /^R\d+(?:\+R\d+)*$/.test(e.ruling)
     && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every(nonblank)
@@ -30,7 +31,7 @@ export function readStore({ path = storePath(), fs = nodeFs, warn = console.warn
       const entry = JSON.parse(line);
       if (!validateEntry(entry)) throw new Error('invalid entry');
       const { ref, sha, ruling, findings, actor, at, quote } = entry;
-      entries.push({ ref, sha, ruling, findings, actor, at, quote });
+      entries.push({ ref, sha, ruling, findings, actor, at, quote, ...(entry.auditId ? { auditId: entry.auditId } : {}) });
     } catch { warn(`WARNING: ruled-weakened store line ${i + 1}: malformed JSON or invalid entry; ignored`); }
   });
   return { entries, error: null };

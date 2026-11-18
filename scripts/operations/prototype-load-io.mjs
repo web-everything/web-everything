@@ -7,6 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
+import { evaluateAuditFile } from '../lib/audit-ledger.mjs';
 import { readStore, storePath } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
@@ -23,7 +24,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -513,16 +514,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Fix the latest readiness evidence; arguments are labels only.' });
       }
       stage = 'no-canonical-audit';
-      let auditRecords = [];
-      try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }
       const covers = (base) => { try {
         // Canonical coverage and R503 carry may need this one read-only main fetch.
         fetchMain();
         return ancestor(base, 'origin/main');
       } catch { return false; } };
+      let auditRecords = [];
+      try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }
       const liveFp = liveFingerprint(auditRecords);
-      out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: out.gate }) };
+      out.canonicalAudit = { mode: 'refuse', ...evaluateAuditFile({ ledgerPath: expand(config.auditRecordPath), fs,
+        head: input.sha, covers, liveFp, ruledWeakened: out.gate,
+        resolveFingerprint: (b, h) => (fingerprint || ((base, head) => netDiffFingerprint(gitRepo, base, head, { exec })))(b, h) }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);

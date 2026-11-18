@@ -4497,3 +4497,11 @@ wedge the writer. A rewritten chained record or legacy bytes, a rollback below `
 or a missing sidecar after genesis refuses the append (`LEDGER_TAMPER`, exit 3), writes the record to
 `audits.quarantine.jsonl`, and is recovered only by the orchestrator-run reseal script kept outside the repo
 (`appendChained` with `{ kind: 'genesis', reseal: true, actor, reason }`).
+
+## Audit ledger v2 (R1047)
+
+Audit readers use `evaluateAuditFile` from `scripts/lib/audit-ledger.mjs`; never parse and
+re-serialize migrated JSONL before evaluation: chain hashes cover the original line bytes.
+The last genesis seals every preceding byte, including earlier genesis records and stale
+writer lines. Test ledgers and sidecars together in a task temporary directory. Legacy-only
+ledgers without a sidecar deliberately retain their historical evaluator and record identity.
