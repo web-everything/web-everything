@@ -25,6 +25,20 @@ const viewOf = (d, over = {}) => ({
 });
 
 describe('isDraftOwedPromotion', () => {
+  it.each([
+    [{ mergeable: 'MERGEABLE' }, 'awaiting-ci-trigger'],
+    [{ mergeable: 'CONFLICTING' }, 'ci-blocked-by-conflict'],
+    [{ labels: ['status:conflict'] }, 'ci-blocked-by-conflict'],
+  ])('classifies unchecked evidence without promoting: %j', (fields, reason) => {
+    expect(isDraftOwedPromotion({ pr: draft(fields), checks: { state: 'unchecked', sha: SHA } }))
+      .toMatchObject({ owed: false, reason });
+  });
+  it('keeps green and red decisions and explanations unchanged', () => {
+    expect(isDraftOwedPromotion({ pr: draft(), checks: green })).toEqual({ owed: true,
+      why: 'draft lane PR — every required check is green on its head; promote it to ready for review (draft-first PRs)' });
+    expect(isDraftOwedPromotion({ pr: draft(), checks: { state: 'red', sha: SHA } }))
+      .toEqual({ owed: false, why: 'required checks read red, not green' });
+  });
   it('owes a green open lane draft', () => {
     expect(isDraftOwedPromotion({ pr: draft(), checks: green }).owed).toBe(true);
   });
@@ -174,7 +188,7 @@ describe('replay: #4567/#4563/#4535 green drafts left unpromoted (2026-10-09)', 
     expect(result.rows.every((r) => r.action === 'skip' && /head moved/.test(r.why))).toBe(true);
   });
   it('the fresh view asks for the fields the tick decides on, and the list asks for the fork flag', () => {
-    for (const f of ['headRefOid', 'comments', 'labels', 'statusCheckRollup', 'isCrossRepository', 'mergeStateStatus', 'baseRefName']) expect(PR_VIEW_FIELDS.split(',')).toContain(f);
+    for (const f of ['headRefOid', 'comments', 'labels', 'statusCheckRollup', 'isCrossRepository', 'mergeStateStatus', 'mergeable', 'baseRefName']) expect(PR_VIEW_FIELDS.split(',')).toContain(f);
     expect(DRAFT_LIST_FIELDS.split(',')).toContain('isCrossRepository');
   });
   it('a rollup at the gh cap of 100 contexts is left to the tick, with a reason that says so', () => {

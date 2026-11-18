@@ -74,7 +74,7 @@ const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => 
  *   `reviewWhileBaseOpen`: the `stack.reviewWhileBaseOpen` setting (read when omitted). A GitHub-stacked
  *   draft (base is another lane branch) is owed promotion on its OWN green checks only while it is on; off, it waits for
  *   its base to land and the drain to retarget it (the behaviour before 2026-10-10).
- * @returns {{owed:boolean, why:string}}
+ * @returns {{owed:boolean, why:string, reason?:string}}
  */
 export function isDraftOwedPromotion({ pr = {}, checks = null, reviewWhileBaseOpen, defaultBranch = 'main' } = {}) {
   if (String(pr?.state ?? 'OPEN').toUpperCase() !== 'OPEN') return { owed: false, why: 'not open' };
@@ -91,6 +91,13 @@ export function isDraftOwedPromotion({ pr = {}, checks = null, reviewWhileBaseOp
   }
   if (!checks) return { owed: false, why: 'required checks not read yet' };
   if (!pr?.headRefOid || checks.sha !== pr.headRefOid) return { owed: false, why: 'check verdict is for a different head' };
+  if (checks.state === 'unchecked') {
+    const conflict = pr.mergeable === 'CONFLICTING'
+      || labelNames(pr.labels).some(label => ['status:conflict', 'merge-status:conflicting'].includes(label));
+    return conflict
+      ? { owed: false, reason: 'ci-blocked-by-conflict', why: 'required checks have no rows on this head — CI cannot run until rebased' }
+      : { owed: false, reason: 'awaiting-ci-trigger', why: 'required checks have no rows on this head — missing-run recovery owns the synchronize-push nudge' };
+  }
   if (checks.state !== 'green' && !(checks.state === 'red' && checks.reviewHoldOnly === true)) {
     return { owed: false, why: `required checks read ${checks.state ?? 'unknown'}, not green` };
   }
