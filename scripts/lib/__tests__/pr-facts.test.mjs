@@ -443,3 +443,20 @@ describe('mirror compaction', () => {
     expect(readMirrorFile(mirrorPath(dir, REPO))).toEqual(mirror);
   });
 });
+
+describe('mirror compaction sha tombstones', () => {
+  it('a PR adopting a sha whose checks were dropped is not served from the mirror', () => {
+    const T = Date.UTC(2026, 10, 18);
+    const repo = 'web-everything/web-everything';
+    const sha = 'a'.repeat(40);
+    const dropped = { type: 'check_run', repo, sha, prs: [], name: 't', app: 'x', conclusion: 'failure', seq: 3, at: new Date(T - 10 ** 9).toISOString() };
+    const pr = { repo, number: 9, sha: 'b'.repeat(40), state: 'open', draft: false, labels: [], checks: [], suites: [], fields: {}, labelChanges: {}, seq: 1 };
+    const m = { v: 1, repo, buckets: { prs: { [JSON.stringify([repo, 9])]: pr }, checks: { k: dropped }, shas: {} }, closedSeen: {},
+      cursor: 1, fetchedAtMs: T, lastOkAt: T, lastDeliveryAt: T, bootstrap: { status: 'complete' } };
+    const next = compactMirror(m, { nowMs: T, retentionMs: 1000 });
+    expect(next.buckets.checks).toEqual({});
+    expect(next.evictedShas).toEqual([sha]);
+    const adopted = { ...next, buckets: { ...next.buckets, prs: { [JSON.stringify([repo, 9])]: { ...pr, sha } } } };
+    expect(lookupInMirror(adopted, { number: 9, nowMs: T })).toEqual({ facts: null, reason: 'evicted' });
+  });
+});

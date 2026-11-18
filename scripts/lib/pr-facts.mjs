@@ -164,11 +164,14 @@ export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.c
   const retained = new Map();
   // Numbers whose evidence was dropped: a later reopen recreates a row without it, so it must never be served as facts.
   const evicted = new Set(mirror.evicted || []);
+  // Head shas whose checks/rows were dropped: a PR that later adopts one of them has lost evidence too.
+  const evictedShas = new Set(mirror.evictedShas || []);
+  const droppedHeads = [];
   for (const [key, row] of Object.entries(mirror.buckets.prs)) {
     if (row.state === 'closed' || !row.state) {
       // A legacy mirror (no closedSeen yet) cannot date its closures: treat them as expired.
       const seen = mirror.closedSeen?.[row.number] ?? (mirror.closedSeen ? nowMs : nowMs - retentionMs);
-      if (nowMs - seen >= retentionMs) { evicted.add(row.number); continue; }
+      if (nowMs - seen >= retentionMs) { evicted.add(row.number); if (row.sha) droppedHeads.push(row.sha); continue; }
       closedSeen[row.number] = seen;
     }
     prs[key] = row;
@@ -181,12 +184,16 @@ export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.c
     const keep = attached.some((n) => retained.has(n));
     const age = nowMs - Date.parse(c.at);
     if (keep || (!attached.length && age >= 0 && age < retentionMs)) checks[key] = c;
+    else if (c.sha) evictedShas.add(c.sha);
   }
   for (const [key, numbers] of Object.entries(mirror.buckets.shas)) {
     const kept = numbers.filter((n) => retained.has(n));
     if (kept.length) shas[key] = kept;
   }
-  return { ...mirror, buckets: { ...mirror.buckets, prs, checks, shas }, closedSeen, evicted: [...evicted].sort((a, b) => a - b) };
+  // A dropped PR's head is tombstoned unless a retained PR still holds it (its checks stayed with that PR).
+  const heldHeads = new Set([...retained.values()].map((r) => r.sha));
+  for (const s of droppedHeads) if (!heldHeads.has(s)) evictedShas.add(s);
+  return { ...mirror, buckets: { ...mirror.buckets, prs, checks, shas }, closedSeen, evicted: [...evicted].sort((a, b) => a - b), evictedShas: [...evictedShas].sort() };
 }
 
 const sortBy = (...keys) => (a, b) => { for (const k of keys) { const x = String(a[k] ?? ''); const y = String(b[k] ?? ''); if (x !== y) return x < y ? -1 : 1; } return 0; };
@@ -247,13 +254,16 @@ export function mirrorRows(mirror) {
   return projectPrRows({ ...bucketStorage(structuredClone(mirror.buckets)) });
 }
 
+/** Compaction dropped this PR's (or its head sha's) evidence: the row cannot prove its checks/review, so it is not served. */
+const lostEvidence = (mirror, row) => !!(mirror.evicted?.includes(row.number) || (row.sha && mirror.evictedShas?.includes(row.sha)));
+
 /** Look one PR up in a mirror. `{ facts }` or `{ facts:null, reason }`. PURE. */
 export function lookupInMirror(mirror, { number, nowMs, ttlMs, staleAfterMs }) {
   const verdict = judgeMirror(mirror, { nowMs, ttlMs, staleAfterMs });
   if (!verdict.ok) return { facts: null, reason: verdict.reason };
   const row = mirrorRows(mirror).find((r) => r.number === Number(number));
   if (!row) return { facts: null, reason: 'no-row' };
-  if (mirror.evicted?.includes(row.number)) return { facts: null, reason: 'evicted' }; // reopened: evidence was dropped, read GitHub
+  if (lostEvidence(mirror, row)) return { facts: null, reason: 'evicted' }; // reopened: evidence was dropped, read GitHub
   if (!row.sha || !row.state || row.draft == null || !Array.isArray(row.labels)) return { facts: null, reason: 'incomplete-row' };
   return { facts: { ...normalizeStoreRow(row), source: 'store', asOfMs: mirror.fetchedAtMs, cursor: mirror.cursor } };
 }
@@ -397,7 +407,7 @@ export async function readRepoFacts({ repo, caller = null, env = process.env, no
   const { mirror, settings } = await loadMirror({ repo, env, now, ...o });
   if (!mirror || !judgeMirror(mirror, { nowMs: now(), ...settings }).ok) return null;
   const prs = mirrorRows(mirror)
-    .filter((row) => !mirror.evicted?.includes(row.number) && row.sha && row.state && row.draft != null && Array.isArray(row.labels))
+    .filter((row) => !lostEvidence(mirror, row) && row.sha && row.state && row.draft != null && Array.isArray(row.labels))
     .map((row) => ({ ...normalizeStoreRow(row), source: 'store', asOfMs: mirror.fetchedAtMs, cursor: mirror.cursor }))
     .sort((a, b) => a.number - b.number);
   logFactsHit(env, caller || deriveGhCaller({}, env), repoKey(repo), prs.length);
