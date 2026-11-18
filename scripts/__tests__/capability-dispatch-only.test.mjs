@@ -1,9 +1,12 @@
+/** @repo-scanning-test scope=files — capability admission rules are checked per changed source. */
 import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import ts from 'typescript';
+import { scanScope, scopedScanFiles } from '../lib/repo-scan-tests.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
+const scope = scanScope();
 const allowlist = new Set([
   'scripts/conveyor/reconcile-fix-dispatch.mjs', // S1 fixer dispatch admission.
   'scripts/conveyor/orphan-fix-round.mjs', // Orphan fixer redispatch only.
@@ -37,10 +40,10 @@ function rosterFilters(source) {
   return found;
 }
 describe('capabilities admit dispatch only', () => {
-  const files = [...new Set([
+  const files = scopedScanFiles([...new Set([
     ...sources('scripts/conveyor'), ...sources('skills-src/conveyor'), ...sources('scripts/operations'),
     'scripts/merge-ai-prs.mjs',
-  ])];
+  ])]);
   it.each(files)('%s has no capability-filtered roster or unapproved admission', path => {
     const source = readFileSync(resolve(root, path), 'utf8');
     if (!allowlist.has(path)) expect(source).not.toMatch(/\b(?:constellationRepoKeysWith|repoHasCapability|assertCapability)\b/);
@@ -53,7 +56,7 @@ describe('capabilities admit dispatch only', () => {
     'repos.flatMap(repo => repo.capabilities?.fix ? [repo] : [])',
   ])('detects a capability roster regression: %s', source => expect(rosterFilters(source)).toHaveLength(1));
 
-  it('allows lander admission only at enqueue and direct merge dispatch, leaving lifecycle paths unguarded', () => {
+  it.skipIf(scope !== null && !scope.has('scripts/merge-ai-prs.mjs'))('allows lander admission only at enqueue and direct merge dispatch, leaving lifecycle paths unguarded', () => {
     const source = readFileSync(resolve(root, 'scripts/merge-ai-prs.mjs'), 'utf8');
     const file = ts.createSourceFile('merge-ai-prs.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const sites = [];
