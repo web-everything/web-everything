@@ -928,7 +928,7 @@ export function historicalCardOnlySkipCandidate(old) {
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
-  readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
+  readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;

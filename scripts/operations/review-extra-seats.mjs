@@ -1824,9 +1824,10 @@ export async function speculateRedTeam({
     const settings = readRedTeamProbes({ env, log: io.log });
     const now = io.now();
     let records = [];
-    try { records = io.readRecords(); } catch (e) {
-      if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
-      io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
+    try { records = io.readRecords({ strict: true }); } catch {
+      return { status: 'skipped', ...(!resumeOnly ? { deferredByGuard: true } : {}),
+        reason: resumeOnly ? 'resume-only: scorecard store unreadable — no call launched'
+          : 'scorecard store unreadable; inspect stored evidence before retrying — no call launched' };
     }
     const prior = priorRedTeamRow(records, pr, rev, repo);
     if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };

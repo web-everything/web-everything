@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import * as storeModule from '../run-scorecard-store.mjs';
 import {
-  validateScorecard, readStore, writeStore, appendScorecard, meanScore,
+  validateScorecard, readStore, writeStore, appendScorecard, meanScore, MissingStoreError,
   resolveScorecardStorePath, LEGACY_IN_TREE_STORE, LEGACY_MIGRATION_ID,
   mergeLegacyStores, migrateLegacyStore, readLegacyStoreTexts,
 } from '../run-scorecard-store.mjs';
@@ -457,10 +457,26 @@ describe('strict scorecard reads for red-team admission', () => {
     expect(() => readStore({ path: '/fixture/store', strict: true,
       read: () => { throw Object.assign(Error('denied'), { code: 'EACCES' }); } })).toThrow('denied');
   });
-  it('allows absent stores but returns existing records unchanged', () => {
-    expect(readStore({ path: '/fixture/store', strict: true,
-      read: () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); } }).records).toEqual([]);
+  it('types injected ENOENT and preserves existing records unchanged', () => {
+    expect(() => readStore({ path: '/fixture/store', strict: true,
+      read: () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); } })).toThrow(MissingStoreError);
     const records = [baseRow()];
     expect(readStore({ path: '/fixture/store', strict: true, read: () => JSON.stringify({ records }) }).records).toEqual(records);
+  });
+  it('distinguishes a real missing store from a present-empty store only in strict mode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'scorecard-strict-'));
+    const path = join(dir, 'scorecards.json');
+    try {
+      expect(() => readStore({ path, strict: true })).toThrow(MissingStoreError);
+      expect(() => readStore({ path, strict: true, exists: existsSync })).toThrow(MissingStoreError);
+      try { readStore({ path, strict: true }); } catch (error) {
+        expect(error).toMatchObject({ name: 'MissingStoreError', code: 'ENOENT', path });
+        expect(error.cause.code).toBe('ENOENT');
+      }
+      expect(readStore({ path })).toEqual({ version: 1, records: [] });
+      writeStore({ version: 1, records: [] }, { path });
+      expect(readStore({ path, strict: true })).toEqual({ version: 1, records: [], migrations: [] });
+      expect(readStore({ path })).toEqual({ version: 1, records: [], migrations: [] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

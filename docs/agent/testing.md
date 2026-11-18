@@ -4441,3 +4441,16 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Strict scorecard evidence: missing versus empty
+
+`scripts/lib/__tests__/strict-scorecard-callers.test.mjs` is the caller matrix for strict
+scorecard reads and their recovery consumers. Each row uses real temporary scorecard,
+status and review-run files: a missing store retains the hold, denies an exemption/retry
+or refuses the read; a present-empty store preserves the caller's previous behavior.
+Keep the record reader, sealing reader, recovery guard, speculation, recovery witness,
+drain evidence, withheld publisher, review-job admission/infra guard, retry predicates
+and on-skip recovery consumers in this table. Missing evidence requires operator
+inspection before retrying. The store unit suite separately pins `MissingStoreError`
+for strict absence and unchanged non-strict reads. Run these and the affected red-team
+suites through the host heavy-admission queue.

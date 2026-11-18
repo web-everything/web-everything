@@ -15,20 +15,23 @@ describe('red-team CLI --resume-only', () => {
     ['missing', ['--resume-only']],
     ['unreadable', ['--resume-only']],
     ['missing', []],
+    ['empty', []],
   ])('guards fresh calls with %s scorecards and flags %j', (store, flags) => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-cli-'));
     try {
       const payloadPath = join(dir, 'loop.json');
+      const storePath = join(dir, 'scorecards.json');
       writeFileSync(payloadPath, JSON.stringify(loopPayload));
+      if (store !== 'missing') writeFileSync(storePath, store === 'unreadable' ? '{broken' : JSON.stringify({ records: [] }));
       // Execute the production CLI handler in a child. Only effect IO is replaced;
       // argv parsing, payload reading and the real runRedTeam guard all execute.
       const source = `
-        import { runExtraSeatsCli } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
+        import { runExtraSeatsCli, createRedTeamIo } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
         const calls = { provider: 0, reserve: 0, model: 0, recheck: 0 };
         const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
         await runExtraSeatsCli(process.argv.slice(1), { redTeamIo: {
           now: () => 1000, log: () => {},
-          readRecords: () => { ${store === 'unreadable' ? "throw Error('EIO');" : 'return [];'} },
+          readRecords: createRedTeamIo({ storePath: ${JSON.stringify(storePath)} }).readRecords,
           cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
           runSeat: forbid('model'), runRecheck: forbid('recheck'),
         } });
@@ -40,16 +43,17 @@ describe('red-team CLI --resume-only', () => {
         env: { PATH: '', WE_REVIEW_EXTRA_SEATS: '1', WE_REVIEW_RED_TEAM: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0' },
       });
       const [result, calls] = output.trim().split('\n').map(line => JSON.parse(line));
-      if (!flags.length) {
+      if (store === 'empty') {
         // Positive control: the same valid input reaches provider selection without
         // the CLI guard. The fake throws before any provider can actually execute.
         expect(result).toEqual({ status: 'error', reason: 'unexpected provider' });
         expect(calls).toEqual({ provider: 1, reserve: 0, model: 0, recheck: 0 });
         return;
       }
-      expect(result).toEqual({ status: 'skipped', reason: store === 'unreadable'
-        ? 'resume-only: scorecard store unreadable — no call launched'
-        : 'resume-only: no clean prior red-team row — no call launched' });
+      expect(result).toEqual(flags.length
+        ? { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' }
+        : { status: 'skipped', deferredByGuard: true,
+          reason: 'scorecard store unreadable; inspect stored evidence before retrying — no call launched' });
       expect(calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
