@@ -104,6 +104,13 @@ describe('agy family-keyed quota holds and legacy observations', () => {
     }
   });
 
+  it.each(['binary-health.json', 'upgrade-check.json'])('reads legacy quota holds named %s', name => {
+    setup();
+    writeFileSync(join(dir, name), JSON.stringify(rowFor('claude-sonnet-4-6')));
+    expect(readAgyHold('sonnet', { dir, now: 1000 })).toMatchObject({ fallbackDecision: 'skip-quota-hold', heldBackend: 'anthropic' });
+    expect(readAgyHold('gemini-3.1-pro', { dir, now: 1000 })).toBeNull();
+  });
+
   it('ignores expired legacy holds and root JSON without a quota reset', () => {
     setup();
     writeFileSync(join(dir, 'expired.json'), JSON.stringify({ quotaResetsAt: new Date(1000).toISOString() }));

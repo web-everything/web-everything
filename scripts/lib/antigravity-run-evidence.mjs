@@ -27,16 +27,20 @@ export function agyRunEvidence({ stdout = '', stderr = '', requestedModel, now =
 }
 export function readAgyHold(model, { dir = agyEvidenceDir(), now = Date.now() } = {}) {
   try {
-    const health = JSON.parse(readFileSync(join(dir, 'binary-health.json'), 'utf8'));
+    const health = JSON.parse(readFileSync(join(dir, 'binary', 'health.json'), 'utf8'));
     const at = typeof health?.at === 'string' ? Date.parse(health.at) : NaN;
-    if (health?.state === 'dead' && typeof health.version === 'string' && typeof health.reason === 'string'
-      && at <= now && now - at < 86400000)
+    if (!['ok', 'dead'].includes(health?.state) || typeof health.version !== 'string'
+      || typeof health.reason !== 'string' || !Number.isFinite(at) || at > now) throw Error('invalid health');
+    if (health.state === 'dead' && now - at < 86400000)
       return { ...health, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
         modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead' };
-  } catch { /* optional binary health fails open to normal quota behavior */ }
+  } catch (error) {
+    if (error.code !== 'ENOENT') return { requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
+      modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead', reason: 'binary health record is unreadable; inspect binary/health.json' };
+  }
   const readRows = (folder) => {
     try {
-      return readdirSync(folder).filter((name) => name.endsWith('.json') && !['binary-health.json', 'upgrade-check.json'].includes(name))
+      return readdirSync(folder).filter((name) => name.endsWith('.json'))
         .map((name) => JSON.parse(readFileSync(join(folder, name), 'utf8')));
     } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   };

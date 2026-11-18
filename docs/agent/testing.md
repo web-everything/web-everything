@@ -4593,3 +4593,7 @@ quota fallback. Keep the two maintenance JSON files excluded from the legacy
 root quota scan: malformed optional health must not become a quota parse error.
 The run lock serializes scheduled ticks; a killed checker requires operator
 inspection and removal of its leftover lock before maintenance can resume.
+
+## Binary maintenance hold regressions
+
+Keep binary health/cache under the evidence directory's `binary/` subfolder; root JSON names remain legacy quota observations. Test unreadable health as a closed hold, recovery followed by an identical outage through the real attention publisher, and refused child kills at every maintenance step with reporting before lock release.

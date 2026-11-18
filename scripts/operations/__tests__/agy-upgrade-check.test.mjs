@@ -17,6 +17,7 @@ const current = { ok: true, stdout: '{"casks":[]}' };
 const outdated = { ok: true, stdout: '{"casks":[{"name":"antigravity-cli"}]}' };
 function fixture(results) {
   const dir = fresh(), exec = vi.fn();
+  fs.mkdirSync(join(dir, 'binary'));
   for (const result of results) exec.mockResolvedValueOnce(result);
   const alert = vi.fn(), log = vi.fn();
   let time = Date.parse('2026-11-18T10:00:00Z');
@@ -61,6 +62,20 @@ describe('bounded commands and smoke', () => {
     expect(await pending).toMatchObject({ ok: false, reason: 'output-limit', stdout: '' });
     expect(kill.mock.calls).toEqual([[45678, 'SIGKILL']]);
   });
+  it('ESRCH means the child already exited and preserves the bounded timeout result', async () => {
+    vi.useFakeTimers();
+    const pending = boundedExec('agy', ['--version'], { spawn: fakeChild, timeoutMs: 10,
+      kill: () => { throw Object.assign(Error('gone'), { code: 'ESRCH' }); } });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await pending).toMatchObject({ ok: false, hung: true, reason: 'timeout' });
+  });
+  it('refused kill on oversized output reports cleanup incomplete', async () => {
+    const child = fakeChild();
+    const pending = boundedExec('agy', ['--version'], { spawn: () => child, timeoutMs: 20000,
+      kill: () => { throw Object.assign(Error('refused'), { code: 'EPERM' }); } });
+    child.stderr.write('x'.repeat(65537));
+    expect(await pending).toMatchObject({ ok: false, reason: 'cleanup incomplete' });
+  });
   it('spawn errors, nonzero exit and missing version cannot report healthy', async () => {
     expect(await smoke({ spawn: () => { throw Error('missing'); } })).toMatchObject({ ok: false });
     const child = fakeChild(); const pending = smoke({ spawn: () => child });
@@ -79,12 +94,12 @@ describe('scheduled upgrade check', () => {
       ['brew', ['upgrade', '--cask', 'antigravity-cli'], { timeoutMs: 120000 }],
       ['agy', ['--version'], { timeoutMs: 20000 }],
     ]);
-    expect(f.read('binary-health.json')).toMatchObject({ state: 'ok', version: '1.5.11' });
+    expect(f.read('binary/health.json')).toMatchObject({ state: 'ok', version: '1.5.11' });
   });
   it('upgrade still hung writes dead before repair and raises one alert across repeats', async () => {
     const f = fixture([hung, outdated, { ok: true }, hung, hung, current]);
     f.alert.mockImplementation(() => {
-      expect(f.read('binary-health.json')).toMatchObject({ state: 'dead', reason: 'hung' });
+      expect(f.read('binary/health.json')).toMatchObject({ state: 'dead', reason: 'hung' });
     });
     expect(await runUpgradeCheck(f.options)).toMatchObject({ status: 'dead' });
     f.advance(); await runUpgradeCheck(f.options);
@@ -95,15 +110,55 @@ describe('scheduled upgrade check', () => {
     const f = fixture([hung, current, { ok: false, stdout: '1.5.9' }, current]);
     await runUpgradeCheck(f.options); f.advance(); await runUpgradeCheck(f.options);
     expect(f.alert).toHaveBeenCalledTimes(2);
-    expect(f.read('binary-health.json')).toMatchObject({ state: 'dead', version: '1.5.9', reason: 'failed' });
+    expect(f.read('binary/health.json')).toMatchObject({ state: 'dead', version: '1.5.9', reason: 'failed' });
   });
   it('healthy smoke clears dead health even when staleness is unavailable', async () => {
     const f = fixture([hung, current, good, { ok: false }]);
     await runUpgradeCheck(f.options); f.advance();
     expect(await runUpgradeCheck(f.options)).toMatchObject({ status: 'staleness-unavailable', ok: true });
-    expect(f.read('binary-health.json').state).toBe('ok');
-    expect(readAgyHold('sonnet', { dir: f.dir })).toBeNull();
+    expect(f.read('binary/health.json').state).toBe('ok');
+    expect(readAgyHold('sonnet', { dir: f.dir, now: Date.parse(f.read('binary/health.json').at) })).toBeNull();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('operator should inspect'));
+  });
+  it('recovery resets the alert identity and an identical later outage publishes again', async () => {
+    const f = fixture([hung, current, good, current, hung, current, hung, current]);
+    const path = join(f.dir, 'attention.jsonl');
+    f.options.alert = item => publishAttention(item, { path });
+    await runUpgradeCheck(f.options);
+    expect(f.read('binary/upgrade-check.json').alerted).toBe('unknown:hung');
+    f.advance(); await runUpgradeCheck(f.options);
+    expect(f.read('binary/upgrade-check.json').alerted).toBe('');
+    f.advance(); await runUpgradeCheck(f.options);
+    f.advance(); await runUpgradeCheck(f.options);
+    expect(replay({ path })).toHaveLength(2);
+  });
+  it.each(['initial smoke', 'brew outdated', 'brew upgrade', 'post-upgrade smoke'])(
+    'refused kill in %s reports dead while locked and stops subsequent commands', async step => {
+      vi.useFakeTimers();
+      const f = fixture([]), kill = vi.fn(() => { throw Object.assign(Error('refused'), { code: 'EPERM' }); });
+      const preceding = { 'initial smoke': [], 'brew outdated': [good], 'brew upgrade': [good, outdated],
+        'post-upgrade smoke': [good, outdated, { ok: true }] }[step];
+      for (const result of preceding) f.exec.mockResolvedValueOnce(result);
+      f.exec.mockImplementationOnce((command, args, options) => boundedExec(command, args, { ...options, spawn: fakeChild, kill }));
+      f.alert.mockImplementation(item => {
+        expect(item.reason).toContain('cleanup incomplete');
+        expect(fs.existsSync(join(f.dir, 'upgrade-check.lock'))).toBe(true);
+        expect(f.read('binary/health.json')).toMatchObject({ state: 'dead', reason: 'cleanup incomplete' });
+      });
+      const pending = runUpgradeCheck(f.options);
+      await vi.advanceTimersByTimeAsync(120000);
+      expect(await pending).toMatchObject({ status: 'dead', ok: false, reason: 'cleanup incomplete' });
+      expect(kill.mock.calls).toEqual([[45678, 'SIGKILL']]);
+      expect(f.exec).toHaveBeenCalledTimes(preceding.length + 1);
+      expect(f.alert).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(join(f.dir, 'upgrade-check.lock'))).toBe(false);
+    });
+  it('creates the binary folder and leaves only atomic destination files', async () => {
+    const f = fixture([good, current]); fs.rmdirSync(join(f.dir, 'binary'));
+    await runUpgradeCheck(f.options);
+    expect(fs.readdirSync(f.dir)).toEqual(['binary']);
+    expect(fs.readdirSync(join(f.dir, 'binary')).sort()).toEqual(['health.json', 'upgrade-check.json']);
+    expect(readAgyHold('sonnet', { dir: f.dir, now: Date.parse(f.read('binary/health.json').at) })).toBeNull();
   });
   it('rate limits to an hour including persisted state and honors disable', async () => {
     const f = fixture([good, current, good, current]);
@@ -114,7 +169,7 @@ describe('scheduled upgrade check', () => {
     expect(await runUpgradeCheck({ ...f.options, env: { WE_AGY_UPGRADE_ENABLED: '0' } })).toEqual({ status: 'disabled' });
   });
   it.each(['{', '{"at":"2099-01-01"}', '{"at":42}', 'x'.repeat(8193)])('ignores invalid or oversized cache (%#)', async text => {
-    const f = fixture([good, current]); fs.writeFileSync(join(f.dir, 'upgrade-check.json'), text);
+    const f = fixture([good, current]); fs.writeFileSync(join(f.dir, 'binary', 'upgrade-check.json'), text);
     expect(await runUpgradeCheck(f.options)).toMatchObject({ status: 'ok' });
   });
   it('concurrent ticks cannot both execute commands', async () => {
@@ -150,19 +205,25 @@ describe('binary health hold', () => {
   const now = Date.parse('2026-11-18T10:00:00Z');
   const health = { state: 'dead', at: new Date(now).toISOString(), version: 'unknown', reason: 'hung' };
   it('fresh dead record holds every model without launching', () => {
-    const dir = fresh(); fs.writeFileSync(join(dir, 'binary-health.json'), JSON.stringify(health));
+    const dir = fresh(); fs.mkdirSync(join(dir, 'binary')); fs.writeFileSync(join(dir, 'binary/health.json'), JSON.stringify(health));
     for (const model of ['sonnet', 'gemini-3.1-pro', undefined])
       expect(readAgyHold(model, { dir, now })).toMatchObject({ fallbackDecision: 'skip-binary-dead', modelEvidence: 'not-launched' });
   });
-  it.each(['{', 'null', JSON.stringify({ ...health, at: new Date(now - 86400000).toISOString() }),
-    JSON.stringify({ ...health, at: new Date(now + 1).toISOString() }), JSON.stringify({ state: 'dead', at: health.at }),
-    JSON.stringify({ ...health, state: 'ok' })])('ignores stale/future/malformed/healthy health (%#)', text => {
-    const dir = fresh(); fs.writeFileSync(join(dir, 'binary-health.json'), text);
+  it.each([JSON.stringify({ ...health, at: new Date(now - 86400000).toISOString() }),
+    JSON.stringify({ ...health, state: 'ok' })])('allows stale dead and valid healthy health (%#)', text => {
+    const dir = fresh(); fs.mkdirSync(join(dir, 'binary')); fs.writeFileSync(join(dir, 'binary/health.json'), text);
     expect(readAgyHold('sonnet', { dir, now })).toBeNull();
   });
-  it('missing and unreadable health fail open to normal behavior', () => {
+  it.each(['{', 'null', '[]', '42', JSON.stringify({ ...health, at: new Date(now + 1).toISOString() }),
+    JSON.stringify({ ...health, at: 'invalid' }), JSON.stringify({ ...health, state: 'other' }),
+    JSON.stringify({ state: 'dead', at: health.at }), JSON.stringify({ ...health, version: 42 }),
+    JSON.stringify({ ...health, reason: null }), JSON.stringify({ state: 'ok' })])('holds unreadable or malformed health (%#)', text => {
+    const dir = fresh(); fs.mkdirSync(join(dir, 'binary')); fs.writeFileSync(join(dir, 'binary/health.json'), text);
+    expect(readAgyHold('sonnet', { dir, now })).toMatchObject({ fallbackDecision: 'skip-binary-dead', reason: expect.stringContaining('health record is unreadable') });
+  });
+  it('only missing health continues; a present unreadable record holds', () => {
     const dir = fresh(); expect(readAgyHold('sonnet', { dir, now })).toBeNull();
-    fs.mkdirSync(join(dir, 'binary-health.json'));
-    expect(readAgyHold('sonnet', { dir, now })).toBeNull();
+    fs.mkdirSync(join(dir, 'binary/health.json'), { recursive: true });
+    expect(readAgyHold('sonnet', { dir, now })).toMatchObject({ fallbackDecision: 'skip-binary-dead', reason: expect.stringContaining('unreadable') });
   });
 });

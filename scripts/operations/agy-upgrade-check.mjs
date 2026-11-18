@@ -33,7 +33,9 @@ export function boundedExec(command, args, { timeoutMs, spawn = nodeSpawn,
       done = true;
       clearTimer(timer);
       if (terminate && Number.isInteger(child?.pid) && child.pid > 0) {
-        try { kill(child.pid, 'SIGKILL'); } catch { /* already exited */ }
+        try { kill(child.pid, 'SIGKILL'); } catch (error) {
+          if (error.code !== 'ESRCH') result = { ok: false, hung: !!result.hung, reason: 'cleanup incomplete' };
+        }
       }
       resolveResult({ stdout, ...result });
     };
@@ -56,7 +58,7 @@ export function boundedExec(command, args, { timeoutMs, spawn = nodeSpawn,
 export async function smoke({ exec = boundedExec, smokeTimeoutMs = 20000, ...io } = {}) {
   const result = await exec('agy', ['--version'], { ...io, timeoutMs: smokeTimeoutMs });
   const version = /\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/.exec(result.stdout ?? '')?.[0] ?? 'unknown';
-  return { ok: result.ok && version !== 'unknown', version, hung: !!result.hung };
+  return { ok: result.ok && version !== 'unknown', version, hung: !!result.hung, ...(result.reason === 'cleanup incomplete' ? { reason: result.reason } : {}) };
 }
 
 function readBounded(io, path) {
@@ -80,7 +82,9 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
   const lock = join(dir, 'upgrade-check.lock');
   try { io.mkdirSync(lock); } catch (e) { if (e.code === 'EEXIST') return { status: 'locked' }; throw e; }
   try {
-    const at = now(), cachePath = join(dir, 'upgrade-check.json'), healthPath = join(dir, 'binary-health.json');
+    const binaryDir = join(dir, 'binary');
+    io.mkdirSync(binaryDir, { recursive: true });
+    const at = now(), cachePath = join(binaryDir, 'upgrade-check.json'), healthPath = join(binaryDir, 'health.json');
     const cache = readBounded(io, cachePath);
     const lastRun = typeof cache?.at === 'string' ? Date.parse(cache.at) : NaN;
     if (Number.isFinite(lastRun) && lastRun <= at && at - lastRun < settings.minIntervalMinutes * 60000)
@@ -89,12 +93,17 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
       && typeof cache?.alerted === 'string' && cache.alerted.length <= 128 ? cache.alerted : '' };
     atomicWrite(io, cachePath, state);
     const record = async result => {
-      const reason = result.ok ? '' : result.hung ? 'hung' : 'failed';
+      const reason = result.ok ? '' : result.reason === 'cleanup incomplete' ? result.reason : result.hung ? 'hung' : 'failed';
       atomicWrite(io, healthPath, { state: result.ok ? 'ok' : 'dead', at: new Date(now()).toISOString(), version: result.version, reason });
+      if (result.ok && state.alerted) {
+        // needs-you-feed has no sanctioned resolver for independently published alerts.
+        state.alerted = '';
+        atomicWrite(io, cachePath, state);
+      }
       if (!result.ok) {
         const identity = `${result.version}:${reason}`;
         if (state.alerted !== identity) {
-          await alert({ repo: 'webeverything', pr: 0, head: createHash('sha256').update(identity).digest('hex'), kind: 'agy-binary-dead',
+          await alert({ repo: 'webeverything', pr: 0, head: createHash('sha256').update(`${identity}:${state.at}`).digest('hex'), kind: 'agy-binary-dead',
             reason: `agy ${result.version} ${reason}; seat held for 24h. Inspect binary; run upgrade check again.`,
             command: 'node scripts/operations/agy-upgrade-check.mjs' });
           state.alerted = identity;
@@ -104,7 +113,14 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
     };
     let result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
     await record(result);
+    if (result.reason === 'cleanup incomplete') return { status: 'dead', ...result };
     const outdated = await exec('brew', ['outdated', '--cask', '--json=v2'], { timeoutMs: 60000 });
+    const cleanupFailed = async command => {
+      result = { ...result, ok: false, reason: 'cleanup incomplete', hung: !!command.hung };
+      await record(result);
+      return { status: 'dead', ...result };
+    };
+    if (outdated.reason === 'cleanup incomplete') return await cleanupFailed(outdated);
     let casks;
     try { casks = JSON.parse(outdated.stdout).casks; } catch { /* refuse unknown staleness */ }
     if (!outdated.ok || !Array.isArray(casks)) {
@@ -113,6 +129,7 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
     }
     if (casks.some(cask => cask?.name === 'antigravity-cli' || cask?.token === 'antigravity-cli')) {
       const upgrade = await exec('brew', ['upgrade', '--cask', 'antigravity-cli'], { timeoutMs: 120000 });
+      if (upgrade.reason === 'cleanup incomplete') return await cleanupFailed(upgrade);
       result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
       await record(result);
       if (!upgrade.ok) log('agy-upgrade: upgrade failed; operator should inspect brew upgrade --cask antigravity-cli');
