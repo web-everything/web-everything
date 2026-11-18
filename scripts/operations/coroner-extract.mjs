@@ -382,7 +382,7 @@ export function builderMetrics(ticks, window, cardNames = []) {
     const observationSeen = new Set();
     const failures = list(t.prepare?.failures).filter((f) => {
       if (!f || typeof f !== 'object') return false;
-      if (f.cause !== 'daemon-observation' && f.stage !== 'retirement') return true;
+      if (f.cause !== 'daemon-observation') return true;
       // No prepare launched: count each card + normalized reason once in this tick, independent of attempt metadata.
       const reason = String(f.reason ?? f.evidence?.reason ?? '').replace(/\d+/g, 'N').slice(0, 90);
       const key = `${f.num}|${reason}`;

@@ -1375,7 +1375,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       refusal = { reason: 'prepare PR listing unavailable' };
     }
     if (!refusal) return null;
-    await effects.recordPrepareRefusal?.({ num, reason: refusal.reason }, { ...preparePolicy, now: effects.now?.() ?? Date.now() });
+    try {
+      await effects.recordPrepareRefusal?.({ num, reason: refusal.reason }, { ...preparePolicy, now: effects.now?.() ?? Date.now() });
+    } catch (e) {
+      console.error(`build-dispatch-daemon: prepare refusal persistence failed for #${num}: ${childFailure(e, { singleLine: true })}`);
+    }
     refusedPrepares.add(num);
     prepare.refused.push({ num, ...refusal });
     console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);

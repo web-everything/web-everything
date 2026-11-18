@@ -1985,6 +1985,38 @@ describe('automatic item preparation', () => {
       expect(offered).toHaveLength(1);
     } finally { log.mockRestore(); }
   });
+  it.each(['throw', 'reject'])('records the refusal and preserves bookkeeping cooldown when persistence fails (%s)', async failure => {
+    const effects = fixture();
+    const now = Date.parse('2026-11-18T12:00:00Z');
+    effects.now = () => now;
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.recordPrepareRefusal = vi.fn(() => {
+      const error = new Error('refusal store unavailable\nextra detail');
+      if (failure === 'throw') throw error;
+      return Promise.reject(error);
+    });
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.planTick = vi.fn(bk => ({ decisions: planPrepareSpawns({
+      needsPrepare: [{ num: '5028' }], prepareHeldNums: bk.prepareHeldNums,
+      availableLanes: [1], maxConcurrentItemPrepares: 1,
+    }), nextState: {} }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      const refusal = { num: '5028', reason: 'open prepare PR #91 (lane/5028d-prepare-x)' };
+      expect(tick.prepare.refused).toEqual([refusal]);
+      expect(tick.nextBookkeeping.prepareRefusals).toContainEqual({ ...refusal, at: new Date(now).toISOString(),
+        pr: 91, head: 'lane/5028d-prepare-x' });
+      const errors = log.mock.calls.filter(([line]) => line.includes('prepare refusal persistence failed'));
+      expect(errors).toHaveLength(1);
+      expect(errors[0][0]).toContain('refusal store unavailable');
+      expect(errors[0][0]).not.toContain('\n');
+      const next = await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
+      expect(next.prepare.planned).toEqual([]);
+      expect(effects.recordPrepareRefusal).toHaveBeenCalledTimes(1);
+      expect(effects.dispatch).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
   it('does not plan when durable refusal evidence is unreadable', async () => {
     const effects = fixture();
     effects.readPrepareRefusals = () => { throw new Error('prepare refusal history unavailable'); };

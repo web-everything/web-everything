@@ -65,9 +65,9 @@ describe('card 130 S2 outcome labels', () => {
     const failures = [
       { num: '41', cause: 'daemon-observation', stage: 'result', reason: 'listing failed after 123 calls', recordedAt: at(-10), held: true },
       { num: '41', cause: 'daemon-observation', reason: 'listing failed after 456 calls', attempt: 'another attempt' },
-      { num: '42', stage: 'retirement', reason: 'listing failed after 789 calls' },
-      { num: '43', stage: 'retirement', reason: `${reason} first` },
-      { num: '43', stage: 'retirement', reason: `${reason} second` },
+      { num: '42', cause: 'daemon-observation', stage: 'retirement', reason: 'listing failed after 789 calls' },
+      { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} first` },
+      { num: '43', cause: 'daemon-observation', stage: 'retirement', reason: `${reason} second` },
     ];
     const metrics = builderMetrics([
       { at: at(-1), prepare: { failures } },
@@ -80,6 +80,14 @@ describe('card 130 S2 outcome labels', () => {
       [reason.slice(0, 90)]: 1,
     } });
     expect(builderMetrics([], { since, until })).not.toHaveProperty('prepareObservationFailures');
+  });
+  it('counts a retirement-stage prepare-session-dead failure without an observation cause as a failed attempt', () => {
+    const metrics = builderMetrics([{ at: at(1), prepare: { failures: [
+      { num: '4501', stage: 'retirement', reason: 'prepare-session-dead' },
+    ] } }], { since, until });
+    expect(metrics.byKind.prepare).toMatchObject({ count: 1, total: 1, launched: 0 });
+    expect(metrics.byKind.prepare.causes.failed.count).toBe(1);
+    expect(metrics).not.toHaveProperty('prepareObservationFailures');
   });
   it('prepare failures count per attempt, not per tick, and carried-over rows do not count', () => {
     const fail = (extra) => ({ num: '4341', stage: 'stamp', reason: 'ref-lock', ...extra });
