@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agyEvidenceError, agyRunEvidence, readAgyHold, saveAgyHold } from '../antigravity-run-evidence.mjs';
@@ -174,4 +174,11 @@ it('retains provenance through the judge adapter, extra seats and probation rows
 it('rejects a changed model within the same backend, while accepting effort suffix resolution', () => {
   expect(agyRunEvidence({ requestedModel: 'claude-sonnet-4-6', stdout: stream('claude-opus-4-6', {}) }).fallbackDecision).toBe('skip-model-mismatch');
   expect(agyRunEvidence({ requestedModel: 'gemini-3.1-pro-high', stdout: stream('gemini-3.1-pro', {}) }).fallbackDecision).toBe('none');
+});
+
+it.each(['upgrading', 'cleanup incomplete'])('a dead %s record never expires', (reason) => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-health-'));
+    mkdirSync(join(dir, 'binary'));
+    writeFileSync(join(dir, 'binary', 'health.json'), JSON.stringify({ state: 'dead', at: new Date(0).toISOString(), version: '1.5.11', reason }));
+    expect(readAgyHold('gemini-4-carbon-high', { dir, now: 10 * 86400000 })).toMatchObject({ fallbackDecision: 'skip-binary-dead', reason });
 });

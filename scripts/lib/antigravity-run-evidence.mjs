@@ -31,7 +31,9 @@ export function readAgyHold(model, { dir = agyEvidenceDir(), now = Date.now() } 
     const at = typeof health?.at === 'string' ? Date.parse(health.at) : NaN;
     if (!['ok', 'dead'].includes(health?.state) || typeof health.version !== 'string'
       || typeof health.reason !== 'string' || !Number.isFinite(at) || at > now) throw Error('invalid health');
-    if (health.state === 'dead' && now - at < 86400000)
+    // An interrupted upgrade or an unconfirmed kill never ages out: only a healthy smoke (or the operator) clears it.
+    const unresolved = health.reason === 'upgrading' || health.reason === 'cleanup incomplete';
+    if (health.state === 'dead' && (unresolved || now - at < 86400000))
       return { ...health, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
         modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead' };
   } catch (error) {
