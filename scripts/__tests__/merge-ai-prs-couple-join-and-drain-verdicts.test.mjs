@@ -1022,6 +1022,34 @@ describe('merge-ai-prs — #2502 headSha real-value wiring (buildDrainVerdicts -
 });
 
 
+it.each(['longshore', 'longshoreai/longshore'])('explicit review:false repo %s stays in evidence but is not a dispatch target', (repos) => {
+  const self = 'web-everything/web-everything';
+  const targets = resolveRepos({ repos, self });
+  expect(targets).toEqual([]);
+  expect(resolveContextRepos(targets, self, repos)).toEqual([
+    'longshoreai/longshore',
+    'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
+  ]);
+});
+
+it('explicit unknown repos stay in evidence with shared normalization and deduplication', () => {
+  const self = 'web-everything/web-everything';
+  const repos = ' outside/repo, unknown, outside/repo, frontierui, ';
+  const targets = resolveRepos({ repos, self });
+  expect(targets).toEqual(['frontier-ui/frontierui']);
+  expect(resolveContextRepos(targets, self, repos)).toEqual([
+    'frontier-ui/frontierui', 'outside/repo', 'web-everything/unknown',
+    'web-everything/web-everything', 'plateauapp/plateau-app',
+  ]);
+});
+
+it('explicit local repo preserves the single-repo context token', () => {
+  const self = 'web-everything/web-everything';
+  expect(resolveContextRepos([null], self, ` ${self}, longshore, ${self} `)).toEqual([
+    null, 'longshoreai/longshore', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
+  ]);
+});
+
 it('couple evidence keeps all repos when dispatch is disabled or the local repo is unknown', () => {
   expect(resolveContextRepos([], 'web-everything/web-everything')).toEqual([
     'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',

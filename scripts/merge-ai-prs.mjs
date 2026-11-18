@@ -3771,6 +3771,16 @@ export function buildReviewCoverageReason(gaps) {
 // silently if the constellation ever grows a 4th repo.
 const CONSTELLATION_REPO_NAMES = ['web-everything', 'frontierui', 'plateau-app'];
 
+// Normalize explicit targets before dispatch capability filtering so evidence keeps every named repo.
+function normalizeExplicitRepos(repos, self) {
+  if (typeof repos !== 'string') return [];
+  // #xc7p3q9 (R10) — normalize short names and historical slugs to owner/name.
+  const owner = self && self.includes('/') ? canonicalizeSlug(self).split('/')[0] : null;
+  const declaredByDir = (n) => Object.values(CONSTELLATION_REPOS).find((r) => r.dirs.includes(n))?.slug ?? null;
+  const norm = (s) => s.includes('/') ? canonicalizeSlug(s) : (declaredByDir(s) ?? repoProfile(s)?.slug ?? (owner ? `${owner}/${s}` : s));
+  return [...new Set(repos.split(',').map((s) => s.trim()).filter(Boolean).map(norm))];
+}
+
 /**
  * #2257 — resolve the set of repos this ONE lander sweeps. Pure. The single `/drain` skill stays one skill;
  * this makes its lander repo-aware instead of copying the transport into each repo (the rejected #2244/#2245
@@ -3793,13 +3803,7 @@ export function resolveRepos({ repos, singleRepo, self: rawSelf, resolveProfile 
   const self = typeof rawSelf === 'string' ? canonicalizeSlug(rawSelf) : rawSelf;
   const reviewEnabled = repo => repoHasCapability(repo, 'review', { resolveProfile });
   if (typeof repos === 'string' && repos.trim()) {
-    // #xc7p3q9 (R10) — NORMALIZE every `--repos` entry to `owner/name`. A short-name `--repos=frontierui` otherwise
-    // yields a bogus `frontierui` alongside the canonical `frontier-ui/frontierui`: its listing throws, and (pre-R3)
-    // latched `contextComplete:false` permanently. Prefix the local owner when an entry carries no `/`.
-    const owner = self && self.includes('/') ? self.split('/')[0] : null;
-    const declaredByDir = (n) => Object.values(CONSTELLATION_REPOS).find((r) => r.dirs.includes(n))?.slug ?? null;
-    const norm = (s) => s.includes('/') ? canonicalizeSlug(s) : (declaredByDir(s) ?? repoProfile(s)?.slug ?? (owner ? `${owner}/${s}` : s));
-    const list = [...new Set(repos.split(',').map((s) => s.trim()).filter(Boolean).map(norm))];
+    const list = normalizeExplicitRepos(repos, self);
     if (list.length) return list.filter(reviewEnabled);
   }
   // #2287 — the constellation is the DEFAULT (the backlog is WE-global, so cross-repo blockedBy needs one
@@ -3829,9 +3833,10 @@ export function resolveRepos({ repos, singleRepo, self: rawSelf, resolveProfile 
  * would rekey the local repo to the slug while the `--this-repo` sweep keys it `null`, breaking the join lookup.
  * @param {Array<string|null>} repos  the candidate repo set (REPOS)
  * @param {string|null} self          the local repo slug (localSlug)
+ * @param {string|null} explicitRepos unfiltered --repos value, retained regardless of review capability
  * @returns {Array<string|null>}
  */
-export function resolveContextRepos(repos, self) {
+export function resolveContextRepos(repos, self, explicitRepos = null) {
   const base = Array.isArray(repos) ? repos : [];
   const localToken = base.includes(null) ? null : self;   // the form REPOS uses for the local repo
   // Context reads must still see disabled repos for couple/dependency guards.
@@ -3839,7 +3844,7 @@ export function resolveContextRepos(repos, self) {
   const context = repoKeyForSlug(self)
     ? Object.values(CONSTELLATION_REPOS).map((r) => r.slug)
     : owner ? [self, ...CONSTELLATION_REPO_NAMES.map((name) => `${owner}/${name}`)] : [null];
-  return [...new Set([...base, ...context].map((r) => (r == null || r === self) ? localToken : r))];
+  return [...new Set([...base, ...normalizeExplicitRepos(explicitRepos, self), ...context].map((r) => (r == null || r === self) ? localToken : r))];
 }
 
 /**
@@ -4849,7 +4854,7 @@ async function runCli() {
   // instead of orphan-landing past a hidden held carrier. `resolveContextRepos` canonicalizes the local repo so
   // it is never listed twice (B8). For the common full-constellation drain (REPOS === the constellation) this is a
   // no-op — no extra listings.
-  const CONTEXT_REPOS = resolveContextRepos(REPOS, localSlug);
+  const CONTEXT_REPOS = resolveContextRepos(REPOS, localSlug, flags.repos);
   // #2458 — THIS run's repo scope (`null` = the cwd repo → normalize to localSlug), recorded in the drain
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
   const leaseScope = [...new Set(REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
