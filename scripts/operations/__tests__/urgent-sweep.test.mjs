@@ -93,13 +93,68 @@ describe('urgent CI sweep', () => {
       expect(f.d.remove).not.toHaveBeenCalled();
     });
   });
-  it('preserves a recorded green completion beyond 24h when CI becomes unreadable', async () => {
+  it('starts a fresh verdict deadline when CI becomes unreadable after green', async () => {
     const f = fixture();
     await f.run();
     f.d.now = () => '2026-11-19T13:00:00Z';
     f.d.checks.mockImplementation(() => { throw new Error('API unavailable'); });
     expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
     expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it.each(['pending', 'missing', 'unreadable'])('expires %s required evidence after green using the persisted first observation', async kind => {
+    const f = fixture();
+    await f.run();
+    const firstObserved = new Date(Date.parse(load.at) + 49 * 60 * 60 * 1000).toISOString();
+    f.d.now = () => firstObserved;
+    const rows = kind === 'pending' ? [check('test', null, { status: 'queued' })] : [];
+    f.d.checks.mockImplementation(() => {
+      if (kind === 'unreadable') throw new Error('API unavailable');
+      return { total_count: rows.length, check_runs: rows, workflows };
+    });
+    expect(await f.run()).toMatchObject({ results: [{ status: kind === 'unreadable' ? 'needs-you' : 'pending' }] });
+    expect(f.settlements()[0]).toMatchObject({ status: 'monitoring-ci', nonGreenSince: firstObserved });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.now = () => new Date(Date.parse(firstObserved) + 6 * 60 * 60 * 1000).toISOString();
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+    f.d.now = () => new Date(Date.parse(firstObserved) + 24 * 60 * 60 * 1000).toISOString();
+    expect(await urgentSweep({}, { ...f.d })).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('resets the non-green clock after a recovered green verdict', async () => {
+    const f = fixture();
+    await f.run();
+    const greenChecks = f.d.checks.getMockImplementation();
+    f.d.checks.mockReturnValue({ total_count: 0, check_runs: [], workflows });
+    await f.run();
+    f.d.now = () => '2026-11-18T18:00:00Z';
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenLastCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+    f.d.checks.mockImplementation(greenChecks);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    f.d.now = () => '2026-11-20T13:00:00Z';
+    f.d.checks.mockReturnValue({ total_count: 0, check_runs: [], workflows });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.settlements()[0]).toMatchObject({ nonGreenSince: new Date(f.d.now()).toISOString() });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    f.d.now = () => '2026-11-20T19:00:00Z';
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledTimes(2);
+    expect(f.d.escalate).toHaveBeenLastCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledTimes(2);
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('fails closed on a corrupt persisted non-green timestamp', async () => {
+    const f = fixture();
+    await f.run();
+    f.d.checks.mockReturnValue({ total_count: 0, check_runs: [], workflows });
+    await f.run();
+    f.settlements()[0].nonGreenSince = 'bad';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('non-green timestamp') }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled();
   });
   it.each(['pinned-closed-pr', 'edge-resolution-recorded', 'history-unreadable'])('raises NEEDS-YOU when guarded expiry retirement refuses a %s overlay', async reason => {
     const f = fixture();

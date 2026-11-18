@@ -277,7 +277,7 @@ function fixture(options = {}) {
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
   const reason = 'Restore critical daemon operation';
-  const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+  const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
   marker.sig = urgentSignature(marker, urgentKey);
   it('writes the urgent tracking intent before registering the overlay', async () => {
     const observed = [];
@@ -372,6 +372,14 @@ describe('urgent prototype admission', () => {
     const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(forged), missingUrgentKey: kind === 'missing key', ...(kind === 'wrong repo' ? { origin: 'https://example.com/other/repo' } : {}) });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
     expect(f.readyWrites).toEqual([]);
+  });
+  it('refuses a correctly signed legacy receipt missing main-history fetch', async () => {
+    const legacy = { ...marker, steps: marker.steps.slice(1) };
+    legacy.sig = urgentSignature(legacy, urgentKey);
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(legacy) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(f.readyWrites).toEqual([]);
+    expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('refuses a correctly signed receipt with empty steps without readiness writes', async () => {
     const empty = { ...marker, steps: [] };
@@ -3288,7 +3296,7 @@ describe('default test check-run reader (production wiring)', () => {
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   };
   const urgentReceipt = () => {
-    const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+    const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
     return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
   };
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(

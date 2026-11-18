@@ -286,7 +286,9 @@ export function ciGatePlan(workflow) {
       || runText(install.run ?? '') !== 'npm ci' || install['working-directory'] !== 'web-everything'
       || jobs[job].steps.indexOf(fui) >= jobs[job].steps.indexOf(install)) throw new Error('unreadable-ci-gates: install layout');
   }
-  return { requiredJobs, installFui: [['npm', 'ci'], ['npm', 'run', 'build:tools']], install: ['npm', 'ci'], coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- $(')[0].split(' ') };
+  const fetchMain = runText(step('test-shard', 'Fetch main history (blobless)').run);
+  if (fetchMain !== 'sh scripts/ci/fetch-main-history.sh') throw new Error('unreadable-ci-gates: main history command');
+  return { requiredJobs, fetchMain: fetchMain.split(' '), installFui: [['npm', 'ci'], ['npm', 'run', 'build:tools']], install: ['npm', 'ci'], coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- $(')[0].split(' ') };
 }
 
 export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedSteps, now, repo, readKey }) {
@@ -302,7 +304,7 @@ export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedStep
       || now - finished > 2 * 60 * 60_000 || finished - now > 5 * 60_000
       || typeof marker.host !== 'string' || !marker.host.trim()) return no('no-urgent-marker');
     if (!fullSha(marker.fuiSha) || marker.fuiRepo !== urgentFuiRepo || !repo || marker.repo !== repo || !Array.isArray(marker.steps)
-      || !Array.isArray(expectedSteps) || expectedSteps.length !== shards + 6
+      || !Array.isArray(expectedSteps) || expectedSteps.length !== shards + 7
       || marker.steps.length !== expectedSteps.length || !expectedSteps.every((step, i) => marker.steps[i] === step)
       || !/^[a-f0-9]{64}$/.test(marker.sig ?? '')
       || !timingSafeEqual(Buffer.from(marker.sig, 'hex'), Buffer.from(urgentSignature(marker, readKey()), 'hex'))) return no('no-urgent-marker');
