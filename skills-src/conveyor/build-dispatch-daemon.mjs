@@ -2694,10 +2694,13 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       const result = readCiJobLog({ repo, jobId: job,
         // Forward the helper's exec options: without its maxBuffer a log over Node's 1 MiB default is ENOBUFS.
         exec: (_command, args, opts) => gh(args, opts) });
-      if (!result.ok) throw new Error(result.reason);
-      let metadata;
-      try { metadata = api(`actions/jobs/${job}`); } catch { /* Preserve the published diagnostic. */ }
-      firstError = firstFailedStepError(metadata, result.text) || firstError;
+      // An unreadable log (over the buffer, timed out, expired) costs only this draft its log-derived
+      // diagnostic; it keeps the published one, like unreadable step metadata, and never aborts the pass.
+      if (result.ok) {
+        let metadata;
+        try { metadata = api(`actions/jobs/${job}`); } catch { /* Preserve the published diagnostic. */ }
+        firstError = firstFailedStepError(metadata, result.text) || firstError;
+      }
     }
     candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
       scope: (pr.files ?? []).map(f => `we:${f.path}`), isDraft: true, builderAuthored: true,

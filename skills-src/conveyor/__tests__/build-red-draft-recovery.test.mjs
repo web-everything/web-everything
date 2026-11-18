@@ -190,6 +190,10 @@ describe('abandoned builder draft recovery', () => {
     { evidence: 'a whole-job log over the 1 MiB default buffer', metadata: { steps }, expectedError: '##[error]AssertionError: Done-when 2',
       log: `2026-09-30T01:00:01Z passing step ${'x'.repeat(2_200_000)}\n`
         + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary' },
+    // Past even the helper's 16 MiB bound the log is unreadable: the draft keeps the published
+    // diagnostic and is still resumed, instead of the throw aborting recovery of every draft.
+    { evidence: 'a whole-job log over the 16 MiB helper bound', metadata: { steps }, expectedError: noDetail,
+      log: `2026-09-30T01:00:11Z failed step ##[error]${'x'.repeat(16 * 1024 * 1024)}\n` },
     { evidence: 'missing step metadata', metadata: {}, expectedError: noDetail },
     { evidence: 'published check detail', metadata: {}, summary: 'AssertionError: failed check summary', expectedError: 'AssertionError: failed check summary' },
     { evidence: 'malformed step metadata', metadata: { steps: [null, steps[1]] }, expectedError: noDetail },
