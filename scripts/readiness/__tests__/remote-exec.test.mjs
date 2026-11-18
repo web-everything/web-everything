@@ -1089,8 +1089,49 @@ describe('standards input parity', () => {
       expect(existsSync(active)).toBe(true);
       expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(true);
       expect(existsSync(cancel)).toBe(['cleanup failure','stale execution'].includes(fault));
-      expect(cleanup).toHaveBeenCalledTimes(fault === 'cleanup failure' ? 1 : 0);
+      expect(cleanup).toHaveBeenCalledTimes(['cleanup failure','stale execution'].includes(fault) ? 1 : 0);
+      if (fault === 'stale execution') expect(existsSync(join(active, 'executing'))).toBe(true);
     } finally {time?.mockRestore();}
+  });
+
+  it.each([[-1,'ok'], [0,'ok'], [1,'ok'], [1,'nonzero'], [1,'throws']])('stale executing cancellation requires hard max runtime (offset %s ms) and proven UID cleanup: %s', async (offset, outcome) => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-stale-')); auxiliary.push(root);
+    mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
+    const cleanup = vi.fn(async () => {
+      expect(existsSync(join(root, 'receipts/worker-active-1/executing'))).toBe(true);
+      if (outcome === 'throws') throw new Error('uid cleanup unconfirmed');
+      return {code:outcome === 'ok' ? 0 : 1};
+    });
+    const now = Date.now(), maxRuntimeMs = 3*1_740_000+15*60*1000;
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup, testReapProbe:{uidBusy:async()=>false}, clock:()=>now});
+    const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
+    const active = join(root, 'receipts/worker-active-1'), executing = join(active, 'executing');
+    mkdirSync(executing);
+    const started = new Date(now-maxRuntimeMs-offset);
+    utimesSync(executing, started, started);
+    await expect(runner.finish({...prepared, nonce})).rejects.toThrow('Worker execution unconfirmed');
+    expect(cleanup).not.toHaveBeenCalled();
+    let tick = 0n;
+    const time = vi.spyOn(process.hrtime, 'bigint').mockImplementation(() => (tick += 25000000000n));
+    try {
+      const finishing = runner.finish({...prepared, nonce, cancel:true});
+      if (outcome === 'ok' && offset >= 0) {
+        await expect(finishing).resolves.toMatchObject({run:prepared.run, cancelAck:true});
+        expect(existsSync(executing)).toBe(false);
+        expect(existsSync(active)).toBe(false);
+        expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(false);
+        expect(cleanup).toHaveBeenCalledTimes(2); // recovery proof, then ordinary finish proof
+      } else {
+        await expect(finishing).rejects.toThrow('Worker cancellation unconfirmed');
+        expect(existsSync(executing)).toBe(true);
+        expect(existsSync(join(active, 'reservation.json'))).toBe(true);
+        expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(true);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+      }
+      expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({argv:['/usr/bin/true'],
+        cwd:join(root, 'runs/slot-1', prepared.run), env:expect.objectContaining({PATH:'/usr/bin:/bin', HOME:'/nonexistent'}), cancel:undefined}));
+      expect(tick).toBeGreaterThanOrEqual(75000000000n); // preserve the supervisor's 45s grace
+    } finally {time.mockRestore();}
   });
 
   it('does not certify cancellation of a legacy shared-UID reservation', async () => {
