@@ -1,4 +1,5 @@
-import { test } from 'node:test';
+// @vitest-environment node
+import { afterEach, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -8,10 +9,15 @@ import { publishStalledDigest } from '../pr-stall-digest.mjs';
 import { runMergeWatch } from '../pass-daemons/pr-merge-watch-pass.mjs';
 
 const repo = 'example/widgets', head = 'a'.repeat(40), now = '2026-11-10T12:00:00Z';
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+});
+
 function fixture(t) {
   assert.ok(process.env.TMPDIR, 'task TMPDIR required');
   const root = mkdtempSync(join(process.env.TMPDIR, 'stuck-trace-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   const events = [], calls = [];
   const why = { head, owner: 'operator', waitingFor: 'human ruling', suggestedOp: 'unpark --preview',
     sections: ['state', 'checks', 'holds', 'daemons'].map((name, i) => ({ name,
@@ -24,6 +30,14 @@ function fixture(t) {
     run: async args => { calls.push(args); return args[0] === 'why' ? { runId: 'why-17', verdict: why } : trace; },
     emit: event => { events.push(event); return true; } };
   return { root, options, events, calls, why, trace };
+}
+
+// These integration cases inject all trace IO and use private state/feed paths.
+// Clear both runner flags only for them so the production digest branch is exercised.
+function productionFixture(t) {
+  vi.stubEnv('VITEST', undefined);
+  vi.stubEnv('WE_UNDER_TEST', undefined);
+  return fixture(t);
 }
 
 const queue = f => JSON.parse(readFileSync(join(f.root, 'stuck-trace-queue.json')));
@@ -310,15 +324,27 @@ test('unknown or malformed queued heads require matching real evidence SHAs or r
 });
 
 test('hung reads are bounded and remain queued for retry', async t => {
-  const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(t); vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   enqueueStuckTrace(f.options);
   const pending = drainStuckTraces({ ...f.options, run: () => new Promise(() => {}) });
   await new Promise(resolve => setImmediate(resolve));
-  t.mock.timers.tick(59_000);
+  await vi.advanceTimersByTimeAsync(59_000);
   await pending;
   assert.equal(queue(f)[key].state, 'queued');
   assert.equal(queue(f)[key].attempts, 1);
-  t.mock.timers.reset();
+});
+
+test('either runner flag prevents an uninjected drain without consuming a claim', async t => {
+  for (const flag of ['VITEST', 'WE_UNDER_TEST']) {
+    const f = productionFixture(t);
+    vi.stubEnv(flag, '1');
+    enqueueStuckTrace(f.options);
+    const before = queue(f);
+    assert.deepEqual(await drainStuckTraces({ ...f.options, run: undefined,
+      emit: () => assert.fail('under-test drain must not emit') }), { processed: 0 });
+    assert.deepEqual(queue(f), before);
+    assert.equal(f.calls.length, 0);
+  }
 });
 
 test('pending emit holds its claim within ten minutes and retries only after the lease', async t => {
@@ -344,7 +370,7 @@ test('pending emit holds its claim within ten minutes and retries only after the
 });
 
 test('digest enqueues every unchanged operator head and drains detached after alerts, never under test', async t => {
-  const f = fixture(t), seen = [], order = [];
+  const f = productionFixture(t), seen = [], order = [];
   const item = { repo, pr: 17, head, lane: 'operator', state: 'queue-wait', evidence: [] };
   const options = { stateDir: join(f.root, 'digest'), traceStateDir: f.root, feedPath: join(f.root, 'feed.jsonl'),
     now: Date.parse(now), env: {}, notify: () => { order.push('alert'); return { ok: true }; },
@@ -365,7 +391,7 @@ test('digest enqueues every unchanged operator head and drains detached after al
 });
 
 test('digest rejects queue feed collisions without creating or corrupting the queue, and rejected feeds leave trace state untouched', async t => {
-  const f = fixture(t), traceStateDir = join(f.root, 'traces');
+  const f = productionFixture(t), traceStateDir = join(f.root, 'traces');
   const queuePath = join(traceStateDir, 'stuck-trace-queue.json');
   const stateDir = join(f.root, 'digest');
   let enqueues = 0, drains = 0;
@@ -393,7 +419,7 @@ test('digest rejects queue feed collisions without creating or corrupting the qu
 });
 
 test('empty digest passes drain watcher-enqueued entries, two per pass, even with no feed writes', async t => {
-  const f = fixture(t);
+  const f = productionFixture(t);
   for (const pr of [17, 18, 19]) enqueueStuckTrace({ ...f.options, pr });
   const drains = [];
   const options = { stateDir: join(f.root, 'digest'), traceStateDir: f.root, feedPath: join(f.root, 'feed.jsonl'),
@@ -410,9 +436,9 @@ test('empty digest passes drain watcher-enqueued entries, two per pass, even wit
 });
 
 test('digest still alerts when queue writing and post-pass drain throw', async t => {
-  const f = fixture(t); let alerts = 0;
+  const f = productionFixture(t); let alerts = 0;
   publishStalledDigest({ items: [{ repo, pr: 17, head, lane: 'operator', state: 'queue-wait' }] }, {
-    stateDir: join(f.root, 'digest'), feedPath: join(f.root, 'feed.jsonl'), env: {},
+    stateDir: join(f.root, 'digest'), traceStateDir: f.root, feedPath: join(f.root, 'feed.jsonl'), env: {},
     enqueue: () => { throw Error('queue write'); }, drain: () => { throw Error('drain'); },
     notify: () => { alerts++; return { ok: true }; },
   });
