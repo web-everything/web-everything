@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import yaml from 'js-yaml';
 import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo } from '../urgent-verify-marker.mjs';
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -146,6 +147,25 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
 
 describe('CI gate mirroring fails closed', () => {
   const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+  it('accepts every run step in the real CI workflow', () => {
+    expect(ciGatePlan(workflow)).toEqual({
+      coverage: ['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9'],
+      hostPaths: ['node', 'scripts/lint-host-paths.mjs'],
+      integration: ['npm', 'run', 'test:integration:vitest'],
+    });
+  });
+  it.each(['test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'])(
+    'refuses an extra unknown run step in %s and tells the operator to update the mirror', job => {
+      const changed = yaml.safeLoad(workflow);
+      changed.jobs[job].steps.push({ name: 'Additional validation', run: 'npm run new-validation' });
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates: update the urgent verification mirror');
+    });
+  it.each(['npm ci\nnpm run new-validation', 42, ''])(
+    'refuses changed setup or unreadable run text %s', run => {
+      const changed = yaml.safeLoad(workflow);
+      changed.jobs.standards.steps.push({ run });
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
+    });
   it.each([
     ['merge', 'npm run coverage:merge -- coverage-shards --threshold=80 --expect=9'],
     ['lint', 'node scripts/lint-host-paths.mjs'],

@@ -4638,3 +4638,9 @@ later-red supersession, event logging and the unchanged non-urgent CI gate. Run 
 ## Urgent local verification receipts
 
 Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
+
+The urgent gate mirror pins every `run` text in `test-shard`, `coverage-merge`, `host-paths`,
+`integration`, `test` and `standards`, with an explicit setup-command allowlist. When CI adds
+validation, update the mirror before issuing local receipts; unknown run steps refuse with
+`unreadable-ci-gates`. Keep the real-workflow acceptance and per-job unknown-step regressions
+in `urgent-verify.test.mjs`.

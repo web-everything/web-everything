@@ -35,9 +35,105 @@ export function ciUnitPlan(workflow) {
   return shards.map(i => ({ shard: `${i}/${shards.length}` }));
 }
 
+// Pin complete run texts, including shard-selection helpers and dependency receipts.
+// Do not derive this allowlist from the workflow at runtime: new validation must update the mirror.
+const runText = run => run.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#')).join('\n');
+const setupRuns = ['sh scripts/ci/fetch-main-history.sh', 'npm ci', 'npm ci --ignore-scripts',
+  'npm run build:tools', 'npm ci\nnpm run build:tools'];
+const mirroredRuns = {
+  'test-shard': [
+    "echo \"Card-only change; no unit tests required by the changes classifier.\"",
+    `
+list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=\${{ matrix.shard }}/9) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+[ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+files=()
+while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+echo "unit shard \${{ matrix.shard }}/9: \${#files[@]} files"
+npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+`,
+    `
+list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+[ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+files=()
+while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+echo "unit no-coverage group: \${#files[@]} files"
+npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+`,
+  ],
+  'coverage-merge': [
+    `
+if [ "\${{ needs.test-shard.result }}" != "success" ]; then
+echo "::error::Unit shards did not succeed; refusing incomplete coverage."
+exit 1
+fi
+`,
+    "npm run coverage:merge -- coverage-shards --threshold=80 --expect=9",
+  ],
+  'host-paths': [
+    "node scripts/lint-host-paths.mjs",
+  ],
+  'integration': [
+    `
+if [ "\${{ needs.changes.result }}" != "success" ]; then
+echo "changes (card-only detection) did not succeed (result: \${{ needs.changes.result }}) - failing closed."
+exit 1
+fi
+if [ "\${{ needs.changes.outputs.light }}" = "true" ]; then
+echo "Card-only PR: integration suite intentionally not run."
+echo "run=false" >> "$GITHUB_OUTPUT"
+else
+echo "run=true" >> "$GITHUB_OUTPUT"
+fi
+`,
+    "npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job=\"integration\")",
+  ],
+  'test': [
+    `
+if [ "\${{ needs.changes.result }}" != "success" ]; then
+echo "::error::Changes detection did not succeed."
+exit 1
+fi
+if [ "\${{ needs.integration.result }}" != "success" ]; then
+echo "::error::Integration did not succeed."
+exit 1
+fi
+if [ "\${{ needs.standards.result }}" != "success" ]; then
+echo "::error::Standards did not succeed."
+exit 1
+fi
+if [ "\${{ needs.host-paths.result }}" != "success" ]; then
+echo "::error::Host paths did not succeed."
+exit 1
+fi
+if [ "\${{ needs.changes.outputs.light }}" = "true" ]; then
+echo "Card-only PR: unit shards and coverage merge intentionally omitted."
+exit 0
+fi
+if [ "\${{ needs.test-shard.result }}" != "success" ]; then
+echo "::error::Unit shards did not succeed."
+exit 1
+fi
+if [ "\${{ needs.coverage-merge.result }}" != "success" ]; then
+echo "::error::Coverage merge did not succeed."
+exit 1
+fi
+`,
+  ],
+  'standards': [
+    "npm run check:standards",
+  ],
+};
+
 /** Mirror only the known CI command and artifact layout; changes require an operator update. */
 export function ciGatePlan(workflow) {
   const jobs = yaml.safeLoad(workflow)?.jobs, plan = ciUnitPlan(workflow);
+  for (const [job, mirrored] of Object.entries(mirroredRuns)) {
+    const steps = jobs?.[job]?.steps;
+    const allowed = new Set([...setupRuns, ...mirrored].map(runText));
+    if (!Array.isArray(steps) || steps.some(s => !s || typeof s !== 'object' || ('run' in s &&
+      (typeof s.run !== 'string' || !allowed.has(runText(s.run))))))
+      throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run steps`);
+  }
   const covered = plan.filter(s => s.group === 'covered').length;
   const step = (job, name) => {
     const matches = jobs?.[job]?.steps?.filter(s => s.name === name);
