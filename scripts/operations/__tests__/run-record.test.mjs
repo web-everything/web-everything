@@ -70,6 +70,13 @@ describe('normalizeJudgeTelemetry — a failed seat keeps its spawn evidence', (
     expect(JSON.stringify(row)).not.toContain('ghp_');
   });
 
+  it('redacts a credential longer than the persisted stderr tail before truncating', () => {
+    const row = normalizeJudgeTelemetry({ telemetry: {
+      stderrTail: `SECRET_TOKEN=${'opaque'.repeat(1000)}private-value-suffix`,
+    } });
+    expect(row.stderrTail).toBe('SECRET_TOKEN=<redacted>');
+  });
+
   it('keeps string failureKind and failureText alongside existing telemetry', () => {
     expect(normalizeJudgeTelemetry({ step: 'judgeSecurity', stepIndex: 2, telemetry: {
       failureKind: 'provider-quota', failureText: "You've hit your weekly limit",

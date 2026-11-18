@@ -16,7 +16,7 @@ const result = { type: 'result', session_id: 'session', structured_output: { ver
 const tool = (command) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command } }] } });
 const jsonl = (events) => events.map(e => JSON.stringify(e)).join('\n') + '\n';
 
-function fake(events, { hang = false, chunks, pid, stderr = 'diagnostic stderr' } = {}) {
+function fake(events, { hang = false, chunks, pid, stderr = 'diagnostic stderr', stderrChunks } = {}) {
   let options;
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -28,7 +28,7 @@ function fake(events, { hang = false, chunks, pid, stderr = 'diagnostic stderr' 
     options = opts;
     queueMicrotask(() => {
       for (const chunk of chunks ?? [jsonl(events)]) child.stdout.write(chunk);
-      child.stderr.write(stderr);
+      for (const chunk of stderrChunks ?? [stderr]) child.stderr.write(chunk);
       if (!hang) child.emit('close', 0, null);
     });
     return child;
@@ -71,24 +71,72 @@ describe('Claude stream diagnostics', () => {
     }
   });
 
-  it('uses the last result event even when an earlier result has a verdict', () => {
+  it('rejects multiple terminal results even when the final result has a verdict', () => {
     const last = { ...result, structured_output: { verdict: 'reject' } };
-    expect(parseJudgeOutcome(jsonl([result, last, { type: 'system' }])).value)
-      .toEqual({ verdict: 'reject' });
+    expect(() => parseJudgeOutcome(jsonl([result, last, { type: 'system' }])))
+      .toThrow(/did not emit parseable JSON/);
   });
 
   it.each([
     ['non-JSON trailer', 'incomplete output\n', /did not emit parseable JSON/],
     ['truncated result', '{"type":"result","structured_output":', /did not emit parseable JSON/],
-    ['error result', jsonl([{ type: 'result', is_error: true, result: 'terminal failure' }]), /terminal failure/],
-    ['empty error result', jsonl([{ type: 'result', is_error: true }]), /no result text/],
-    ['missing structured output', jsonl([{ type: 'result' }]), /structured_output/],
-    ['invalid structured output', jsonl([{ type: 'result', structured_output: null }]), /structured_output/],
+    ['error result', jsonl([{ type: 'result', is_error: true, result: 'terminal failure' }]), /did not emit parseable JSON/],
+    ['empty error result', jsonl([{ type: 'result', is_error: true }]), /did not emit parseable JSON/],
+    ['missing structured output', jsonl([{ type: 'result' }]), /did not emit parseable JSON/],
+    ['invalid structured output', jsonl([{ type: 'result', structured_output: null }]), /did not emit parseable JSON/],
   ])('refuses an earlier verdict after a terminal %s', async (_name, trailer, message) => {
     const stdout = jsonl([result]) + trailer;
     expect(() => parseJudgeOutcome(stdout)).toThrow(message);
     await expect(judgeSpawn({ ...request, ...fake([], { chunks: [stdout] }), log: () => {} }))
       .rejects.toThrow(message);
+  });
+
+  it.each([
+    { type: 'error', error: 'terminal failure' },
+    { type: 'assistant' }, { type: 'user' }, { type: 'stream_event' }, { type: 'unknown' },
+    {}, null, [], 42,
+    ...['system', 'rate_limit_event'].flatMap(type => [
+      { type, is_error: true }, { type, error: { message: 'failed' } },
+      { type, subtype: 'error' }, { type, subtype: 'error_during_execution' },
+    ]),
+  ])('rejects meaningful or error-bearing JSON trailers: %j', async trailer => {
+    const events = [result, trailer, { type: 'system' }];
+    expect(() => parseJudgeOutcome(jsonl(events))).toThrow(/did not emit parseable JSON/);
+    await expect(judgeSpawn({ ...request, ...fake(events), log: () => {} }))
+      .rejects.toBeInstanceOf(JudgeUnparseableError);
+    expect(() => parseJudgeOutcome(jsonl([...events, result])))
+      .toThrow(/did not emit parseable JSON/);
+  });
+
+  it('tolerates benign system and rate-limit trailers', () => {
+    expect(parseJudgeOutcome(jsonl([result, { type: 'system' },
+      { type: 'rate_limit_event', is_error: false, subtype: 'success' }])).value)
+      .toEqual(result.structured_output);
+  });
+
+  it.each([
+    { split: false, json: false }, { split: true, json: false },
+    { split: false, json: true }, { split: true, json: true },
+  ])('redacts or omits oversized stderr before bounding, including split credentials (%j)', async ({ split, json }) => {
+    const limit = 8 * 1024 * 1024;
+    const secret = 'private-value-suffix';
+    const opener = json ? '{"SECRET_TOKEN":"' : 'SECRET_TOKEN=';
+    const closing = json ? '"}' : '';
+    const text = `${opener}${'v'.repeat(limit)}${secret}${closing}`;
+    const stderrChunks = split
+      ? [opener.slice(0, -3), `${opener.slice(-3)}${'v'.repeat(limit)}`, secret + closing] : [text];
+    const log = vi.fn();
+    const error = await judgeSpawn({ ...request, ...fake([], { stderrChunks }), log }).catch(e => e);
+    expect(error).toBeInstanceOf(JudgeUnparseableError);
+    const diagnostics = inspect(error, { depth: null }) + JSON.stringify(log.mock.calls);
+    expect(diagnostics).not.toContain(secret);
+    expect(diagnostics).not.toContain('v'.repeat(100));
+    expect(error.stderrTail).toContain('<redacted');
+    if (json) expect(error.stderrTail).not.toContain('could not be sanitized');
+    else expect(error.stderrTail).toContain('could not be sanitized');
+    expect(error.stderrTail).toContain('Rerun with a narrower mandate');
+    expect(error.stderrTail.length).toBeLessThanOrEqual(1000);
+    expect(normalizeJudgeTelemetry({ telemetry: error.telemetry }).stderrTail).toBe(error.stderrTail);
   });
 
   it.each([false, true])('redacts and bounds CLI error diagnostics (empty result=%s)', async empty => {

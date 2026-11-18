@@ -827,20 +827,32 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     if (parsed?.type !== 'result') throw new Error('missing result event');
   } catch {
     parsed = undefined;
+    let sawResult = false;
+    let invalidTrailer = false;
     for (const line of String(stdout).split(/\r?\n/)) {
       if (!line.trim()) continue;
       try {
         const candidate = JSON.parse(line);
-        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+        if (sawResult) {
+          // Only benign housekeeping may follow the terminal result. Keep this
+          // failure sticky: another result cannot repair contradictory evidence.
+          const benign = candidate && ['system', 'rate_limit_event'].includes(candidate.type)
+            && !candidate.is_error && !candidate.error
+            && !(typeof candidate.subtype === 'string' && /error/i.test(candidate.subtype));
+          if (!benign) invalidTrailer = true;
+        } else if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
           && candidate.type === 'result') {
           parsed = candidate;
+          sawResult = true;
         }
       } catch {
         // A warning before a result is tolerable; malformed output after it may be
-        // an incomplete terminal result. Only a later result can restore a verdict.
+        // an incomplete terminal result. Never restore a verdict after that.
+        if (sawResult) invalidTrailer = true;
         parsed = undefined;
       }
     }
+    if (invalidTrailer) parsed = undefined;
     if (parsed === undefined) {
       const evidence = streamEvidence();
       evidence.add(stdout);
@@ -1045,6 +1057,7 @@ export async function judgeSpawn({
       }
       let out = '';
       let err = '';
+      let stderrCapped = false;
       let timer = null;
       let grace = null;
       let killed = false;
@@ -1071,7 +1084,26 @@ export async function judgeSpawn({
       child.stdout?.setEncoding?.('utf8');
       child.stderr?.setEncoding?.('utf8');
       child.stdout?.on('data', (d) => { evidence.add(d); out = (out + d).slice(-STREAM_LIMIT); });
-      child.stderr?.on('data', (d) => { err = (err + d).slice(-STREAM_LIMIT); });
+      child.stderr?.on('data', (d) => {
+        if (stderrCapped) return;
+        const text = err + d;
+        if (text.length > STREAM_LIMIT) {
+          // Redact with the key still present, then bound the diagnostic. Do not
+          // retain later chunks: they could continue this credential's value.
+          try {
+            err = redactSpawnText(text).slice(-STREAM_LIMIT);
+          } catch {
+            // Some redaction patterns cannot process multi-megabyte values.
+            // Never fall back to an unsanitized prefix or suffix on failure.
+            err = '<redacted: oversized stderr could not be sanitized>';
+          }
+          err += '\nStderr capture limit reached; remaining stderr omitted. Rerun with a narrower mandate.';
+          stderrCapped = true;
+        } else {
+          // Keep complete context across chunk boundaries until redaction at use.
+          err = text;
+        }
+      });
       child.on('error', (e) => {
         if (timer) clearTimeout(timer);
         if (grace) clearTimeout(grace);
