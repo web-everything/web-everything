@@ -266,3 +266,69 @@ describe('completion wrapper', () => {
       { spawnFn: () => { throw error; } })).rejects.toBe(error);
   });
 });
+
+// Codex `exec resume [OPTIONS] [SESSION_ID] [PROMPT]`: the id is the first POSITIONAL after `resume`.
+describe('codex resume id is the positional session id, never an option', () => {
+  const shapes = [
+    ['exec', 'resume', '--json', SID, '-'],
+    ['exec', 'resume', '--json', '--skip-git-repo-check', SID, 'prompt'],
+    ['exec', 'resume', '-m', 'some-model', SID, '-'],
+    ['exec', 'resume', '--model', 'some-model', '-c', 'k=v', SID],
+    ['exec', 'resume', '--profile=fixture', SID],
+    ['exec', '--profile', 'resume', 'resume', SID],
+  ];
+  it.each(shapes.map(argv => [JSON.stringify(argv), argv]))('extracts the id from %s', (_label, argv) => {
+    expect(agentResumeId(argv)).toBe(SID);
+    const primitive = vi.fn();
+    launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv);
+    expect(primitive).toHaveBeenCalledTimes(1);
+  });
+  it.each([['--json'], ['-'], ['report-slug'], [null]])('refuses resumeId %j that is not the positional id', resumeId => {
+    const primitive = vi.fn();
+    expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId, log() {} }, primitive, 'codex',
+      ['exec', 'resume', '--json', SID, '-'])).toThrow('native resume id');
+    expect(primitive).not.toHaveBeenCalled();
+  });
+  it('reads an option-only resume (no positional) as an empty id, which is refused', () => {
+    expect(agentResumeId(['exec', 'resume', '--last'])).toBe('');
+    const primitive = vi.fn();
+    expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: null, log() {} }, primitive, 'codex',
+      ['exec', 'resume', '--last'])).toThrow('native resume id');
+    expect(primitive).not.toHaveBeenCalled();
+  });
+  it('applies the same extraction to string and shell -c forms', () => {
+    expect(agentResumeId(`codex exec resume --json ${SID} -`)).toBe(SID);
+    expect(agentResumeId(`exec resume --json '${SID}' -`)).toBe(SID);
+    const primitive = vi.fn();
+    launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'sh', ['-c', `codex exec resume --json ${SID} -`]);
+    expect(primitive).toHaveBeenCalledTimes(1);
+    expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: '--json', log() {} }, vi.fn(), 'sh',
+      ['-c', `codex exec resume --json ${SID} -`])).toThrow('native resume id');
+  });
+});
+
+describe('an async launchGuard is refused without leaking its rejection', () => {
+  it('consumes a rejected guard promise so the caller can handle the refusal', async () => {
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const primitive = vi.fn(), log = vi.fn();
+      expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log,
+        launchGuard: async () => { throw new Error('admission unavailable'); } }, primitive))
+        .toThrow('launchGuard must be synchronous');
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(unhandled).not.toHaveBeenCalled();
+      expect(primitive).not.toHaveBeenCalled();
+    } finally { process.off('unhandledRejection', unhandled); }
+  });
+  it('refuses a thenable whose then throws or whose then getter throws', () => {
+    const primitive = vi.fn();
+    const throwing = { then() { throw new Error('boom'); } };
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log() {}, launchGuard: () => throwing }, primitive))
+      .toThrow('launchGuard must be synchronous');
+    const getter = { get then() { throw new Error('getter boom'); } };
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log() {}, launchGuard: () => getter }, primitive))
+      .toThrow('launchGuard must be synchronous');
+    expect(primitive).not.toHaveBeenCalled();
+  });
+});

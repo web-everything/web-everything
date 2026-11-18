@@ -42,9 +42,36 @@ export function agentResumeId(argv = []) {
 // A `--` right after an option that consumes the next word is that option's VALUE, not the delimiter.
 // Fail closed: any long option not known to be a plain switch is assumed to take a value (the unknown case
 // scans more, so it can only over-refuse), and so are the short value options below.
-const SWITCH_OPTIONS = new Set(['--print', '--bg', '--verbose', '--continue', '--restricted', '--json', '--help', '--version', '--debug']);
+const SWITCH_OPTIONS = new Set([
+  '--print', '--bg', '--verbose', '--continue', '--restricted', '--json', '--help', '--version', '--debug',
+  '--last', '--all', '--skip-git-repo-check', '--full-auto', '--ephemeral', '--oss',
+  '--dangerously-bypass-approvals-and-sandbox', '--dangerously-skip-permissions',
+]);
 const SHORT_VALUE_OPTIONS = new Set(['-n', '-m', '-s', '-C']);
+// Codex's own short value options (-c config, -i image, -p profile, -o output file) are only consulted while
+// walking `codex exec [resume]` options, so they never change where the `--` delimiter is found.
+const CODEX_SHORT_VALUE_OPTIONS = new Set(['-c', '-i', '-p', '-o']);
 const takesValue = (word) => SHORT_VALUE_OPTIONS.has(word) || (typeof word === 'string' && /^--[\w-]+$/.test(word) && !SWITCH_OPTIONS.has(word));
+const codexTakesValue = (word) => CODEX_SHORT_VALUE_OPTIONS.has(word) || takesValue(word);
+const isOption = (word) => typeof word === 'string' && word.length > 1 && word.startsWith('-');
+
+/** Index of the first positional word at or after `from`, stepping over options and the values they consume. */
+function firstPositional(argv, from) {
+  let j = from;
+  while (j < argv.length && isOption(argv[j])) j += codexTakesValue(argv[j]) ? 2 : 1;
+  return j;
+}
+
+/**
+ * Codex `exec resume [OPTIONS] [SESSION_ID] [PROMPT]`: the session id is the first POSITIONAL after `resume`,
+ * never an option. No positional reads as '' (refused, like a resume flag with no value).
+ */
+function codexResumeId(argv, execAt) {
+  const sub = firstPositional(argv, execAt + 1);
+  if (argv[sub] !== 'resume') return [];
+  const id = firstPositional(argv, sub + 1);
+  return [typeof argv[id] === 'string' ? argv[id] : ''];
+}
 
 function resumeIds(allWords) {
   // `--` ends the launched claude/codex's option parsing: everything after it is prompt text, never a
@@ -54,10 +81,11 @@ function resumeIds(allWords) {
   const binary = allWords.findIndex(w => typeof w === 'string' && /(?:^|[/\\])(?:claude|codex)$/.test(w));
   const delimiter = allWords.findIndex((w, i) => w === '--' && i > binary && !takesValue(allWords[i - 1]));
   const argv = delimiter < 0 ? allWords : allWords.slice(0, delimiter);
-  let hasExec = false;
+  let sawExec = false;
   return argv.flatMap((word, i) => {
-    if (word === 'exec') hasExec = true;
-    if (word === '--resume' || word === '-r' || word === '--session-id' || (word === 'resume' && hasExec)) return [argv[i + 1] ?? ''];
+    // Only the first `exec` that is not an option's value starts a codex exec; later words are its options/prompt.
+    if (word === 'exec' && !sawExec && !takesValue(argv[i - 1])) { sawExec = true; return codexResumeId(argv, i); }
+    if (word === '--resume' || word === '-r' || word === '--session-id') return [argv[i + 1] ?? ''];
     return typeof word === 'string' && /^(?:--resume=|--session-id=|-r=?)/.test(word) ? [word.replace(/^(?:--resume=|--session-id=|-r=?)/, '')] : [];
   });
 }
@@ -93,6 +121,12 @@ function shellResumeIds(text) {
   return ids;
 }
 
+// A throwing `then` getter must read as thenable (fail closed), not escape as an unrelated error.
+function isThenable(value) {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+  try { return typeof value.then === 'function'; } catch { return true; }
+}
+
 /**
  * Execute exactly one primitive with its original arguments and return value.
  * `resumeId` is an explicit key even for management commands/fresh launches (null/undefined).
@@ -118,7 +152,11 @@ export function launchAgent(descriptor, primitive, ...args) {
       refuse(`launchGuard threw: ${String(cause?.message ?? cause)}`, descriptor, log, cause);
     }
     if (allowed === false) refuse('launchGuard returned false', descriptor, log);
-    if (allowed && typeof allowed.then === 'function') refuse('launchGuard must be synchronous', descriptor, log);
+    if (isThenable(allowed)) {
+      // The refusal is the caller's to handle; the abandoned guard promise's own rejection must not crash Node.
+      try { allowed.then(undefined, () => {}); } catch { /* a throwing then() is still refused below */ }
+      refuse('launchGuard must be synchronous', descriptor, log);
+    }
     if (allowed !== true && allowed !== undefined) refuse('launchGuard must return true or undefined', descriptor, log);
   }
   if (typeof primitive !== 'function') refuse('execution primitive is required', descriptor, log);
