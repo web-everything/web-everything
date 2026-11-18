@@ -3272,7 +3272,7 @@ export function planReconcile({
           }
           if (spent >= cap) {
             owedRerunSpent = true;
-            notes.push({ kind: 'owed-ci-rerun-spent', prNumber, attempts: spent, cap,
+            notes.push({ kind: 'owed-ci-rerun-spent', prNumber, head: pr.headRefOid, attempts: spent, cap,
               text: `PR #${prNumber}: failed required jobs remain red after ${spent}/${cap} re-runs on this head with main green — ordinary ci-heal is owed` });
           }
         }

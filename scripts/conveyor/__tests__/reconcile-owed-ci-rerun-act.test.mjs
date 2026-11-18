@@ -35,7 +35,7 @@ describe('owed CI rerun action', () => {
   it.each([{ confirmed: 1, rejected: 0 }, { confirmed: 0, rejected: 1 }])('heals after the budget is spent: %j', budget => {
     const out = plan({ timeoutRetryBudget: budget });
     expect(out.dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
-    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'owed-ci-rerun-spent', attempts: 1, cap: 1 }));
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'owed-ci-rerun-spent', head, attempts: 1, cap: 1 }));
     expect(out.dispatch.some(r => r.kind === 'ci-heal')).toBe(true);
     expect(out.refusals.some(r => r.kind === 'owed-ci-rerun')).toBe(false);
   });

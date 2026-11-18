@@ -10,6 +10,7 @@ import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
 import { redTeamOwedFor } from './review-red-team-policy.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
+import { readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
 /** Thrown values can have unreadable messages or unstringifiable JSON shapes. */
@@ -81,6 +82,30 @@ function storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam }) {
   } catch { return false; }
 }
 
+/** Read at the notification boundary, never reuse the job's earlier PR snapshot. */
+export function createLiveRedTeamReader({ provider, readComments, env = process.env, gh,
+  readCheckFact = args => {
+    const app = resolveWeAppId({ env });
+    return app.ok ? readRedTeamCheckFact({ ...args, appId: app.appId, gh }) : app;
+  } }) {
+  return ({ repo, pr, head }) => {
+    const live = provider.readPrState(repo, pr);
+    if (!isRealHead(live?.headRefOid)) throw Error('live PR head unreadable');
+    if (!isRealHead(head)) return { clear: false };
+    if (live.headRefOid.toLowerCase() !== head.toLowerCase()) return { clear: true };
+    if (live.labels?.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:clear'))
+      return { clear: true };
+    const result = redTeamForHead(readComments({ repo, pr }), pr, head);
+    if (result?.findings?.length === 0) return { clear: true };
+    return { clear: readCheckFact({ repo, pr, headSha: head })?.ok === true };
+  };
+}
+
+function suppressLiveAlert(io, item) {
+  try { return io.readLiveRedTeam?.(item)?.clear === true; }
+  catch { return false; } // Missing/unreadable live evidence preserves the existing alert.
+}
+
 /** Retry notification IO only; old failures must not prevent this job's settlement. */
 function flushPending(io, note) {
   try {
@@ -129,7 +154,7 @@ function flushPending(io, note) {
         if (attempted >= 25) { overflow = true; continue; }
         attempted++;
         try {
-          io.publishNeedsYou(item);
+          if (!suppressLiveAlert(io, item)) io.publishNeedsYou(item);
           mkdirSync(dirname(published), { recursive: true });
           writeJsonAtomic(published, item);
           unlinkSync(pending);
@@ -205,7 +230,7 @@ export function settleRedTeamSkip(input = {}) {
     const pending = join(redTeamStatusDir(io?.env ?? process.env), 'skip-pending', `${key}.json`);
     mkdirSync(dirname(pending), { recursive: true });
     writeJsonAtomic(pending, item);
-    io.publishNeedsYou(item);
+    if (!suppressLiveAlert(io, item)) io.publishNeedsYou(item);
     mkdirSync(dirname(path), { recursive: true });
     writeJsonAtomic(path, item);
     unlinkSync(pending);

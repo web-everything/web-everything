@@ -148,6 +148,8 @@ export function buildNoteComment(note, { informational = isInformationalNote(not
   if (note?.kind === 'ci-heal-exhausted' && note?.lastFailureReason) {
     lines.push('', `Last failure: ${note.lastFailureReason}`);
   }
+  if (typeof note?.head === 'string' && /^[a-f0-9]{40}$/i.test(note.head))
+    lines.push('', `<!-- conveyor-note-head: ${note.head} -->`);
   lines.push('', `<!-- conveyor-note-key: ${key} -->`);
   return lines.join('\n');
 }

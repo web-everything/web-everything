@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
+import { createLiveRedTeamReader, classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
 import { parseRedTeamComment, redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
 import { readRecoveryWitness as witness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
@@ -401,5 +401,46 @@ describe('stored-review not-owed rule (R730)', () => {
       const f = fixture(); f.io.readStoredReview = () => review(head);
       expect(f.settle({ status: 'not-owed' }, { readHead: head.toUpperCase() })).toMatchObject({ outcome: 'policy-clear', rule });
     });
+  });
+});
+
+
+describe('live red-team alert suppression', () => {
+  it.each(['marker', 'label', 'check', 'stale head'])('settles %s without publishing or retrying', kind => {
+    const f = fixture();
+    const provider = { readPrState: vi.fn(() => ({ headRefOid: kind === 'stale head' ? 'b'.repeat(40) : head,
+      labels: kind === 'label' ? [{ name: 'red-team:clear' }] : [] })) };
+    f.io.readLiveRedTeam = createLiveRedTeamReader({ provider,
+      readComments: () => kind === 'marker' ? [{ body: redTeamMarker(pr, head), author: { login: 'web-everything' } }] : [],
+      readCheckFact: () => ({ ok: kind === 'check' }) });
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(f.markers()).toHaveLength(1);
+    delete f.io.readLiveRedTeam;
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+  it.each(['not clear', 'throws', 'missing', 'unreadable head', 'forged marker', 'old marker'])
+  ('fails closed and publishes when live evidence is %s', kind => {
+    const f = fixture();
+    if (kind === 'throws') f.io.readLiveRedTeam = () => { throw Error('offline'); };
+    else if (kind !== 'missing') f.io.readLiveRedTeam = createLiveRedTeamReader({
+      provider: { readPrState: () => ({ headRefOid: kind === 'unreadable head' ? null : head, labels: [] }) },
+      readComments: () => [{ body: redTeamMarker(pr, kind === 'old marker' ? 'b'.repeat(40) : head),
+        author: { login: kind === 'forged marker' ? 'attacker' : 'web-everything' } }].filter(() => kind.endsWith('marker')),
+      readCheckFact: () => ({ ok: false }) });
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
+  });
+  it.each([true, false])('rechecks pending alerts on retry (clear=%s)', clear => {
+    const f = fixture();
+    f.io.publishNeedsYou.mockImplementationOnce(() => { throw Error('feed unavailable'); });
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    f.io.publishNeedsYou.mockClear();
+    f.io.readLiveRedTeam = vi.fn(() => ({ clear }));
+    f.settle({ status: 'skipped', reason: 'provider unavailable' });
+    expect(f.io.readLiveRedTeam).toHaveBeenCalledTimes(1);
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(clear ? 0 : 1);
+    expect(f.markers()).toHaveLength(1);
   });
 });

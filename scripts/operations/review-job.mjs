@@ -95,7 +95,7 @@ import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, r
 
 import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
-import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
+import { createLiveRedTeamReader, classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mjs';
@@ -346,6 +346,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       env,
       log: line => process.stderr.write(`${line}\n`),
       readComments,
+      readLiveRedTeam: createLiveRedTeamReader({ provider, readComments, env,
+        gh: (args, options) => exec('gh', args, { ...options, cwd: root, env }) }),
       postComment,
       ...(input.carry ? { carry: createRedTeamCarryIo({ env, readStatus, writeStatus, readEvidence,
         readLive: ({ repo, pr }) => provider.readPrState(repo, pr), readComments,
