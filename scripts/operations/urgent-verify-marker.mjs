@@ -2,10 +2,16 @@
 import yaml from 'js-yaml';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 export const urgentKeyPath = home => `${home}/workspace/.operations/state/urgent-verify.key`;
-export const normalizeUrgentRepo = url => String(url ?? '').trim().replace(/\/+$/, '').replace(/\.git$/, '');
+export const normalizeUrgentRepo = url => {
+  const value = String(url ?? '').trim().replace(/\/+$/, '').replace(/\.git$/, '');
+  const match = value.match(/^(?:https:\/\/|ssh:\/\/(?:git@)?)([\w.-]+)\/([\w.-]+\/[\w.-]+)$/)
+    ?? value.match(/^git@([\w.-]+):([\w.-]+\/[\w.-]+)$/);
+  return match ? `https://${match[1].toLowerCase()}/${match[1].toLowerCase() === 'github.com' ? match[2].toLowerCase() : match[2]}` : value;
+};
+export const urgentFuiRepo = 'https://github.com/frontier-ui/frontierui';
 export function urgentSignature(record, key) {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('unreadable urgent key');
-  const fields = ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha'];
+  const fields = ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha', 'fuiRepo'];
   return createHmac('sha256', key).update(JSON.stringify(Object.fromEntries(fields.map(k => [k, record[k]])))).digest('hex');
 }
 export const urgentLedger = (home, name = 'urgent-full-green') => `${home}/workspace/.operations/coordination/${name}.jsonl`;
@@ -202,7 +208,7 @@ export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedStep
       || marker.shards !== shards || !Number.isFinite(now) || !Number.isFinite(finished) || !(started < finished)
       || now - finished > 2 * 60 * 60_000 || finished - now > 5 * 60_000
       || typeof marker.host !== 'string' || !marker.host.trim()) return no('no-urgent-marker');
-    if (!fullSha(marker.fuiSha) || !repo || marker.repo !== repo || !Array.isArray(marker.steps)
+    if (!fullSha(marker.fuiSha) || marker.fuiRepo !== urgentFuiRepo || !repo || marker.repo !== repo || !Array.isArray(marker.steps)
       || !Array.isArray(expectedSteps) || expectedSteps.length !== shards + 6
       || marker.steps.length !== expectedSteps.length || !expectedSteps.every((step, i) => marker.steps[i] === step)
       || !/^[a-f0-9]{64}$/.test(marker.sig ?? '')

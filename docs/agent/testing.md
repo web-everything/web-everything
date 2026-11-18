@@ -4637,6 +4637,14 @@ later-red supersession, event logging and the unchanged non-urgent CI gate. Run 
 
 ## Urgent local verification receipts
 
+FUI sibling verification requires its origin to normalize to `https://github.com/frontier-ui/frontierui`
+(HTTPS and Git SSH forms are accepted) before fetching or installing. Signed receipts bind `fuiRepo`
+as well as `fuiSha`; old receipts without the origin require fresh verification or passing CI.
+The urgent sweep reads all check-runs (maximum 100, exact count and unique IDs required) and settles
+green only after every run completes and all required runs succeed. Pending unrelated runs keep the
+load eligible for later failure detection. Legacy green settlements without `checksComplete: true`
+are rechecked; incomplete or oversized evidence escalates to NEEDS-YOU for manual inspection.
+
 Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
 
 The urgent gate mirror pins every `run` text in `test-shard`, `coverage-merge`, `host-paths`,

@@ -36,7 +36,7 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
         { cwd: r.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024, throttle: { caller: 'urgent-sweep', exec: (a, o) => exec('gh', a, o) } })) });
       const origin = resolveOriginRepository({ git, gh });
       if (!origin.repo) throw new Error('unreadable CI repository');
-      const result = origin.gh(['api', `repos/${origin.repo}/commits/${r.sha}/check-runs?per_page=100`]);
+      const result = origin.gh(['api', `repos/${origin.repo}/commits/${r.sha}/check-runs?per_page=100&filter=all`]);
       if (result.code !== 0) throw new Error('unreadable CI checks');
       return JSON.parse(result.stdout);
     },
@@ -55,7 +55,9 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const settlements = deps.state();
     if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['settled-green', 'settled-unloaded', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
-    const settled = new Set(settlements.filter(r => r.status !== 'sweep-cursor').map(r => r.id));
+    // Old green receipts did not prove all runs had finished; re-read them once.
+    const settled = new Set(settlements.filter(r => r.status === 'settled-unloaded'
+      || (r.status === 'settled-green' && r.checksComplete === true)).map(r => r.id));
     const loads = new Map(deps.loads().filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
     const entries = [...loads], cursor = settlements.filter(r => r.status === 'sweep-cursor').at(-1)?.id;
     // Use the complete load order so even a cursor load settled last pass remains an anchor.
@@ -73,7 +75,8 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         const required = await deps.required(r), data = await deps.checks(r);
         if (!Array.isArray(required) || !required.includes('test') || !Number.isInteger(data?.total_count)
           || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
-          || data.check_runs.length !== data.total_count || data.check_runs.some(c => !Number.isSafeInteger(c?.id)
+          || data.check_runs.length !== data.total_count || new Set(data.check_runs.map(c => c?.id)).size !== data.total_count
+          || data.check_runs.some(c => !Number.isSafeInteger(c?.id)
             || c.head_sha !== r.sha || typeof c.name !== 'string' || !Number.isSafeInteger(c.app?.id)
             || !['queued', 'in_progress', 'completed'].includes(c.status)
             || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
@@ -89,8 +92,9 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           await deps.settle({ ...event, status: 'settled-unloaded' });
           results.push({ id, status: 'settled-unloaded' });
         } else if (required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
-          && checks.every(c => c.status === 'completed' && c.conclusion === 'success')) {
-          await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-green' });
+          && checks.every(c => c.status === 'completed' && c.conclusion === 'success')
+          && data.check_runs.every(c => c.status === 'completed')) {
+          await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-green', checksComplete: true });
           results.push({ id, status: 'settled-green' });
         } else results.push({ id, status: 'pending' });
       } catch (e) {

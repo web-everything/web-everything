@@ -4,7 +4,7 @@ import * as realFs from 'node:fs';
 import { spawnSync as realSpawn } from 'node:child_process';
 import { hostname, homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
-import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
+import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo } from './urgent-verify-marker.mjs';
 
 export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env } = {}) {
   const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CI', 'SHELL', 'USER']
@@ -34,6 +34,8 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       return ciUnitPlan(workflow);
     },
     verifyFui: () => {
+      const repo = normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'], fui));
+      if (repo !== urgentFuiRepo) throw new Error('FUI sibling origin must be frontier-ui/frontierui on github.com');
       if (run('git', ['status', '--porcelain', '--untracked-files=all'], fui) !== '') throw new Error('FUI sibling must exist and be clean');
       run('git', ['fetch', 'origin'], fui);
       let tip;
@@ -41,7 +43,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       catch { tip = run('git', ['rev-parse', '--verify', 'origin/main^{commit}'], fui).trim(); }
       const head = run('git', ['rev-parse', 'HEAD'], fui).trim();
       if (!/^[a-f0-9]{40}$/i.test(head) || head !== tip) throw new Error('FUI sibling must match fetched origin default branch');
-      return head;
+      return { sha: head, repo };
     },
     'install-fui': () => { for (const command of gates.installFui) heavy(command, fui); },
     install: () => heavy(gates.install),
@@ -87,16 +89,18 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
       return { ok: false, detail: 'clean-checkout-at-sha-required', fallback };
     const plan = deps.plan(), startedAt = deps.now(), repo = deps.repo(), steps = [];
     if (!repo) throw new Error('unreadable origin remote');
-    let result = 'green', fuiSha;
+    let result = 'green', fuiSha, fuiRepo;
     // Stop on failure, including queue exhaustion: no admission polling or retry loop.
     try {
-      fuiSha = await deps.verifyFui();
+      const fui = await deps.verifyFui();
+      fuiSha = fui.sha; fuiRepo = fui.repo;
+      if (fuiRepo !== urgentFuiRepo) throw new Error('untrusted FUI origin');
       for (const step of ['install-fui', 'install']) { steps.push(step); await deps[step](); }
       for (const shard of plan) { steps.push(`unit:${shard.group ?? 'unit'}:${shard.shard}`); await deps.shard(shard); }
       for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) { steps.push(step); await deps[step](); }
       if (!deps.clean() || deps.head() !== sha) throw new Error('checkout changed');
     } catch { result = 'red'; }
-    const marker = { sha, suite: 'full', shards: plan.length, result, startedAt, finishedAt: deps.now(), host: deps.host, repo, steps, fuiSha };
+    const marker = { sha, suite: 'full', shards: plan.length, result, startedAt, finishedAt: deps.now(), host: deps.host, repo, steps, fuiSha, fuiRepo };
     marker.sig = urgentSignature(marker, deps.readKey());
     deps.append(marker);
     return { ok: result === 'green', marker, ...(result === 'red' ? { fallback } : {}) };

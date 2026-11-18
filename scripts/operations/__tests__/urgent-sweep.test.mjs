@@ -7,7 +7,8 @@ const sha = 'a'.repeat(40);
 const load = { type: 'prototype-load.urgent', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
   registration: { clone: '/clone', ref: 'lane/repair-m1', sha: 'b'.repeat(40) } };
 const required = ['changes', 'test-shard', 'test'];
-const check = (name, conclusion = 'success', extra = {}) => ({ id: 1, head_sha: sha, name, app: { id: 15368 }, status: 'completed', conclusion, ...extra });
+let checkId = 0;
+const check = (name, conclusion = 'success', extra = {}) => ({ id: ++checkId, head_sha: sha, name, app: { id: 15368 }, status: 'completed', conclusion, ...extra });
 function fixture(rows = required.map(n => check(n))) {
   const state = [], events = [], loads = [load];
   const d = { loads: () => loads, state: () => state, now: () => '2026-11-18T12:00:00Z', required: vi.fn(() => required),
@@ -24,11 +25,29 @@ describe('urgent CI sweep', () => {
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU'), status: 'open' }));
     await f.run(); expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.escalate).toHaveBeenCalledTimes(1);
   });
-  it('settles all required green and never checks it again', async () => {
+  it('settles all required green only with every check completed and never checks it again', async () => {
     const f = fixture(); await f.run(); await f.run();
     expect(f.settlements()[0].status).toBe('settled-green'); expect(f.d.checks).toHaveBeenCalledTimes(1); expect(f.d.remove).not.toHaveBeenCalled();
   });
+  it('unloads and raises NEEDS-YOU when required CI fails after required green with another run pending', async () => {
+    const f = fixture([...required.map(n => check(n)), check('smoke', null, { status: 'in_progress' })]);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.settlements()).toEqual([]); expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
+  });
+  it('rechecks persisted legacy green without completion evidence and unloads later failure', async () => {
+    const f = fixture(); await f.run();
+    delete f.settlements()[0].checksComplete;
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
+  });
   it.each([
+    ['unrelated queued check', [...required.map(n => check(n)), check('smoke', null, { status: 'queued' })]],
+    ['unrelated running check', [...required.map(n => check(n)), check('smoke', null, { status: 'in_progress' })]],
     ['missing required checks', [check('test')]],
     ['pending', [check('test', null, { status: 'queued' })]],
     ['unrelated failure', [check('smoke', 'failure')]],
@@ -41,6 +60,7 @@ describe('urgent CI sweep', () => {
   it.each([
     ['oversized', { total_count: 101, check_runs: [] }], ['incomplete', { total_count: 2, check_runs: [check('test')] }],
     ['wrong sha', { total_count: 1, check_runs: [check('test', 'failure', { head_sha: 'c'.repeat(40) })] }],
+    ['pagination gap', { total_count: 3, check_runs: [check('test', 'success', { id: 1 }), check('test', 'success', { id: 1 }), check('changes')] }],
     ['malformed', { total_count: 1, check_runs: [{}] }],
   ])('escalates %s evidence without unloading or settling', async (_, data) => {
     const f = fixture(); f.d.checks.mockReturnValue(data);
@@ -97,7 +117,7 @@ describe('urgent CI sweep', () => {
     expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.remove).toHaveBeenCalledWith(failing);
     expect(f.settlements()).toEqual([expect.objectContaining({ ref: failing.ref, status: 'settled-unloaded' })]);
   });
-  it('honors legacy settlements without cursor records', async () => {
+  it('honors complete settlements without cursor records', async () => {
     const f = fixture(); await f.run();
     f.state.splice(0, f.state.length, ...f.settlements());
     await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(1); expect(f.settlements()).toHaveLength(1);
@@ -123,7 +143,7 @@ describe('production sweep storage and removal guards', () => {
     const remove = vi.fn(() => ({ removed: true })), env = {};
     const deps = createSweepDeps({ exec, ghExec, remove, env });
     expect(deps.checks(load)).toEqual({ total_count: 0, check_runs: [] });
-    expect(ghExec.mock.calls[1][1]).toEqual(['api', `repos/org/repo/commits/${sha}/check-runs?per_page=100`, '--hostname', 'example.com']);
+    expect(ghExec.mock.calls[1][1]).toEqual(['api', `repos/org/repo/commits/${sha}/check-runs?per_page=100&filter=all`, '--hostname', 'example.com']);
     expect(ghExec.mock.calls.every(([, , o]) => o.maxBuffer === 1024 * 1024 && o.timeout === 30000 && o.throttle.caller === 'urgent-sweep')).toBe(true);
     deps.remove(load);
     expect(remove).toHaveBeenCalledWith(expect.objectContaining({ root: '/clone', ref: 'lane/repair-m1', expectedTip: load.registration.sha, env }));

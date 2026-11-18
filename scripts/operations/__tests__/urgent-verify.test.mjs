@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
-import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo } from '../urgent-verify-marker.mjs';
+import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo, urgentFuiRepo } from '../urgent-verify-marker.mjs';
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
@@ -10,7 +10,7 @@ const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
 const sign = m => ({ ...m, sig: urgentSignature(m, key) });
 const expectedSteps = ['install-fui', 'install', ...Array.from({ length: 10 }, (_, i) => `unit:unit:${i + 1}/10`), 'coverage', 'hostPaths', 'integration', 'standards'];
-const marker = sign( { sha, fuiSha: sha, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: expectedSteps });
+const marker = sign( { sha, fuiSha: sha, fuiRepo: urgentFuiRepo, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: expectedSteps });
 const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, expectedSteps, now, repo: marker.repo, readKey: () => key, ledger: JSON.stringify(m), ...input });
 
 describe('urgent marker', () => {
@@ -40,10 +40,14 @@ describe('urgent marker', () => {
   ])('refuses correctly signed %s steps', (_, steps) => {
     expect(check(sign({ ...marker, steps }))).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
   });
+  it.each([undefined, 'https://github.com/other/frontierui', 'https://example.com/frontier-ui/frontierui'])(
+    'refuses correctly signed missing or foreign FUI origin %s', fuiRepo => {
+      expect(check(sign({ ...marker, fuiRepo }))).toMatchObject({ ok: false, fallback: expect.stringContaining('urgent-verify') });
+    });
   it('refuses an unreadable expected step list', () => expect(check(marker, { expectedSteps: undefined }).ok).toBe(false));
   it.each([undefined, '0'.repeat(64), 'bad'])('refuses forged signature %s', sig => expect(check({ ...marker, sig }).ok).toBe(false));
   it('signature covers every evidence field', () => {
-    for (const field of ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha'])
+    for (const field of ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha', 'fuiRepo'])
       expect(urgentSignature({ ...marker, [field]: 'tampered' }, key)).not.toBe(marker.sig);
   });
   it('later red for same sha supersedes green, regardless of its timestamp', () => {
@@ -56,7 +60,7 @@ describe('urgent marker', () => {
 
 function fixture() {
   let tick = now - 1000;
-  return { verifyFui: vi.fn(() => sha), 'install-fui': vi.fn(), install: vi.fn(), repo: () => marker.repo, readKey: () => key, host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
+  return { verifyFui: vi.fn(() => ({ sha, repo: urgentFuiRepo })), 'install-fui': vi.fn(), install: vi.fn(), repo: () => marker.repo, readKey: () => key, host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
     plan: () => [{ shard: '1/2' }, { shard: '2/2' }], shard: vi.fn(), standards: vi.fn(), coverage: vi.fn(), hostPaths: vi.fn(), integration: vi.fn(), append: vi.fn() };
 }
 describe('urgent verifier', () => {
@@ -67,7 +71,7 @@ describe('urgent verifier', () => {
     expect(await urgentVerify({ sha, result: 'red' }, d)).toMatchObject({ ok: true });
     expect(order).toEqual(['install-fui', 'install', '1/2', 'done', '2/2', 'done', 'coverage', 'hostPaths', 'integration', 'standards']);
     expect(d.append).toHaveBeenCalledTimes(1);
-    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, suite: 'full', result: 'green', shards: 2, host: 'host', repo: marker.repo, steps: ['install-fui', 'install', 'unit:unit:1/2', 'unit:unit:2/2', 'coverage', 'hostPaths', 'integration', 'standards'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) }));
+    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, fuiSha: sha, fuiRepo: urgentFuiRepo, suite: 'full', result: 'green', shards: 2, host: 'host', repo: marker.repo, steps: ['install-fui', 'install', 'unit:unit:1/2', 'unit:unit:2/2', 'coverage', 'hostPaths', 'integration', 'standards'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) }));
   });
   it.each(['install-fui', 'install', 'shard', 'coverage', 'hostPaths', 'integration', 'standards'])('records red when %s fails', async stage => {
     const d = fixture(); d[stage] = vi.fn(() => { throw new Error('failed'); });
@@ -108,7 +112,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(plan[9]).toEqual({ group: 'nocov', shard: '1/1' });
     const packageText = readFileSync('package.json', 'utf8');
     const fs = { readFileSync: vi.fn(p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow), mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), copyFileSync: vi.fn() };
-    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? `${marker.repo}.git/\n` : args[0]?.includes('shard-assign') ? 'scripts/example.test.mjs\n' : '' }));
+    const spawnSync = vi.fn((cmd, args, opts) => ({ status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? `${opts.cwd === '/frontierui' ? urgentFuiRepo : marker.repo}.git/\n` : args[0]?.includes('shard-assign') ? 'scripts/example.test.mjs\n' : '' }));
     const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync,
       env: { PATH: '/bin', HOME: '/home/test', URGENT_KEY: urgentKeyPath('/home/test'), NODE_OPTIONS: urgentKeyPath('/home/test') } });
     expect((await urgentVerify({ sha }, d)).ok).toBe(true);
@@ -144,7 +148,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
   it('treats admission failure as red and appends once without retrying', async () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8'), packageText = readFileSync('package.json', 'utf8');
     const fs = { readFileSync: p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow, mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn() };
-    const spawnSync = vi.fn((cmd, args) => ({ status: args[0].includes('heavy-admission') ? 75 : 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? marker.repo : 'scripts/example.test.mjs\n' }));
+    const spawnSync = vi.fn((cmd, args, opts) => ({ status: args[0].includes('heavy-admission') ? 75 : 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? (opts.cwd.endsWith('/frontierui') ? urgentFuiRepo : marker.repo) : 'scripts/example.test.mjs\n' }));
     expect(await urgentVerify({ sha }, createUrgentDeps({ fs, spawnSync }))).toMatchObject({ ok: false, marker: { result: 'red' } });
     expect(spawnSync.mock.calls.filter(([, args]) => args[0].includes('heavy-admission'))).toHaveLength(1);
     expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
@@ -237,14 +241,45 @@ describe('CI gate mirroring fails closed', () => {
   it.each(['missing', 'dirty', 'stale', 'fetch failed'])('refuses %s sibling before any install or suite', async kind => {
     const spawnSync = vi.fn((cmd, args, opts) => ({ status: opts.cwd === '/frontierui' && (kind === 'missing' || (kind === 'fetch failed' && args[0] === 'fetch')) ? 1 : 0,
       stdout: args[0] === 'status' ? (opts.cwd === '/frontierui' && kind === 'dirty' ? '?? untracked' : '')
-        : args[0] === 'remote' ? marker.repo : kind === 'stale' && args.includes('origin/HEAD^{commit}') ? 'b'.repeat(40) : sha }));
+        : args[0] === 'remote' ? (opts.cwd.endsWith('/frontierui') ? urgentFuiRepo : marker.repo) : kind === 'stale' && args.includes('origin/HEAD^{commit}') ? 'b'.repeat(40) : sha }));
     const fs = { readFileSync: p => p.endsWith('.key') ? key : workflow, rmSync: vi.fn(), mkdirSync: vi.fn(), writeFileSync: vi.fn(), appendFileSync: vi.fn() };
     expect((await urgentVerify({ sha }, createUrgentDeps({ cwd: '/repo', fs, spawnSync }))).ok).toBe(false);
     expect(spawnSync.mock.calls.some(([, args]) => args[0].includes('heavy-admission'))).toBe(false);
   });
   it('falls back to fetched origin/main when origin/HEAD is unavailable', () => {
     const calls = [];
-    const d = createUrgentDeps({ spawnSync: (cmd, args) => { calls.push(args); return { status: args.includes('origin/HEAD^{commit}') ? 1 : 0, stdout: args[0] === 'status' ? '' : sha }; } });
-    expect(d.verifyFui()).toBe(sha); expect(calls.some(a => a.includes('origin/main^{commit}'))).toBe(true);
+    const d = createUrgentDeps({ spawnSync: (cmd, args) => { calls.push(args); return { status: args.includes('origin/HEAD^{commit}') ? 1 : 0, stdout: args[0] === 'status' ? '' : args[0] === 'remote' ? urgentFuiRepo : sha }; } });
+    expect(d.verifyFui()).toEqual({ sha, repo: urgentFuiRepo }); expect(calls.some(a => a.includes('origin/main^{commit}'))).toBe(true);
+  });
+});
+
+describe('FUI origin binding', () => {
+  it.each([
+    'https://github.com/frontier-ui/frontierui.git',
+    'git@github.com:frontier-ui/frontierui.git',
+    'ssh://git@github.com/frontier-ui/frontierui.git',
+  ])('accepts and records normalized origin %s', origin => {
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'remote' ? origin : args[0] === 'status' ? '' : sha }));
+    const deps = createUrgentDeps({ cwd: '/repo', spawnSync });
+    expect(deps.verifyFui()).toEqual({ sha, repo: urgentFuiRepo });
+    expect(spawnSync.mock.calls[0]).toMatchObject(['git', ['remote', 'get-url', 'origin'], { cwd: '/frontierui' }]);
+  });
+  it.each([
+    '', 'https://github.com/other/frontierui.git', 'git@example.com:frontier-ui/frontierui.git',
+    'https://github.com.example.com/frontier-ui/frontierui.git',
+    'https://github.com/frontier-ui/frontierui/extra',
+    'https://github.com/frontier-ui/frontierui?ignored',
+  ])('refuses foreign or unreadable sibling origin %s before fetch or install', async origin => {
+    const d = fixture();
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: origin }));
+    d.verifyFui = createUrgentDeps({ cwd: '/repo', spawnSync }).verifyFui;
+    expect(await urgentVerify({ sha }, d)).toMatchObject({ ok: false, marker: { result: 'red' }, fallback: expect.stringContaining('wait for passing CI') });
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+    expect(d['install-fui']).not.toHaveBeenCalled(); expect(d.shard).not.toHaveBeenCalled();
+  });
+  it('refuses an origin command failure before fetch', () => {
+    const spawnSync = vi.fn(() => ({ status: 1, stdout: '' }));
+    expect(() => createUrgentDeps({ spawnSync }).verifyFui()).toThrow();
+    expect(spawnSync).toHaveBeenCalledTimes(1);
   });
 });
