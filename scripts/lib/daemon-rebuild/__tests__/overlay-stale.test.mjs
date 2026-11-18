@@ -46,13 +46,13 @@ describe('post-plan stale detector', () => {
     expect(tick()[0].count).toBe(3);
     tick();
     expect(emit).toHaveBeenCalledTimes(1);
-    expect(emit).toHaveBeenCalledWith({ ref, tip, registration: expect.any(String), count: 3, reason: 'conflict', ownerAction: `rebase ${ref} onto main` });
+    expect(emit).toHaveBeenCalledWith({ ref, tip, registration: expect.any(String), count: 3, cause: 'conflict', ownerAction: `rebase ${ref} onto main` });
   });
   it('a transient unknown does not suppress the later conflict alert', () => {
     tick({ remoteTips: {} });
     const before = emit.mock.calls.length;
     tick(); tick(); tick();
-    expect(emit.mock.calls.slice(before).some(([row]) => row.reason === 'conflict')).toBe(true);
+    expect(emit.mock.calls.slice(before).some(([row]) => row.cause === 'conflict')).toBe(true);
   });
   it('a fork PR with the same branch name does not exclude the origin overlay', () => {
     const heads = [{ headRefName: ref, headRefOid: sha('e'), isCrossRepository: true }];
@@ -137,10 +137,10 @@ describe('post-plan stale detector', () => {
   it('resets consecutive conflicts after a clean or unknown probe', () => {
     tick(); tick();
     git.mockImplementationOnce(() => ({ status: 2 }));
-    expect(tick()[0]).toMatchObject({ reason: 'unknown', count: 0 });
+    expect(tick()[0]).toMatchObject({ cause: 'unknown', count: 0 });
     expect(tick()[0].count).toBe(1);
     const cleanGit = args => args[0] === 'merge-tree' ? { status: 0, stdout: tree } : git(args);
-    expect(tick({ git: cleanGit })[0]).toMatchObject({ reason: 'clean', count: 0 });
+    expect(tick({ git: cleanGit })[0]).toMatchObject({ cause: 'clean', count: 0 });
     expect(tick()[0].count).toBe(1);
   });
   it.each([
@@ -170,7 +170,7 @@ describe('post-plan stale detector', () => {
     ['merge unknown', { git: args => args[0] === 'merge-tree' ? { status: 128 } : git(args) }],
     ['unreadable merge output', { git: args => args[0] === 'merge-tree' ? { status: 1, stdout: 'fatal' } : git(args) }],
   ])('keeps and alerts once when %s', (_name, extra) => {
-    expect(tick(extra)[0]).toMatchObject({ reason: 'unknown', count: 0 });
+    expect(tick(extra)[0]).toMatchObject({ cause: 'unknown', count: 0 });
     tick(extra);
     expect(emit).toHaveBeenCalledTimes(1);
     expect(emit.mock.calls[0][0].ownerAction).toBe(`rebase ${ref} onto main`);
@@ -182,26 +182,28 @@ describe('post-plan stale detector', () => {
     const extra = { overlays: [overlay, { ref: carrier, pr: 42 }], git: probe,
       plan: { applied: [{ ref: carrier, sha: T1, pinnedFrom: T2 }] },
       openPrHeads: [{ headRefName: carrier, headRefOid: T2 }], remoteTips: { [ref]: tip, [carrier]: T2 } };
-    expect(tick(extra)[0].reason).toBe('conflict');
+    expect(tick(extra)[0].cause).toBe('conflict');
     expect(emit).not.toHaveBeenCalled();
     extra.plan.applied[0].sha = T2;
-    expect(tick(extra)[0].reason).toBe('superseded');
+    expect(tick(extra)[0].cause).toBe('superseded');
     expect(emit).toHaveBeenCalledTimes(1);
-    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ reason: 'superseded', ownerAction: `daemon-overlay.mjs remove ${ref}` }));
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ cause: 'superseded', ownerAction: `daemon-overlay.mjs remove ${ref}` }));
   });
   it('accepts open PR heads as superseded carriers', () => {
     const probe = args => args[1] === '--is-ancestor' ? { status: 0 } : git(args);
-    expect(tick({ git: probe, openPrHeads: [{ headRefName: 'lane/other', headRefOid: sha('d') }] })[0].reason).toBe('superseded');
+    expect(tick({ git: probe, openPrHeads: [{ headRefName: 'lane/other', headRefOid: sha('d') }] })[0].cause).toBe('superseded');
   });
   it('bounds the PR read and treats failures, malformed and limit-sized listings as unknown', () => {
     const row = { headRefName: ref, headRefOid: tip };
     const query = vi.fn(() => JSON.stringify([row]));
-    expect(readOpenPrHeads(root, env, query)).toEqual([row]);
+    expect(readOpenPrHeads(root, env, query, 'o/r')).toEqual([row]);
+    expect(query.mock.calls[0][0]).toContain('--repo=o/r');
+    expect(readOpenPrHeads(root, env, query, null)).toBeNull();
     expect(query.mock.calls[0][1]).toMatchObject({ timeout: 20000, maxBuffer: 2097152 });
     for (const value of ['{}', 'bad', JSON.stringify([{}]), JSON.stringify(Array(1000).fill(row))]) {
-      expect(readOpenPrHeads(root, env, () => value)).toBeNull();
+      expect(readOpenPrHeads(root, env, () => value, 'o/r')).toBeNull();
     }
-    expect(readOpenPrHeads(root, env, () => { throw new Error('gh failed'); })).toBeNull();
+    expect(readOpenPrHeads(root, env, () => { throw new Error('gh failed'); }, 'o/r')).toBeNull();
   });
   it('resolves enabled and threshold from the tool settings and honors WE_OVERLAY_STALE=0', () => {
     expect(overlayStaleSettings({ WE_PLATFORM_PREFERENCES_FILE: join(root, 'absent') })).toEqual({ enabled: true, threshold: 2 });
@@ -374,5 +376,5 @@ it('observes real merge-tree conflicts and publishes one event on the third tick
   const main = must(['rev-parse', 'HEAD']); must(['update-ref', `refs/remotes/origin/${ref}`, overlayTip]);
   for (let i = 0; i < 4; i++) tick({ git: run, mainSha: main, remoteTips: undefined });
   expect(emit).toHaveBeenCalledTimes(1);
-  expect(emit).toHaveBeenCalledWith(expect.objectContaining({ ref, tip: overlayTip, reason: 'conflict', count: 3 }));
+  expect(emit).toHaveBeenCalledWith(expect.objectContaining({ ref, tip: overlayTip, cause: 'conflict', count: 3 }));
 });
