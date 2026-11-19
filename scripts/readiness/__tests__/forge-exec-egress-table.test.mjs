@@ -50,7 +50,7 @@ beforeEach(async () => {
   await symlink(process.execPath, join(bin, 'node'));
   await writeFile(join(bin, 'npm'), `#!/bin/bash\necho ran >> '${root}/npm.log'\nmkdir -p node_modules\nexit 0\n`, {mode: 0o755});
   probeCalls = 0;
-  probeResult = {code: 0};
+  probeResult = {code: 0, stdout: ruleset(process.getuid())};
   nftStub.code = undefined;
 });
 afterEach(async () => {
@@ -244,7 +244,7 @@ describe('egress table readiness', () => {
     for (const callback of Object.values(injected)) expect(callback).not.toHaveBeenCalled();
     expect(children.slice(before).filter(c => c.file === '/usr/sbin/nft')).toHaveLength(1);
   });
-  it('egress readiness: a zero exit lets the run proceed', async () => {
+  it('egress readiness: complete rules covering the run UID let the run proceed', async () => {
     const runner = makeRunner(), request = await requestFor(runner);
     expect((await runner.run(request)).code).toBe(0);
     expect(await ran()).toBe(true);
