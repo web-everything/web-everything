@@ -251,3 +251,38 @@ export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTING
 export function carbonNonShadowAllowed(model, options) {
   return !/carbon/i.test(String(model)) || resolveShadowPromoted(options).value === true;
 }
+
+const loggedExternalJurors = new Set();
+
+/** External CLI liveness and the optional agy seat share the review policy cascade. */
+export function resolveExternalJurorSettings({ env = process.env, platform, file = REVIEW_SETTINGS_FILE,
+  readFile = p => readFileSync(p, 'utf8'), log = m => console.error(m) } = {}) {
+  let tool = {};
+  try { tool = JSON.parse(readFile(file)); } catch { /* absent layer */ }
+  const valid = {
+    firstOutputMs: v => Number.isSafeInteger(v) && v >= 0,
+    cooldownMs: v => Number.isSafeInteger(v) && v > 0,
+    antigravityReview: v => ['on', 'off', 'probation'].includes(v),
+  };
+  const invalid = [];
+  const project = v => Object.fromEntries(Object.entries({ firstOutputMs: v?.externalJurors?.firstOutputMs,
+    cooldownMs: v?.externalJurors?.cooldownMs, antigravityReview: v?.advisorySeats?.antigravityReview })
+    .filter(([key, value]) => {
+      if (value === undefined) return false;
+      if (valid[key](value)) return true;
+      invalid.push(`${key}=${JSON.stringify(value)}`); return false;
+    }));
+  const numeric = v => typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : v;
+  const result = cascadePolicy('review.externalJurors', project(tool), {
+    standard: { firstOutputMs: 120000, cooldownMs: 1800000, antigravityReview: 'probation' },
+    platform: project(platform ?? platformPreference('review', { env })), env,
+    envValues: { firstOutputMs: numeric(env.WE_REVIEW_JUROR_FIRST_OUTPUT_MS),
+      cooldownMs: numeric(env.WE_REVIEW_JUROR_COOLDOWN_MS),
+      antigravityReview: env.REVIEW_PR_ANTIGRAVITY_REVIEW === undefined ? undefined
+        : env.REVIEW_PR_ANTIGRAVITY_REVIEW === '1' ? 'on' : 'off' }, valid,
+  });
+  result.invalid.unshift(...invalid);
+  const line = formatCascadeSourcesLine('review.externalJurors', result);
+  if (!loggedExternalJurors.has(line)) { loggedExternalJurors.add(line); log(line); }
+  return result;
+}

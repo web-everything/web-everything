@@ -871,7 +871,8 @@ export function createDefaultJudge({
     // closes, both measured live against PRs #2865/#2867/#2873/#2874/#2875 (card x5s8b47): (a) Codex
     // quota-exhausted — the spawn was never even attempted before this fix, so it failed every time and
     // crashed the whole `review-loop-cli` process; and (b) the spawn throwing for any OTHER reason, mid-call.
-    // NEITHER may propagate past this function for a graceful request: both become a recorded, zero-finding,
+    // Codex failures become a recorded, zero-finding answer; Antigravity requires explicit skip evidence.
+    // Eligible failures become a recorded, zero-finding,
     // non-blocking judge answer instead. `reduce`'s own silent-juror refusal (`review-pr.mjs`) requires a
     // non-empty `summary`, which the skip answer below always carries, so a skip reads to every downstream
     // consumer as an ordinary — if uninformative — juror answer, never as `unrun`.
@@ -918,10 +919,16 @@ export function createDefaultJudge({
         // NOT a spread of `outcome` — see the ordinary path's own note just below.
         return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, actual));
       } catch (e) {
+        // Antigravity may skip only with explicit provider-unavailability evidence.
+        // Missing/malformed output, schema failures and tool denials remain seat failures.
+        if (spawnProviderName === 'antigravity' && ![
+          'skip-provider-unresponsive', 'skip-quota-exhausted', 'skip-quota-hold',
+          'skip-backend-mismatch', 'skip-model-mismatch',
+        ].includes(e?.telemetry?.fallbackDecision)) throw e;
         const reason = `spawn failed — ${String(e?.message ?? e).slice(0, 500)}`;
         logGracefulOutcome(`judge seat crashed, recorded as skipped — ${spawnProviderName}: ${reason}`);
         return e?.telemetry
-          ? judgeOutcome({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: spawnProviderName, reason } }, judgeTelemetryFrom(e.telemetry, effective))
+          ? judgeOutcome({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: spawnProviderName, reason: e.telemetry.quotaState === 'provider-unresponsive' ? 'provider-unresponsive' : reason } }, judgeTelemetryFrom(e.telemetry, effective))
           : skipOutcome(reason, { provider: spawnProviderName, crashed: true });
       }
     }
