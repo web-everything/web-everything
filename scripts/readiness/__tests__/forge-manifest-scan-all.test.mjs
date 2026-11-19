@@ -1,6 +1,7 @@
 // @vitest-environment node
 import {generateKeyPairSync} from 'node:crypto';
 import {performance} from 'node:perf_hooks';
+import {gzipSync} from 'node:zlib';
 import {describe,expect,it} from 'vitest';
 import {CONTENT_SCAN_MAX_BYTES,manifestEntry} from '../forge-exec-manifest.mjs';
 
@@ -52,6 +53,18 @@ describe('Forge scans all manifest content',()=>{
     const token='gh'+'p_'+'A1b2C3d4'.repeat(5);
     refused('docs/notes.md',Buffer.from('"\\u0067'+token.slice(1)+'"'),true,'content-detected credential');
     refused('docs/notes.md',Buffer.from('gh\\x70_'+token.slice(4)),false,'content-detected credential');
+  });
+  it('refuses an encrypted PEM wrapped at four columns and a gzip-compressed key, at any extension',()=>{
+    const encrypted=privateKey.export({format:'pem',type:'pkcs8',cipher:'aes-256-cbc',passphrase:'x'}).toString();
+    const [head,...rest]=encrypted.trim().split('\n'),tail=rest.pop();
+    const narrow=[head,...rest.join('').match(/.{1,4}/g),tail].join('\n');
+    for(const tracked of [true,false]) {
+      refused('docs/notes.md',Buffer.from(narrow),tracked,'content-detected credential');
+      for(const path of ['image.gz','notes.md','NOTES'])
+        refused(path,gzipSync(Buffer.from(material.PEM)),tracked,'content-detected credential');
+    }
+    refused('image.gz',Buffer.from([0x1f,0x8b,8,0,0,0]),true,'unreadable-compressed-content');
+    expect(admit('image.gz',gzipSync(Buffer.from('# plain notes\n')))).toHaveProperty('sha256');
   });
   it('refuses a PNG-signed file hiding a JWK behind nested brackets (scan exhaustion fails closed)',()=>{
     const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('['.repeat(65)),Buffer.from(material.JWK)]);

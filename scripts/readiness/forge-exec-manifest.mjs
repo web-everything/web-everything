@@ -1,10 +1,11 @@
 import {createHash} from 'node:crypto';
+import {gunzipSync} from 'node:zlib';
 import {keyStructureFinding} from './forge-key-structure.mjs';
 const LIMIT=4*1024*1024;
 export const CONTENT_SCAN_MAX_BYTES=8*1024*1024;
 export const CONTENT_SCAN_BINARY_EXTENSIONS=Object.freeze([
   'png','jpg','jpeg','gif','webp','ico','avif','woff','woff2','ttf','otf','pdf',
-  'mp4','webm','mp3','wav','zip','gz','wasm',
+  'mp4','webm','mp3','wav','gz','wasm',
 ]);
 const sha=value=>createHash('sha256').update(value).digest('hex');
 // Paths remain bytes throughout inventory, transport, hashing and verification.
@@ -222,13 +223,33 @@ export function credentialBufferFinding(content) {
 // structural key detectors still do.
 // The body is any base64-looking line after the header (optionally after a few header lines), so a PEM wrapped
 // at 32 columns, or an encrypted PKCS#8 block, is caught as well as a 64-column one.
-const pemPrivateBlock=/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]{0,300}?[\r\n][ \t]*[A-Za-z0-9+/_-]{16,}={0,2}[ \t]*(?:[\r\n]|$)/;
+// Body lines may be any width (a PEM wrapped at four columns still loads), so lines are summed, not matched singly.
+function pemPrivateBlock(text) {
+  for(const header of text.matchAll(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g)) {
+    let body=0;
+    for(const line of text.slice(header.index+header[0].length,header.index+header[0].length+65536).split(/\r\n|\n|\r/).slice(1,4097)) {
+      if(/^[ \t]*[A-Za-z0-9+/]+={0,2}[ \t]*$/.test(line))body+=line.trim().length;
+      else if(line.trim()!==''&&!(body===0&&line.includes(':')))break;
+      if(body>=16)return true;
+    }
+  }
+  return false;
+}
 const ordinaryPatterns=secretText.slice(2);
-const ordinaryViewFinding=text=>pemPrivateBlock.test(text)?'private-key-block':ordinaryPatterns.find(([pattern])=>pattern.test(text))?.[1]??null;
+const ordinaryViewFinding=text=>pemPrivateBlock(text)?'private-key-block':ordinaryPatterns.find(([pattern])=>pattern.test(text))?.[1]??null;
 // Same three views as the credential-named scan: raw, escapes decoded (`ghp_`), backslashes dropped.
 const ordinaryTextFinding=text=>ordinaryViewFinding(text)
   ??(text.includes('\\')?ordinaryViewFinding(decodeEscapes(text))??ordinaryViewFinding(text.replace(/\\/g,'')):null);
-export function ordinaryBufferFinding(content) {
+export function ordinaryBufferFinding(content,layers=0) {
+  // Gzip hides any content from every other view: decompress (bounded) and scan the result too. A stream that
+  // claims gzip but cannot be decompressed within the bound is refused.
+  if(content.length>2&&content[0]===0x1f&&content[1]===0x8b) {
+    if(layers>=3)return 'nested-compressed-content';
+    let inner;
+    try {inner=gunzipSync(content,{maxOutputLength:CONTENT_SCAN_MAX_BYTES*4});} catch {return 'unreadable-compressed-content';}
+    const finding=ordinaryBufferFinding(inner,layers+1);
+    if(finding)return finding;
+  }
   for(const encoding of ['latin1','utf8','utf16le']) {
     const finding=ordinaryTextFinding(content.toString(encoding));
     if(finding)return finding;
