@@ -8,6 +8,21 @@ import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
+import { cardHash } from './audit-base-repro.mjs';
+import { findingKey } from '../lib/audit-finding-key.mjs';
+import { FINDING_CLASSES } from './audit-verdict.mjs';
+
+function validPreExisting(f) {
+  if (!f || typeof f !== 'object' || Array.isArray(f) || typeof f.line !== 'string'
+    || typeof f.key !== 'string' || f.relation !== 'SAME'
+    || typeof f.cardHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(f.cardHash) || f.cardHash !== cardHash(f.key)
+    || !f.base || typeof f.base.sha !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/i.test(f.base.sha)
+    || typeof f.base.path !== 'string' || !f.base.path.trim()
+    || !Number.isSafeInteger(f.base.line) || f.base.line < 1 || typeof f.base.quote !== 'string' || !f.base.quote.trim()) return false;
+  const parts = f.key.split('|');
+  if (parts.length !== 3 || !parts[0] || !parts[1] || !FINDING_CLASSES.includes(parts[2])) return false;
+  try { return findingKey({ file: parts[0], symbol: parts[1], class: parts[2] }) === f.key; } catch { return false; }
+}
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
@@ -17,6 +32,11 @@ function wellFormedAudit(record) {
     || typeof record.questionHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.questionHash)
     || typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at))
     || (record.fingerprint != null && (typeof record.fingerprint !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.fingerprint)))
+    || (Object.hasOwn(record, 'modelVerdict') && !['WEAKENED', 'NOT WEAKENED'].includes(record.modelVerdict))
+    || (['modelVerdict', 'findingKeys', 'preExisting'].some(k => Object.hasOwn(record, k))
+      && (!['modelVerdict', 'findingKeys', 'preExisting'].every(k => Object.hasOwn(record, k))
+        || !Array.isArray(record.findingKeys) || !record.findingKeys.every(k => typeof k === 'string')
+        || !Array.isArray(record.preExisting) || !record.preExisting.every(validPreExisting)))
     || !Array.isArray(record.findings) || !record.findings.every(f => typeof f === 'string')) return false;
   // Validate verdict/contradiction syntax with the canonical parser, even for a
   // historical question. The original hash still determines evidence eligibility.

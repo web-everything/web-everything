@@ -4770,6 +4770,15 @@ hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-la
 and other incidental holds retain failure. Empty or malformed required rosters always
 return `unknown` with `roster-unavailable`, including persisted options containing the
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
+## Pre-existing audit exemption evidence (R1053)
+
+Keep proof-mode fixtures explicit about `auditPolicy` (`releaseStage`, `requirePayBy`,
+`requireOnMain`); a missing or partial policy must retain findings for human review.
+Pay-by fixtures inject trusted persisted card text through `readCard`, never a date in
+model finding text. A confirmed held card satisfies existence (D5). Security fixtures
+for every B class must supply separate `written`, `expedite`, and `needsYou` confirmations,
+and exercise a persisted-card write that drops the needs-you line. Keep the block-mode
+stdout/record golden unchanged when changing proof-mode policy.
 
 ## Antigravity binary maintenance
 
@@ -5076,3 +5085,12 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+## Audit proof fallbacks and held-card separators (R1053)
+
+A null result from the approximate symbol scanner is not proof of top-level scope.
+Keep distant guard replacement and deletion cases for default-call parameters and typed
+functions in `audit-base-repro.test.mjs`; an unknown extent requires an unchanged file.
+In `codex-audit.test.mjs`, pass generated cards through the real held-card parser,
+including U+2028/U+2029 finding text. Normalize line separators at serialization while
+preserving the original finding in the audit record and keeping block-mode bytes pinned.
