@@ -389,7 +389,9 @@ export function designTokenSecretFinding(content,{warnings=false}={}) {
 // Pure policy and leaf construction are shared by inventory, warm export and delta.
 export function classifyManifestPath(path) {
   const parts=pathParts(path),names=parts.map(normalizedComponent);
-  const excluded=names.some((name,i)=>excludedComponent(name,i===names.length-1));
+  // The tracked `.claude/settings.json` (and only it) ships: guard-prep reads it, and a Forge slot without it fails ENOENT.
+  const trackedSettings=names.length===2&&names[0]==='.claude'&&names[1]==='settings.json';
+  const excluded=!trackedSettings&&names.some((name,i)=>excludedComponent(name,i===names.length-1));
   // Excluded ONLY because of a credential-looking name (see R321 above).
   const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};

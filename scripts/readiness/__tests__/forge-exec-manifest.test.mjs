@@ -225,3 +225,12 @@ describe('generic evidence never masks a blocking continuation bound', () => {
     expect(credentialContentFinding(path,content)).toBe('unbounded-continuation-private-key');
   });
 });
+
+describe('tracked .claude/settings.json projection', () => {
+  it('ships only that exact file out of the .claude dot-directory', async () => {
+    const { classifyManifestPath } = await import('../forge-exec-manifest.mjs');
+    expect(classifyManifestPath(Buffer.from('.claude/settings.json')).excluded).toBe(false);
+    expect(classifyManifestPath(Buffer.from('.claude/settings.local.json')).excluded).toBe(true);
+    expect(classifyManifestPath(Buffer.from('.claude/other/settings.json')).excluded).toBe(true);
+  });
+});
