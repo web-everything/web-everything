@@ -116,7 +116,7 @@ describe('single failed-file retry core', () => {
 });
 
 function fixture(overrides = {}) {
-  return { shard: '2', mode: 'nocov', root, env: { GITHUB_SHA: 'abc', GITHUB_RUN_ID: '123' }, policy,
+  return { shard: '2', mode: 'nocov', firstExit: '1', root, env: { GITHUB_SHA: 'abc', GITHUB_RUN_ID: '123' }, policy,
     skipArgs: ['--exclude=quarantined.test.mjs'],
     read: vi.fn(file => file.includes('timing') ? firstText : report(passingEntry())),
     write: vi.fn(), remove: vi.fn(), run: vi.fn(() => ({ status: 0 })),
@@ -143,6 +143,12 @@ describe('retry IO boundary', () => {
       '--coverage.reportOnFailure=true', '--coverage.reportsDirectory=coverage-rerun-2',
       '--reporter=default', '--reporter=./scripts/ci/unit-json-reporter.mjs',
       '--outputFile.json=coverage/rerun-unit-2.json', 'a.test.mjs', '--exclude=quarantined.test.mjs']);
+  });
+  it.each([undefined, '0', '2', '134', '137'])('refuses a first-run exit %s that is not a plain test failure, before any retry', async firstExit => {
+    const io = fixture({ firstExit });
+    expect(await rerunOnce(io)).toBe(1);
+    expect(io.run).not.toHaveBeenCalled();
+    expect(io.error).toHaveBeenCalledWith(expect.stringMatching(/not a plain test failure.*inspect original run/));
   });
   it.each([undefined, 'unknown'])('refuses missing or unknown coverage mode %s before launching a retry', async mode => {
     const io = fixture({ mode });

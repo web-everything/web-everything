@@ -57,7 +57,7 @@ describe.each(STEPS)('ci.yml test-shard %s', (_label, prefix, mode) => {
         *rerun-failed-once*) echo "retry-invoked:$*"; exit ${retryExit} ;;
       esac`, 1);
     expect(r.status).toBe(retryExit);
-    expect(r.out).toContain(`retry-invoked:scripts/ci/rerun-failed-once.mjs --shard=2 --mode=${mode} -- --exclude=quarantined.test.mjs`);
+    expect(r.out).toContain(`retry-invoked:scripts/ci/rerun-failed-once.mjs --shard=2 --mode=${mode} --first-exit=1 -- --exclude=quarantined.test.mjs`);
     expect(r.npmArgs).toContain('--exclude=quarantined.test.mjs');
   });
 

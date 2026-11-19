@@ -3,7 +3,7 @@
  * hiding either: every retried file is recorded, and only proven passing retries can recover a shard.
  * The original coverage is retained; retries use the same coverage mode in a separate directory. Missing evidence, process errors,
  * and widespread failures stay red for operator inspection. This is evidence collection, not quarantine.
- * Usage (only after a nonzero first run): node scripts/ci/rerun-failed-once.mjs --shard=N --mode=covered|nocov -- [quarantine args]
+ * Usage (only after a nonzero first run): node scripts/ci/rerun-failed-once.mjs --shard=N --mode=covered|nocov --first-exit=<code> -- [quarantine args]
  */
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
@@ -90,13 +90,16 @@ export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCo
 }
 
 /** IO boundary, injectable so orchestration and fail-closed reads can be exercised hermetically. */
-export async function rerunOnce({ shard, mode, skipArgs = [], env = process.env, root = process.cwd(),
+export async function rerunOnce({ shard, mode, firstExit, skipArgs = [], env = process.env, root = process.cwd(),
   policy, read = file => readFileSync(file, 'utf8'), write = (file, data) => writeFileSync(file, data),
   remove = file => rmSync(file, { force: true }), run = args => spawnSync('npm', args, { cwd: root, env, stdio: 'inherit' }),
   listFiles, warn = console.log, error = console.error } = {}) {
   try {
     if (!/^\d+$/.test(String(shard))) throw new Error('invalid shard');
     if (!['covered', 'nocov'].includes(mode)) throw new Error('invalid or missing retry mode');
+    // Vitest exits 1 for test failures. Any other first-run exit (a crash, a kill, a coverage or teardown error)
+    // is a process failure a file retry cannot clear, even when the report also lists failed files.
+    if (String(firstExit) !== '1') throw new Error(`first run exit ${firstExit} is not a plain test failure (1)`);
     const first = planRetry(read(`coverage/timing-unit-${shard}.json`), policy, root);
     // Vitest positional filters are substrings: refuse ambiguous filters rather than run extra files.
     const all = await listFiles();
@@ -122,8 +125,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const options = args.includes('--') ? args.slice(0, args.indexOf('--')) : args;
   const shard = options.find(arg => arg.startsWith('--shard='))?.slice('--shard='.length);
   const mode = options.find(arg => arg.startsWith('--mode='))?.slice('--mode='.length);
+  const firstExit = options.find(arg => arg.startsWith('--first-exit='))?.slice('--first-exit='.length);
   const { listUnitTestFiles } = await import('./shard-assign.mjs');
   mkdirSync('coverage', { recursive: true });
   const policy = resolvePolicy({ tool: readSettings().ciUnitRerun, env: process.env });
-  process.exitCode = await rerunOnce({ shard, mode, policy, skipArgs: args.includes('--') ? args.slice(args.indexOf('--') + 1) : [], listFiles: listUnitTestFiles });
+  process.exitCode = await rerunOnce({ shard, mode, firstExit, policy, skipArgs: args.includes('--') ? args.slice(args.indexOf('--') + 1) : [], listFiles: listUnitTestFiles });
 }
