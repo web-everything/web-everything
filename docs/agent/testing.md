@@ -4810,3 +4810,16 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+
+## Verify failed-file recovery
+
+`verify.retryFailed` (`scripts/verify-settings.json`, env `WE_VERIFY_RETRY_FAILED`) defaults to 1,
+accepts 0–10 attempts, and logs its effective value/source. Zero retains the historical
+`isolatedRetry` policy. Positive values retry up to three failed files per Vitest/scan/guard
+phase, including edited files, using serial workers and the phase's scaled timeouts. A complete
+failure inventory and a JSON report proving the original failing assertions passed are required;
+missing, skipped, or incomplete execution never clears red. Oversized/incomplete inventories
+stay red: fix the failures or run a fresh verify. The recognized full-unit default separates tests
+from standards; opaque explicit combined commands retain their verdict. Recovered files appear in
+marker `flakes` and the advisory coordination-root `.operations/test-flakes.jsonl`; merge CI is unchanged.

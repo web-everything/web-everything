@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { timeoutRetryFiles, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF,
-  MAX_TIMEOUT_LOG_BYTES } from '../gate-timeout-retry.mjs';
+  MAX_TIMEOUT_LOG_BYTES, retryFailedPhase, retryPassedFiles, appendTestFlake, scanFailureDiagnostic } from '../gate-timeout-retry.mjs';
 import { createFailureCollector } from '../verify-failures.mjs';
 
 function evidence(messages = ['Error: Test timed out in 5000ms.'], files = ['a.test.mjs']) {
@@ -81,5 +81,95 @@ describe('isolated retry of failures in untouched files (75c)', () => {
     expect(describeIsolatedRetry({ ...audit, isolatedRetry: 'still-red' })).toContain('still failed alone');
     expect(isolatedRetryAudit([], FLAKY_OUTSIDE_DIFF)).toEqual({});
     expect(describeIsolatedRetry({ retriedTimeouts: ['x.test.mjs'] })).toContain('timeout-only failures');
+  });
+});
+
+describe('failed-file retry', () => {
+  const report = (files, status = 'passed') => JSON.stringify({ testResults: files.map((file, i) => ({ name: `/repo/${file}`, status: 'passed', assertionResults: [{ fullName: `case ${i}`, status }] })) });
+  const red = () => ({ ...{ output: evidence(), failureDetails: evidence().failureDetails }, exitCode: 1 });
+  const invoke = (options = {}) => retryFailedPhase({ result: red(), attempts: 1, cwd: '/repo', infrastructureFailure: () => false,
+    run: async () => ({ exitCode: 0, retryReportText: report(['a.test.mjs']) }), ...options });
+  it('retries edited failures with all completeness guards and the three-file bound intact', () => {
+    expect(isolatedRetryFailures({ ...evidence(), mode: 'all', changedFiles: ['a.test.mjs'] })).toHaveLength(1);
+    expect(isolatedRetryFailures({ ...evidence(Array(4).fill('AssertionError: bad'), ['a.test.mjs', 'b.test.mjs', 'c.test.mjs', 'd.test.mjs']), mode: 'all' })).toEqual([]);
+    expect(isolatedRetryFailures({ ...evidence(), mode: 'all', failureDetails: { ...evidence().failureDetails, truncated: true } })).toEqual([]);
+  });
+  it('recovers only executed passing assertions, and emits one flake per file', async () => {
+    const rows = [];
+    const r = await invoke({ onFlake: e => rows.push(e) });
+    expect(r.result.exitCode).toBe(0);
+    expect(r.flakes).toEqual([{ file: 'a.test.mjs' }]);
+    expect(rows).toEqual([{ file: 'a.test.mjs', test: 'case 0' }]);
+  });
+  it.each(['pending', 'skipped', 'todo', 'failed'])('keeps nominal green red when the original assertion is %s', async status => {
+    const r = await invoke({ run: async () => ({ exitCode: 0, retryReportText: report(['a.test.mjs'], status) }) });
+    expect(r.result.exitCode).toBe(1);
+    expect(r.flakes).toEqual([]);
+  });
+  it('refuses unreadable, empty and wrong-file execution reports', () => {
+    for (const text of [null, '{bad', '{}', report(['other.test.mjs']), JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'passed' }] })])
+      expect(retryPassedFiles(text, [{ file: 'a.test.mjs', names: ['case 0'] }], '/repo')).toEqual([]);
+  });
+  it('matches nested Vitest suite identities using ancestor titles and test title', () => {
+    const text = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'passed', assertionResults: [{ ancestorTitles: ['', 'suite', 'nested'], title: 'case', fullName: 'suite nested case', status: 'passed' }] }] });
+    expect(retryPassedFiles(text, [{ file: 'a.test.mjs', names: ['suite > nested > case'] }], '/repo')).toHaveLength(1);
+  });
+  it('retains a repeat red and bounds attempts exactly', async () => {
+    let calls = 0;
+    const r = await invoke({ attempts: 2, run: async () => { calls++; return red(); } });
+    expect(calls).toBe(2);
+    expect(r.result.exitCode).toBe(1);
+    expect(r.flakes).toEqual([]);
+  });
+  it.each([{ signal: 'SIGKILL' }, { timedOut: true }, { infrastructure: true }])('never retries infrastructure failures %j', async fields => {
+    const r = await invoke({ result: { ...red(), ...fields }, infrastructureFailure: r => r.infrastructure, run: async () => { throw Error('must not run'); } });
+    expect(r.retried).toEqual([]);
+  });
+  it('zero attempts leaves the red untouched', async () => {
+    expect((await invoke({ attempts: 0, run: async () => { throw Error('must not run'); } })).retried).toEqual([]);
+  });
+  it('shrinks the next attempt to only files that remain red', async () => {
+    const initial = evidence(['AssertionError: a', 'AssertionError: b'], ['a.test.mjs', 'b.test.mjs']);
+    const remaining = evidence(['AssertionError: b'], ['b.test.mjs']);
+    remaining.stderr = remaining.stderr.replace('case 0', 'case 1');
+    remaining.failureDetails.tests[0].name = 'case 1';
+    const calls = [];
+    const r = await invoke({ result: { exitCode: 1, output: initial, failureDetails: initial.failureDetails }, attempts: 2,
+      run: async files => {
+        calls.push(files);
+        return calls.length === 1
+          ? { exitCode: 1, output: remaining, failureDetails: remaining.failureDetails, retryReportText: report(['a.test.mjs']) }
+          : { exitCode: 0, retryReportText: report(['b.test.mjs']).replace('case 0', 'case 1') };
+      } });
+    expect(calls).toEqual([['a.test.mjs', 'b.test.mjs'], ['b.test.mjs']]);
+    expect(r.result.exitCode).toBe(0);
+    expect(r.flakes).toHaveLength(2);
+  });
+  it('requires every original failing assertion across later attempts, even if it stops appearing in red output', async () => {
+    const initial = evidence(['AssertionError: a', 'AssertionError: b'], ['a.test.mjs', 'a.test.mjs']);
+    const partial = evidence(['AssertionError: b'], ['a.test.mjs']);
+    partial.stderr = partial.stderr.replace('case 0', 'case 1');
+    partial.failureDetails.tests[0].name = 'case 1';
+    let attempts = 0;
+    const r = await invoke({ attempts: 2, result: { exitCode: 1, output: initial, failureDetails: initial.failureDetails }, run: async () => {
+      attempts++;
+      return attempts === 1 ? { exitCode: 1, output: partial, failureDetails: partial.failureDetails }
+        : { exitCode: 0, retryReportText: report(['a.test.mjs']).replace('case 0', 'case 1') };
+    } });
+    expect(attempts).toBe(2);
+    expect(r.result.exitCode).toBe(1);
+    expect(r.flakes).toEqual([]);
+  });
+  it('writes JSONL with host metadata and never throws on append or root failure', () => {
+    const rows = [];
+    expect(appendTestFlake({ file: 'a.test.mjs', test: null, sha: 'abc' }, { root: '/coord', mkdir() {}, append(path, row) { rows.push([path, JSON.parse(row)]); } })).toBe(true);
+    expect(rows[0][0]).toBe('/coord/.operations/test-flakes.jsonl');
+    expect(rows[0][1]).toMatchObject({ file: 'a.test.mjs', test: null, host: expect.any(String), load: expect.any(Number), at: expect.any(String) });
+    expect(appendTestFlake({}, { root: () => { throw Error('root'); } })).toBe(false);
+    expect(appendTestFlake({}, { root: '/coord', mkdir() {}, append() { throw Error('full'); } })).toBe(false);
+  });
+  it('prints the failing scan check and first error, with command fallback', () => {
+    expect(scanFailureDiagnostic({ ...red(), output: { stderr: ' FAIL a.test.mjs > case 0\nAssertionError: bad policy\n', stdout: '' } }, 'scanner')).toBe('FAIL a.test.mjs > case 0: AssertionError: bad policy\n');
+    expect(scanFailureDiagnostic({ exitCode: 1, output: { stderr: 'Error: loader failed' } }, 'policy scan')).toBe('FAIL policy scan: Error: loader failed\n');
   });
 });
