@@ -142,7 +142,8 @@ function auditTranscript(text, clone) {
   }
   // Audit every update separately: a later update must not hide an earlier outside path by
   // reusing its step index, changing its parameters, or reporting an error afterwards.
-  const updates = events.filter(e => e?.step_update?.step_type === 'tool').map((e, i) => ({
+  const updates = events.filter(e => e?.step_update && (e.step_update.step_type === 'tool'
+    || e.step_update.tool_name != null || e.step_update.tool_info?.name != null)).map((e, i) => ({
     ...e, event: 'step_update', step_update: { ...e.step_update, step_index: i, conversation_id: 'build-audit' },
   }));
   if (stateChangingToolCalls(updates.map(e => JSON.stringify(e)).join('\n'), { allowedRoots: [clone] }).length)
