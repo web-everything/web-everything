@@ -68,6 +68,10 @@
   },
   "launchAgentsDir": "~/Library/LaunchAgents",
   "workspaceRoot": "~/workspace",
+  "degradedFastPath": {
+    "enabled": true,
+    "degradedAfterMinutes": 60
+  },
   "adoption": {
     "timeoutMs": 600000,
     "pollMs": 15000

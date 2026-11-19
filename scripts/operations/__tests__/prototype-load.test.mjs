@@ -15,6 +15,8 @@ import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import { urgentSignature } from '../urgent-verify-marker.mjs';
+const urgentKey = Buffer.alloc(32, 7);
 import * as prototypeLoad from '../prototype-load.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -39,7 +41,7 @@ const settings = {
 function fixture(options = {}) {
   const candidateSha = options.sha || SHA;
   const calls = [], records = [], readyWrites = [], sleeps = [], reads = [], cloneRoots = [];
-  let clock = 0;
+  let clock = options.now ?? 0;
   let remoteTip = candidateSha;
   let tipReads = 0;
   let establishedAdvanced = false;
@@ -51,9 +53,20 @@ function fixture(options = {}) {
   const admitted = [];
   const env = { HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
   const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
+  const pendingFiles = new Map();
   const fs = {
+    writeFileSync(p, value) { if (options.pendingWriteFails) throw new Error('unwritable pending'); pendingFiles.set(p, value); },
+    renameSync(from, to) { pendingFiles.set(to, pendingFiles.get(from)); pendingFiles.delete(from); },
+    rmSync(p) { pendingFiles.delete(p); }, rmdirSync() {},
     readFileSync(p) {
       reads.push(p);
+      if (pendingFiles.has(p)) return pendingFiles.get(p);
+      if (p.endsWith('/daemon-events.jsonl')) return options.daemonEvents ?? '';
+      if (p.endsWith('/urgent-full-green.jsonl')) {
+        if (options.urgentLedger === undefined) throw new Error('unreadable urgent ledger');
+        return options.urgentLedger;
+      }
+      if (p.endsWith('/.github/workflows/ci.yml')) return options.urgentWorkflow ?? 'jobs:\n  test-shard:\n    strategy:\n      matrix:\n        shard: [1]\n    steps:\n      - run: vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}';
       if (p === '/home/test/platform-preferences.json') return JSON.stringify({ prototypeLoad: options.platformSettings });
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('/test-clone-key.json')) return options.registryRaw ?? (options.list ? JSON.stringify({ overlays: [...registrations.values()] }) : '');
@@ -73,7 +86,10 @@ function fixture(options = {}) {
       }
       const e = new Error('missing'); e.code = 'ENOENT'; throw e;
     },
-    mkdirSync() {}, appendFileSync(p, line) { (p === '/home/test/ready' ? readyWrites : records).push({ path: p, ...JSON.parse(line) }); },
+    mkdirSync() {}, appendFileSync(p, line) {
+      options.onAppend?.(p, JSON.parse(line), calls);
+      if (options.urgentWriteFails && p.endsWith('/urgent-loads.jsonl')) throw new Error('urgent ledger unwritable');
+      (p === '/home/test/ready' ? readyWrites : records).push({ path: p, ...JSON.parse(line) }); },
   };
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
@@ -83,6 +99,7 @@ function fixture(options = {}) {
     expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...Object.keys(options.gitEnv || {}), ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])].sort());
     if (options.gitEnv) expect(config.env).toMatchObject(options.gitEnv);
     if (options.execFailure === args[0]) throw Object.assign(new Error('maxBuffer exceeded; inspect full output separately'), { code: 'ENOBUFS' });
+    if (cmd === 'git' && args[0] === 'remote' && !options.defaultTestCheck) return options.origin ?? 'https://example.com/org/repo.git\n';
     if (cmd === 'plutil') return JSON.stringify({ WorkingDirectory: '/home/test/workspace/review' });
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
@@ -125,7 +142,10 @@ function fixture(options = {}) {
         }
         return clean ? data : fail(3, data);
       }
-      if (action === 'add' && options.addFails) return fail(1);
+      if (action === 'add' && options.addFails) {
+        if (options.persistBeforeAddFailure) admitted.push({ ref });
+        return fail(1);
+      }
       if (action === 'add') {
         if (options.advanceDuringAdd) remoteTip = TREE;
         const expected = args.find((a) => a.startsWith('--expected-sha='))?.slice(15);
@@ -144,6 +164,7 @@ function fixture(options = {}) {
         if (args.at(-1) === 'HEAD^{commit}') return options.badHead ? fail(1) : SHA;
         return options.missingCandidate ? fail(1, '', '') : SHA;
       }
+      if (options.probeThrows) throw new Error('probe exploded after registration');
       expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : candidateSha, 'HEAD']);
       if (options.missingCandidate && (options.missingForever || sleeps.length === 0)) return fail(128, '', 'Not a valid commit name');
       if (options.adoptionError) return fail(options.adoptionError);
@@ -251,15 +272,130 @@ function fixture(options = {}) {
   }
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
-  const load = createPrototypeLoader({ exec, fs, env, retirePlanner,
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, readUrgentKey: () => { if (options.missingUrgentKey) throw new Error('missing'); return urgentKey; },
+    emitDaemonEvent: async event => { records.push(event); return !options.eventWriteFails; }, needsYou: options.needsYou ?? (() => {}),
+    readState: options.readState ?? (() => ({ corrupt: false, overlays: [...registrations.values(), ...admitted] })),
     // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
     testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { pendingFiles, calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
+describe('urgent prototype admission', () => {
+  const reason = 'Restore critical daemon operation';
+  const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+  marker.sig = urgentSignature(marker, urgentKey);
+  it('writes the urgent tracking intent before registering the overlay', async () => {
+    const observed = [];
+    const f = fixture({ onAppend: (path, record, calls) => {
+      if (record.type === 'prototype-load.urgent') observed.push({ record, mutations: calls.filter(c => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check')).length });
+    } });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(observed).toEqual([{ record: expect.objectContaining({ trackingId: expect.any(String), clone: expect.any(String), sha: SHA }), mutations: 0 }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('refuses registration when the urgent tracking intent cannot be written', async () => {
+    const f = fixture({ urgentWriteFails: true });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false, error: 'urgent ledger unwritable' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('appends a registration-failed note only when the failed registration is proven absent', async () => {
+    const f = fixture({ addFails: true });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false });
+    const records = f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'));
+    expect(records).toHaveLength(2);
+    expect(records[1]).toMatchObject({ type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', trackingId: records[0].trackingId });
+  });
+  it.each([
+    ['present', { corrupt: false, overlays: [{ ref: BASE.branch }] }],
+    ['corrupt', { corrupt: true, overlays: [] }],
+    ['missing state', null],
+    ['incomplete state', { corrupt: false }],
+    ['malformed registration', { corrupt: false, overlays: [{}] }],
+    ['read failure', new Error('store unreadable')],
+  ])('keeps an unsuccessful urgent registration tracked when overlay state is %s', async (_, state) => {
+    const readState = vi.fn(() => { if (state instanceof Error) throw state; return state; });
+    const f = fixture({ addFails: true, readState });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false });
+    expect(readState).toHaveBeenCalledWith(expect.any(String), { env: expect.objectContaining({ HOME: '/home/test' }) });
+    expect(readState.mock.calls[0][0]).toBe(f.records.find(r => r.type === 'prototype-load.urgent').registration.clone);
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
+  });
+  it('keeps tracking when the registration command persists the overlay before failing', async () => {
+    const f = fixture({ addFails: true, persistBeforeAddFailure: true });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false });
+    expect(f.admitted).toEqual([{ ref: BASE.branch }]);
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
+  });
+  it('keeps the intent tracked when registration succeeds but admission evidence is incomplete', async () => {
+    const f = fixture({ addRaw: '{}' });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: true, detail: 'admitted-sha-unverified' });
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
+  });
+  it('logs the urgent event and writes explicit urgent readiness evidence', async () => {
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1)).toMatchObject({ tests: 'green', testCheck: { source: 'urgent-local-full', marker, reason } });
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', clone: expect.any(String), registration: expect.objectContaining({ clone: expect.any(String), ref: expect.any(String), sha: SHA }), ref: BASE.branch, sha: SHA, reason, marker }));
+  });
+  it.each(['ledger', 'workflow'])('refuses unreadable %s with an operator fallback', async (missing) => {
+    const f = fixture({ testCheck: async () => null, ...(missing === 'workflow' ? { urgentLedger: JSON.stringify(marker), urgentWorkflow: 'broken' } : {}) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-urgent-marker', fallback: expect.stringContaining('urgent-verify') });
+    expect(f.readyWrites).toEqual([]);
+  });
+  it('keeps non-urgent CI refusal unchanged even with a green marker', async () => {
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run()).toMatchObject({ detail: 'no-passing-test-check' });
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+  });
+  it.each(['failure', 'cancelled', 'timed_out', 'neutral', 'skipped', null])('refuses completed CI %s even with a signed green marker', async conclusion => {
+    const f = fixture({ testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion, appId: prototypeLoad.TEST_CHECK_APP_ID }), urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+    expect(f.readyWrites).toEqual([]);
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+  });
+  it.each(['queued', 'in_progress'])('allows signed urgent evidence when CI is %s', async status => {
+    const f = fixture({ testCheck: async () => { return { sha: SHA, name: 'test', status }; }, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+  });
+  it('refuses a thrown CI reader error even with a signed receipt', async () => {
+    const f = fixture({ testCheck: async () => { throw new Error('unreadable'); }, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'ci-evidence-unreadable', fallback: expect.stringContaining('Repair') });
+    expect(f.readyWrites).toEqual([]);
+    expect(mutations(f, 'add')).toHaveLength(0);
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+  });
+  it.each(['unsigned', 'bad signature', 'wrong repo', 'missing key'])('refuses %s without readiness writes', async kind => {
+    const forged = { ...marker };
+    if (kind === 'unsigned') delete forged.sig;
+    if (kind === 'bad signature') forged.sig = '0'.repeat(64);
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(forged), missingUrgentKey: kind === 'missing key', ...(kind === 'wrong repo' ? { origin: 'https://example.com/other/repo' } : {}) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(f.readyWrites).toEqual([]);
+  });
+  it('refuses a correctly signed receipt with empty steps without readiness writes', async () => {
+    const empty = { ...marker, steps: [] };
+    empty.sig = urgentSignature(empty, urgentKey);
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(empty) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(f.readyWrites).toEqual([]);
+  });
+  it('uses normal passing CI when urgent was requested and still logs the event', async () => {
+    const f = fixture();
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1).testCheck).toMatchObject({ name: 'test', conclusion: 'success' });
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', marker: null }));
+  });
+});
 const auditRecord = (overrides = {}) => ({
   at: '2026-10-20T12:00:00Z', base: TREE, head: SHA, baseRef: 'origin/main',
   questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], ...overrides,
@@ -1737,7 +1873,7 @@ describe('prototype-load', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('warns when the pending-adoption tracking write fails', async () => {
-    const r = await fixture({ timeout: true }).run({ waitAdoptionMs: undefined });
+    const r = await fixture({ timeout: true, pendingWriteFails: true }).run({ waitAdoptionMs: undefined });
     expect(r.adoptionEventTracked).toBe(false);
     expect(r.message).toContain('pending-adoption record could not be written');
     expect(r.message).toContain('no overlay-adopted event will follow');
@@ -2977,7 +3113,7 @@ describe('refuse-only safety properties P1–P9', () => {
   });
   it.each([null, { sha: TREE, name: 'test', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'other', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'in_progress', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'completed', conclusion: 'failure' }])('P8 fails closed on absent, wrong-sha or nonpassing check evidence: %j', async check => {
     const f = fixture({ ready: '', testCheck: async () => check });
-    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: check?.sha === SHA && check.status === 'completed' && check.conclusion !== 'success' ? 'ci-test-failed' : 'no-passing-test-check' });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('P9 an already-live registration is never removed or rebuilt, and an unaudited re-load is still refused', async () => {
@@ -3139,7 +3275,7 @@ describe('default test check-run reader (production wiring)', () => {
   const REPO_SLUG = 'web-everything/web-everything';
   const run = (o = {}) => ({ id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 }, ...o });
   const wf = (o = {}) => ({ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml', ...o });
-  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, ...options } = {}) {
+  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, ...options } = {}) {
     const gh = [];
     const combinedIO = { fs: {},
       handles: (cmd, args) => cmd === 'gh' || (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url'),
@@ -3147,17 +3283,74 @@ describe('default test check-run reader (production wiring)', () => {
         if (cmd === 'git') return `https://github.com/${REPO_SLUG}.git\n`;
         gh.push(args.join(' '));
         const bad = () => { throw Object.assign(new Error('gh: HTTP 500'), { status: 1, stdout: '', stderr: 'HTTP 500' }); };
-        if (args[0] === 'repo' && args[1] === 'view') return JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
-        if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : JSON.stringify(checks);
-        if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : JSON.stringify(runs);
+        if (args[0] === 'repo' && args[1] === 'view') return fail === 'repo' ? bad() : JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
+        if (args[0] === 'api' && args[1].includes('/check-runs') && fail === 'overflow') throw Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' });
+        if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : checksRaw ?? JSON.stringify(checks);
+        if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : runsRaw ?? JSON.stringify(runs);
         throw new Error(`unexpected gh call ${args.join(' ')}`);
       } };
     return { gh, ...fixture({ ready: '', defaultTestCheck: true, combinedIO, ...options }) };
   }
-  const refused = async (f) => {
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+  const refused = async (f, detail = 'no-passing-test-check') => {
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   };
+  const urgentReceipt = () => {
+    const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+    return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
+  };
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
+    'urgent refuses a pending suite plus another suite completed with %s', async conclusion => {
+      const f = ghFixture({ urgentLedger: urgentReceipt(), checks: { total_count: 2, check_runs: [
+        run({ status: 'in_progress', conclusion: null }),
+        run({ id: 2, name: 'other-check', app: { id: 1 }, check_suite: { id: 8 }, conclusion }),
+      ] } });
+      expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+      expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+      expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+    });
+  it('urgent refuses a failed run even when the workflow-binding read is unavailable', async () => {
+    const f = ghFixture({ fail: 'runs', urgentLedger: urgentReceipt(), checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+    // The raw veto happens before the unavailable binding reader can hide the failure.
+    expect(f.gh.some(c => c.includes('/actions/runs'))).toBe(false);
+  });
+  it.each([
+    ['unavailable repository API (nonzero)', { fail: 'repo' }],
+    ['unavailable raw checks (API nonzero)', { fail: 'checks' }],
+    ['unavailable workflow binding (API nonzero)', { fail: 'runs' }],
+    ['absent check', { checks: { total_count: 0, check_runs: [] } }],
+    ['queued CI', { checks: { total_count: 1, check_runs: [run({ status: 'queued', conclusion: null })] } }],
+    ['pending CI', { checks: { total_count: 1, check_runs: [run({ status: 'in_progress', conclusion: null })] } }],
+    ['a failure on another SHA', { checks: { total_count: 1, check_runs: [run({ head_sha: TREE, conclusion: 'failure' })] } }],
+  ])('urgent requires a signed receipt with %s', async (_, options) => {
+    const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1).testCheck.source).toBe('urgent-local-full');
+    const missing = ghFixture(options);
+    expect(await missing.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(missing.readyWrites).toEqual([]);
+  });
+  it.each([
+    ['check response buffer overflow', { fail: 'overflow' }],
+    ['invalid check JSON', { checksRaw: '{' }],
+    ['missing check array', { checks: { total_count: 0 } }],
+    ['incomplete checks', { checks: { total_count: 2, check_runs: [run()] } }],
+    ['oversized checks', { checks: { total_count: 101, check_runs: Array.from({ length: 101 }, () => run()) } }],
+    ['malformed check', { checks: { total_count: 1, check_runs: [run({ check_suite: null })] } }],
+    ['unknown check status', { checks: { total_count: 1, check_runs: [run({ status: 'unknown' })] } }],
+    ['invalid workflow JSON', { runsRaw: '{' }],
+    ['incomplete workflows', { runs: { total_count: 2, workflow_runs: [wf()] } }],
+    ['oversized workflows', { runs: { total_count: 101, workflow_runs: Array.from({ length: 101 }, () => wf()) } }],
+    ['malformed workflow', { runs: { total_count: 1, workflow_runs: [null] } }],
+    ['foreign workflow', { runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }],
+  ])('urgent refuses %s before reading a signed receipt', async (_, options) => {
+    const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-evidence-unreadable', fallback: expect.stringContaining('Repair') });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+  });
   it('admits a passing test bound to the expected workflow file and writes fresh readiness', async () => {
     const f = ghFixture();
     expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
@@ -3180,7 +3373,7 @@ describe('default test check-run reader (production wiring)', () => {
     ['a truncated check-runs page', { checks: { total_count: 101, check_runs: [run()] } }],
     ['a check-run from another GitHub app', { checks: { total_count: 1, check_runs: [run({ app: { id: 1 } })] } }],
     ['a failing test check-run', { checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } }],
-  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options)); });
+  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options), options.checks?.check_runs?.[0]?.conclusion === 'failure' ? 'ci-test-failed' : (options.checks?.total_count > 100 || options.runs?.total_count === 2) ? 'ci-evidence-unreadable' : 'no-passing-test-check'); });
 });
 
 const shippedRuledSettings = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
@@ -3191,4 +3384,177 @@ it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))(
     audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
     settings: { ...shippedRuledSettings, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
   expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R803' } } });
+});
+
+describe('R1075 degraded daemon admission', () => {
+  const signal = { daemon: 'wev-control', kind: 'overlay-adoption-overdue', at: new Date(-7200000).toISOString() };
+  const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'studio', repo: 'https://example.com/org/repo', steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+  marker.sig = urgentSignature(marker, urgentKey);
+  const degraded = options => fixture({ daemonEvents: JSON.stringify(signal), testCheck: async () => null, urgentLedger: JSON.stringify(marker), ...options });
+  it('loads without a CI test check using the existing signed receipt and logs daemon evidence', async () => {
+    const f = degraded();
+    const out = await f.run({ reason: 'caller reason is ignored', evidence: { ageMinutes: 999 } });
+    expect(out).toMatchObject({ ok: true, registered: true, degradedFastPath: { signals: [{ kind: signal.kind, at: signal.at }], ageMinutes: 120, marker } });
+    expect(f.readyWrites.at(-1).testCheck.reason).toContain('overlay-adoption-overdue@');
+    expect(f.readyWrites.at(-1).testCheck.reason).not.toContain('caller');
+    expect(f.records).toContainEqual(expect.objectContaining({ kind: 'prototype-load.degraded-fast-path', daemon: 'control', detail: expect.objectContaining({ branch: BASE.branch, sha: SHA, marker }) }));
+  });
+  it('preserves ordinary green-CI admission without a receipt', async () => {
+    const f = degraded({ urgentLedger: undefined, testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+  });
+  it.each(['missing readiness', 'carried audit'])('preserves normal green-CI admission with %s', async kind => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ urgentLedger: undefined,
+      ...(kind === 'missing readiness' ? { ready: '' } : {
+        audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint })]), fingerprint: () => fingerprint,
+      }),
+      testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+  });
+  it.each(['green', 'absent', 'red'])('degradation never makes %s CI admission stricter', async state => {
+    const testCheck = async () => state === 'absent' ? null : ({ sha: SHA, name: 'test', status: 'completed',
+      conclusion: state === 'green' ? 'success' : 'failure', appId: prototypeLoad.TEST_CHECK_APP_ID });
+    const healthy = await degraded({ daemonEvents: '', testCheck, urgentLedger: undefined }).run();
+    const stuck = await degraded({ testCheck, urgentLedger: undefined }).run();
+    if (healthy.ok) expect(stuck.ok).toBe(true);
+    else expect(stuck.ok).toBe(false);
+    if (state === 'green') expect(stuck.degradedFastPath).toBeUndefined();
+  });
+  it.each(['green', 'absent', 'red'])('receipt-backed degraded admission supplements the healthy path with %s CI', async state => {
+    const testCheck = async () => state === 'absent' ? null : ({ sha: SHA, name: 'test', status: 'completed',
+      conclusion: state === 'green' ? 'success' : 'failure', appId: prototypeLoad.TEST_CHECK_APP_ID });
+    const healthy = await degraded({ daemonEvents: '', testCheck }).run();
+    const stuck = await degraded({ testCheck }).run();
+    expect(healthy.ok).toBe(state === 'green');
+    expect(stuck.ok).toBe(state !== 'red');
+  });
+  it('preserves ordinary merging onto main when degraded CI is green', async () => {
+    const f = degraded({ behind: true, urgentLedger: undefined,
+      testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, effectiveSha: MERGE });
+  });
+  it('clears pending tracking when registration fails', async () => {
+    const f = degraded({ addFails: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'register-failed' });
+    expect([...f.pendingFiles.values()]).toHaveLength(0);
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
+  it('retains tracking when the failed add actually persisted the registration', async () => {
+    const f = degraded({ addFails: true, persistBeforeAddFailure: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'register-failed' });
+    expect([...f.pendingFiles.values()]).toHaveLength(1);
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(true);
+  });
+  it('records no admitted fast-path event on early refusal', async () => {
+    const f = degraded({ ready: '' });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false });
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
+  it('requires an existing green scoped fix-ready record', async () => {
+    expect(await degraded({ ready: '' }).run()).toMatchObject({ ok: false, detail: 'no-fix-ready-record' });
+  });
+  it.each(['failure', 'cancelled', 'timed_out'])('CI %s still vetoes', async conclusion => {
+    expect(await degraded({ testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion }) }).run()).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+  });
+  it('healthy daemon cannot be forced by extra caller input', async () => {
+    const f = degraded({ daemonEvents: '' });
+    expect(await f.run({ degradedFastPath: { enabled: true }, degraded: true, evidence: { signals: [signal], ageMinutes: 120 } })).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
+  it.each([false, 'yes', null, [], { enabled: 'true' }, { degradedAfterMinutes: 0 }, { degradedAfterMinutes: '60' }, { degradedAfterMinutes: -1 }, { extra: true }])('disabled or malformed setting %j cannot enable it', async setting => {
+    const degradedFastPath = setting === false ? { enabled: false, degradedAfterMinutes: 60 } : setting;
+    const out = await degraded({ settings: { degradedFastPath } }).run();
+    expect(out).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+    expect(out.degradedFastPath).toBeUndefined();
+  });
+  it('takes the standard default and records platform/tool provenance', async () => {
+    const standard = await degraded().run();
+    expect(standard.settings.sources['degradedFastPath.enabled']).toBe('standard');
+    const platform = await degraded({ platformSettings: { degradedFastPath: { enabled: false } }, env: { WE_PLATFORM_PREFERENCES_FILE: '/home/test/platform-preferences.json' } }).run();
+    expect(platform.settings.sources['degradedFastPath.enabled']).toBe('platform');
+    expect(platform.degradedFastPath).toBeUndefined();
+  });
+  it('preserves ruled WEAKENED on green CI but refuses unclassified findings on the fast path', async () => {
+    const findings = ['scripts/tool.mjs:1 intentional scope relaxation'];
+    const ready = JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R1075', auditDisclosed: findings });
+    const audits = auditLines([auditRecord({ base: 'e'.repeat(40), verdict: 'WEAKENED', findings })]);
+    expect(await degraded({ ready, audits }).run()).toMatchObject({ ok: false, stopReason: 'no-ready' });
+    const options = { ready, audits, settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] } };
+    expect(await degraded(options).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'security-finding' });
+    expect(await degraded({ ...options, testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) }).run()).toMatchObject({ ok: true });
+  });
+  it('keeps fingerprint matching: a newer WEAKENED on the same fingerprint still blocks', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint }),
+      auditRecord({ head: 'd'.repeat(40), base: 'e'.repeat(40), fingerprint, verdict: 'WEAKENED', findings: ['scripts/x.mjs:1 newer negative evidence'] })]), fingerprint: () => fingerprint });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('unreadable daemon log cannot be replaced by caller evidence', async () => {
+    const f = degraded({ daemonEvents: 'truncated jsonl' });
+    expect(await f.run({ evidence: { signals: [signal], ageMinutes: 120 } })).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+  });
+  it.each(['security', 'B-class', 'B class', 'R37', '[B]', 'insecure temp file', 'arbitrary code execution', 'unclassified relaxation'])('findings cannot be waived on this path: %s', async text => {
+    const findings = [`scripts/tool.mjs:1 ${text}`];
+    const f = degraded({ ready: JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R1075', auditDisclosed: findings }),
+      settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] },
+      audits: auditLines([auditRecord({ base: 'e'.repeat(40), verdict: 'WEAKENED', findings })]) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'security-finding' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('refused smoke withdraws the candidate through retirement and raises NEEDS-YOU', async () => {
+    const retire = vi.fn(async () => ({ retired: true })), needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou,
+      retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'retire', reason: 'pr-merged', tip: SHA })) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-refused', registered: false, rollback: { retired: true }, needsYou: true });
+    expect(retire).toHaveBeenCalledWith(expect.objectContaining({ ref: BASE.branch, expectedTip: SHA, expectedEntry: { ref: BASE.branch } }));
+    expect(needsYou).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringContaining('NEEDS-YOU') }));
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path-failed')).toBe(true);
+  });
+  it('unproven retirement keeps the overlay, refuses and raises NEEDS-YOU without withdrawing', async () => {
+    const retire = vi.fn(async () => ({ retired: true })), needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou,
+      retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'keep', reason: 'pr-open' })) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: true, rollback: { retired: false, refused: 'retirement-unproved' }, needsYou: true });
+    expect(retire).not.toHaveBeenCalled();
+    expect(needsYou.mock.calls[0][0].error).toContain('NEEDS-YOU');
+  });
+  it('refused rollback stays visible and escalates manual recovery', async () => {
+    const needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: async () => ({ retired: false, refused: 'registration-changed' }), needsYou });
+    expect(await f.run()).toMatchObject({ registered: true, rollback: { retired: false }, needsYou: true });
+    expect(needsYou.mock.calls[0][0].error).toContain('unload manually');
+  });
+  it('never carries an older head audit across a matching fingerprint on degraded admission', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint })]), fingerprint: () => fingerprint });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('keeps pending-adoption tracking when a degraded load fails after registration without a rollback', async () => {
+    const f = degraded({ probeThrows: true });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, adoptionEventTracked: true });
+    expect(out.rollback).toBeUndefined();
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect([...f.pendingFiles.values()].length).toBeGreaterThan(0);
+  });
+  it('unwritable pending-adoption storage refuses before registration', async () => {
+    const f = degraded({ pendingWriteFails: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, error: expect.stringContaining('adoption tracking unwritable') });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('does not create an unaudited merged SHA on the fast path', async () => {
+    const f = degraded({ behind: true });
+    expect(await f.run()).toMatchObject({ ok: false, detail: 'exact-sha-required' });
+    expect(f.calls.some(c => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+  });
+  it('unwritable daemon event log refuses before registration', async () => {
+    const f = degraded({ eventWriteFails: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, error: expect.stringContaining('event log unwritable') });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
 });

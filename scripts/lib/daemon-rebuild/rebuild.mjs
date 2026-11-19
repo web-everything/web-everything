@@ -3,6 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { checkDegradedFailures } from '../../operations/degraded-load-rollback.mjs';
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
@@ -106,8 +107,8 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const startedAtMs = Date.now();
   const result = await rebuildCloneInternal(options);
+  const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
   try {
-    const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
     // Only moved proves this invocation actually changed the running build.
     if (result.moved === true) {
@@ -121,7 +122,17 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, eventOptions);
     }
-    // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
+    for (const alert of result.alerts ?? []) {
+      if (['ready-candidate-discarded', 'ready-candidate-discarded-needs-you'].includes(alert.kind))
+        await emitEvent({ ...alert, daemon: basename(options.root) }, eventOptions);
+    }
+  } catch { /* Event failures must never change the rebuild outcome or skip recovery. */ }
+  // Recovery and adoption tracking are independent: neither event IO nor a
+  // rollback failure may prevent the other hook from running.
+  try {
+    await checkDegradedFailures({ root: options.root, result, env: { ...process.env, ...options.env }, emit: (e, o) => emitEvent(e, o) });
+  } catch { /* A rollback failure stays pending for the next rebuild. */ }
+  try {
     await checkPendingAdoptions({
       root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
       emit: (event) => emitEvent(event, eventOptions),

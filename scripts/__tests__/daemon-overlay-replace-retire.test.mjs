@@ -10,8 +10,8 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, inferPrNumber } from '../daemon-overlay.mjs';
-import { addOverlay } from '../lib/daemon-overlays.mjs';
+import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, recoverDrops, inferPrNumber } from '../daemon-overlay.mjs';
+import { addOverlay, recordEdgeResolution } from '../lib/daemon-overlays.mjs';
 import { planRebuild } from '../lib/daemon-rebuild.mjs';
 
 const CLI = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-overlay.mjs');
@@ -276,6 +276,184 @@ describe('daemon-overlay.mjs retire', () => {
       expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => 'f'.repeat(40) } })).toEqual([{ ref: 'lane/done', outcome: 'still-registered' }]);
       expect(f.entry('lane/done')).toMatchObject({ reason: 'newer' });
     });
+  });
+});
+
+describe.each(['unique-commits-not-on-main', 'pr-open'])('guarded urgent-failed unload with a %s keep verdict', reason => {
+  async function urgent({ outcome = 'held', snapshot = 'same', edge = false } = {}) {
+    const f = fixture();
+    const tip = f.push('lane/urgent', 'urgent.txt', 'unmerged urgent work\n');
+    addOverlay(f.clone, { ref: 'lane/urgent', reason: 'urgent load' }, { env: f.env });
+    if (edge) recordEdgeResolution(f.clone, 'lane/urgent', { sha: tip, by: 'reviewer' }, { env: f.env });
+    const entry = f.entry('lane/urgent');
+    let dropped = false;
+    const args = { root: f.clone, ref: entry.ref, expectedTip: tip,
+      expectedEntry: snapshot === 'missing' ? undefined : snapshot === 'changed' ? { ...entry, addedAt: 'newer' } : entry,
+      mode: 'urgent-failed', trackingId: 'urgent-attempt', env: f.env, deps: {
+        ...(reason === 'pr-open' ? { prove: () => ({ action: 'keep', reason, tip }) } : {}),
+        readUrgentLoads: () => {
+          expect(readdirSync(f.env.WE_DAEMON_OVERLAY_DIR).some(n => n.endsWith('.add-guard.lock'))).toBe(true);
+          return [{ type: 'prototype-load.urgent', trackingId: 'urgent-attempt',
+            at: '2026-01-01T00:00:00Z', ref: entry.ref, sha: tip,
+            clone: f.clone, registration: { clone: f.clone, ref: entry.ref, sha: tip } }];
+        },
+        readUrgentDecisions: () => [{ status: 'unload-decision', trackingId: 'urgent-attempt',
+          at: '2026-01-02T00:00:00Z', reason: 'ci-failed', clone: f.clone, ref: entry.ref, sha: tip,
+          registration: { clone: f.clone, ref: entry.ref, sha: tip },
+          check: { head_sha: tip, status: 'completed', conclusion: 'failure' } }],
+        tip: () => {
+          if (dropped && outcome === 'post-drop-moved') return 'f'.repeat(40);
+          if (outcome === 'unreadable') throw new Error('offline');
+          return outcome === 'moved' ? 'f'.repeat(40) : tip;
+        },
+        afterDrop: () => {
+          dropped = true;
+          expect(readPendingDrops(f.clone, f.env)).toMatchObject([{ ref: entry.ref, entry, tip }]);
+          expect(readdirSync(f.env.WE_DAEMON_OVERLAY_DIR).some(n => n.endsWith('.add-guard.lock'))).toBe(true);
+          if (outcome === 'killed') throw new Error('killed');
+        },
+      } };
+    return { f, tip, entry, args };
+  }
+  it('refuses urgent withdrawal of an approved edge even when the planner returns pr-open', async () => {
+    const { f, args, tip } = await urgent({ edge: true });
+    args.deps.prove = () => ({ action: 'keep', reason: 'pr-open', tip });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'not-proved',
+      proof: { action: 'keep', reason: 'edge-resolution-recorded' } });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it('re-proves ordinary retirement then explicitly withdraws unmerged urgent work under lock with durable intent', async () => {
+    const { f, args } = await urgent();
+    expect(await retireRegistration(args)).toMatchObject({ retired: true, reason: 'urgent-failed' });
+    expect(f.list()).toEqual([]);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+    expect(f.events().at(-1)).toMatchObject({ reason: 'urgent-failed', evidence: { urgentUnload: true } });
+    expect(f.events().at(-1).operatorReason).toBeUndefined();
+  });
+  it.each([true, false])('refuses urgent withdrawal with a stacked dependent (cached=%s)', async cached => {
+    const { f, args } = await urgent();
+    f.push('lane/top', 'top.txt', 'depends on urgent\n', 'origin/lane/urgent');
+    addOverlay(f.clone, { ref: 'lane/top', ...(cached ? { stackBases: ['lane/urgent'] } : {}) }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false,
+      refused: cached ? 'stacked-or-unreadable' : 'stacked-dependents' });
+    expect(f.list()).toEqual(['lane/urgent', 'lane/top']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+    expect(f.events().some(e => e.kind === 'auto-retired')).toBe(false);
+  });
+  it('allows urgent withdrawal with an independent registration', async () => {
+    const { f, args } = await urgent();
+    f.push('lane/independent', 'independent.txt', 'independent work\n');
+    addOverlay(f.clone, { ref: 'lane/independent' }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: true, reason: 'urgent-failed' });
+    expect(f.list()).toEqual(['lane/independent']);
+  });
+  it('refuses urgent withdrawal when a potential dependent cannot be read', async () => {
+    const { f, args } = await urgent();
+    addOverlay(f.clone, { ref: 'lane/missing' }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'stacked-or-unreadable' });
+    expect(f.list()).toEqual(['lane/urgent', 'lane/missing']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['missing-reader', 'unreadable', 'incomplete', 'absent', 'trackingId', 'clone', 'ref', 'sha', 'registration', 'reason', 'pending', 'green', 'check-sha', 'timestamp', 'future', 'early-expiry'])(
+    'refuses %s negative unload evidence even with a matching load', async kind => {
+      const { f, args } = await urgent();
+      const decision = args.deps.readUrgentDecisions()[0];
+      if (kind === 'missing-reader') delete args.deps.readUrgentDecisions;
+      else if (kind === 'unreadable') args.deps.readUrgentDecisions = () => { throw new Error('corrupt ledger; repair manually'); };
+      else if (kind === 'incomplete') args.deps.readUrgentDecisions = () => null;
+      else {
+        if (['trackingId', 'clone', 'ref', 'sha', 'reason'].includes(kind)) decision[kind] = 'other';
+        if (kind === 'registration') decision.registration.sha = 'f'.repeat(40);
+        if (kind === 'pending') decision.check.status = 'in_progress';
+        if (kind === 'green') decision.check.conclusion = 'success';
+        if (kind === 'check-sha') decision.check.head_sha = 'f'.repeat(40);
+        if (kind === 'timestamp') decision.at = 'invalid';
+        if (kind === 'future') decision.at = '2099-01-01T00:00:00Z';
+        if (kind === 'early-expiry') { decision.reason = 'ci-expired'; decision.at = '2026-01-01T23:59:59Z'; }
+        args.deps.readUrgentDecisions = () => kind === 'absent' ? [] : [decision];
+      }
+      expect(await retireRegistration(args)).toMatchObject({ retired: false,
+        refused: ['missing-reader', 'unreadable', 'incomplete'].includes(kind) ? 'urgent-decision-unreadable' : 'urgent-decision-required' });
+      expect(f.list()).toEqual(['lane/urgent']);
+      expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+    });
+  it('accepts a durable exact-load expiry decision at the 24h boundary', async () => {
+    const { f, args } = await urgent();
+    const decision = { ...args.deps.readUrgentDecisions()[0], reason: 'ci-expired' };
+    delete decision.check;
+    args.deps.readUrgentDecisions = () => [decision];
+    expect(await retireRegistration(args)).toMatchObject({ retired: true });
+    expect(f.list()).toEqual([]);
+  });
+  it('preserves the keep verdict without urgent-failed mode', async () => {
+    const { f, args } = await urgent();
+    expect(await retireRegistration({ ...args, mode: 'retired' })).toMatchObject({
+      retired: false, refused: 'not-proved', proof: { action: 'keep', reason },
+    });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['pinned-closed-pr', 'edge-resolution-recorded', 'fetch-failed', 'history-unreadable', 'pr-state-unknown', 'unprovable', 'unknown'])('preserves the %s keep verdict for an authorized urgent request', async reason => {
+    const { f, args, tip } = await urgent();
+    args.deps.prove = () => ({ action: 'keep', reason, tip });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'not-proved', proof: { reason } });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['reader-missing', 'unreadable', 'incomplete', 'absent', 'ref', 'sha', 'trackingId', 'clone', 'type', 'request-id'])('refuses %s urgent tracking evidence before dropping', async kind => {
+    const { f, args } = await urgent();
+    const records = [{ type: 'prototype-load.urgent', trackingId: args.trackingId, clone: f.clone,
+      registration: { clone: f.clone, ref: args.ref, sha: args.expectedTip } }];
+    if (kind === 'reader-missing') delete args.deps.readUrgentLoads;
+    else if (kind === 'unreadable') args.deps.readUrgentLoads = () => { throw new Error('corrupt ledger'); };
+    else if (kind === 'incomplete') args.deps.readUrgentLoads = () => null;
+    else {
+      if (kind === 'ref') records[0].registration.ref = 'lane/other';
+      if (kind === 'sha') records[0].registration.sha = 'f'.repeat(40);
+      if (kind === 'trackingId') records[0].trackingId = 'another-attempt';
+      if (kind === 'clone') records[0].clone = '/other';
+      if (kind === 'type') records[0].type = 'prototype-load.urgent-unloaded';
+      if (kind === 'request-id') delete args.trackingId;
+      args.deps.readUrgentLoads = () => kind === 'absent' ? [] : records;
+    }
+    expect(await retireRegistration(args)).toMatchObject({ retired: false,
+      refused: ['reader-missing', 'unreadable', 'incomplete'].includes(kind) ? 'urgent-tracking-unreadable' : 'urgent-tracking-required' });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each([{ mode: 'unknown' }, { expectedTip: 'bad' }, { expectedEntry: { ref: 'lane/other' } }])('refuses invalid urgent authorization %j', async override => {
+    const { f, args } = await urgent();
+    expect(await retireRegistration({ ...args, ...override })).toMatchObject({ retired: false,
+      refused: override.mode ? 'unknown-retirement-mode' : 'urgent-snapshot-required' });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['missing', 'changed'])('refuses a %s expected entry before dropping', async snapshot => {
+    const { f, args } = await urgent({ snapshot });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false,
+      refused: snapshot === 'missing' ? 'urgent-snapshot-required' : 'registration-changed' });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['moved', 'unreadable'])('refuses a %s loaded tip before dropping', async outcome => {
+    const { f, args } = await urgent({ outcome });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'tip-moved-or-unreadable' });
+    expect(f.list()).toEqual(['lane/urgent']);
+  });
+  it('restores an urgent unload when its tip moves during the drop', async () => {
+    const { f, args, entry } = await urgent({ outcome: 'post-drop-moved' });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'tip-moved-restored' });
+    expect(f.entry(entry.ref)).toEqual(entry);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['held', 'moved', 'unreadable'])('recovers an interrupted urgent drop with a %s tip', async outcome => {
+    const { f, args, tip } = await urgent({ outcome: 'killed' });
+    await expect(retireRegistration(args)).rejects.toThrow('killed');
+    expect(f.list()).toEqual([]);
+    const result = await recoverDrops({ root: f.clone, env: f.env, deps: { tip: () => outcome === 'held' ? tip : outcome === 'moved' ? 'f'.repeat(40) : undefined } });
+    expect(result).toMatchObject({ pending: [], settled: [{ outcome: outcome === 'held' ? 'drop-confirmed' : 'restored' }] });
+    expect(f.list()).toEqual(outcome === 'held' ? [] : ['lane/urgent']);
   });
 });
 
