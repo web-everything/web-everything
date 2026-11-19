@@ -6,16 +6,18 @@
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { pinnedLeafGitFixture } from './fixtures/pinned-leaf-git-fixture.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const TIMEOUT_SCALE = 3; // Allow extra time for CLI subprocesses on loaded shards.
 const NOW = Date.now();
 const iso = (minAgo) => new Date(NOW - minAgo * 60_000).toISOString();
+const headSha = number => number.toString(16).padStart(40, '0');
 
 const fakeGh = `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -76,13 +78,13 @@ if (a[0] === 'api') {
       protection: { required_status_checks: { contexts: ['smoke'] } } });
   }
   let m;
-  if ((m = /commits\\/(sha-\\d+)\\/check-runs/.exec(path))) {
+  if ((m = /commits\\/([0-9a-f]{40})\\/check-runs/.exec(path))) {
     const p = prs.find(p => p.headRefOid === m[1]);
     out([{ check_runs: [{ id: 7, name: 'test', head_sha: m[1], status: 'completed', conclusion: 'success',
       started_at: p.passAt, completed_at: p.passAt, details_url: 'https://github.com/o/r/actions/runs/99' + p.number + '/job/1' }] }]);
   }
   if (/\\/branches\\/main$/.test(path)) out({ sha: 'tip' });
-  if ((m = /compare\\/(sha-\\d+)\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['backlog/elsewhere.md'], n: 1 });
+  if ((m = /compare\\/([0-9a-f]{40})\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['backlog/elsewhere.md'], n: 1 });
   if ((m = /pulls\\/(\\d+)\\/files/.exec(path))) out([[{ filename: 'backlog/leaf-' + m[1] + '.md' }]]);
 }
 process.exit(0);
@@ -90,6 +92,9 @@ process.exit(0);
 const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
+const db = JSON.parse(fs.readFileSync(process.env.MQ_FIXTURE, 'utf8'));
+const pinned = (${pinnedLeafGitFixture})(a, Array.isArray(db) ? db : Object.values(db.repos).flat());
+if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
 if (a[0] === 'ls-remote') fs.appendFileSync(process.env.MQ_FIXTURE + '.refresh-pins', a.join(' ') + '\\n');
 if (a[0] === 'fetch') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-fetches', a.join(' ') + '\\n');
 if (a[0] === 'merge-tree') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-trees', a.join(' ') + '\\n');
@@ -109,13 +114,13 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
     for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
-    const head = number => approvedHeadPlan ? 'a'.repeat(40) : `sha-${number}`;
+    const head = number => approvedHeadPlan ? 'a'.repeat(40) : headSha(number);
     const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
     const cwd = approvedHeadPlan ? join(dir, 'local') : dir;
     if (approvedHeadPlan) {
       mkdirSync(cwd);
-      // Provision the sibling read surface without creating or modifying any git metadata.
-      symlinkSync(join(dirname(script), '..'), join(dir, 'frontierui'), 'dir');
+      // The sibling clone's Git boundary is served by the same hermetic shim.
+      mkdirSync(join(dir, 'frontierui', '.git'), { recursive: true });
     }
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
@@ -223,7 +228,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(attempts).toEqual([3001]);
     expect(result.merged.map((p) => p.num)).toEqual([3001]);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
-    expect(api.some((p) => p.includes('commits/sha-3002/check-runs'))).toBe(true);
+    expect(api.some((p) => p.includes('commits/' + headSha(3002) + '/check-runs'))).toBe(true);
   }, 30_000 * TIMEOUT_SCALE);
 
   it('a refresh that did not go through is NOT recorded, so the next pass retries it', () => {
@@ -236,7 +241,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
   // The record a refresh writes: the head AND the pass it was requested against (the fixture's check-run id is 7 and
   // its pass completed at `iso(120)`), plus when it was requested.
   const seedFor = (over = {}) => Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k,
-    { head: 'sha-3002', checkRunId: 7, completedAtMs: Date.parse(iso(120)), atMs: NOW, ...over }]));
+    { head: headSha(3002), checkRunId: 7, completedAtMs: Date.parse(iso(120)), atMs: NOW, ...over }]));
 
   it('once per pass: a head refreshed against the pass still in force waits — no second refresh, no merge', () => {
     const { stderr, attempts } = runCli({ hookOn: true, seedRefreshed: seedFor() });
@@ -253,7 +258,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
   }, 30_000 * TIMEOUT_SCALE);
 
   it('a legacy head-only record (key → head) does not park the head either', () => {
-    const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
+    const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, headSha(3002)]));
     const { stderr } = runCli({ hookOn: true, seedRefreshed: seed });
     expect(stderr).not.toMatch(/refresh-already-requested/);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
@@ -355,13 +360,16 @@ const COUPLE_TEST_TIMEOUT_MS = 300_000 * TIMEOUT_SCALE;
 function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-couple-'));
   try {
+    const cwd = join(dir, 'local');
+    mkdirSync(cwd);
+    for (const name of ['frontierui', 'plateau-app']) mkdirSync(join(dir, name, '.git'), { recursive: true });
     const bin = join(dir, 'bin');
     mkdirSync(bin);
     for (const [name, code] of [['gh', fakeGhCouple], ['git', fakeGitCouple]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const manifest = { item: 'xcarr01', repos: [{ repo: 'we', ref: 'lane/xcarr01-we' }, { repo: 'fui', ref: 'lane/xcarr01-fui' },
       ...(secondImplPassAges ? [{ repo: 'plateau-app', ref: 'lane/xcarr01-pa' }] : [])], blockedBy: [], stackParents: [] };
     const body = `A real summary.\n\n<!-- lane-manifest:begin -->\n\`\`\`json\n${JSON.stringify(manifest)}\n\`\`\`\n<!-- lane-manifest:end -->\n`;
-    const sha = (number) => String(number).padStart(12, 'a'); // a hex sha, so a reviewed-sha marker can name it
+    const sha = headSha;
     // A cross-repo couple is always escalated for review; the carrier carries the human clearance for ITS head
     // (label + a trusted reviewed-sha marker), which is what the real drain requires before it will land it.
     const accepted = (number) => ({ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
@@ -385,7 +393,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
-      cwd: dir, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
+      cwd, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
       env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord,
         // Carrier pre-check and impl revalidation each retry; keep their real reads, omit production waits.
         WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0', ...extraEnv },

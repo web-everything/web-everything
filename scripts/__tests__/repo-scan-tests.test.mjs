@@ -33,6 +33,7 @@ describe('selectScanTests', () => {
     expect(full.map((e) => [e.test, e.scope])).toEqual([
       ['scripts/lib/__tests__/constellation-ownership.test.mjs', 'full'],
       ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
+      ['scripts/__tests__/pinned-diff-basis-structure.test.mjs', 'full'],
       ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],
       ['scripts/lib/__tests__/permission-change.test.mjs', 'full'],
     ]);

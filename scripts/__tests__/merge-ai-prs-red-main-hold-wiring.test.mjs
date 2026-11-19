@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { pinnedLeafGitFixture } from './fixtures/pinned-leaf-git-fixture.mjs';
 
 // One drain pass here takes ~31s on an idle 30-core host (each held row's ledger write
 // exhausts its fail-closed retry backoff against the fixture git), so the 30s default
@@ -90,6 +91,8 @@ if (S) {
   if (a[0] === 'log' && a.includes('--pretty=%s') && a.includes('origin/main')) say('WE #7001: the stranded delivery (#7001)');
   if (a[0] === 'ls-files' && /^backlog\\/7001-/.test(a[1] || '')) say('backlog/7001-stranded-card.md');
 }
+const pinned = (${pinnedLeafGitFixture})(a, JSON.parse(require('node:fs').readFileSync(process.env.RMH_FIXTURE, 'utf8')));
+if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-rmh.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
@@ -111,10 +114,10 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([FIX, OTHER].map((number) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: number === FIX ? fixMergeable : 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: number === FIX ? fixMergeable : 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
-      commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     const coord = join(dir, 'coord');
@@ -143,6 +146,8 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
       ...(freeze === 'sibling' ? {} : { WE_RED_MAIN_FREEZE_LEGACY: legacyMarker }), WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings,
       // VITEST is cleared below, so pin the merge-delivery tool layer to a file with no `mergeDelivery` (drain-direct), not the live one.
       WE_MERGE_DELIVERY_SETTINGS_FILE: mqSettings,
+      // VITEST is cleared below; retain real ledger writes in the isolated home, not the live dual Git store.
+      WE_VERDICT_LEDGER_STORE: 'home',
       WE_RED_MAIN_FREEZE_SHARED: 'off' }; // VITEST is cleared below, so the unfreeze CLI must not push the live shared ops branch (xyd06qo)
     if (freeze === 'sibling') delete env.WE_RED_MAIN_FREEZE_LEGACY;
     if (lateGroup) env.RMH_LATE_GROUP = `${join(coord, 'drain-card-groups.json')}#${lateGroup}`;
