@@ -55,6 +55,8 @@ export const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)),
  */
 export const READ_ONLY_AGY_TOOLS = Object.freeze([
   'view_file', 'list_dir', 'grep_search', 'find_by_name', 'view_file_outline', 'view_code_item', 'codebase_search',
+  // Gemini 4 Carbon names its plain file read `read_file` (live 2026-11-18: a pure read voided the seat). Path-contained like the rest.
+  'read_file',
   // agy returns its structured answer through a `finish` tool step (live transcripts: ~1 in 4 runs end this way).
   'finish',
 ]);
@@ -243,7 +245,8 @@ export function changedCheckouts(before = {}, after = {}) {
 
 /**
  * Tool steps in an agy stream-json transcript that were NOT a read-only tool and did NOT end in an error, judged on
- * each step's LAST update (a denied call is first ACTIVE, then an error). Fail closed: a tool step with no name counts.
+ * each step's LAST status (a denied call is first ACTIVE, then an error). read_file validates every update's parameters.
+ * Fail closed: a tool step with no name counts.
  * PURE.
  */
 export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home = homedir(), sessionId } = {}) {
@@ -257,11 +260,12 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
     if (!step) continue;
     const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : (step.step_type === 'tool' ? `#${n++}` : null);
     if (key == null) continue;
-    const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, errored: false };
+    const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, updates: [], errored: false };
+    cur.updates.push(step.tool_info?.parameters);
     if (step.step_type === 'tool') {
+      if (cur.params == null) cur.params = step.tool_info?.parameters;
       cur.isTool = true;
       cur.name ??= step.tool_name ?? step.tool_info?.name;
-      cur.params ??= step.tool_info?.parameters;
     }
     if (step.status === 'TOOL_ERROR' || step.state === 'ERROR' || step.tool_info?.error != null) cur.errored = true;
     steps.set(key, cur);
@@ -282,9 +286,28 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   }
   const out = [];
   for (const step of steps.values()) {
-    if (!step.isTool || step.errored) continue;
+    if (!step.isTool || (step.errored && step.name !== 'read_file')) continue;
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
+    if (name === 'read_file') {
+      const laneRoots = lanes.map(canonicalPath).filter(Boolean);
+      const seenPaths = new Set();
+      // Judge each update independently, then their union: no update may omit or change the direct path.
+      const invalid = step.updates.some(update => {
+        let params = update;
+        if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = null; } }
+        const paths = params && typeof params === 'object' && !Array.isArray(params)
+          ? Object.entries(params).filter(([key]) => PATH_PARAM_KEY.test(key)).map(([, value]) => value) : [];
+        for (const path of paths) seenPaths.add(path);
+        return !cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
+          || readsOutside(p, laneRoots, cwd))
+          || pathLeaves(params, false).some(p => readsOutside(p, laneRoots, cwd));
+      });
+      if (invalid || seenPaths.size !== 1) {
+        out.push('read_file (missing or invalid in-lane path)');
+      }
+      continue;
+    }
     // A completed READ must stay inside the juror lane or this conversation's brain folder.
     // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
     if (roots.length && name !== 'finish' && step.params != null) {
@@ -390,7 +413,9 @@ export function scrubPaths(text, roots = [], home = homedir()) {
  */
 export function relativizeFindings(findings, roots = []) {
   const prefixes = roots.filter(Boolean).map((r) => `${String(r).replace(/\/+$/, '')}/`);
-  return (Array.isArray(findings) ? findings : []).map((f) => {
+  // Preserve malformed raw evidence for the shadow answer validator; never turn it into a clean accept.
+  if (!Array.isArray(findings)) return findings;
+  return findings.map((f) => {
     if (!f || typeof f.file !== 'string') return f;
     const hit = prefixes.find((p) => f.file.startsWith(p));
     return hit ? { ...f, file: f.file.slice(hit.length) } : f;
@@ -481,6 +506,26 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     let transcriptText = '';
     if (transcriptFile) {
       try { transcriptText = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
+      // Every line must be an event object; an answered juror must end with a successful result.
+      const lines = String(transcriptText).split('\n').filter(line => line.trim());
+      const events = [];
+      let malformed = false;
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.event !== 'string') malformed = true;
+          else events.push(event);
+        } catch { malformed = true; }
+      }
+      if (malformed) reasons.push('transcript malformed — escape check incomplete');
+      const terminal = events.at(-1);
+      const successfulResult = terminal?.event === 'result' && terminal.result
+        && typeof terminal.result === 'object' && !Array.isArray(terminal.result)
+        && terminal.result.status === 'SUCCESS';
+      const relevant = events.some(event => event.event === 'step_update' || event.event === 'result');
+      if (!lines.length || !relevant || (outcome?.value != null && !successfulResult)) {
+        reasons.push('transcript empty/unrelated — escape check incomplete');
+      }
       const calls = stateChangingToolCalls(transcriptText, {
         allowedRoots: [jurorLane, realpathOr(jurorLane)], home, sessionId: outcome?.sessionId,
       });
