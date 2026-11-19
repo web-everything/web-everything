@@ -151,12 +151,15 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     const seedOpts = opts({ fields, exec, cacheOnly: true, ttlMs: 75_000 });
     clock += 30_000;
     expect(readSharedOpenPrs(seedOpts)).toHaveLength(14);
+    clock += 60_000;
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // expired, no dirty mark: TTL alone refuses
+    expect(calls.length).toBe(before);
+    readSharedOpenPrs(opts({ fields, exec })); // refresh, then dirty it
+    const afterRefresh = calls.length;
     markPrSnapshotDirty({ repo: REPO, env: { WE_PR_SNAPSHOT_DIR: dir }, nowMs: clock + 1 });
     clock += 20_000;
-    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty: no seed, never a refresh
-    clock += 60_000;
-    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // expired
-    expect(calls.length).toBe(before);
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty, inside TTL: no seed, never a refresh
+    expect(calls.length).toBe(afterRefresh);
   });
   it('8 readers with 8 different field sets inside the TTL share ONE paged refresh and hydration', () => {
     const { exec, calls } = fakeExec();
