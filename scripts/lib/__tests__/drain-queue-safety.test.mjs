@@ -864,7 +864,7 @@ describe('merge-queue same-head failure admission', () => {
             head_sha: removed().beforeCommit.oid, status: 'completed', conclusion: 'failure',
             ...(check?.conclusion !== 'failure' ? { conclusion: check?.conclusion } : {}),
             steps: check?.conclusion !== 'failure'
-              ? [{ name: 'Run', status: 'completed', conclusion: 'success' }]
+              ? [{ name: 'Run', status: 'completed', conclusion: ['cancelled', 'timed_out'].includes(check?.conclusion) ? check.conclusion : 'success' }]
               : [{ name: 'Gate on shard results', status: 'completed', conclusion: 'failure' }] });
         }
         if (endpoint?.endsWith('/actions/runs/500')) return JSON.stringify({ id: 500, run_attempt: 1,
@@ -923,9 +923,9 @@ describe('merge-queue same-head failure admission', () => {
       { id: 24, name: 'soak', status: 'completed', conclusion: 'success' },
     ];
     it.each(['cancelled', 'startup_failure'])(
-      'cancelled/regroup retries %s plus a derived aggregate without main, logs or reruns', conclusion => fixture(f => {
+      'cancelled/regroup retries %s plus a derived aggregate with its required main evidence and no logs or reruns', conclusion => fixture(f => {
         f.checks = regroupChecks(conclusion);
-        f.mainError = true;
+        f.mainError = conclusion === 'startup_failure';
         const result = f.guard();
         expect(result.hold).toBe(false);
         expect(result.line).toContain('mq-same-head-retry:');
@@ -933,8 +933,9 @@ describe('merge-queue same-head failure admission', () => {
           ? 'failed_checks infrastructure retry 1/1 (INFRA: CI / integration; PR CLEAN)'
           : 'failed_checks cancelled/regroup retry 1/2 (no failed required job; cancelled: CI / integration; aggregate derived: CI / test; PR CLEAN)');
         expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
-          && !args.some(arg => arg.includes('/workflows/') || arg.includes('/logs')))).toBe(true);
-        expect(f.mainReads).toBeUndefined();
+          && !args.some(arg => arg.includes('/logs')))).toBe(true);
+        if (conclusion === 'cancelled') expect(f.mainReads).toBe(2);
+        else expect(f.mainReads).toBeUndefined();
       }));
     it.each(['intrinsic step', 'missing steps', 'wrong job id', 'wrong commit', 'wrong job name',
       'wrong status', 'wrong conclusion', 'unreadable metadata', 'missing details URL', 'foreign details URL'])(
@@ -1073,12 +1074,12 @@ describe('merge-queue same-head failure admission', () => {
           details_url: `https://github.com/${repo}/actions/runs/500/job/${9100 + i}`,
         }));
         f.checks.push(checks[1]);
-        f.mainError = true;
         const result = f.guard();
         expect(result.hold).toBe(count > 10);
         if (count > 10) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
         else expect(result.line).toContain('infrastructure retry 1/1');
-        expect(f.mainReads).toBeUndefined();
+        if (count > 10) expect(f.mainReads).toBeUndefined();
+        else expect(f.mainReads).toBe(2);
         expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
       });
     });
@@ -1091,7 +1092,7 @@ describe('merge-queue same-head failure admission', () => {
         expect(result.hold).toBe(true);
         expect(result.line).toMatch(/already spent: 1\/1.*operator must inspect/);
         expect(f.log.mock.calls.some(([line]) => line.startsWith('mq-infra-requeue-exhausted:'))).toBe(true);
-        expect(f.mainReads).toBeUndefined();
+        expect(f.mainReads).toBe(2);
       });
     });
     it('cancelled/regroup still holds past two failed removals even with fewer than two re-enqueues', () => {
@@ -1124,7 +1125,7 @@ describe('merge-queue same-head failure admission', () => {
           const result = f.guard();
           expect(result.hold).toBe(true);
           expect(result.line).toContain('infrastructure requeue already spent: 1/1');
-          expect(f.mainReads).toBeUndefined();
+          expect(f.mainReads).toBe(2);
         });
       } finally {
         if (previous === undefined) delete process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX;
@@ -1145,7 +1146,7 @@ describe('merge-queue same-head failure admission', () => {
         expect(f.guard().hold).toBe(true);
         if (kind === 'not CLEAN' || kind === 'unreadable PR state') {
           expect(f.log.mock.calls[1][0]).toMatch(/PR is not CLEAN/);
-          expect(f.mainReads).toBeUndefined();
+          expect(f.mainReads).toBe(2);
         }
       }));
     it.each([['title', 'Runner disconnected'], ['summary', 'Lost communication with worker'],
@@ -1157,7 +1158,7 @@ describe('merge-queue same-head failure admission', () => {
         steps: [{ name: 'Run', status: 'completed', conclusion: 'success' }] };
       f.jobLog = 'Execution interrupted by runner loss.';
       expect(f.guard().hold).toBe(false);
-      expect(f.log.mock.calls).toEqual([[`mq-same-head-retry: #${pr} head ${head} — failed_checks infrastructure retry 1/1 (INFRA: CI / integration; PR CLEAN)`]]);
+      expect(f.log.mock.calls).toEqual([[`mq-same-head-retry: #${pr} head ${head} — failed_checks infrastructure retry 1/1 (INFRA: CI / integration; PR CLEAN); main run 12`]]);
     }));
     it('guard holds when any failed check is a real test failure', () => fixture(f => {
       f.checks.push({ id: 22, status: 'completed', conclusion: 'failure', output: { title: 'Assertion failed', summary: 'expected 1 to equal 2' } });

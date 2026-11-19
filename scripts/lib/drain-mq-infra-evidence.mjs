@@ -6,7 +6,7 @@ const passing = new Set(['success', 'neutral', 'skipped']);
 const cancelled = new Set(['cancelled', 'timed_out']);
 const runnerLoss = /\blost communication\b|\b(?:self-hosted[ \t]+)?runner[ \t]+(?:(?:has|was|is)[ \t]+)?(?:disconnected|went away|lost connection|stopped responding|failed to (?:start|connect))\b/i;
 const timeout = /\b(?:job|execution|operation) (?:has )?(?:exceeded|timed out)|\bexceeded (?:the )?(?:maximum execution time|time limit)|\bjob was canceled because it exceeded\b/i;
-const intrinsicFailure = /\bFAIL\b|assert|\bexpected\b|\bexpect\(|\bfailing tests?\b|process completed with exit code [1-9]\d*/i;
+const intrinsicFailure = /assert|expected|\bexpect\(|\btests?\b|✗|×|\bFAIL\b|process completed with exit code [1-9]\d*/i;
 const summarySteps = new Map([['test', 'Gate on shard results'], ['coverage-merge', 'Require successful shards']]);
 const local = name => typeof name === 'string' ? name.split(' / ').at(-1) : name;
 const stamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
@@ -22,11 +22,11 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
   // A merge-gate HOLD has its own whole-log/freeze proof and still requires main green.
   if (failed.some(check => local(check.name) === 'merge-gate' && check.conclusion === 'failure')) return undefined;
   const decline = why => ({ logReason: `${why}; operator must inspect failed jobs and enqueue manually` });
-  let candidate = failed.some(check => cancelled.has(check.conclusion) || infraText(outputText(check))
+  const candidate = failed.some(check => cancelled.has(check.conclusion) || infraText(outputText(check))
     || !aggregateJobs.includes(local(check.name)) && check.output?.annotations_count > 0);
-  const jobs = new Map();
   let workflow;
   const durationTimeout = job => {
+    if (!cancelled.has(job.conclusion) || job.steps.some(step => step.conclusion === 'failure')) return false;
     const start = stamp(job?.started_at), end = stamp(job?.completed_at);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return false;
     if (!workflow) {
@@ -46,19 +46,6 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
     const minutes = matches.length === 1 ? matches[0][1]['timeout-minutes'] : null;
     return typeof minutes === 'number' && Number.isFinite(minutes) && minutes > 0 && end - start >= minutes * 60_000;
   };
-  if (!candidate && failed.length <= 10) {
-    // Discover duration-only timeouts without replacing unrelated legacy evidence (quarantine,
-    // exact-test, main-red, etc.) when no infrastructure conclusion/annotation can be proved.
-    try {
-      for (const check of failed.filter(check => check.conclusion === 'failure' && !aggregateJobs.includes(local(check.name)))) {
-        const identity = mqActionsJob(check, repo);
-        if (!identity) continue;
-        const job = readJson(`actions/jobs/${identity.id}`);
-        jobs.set(identity.id, job);
-        if (durationTimeout(job)) { candidate = true; break; }
-      }
-    } catch { /* No duration proof; retain the separate legacy evidence guards. */ }
-  }
   if (!candidate) return undefined;
   if (failed.length > 10) return decline('failed-job count exceeds 10-job limit');
   if (checks.some(check => check.status !== 'completed')) return decline('job evidence unreadable or incomplete');
@@ -72,7 +59,7 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
     const infraNames = [], derivedNames = [];
     for (const check of failed) {
       const identity = mqActionsJob(check, repo);
-      const job = jobs.get(identity.id) ?? readJson(`actions/jobs/${identity.id}`);
+      const job = readJson(`actions/jobs/${identity.id}`);
       if (!runs.has(identity.run)) runs.set(identity.run, readJson(`actions/runs/${identity.run}`));
       const run = runs.get(identity.run);
       const start = stamp(job?.started_at), end = stamp(job?.completed_at);
@@ -100,30 +87,30 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
         derivedRuns.add(run.id);
         continue;
       }
-      // Even cancellation must not conceal an intrinsic failing step.
-      if (cancelled.has(job.conclusion) && job.steps.some(step => step.conclusion === 'failure')
-        || intrinsicFailure.test(outputText(check)))
-        return decline('non-infrastructure failed job');
-      if (!cancelled.has(job.conclusion)) {
-        let annotationText = '';
-        const count = check.output?.annotations_count ?? 0;
-        if (!Number.isSafeInteger(count) || count < 0 || count > 100)
-          return decline('annotation evidence exceeds 100-entry limit or is incomplete');
-        if (count) {
-          const annotations = readJson(`check-runs/${check.id}/annotations?per_page=100`);
-          if (!Array.isArray(annotations) || annotations.length !== count
-            || annotations.some(annotation => typeof annotation?.message !== 'string'))
-            return decline('annotation evidence unreadable or incomplete');
-          annotationText = annotations.map(annotation => annotation.message).join('\n');
-        }
-        const text = `${outputText(check)}\n${annotationText}`;
-        if (intrinsicFailure.test(text) || !(infraText(text) || durationTimeout(job)))
-          return decline('non-infrastructure failed job');
-        // Failure conclusions require a whole bounded log: a FAIL/exit-1 line vetoes infrastructure hints.
+      if (intrinsicFailure.test(outputText(check))) return decline('non-infrastructure failed job');
+      let annotationText = '';
+      const count = check.output?.annotations_count ?? 0;
+      if (!Number.isSafeInteger(count) || count < 0 || count > 100)
+        return decline('annotation evidence exceeds 100-entry limit or is incomplete');
+      if (count) {
+        const annotations = readJson(`check-runs/${check.id}/annotations?per_page=100`);
+        if (!Array.isArray(annotations) || annotations.length !== count
+          || annotations.some(annotation => typeof annotation?.message !== 'string'))
+          return decline('annotation evidence unreadable or incomplete');
+        annotationText = annotations.map(annotation => annotation.message).join('\n');
+      }
+      const text = `${outputText(check)}\n${annotationText}`;
+      if (intrinsicFailure.test(text)) return decline('non-infrastructure failed job');
+      const needsText = !cancelled.has(job.conclusion) || job.steps.some(step => step.conclusion === 'failure');
+      if (needsText) {
+        // Failure conclusions/steps require positive text and a whole bounded log; elapsed time cannot suffice.
         const log = readLog(`actions/jobs/${identity.id}/logs`);
         if (typeof log !== 'string' || !log.trim() || Buffer.byteLength(log) >= 4 * 1024 * 1024)
           return decline('job log evidence unreadable or incomplete');
-        if (intrinsicFailure.test(log)) return decline('non-infrastructure failed job');
+        if (intrinsicFailure.test(log) || !(infraText(text) || infraText(log)))
+          return decline('non-infrastructure failed job');
+      } else if (!(infraText(text) || job.steps.some(step => cancelled.has(step.conclusion)) || durationTimeout(job))) {
+        return decline('non-infrastructure failed job');
       }
       infraNames.push(check.name);
       intrinsicRuns.add(run.id);

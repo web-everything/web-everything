@@ -16,6 +16,8 @@ export function infraFixture(guard, { checkConclusion = 'timed_out' } = {}) {
   const f = {
     events: [added(), removal()], calls: [], lines: [], live: { headRefOid: head, mergeStateStatus: 'CLEAN' },
     checks: [check(1, 'integration', 135261064381, checkConclusion), check(2, 'test', 135269693446, 'failure')],
+    mainRuns: [{ id: 9, run_attempt: 1, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
+      status: 'completed', conclusion: 'success', created_at: '2026-11-18T00:00:00Z', updated_at: '2026-11-18T00:30:00Z' }],
     jobs: {}, runs: {}, logs: {}, annotations: [], workflow: 'jobs:\n  integration:\n    timeout-minutes: 20\n',
   };
   const job = (id, name, conclusion, steps) => ({ id, name, head_sha: commit, run_id: 44434828048,
@@ -53,10 +55,16 @@ export function infraFixture(guard, { checkConclusion = 'timed_out' } = {}) {
     if (path?.startsWith('check-runs/')) return JSON.stringify(f.annotations);
     if (path === `contents/.github/workflows/ci.yml?ref=${commit}`) return JSON.stringify({ type: 'file', encoding: 'base64',
       size: Buffer.byteLength(f.workflow), content: Buffer.from(f.workflow).toString('base64') });
-    // A deliberately red main demonstrates the legacy decline and must never authorize the new route.
-    if (path?.startsWith('actions/workflows/ci.yml/runs?')) return JSON.stringify({ total_count: 1,
-      workflow_runs: [{ id: 9, run_attempt: 1, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
-        status: 'completed', conclusion: 'failure', created_at: '2026-11-18T00:00:00Z', updated_at: '2026-11-18T00:30:00Z' }] });
+    if (path?.startsWith('actions/workflows/ci.yml/runs?')) {
+      if (f.mainError) throw new Error('main CI unavailable');
+      const query = new URLSearchParams(path.split('?')[1]);
+      let runs = [...f.mainRuns];
+      if (query.get('status')) runs = runs.filter(run => run.status === query.get('status'));
+      const before = query.get('created');
+      if (before?.startsWith('<')) runs = runs.filter(run => Date.parse(run.created_at) < Date.parse(before.slice(1)));
+      runs.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
+      return JSON.stringify({ total_count: f.mainTotal ?? runs.length, workflow_runs: runs.slice(0, 100) });
+    }
     throw new Error(`unexpected fixture IO: ${JSON.stringify(args)}`);
   };
   f.guard = () => guard({ repo, pr: 7103, head, exec: f.exec, log: line => f.lines.push(line),

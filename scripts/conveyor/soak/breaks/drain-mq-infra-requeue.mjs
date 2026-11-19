@@ -40,6 +40,38 @@ export default {
     const unreadable = infraFixture(mqSameHeadGuard);
     delete unreadable.jobs[135261064381];
     if (!unreadable.guard().hold) violations.push('unreadable job evidence authorized requeue');
+    const red = infraFixture(mqSameHeadGuard);
+    red.mainRuns[0].conclusion = 'failure';
+    if (!red.guard().hold || !red.lines.some(line => line.includes('main CI is failing')))
+      violations.push('real failing main did not veto infrastructure retry with a main reason');
+    red.mainRuns.unshift({ ...red.mainRuns[0], id: 10, conclusion: 'timed_out',
+      created_at: '2026-11-18T01:40:00Z', updated_at: '2026-11-18T01:50:00Z' });
+    if (!red.guard().hold) violations.push('newer timed-out main run concealed a real main failure');
+    const cancelledMain = infraFixture(mqSameHeadGuard);
+    cancelledMain.mainRuns[0].conclusion = 'cancelled';
+    if (cancelledMain.guard().hold) violations.push('infra-only main cancellation blocked infrastructure retry');
+    for (const [source, failure] of [['output', 'Runner lost connection tests: 1 failed'],
+      ['annotations', '✗ integration suite: 1 failed'], ['logs', '× integration suite: 1 failed']]) {
+      const mixed = infraFixture(mqSameHeadGuard);
+      mixed.checks[0].conclusion = mixed.jobs[135261064381].conclusion = 'failure';
+      mixed.jobs[135261064381].steps[1].conclusion = 'failure';
+      mixed.checks[0].output.summary = 'Runner lost connection';
+      mixed.logs[135261064381] = 'Execution interrupted.';
+      if (source === 'output') mixed.checks[0].output.summary = failure;
+      if (source === 'annotations') {
+        mixed.checks[0].output.annotations_count = 1;
+        mixed.annotations = [{ message: failure }];
+      }
+      if (source === 'logs') mixed.logs[135261064381] = failure;
+      if (!mixed.guard().hold) violations.push(`test failure in ${source} authorized infrastructure retry`);
+    }
+    const duration = infraFixture(mqSameHeadGuard);
+    duration.checks[0].conclusion = duration.jobs[135261064381].conclusion = 'failure';
+    duration.jobs[135261064381].steps[1].conclusion = 'failure';
+    duration.checks[0].output.annotations_count = 1;
+    duration.annotations = [{ message: 'Error: invalid configuration' }];
+    duration.logs[135261064381] = 'Error: invalid configuration';
+    if (!duration.guard().hold) violations.push('duration alone authorized a failed job without timeout text');
     return { violations };
   },
   judge(report) { return report.violations; },

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { mqSameHeadGuard } from '../drain-queue-safety.mjs';
+import { decideMqSameHead, mqSameHeadGuard } from '../drain-queue-safety.mjs';
 import { added, head, infraFixture } from './fixtures/drain-mq-infra.mjs';
 
 describe('merge-group infrastructure same-head requeue', () => {
@@ -20,6 +20,7 @@ describe('merge-group infrastructure same-head requeue', () => {
       writeFileSync(file, source);
       const legacy = await import(/* @vite-ignore */ pathToFileURL(file).href);
       const f = infraFixture(legacy.mqSameHeadGuard);
+      f.mainRuns[0].conclusion = 'failure';
       f.logs[135261064381] = 'Real-git integration suite\n';
       expect(f.guard().hold).toBe(true);
       expect(f.lines[1]).toBe(`mq-same-head-retry-declined: #7103 head ${head} — main CI is not green (newest completed run 9 concluded failure); failed check(s): integration, test; derived aggregates skipped: test; main run 9`);
@@ -29,14 +30,55 @@ describe('merge-group infrastructure same-head requeue', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it.each(['cancelled', 'timed_out'])('re-enqueues once for a 20-minute cancelled job, %s check and derived test, despite red main', conclusion => {
+  it.each(['cancelled', 'timed_out'])('re-enqueues once for a 20-minute cancelled job, %s check and derived test, with green main', conclusion => {
     const f = infraFixture(mqSameHeadGuard, { checkConclusion: conclusion });
     expect(f.guard().hold).toBe(false);
     expect(f.lines).toEqual([expect.stringMatching(/^mq-same-head-retry:.*infrastructure retry 1\/1.*INFRA: integration.*derived aggregates skipped: test/)]);
-    expect(f.calls.some(([, args]) => args.some(arg => /workflows\/ci.yml|\/logs|POST/.test(arg)))).toBe(false);
-    expect(f.calls.length).toBeLessThanOrEqual(8);
+    expect(f.calls.some(([, args]) => args.some(arg => /\/logs|POST/.test(arg)))).toBe(false);
+    expect(f.calls.filter(([, args]) => args[1]?.includes('/actions/workflows/'))).toHaveLength(2);
+    expect(f.calls.length).toBeLessThanOrEqual(11);
     f.events.push(added());
     expect(f.guard().hold).toBe(true); // A manual withdrawal cannot restore the allowance.
+  });
+
+  it.each([undefined, false])('holds infrastructure evidence without affirmative main safety (%s)', mainNotFailing => {
+    const f = infraFixture(mqSameHeadGuard);
+    expect(decideMqSameHead({ pr: 7103, head, timeline: { nodes: f.events, hasPreviousPage: false },
+      retryEvidence: { infra: 'infra-jobs', infraNames: ['integration'], mergeState: 'CLEAN', mainNotFailing } }).hold).toBe(true);
+  });
+
+  it.each(['success', 'cancelled', 'timed_out', 'in_progress'])('retries once when newest main run is %s', state => {
+    const f = infraFixture(mqSameHeadGuard);
+    f.mainRuns[0].conclusion = state === 'in_progress' ? null : state;
+    f.mainRuns[0].status = state === 'in_progress' ? state : 'completed';
+    expect(f.guard().hold).toBe(false);
+    expect(f.calls.filter(([, args]) => args[1]?.includes('/actions/workflows/'))).toHaveLength(2);
+    f.secondFailure();
+    expect(f.guard().hold).toBe(true);
+  });
+
+  it.each(['failure', 'cancelled', 'timed_out', 'in_progress'])('holds real failing main even with a newer %s run', state => {
+    const f = infraFixture(mqSameHeadGuard);
+    f.mainRuns[0].conclusion = 'failure';
+    if (state !== 'failure') f.mainRuns.unshift({ ...f.mainRuns[0], id: 10,
+      status: state === 'in_progress' ? state : 'completed', conclusion: state === 'in_progress' ? null : state,
+      created_at: '2026-11-18T01:40:00Z', updated_at: '2026-11-18T01:50:00Z' });
+    expect(f.guard().hold).toBe(true);
+    expect(f.lines.join('\n')).toContain('main CI is failing (newest completed run 9 concluded failure)');
+    expect(f.lines.some(line => line.startsWith('mq-same-head-retry:'))).toBe(false);
+  });
+
+  it.each([
+    ['unreadable', f => { f.mainError = true; }],
+    ['incomplete', f => { f.mainTotal = 2; }],
+    ['malformed', f => { f.mainRuns[0].path = 'other.yml'; }],
+    ['missing', f => { f.mainRuns = []; }],
+  ])('holds %s main CI evidence and names the manual fallback', (_kind, change) => {
+    const f = infraFixture(mqSameHeadGuard);
+    change(f);
+    expect(f.guard().hold).toBe(true);
+    expect(f.lines.join('\n')).toContain('main CI evidence unreadable or incomplete');
+    expect(f.lines.join('\n')).toContain('operator must inspect main CI and enqueue manually');
   });
 
   it('holds the second infrastructure failure on the same head and alerts on the existing log channel', () => {
@@ -52,13 +94,13 @@ describe('merge-group infrastructure same-head requeue', () => {
     expect(f.lines.filter(line => line.startsWith('mq-same-head-retry:'))).toHaveLength(1);
   });
 
-  it('retries a pure cancellation without aggregates once without consulting main', () => {
+  it('retries a pure cancellation without aggregates once after consulting main', () => {
     const f = infraFixture(mqSameHeadGuard, { checkConclusion: 'cancelled' });
     f.checks.pop();
     expect(f.guard().hold).toBe(false);
     f.secondFailure();
     expect(f.guard().hold).toBe(true);
-    expect(f.calls.some(([, args]) => args[1]?.includes('/workflows/'))).toBe(false);
+    expect(f.calls.some(([, args]) => args[1]?.includes('/actions/workflows/'))).toBe(true);
   });
 
   it('accepts a complete run finalized after ejection while all failed jobs and checks finished before it', () => {
@@ -98,31 +140,74 @@ describe('merge-group infrastructure same-head requeue', () => {
     expect(f.guard().hold).toBe(true);
   });
 
-  it.each(['annotation', 'duration'])('recognizes timeout %s evidence while rejecting unreadable evidence', kind => {
+  it.each(['annotation', 'log'])('recognizes positive timeout %s evidence while rejecting unreadable evidence', kind => {
     const f = infraFixture(mqSameHeadGuard);
     f.checks[0].conclusion = f.jobs[135261064381].conclusion = 'failure';
+    f.jobs[135261064381].steps[1].conclusion = 'failure';
     f.checks[0].output.annotations_count = 1;
     f.annotations = [{ message: kind === 'annotation' ? 'The job has exceeded the time limit' : 'Execution interrupted' }];
-    f.logs[135261064381] = 'Execution interrupted.';
+    f.logs[135261064381] = kind === 'log' ? 'The job has exceeded the time limit' : 'Execution interrupted.';
     expect(f.guard().hold).toBe(false);
     f.annotations = [];
     expect(f.guard().hold).toBe(true);
   });
 
-  it('recognizes a duration-only timeout using timeout-minutes from the tested workflow', () => {
-    const f = infraFixture(mqSameHeadGuard);
-    f.checks[0].conclusion = f.jobs[135261064381].conclusion = 'failure';
-    f.logs[135261064381] = 'Execution interrupted.';
+  it.each(['cancelled', 'timed_out'])('recognizes duration-only %s without failed steps using the tested workflow timeout', conclusion => {
+    const f = infraFixture(mqSameHeadGuard, { checkConclusion: conclusion });
+    f.jobs[135261064381].conclusion = conclusion;
     expect(f.guard().hold).toBe(false);
+    expect(f.calls.some(([, args]) => args[1]?.includes('contents/.github/workflows/ci.yml?ref='))).toBe(true);
     f.workflow = 'jobs:\n  integration:\n    timeout-minutes: 25\n';
     expect(f.guard().hold).toBe(true);
   });
 
+  it.each([
+    ['failure', false], ['failure', true], ['cancelled', true], ['timed_out', true],
+  ])('holds elapsed-time-only %s with failed step=%s and invalid configuration', (conclusion, failedStep) => {
+    const f = infraFixture(mqSameHeadGuard, { checkConclusion: conclusion });
+    f.jobs[135261064381].conclusion = conclusion;
+    if (failedStep) f.jobs[135261064381].steps[1].conclusion = 'failure';
+    f.checks[0].output.annotations_count = 1;
+    f.annotations = [{ message: 'Error: invalid configuration' }];
+    f.logs[135261064381] = 'Error: invalid configuration';
+    expect(f.guard().hold).toBe(true);
+    expect(f.lines.join('\n')).toContain('non-infrastructure failed job');
+    expect(f.calls.some(([, args]) => args[1]?.includes('contents/.github/workflows/ci.yml?ref='))).toBe(false);
+  });
+
+  it.each(['failure', 'cancelled', 'timed_out'])('accepts positive timeout text for %s with a failed step and no test failure', conclusion => {
+    const f = infraFixture(mqSameHeadGuard, { checkConclusion: conclusion });
+    f.jobs[135261064381].conclusion = conclusion;
+    f.jobs[135261064381].steps[1].conclusion = 'failure';
+    f.checks[0].output.summary = 'The job has exceeded the time limit';
+    f.logs[135261064381] = 'Execution interrupted.';
+    expect(f.guard().hold).toBe(false);
+    f.secondFailure();
+    expect(f.guard().hold).toBe(true);
+  });
+
+  describe.each(['output', 'annotations', 'logs'])('intrinsic failure veto in %s', source => {
+    it.each(['assert', 'unexpected', 'expect(', 'test: 1 failed', 'tests: 1 failed', '✗ integration suite: 1 failed',
+      '× integration suite: 1 failed', 'FAIL', 'Process completed with exit code 1'])('holds runner loss accompanied by %s', failure => {
+      const f = infraFixture(mqSameHeadGuard);
+      f.checks[0].conclusion = f.jobs[135261064381].conclusion = 'failure';
+      f.jobs[135261064381].steps[1].conclusion = 'failure';
+      f.checks[0].output.summary = 'Runner lost connection';
+      f.logs[135261064381] = 'Execution interrupted.';
+      if (source === 'output') f.checks[0].output.summary += ` ${failure}`;
+      if (source === 'annotations') {
+        f.checks[0].output.annotations_count = 1;
+        f.annotations = [{ message: failure }];
+      }
+      if (source === 'logs') f.logs[135261064381] += `\n${failure}`;
+      expect(f.guard().hold).toBe(true);
+      expect(f.lines.join('\n')).toContain('non-infrastructure failed job');
+      expect(f.lines.some(line => line.startsWith('mq-same-head-retry:'))).toBe(false);
+    });
+  });
+
   it('holds an oversized workflow timeout definition and names the manual fallback', () => {
     const f = infraFixture(mqSameHeadGuard);
-    f.checks[0].conclusion = f.jobs[135261064381].conclusion = 'failure';
-    f.checks[0].output.annotations_count = 1;
-    f.annotations = [{ message: 'Execution interrupted' }];
     f.workflow = '#'.repeat(128 * 1024 + 1);
     expect(f.guard().hold).toBe(true);
     expect(f.lines.join('\n')).toContain('128-KiB limit or is incomplete; operator must inspect');
