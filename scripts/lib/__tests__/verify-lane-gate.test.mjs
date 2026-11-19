@@ -1310,7 +1310,8 @@ describe('explicit-list sharding', () => {
       const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/deep.test.mjs': "import './mid.mjs'", 'guard.test.mjs': '// guard' };
       for (let i = 0; i < 24; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
       for (const [file, content] of Object.entries(files)) writeFileSync(join(repo, file), content);
-      const env = { ...process.env, WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected',
+      // Model a bounded local gate in both child checkouts, even when this fixture runs in CI.
+      const env = { ...process.env, CI: '', GITHUB_ACTIONS: '', WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected',
         WE_VERIFY_SELECTION: 'pr', WE_VERIFY_RELATED: 'all', WE_VERIFY_RELATED_MAX_TESTS: '1', WE_VERIFY_RELATED_DEPTH: '2',
         WE_VERIFY_TEST_TIMEOUT_FACTOR: '1', WE_VERIFY_STANDARDS: 'ci-only', WE_VERIFY_REVERT_RED: 'off',
         WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3',
