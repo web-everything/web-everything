@@ -4813,19 +4813,27 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Audit convergence evidence (R1081)
 
-Convergence anchors only to the latest appended full-ledger record for the ref. Converge
-records are write-only and never influence selection, even at a newer or descendant head.
-Validate the anchor's full mode (or absent mode), current canonical question hash, verdict,
-non-conflicting string findings, commit SHAs and timestamp (at most five minutes ahead).
-A WEAKENED anchor without findings fails closed with exit 3; malformed evidence requires a
-retry or human review of the full diff. Missing anchors, exact-head anchors, rebased heads,
-backward bases or a base outside head ancestry require a full audit (exit 2).
+Convergence uses every full-ledger record for the ref whose head is an ancestor of the
+requested head; the latest appended qualifying record anchors the delta. Converge records
+are write-only and never influence selection. Validate every used record's full mode (or
+absent mode), current canonical question hash, verdict, non-conflicting string findings,
+commit SHAs and timestamp (at most five minutes ahead). A WEAKENED record without findings
+fails closed with exit 3; malformed evidence requires retry or human review of the full diff.
+An unreadable candidate head also fails closed rather than silently excluding its findings.
+Missing anchors, exact-head anchors, no ancestral heads, backward requested bases or a
+requested base outside head ancestry require a full audit (exit 2). Independently require
+`isAncestor(record.base, record.head)` for every used record (exit 2 on false), plus the
+anchor's head-to-head and anchor.base-to-requested-base-to-head ancestry checks.
 
-Every round reviews the unrestricted `git diff --no-renames <anchor.head> <head>` and every
-anchor finding, including findings marked FIXED in earlier converge rounds. The command
-contains only validated SHAs and stays outside the untrusted findings fence. Each anchor
-finding needs exactly one exact-text FIXED/OPEN disposition; NEW reports delta weakening.
-Missing, duplicate, unknown or unprefixed dispositions and inconsistent verdicts fail closed.
+Every round reviews the unrestricted `git diff --no-renames <anchor.head> <head>` and the
+exact-text deduplicated union of every used record's findings, including previously FIXED
+findings. An older broad audit's findings survive a later audit with a narrower base and
+fewer findings. Cite each source record's timestamp and head inside the untrusted findings
+fence; keep the validated delta command outside it. Every distinct finding needs exactly
+one exact-text FIXED/OPEN disposition; NEW reports delta weakening. Missing, duplicate,
+unknown or unprefixed dispositions and inconsistent verdicts fail closed. Named tests cover
+the narrowed-base union, cross-record deduplication, malformed older members and invalid
+base/head lineage for both anchors and older members, asserting the ancestry calls.
 Keep these paths covered in `codex-audit-converge.test.mjs`; real Git regressions in
 `codex-audit-io-real.test.mjs` cover forward/backward bases, reverted guards, renames and
 `<material>.mjs` remaining in scope even when the requested base advances to head.

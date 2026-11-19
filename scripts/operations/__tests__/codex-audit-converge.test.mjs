@@ -39,7 +39,7 @@ describe('R1081 converge rounds', () => {
     expect(prompt).not.toContain(`git diff ${BASE}...${HEAD}`);
     expect(prompt).not.toContain('Judge the WHOLE diff');
     expect(prompt).toContain(`full audit ${original.at} on ${PRIOR}`);
-    expect(prompt).toContain(`<findings>\n${finding}\n</findings>`);
+    expect(prompt).toContain(`<findings>\nFindings from full audit ${original.at} on ${PRIOR}:\n${finding}\n</findings>`);
     expect(prompt).not.toContain('<material>');
     expect(f.deps.readRecords.mock.calls).toEqual([['audits.jsonl']]);
     expect(f.deps.isAncestor).toHaveBeenCalledWith(PRIOR, HEAD);
@@ -166,11 +166,69 @@ describe('R1081 converge rounds', () => {
   });
 
   it('anchors to the latest appended full record for the ref', async () => {
-    const f = fixture('NOT WEAKENED\nFIXED: latest:1 gap');
+    const f = fixture(`NOT WEAKENED\nFIXED: ${finding}\nFIXED: latest:1 gap`);
     f.full.push({ ...original, mode: 'full', head: PRIOR, at: '2026-11-16T00:00:00Z', findings: ['latest:1 gap'] });
     f.full.push({ ...original, ref: 'lane/other', head: HEAD });
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.converge[0].priorAt).toBe('2026-11-16T00:00:00Z');
+  });
+
+  it('keeps the exact-text union from an older broad audit when the latest audit narrows its base', async () => {
+    const narrowBase = 'ab'.repeat(20), anchorHead = 'bc'.repeat(20);
+    const f = fixture();
+    const latest = { ...original, mode: 'full', base: narrowBase, head: anchorHead,
+      at: '2026-11-17T12:00:00Z', findings: ['latest:1 gap', 'latest:1 gap'] };
+    f.full.push(latest);
+    f.deps.resolveSha.mockImplementation(ref => ref === 'origin/main' ? narrowBase : ref);
+    // Disposing only the latest audit's finding must fail closed.
+    f.deps.runCodex.mockReturnValue('NOT WEAKENED\nFIXED: latest:1 gap');
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.converge).toEqual([]);
+    f.deps.runCodex.mockReturnValue(`WEAKENED\nOPEN: ${finding}\nFIXED: latest:1 gap`);
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.converge[0].priorHead).toBe(anchorHead);
+    const prompt = f.deps.runCodex.mock.calls[1][0];
+    expect(prompt).toContain(`git diff --no-renames ${anchorHead} ${HEAD}`);
+    const fenced = prompt.split('<findings>\n')[1].split('\n</findings>')[0];
+    for (const record of [original, latest]) {
+      expect(fenced).toContain(`full audit ${record.at} on ${record.head}:`);
+      for (const text of record.findings) expect(fenced).toContain(text);
+    }
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(BASE, PRIOR);
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(narrowBase, anchorHead);
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(narrowBase, narrowBase);
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(narrowBase, HEAD);
+    f.deps.runCodex.mockReturnValue(`WEAKENED\nOPEN: ${finding}\nFIXED: latest:1 gap\nOPEN: latest:1 gap`);
+    expect(await main(ARGS, f.deps)).toBe(3);
+  });
+
+  it('deduplicates identical findings across full records into exactly one disposition', async () => {
+    const f = fixture(); f.full.push({ ...original, mode: 'full' });
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.converge[0].findings).toEqual([`FIXED: ${finding}`]);
+  });
+
+  it.each([false, true])('refuses invalid record base/head ancestry in an older union member=%s', async older => {
+    const f = fixture();
+    if (older) f.full.push({ ...original, head: 'bc'.repeat(20) });
+    f.deps.isAncestor.mockImplementation((a, b) => !(a === BASE && b === PRIOR));
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.deps.isAncestor.mock.calls).toEqual([[PRIOR, HEAD], [BASE, PRIOR]]);
+    expect(f.err.join('')).toContain('run a full audit');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { base: 'bad' }, { mode: 'converge' }, { questionHash: 'bad' }, { verdict: 'INVALID' },
+    { findings: null }, { findings: [null] }, { findings: [finding, 'NOT WEAKENED'] },
+    { findings: [] }, { at: 'bad' }, { at: '2026-11-18T00:05:00.001Z' },
+  ])('fails closed on malformed older ancestor union evidence %j', async over => {
+    const f = fixture(); f.full.unshift({ ...original, ...over });
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+    expect(f.err.join('')).toContain('human review of the full diff');
   });
 
   it.each(['0'.repeat(40), NEXT])('refuses backward or outside-head base %s with full-audit fallback', async base => {
