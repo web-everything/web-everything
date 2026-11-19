@@ -17,6 +17,8 @@ function ruleFor(name) {
     : Object.entries(registry).find(([pattern]) => pattern.endsWith('*') && name.startsWith(pattern.slice(0, -1)))?.[1];
 }
 const unclassified = names => names.filter(name => !ruleFor(name));
+const hasValueDecision = rule => !/value[\s-]*depend/i.test(rule.why)
+  || (Array.isArray(rule.restrictiveValues) && rule.restrictiveValues.length > 0) || rule.relaxOnly === true;
 function inventoryNames(result) {
   if (result.error || result.status !== 0) {
     throw Error(`env inventory incomplete; repair rg/read access or split the inventory for human review: ${result.error?.message ?? result.stderr}`);
@@ -48,17 +50,38 @@ describe('agent environment registry drift', () => {
   it('uses only the three classes, reasons, supported validators and exact or trailing-prefix names', () => {
     for (const [name, rule] of Object.entries(registry)) {
       expect(name).toMatch(/^[A-Za-z_][A-Za-z0-9_]*\*?$/);
-      expect(Object.keys(rule).every(key => ['class', 'why', 'value', 'restrictiveValues'].includes(key))).toBe(true);
+      expect(Object.keys(rule).every(key => ['class', 'why', 'value', 'restrictiveValues', 'relaxOnly'].includes(key))).toBe(true);
       // Value-gated vars are 'drop' by default; only their listed tightening values are forwarded.
       if (rule.restrictiveValues !== undefined) {
         expect(rule.class).toBe('drop');
+        expect(rule.restrictiveValues.length, name).toBeGreaterThan(0);
+        expect(new Set(rule.restrictiveValues).size, name).toBe(rule.restrictiveValues.length);
         expect(rule.restrictiveValues.every(v => typeof v === 'string' && v === v.trim().toLowerCase() && v)).toBe(true);
+        expect(rule.relaxOnly, name).toBeUndefined();
+      }
+      if (rule.relaxOnly !== undefined) {
+        expect(rule.relaxOnly, name).toBe(true);
+        expect(rule.class, name).toBe('drop');
       }
       expect(['forward-restrictive', 'forward', 'drop']).toContain(rule.class);
       expect(typeof rule.why === 'string' && rule.why.trim().length > 0).toBe(true);
       if (rule.value !== undefined) expect(rule.value).toBe('absolute-path');
     }
     expect(registry.LANE_POOL_ROOT.value).toBe('absolute-path');
+  });
+  it('requires an explicit tightening or relax-only decision for every value-dependent reason', () => {
+    for (const [name, rule] of Object.entries(registry)) expect(hasValueDecision(rule), name).toBe(true);
+    expect(hasValueDecision({ why: 'Value-dependent: 1 enables isolation' })).toBe(false);
+    expect(hasValueDecision({ why: 'Value dependence: policy changes', relaxOnly: false })).toBe(false);
+    expect(hasValueDecision({ why: 'Value-dependent', restrictiveValues: [] })).toBe(false);
+    expect(hasValueDecision({ why: 'Value-dependent', restrictiveValues: ['1'] })).toBe(true);
+    expect(hasValueDecision({ why: 'Value-dependent: no value tightens', relaxOnly: true })).toBe(true);
+  });
+  it('pins container isolation to the exact enabling strings accepted by heavy-admission', () => {
+    for (const name of ['WE_HEAVY_ADMISSION_CONTAINER', 'WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES']) {
+      expect(registry[name]).toMatchObject({ class: 'drop', restrictiveValues: ['1'] });
+      expect(registry[name].why).toMatch(/scripts\/readiness\/heavy-admission\.mjs:\d+/);
+    }
   });
   it('drops known executable, shell, escape-hatch and credential controls', () => {
     for (const name of ['NODE_OPTIONS', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'PATH', 'HOME', 'DYLD_INSERT_LIBRARIES',

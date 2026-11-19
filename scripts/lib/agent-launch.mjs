@@ -4,6 +4,9 @@
  * smuggling, expanded ids, accessors, Proxies, argv0, execPath/execArgv, runtime
  * env, shell env, HOME, mutation/aliasing) shared one root: inspected and executed
  * views differed. No caller argv, unclassified env, binary, or spawn options cross this boundary.
+ * Parent restrictions must survive projection: nonblank restrictive markers and only
+ * exact gh auth/throttle shim directories under the real account home survive. Other
+ * parent PATH entries cannot select executables; custom shims require pathPrefix.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
  */
 import { spawn } from 'node:child_process';
@@ -88,6 +91,7 @@ function envRecord(env) {
 // A value-dependent var (registry `restrictiveValues`) is forward-restrictive only when it holds one of
 // its tightening values (e.g. WE_GH_AUTH_PERSONAL_FALLBACK=refuse); any other value is dropped.
 function classOf(rule, value) {
+  if ((rule?.class === 'forward-restrictive' || rule?.restrictiveValues) && !String(value).trim()) return 'drop';
   if (Array.isArray(rule?.restrictiveValues)) {
     return rule.restrictiveValues.includes(String(value).trim().toLowerCase()) ? 'forward-restrictive' : 'drop';
   }
@@ -98,16 +102,19 @@ function inheritedEnv(inherit, ambient) {
   for (const [key, value] of Object.entries(inherit)) {
     const rule = envRule(key), cls = classOf(rule, value);
     if (cls === 'forward' || cls === 'forward-restrictive') {
-      out[key] = rule.value === 'absolute-path' ? absolute(value, key) : value;
+      out[key] = rule.value === 'absolute-path' ? absolute(value, key)
+        : rule.restrictiveValues ? value.trim().toLowerCase() : value;
     }
   }
   for (const [key, value] of Object.entries(ambient)) {
     const rule = envRule(key);
     if (classOf(rule, value) !== 'forward-restrictive') continue;
     // A malformed ambient isolation root is a refusal, even if the bag supplies another root.
-    const checked = rule.value === 'absolute-path' ? absolute(value, key) : value;
+    const checked = rule.value === 'absolute-path' ? absolute(value, key)
+      : rule.restrictiveValues ? value.trim().toLowerCase() : value;
     // The bag cannot remove a restriction: a dropped (relaxing) bag value yields to the ambient tightening one.
-    if (!Object.hasOwn(out, key)) out[key] = checked;
+    // Value-gated policies can have different tightening strengths; retain the parent's choice.
+    if (rule.restrictiveValues || !Object.hasOwn(out, key)) out[key] = checked;
   }
   return out;
 }
@@ -184,6 +191,19 @@ export function findAgentBinary(agent, dirs) {
   fail(`${agent} binary not found; install it in a well-known installation directory`);
 }
 
+/** Pure PATH projection; production supplies the real account home and snapshotted parent paths.
+ * Keep this exact structure aligned with gh-app-shim's defaultShimDir/checkoutShimDir.
+ */
+export function buildAgentPath({ parentPaths, home, pathPrefix, nodePath, binary }) {
+  const legacy = join(home, '.claude/github-app-token/gh-shim');
+  const checkouts = join(home, '.claude/github-app-token/gh-shim.d') + '/';
+  const restrictive = parentPaths.flatMap(path => String(path ?? '').split(':')).filter(dir =>
+    isAbsolute(dir) && !dir.split('/').includes('..')
+    && (dir === legacy || (dir.startsWith(checkouts) && /^[0-9a-f]{16}(?![\s\S])/.test(dir.slice(checkouts.length)))));
+  return [...new Set([...restrictive, pathPrefix, dirname(nodePath), ...FIXED_PATH.split(':'),
+    '/opt/homebrew/bin', '/usr/local/bin', dirname(binary)].filter(Boolean))].join(':');
+}
+
 /** Pure argv projection, retained for direct-task's existing argv consumers. */
 export function buildAgentArgs(descriptor) { return argsFrom(snapshot(descriptor)); }
 
@@ -197,7 +217,9 @@ export function buildAgentInvocation(descriptor, io) {
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }
   catch { fail('cwd must be an existing directory'); }
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
-  const env = { ...forwarded, PATH: [d.pathPrefix, FIXED_PATH, dirname(file)].filter(Boolean).join(':'), HOME: userInfo().homedir };
+  const home = userInfo().homedir;
+  const env = { ...forwarded, PATH: buildAgentPath({ parentPaths: [d.inheritEnv?.PATH, ambient.PATH],
+    home, pathPrefix: d.pathPrefix, nodePath: process.execPath, binary: file }), HOME: home };
   if (d.tempRoot !== undefined) for (const key of ['TMPDIR', 'TMP', 'TEMP']) env[key] = d.tempRoot;
   return { file, args, options: { shell: false, cwd: d.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: d.processGroup === true } };
 }

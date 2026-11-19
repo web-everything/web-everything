@@ -4828,3 +4828,25 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+
+## Launcher restriction projection (SEC1 S1 round 4)
+
+An explicit environment bag must not erase parent restrictions. Blank/whitespace restrictive
+markers count as absent, including isolation roots; malformed nonblank roots still refuse.
+Value-gated restrictions emit canonical trimmed lowercase values so exact-string consumers
+(such as heavy-admission container switches) receive an enabling value. An ambient gated
+restriction wins over a different bag mode because modes may have different strengths.
+
+The launcher PATH retains only exact gh auth/throttle shim directories under the real account
+home, in bag-then-ambient order, before an explicit pathPrefix, running Node directory, fixed
+system/Homebrew/local directories, and resolved agent directory. Keep the pure PATH fixture
+independent of host HOME and prove bare gh resolves to its first shim. Agent binary lookup
+still uses only the fixed installation search, independently of this child PATH.
+
+Audit every registry drop entry for tightening modes when updating the boundary. Reasons
+that mention value dependence require restrictiveValues or relaxOnly: true; relaxOnly means
+no value tightens the unset policy. Keep throughput tuning dropped. Record uncertain numeric
+or policy-relative guards explicitly rather than inventing thresholds or claiming relax-only.
+The launcher and registry regressions run with agent-launch-structure.test.mjs and
+codex-direct-task.test.mjs through host heavy-admission, never a bare test runner.
