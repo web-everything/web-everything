@@ -165,7 +165,8 @@ describe('acquire shared-list contention grace', () => {
     const first = seedClaimedPool();
     const marker = join(pool, 'lane-1', '.git', '.lane-lease');
     const lease = JSON.parse(readFileSync(marker, 'utf8'));
-    writeFileSync(marker, JSON.stringify({ ...lease, acquiredAt: '2000-01-01T00:00:00.000Z' }) + '\n');
+    // Model an abandoned holder, not the still-running test process.
+    writeFileSync(marker, JSON.stringify({ ...lease, pid: null, acquiredAt: '2000-01-01T00:00:00.000Z' }) + '\n');
     refreshCache();
     const second = acquire('first-holder');
     expect(second.lane).toBe(first.lane);

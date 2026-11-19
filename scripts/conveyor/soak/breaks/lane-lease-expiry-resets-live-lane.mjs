@@ -8,7 +8,7 @@ import { join } from 'node:path';
 export function replayExpiry(root) {
   const base = mkdtempSync(join(tmpdir(), 'soak-lease-expiry-'));
   const violations = [];
-  const git = args => execFileSync('git', args, { cwd: base, stdio: 'pipe', timeout: 5000 });
+  const git = args => execFileSync('git', args, { cwd: base, stdio: 'pipe', timeout: 5000, maxBuffer: 1024 * 1024 });
   try {
     const reference = join(base, 'reference'), pool = join(base, 'pool');
     const lane = join(pool, 'fixture', 'lane-1'), bin = join(base, 'bin');
