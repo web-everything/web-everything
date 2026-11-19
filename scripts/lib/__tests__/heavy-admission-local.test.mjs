@@ -1,12 +1,13 @@
 // @vitest-environment node
 /** `heavy-admission.mjs run --local`: run on this machine while still holding a LOCAL admission slot. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { main, heldSlots, tryAcquireSlot, shellQuoteWord, ADMISSION_DEFERRED_EXIT } from '../../readiness/heavy-admission.mjs';
 
-vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal(), execSync: vi.fn() }));
+vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal(), spawn: vi.fn() }));
 vi.mock('../host-load.mjs', async (importOriginal) => ({ ...await importOriginal(), hostLoadAdmission: vi.fn(() => ({ admitted: true })) }));
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
@@ -27,19 +28,35 @@ function setup(extraEnv = {}) {
     WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_VERIFY_REMOTE_REPORT: join(root, 'verify.jsonl'), ...extraEnv })) vi.stubEnv(k, v);
   return { root, lockRoot: join(pool, '.admission', 'heavy'), exited, exit, stderr, remoteExec: vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' })) };
 }
-const teardown = (s) => { vi.mocked(execSync).mockReset(); s.exit.mockRestore(); s.stderr.mockRestore(); vi.unstubAllEnvs(); };
+const teardown = (s) => { vi.mocked(spawn).mockReset(); s.exit.mockRestore(); s.stderr.mockRestore(); vi.unstubAllEnvs(); };
 
 describe('heavy-admission run --local', () => {
   it('runs locally while holding a local slot, logs its provenance, and never dispatches remotely', async () => {
     const s = setup(); let heldRow;
-    vi.mocked(execSync).mockImplementation(() => {
+    const shellSpawn = vi.fn(() => {
       heldRow = heldSlots({ lockRoot: s.lockRoot, cap: 2, fastSlots: 1 });
-      throw Object.assign(new Error('local exit'), { status: 17 });
+      const child = new EventEmitter();
+      child.pid = 123456;
+      queueMicrotask(() => {
+        child.emit('exit', 17, null);
+        child.emit('close', 17, null);
+      });
+      return child;
+    });
+    vi.mocked(spawn).mockImplementation((file, args, options) => {
+      if (file === '/bin/sh') return shellSpawn(file, args, options);
+      // Selected-file runs also spawn a detached timeout watchdog.
+      expect(file).toBe(process.execPath);
+      expect(args[0]).toBe('-e');
+      return { unref: vi.fn(), kill: vi.fn() };
     });
     try {
       await expect(main(['run', `--repo=${s.root}`, '--local', '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy })).rejects.toBe(s.exited);
       expect(s.remoteExec).not.toHaveBeenCalled();
-      expect(execSync).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({ cwd: s.root }));
+      expect(shellSpawn).toHaveBeenCalledTimes(1);
+      expect(shellSpawn).toHaveBeenCalledWith('/bin/sh', ['-c', argv.map(shellQuoteWord).join(' ')], expect.objectContaining({
+        cwd: s.root, stdio: 'inherit', env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
+      }));
       expect(heldRow).toHaveLength(1);
       expect(heldRow[0].meta.location).toBe('local');
       expect(s.stderr).toHaveBeenCalledWith(expect.stringContaining('location=local reason=--local'));
@@ -55,7 +72,7 @@ describe('heavy-admission run --local', () => {
     expect(heldSlots({ lockRoot: s.lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(3);
     try {
       await expect(main(['run', `--repo=${s.root}`, '--local', '--wait-ms=300', '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy })).rejects.toBe(s.exited);
-      expect(execSync).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
       expect(s.remoteExec).not.toHaveBeenCalled();
       expect(s.exit).toHaveBeenCalledWith(ADMISSION_DEFERRED_EXIT);
     } finally { teardown(s); }
@@ -66,7 +83,7 @@ describe('heavy-admission run --local', () => {
     try {
       await expect(main(['run', `--repo=${s.root}`, '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy })).rejects.toBe(s.exited);
       expect(s.remoteExec).toHaveBeenCalledTimes(1);
-      expect(execSync).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
       expect(s.exit).toHaveBeenCalledWith(23);
     } finally { teardown(s); }
   });
