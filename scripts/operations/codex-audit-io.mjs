@@ -34,6 +34,12 @@ export function resolveAuditRecordPath(settings, { home, cwd }) {
     : configured === '~' ? home : resolve(cwd, configured);
 }
 
+/** Separate convergence evidence from every full-audit consumer, even for a non-jsonl setting. */
+export function resolveConvergeRecordPath(settings, context) {
+  const path = resolveAuditRecordPath(settings, context);
+  return path.endsWith('.jsonl') ? path.slice(0, -6) + '-converge.jsonl' : path + '-converge.jsonl';
+}
+
 /** The launcher streams JSONL before its final (potentially pretty-printed) JSON report. */
 function readReport(stdout) {
   const text = String(stdout ?? '');
@@ -55,7 +61,24 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
     return result.stdout;
   };
+  const recordPath = () => resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+  const convergeRecordPath = () => resolveConvergeRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
   return {
+    recordPath, convergeRecordPath,
+    readRecords(path) {
+      let contents;
+      try { contents = fs.readFileSync(path, 'utf8'); }
+      catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
+      return contents.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+    },
+    refsPointingAt: head => run('git', ['for-each-ref', `--points-at=${head}`, '--format=%(refname:short)', 'refs/remotes/origin/'], 30_000)
+      .split(/\r?\n/).filter(Boolean).map(ref => ref.replace(/^origin\//, '')),
+    isAncestor(prior, head) {
+      const result = spawnSync('git', ['merge-base', '--is-ancestor', prior, head], { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000 });
+      if (result.error || ![0, 1].includes(result.status)) throw new Error('audit ancestry unavailable');
+      return result.status === 0;
+    },
+    deltaPaths: (base, head) => run('git', ['diff', '--name-only', '-z', `${base}...${head}`], 30_000).split('\0').filter(Boolean),
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
@@ -81,8 +104,8 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.rmSync(scratch, { recursive: true, force: true });
       }
     },
-    appendRecord(record) {
-      const path = resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+    appendRecord(record, path = recordPath()) {
+      if (record.mode === 'converge') path = convergeRecordPath();
       fs.mkdirSync(dirname(path), { recursive: true });
       fs.appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
     },

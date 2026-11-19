@@ -22,6 +22,30 @@ describe('codex-audit real IO', () => {
     });
   });
 
+  it('derives origin refs, checks ancestry and restricts delta paths to the branch net diff', async () => {
+    await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
+      const base = head();
+      commit({ 'branch.txt': 'branch change\n' });
+      const prior = head();
+      git(['branch', 'branch-work', prior]);
+      git(['checkout', '--quiet', '--detach', base]);
+      commit({ 'main-only.txt': 'merged main change\n' });
+      const main = head();
+      git(['checkout', '--quiet', 'branch-work']);
+      git(['merge', '--quiet', '--no-edit', main]);
+      const current = head();
+      git(['update-ref', 'refs/remotes/origin/lane/audit', current]);
+      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      expect(deps.refsPointingAt(current)).toContain('lane/audit');
+      expect(deps.isAncestor(prior, current)).toBe(true);
+      expect(deps.isAncestor(current, prior)).toBe(false);
+      expect(deps.deltaPaths(main, current)).toEqual(['branch.txt']);
+      // The actual range contains the main change, but the path filter excludes it.
+      const delta = git(['diff', prior, current, '--', ...deps.deltaPaths(main, current)]);
+      expect(String(delta).trim()).toBe('');
+    });
+  });
+
   it('throws for an unknown ref in a real repo', async () => {
     await withRealRepo(async ({ root: repo, tmp }) => {
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });

@@ -35,7 +35,7 @@ function fixture(answer = 'NOT WEAKENED') {
 
 describe('canonical audit', () => {
   it('pins the question text and its sha256 hash', () => {
-    expect(CANONICAL_QUESTION).toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
+    expect(CANONICAL_QUESTION).toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. List EVERY finding you can find in this one exhaustive pass; do not stop at the first finding. Later rounds will only check the delta. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
     expect(QUESTION_HASH).toMatch(/^[a-f0-9]{64}$/);
     expect(QUESTION_HASH).toBe(createHash('sha256').update(CANONICAL_QUESTION).digest('hex'));
   });
@@ -73,7 +73,7 @@ describe('canonical audit', () => {
     const f = fixture(`\n\r\n${verdict}\r\nscripts/example.mjs:12 why\n`);
     expect(await main(ARGS, f.deps)).toBe(code);
     expect(f.output.join('')).toBe(`${verdict}\nscripts/example.mjs:12 why\n`);
-    expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
+    expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main', ref: null, mode: 'full',
       questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(CANONICAL_QUESTION);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
@@ -429,8 +429,8 @@ describe('prior question hashes (AU1 PR-B)', () => {
   it('contradictory prior records are still rejected', () => {
     expect(find([rec('NOT WEAKENED', { findings: ['WEAKENED'] })], open)).toBeNull();
   });
-  it('the setting lands empty and invalid values resolve to empty', () => {
-    expect(resolvePriorQuestionHashes()).toEqual([]);
+  it('the pre-R1081 migration is configured and invalid values resolve to empty', () => {
+    expect(resolvePriorQuestionHashes({ env: {} })).toEqual([{ hash: 'c911fc8450ac5a4864dd1ef78284b88321e32671cc66880a8d84a9b2f4a6c284', acceptUntil: '2026-11-26T05:00:00.000Z' }]);
     expect(resolvePriorQuestionHashes({ readFile: () => '{"audit":{"priorQuestionHashes":[{"hash":"zz","acceptUntil":"2026-12-01"}]}}' })).toEqual([]);
     expect(resolvePriorQuestionHashes({ readFile: () => { throw new Error('unreadable'); } })).toEqual([]);
   });
@@ -499,7 +499,10 @@ describe('prior question hashes (AU1 PR-B)', () => {
   });
   it('replay over a frozen copy of audits.jsonl is identical with priorQuestionHashes empty', () => {
     const dir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
-    const records = realFs.readFileSync(join(dir, 'audits-frozen.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    // The frozen copy predates R1081: its records carry the pre-R1081 question hash, replayed here as the current one.
+    const PRE_R1081 = 'c911fc8450ac5a4864dd1ef78284b88321e32671cc66880a8d84a9b2f4a6c284';
+    const records = realFs.readFileSync(join(dir, 'audits-frozen.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+      .map(r => r.questionHash === PRE_R1081 ? { ...r, questionHash: QUESTION_HASH } : r);
     const expected = JSON.parse(realFs.readFileSync(join(dir, 'audits-frozen.expected.json'), 'utf8'));
     const pairs = [...new Set(records.map(r => `${r.head}/${r.base}`))];
     expect(pairs.length).toBeGreaterThan(10);

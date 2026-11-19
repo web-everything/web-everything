@@ -221,10 +221,10 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
 // Capture both audit streams as the operation result. The CLI adapter owns the JSON envelope;
 // plain mode prints the captured verdict/findings or refusal diagnostic, preserving the audit exit code.
 export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = {}) {
-  return async ({ base, head }) => {
+  return async ({ base, head, ref, converge }) => {
     let stdout = '', stderr = '';
     const deps = makeDeps ? makeDeps() : (await import('./codex-audit-io.mjs')).createAuditDeps();
-    const code = await auditMain([`--base=${base}`, `--head=${head}`], {
+    const code = await auditMain([`--base=${base}`, `--head=${head}`, ...(ref ? [`--ref=${ref}`] : []), ...(converge ? ['--converge'] : [])], {
       ...deps,
       stdout: text => { stdout += text; },
       stderr: text => { stderr += text; },
@@ -623,9 +623,10 @@ export const OPERATIONS = Object.freeze({
   }),
   'codex-audit': () => ({
     declaration: op('codex-audit', {
-      input: { base: { type: 'string' }, head: { type: 'string' } },
+      input: { base: { type: 'string' }, head: { type: 'string' },
+        ref: { type: 'string', required: false }, converge: { type: 'boolean', required: false, default: false } },
       verdictFrom: 'assess',
-      audit: effect({ reads: ['input.base', 'input.head'], effects: ({ input }) => [{
+      audit: effect({ reads: ['input.base', 'input.head', 'input.ref', 'input.converge'], effects: ({ input }) => [{
         type: 'codex-audit.run', payload: input, idempotent: false,
       }] }),
       assess: compute({ reads: ['findings.audit'], fn: ({ findings }) => {
