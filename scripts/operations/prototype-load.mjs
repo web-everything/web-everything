@@ -263,6 +263,8 @@ export function refusal(records, ref, since, alerts = false) {
 export function prototypeLoadOperation() {
   const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms', 'ruling', 'quote', 'remove', 'reason', 'actor'].map((key) => [key, { type: 'string', required: false, default: '' }]));
   input['dry-run'] = { type: 'boolean', required: false, default: false };
+  // Urgent authorizes prototype loading only; merging still requires real CI.
+  input.urgent = { type: 'boolean', required: false, default: false };
   // R310: retire-only run — drop registrations proved merged, in main, or superseded, and load nothing.
   input.retire = { type: 'boolean', required: false, default: false };
   // R508: operator force-adopt of ONE build over a failed smoke; needs --ruling, a verbatim --quote and --sha (the full

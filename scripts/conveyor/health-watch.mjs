@@ -46,6 +46,7 @@
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
 import { runArchiveRetentionTick } from './archive-retention-tick.mjs';
+import { runUrgentSweepTick } from './urgent-sweep-tick.mjs';
 export { archiveRetentionTickAllowed } from './archive-retention-tick.mjs';
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
@@ -431,19 +432,31 @@ export function daemonNameForLabel(label) {
  * (every resident daemon that is not a `pass-daemon.mjs` watcher), which the smell already treats as "use the
  * generic default".
  */
-export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000 } = {}) {
+export function probeLeasePid(pid, { signal = process.kill } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  try { signal(pid, 0); return true; } // signal 0 only checks existence; it never terminates anything
+  catch (e) { return e?.code === 'ESRCH' ? false : e?.code === 'EPERM' ? true : null; }
+}
+
+export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000,
+  leasePidAlive = pid => probeLeasePid(pid),
+} = {}) {
   const exec = (cmd, args, opts = {}) => execFileSync(cmd, args, { ...opts, timeout: timeoutMs });
   const read = assess(collect({ exec }));
   return read.daemons.filter((d) => d.readable !== false).map((d) => {
     const ms = (v) => (v == null ? null : typeof v === 'number' ? v : Date.parse(v) || null);
     const entry = d.lease?.entry ?? null;
+    const outsideLaunchd = !d.running && Number.isSafeInteger(entry?.pid) && entry.pid > 1
+      ? leasePidAlive(entry.pid) : false;
     const activity = [ms(d.tick?.lastActivityAt), ms(d.tick?.at), ms(d.tick?.logMtimeMs)].filter(Number.isFinite);
     const log = daemonNameForLabel(d.name);
     return {
       log,
       role: d.kind ?? null,
       pid: entry?.pid ?? null,
-      pidAlive: !!d.running,
+      pidAlive: !!d.running, // unchanged: a bare signal-0 probe never feeds the silent-daemon investigation
+      // Launchd absence does not prove that the process holding the daemon lease is dead; the alert smell reads this.
+      outsideLaunchd,
       heartbeatAt: ms(entry?.heartbeatAt),
       lastActivityAt: activity.length ? Math.max(...activity) : null,
       daemonState: d.state,
@@ -1159,6 +1172,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     if (error) probeErrors.archiveRetention = error;
     return results;
   });
+  const urgentSweepState = await attempt('urgentSweep', () => runUrgentSweepTick({
+    flags, now, state: prev.urgentSweep, sweep: deps.urgentSweep,
+  }));
+  if (urgentSweepState?.error) probeErrors.urgentSweep = urgentSweepState.error;
 
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
@@ -1439,6 +1456,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // Scrubbed ONCE, right here: everything below — the printed section, the returned summary, every file — sees
   // only the redacted state.
   const state = scrubDeep(result.state);
+  if (urgentSweepState) state.urgentSweep = urgentSweepState;
   if (claudeJobsArchive) state.claudeJobsArchive = { at: now, ...(claudeJobsArchive.complete ? { completedAt: now } : {}), ...claudeJobsArchive };
   else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
   if (prSweepJob) state.prSweep = prSweepJob.state;
