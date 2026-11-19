@@ -610,12 +610,41 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     setParent({ GIT_CONFIG_COUNT: '0', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks' });
     expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '0' });
   });
-  it('ignores caller-bag pins with no ambient set and cannot overwrite a valid ambient set', () => {
+  it('caller-bag hardening pins pass (tighten-only) and cannot loosen or reorder a valid ambient set', () => {
     const bag = laneGitHardeningEnv({});
-    expect(configOf(envOf(bag))).toEqual({});
+    expect(configOf(envOf(bag))).toEqual(configOf(bag));
     const parent = laneHistoryProofEnv({}, { remoteProbe: true });
     setParent(parent);
     expect(configOf(envOf({ ...bag, GIT_CONFIG_VALUE_0: 'true' }))).toEqual(configOf(parent));
+  });
+  it('protocol.*.allow=never passes from either source; any other protocol value does not (final audit)', () => {
+    setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never',
+      GIT_CONFIG_KEY_1: 'protocol.ext.allow', GIT_CONFIG_VALUE_1: 'always' });
+    expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never' });
+    const bagOnly = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'never' };
+    expect(configOf(envOf(bagOnly))).toMatchObject({ GIT_CONFIG_KEY_1: 'protocol.ext.allow', GIT_CONFIG_VALUE_1: 'never' });
+  });
+  it('a caller-supplied laneGitHardeningEnv() reaches the child intact (final audit)', () => {
+    const hardening = laneGitHardeningEnv({});
+    const child = envOf(hardening);
+    expect(configOf(child)).toEqual(configOf(hardening));
+    for (const key of ['GIT_TERMINAL_PROMPT', 'GIT_NO_LAZY_FETCH', 'GIT_NO_REPLACE_OBJECTS']) {
+      if (hardening[key] !== undefined) expect(child[key], key).toBe(hardening[key]);
+    }
+    // core.sshCommand with any non-pin value is still blocked, from either source.
+    const at = Number(hardening.GIT_CONFIG_COUNT);
+    const evil = { ...hardening, GIT_CONFIG_COUNT: String(at + 1), [`GIT_CONFIG_KEY_${at}`]: 'core.sshCommand', [`GIT_CONFIG_VALUE_${at}`]: '/untrusted/ssh' };
+    expect(Object.values(configOf(envOf(evil)))).not.toContain('/untrusted/ssh');
+    setParent(evil);
+    expect(Object.values(configOf(envOf({})))).not.toContain('/untrusted/ssh');
+  });
+  it('a caller pin cannot override a stricter parent value for the same key (git: later wins)', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.https.allow', GIT_CONFIG_VALUE_0: 'never' });
+    const bag = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.HTTPS.allow', GIT_CONFIG_VALUE_0: 'user',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' };
+    expect(configOf(envOf(bag))).toEqual({ GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'protocol.https.allow', GIT_CONFIG_VALUE_0: 'never',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
   });
   it('forwards unregistered ambient WE_PR_LIMIT_WE=0 and arbitrary values but drops unknown bag names', () => {
     for (const name of ['WE_PR_LIMIT_WE', 'SEC1_ARBITRARY_UNKNOWN', 'SEC1_BAG_UNKNOWN']) clearEnv(name);

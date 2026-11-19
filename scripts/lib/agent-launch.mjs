@@ -122,26 +122,47 @@ function classOf(rule, value, ceiling) {
 // Each entry is kept only if its (key, value) pair EXACTLY equals a hardening pin; every other entry
 // (core.sshCommand, core.pager, url.*.insteadOf, even a harmless user.name) is dropped on its own, and the
 // kept pins are re-indexed in their original order, so one extra entry can never discard the protections.
-function ambientGitConfig(ambient) {
-  const raw = ambient.GIT_CONFIG_COUNT;
-  if (!/^\d+$/.test(raw)) return {};
+const GIT_PINS = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
+// Tightening-only beyond the pin inventory: a protocol allow rule set to "never" or "user" can only narrow
+// which transports run (git's default for unknown protocols is already "user").
+const tighteningGitPair = (key, value) => GIT_PINS.some(([k, v]) => key === k && value === v)
+  || ((value === 'never' || value === 'user') && /^protocol\.(?:[a-z0-9+.-]+\.)?allow$/i.test(key));
+function gitConfigPairs(env) {
+  const raw = env.GIT_CONFIG_COUNT;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return null;
   const count = Number(raw);
   // Reject impossible counts before iterating (each entry needs a key and a value var).
-  if (!Number.isSafeInteger(count) || count * 2 + 1 > Object.keys(ambient).length) return {};
-  const pins = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
-  const kept = [];
+  if (!Number.isSafeInteger(count) || count * 2 + 1 > Object.keys(env).length) return null;
+  const kept = [], all = [];
   for (let i = 0; i < count; i++) {
-    const key = ambient[`GIT_CONFIG_KEY_${i}`], value = ambient[`GIT_CONFIG_VALUE_${i}`];
-    if (pins.some(([k, v]) => key === k && value === v)) kept.push([key, value]);
+    const key = env[`GIT_CONFIG_KEY_${i}`], value = env[`GIT_CONFIG_VALUE_${i}`];
+    if (typeof key === 'string') all.push(key);
+    if (tighteningGitPair(key, value)) kept.push([key, value]);
   }
-  if (!kept.length) return count === 0 ? { GIT_CONFIG_COUNT: '0' } : {};
+  return { count, kept, all };
+}
+// The sole indexed-config exception to GIT_*: from the parent AND the caller bag, only tightening pairs
+// pass (exact hardening pins, protocol.*.allow=never). Every other entry drops on its own; kept pairs are
+// re-indexed, parent pairs first, so no extra entry can discard a protection and no caller pair can add one
+// that loosens.
+function childGitConfig(ambient, inherit) {
+  const parent = gitConfigPairs(ambient), bag = gitConfigPairs(inherit);
+  // Git applies later entries over earlier ones, so a caller pair is added only for a key the parent's KEPT
+  // pairs do not set (git keys compare case-insensitively): the caller can add hardening, never override the
+  // parent's. A parent pair that was dropped as non-tightening is absent from the child, so it does not block one.
+  const parentKeys = new Set((parent?.kept ?? []).map(([k]) => String(k).toLowerCase()));
+  const kept = [...(parent?.kept ?? [])];
+  for (const pair of bag?.kept ?? []) {
+    if (!parentKeys.has(pair[0].toLowerCase()) && !kept.some(([k, v]) => k === pair[0] && v === pair[1])) kept.push(pair);
+  }
+  if (!kept.length) return parent?.count === 0 ? { GIT_CONFIG_COUNT: '0' } : {};
   const out = { GIT_CONFIG_COUNT: String(kept.length) };
   kept.forEach(([k, v], i) => { out[`GIT_CONFIG_KEY_${i}`] = k; out[`GIT_CONFIG_VALUE_${i}`] = v; });
   return out;
 }
 function inheritedEnv(inherit, ambient) {
   const out = Object.create(null);
-  Object.assign(out, ambientGitConfig(ambient));
+  Object.assign(out, childGitConfig(ambient, inherit));
   const checked = (rule, value, key) => rule.value === 'absolute-path' ? absolute(value, key)
     : rule.tighterThan ? String(quantity(value, rule.tighterThan))
     : rule.restrictiveValues?.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : value;
