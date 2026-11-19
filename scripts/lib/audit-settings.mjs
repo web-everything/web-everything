@@ -253,7 +253,7 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.mjs', 'scripts/conveyor/stand-down-auto-proceed-io.mjs',
   'scripts/held-cards-io.mjs', 'scripts/lane-drain.mjs', 'scripts/lib/card-group.mjs', 'scripts/lib/card-number-ledger.mjs',
   'scripts/lib/daemon-clone-lock.mjs', 'scripts/lib/daemon-item-tasks.mjs', 'scripts/lib/daemon-jobs-runtime.mjs',
-  'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
+  'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/adopt.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
   'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',

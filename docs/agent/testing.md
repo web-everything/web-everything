@@ -149,6 +149,12 @@ identity; old persisted records without it start fresh. Keep enqueue result reco
 emission in one helper, test each outcome and delivery failures, and exercise exported helpers
 instead of evaluating extracted source with `new Function`.
 
+The post-plan detector regressions in `scripts/lib/daemon-rebuild/__tests__/overlay-stale.test.mjs`
+cover consecutive conflicts, moved tips, registration identity, open PR/pin exclusions, unknown evidence,
+read-only stale inspection, and event/attention publication. F1 refuses pending drop intents before planning;
+F3 proves supersession against the applied carrier SHA even when `pinnedFrom` names a newer fetched tip.
+The static case forbids registration mutation APIs in the detector; a local Git fixture exercises merge-tree.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
