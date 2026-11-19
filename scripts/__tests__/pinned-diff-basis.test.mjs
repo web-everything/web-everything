@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { resolvePinnedDiffBasis, requireScoredNetDiff, pinnedGit } from '../lib/pinned-diff-basis.mjs';
+import { resolvePinnedDiffBasis, requireScoredNetDiff, pinnedGit, isScorableDiffText } from '../lib/pinned-diff-basis.mjs';
 import { computeNetDiffSignals, readPinnedCarryDiff, carryHumanClearanceOnIdenticalDiff } from '../merge-ai-prs.mjs';
 import { scanTestTampering } from '../lib/pr-merge-gate.mjs';
 
@@ -167,6 +167,33 @@ describe('resolvePinnedDiffBasis real Git boundary', () => {
       if (args.includes('diff')) for (const flag of ['--no-textconv', '--no-ext-diff', '--no-renames']) expect(args).toContain(flag);
     }
     expect(() => pinnedGit(() => { throw new Error('oversized output'); }, ['diff', basis.mergeBaseSha, basis.headSha])).toThrow('oversized output');
+  });
+});
+
+describe('pinned diff context', () => {
+  it('ignores repo-local diff.context=0 and keeps three context lines', () => {
+    const f = fixture();
+    const lines = Array.from({ length: 12 }, (_, i) => `line${i + 1}`);
+    writeFileSync(join(f.dir, 'ctx.txt'), lines.join('\n') + '\n');
+    f.git(['add', '.']);
+    const base = f.git(['commit-tree', f.git(['write-tree']), '-p', f.base, '-m', 'ctx base']);
+    f.setFetched(base);
+    lines[5] = 'changed6';
+    writeFileSync(join(f.dir, 'ctx.txt'), lines.join('\n') + '\n');
+    f.git(['add', '.']);
+    const head = f.git(['commit-tree', f.git(['write-tree']), '-p', base, '-m', 'ctx head']);
+    f.git(['config', 'diff.context', '0']);
+    const basis = resolvePinnedDiffBasis({ exec: f.exec, headSha: head });
+    const text = pinnedGit(f.exec, ['diff', basis.mergeBaseSha, basis.headSha]);
+    expect(text).toContain(' line3');
+    expect(text).toContain(' line9');
+    expect(isScorableDiffText(text)).toBe(true);
+  });
+
+  it('rejects zero-context hunks as unscorable', () => {
+    const zero = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -6 +6 @@\n-line6\n+changed6\n';
+    expect(isScorableDiffText(zero)).toBe(false);
+    expect(isScorableDiffText(zero.replace('@@ -6 +6 @@', '@@ -6,1 +6,1 @@\n line5'))).toBe(true);
   });
 });
 

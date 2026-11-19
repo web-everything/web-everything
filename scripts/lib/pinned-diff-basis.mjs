@@ -12,11 +12,11 @@ export function pinnedGit(exec, args) {
   }
   Object.assign(env, { GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0', GIT_ATTR_NOSYSTEM: '1', GIT_GRAFT_FILE: '/dev/null' });
-  const diff = args[0] === 'diff' ? ['--no-textconv', '--no-ext-diff', '--no-renames', '--no-color',
+  const diff = args[0] === 'diff' ? ['--no-textconv', '--no-ext-diff', '--no-renames', '--no-color', '--unified=3',
     '--src-prefix=a/', '--dst-prefix=b/', '--no-relative', '--submodule=short', '--ignore-submodules=none'] : [];
   // Repo-local diff rendering keys cannot be ignored, so pin every one that changes paths or prefixes.
   const pins = ['core.attributesFile=/dev/null', 'diff.noprefix=false', 'diff.mnemonicPrefix=false',
-    'diff.relative=false', 'core.quotepath=false', 'diff.suppressBlankEmpty=false', 'diff.orderFile=/dev/null',
+    'diff.relative=false', 'diff.context=3', 'diff.interHunkContext=0', 'core.quotepath=false', 'diff.suppressBlankEmpty=false', 'diff.orderFile=/dev/null',
     'diff.ignoreSubmodules=none', 'diff.submodule=short', 'diff.external=', 'color.ui=false', 'color.diff=false'].flatMap(c => ['-c', c]);
   return String(exec('git', [...pins, args[0], ...diff, ...args.slice(1)], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
@@ -58,7 +58,17 @@ export function resolvePinnedDiffBasis({ exec, remote = 'origin', baseRef = 'mai
 /** The tamper parser only understands raw, matching two-tree paths. */
 export function isScorableDiffText(text) {
   if (typeof text !== 'string') return false;
-  const headers = text.split('\n').filter(line => line.startsWith('diff --git'));
+  const lines = text.split('\n');
+  // Pinned diffs force -U3; a hunk that starts past line 1 yet carries no context line is zero-context output
+  // (repo-local diff.context=0) and would hide edits under an unchanged @invariant marker.
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(lines[i]);
+    if (!m || (m[1] === '1' && m[2] === '1') || m[1] === '0' || m[2] === '0') continue;
+    let context = false;
+    for (let j = i + 1; j < lines.length && !/^(@@|diff --git)/.test(lines[j]); j++) if (lines[j].startsWith(' ')) context = true;
+    if (!context) return false;
+  }
+  const headers = lines.filter(line => line.startsWith('diff --git'));
   // Renames are disabled: both raw paths must agree. C-quoted/unknown headers cannot be parsed safely.
   return (!text || headers.length > 0) && headers.every(line => /^diff --git a\/(.+) b\/\1$/.test(line));
 }
