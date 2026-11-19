@@ -443,7 +443,9 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
 
 const admissionPolicyCache = new Map();
 const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
-const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
+// The host platform bag grew past 256 KiB on 2026-11-19 and every fresh process then read the standard layer
+// (remote.enabled=false); the bound is a sanity limit, not a policy limit.
+const PLATFORM_FILE_MAX_BYTES = 4 * 1024 * 1024;
 function readPlatformPreferences(path) {
   if (!path) throw new Error('canonical host preferences path unavailable');
   if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);

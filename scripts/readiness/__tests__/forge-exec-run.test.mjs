@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link, chmod} from 'node:fs/promises';
 import {join} from 'node:path';
 import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
@@ -1248,6 +1248,23 @@ assert fired
     expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('Invalid copy source');expect(await readdir(destination)).toEqual([]);
     expect(result.stdout).toBe('');expect(result.stderr).not.toContain('private fixture');
+  });
+  it.skipIf(process.platform!=='linux')('copy source accepts a traverse-only (0710) ancestor and still refuses symlinks', async () => {
+    const outer=join(root,'slot-traverse');const source=join(outer,'src');const destination=join(root,'slot-traverse-dest');
+    await mkdir(source,{recursive:true});await mkdir(destination);
+    await writeFile(join(source,'leaf'),'public fixture');await symlink(join(source,'leaf'),join(source,'link'));
+    await chmod(outer,0o110);
+    try {
+      const run=(name,body)=>spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+        input:JSON.stringify({source,destination,entries:[{path:Buffer.from(name).toString('base64'),sha256:hash(body),executable:false}]}),
+        encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      });
+      const ok=run('leaf','public fixture');
+      expect(ok.error).toBeUndefined();expect(ok.status).toBe(0);
+      expect(await readFile(join(destination,'leaf'),'utf8')).toBe('public fixture');
+      const bad=run('link','public fixture');
+      expect(bad.status).not.toBe(0);expect(await readdir(destination)).toEqual(['leaf']);
+    } finally {await chmod(outer,0o755);}
   });
   it('warm-install accepts an ordinary source and completes dependency installation', async () => {
     const source=join(root,'ordinary-warm-source');await mkdir(source);
