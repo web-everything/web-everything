@@ -235,7 +235,9 @@ it('refuses a planted worktrees admin link before git writes, and ignores inject
 
 it('refuses a reused slot whose admin dir holds a link', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
-  symlinkSync(join(lane, '.git', 'logs'), join(pool, 'repo.git', 'worktrees', 'slot-1', 'logs'));
+  const logs = join(pool, 'repo.git', 'worktrees', 'slot-1', 'logs');
+  rmSync(logs, { recursive: true, force: true });
+  symlinkSync(join(lane, '.git', 'logs'), logs);
   const before = readdirSync(join(lane, '.git')).sort();
   expect(() => acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool })).toThrow(/contains a link/);
   expect(readdirSync(join(lane, '.git')).sort()).toEqual(before);

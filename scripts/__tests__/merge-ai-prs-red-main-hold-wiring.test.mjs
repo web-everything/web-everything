@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 
 // One drain pass here takes ~31s on an idle 30-core host (each held row's ledger write
 // exhausts its fail-closed retry backoff against the fixture git), so the 30s default
@@ -36,6 +37,9 @@ const F = process.env.RMH_FIXTURE;
 const prs = JSON.parse(fs.readFileSync(F, 'utf8'));
 const landed = n => fs.existsSync(F + '.merged-' + n);
 const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
+const completeCheckReadFixture = ${completeCheckReadFixture};
+const checkPages = completeCheckReadFixture(prs, a);
+if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 // RMH_LATE_FREEZE: the operator raises the freeze DURING the pass (after the drain's pre-pass freeze check).
 if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_FREEZE && !fs.existsSync(process.env.RMH_LATE_FREEZE)) {

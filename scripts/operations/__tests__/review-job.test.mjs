@@ -1,6 +1,6 @@
 import * as reviewDispatch from '../review-dispatch.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
-import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
+import { readReviewCiGate, readReviewChecks } from '../../lib/review-ci-gate-io.mjs';
 /**
  * x26lw6u — the review arc as a deterministic job (we:scripts/operations/review-job.mjs) and its job-record
  * store (we:scripts/operations/review-job-store.mjs). Every effect is faked: no lane pool, no `claude`, no `gh`.
@@ -421,8 +421,45 @@ describe('dispatch mode', () => {
   });
 });
 
+describe('complete review check reader evidence', () => {
+  const headSha = 'a'.repeat(40);
+  const pages = {
+    runs: [{ check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }] }, { check_runs: [] }],
+    statuses: [{ statuses: [{ context: 'legacy', state: 'success' }] }],
+  };
+  const gate = run => readReviewCiGate({ repo: REPO, pr: 3432,
+    policy: { startAfter: 'ci-green', startEarly: 'off' }, readHead: () => headSha,
+    readRequired: () => ({ source: 'live', checks: ['test', 'legacy'] }),
+    readChecks: args => readReviewChecks({ ...args, run }),
+  });
+
+  it('binds checks and legacy statuses from complete paginated reads to the requested head', () => {
+    const calls = [];
+    const result = gate(args => {
+      calls.push(args);
+      return JSON.stringify(args.at(-1).includes('/check-runs?') ? pages.runs : pages.statuses);
+    });
+    expect(result.allowed).toBe(true);
+    expect(result.checks).toMatchObject({ rowsComplete: true, rowsHead: headSha });
+    expect(calls).toHaveLength(2);
+    for (const args of calls) {
+      expect(args).toContain('--paginate');
+      expect(args).toContain('--slurp');
+      expect(args.at(-1)).toContain(`/commits/${headSha}/`);
+    }
+  });
+
+  it.each(['runs', 'statuses'])('refuses an unreadable %s page before attesting completeness', broken => {
+    const result = gate(args => JSON.stringify(
+      args.at(-1).includes('/check-runs?')
+        ? broken === 'runs' ? [{}] : pages.runs
+        : broken === 'statuses' ? [{}] : pages.statuses));
+    expect(result).toMatchObject({ allowed: false, reason: 'unreadable-ci' });
+  });
+});
+
 describe('x6n7c2p required checks before review — fresh dispatch boundary', () => {
-  it.each(['pending', 'red', 'missing', 'head-moved', 'stale-cache', 'fallback', 'error', 'green'])('stale green plan, fresh %s', state => {
+  it.each(['pending', 'red', 'missing', 'head-moved', 'stale-cache', 'fallback', 'error', 'incomplete', 'wrong-head', 'missing-metadata', 'green'])('stale green plan, fresh %s', state => {
     const reads = [];
     const headSha = 'a'.repeat(40);
     let headReads = 0;
@@ -434,8 +471,10 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
       readChecks: args => {
         reads.push(['checks', args]);
         if (state === 'error') throw new Error('offline');
-        return [{ name: 'test', status: 'completed', conclusion: 'success' },
+        const rows = [{ name: 'test', status: 'completed', conclusion: 'success' },
           ...(state === 'missing' ? [] : [{ name: 'daemon-soak', status: state === 'pending' ? 'in_progress' : 'completed', conclusion: state === 'red' ? 'failure' : 'success' }])];
+        return state === 'missing-metadata' ? rows : Object.assign(rows,
+          { rowsComplete: state !== 'incomplete', rowsHead: state === 'wrong-head' ? 'c'.repeat(40) : headSha });
       },
     });
     const out = dispatchReviewJob({ pr: 3432, repo: REPO, root: '/daemon', dir, ciGate,
@@ -465,7 +504,8 @@ it('x6n7c2p required checks before review — default job four-tick soak spends 
         checkStaleness: FRESH, readCompletion: () => null, resolveSettingsEnv: () => ({}),
         ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green', startEarly: 'off' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
-          readChecks: () => [{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
+          readChecks: () => Object.assign([{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
+            { rowsComplete: true, rowsHead: head.repeat(40) }),
         }), spawnJob: () => { spawns++; return 4242; },
       }),
     });

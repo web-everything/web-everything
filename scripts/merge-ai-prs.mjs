@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readReviewChecks } from './lib/review-ci-gate-io.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -1088,7 +1089,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       queueBlocker = `; required-checks-not-successful: ${absent.map(name => `${name} (missing)`).join(', ')}`;
       return false;
     }
-    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [] });
+    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [],
+      rowsComplete: pr.rowsComplete, rowsHead: pr.rowsHead });
     if (!gate.allowed) {
       queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;
       return false;
@@ -5127,7 +5129,12 @@ async function runCli() {
       const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
       updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
-      return await resolveChecks(repo, data);
+      const resolved = await resolveChecks(repo, data);
+      // Flattened `gh pr view` rows carry no completeness or head provenance.
+      // Revalidation must use the same complete, head-scoped read as pre-stage.
+      const checks = readReviewChecks({ repo: repo || localSlug, headSha: data.headRefOid });
+      return { ...resolved, statusCheckRollup: checks,
+        rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead };
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
@@ -5605,7 +5612,11 @@ async function runCli() {
         // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
         if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');
         // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
-        return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+        const resolved = await resolveChecks(null, pr);
+        const checks = readReviewChecks({ repo: localSlug, headSha: pr.headRefOid });
+        return attachLiveFixClaim({ ...resolved, statusCheckRollup: checks,
+          rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead },
+        { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),

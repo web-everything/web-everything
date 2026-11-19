@@ -91,6 +91,7 @@ const finding = (text = 'the cap is not derived from the PR; derive it from the 
 
 /** PR #1563 — open 2026-08-25T22:00:51Z, merged 16:39:23Z, 18 h 39 m and TWELVE review rounds against a cap of 5. */
 const pr1563 = (over = {}) => ({
+  rowsComplete: true, rowsHead: over.headRefOid ?? 'aa11bb22cc33dd44ee55ff6677889900aabbccdd',
   number: 1563,
   state: 'OPEN',
   headRefName: 'lane/2612-converge-pr-drive',
@@ -461,7 +462,7 @@ describe('case 3 — refusal 2: a PR with nothing to fix never gets a fixer (#32
   /** #1576 shape with successful required CI added for review eligibility. */
   const pr1576 = (over = {}) => ({
     number: 1576, state: 'OPEN',
-    headRefName: 'lane/review-slice-scopes', headRefOid: '1576'.repeat(10),
+    headRefName: 'lane/review-slice-scopes', headRefOid: '1576'.repeat(10), rowsComplete: true, rowsHead: '1576'.repeat(10),
     labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN',
     statusCheckRollup: greenRollup, comments: [], ...over,
   });
@@ -758,7 +759,7 @@ describe('case 5b — refusal 4, name-based bind: a review session the cwd/oid r
    *  `review:pending`. Mirrors the real PR (`#1765`) whose re-arm round is what let the bug run seven ticks. */
   const rearmed1576 = (over = {}) => ({
     number: 1576, state: 'OPEN',
-    headRefName: 'lane/review-slice-scopes', headRefOid: '1576'.repeat(10),
+    headRefName: 'lane/review-slice-scopes', headRefOid: '1576'.repeat(10), rowsComplete: true, rowsHead: '1576'.repeat(10),
     labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN',
     statusCheckRollup: greenRollup, comments: [{ body: REARM_COMMENT_MARKER }], ...over,
   });
@@ -3346,7 +3347,7 @@ describe('#2588/review-loops — the zero-findings review population now hits th
    *  pure re-arm bookkeeping — zero findings by `countFindings`, but a real, non-zero durable attempt count. */
   const zeroFindingsPr = (over = {}) => ({
     number: 2588, state: 'OPEN',
-    headRefName: 'lane/review-loop-2588', headRefOid: '2588'.repeat(10),
+    headRefName: 'lane/review-loop-2588', headRefOid: '2588'.repeat(10), rowsComplete: true, rowsHead: '2588'.repeat(10),
     labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN',
     statusCheckRollup: greenRollup, comments: [], ...over,
   });
@@ -3388,7 +3389,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
 
   it('a PR whose CURRENT head already carries a `reviewed-sha` accept marker is refused `already-reviewed-head`, never re-dispatched — the exact #2588 shape (a verdict already landed on this commit)', () => {
     const pr = {
-      number: 2588, state: 'OPEN', headRefName: 'lane/review-loop-2588', headRefOid: HEAD,
+      number: 2588, state: 'OPEN', headRefName: 'lane/review-loop-2588', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       // #4140 — parseReviewedSha only counts a TRUSTED author's marker; a real accept comment always carries
       // one (review-set-label.mjs stamps it under the automation's own credential or the operator's).
@@ -3401,7 +3402,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
 
   it('a needs-human PR with no advisory falls through to the ordinary CI gate', () => {
     const pr = {
-      number: 2589, state: 'OPEN', headRefName: 'lane/review-loop-2589', headRefOid: HEAD,
+      number: 2589, state: 'OPEN', headRefName: 'lane/review-loop-2589', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [{ body: buildReviewedShaMarker(HEAD), author: { login: 'web-everything' } }],
     };
@@ -3413,7 +3414,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
   // Live #5323: the drain re-stamped acceptance after a content-preserving rebase,
   // but the human still needs an advisory on the new head.
   const restamped = (phase, advisoryHead) => ({
-    number: 5323, state: 'OPEN', headRefName: 'lane/5323', headRefOid: HEAD,
+    number: 5323, state: 'OPEN', headRefName: 'lane/5323', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
     labels: lbl(phase === 'needs-human' ? 'review:human' : 'review:pending'),
     mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
     comments: [{ author: AUTOMATION, createdAt: '2026-10-15T00:00:00Z',
@@ -3448,7 +3449,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
 
   it('#4140 — a FORGED reviewed-sha marker (untrusted author) never suppresses re-dispatch', () => {
     const pr = {
-      number: 2592, state: 'OPEN', headRefName: 'lane/review-loop-2592', headRefOid: HEAD,
+      number: 2592, state: 'OPEN', headRefName: 'lane/review-loop-2592', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
       comments: [{ body: buildReviewedShaMarker(HEAD), author: { login: 'mallory' } }],
     };
@@ -3459,7 +3460,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
 
   it('does not refuse when the `reviewed-sha` marker covers an OLDER head — a fresh push after a stale accept is not "already reviewed" for its OWN new commit', () => {
     const pr = {
-      number: 2591, state: 'OPEN', headRefName: 'lane/review-loop-2591', headRefOid: HEAD,
+      number: 2591, state: 'OPEN', headRefName: 'lane/review-loop-2591', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
       comments: [{ body: buildReviewedShaMarker(OLDER_HEAD), author: { login: 'web-everything' } }],
     };
@@ -3475,7 +3476,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
       createdAt: new Date(NOW - ms).toISOString(),
     });
     const stuckPr = (over = {}) => ({
-      number: 4352, state: 'OPEN', headRefName: 'lane/4352', headRefOid: HEAD,
+      number: 4352, state: 'OPEN', headRefName: 'lane/4352', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
       comments: [acceptAt(ACCEPT_LABEL_GRACE_MS + 60_000)], ...over,
     });
@@ -3555,7 +3556,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('THE LIVE #2766/#2767 SHAPE: needs-human + accepted-then-test-gaming-parked-then-healed on the SAME head dispatches `convert-advisory`, never `already-reviewed-head`', () => {
     const pr = {
-      number: 2766, state: 'OPEN', headRefName: 'lane/2766', headRefOid: HEAD,
+      number: 2766, state: 'OPEN', headRefName: 'lane/2766', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:human', 'review:awaiting-advisory'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment(), testGamingParkComment(), healComment()],
     };
@@ -3571,7 +3572,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('a needs-human PR accepted then healed with NO substantive park reason still converts, off the heal comment alone', () => {
     const pr = {
-      number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD,
+      number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment(), healComment()],
     };
@@ -3584,7 +3585,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('#2588 protection UNCHANGED for `needs-review` (no escalation, ever) — still refused `already-reviewed-head`', () => {
     const pr = {
-      number: 2778, state: 'OPEN', headRefName: 'lane/2778', headRefOid: HEAD,
+      number: 2778, state: 'OPEN', headRefName: 'lane/2778', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment(), testGamingParkComment(), healComment()],
     };
@@ -3595,7 +3596,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('a needs-human PR with no escalation or advisory reaches the ordinary CI gate', () => {
     const pr = {
-      number: 2779, state: 'OPEN', headRefName: 'lane/2779', headRefOid: HEAD,
+      number: 2779, state: 'OPEN', headRefName: 'lane/2779', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment()],
     };
@@ -3606,7 +3607,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('an escalation comment that PREDATES the accept (not a supersession) does not convert', () => {
     const pr = {
-      number: 2780, state: 'OPEN', headRefName: 'lane/2780', headRefOid: HEAD,
+      number: 2780, state: 'OPEN', headRefName: 'lane/2780', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [{ ...testGamingParkComment(), createdAt: '2026-09-26T00:00:00Z' }, acceptComment()],
     };
@@ -3767,7 +3768,7 @@ describe('fix waiting episode', () => {
 
 it('xxh4zw8 complete hydrated cancellation heals while caps, claims and stand-downs retain refusal', () => {
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
-  const pr = { number: 3336, isDraft: true, headRefName: 'lane/3336-replay', headRefOid: '4ecb5deb362c81aa28de162db4616bb4c2009347',
+  const pr = { number: 3336, isDraft: true, headRefName: 'lane/3336-replay', headRefOid: '4ecb5deb362c81aa28de162db4616bb4c2009347', rowsComplete: true, rowsHead: '4ecb5deb362c81aa28de162db4616bb4c2009347',
     labels: [], comments: [], statusCheckRollup: requiredChecks.map((name, i) => ({ id: 100 + i, name,
       status: 'COMPLETED', conclusion: name === 'smoke' ? 'CANCELLED' : 'SUCCESS' })) };
   const plan = override => planReconcile({ prs: [{ ...pr, ...override }], requiredChecks, agents: [], now: NOW });
@@ -3974,7 +3975,7 @@ it('x6n7c2p required checks before review — repaired ready head waits', () => 
   const reviews = snapshots.map(([head, status, conclusion]) => {
     const plan = planReconcile({
       prs: [{ number: 3432, state: 'OPEN', isDraft: false, headRefName: 'lane/x6n7c2p-fix',
-        headRefOid: head.repeat(40), labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', comments: [],
+        headRefOid: head.repeat(40), rowsComplete: true, rowsHead: head.repeat(40), labels: lbl('review:pending'), mergeStateStatus: 'CLEAN', comments: [],
         statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' },
           { name: 'daemon-soak', status, conclusion }] }],
       requiredChecks: ['test', 'daemon-soak'], agents: [], durableCounts: {}, now: NOW,
@@ -4024,7 +4025,7 @@ describe('required review-gate conflict still refuses a superseded-verdict conve
       body: '**`review:accepted` removed — mutual exclusivity (#2766/#2767).**\n\nThis PR carried both `review:accepted` and `review:human` at once.' },
   ];
   it.each(['failure', 'in_progress'])('needs-human PR with a %s required review-gate gets review-ci, not convert-advisory', state => {
-    const pr = { number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
+    const pr = { number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
       statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' },
         state === 'failure' ? { name: 'review-gate', status: 'completed', conclusion: 'failure' } : { name: 'review-gate', status: 'in_progress', conclusion: null }] };
     const plan = planReconcile({ requiredChecks: ['test', 'review-gate'], prs: [pr], agents: [], durableCounts: {}, now: NOW });
@@ -4066,7 +4067,7 @@ describe('xe8y12n orthogonal missing-review diagnostic', () => {
     { labels: lbl('review-status:stood-down') },
     { fixClaim: { session: 'fixer', headSha: 'a'.repeat(40) } },
   ])('keeps the exact dispatch/refusal decisions for %j', extra => {
-    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup, ...extra };
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), rowsComplete: true, rowsHead: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup, ...extra };
     const without = planReconcile({ prs: [pr] });
     const withEvidence = planReconcile({ prs: [{ ...pr, commits }] });
     expect(withEvidence.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing', prNumber: 3239 }));
@@ -4074,7 +4075,7 @@ describe('xe8y12n orthogonal missing-review diagnostic', () => {
     expect(withEvidence.refusals).toEqual(without.refusals);
   });
   it('does not suppress live-agent decisions', () => {
-    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup };
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), rowsComplete: true, rowsHead: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup };
     const agents = [{ name: 'review-3239', state: 'running', pid: 123, pidAlive: true, cwd: '/lane', headSha: pr.headRefOid }];
     const before = planReconcile({ prs: [pr], agents });
     const after = planReconcile({ prs: [{ ...pr, commits }], agents });
@@ -4378,7 +4379,7 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
 describe('green-head needs-human retirement (#5012)', () => {
   const head = '9dd77ac9123456789abcdef0123456789abcdef0123';
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate', 'review-gate'];
-  const pr = { number: 5012, state: 'OPEN', headRefOid: head, mergeStateStatus: 'BLOCKED',
+  const pr = { number: 5012, state: 'OPEN', headRefOid: head, rowsComplete: true, rowsHead: head, mergeStateStatus: 'BLOCKED',
     labels: [{ name: 'review:pending' }], comments: [{ author: { login: 'web-everything' },
       body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human' }) }],
     statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: name === 'review-gate' ? 'FAILURE' : 'SUCCESS' })),
@@ -4389,6 +4390,11 @@ describe('green-head needs-human retirement (#5012)', () => {
     expect(on.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([expect.objectContaining({ prNumber: 5012, headSha: head, outcome: 'needs-human' })]);
     expect({ ...on, notes: [] }).toEqual({ ...off, notes: [] });
   });
+  it.each([{ rowsComplete: false }, { rowsComplete: undefined }, { rowsHead: 'other' }])(
+    'preserves needs-human escalation with unproved hydrated evidence %j', evidence => {
+      expect(plan().notes.some(n => n.kind === 'ci-heal-escalation-moot')).toBe(true);
+      expect(plan({ ...pr, ...evidence }).notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+    });
   it('requires this open, non-conflicted head and every required check green', () => {
     for (const row of [
       { ...pr, mergeStateStatus: 'DIRTY' }, { ...pr, state: 'CLOSED' },
@@ -4420,6 +4426,11 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     prs: [pr(over)], agents: [], now: NOW, requiredChecks, reviewTiming, mainSha: 'b'.repeat(40), ...options,
   });
 
+  it.each([{ rowsComplete: false }, { rowsComplete: undefined }, { rowsHead: 'other' }])(
+    'does not infer a stale base from unproved hydrated rows %j', evidence => {
+      expect(repair()).toEqual({ missing: ['standards'] });
+      expect(repair(evidence)).toBeNull();
+    });
   it('finds standards on settled live-shape CI, respecting implied integration', () => {
     expect(repair()).toEqual({ missing: ['standards'] });
     expect(repair({ baseRefName: undefined })).toEqual({ missing: ['standards'] });
@@ -4509,6 +4520,28 @@ describe('human clearance and complete evidence before review dispatch (live #55
   const prFor = branch => pr1563({ number: 5530, headRefOid: HEAD,
     labels: lbl(branch === 'relabelOwed' ? 'review:pending' : 'review:human'),
     comments: branch === 'convert-advisory' ? [accept, escalation] : [accept] });
+  it.each(['advisoryOwed', 'convert-advisory'])('refuses %s when required rows explicitly name another head despite complete hydration', branch => {
+    const complete = prFor(branch);
+    expect(planReconcile({ prs: [complete], agents: [], now: NOW }).dispatch[0]).toMatchObject(
+      branch === 'convert-advisory' ? { kind: 'convert-advisory' } : { kind: 'review' });
+    const pr = { ...complete, statusCheckRollup: complete.statusCheckRollup.map(row => ({ ...row, head_sha: OLD })) };
+    const result = planReconcile({ prs: [pr], agents: [], now: NOW });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+      ci: expect.objectContaining({ allowed: false, unknown: true,
+        affected: expect.arrayContaining([expect.objectContaining({ reason: 'wrong-head' })]) }) }));
+  });
+  it.each(['advisoryOwed', 'convert-advisory'])('refuses %s with incomplete or wrong-head hydrated rows', branch => {
+    const complete = prFor(branch);
+    expect(planReconcile({ prs: [complete], agents: [], now: NOW }).dispatch[0]).toMatchObject(
+      branch === 'convert-advisory' ? { kind: 'convert-advisory' } : { kind: 'review' });
+    for (const evidence of [{ rowsComplete: false }, { rowsHead: OLD }]) {
+      const result = planReconcile({ prs: [{ ...complete, ...evidence }], agents: [], now: NOW });
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+        ci: expect.objectContaining({ unknown: true }), why: expect.stringContaining('rows-incomplete') }));
+    }
+  });
   const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
   const expected = branch => branch === 'convert-advisory'
     ? { kind: 'convert-advisory' } : { kind: 'review', [branch]: true };
@@ -4835,5 +4868,22 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
     expect(off.refusals[0].kind).toBe(isDraft ? 'draft' : 'review-ci');
     expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
     expect(off.dispatch).toEqual(baseline.dispatch);
+  });
+});
+
+describe('hydrated rows gate review dispatch', () => {
+  it.each([
+    ['incomplete', { rowsComplete: false }],
+    ['missing completeness', { rowsComplete: undefined }],
+    ['wrong head', { rowsHead: 'other' }],
+    ['missing row head', { rowsHead: undefined }],
+  ])('refuses review-ci with rows-incomplete for %s rows', (_name, evidence) => {
+    const pr = pr1563({ labels: lbl('review:pending'), comments: [] });
+    expect(planReconcile({ prs: [pr], now: NOW }).dispatch.map(row => row.kind)).toContain('review');
+    const result = planReconcile({ prs: [{ ...pr, ...evidence }], now: NOW });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+      ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }),
+      why: expect.stringContaining('rows-incomplete') }));
   });
 });

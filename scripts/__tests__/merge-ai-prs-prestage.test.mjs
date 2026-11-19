@@ -36,7 +36,9 @@ if (a[0] === 'api') {
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
-  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
+  if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
+  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:pr.statusCheckRollup.filter(c => c.name)}]);
+  if (path.includes('/status?')) out([{statuses:pr.statusCheckRollup.filter(c => c.context)}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
@@ -104,6 +106,17 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
 }
 
 describe('real drain pre-stage path', () => {
+  it.each(['check-runs', 'status'])('fresh cascade revalidation refuses unreadable %s evidence', endpoint => world(({pr,run}) => {
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.unreadableCheckRows = endpoint;
+    const next = run();
+    expect(next.calls.some(a => a.some(x => x.includes(`/commits/${sha}/${endpoint}?`)))).toBe(true);
+    expect(next.report.revalidationAborted, next.stderr).toEqual(expect.arrayContaining([
+      expect.objectContaining({num:42,reason:expect.stringContaining('could not re-read the PR fresh')}),
+    ]));
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+  }));
+
   it.each(['dependency-held', 'cascade', 'prestage'])('shadow adds zero gh calls compared with off (%s)', async path => {
     const traces = [];
     for (const shadowMode of ['off', 'shadow']) {
@@ -342,7 +355,7 @@ describe('real drain pre-stage path', () => {
     const enqueue = vi.fn(() => ({ enqueued: true }));
     const result = await enqueuePrestage({ cache: createPrestageCache({ root: join(coord, 'drain-prestage') }), repo: 'web-everything/web-everything', num: 42,
       settings: resolvePrestageSettings({ env: {}, tool: {}, platform: {} }), recordLanded: vi.fn(), enqueue,
-      readPr: async () => ({ ...pr, statusCheckRollup: [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}] }),
+      readPr: async () => ({ ...pr, rowsComplete: true, rowsHead: sha, statusCheckRollup: [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}] }),
       fixClaimHeld: () => prestageFixClaimHeld(42, { claimKey: 'we', readClaim: q => readLiveFixClaim({ ...q, lockRoot }) }), beforeEnqueue: vi.fn(),
       // The initial read saw no claim; the fixer takes it while the drain waits for the merge-write lock.
       withLock: fn => {

@@ -292,6 +292,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   const { MAX_VERDICT_VOIDS_PER_HEAD, planVerdictVoid, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
   const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
   const head = fixture.headRefOid;
+  fixture.rowsComplete = true; fixture.rowsHead = head;
   const settings = { recheckNotCiBreak: true };
   const voidComment = (headSha = head) => ({ author: AUTOMATION, createdAt: '2026-10-09T05:00:00Z',
     body: buildCiHealVerdictVoidComment({ headSha, red: ['test'] }) });
@@ -661,7 +662,7 @@ describe('stacked base escalation facts (#4792)', () => {
   });
 
   it('reads each eligible base once, preserving untouched objects including failed reads', () => {
-    const pr = { headRefOid: HEAD, baseRefName: 'lane/base', comments: [comment()] };
+    const pr = { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, baseRefName: 'lane/base', comments: [comment()] };
     const prs = [pr, { ...pr }, { ...pr, baseRefName: 'trunk' }, { ...pr, comments: [] },
       { ...pr, baseRefName: 'lane/missing' }, { ...pr, baseRefName: 'lane/missing' },
       { ...pr, baseRefName: null }, { ...pr, headRefOid: 'new' }];
@@ -729,7 +730,7 @@ describe('needs-human CLI preflight wiring — #6004/#5979', () => {
 import cp from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-const facts = ${JSON.stringify({ number: 6042, labels, headRefOid: HEAD, statusCheckRollup: [
+const facts = ${JSON.stringify({ number: 6042, labels, headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [
   { name: 'test', status: 'COMPLETED', conclusion: evidence === 'malformed' ? 'FAILURE' : 'SUCCESS' },
   ...(evidence === 'malformed' ? [{}] : []),
   ...(evidence === 'conflicting-flags' ? [
@@ -850,7 +851,7 @@ describe('needs-human verdict void', async () => {
   const options = (comments = [escalation()]) => ({
     note: { kind: 'ci-heal-escalation-moot', prNumber: 5012, headSha: HEAD, outcome: 'needs-human' },
     repo: 'we', verdictSettings: { voidNeedsHumanWhenCiGreen: true },
-    pr: { headRefOid: HEAD, state: 'OPEN', comments, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] },
+    pr: { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, state: 'OPEN', comments, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] },
     readRequiredChecks: () => ['test'],
   });
   it('preserves the original not-a-ci-break comment byte for byte', () => {
@@ -876,6 +877,14 @@ describe('needs-human verdict void', async () => {
     expect(latestCiHealEscalationForHead([escalation('not-a-ci-break'), voidComment()], HEAD, { recheck: true })?.outcome).toBe('not-a-ci-break');
     expect(notCiBreakVerdictVoidState([escalation('not-a-ci-break'), voidComment()], HEAD).voidCount).toBe(0);
     expect(needsHumanVoidState(comments, HEAD)).toEqual({ escalationIndex: 0, voided: true, voidCount: 1 });
+  });
+  it.each([
+    { rowsComplete: undefined }, { rowsComplete: false },
+    { rowsHead: undefined }, { rowsHead: 'other' },
+  ])('does not void needs-human with incomplete row provenance %j', provenance => {
+    const o = options();
+    Object.assign(o.pr, provenance);
+    expect(planNeedsHumanVoid(o)).toBeNull();
   });
   it('plans once per escalation, dedupes and caps', () => {
     expect(planNeedsHumanVoid(options())).toMatchObject({ key: 'ci-heal-needs-human-void:5012:' + HEAD + ':0', alreadyPosted: false });
@@ -913,7 +922,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
   const jobId = 123;
   const options = (overrides = {}) => {
     const facts = { number: 6042, url: 'https://github.com/example/repo/pull/6042',
-      headRefOid: HEAD, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [
+      headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
         { name: 'merge-gate', id: jobId, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T13:00:00-04:00' },
       ] };

@@ -11,7 +11,7 @@ export function openPrPageFixture(prs, query) {
     isCrossRepository: p.isCrossRepository || false, mergeable: p.mergeable,
     mergeStateStatus: p.mergeStateStatus, reviewDecision: p.reviewDecision || '',
     labels: { nodes: p.labels || [] },
-    commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes:
+    commits: { nodes: [{ commit: { oid: p.headRefOid, statusCheckRollup: { contexts: { totalCount: (p.statusCheckRollup || []).length, pageInfo: { hasNextPage: false }, nodes:
       (p.statusCheckRollup || []).map(c => c.context
         ? { ...c, __typename: 'StatusContext', createdAt: c.createdAt || c.startedAt }
         : { ...c, __typename: 'CheckRun',

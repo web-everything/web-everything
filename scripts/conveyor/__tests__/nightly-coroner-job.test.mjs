@@ -18,6 +18,14 @@ import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
 import { markLaunching } from '../../lib/daemon-jobs.mjs';
 import coronerSmell from '../health-smells/nightly-coroner-failed.mjs';
 import { emptyHealthState, runHealthTick } from '../health-watch-core.mjs';
+// Exercise the real job lifecycle while keeping host process-start discovery hermetic.
+// The SIGTERM contract still uses a live extractor and probes its actual liveness.
+vi.mock('../../lib/daemon-jobs-runtime.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, runJob: options => actual.runJob({
+    ...options, readStart: options.readStart ?? (() => 'fixture-process-start'),
+  }) };
+});
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal();
   return { ...actual, readFileSync: vi.fn(actual.readFileSync), renameSync: vi.fn(actual.renameSync) };

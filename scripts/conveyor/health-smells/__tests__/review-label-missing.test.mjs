@@ -44,7 +44,7 @@ describe('xe8y12n durable missing review observations', () => {
     expect(Object.keys(next.state.episodes)).toHaveLength(2);
   });
   it('reported #3239 shape is diagnostic-only; pending enables ordinary review selection', () => {
-    const pr = { ...observed(1), number: 3239, headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: [] };
+    const pr = { ...observed(1), rowsComplete: true, rowsHead: 'a'.repeat(40), number: 3239, headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: [] };
     const before = planReconcile({ prs: [pr] });
     expect(before.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing', prNumber: 3239 }));
     expect(before.dispatch).toEqual([]);

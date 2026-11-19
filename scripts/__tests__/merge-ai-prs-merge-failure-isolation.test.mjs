@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 import * as drain from '../merge-ai-prs.mjs';
 
 // Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
@@ -26,6 +27,9 @@ const openPrPageFixture = ${openPrPageFixture};
 const prs = JSON.parse(fs.readFileSync(process.env.ISOLATION_FIXTURE, 'utf8'));
 const landed = n => fs.existsSync(process.env.ISOLATION_FIXTURE + '.merged-' + n);
 const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
+const completeCheckReadFixture = ${completeCheckReadFixture};
+const checkPages = completeCheckReadFixture(prs, a);
+if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 // The drain's candidate listing reads small GraphQL pages (pr-list-paged.mjs); the shared fixture serves them.
