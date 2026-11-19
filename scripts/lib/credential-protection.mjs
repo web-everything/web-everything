@@ -1,7 +1,7 @@
 /**
  * R1082: lexical content-read boundary, pure and filesystem independent.
  * ls (including -l) is names/metadata only and falls through. Only ssh and ssh-add
- * bypass argument checks (ssh remote command paths belong to the remote). Redirections
+ * allow only plain -i/-F path operands and safe options. Redirections
  * and nested commands are checked even inside these allowed commands. Other commands
  * referencing protected paths conservatively deny (including interpreters, archives,
  * copies, transforms, grep/sed/awk and ssh-keygen -y/-f). Exact .env.example,
@@ -63,42 +63,115 @@ export function classifyProtectedPath(path, { home, repoRoot, protectedPaths = D
 }
 
 const pass = () => ({ decision: 'pass', path: null, reason: null });
+const normalizeWord = word => word.replace(/\\(.)/gs, '$1').replace(/["']/g, '');
+const escapeRegex = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Compile a shell glob component. Braces are alternatives; stars never cross '/'.
+function globRegex(pattern) {
+  let out = '';
+  // Unbalanced braces are literal text in a shell, not an alternation.
+  const braces = pattern.split('{').length === pattern.split('}').length;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (!braces && (c === '{' || c === '}' || c === ',')) { out += escapeRegex(c); continue; }
+    if (c === '*') out += '[^/]*';
+    else if (c === '?') out += '[^/]';
+    else if (c === '[' && pattern.indexOf(']', i + 1) > i + 1) {
+      const end = pattern.indexOf(']', i + 1);
+      let chars = pattern.slice(i + 1, end);
+      if (chars.startsWith('!')) chars = '^' + chars.slice(1);
+      out += '[' + chars.replace(/\\/g, '\\\\') + ']'; i = end;
+    } else if (c === '{') out += '(?:';
+    else if (c === '}') out += ')';
+    else if (c === ',') out += '|';
+    else out += escapeRegex(c);
+  }
+  return new RegExp(`^(?:${out})$`);
+}
+function patternHit(word, options) {
+  const full = resolve(options.repoRoot, expandHome(word, options.home));
+  if (!/[*?\[{]/.test(full)) return classifyProtectedPath(word, options);
+  const parts = full.split('/');
+  try {
+    for (const entry of withProtectedPathFloor(options.protectedPaths)) {
+      if (entry.path === '.env*') {
+        const name = parts.at(-1);
+        const regex = globRegex(name);
+        // Include the pattern's literal suffix to witness arbitrary .env variants.
+        const suffix = name.replace(/[*?\[\]{}!,]/g, '');
+        if (['.env', '.env.local', `.env${suffix}`].some(v => !examples.has(v) && regex.test(v))) {
+          return { decision: 'deny', path: full, reason: entry.reason };
+        }
+      } else {
+        const root = resolve(expandHome(entry.path, options.home));
+        const roots = root.split('/');
+        if (parts.slice(0, roots.length).every((part, i) => globRegex(part).test(roots[i]))) {
+          return { decision: 'deny', path: root, reason: entry.reason };
+        }
+      }
+    }
+  } catch {
+    return { decision: 'deny', path: full, reason: 'Unparseable path pattern; use an explicit path and retry' };
+  }
+  return pass();
+}
 export function classifyBashCommand(command, options = {}) {
   if (typeof command !== 'string') return pass();
-  // Quotes may occur within a shell word (~/'.ssh'/id) or an interpreter string.
-  // Removing them is conservative: quoted literal references can also deny.
-  const text = command.replace(/\\\n/g, '').replace(/["'`]/g, '');
+  // Retain substitutions for the SSH check; normalize adjacent shell fragments
+  // before tokenization so escaping cannot conceal a protected directory.
+  const text = normalizeWord(command.replace(/\\\n/g, ''));
   const references = segment => {
     const expanded = expandHome(segment, options.home ?? '');
-    // Preserve a HOME containing spaces: shell quoting was stripped above, but the
-    // complete expanded prefix is still present. Require real path boundaries.
     for (const entry of withProtectedPathFloor(options.protectedPaths)) {
-      if (entry.path === '.env*') continue;
+      if (entry.path === '.env*' || !/\s/.test(options.home ?? '')) continue;
       const root = expandHome(entry.path, options.home ?? '');
-      const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (new RegExp(`(^|[\\s=:(,<>])${escaped}(?=$|[/\\s*?;|<>()},:])`).test(expanded)) {
+      if (new RegExp(`(^|[\\s=:(,<>])${escapeRegex(root)}(?=$|[/\\s*?;|<>()},:])`).test(expanded)) {
         return { decision: 'deny', path: root, reason: entry.reason };
       }
     }
-    // Interpreter source punctuation and shell metacharacters delimit path literals.
-    const words = expanded.split(/[\s;&|<>(){},=:+]+/).filter(Boolean);
+    // Keep braces and brackets within glob words, including brace commas.
+    const words = segment.split(/[\s;&|<>()=:+`]+/).filter(Boolean);
     for (const word of words) {
-      const hit = classifyProtectedPath(word.replace(/^@/, ''), options);
+      const hit = patternHit(word.replace(/^@/, ''), options);
       if (hit.decision === 'deny') return hit;
     }
     return pass();
   };
-  // Redirect targets remain protected even on otherwise exempt commands.
+  // Examine each SSH segment before splitting nested shell constructs.
+  for (const segment of text.split(/&&|\|\||[;|\n]/)) {
+    const words = segment.trim().split(/\s+/);
+    while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
+    if (!['ssh', 'ssh-add'].includes(basename(words[0] ?? ''))) continue;
+    const refuse = () => ({ decision: 'deny', path: 'ssh', reason: 'Unsafe SSH arguments; use plain -i/-F operands and safe options' });
+    if (/ProxyCommand|LocalCommand/i.test(segment) || /`|\$\(|<\(|>\(/.test(segment)) return refuse();
+    const safe = new Set(['stricthostkeychecking', 'batchmode', 'connecttimeout', 'userknownhostsfile', 'identityfile', 'port', 'user']);
+    for (let i = 1; i < words.length; i++) {
+      const word = words[i];
+      if (word === '-i' || word === '-F') {
+        const operand = words[++i];
+        if (!operand || operand.startsWith('-') || /[*?\[{}<>`]/.test(operand)) return refuse();
+        continue;
+      }
+      if (word === '-o' || word.startsWith('-o')) {
+        const value = word === '-o' ? words[++i] : word.slice(2);
+        if (!value || !safe.has(value.split('=')[0].toLowerCase())) return refuse();
+        if (!value.includes('=')) {
+          const operand = words[++i];
+          if (!operand || references(operand).decision === 'deny') return refuse();
+        }
+        if (references(value).decision === 'deny') return refuse();
+        continue;
+      }
+      if (references(word).decision === 'deny') return refuse();
+    }
+  }
   for (const m of text.matchAll(/[<>]+\s*([^\s;&|<>()]+)/g)) {
     const hit = references(m[1]);
     if (hit.decision === 'deny') return hit;
   }
-  // Splitting parentheses also exposes $(cat ...) inside otherwise allowed commands.
   for (const segment of text.split(/&&|\|\||[;|\n()]/)) {
     const words = segment.trim().split(/\s+/);
     while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
-    const executable = basename(words[0] ?? '');
-    if (['ls', 'ssh', 'ssh-add'].includes(executable)) continue;
+    if (['ls', 'ssh', 'ssh-add'].includes(basename(words[0] ?? ''))) continue;
     const hit = references(segment);
     if (hit.decision === 'deny') return hit;
   }

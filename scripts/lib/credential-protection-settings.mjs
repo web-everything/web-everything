@@ -18,7 +18,13 @@ export function resolveCredentialProtection({ platform = {}, tool = {}, env = {}
     envValues: { gitleaks: env.WE_GITLEAKS_MODE === 'require' ? { mode: 'require' } : undefined }, valid });
   const strict = invalid || !shape(platform) || !shape(tool) || r.invalid.length > 0;
   const settings = strict ? structuredClone(STRICT_CREDENTIAL_PROTECTION) : r.value;
-  settings.protectedPaths = withProtectedPathFloor(settings.protectedPaths);
+  settings.protectedPaths = withProtectedPathFloor([
+    ...(validProtectedPaths(platform?.protectedPaths) ? platform.protectedPaths : []),
+    ...(validProtectedPaths(tool?.protectedPaths) ? tool.protectedPaths : []),
+    ...settings.protectedPaths,
+  ]);
+  r.sources.protectedPaths = ['standard', ...(platform?.protectedPaths ? ['platform'] : []),
+    ...(tool?.protectedPaths ? ['tool'] : [])].join('+');
   delete settings.$comment;
   if (env.WE_GITLEAKS_MODE !== undefined && env.WE_GITLEAKS_MODE !== 'require') {
     log('credential-protection: ignored WE_GITLEAKS_MODE; environment may only select require.');

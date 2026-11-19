@@ -34,29 +34,40 @@ export function gitleaksGuard({ phase, input = '', mode = 'auto', env = process.
   if (!['auto', 'require', 'off'].includes(mode)) { log('Invalid gitleaks mode; refusing unscanned operation.'); return 1; }
   if (!['pre-commit', 'pre-push'].includes(phase)) { log('Expected pre-commit or pre-push.'); return 1; }
   if (mode === 'off') { log('gitleaks secret scan disabled (mode=off).'); return 0; }
+  let commands;
+  try { commands = phase === 'pre-commit' ? [['protect', '--staged', '--redact']]
+    : pushedRanges(input).map(range => ['detect', '--redact', `--log-opts=${range}`]); }
+  catch (e) { log(e.message); return 1; }
   const binary = find(env);
   if (!binary) {
     log('!!! gitleaks not installed: secret scan SKIPPED !!!\nInstall: brew install gitleaks (or https://github.com/gitleaks/gitleaks#installing)\nSet gitleaks.mode=require in scripts/settings/credential-protection.json to refuse missing scanners.');
     return mode === 'require' ? 1 : 0;
   }
-  let commands;
-  try { commands = phase === 'pre-commit' ? [['protect', '--staged', '--redact']]
-    : pushedRanges(input).map(range => ['detect', '--redact', `--log-opts=${range}`]); }
-  catch (e) { log(e.message); return 1; }
   if (phase === 'pre-push' && commands.length === 0) {
     if (mode === 'require') {
       log('No pre-push ranges supplied; mode=require refuses unscanned push. Retry through Git with ref evidence.');
       return 1;
     }
-    log('No pre-push ranges supplied; mode=auto falls back to scanning HEAD~1..HEAD (HEAD for a single commit). This does not verify all pushed history.');
-    const parent = run('git', ['rev-list', '--max-count=2', 'HEAD'], { env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-    const commits = String(parent.stdout ?? '').trim().split('\n');
-    if (parent.error || parent.status !== 0 || commits.length > 2
-      || !commits.every(sha => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha))) {
-      log('Cannot determine HEAD parent; repair Git evidence and retry.');
+    const origin = run('git', ['rev-parse', '--verify', 'origin/main^{commit}'], { env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+    if (origin.error || (origin.status !== 0 && origin.status !== 128)
+      || (origin.status === 0 && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(String(origin.stdout ?? '').trim()))) {
+      log('Cannot resolve origin/main evidence; repair Git evidence and retry.');
       return 1;
     }
-    commands = [['detect', '--redact', `--log-opts=${commits.length === 2 ? 'HEAD~1..HEAD' : 'HEAD'}`]];
+    let range;
+    if (origin.status === 0) range = 'origin/main..HEAD';
+    else {
+      const parent = run('git', ['rev-list', '--max-count=2', 'HEAD'], { env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+      const commits = String(parent.stdout ?? '').trim().split('\n');
+      if (parent.error || parent.status !== 0 || commits.length > 2
+        || !commits.every(sha => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha))) {
+        log('Cannot determine HEAD parent; repair Git evidence and retry.');
+        return 1;
+      }
+      range = commits.length === 2 ? 'HEAD~1..HEAD' : 'HEAD';
+    }
+    log(`No pre-push ranges supplied; mode=auto falls back to scanning ${range}. This does not verify all pushed history.`);
+    commands = [['detect', '--redact', `--log-opts=${range}`]];
   }
   for (const args of commands) {
     const result = run(binary, args, { env, stdio: ['ignore', 'inherit', 'inherit'], timeout: 300000, maxBuffer: 1024 * 1024 });

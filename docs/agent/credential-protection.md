@@ -18,17 +18,20 @@ the strict defaults, including requiring gitleaks; repair settings to recover.
 `auto` runs an installed gitleaks or prints **secret scan SKIPPED** with an install
 hint and returns success when the scanner is missing: this is the intended operator
 policy. Set `mode: "require"` for the strict option, which refuses missing scanners.
-`off` visibly disables scanning when selected in the settings file.
+`off` visibly disables scanning with a one-line notice when selected in settings.
+Both missing-scanner success in `auto` and disable in `off` are deliberate operator
+settings, not modes a caller may silently toggle. The environment can only tighten
+the resolved mode to `require`; it cannot select `auto` or `off`.
 
 Custom `protectedPaths` always extend the built-in floor: `~/.ssh`, `~/.gnupg`,
 `~/.aws`, `~/.docker`, `~/.kube`, `~/.netrc`, `~/.secrets`,
-`~/.config/gh/hosts.yml`, and `.env*`. They cannot remove these protections.
+`~/.config/gh/hosts.yml`, and `.env*`. Platform and file lists are unioned with the built-in floor; later layers cannot remove earlier paths.
 `.env*` matches the basename in any directory, including outside the repository.
 
 When pre-push evidence yields no ranges (including deletion-only input), `require`
 refuses the push and asks for ref evidence. `auto` prints a notice and scans
-`HEAD~1..HEAD`, or `HEAD` for a single commit. That fallback does not verify all
-pushed history. Malformed evidence still refuses the operation.
+`origin/main..HEAD` when that ref resolves, otherwise `HEAD~1..HEAD` (or `HEAD` for a single commit). That fallback does not verify all
+pushed history. Malformed or oversized evidence refuses the operation before scanner discovery in every mode except the explicit `off` setting.
 
 Apply deliberately with `node scripts/bootstrap-session.mjs install`; preview with
 `node scripts/bootstrap-session.mjs install --dry-run`, verify with `--check`, and
@@ -37,9 +40,16 @@ undo owned entries with `node scripts/bootstrap-session.mjs uninstall` (also sup
 ownership manifest in `~/.plateau/hooks/` records additions; modified hook files
 require operator review. Use a scratch `HOME` for tests, never the real HOME.
 
-Only `ssh` (including `ssh -i` and remote command text), `ssh-add`, and directory
-listings (`ls`, including `-l`) bypass argument checks. Redirects and nested local
-commands remain checked. Git, gh, scp, rsync, and curl deny protected path arguments;
+SSH commands permit protected paths only as plain `-i <key>` / `-F <config>`
+operands; other protected-path references deny, including remote command text and
+bare `ssh-add` key operands. `ProxyCommand`, `LocalCommand`, backticks, command/process
+substitution, and unrecognized `-o` options deny. The safe `-o` names are
+StrictHostKeyChecking, BatchMode, ConnectTimeout, UserKnownHostsFile, IdentityFile,
+Port, and User; their values still undergo protected-path checks. Directory listings
+(`ls`, including `-l`) pass. Redirects and nested local commands remain checked.
+Shell word escapes and adjacent quote fragments normalize before matching; HOME,
+repeated separators, dot segments and lexical parent segments resolve. Glob patterns
+that can reach protected paths also deny. Git, gh, scp, rsync, and curl deny protected path arguments;
 Git/gh commands without those arguments follow normal permission flow. Content
 reads, copies, archives, transforms, interpreters referencing protected paths and input
 redirections deny. The Bash matcher exempts exact `.env.example`, `.env.sample`,

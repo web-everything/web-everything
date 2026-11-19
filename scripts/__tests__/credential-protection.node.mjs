@@ -40,14 +40,48 @@ for (const command of deny) test(`denies content read: ${command}`, () => {
   assert.equal(hit.decision, 'deny'); assert.ok(hit.path); assert.ok(hit.reason);
 });
 const allow = [
-  'ssh host uptime', 'ssh -i ~/.ssh/id_rsa host uptime', 'ssh-add ~/.ssh/key',
-  'ssh host', 'ssh host cat ~/.ssh/x', '/usr/bin/ssh-add ~/.ssh/key',
+  'ssh host uptime', 'ssh -i ~/.ssh/id_rsa host uptime', 'ssh-add',
+  'ssh host', 'ssh -F ~/.ssh/config host', '/usr/bin/ssh-add',
   'git status', 'git push', 'gh auth status', 'gh api /x',
   'ls ~/.ssh', 'ls -la ~/.ssh', 'cat ~/.sshfoo', 'cat my.ssh/key',
   'cat .env.example', 'cat .env.sample', 'cat .env.template',
   'cat config/.env.example', 'cat ../.env.sample', 'cat /elsewhere/.env.template', 'echo hello',
 ];
 for (const command of allow) test(`passes intended exception: ${command}`, () => assert.equal(classifyBashCommand(command, options).decision, 'pass'));
+for (const command of [
+  'ssh -o ProxyCommand=cat host', 'ssh -o LocalCommand=cat host',
+  'ssh -o PermitLocalCommand=yes host', 'ssh -oUnknown=yes host',
+  'ssh host `echo hi`', 'ssh host $(echo hi)', 'ssh host <(echo hi)', 'ssh host >(echo hi)',
+  'ssh host cat ~/.ssh/x', 'ssh-add ~/.ssh/key', '/usr/bin/ssh-add ~/.ssh/key',
+  'ssh -o IdentityFile=~/.ssh/key host', 'ssh -o UserKnownHostsFile ~/.ssh/known_hosts host',
+  'ssh -i ~/.ssh/key host ~/.aws/config', 'ssh -i ~/.s*/key host', 'ssh -F',
+]) test(`SSH exemption refuses unsafe segment: ${command}`, () => {
+  assert.equal(classifyBashCommand(command, options).decision, 'deny');
+});
+for (const option of ['StrictHostKeyChecking=yes', 'BatchMode=yes', 'ConnectTimeout=3',
+  'UserKnownHostsFile=/dev/null', 'IdentityFile=/public/key', 'Port=22', 'User=alice']) {
+  test(`SSH exemption permits safe option ${option}`, () => {
+    for (const prefix of ['-o ', '-o']) {
+      assert.equal(classifyBashCommand(`ssh ${prefix}${option} host`, options).decision, 'pass');
+    }
+  });
+}
+for (const word of [String.raw`~/.s\sh/id_rsa`, '~/".ssh"/id_rsa', '"~/.s"sh/id_rsa',
+  '${HOME}/.ssh/id_rsa', '$HOME/.ssh/id_rsa', '~//.ssh/./id_rsa', '~/foo/../.ssh/id_rsa',
+  '~/.ss?/id_rsa', '~/.s*/id*', '~/.{ssh,aws}/x', '~/.s[rs]h/key']) {
+  test(`normalizes shell path or glob ${word}`, () => {
+    assert.equal(classifyBashCommand(`cat ${word}`, options).decision, 'deny');
+  });
+}
+for (const word of ['~/.sshfoo*', '~/.sshfo?', '~/.s[ab]h/key', '~/.{sshfoo,awsfoo}/x', '~/.ssh/../.sshfoo*']) {
+  test(`glob cannot reach protected path ${word}`, () => {
+    assert.equal(classifyBashCommand(`cat ${word}`, options).decision, 'pass');
+  });
+}
+test('listing protected globs remains metadata only', () => {
+  assert.equal(classifyBashCommand('ls ~/.ss?', options).decision, 'pass');
+});
+
 test('HOME containing spaces and quoted full path remain protected', () => {
   assert.equal(classifyBashCommand('cat "$HOME/.ssh/key"', { ...options, home: '/home/an operator' }).decision, 'deny');
 });
@@ -98,6 +132,18 @@ test('custom paths extend the floor in persisted policy, settings, classifiers a
         { ...options, policy }).hookSpecificOutput.permissionDecision, 'deny', path);
     }
   }
+});
+
+test('protected paths union platform custom paths, tool paths and the built-in floor with provenance', () => {
+  const platform = { protectedPaths: [{ path: '~/.company', reason: 'Company secret' }] };
+  const tool = { protectedPaths: [{ path: '~/.team', reason: 'Team secret' }] };
+  const logs = [];
+  const { settings, sources } = resolveCredentialProtection({ platform, tool, log: line => logs.push(line) });
+  for (const path of ['~/.company', '~/.team', ...DEFAULT_CREDENTIAL_PROTECTION.protectedPaths.map(p => p.path)]) {
+    assert.ok(settings.protectedPaths.some(p => p.path === path), path);
+  }
+  assert.equal(sources.protectedPaths, 'standard+platform+tool');
+  assert.match(logs.join(''), /standard\+platform\+tool/);
 });
 
 test('hook denies agents and asks operator, with protected path and reason', () => {
@@ -211,16 +257,18 @@ test('empty push ranges refuse require and visibly scan a fallback in auto with 
     assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode: 'require', find: () => scanner,
       run: () => assert.fail('must not scan without evidence'), log: line => logs.push(line) }), 1);
     assert.match(logs.join('\n'), /No pre-push ranges.*require/);
-    for (const parentStatus of [0, 128]) {
-      const range = parentStatus === 0 ? 'HEAD~1..HEAD' : 'HEAD';
+    for (const range of ['origin/main..HEAD', 'HEAD~1..HEAD', 'HEAD']) {
       const calls = [];
       assert.equal(gitleaksGuard({ phase: 'pre-push', input, env: { ...process.env, EXPECTED_RANGE: range },
         find: () => scanner, log: line => logs.push(line), run: (bin, args, opts) => {
           calls.push([bin, args]);
-          return bin === 'git' ? { status: 0, stdout: parentStatus === 0 ? `${local}\n${remote}\n` : `${local}\n` } : spawnSync(bin, args, opts);
+          if (bin !== 'git') return spawnSync(bin, args, opts);
+          if (args[0] === 'rev-parse') return range === 'origin/main..HEAD' ? { status: 0, stdout: local } : { status: 128 };
+          return { status: 0, stdout: range === 'HEAD' ? `${local}\n` : `${local}\n${remote}\n` };
         } }), 0);
-      assert.equal(calls.length, 2);
-      assert.deepEqual(calls[1], [scanner, ['detect', '--redact', `--log-opts=${range}`]]);
+      assert.equal(calls.length, range === 'origin/main..HEAD' ? 2 : 3);
+      assert.deepEqual(calls[0], ['git', ['rev-parse', '--verify', 'origin/main^{commit}']]);
+      assert.deepEqual(calls.at(-1), [scanner, ['detect', '--redact', `--log-opts=${range}`]]);
       assert.match(logs.join('\n'), /auto falls back/);
     }
   }
@@ -231,4 +279,36 @@ test('fallback refuses failed parent evidence and scanner failure', () => {
   }
   assert.equal(gitleaksGuard({ phase: 'pre-push', find: () => '/scanner', log: () => {},
     run: bin => bin === 'git' ? { status: 0, stdout: local } : { status: 1 } }), 1);
+});
+
+test('malformed and oversized push evidence refuses auto and require even without scanner; off explicitly disables', () => {
+  for (const input of ['broken', 'x'.repeat(1024 * 1024 + 1)]) {
+    for (const mode of ['auto', 'require']) {
+      const logs = [];
+      assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode, log: line => logs.push(line),
+        find: () => assert.fail('must validate evidence before scanner discovery') }), 1);
+      assert.match(logs.join(''), /invalid pre-push|operator must inspect/);
+    }
+    const logs = [];
+    assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode: 'off', log: line => logs.push(line),
+      find: () => assert.fail('explicit disable') }), 0);
+    assert.equal(logs.length, 1); assert.match(logs[0], /disabled/);
+  }
+});
+test('missing scanner auto visibly skips valid push evidence; require refuses', () => {
+  for (const mode of ['auto', 'require']) {
+    const logs = [];
+    assert.equal(gitleaksGuard({ phase: 'pre-push', input: '', mode, find: () => null,
+      log: line => logs.push(line) }), mode === 'auto' ? 0 : 1);
+    assert.match(logs.join(''), /secret scan SKIPPED/);
+  }
+});
+test('absent origin refuses unreadable or malformed parent evidence', () => {
+  for (const result of [{ error: Error('timeout') }, { status: 128 }, { status: 0, stdout: '' },
+    { status: 0, stdout: 'bad' }, { status: 0, stdout: `${local}\n${remote}\n${local}` }]) {
+    const logs = [];
+    assert.equal(gitleaksGuard({ phase: 'pre-push', find: () => '/scanner', log: l => logs.push(l),
+      run: (_bin, args) => args[0] === 'rev-parse' ? { status: 128 } : result }), 1);
+    assert.match(logs.join(''), /Cannot determine HEAD parent/);
+  }
 });
