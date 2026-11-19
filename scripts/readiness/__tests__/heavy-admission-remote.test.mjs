@@ -788,7 +788,7 @@ describe('runWithRemoteDecision', () => {
 
   it.each([
     ['cancelled', 5000], ['cancelled', 18000],
-    ['telemetry', 5000], ['telemetry', 18000], ['remote', 5000], ['remote', 18000], ['remote-telemetry', 5000], ['inflight', 30000],
+    ['telemetry', 5000], ['telemetry', 18000], ['remote', 5000], ['remote', 18000], ['remote', 60000], ['remote', 170000], ['cancelled', 60000], ['remote-telemetry', 5000], ['inflight', 180000],
   ])('files timeout waits for %s after %i ms without releasing a live run', async (completion, delay) => {
     vi.useFakeTimers();
     try {
@@ -819,7 +819,7 @@ describe('runWithRemoteDecision', () => {
       expect(content.owner).toMatch(/^remote-\d+-[0-9a-f]+$/);
       expect(JSON.parse(readFileSync(marker + '.run', 'utf8'))).toEqual({owner: content.owner, run});
       expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(1);
-      await vi.advanceTimersByTimeAsync(28_000);
+      await vi.advanceTimersByTimeAsync(Math.max(28_000, delay - 4000));
       const kept = completion === 'inflight';
       expect(await pending).toEqual(kept ? {handled: true, exitCode: 124}
         : completion.startsWith('remote') ? {handled: true, exitCode: 0, remoteResult: {mode: 'remote', code: 0, run}}
@@ -835,7 +835,7 @@ describe('runWithRemoteDecision', () => {
   });
 
   it.each([
-    [undefined, 30000], ['invalid', 30000], ['-1', 30000], ['1.5', 30000], ['999999', 90000], ['0', 0], ['6000', 6000],
+    [undefined, 180000], ['invalid', 180000], ['-1', 180000], ['1.5', 180000], ['999999', 300000], ['0', 0], ['6000', 6000],
   ])('bounds timeout cancel-wait setting %s to %i ms and retains unknown execution', async (setting, waitMs) => {
     vi.useFakeTimers();
     try {
@@ -844,6 +844,7 @@ describe('runWithRemoteDecision', () => {
       const pending = runWithRemoteDecision({...f, timeoutMs: 20,
         env: setting === undefined ? {} : {WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS: setting}});
       await vi.advanceTimersByTimeAsync(20);
+      expect(f.log.mock.calls.some(([line]) => line === `heavy-admission: remote timeout; waiting up to ${waitMs}ms for confirmed cancellation (${setting === undefined ? 'default' : 'WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS'})\n`)).toBe(true);
       if (waitMs) {
         await vi.advanceTimersByTimeAsync(waitMs - 1);
         expect(f.log.mock.calls.some(([line]) => line.includes('exit 124'))).toBe(false);
@@ -963,7 +964,7 @@ describe('runWithRemoteDecision', () => {
       await vi.advanceTimersByTimeAsync(4000);
       expect(settled).toBe(false);
       if (recorded) expect(f.readTelemetry.mock.calls.length).toBeGreaterThan(probes);
-      await vi.advanceTimersByTimeAsync(25_900);
+      await vi.advanceTimersByTimeAsync(175_900);
       expect(await pending).toEqual({handled: true, exitCode: 124});
       const remoteRoot = join(f.lockRoot, '..', 'remote'), marker = join(remoteRoot, 'slot-0.unconfirmed');
       expect(existsSync(marker)).toBe(true);
@@ -994,7 +995,7 @@ describe('runWithRemoteDecision', () => {
           if (!result.handled) local();
           return result;
         });
-        await vi.advanceTimersByTimeAsync(30_020);
+        await vi.advanceTimersByTimeAsync(180_020);
         expect(await pending).toEqual({ handled: true, exitCode: 124 });
         expect(signal.aborted).toBe(true);
         expect(local).not.toHaveBeenCalled();
@@ -1120,7 +1121,7 @@ describe('runWithRemoteDecision', () => {
         if (outcome === 'synchronous throw') f.remoteExec.mockImplementation(() => { throw new Error('unavailable'); });
         if (outcome === 'timeout') f.remoteExec.mockImplementation(() => new Promise(() => {}));
         const pending = runWithRemoteDecision({ ...f, timeoutMs: 20 });
-        if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(30_020);
+        if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(180_020);
         const expected = outcome === 'success' ? { handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) } : { handled: true, exitCode: 124 };
         expect(await pending).toEqual(expected);
         expect(vi.getTimerCount()).toBe(0);
