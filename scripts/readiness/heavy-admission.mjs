@@ -159,7 +159,7 @@ import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
-import { startLaneLeaseHeartbeat } from '../lib/lane-lease-heartbeat.mjs';
+import { startLaneLeaseHeartbeat, renewLaneLease } from '../lib/lane-lease-heartbeat.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor, ENTRYLESS_LOCK_DIR_GRACE_MS } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
@@ -2071,7 +2071,8 @@ export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fast
  * pid is refreshed (a sibling same-owner process's slot is never touched). Uses `heartbeatOwn`, which never
  * rewrites `lock.json`. Returns the refreshed slot index, or null when this process holds none.
  */
-export function heartbeatOwnedSlot({ lockRoot, cap, owner, pid = process.pid, nowIso = new Date().toISOString(), fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
+export function heartbeatOwnedSlot({ lockRoot, cap, owner, laneCwd, pid = process.pid, nowIso = new Date().toISOString(), fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
+  if (laneCwd) renewLaneLease({ cwd: laneCwd });
   for (let i = 0; i < cap + fastSlots; i++) {
     const entry = readLockEntry(lockRoot, slotPath(i));
     if (!entry || entry.owner !== owner || entry.pid !== pid) continue;
@@ -2998,7 +2999,14 @@ function execWithRunCeiling(command, opts, ceilingMs, exec) {
   });
 }
 
-export async function runUnderAdmission({
+export async function runUnderAdmission(options) {
+  const { cwd = process.cwd(), startHeartbeat = startLaneLeaseHeartbeat } = options;
+  const heartbeat = startHeartbeat({ cwd });
+  try { return await runUnderAdmissionWithoutHeartbeat({ ...options, startHeartbeat: () => ({ stop() {} }) }); }
+  finally { heartbeat.stop(); }
+}
+
+async function runUnderAdmissionWithoutHeartbeat({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   kind = null, command, cwd = process.cwd(), exec = defaultExec, log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),

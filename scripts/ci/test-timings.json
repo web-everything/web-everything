@@ -2250,6 +2250,7 @@
   "scripts/conveyor/soak/breaks/infra-ci-fallback-push-refused.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/item-task-authority-lost-before-write.soak.test.mjs": 0.04,
   "scripts/conveyor/soak/breaks/lane-pool-recovery-origin-isolation.soak.test.mjs": 64.92,
+  "scripts/conveyor/soak/breaks/lane-lease-expiry-resets-live-lane.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lease-reaper-stale-terminal-row.soak.test.mjs": 20.72,
   "scripts/conveyor/soak/breaks/main-ci-budget-refusal.soak.test.mjs": 0.05,
   "scripts/conveyor/soak/breaks/merge-watch-budget-starvation.soak.test.mjs": 0.51,

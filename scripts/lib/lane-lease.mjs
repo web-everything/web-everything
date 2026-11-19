@@ -146,8 +146,7 @@ export function chooseFreeLane(laneInfos, nowMs, ttlMs, { excludeLane = null } =
  *  Bash-tool calls yet distinct between concurrent sessions, and does NOT false-match two independent sessions
  *  that merely share an upper process ancestor (terminal, a parallel-lane orchestrator) — the over-match that
  *  made the earlier pid-ancestry heuristic unsafe in this guard's target topology (r2: pid-ancestry removed).
- *  `pid` is informational only (human-readable `status`/debug; a leaf that exits right after `acquire`, never
- *  useful for ownership).
+ *  `pid` records the long-lived acquire caller. It protects liveness, never proves ownership.
  *  `predictedScope` (#2560 final slice) is the OPTIONAL, ADVISORY repo-qualified `"<repo>:<path>"` file-scope
  *  list a lane declares at acquire (`acquire --scope=`). It is the real predicted-scope source the live
  *  scope-lease observer/collector consumes — but it NEVER gates the acquire (the whole-clone lease is the real

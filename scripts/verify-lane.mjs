@@ -89,6 +89,7 @@ import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { startLaneLeaseHeartbeat } from './lib/lane-lease-heartbeat.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -124,6 +125,8 @@ for (const a of process.argv.slice(2)) {
 
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
+const laneHeartbeat = startLaneLeaseHeartbeat({ cwd: REPO });
+process.once('exit', () => laneHeartbeat.stop());
 const AS_JSON = !!flags.json;
 // #2833 finding 5 — resolve the gate options through the SHARED resolver so `check` mode agrees with pr-land:
 // `--require-verified` OR `WE_REQUIRE_VERIFIED=1`, and the `WE_LAND_UNVERIFIED=1` break-glass. Previously `check`
@@ -805,7 +808,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
       pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
       kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
-      ...(currentAdmission.ok ? { heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS } } : {}),
+      heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, laneCwd: REPO }, everyMs: Math.min(SLOT_HEARTBEAT_MS, 60_000) },
       onFire: () => {
         if (settled) return;
         announce();

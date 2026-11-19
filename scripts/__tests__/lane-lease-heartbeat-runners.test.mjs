@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runCodexDirectExec } from '../codex-direct-task.mjs';
+import { runCodexDirectExec, waitForJob } from '../codex-direct-task.mjs';
 import { runUnderAdmission, heldSlots, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 import { startLaneLeaseHeartbeat } from '../lib/lane-lease-heartbeat.mjs';
 
@@ -61,5 +61,20 @@ it.each([null, 'held'])('heavy command stops its heartbeat on failure (bypass=%s
     command: 'test', cwd: dir, bypass, log: () => {}, startHeartbeat: () => ({ stop }),
     exec: async () => { throw Object.assign(Error('failed'), { status: 7 }); } });
   expect(result.exitCode).toBe(7);
+  expect(stop).toHaveBeenCalledOnce();
+});
+
+it.each(['done', 'error', 'timeout'])('Codex wait keeps and stops the cwd heartbeat on %s', async outcome => {
+  const stop = vi.fn();
+  const startHeartbeat = vi.fn(() => ({ stop }));
+  const readRecord = async () => {
+    expect(stop).not.toHaveBeenCalled();
+    if (outcome === 'error') throw Error('read failed');
+    return { status: outcome === 'done' ? 'done' : 'running', exitCode: 0 };
+  };
+  const result = await waitForJob({ cwd: dir, startHeartbeat, readRecord, maxMs: 10,
+    isAlive: () => true, pollMs: 1 });
+  expect(result.code).toBe(outcome === 'done' ? 0 : outcome === 'error' ? 2 : 75);
+  expect(startHeartbeat).toHaveBeenCalledWith({ cwd: dir });
   expect(stop).toHaveBeenCalledOnce();
 });

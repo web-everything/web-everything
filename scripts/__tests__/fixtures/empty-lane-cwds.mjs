@@ -4,7 +4,7 @@ export async function load(url, context, nextLoad) {
   if (url.endsWith('/lane-lease-liveness.mjs')) {
     const actual = JSON.stringify(url + '?actual');
     return { format: 'module', shortCircuit: true, source:
-      'export { journalLiveProcessRefusal } from ' + actual + ';' +
+      'export { journalLiveProcessRefusal, probeLaneReclaim } from ' + actual + ';' +
       'import { staleTakeoverHasLiveProcesses as probe } from ' + actual + ';' +
       'export const staleTakeoverHasLiveProcesses = (dir, options) => probe(dir, { ...options, readCwds: () => [] });'
     };

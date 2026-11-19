@@ -1585,7 +1585,14 @@ export function jobIsAlive({ pid, pidStart }, { readStart = readPidStart, readSt
   // answer throws, so `wait` fails closed (exit 2) instead of marking a possibly-live job failed.
   return readStart(pid) === pidStart;
 }
-export async function waitForJob({
+export async function waitForJob(options = {}) {
+  const { cwd = process.cwd(), startHeartbeat = startLaneLeaseHeartbeat } = options;
+  const heartbeat = startHeartbeat({ cwd });
+  try { return await waitForJobWithoutHeartbeat(options); }
+  finally { heartbeat.stop(); }
+}
+
+async function waitForJobWithoutHeartbeat({
   jobId, maxMs = MAX_JOB_WAIT_MS,
   readRecord,
   writeRecord,

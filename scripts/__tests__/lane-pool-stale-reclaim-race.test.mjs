@@ -67,6 +67,9 @@ beforeEach(() => {
   // Seed a long-TTL-stale lease on lane-1 — both reclaimers will judge it stale the same way.
   const seed = runPool(['acquire', '--lane=1', ...REPO(), '--session=long-dead', '--ttl-minutes=0']);
   expect(seed.code).toBe(0);
+  // The fixture represents a dead holder, not this still-running test process.
+  const expired = JSON.parse(readFileSync(leaseMarker(1), 'utf8'));
+  writeFileSync(leaseMarker(1), JSON.stringify({ ...expired, pid: null }));
 });
 
 afterEach(() => {
