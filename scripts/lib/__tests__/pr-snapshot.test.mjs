@@ -143,6 +143,24 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(viewCalls(calls)).toHaveLength(1);
     expect(SNAPSHOT_FIELDS).toContain('comments');
   });
+  it('cacheOnly serves a fresh snapshot and refuses a dirty or expired one, with no gh call (drain listing seed)', () => {
+    const { exec, calls } = fakeExec();
+    const fields = 'number,updatedAt,headRefOid,body,files';
+    readSharedOpenPrs(opts({ fields, exec }));
+    const before = calls.length;
+    const seedOpts = opts({ fields, exec, cacheOnly: true, ttlMs: 75_000 });
+    clock += 30_000;
+    expect(readSharedOpenPrs(seedOpts)).toHaveLength(14);
+    clock += 60_000;
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // expired, no dirty mark: TTL alone refuses
+    expect(calls.length).toBe(before);
+    readSharedOpenPrs(opts({ fields, exec })); // refresh, then dirty it
+    const afterRefresh = calls.length;
+    markPrSnapshotDirty({ repo: REPO, env: { WE_PR_SNAPSHOT_DIR: dir }, nowMs: clock + 1 });
+    clock += 20_000;
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty, inside TTL: no seed, never a refresh
+    expect(calls.length).toBe(afterRefresh);
+  });
   it('8 readers with 8 different field sets inside the TTL share ONE paged refresh and hydration', () => {
     const { exec, calls } = fakeExec();
     const fieldSets = [
