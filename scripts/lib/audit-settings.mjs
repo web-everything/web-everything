@@ -165,6 +165,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/readiness/prepare-hold-state.mjs',
   // Binary maintenance serializes scheduled ticks with an exclusive lock directory.
   'scripts/operations/agy-upgrade-check.mjs',
+  // The urgent-load verifier takes an exclusive lock directory and `wx` receipt files (found by the hold scan).
+  'scripts/operations/urgent-verify.mjs',
   // Receipt archiving reserves its temp with `wx` and publishes with a no-clobber hard link.
   'scripts/readiness/forge-receipts-archive.mjs',
   // Forge deploy reserves record temps with `wx` and serializes writers on a flock deploy lock.
@@ -228,7 +230,7 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
-  'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs',
+  'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.
   'scripts/conveyor/health-watch.mjs', 'scripts/conveyor/liveness-sweep.mjs', 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs',

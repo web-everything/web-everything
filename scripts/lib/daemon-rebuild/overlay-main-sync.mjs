@@ -31,8 +31,9 @@ const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-reba
 const executeGit = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
 const cleanText = text => String(text ?? '').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
 const stderrTail = result => cleanText(result?.stderr || result?.error?.message).slice(-500);
-function testStderrTail(result, { failedAssertions = [], failed = [] } = {}) {
-  const combined = `${result?.stdout ?? ''}\n${result?.stderr || result?.error?.message || ''}`;
+const withoutDeprecations = text => String(text ?? '').split(/\r?\n/)
+  .filter(line => !/DeprecationWarning|--trace-deprecation/.test(stripVTControlCharacters(line))).join('\n');
+function failedTestNames({ failedAssertions = [], failed = [] } = {}) {
   const namedFiles = new Set();
   const names = failedAssertions.filter(identity => identity !== null).map(identity => {
     const [file, form, ...title] = JSON.parse(identity);
@@ -40,11 +41,29 @@ function testStderrTail(result, { failedAssertions = [], failed = [] } = {}) {
     return `${file} > ${form === 'fullName' ? title[0] : [...title[0], title[1]].join(' > ')}`;
   });
   names.push(...failed.filter(file => !namedFiles.has(file)));
+  return [...new Set(names)];
+}
+function testResultNames(result, evidence = {}) {
+  const names = failedTestNames(evidence);
   if (!names.length) {
-    for (const match of stripVTControlCharacters(combined).matchAll(/^\s*FAIL\s+([^\r\n]+)/gm)) names.push(match[1].trim());
+    names.push(...testOutputFailures(result).names);
   }
-  // Preserve the historical stderr-only diagnostic byte for byte after sanitizing.
-  if (!result?.stdout && !names.length) return stderrTail(result);
+  return names;
+}
+function testOutputFailures(result) {
+  const plain = stripVTControlCharacters(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`);
+  const names = [...plain.matchAll(/^[ \t]*(?:not ok\b(?:[ \t]+\d+)?(?:[ \t]+-)?|FAIL\b|[×✗])[ \t]*([^\r\n]*)/gm)]
+    .map(match => cleanText(match[1].trim())).filter(Boolean);
+  return { red: names.length > 0 || /^\s*(?:not ok\b|FAIL\b|[×✗])/m.test(plain)
+    || /\b[1-9]\d*\s+failed\b/i.test(plain)
+    || plain.split(/\r?\n/).some(line => UNHANDLED_ERRORS.test(line)), names };
+}
+function testStderrTail(result, evidence = {}) {
+  const stderr = stripVTControlCharacters(withoutDeprecations(result?.stderr || result?.error?.message));
+  const combined = `${stripVTControlCharacters(withoutDeprecations(result?.stdout))}\n${stderr}`;
+  const names = testResultNames(result, evidence);
+  // Preserve stderr-only diagnostics after removing warning lines and sanitizing.
+  if (!result?.stdout && !names.length) return cleanText(stderr).slice(-500);
   const prefix = cleanText([...new Set(names)].join('; ')).slice(0, 500);
   const tail = cleanText(combined);
   if (!prefix) return tail.slice(-500);
@@ -55,10 +74,10 @@ function testStderrTail(result, { failedAssertions = [], failed = [] } = {}) {
 const unsupportedAttributeSource = result => result?.status === 129 && !result.error
   && /^unknown option: --attr-source(?:=origin\/main)?\r?$/m.test(result.stderr ?? '');
 const output = (result, failureTail = stderrTail(result)) => {
-  if (result?.status !== 0 || result.error || typeof result.stdout !== 'string') {
+  if (result?.status !== 0 || result.error || result.signal || typeof result.stdout !== 'string') {
     const step = result?.step ?? 'unknown', tail = failureTail;
     throw Object.assign(new Error(`${step}: command failed or incomplete; operator review required${tail ? `: ${tail}` : ''}`),
-      { step, stderrTail: tail });
+      { step, stderrTail: tail, cause: result.cause, failedTests: result.failedTests ?? [] });
   }
   return result.stdout;
 };
@@ -448,7 +467,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   return result;
 }
 const testFailure = evidence => Object.assign(new Error('selected tests did not pass or execute; operator review required'),
-  { stderrTail: evidence?.stderrTail ?? '' });
+  { stderrTail: evidence?.stderrTail ?? '', cause: evidence?.cause, failedTests: evidence?.failedTests ?? failedTestNames(evidence) });
 const remoteUnconfirmed = result => result?.status === 124 && typeof result.stderr === 'string'
   && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
 // Vitest's "Unhandled Errors" section header and its "Errors  N error(s)" summary row.
@@ -580,11 +599,90 @@ async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
   }
 }
 
+// Only explicit interruption evidence earns a retry; an ordinary red remains on the flake path.
+function testRunCause(result, selected) {
+  const limit = result?.status !== 0 && result?.status !== 1
+    ? /run exceeded (\d+)ms and was stopped/i.exec(result?.stderr ?? '') : null;
+  const timeout = result?.status === 124 || result?.error?.code === 'ETIMEDOUT' || limit !== null;
+  return { kind: timeout ? 'timeout' : result?.signal || result?.error?.code === 'ENOBUFS' ? 'killed' : 'exit',
+    status: result?.status ?? null, signal: result?.signal ?? null,
+    limitMs: limit ? Number(limit[1]) : null, files: selected.length };
+}
+
+function validatePartialTestReport(report) {
+  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const statuses = ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled'];
+  if (!record(report) || !Array.isArray(report.testResults)
+    || (Object.hasOwn(report, 'success') && typeof report.success !== 'boolean')
+    || ['numFailedTests', 'numFailedTestSuites'].some(key => Object.hasOwn(report, key)
+      && (!Number.isSafeInteger(report[key]) || report[key] < 0))
+    || report.testResults.some(row => !record(row) || typeof row.name !== 'string' || !row.name.trim()
+      || (Object.hasOwn(row, 'status') && !statuses.includes(row.status))
+      || !Array.isArray(row.assertionResults)
+      || row.assertionResults.some(assertion => !record(assertion) || !statuses.includes(assertion.status)))) {
+    throw new Error('invalid partial test report structure');
+  }
+}
+
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
-  io.rmSync(testReport, { force: true }); // Never consume a previous attempt's evidence.
-  const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
-  const result = await (runner ?? (options => runHeavyTests(options, { io })))(invocation);
-  if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
+  let result, invocation, cause, timeoutRetried = false;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const reportPath = attempt === 1 ? testReport : `${testReport}.retry`;
+    io.rmSync(reportPath, { force: true }); // Never consume a previous attempt's evidence.
+    invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport: reportPath, env, io });
+    try { result = await (runner ?? (options => runHeavyTests(options, { io })))(invocation); }
+    catch (error) {
+      result = { status: error.status ?? null, signal: error.signal, error, stdout: error.stdout, stderr: error.stderr };
+      if (testRunCause(result, selected).kind === 'exit') throw error;
+    }
+    if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
+    cause = testRunCause(result, selected);
+    if (cause.kind === 'exit') { testReport = reportPath; break; }
+    cause = { ...cause, attempts: attempt };
+    // Retry only interruptions with no red evidence, including rows outside the selected files.
+    const partial = { failed: [], failedAssertions: [] };
+    let red = testOutputFailures(result).red;
+    let reportError;
+    try {
+      let stat;
+      try { stat = io.statSync(reportPath); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      // Only ENOENT from the initial stat means no evidence. A later read failure is corrupt evidence.
+      if (stat) {
+        if (stat.size > 8 * 1024 * 1024) throw new Error('partial test report over 8 MiB');
+        const text = io.readFileSync(reportPath, 'utf8');
+        if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('partial test report over 8 MiB');
+        const report = JSON.parse(text);
+        red ||= report?.success === false || report?.numFailedTests > 0 || report?.numFailedTestSuites > 0;
+        const rows = Array.isArray(report?.testResults) ? report.testResults : [];
+        for (const row of rows) {
+          const assertions = Array.isArray(row?.assertionResults) ? row.assertionResults : [];
+          const failed = assertions.filter(a => a?.status === 'failed');
+          if (row?.status !== 'failed' && !failed.length) continue;
+          red = true;
+          const file = selected.find(file => row.name === join(io.realpathSync(scratch), file))
+            ?? (typeof row.name === 'string' ? row.name : 'unknown test file');
+          partial.failed.push(file);
+          partial.failedAssertions.push(...failed.map(a => assertionIdentity(file, a)));
+        }
+        validatePartialTestReport(report);
+      }
+    } catch (error) {
+      red = true;
+      reportError = `partial test report unreadable or invalid: ${cleanText(error.message)}`;
+    }
+    const diagnostic = testStderrTail(result, partial);
+    const tail = reportError ? `${reportError.slice(0, 400)} | ${diagnostic}`.slice(0, 500) : diagnostic;
+    const failedTests = testResultNames(result, partial);
+    if (attempt === 1 && !red) {
+      timeoutRetried = true;
+      continue;
+    }
+    const description = cause.kind === 'timeout' ? `timeout${cause.limitMs === null ? '' : ` ${cause.limitMs}ms`}`
+      : `signal ${cause.signal ?? result?.error?.code ?? 'unknown'}`;
+    throw Object.assign(new Error(`tests: run killed (${description}, ${attempt} attempts, ${selected.length} files); operator review required${tail ? `: ${tail}` : ''}`),
+      { step: 'tests', stderrTail: tail, cause, failedTests });
+  }
   let validatedFailure = false;
   if (result?.status === 1) {
     try {
@@ -599,11 +697,11 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
     report = JSON.parse(io.readFileSync(testReport, 'utf8'));
   } catch (error) {
-    if (!commandOk) output({ ...result, step: 'tests' }, testStderrTail(result));
-    throw Object.assign(error, { stderrTail: testStderrTail(result) });
+    if (!commandOk) output({ ...result, step: 'tests', cause, failedTests: testResultNames(result) }, testStderrTail(result));
+    throw Object.assign(error, { cause, failedTests: [], stderrTail: testStderrTail(result) });
   }
   const results = report?.testResults;
-  if (!Array.isArray(results)) throw testFailure({ stderrTail: testStderrTail(result) });
+  if (!Array.isArray(results)) throw testFailure({ cause, stderrTail: testStderrTail(result) });
   const names = selected.map(file => join(io.realpathSync(scratch), file));
   const failed = [], passed = [], failedAssertions = [], failedFiles = [], byFile = new Map();
   for (let i = 0; i < selected.length; i++) {
@@ -629,11 +727,13 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
       && r.assertionResults.every(a => a?.status === 'passed')));
   const green = commandOk && complete && !failed.length && report.success !== false
     && !(report.numFailedTests > 0) && !(report.numFailedTestSuites > 0);
-  const tail = testStderrTail(result, { failedAssertions, failed: [...new Set([...failed, ...failedFiles])] });
+  const failureNames = { failedAssertions, failed: [...new Set([...failed, ...failedFiles])] };
+  const failedTests = testResultNames(result, failureNames);
+  const tail = testStderrTail(result, failureNames);
   if (!commandOk && !(result?.status === 1 && (!result.error || validatedFailure) && complete && failed.length)) {
-    output({ ...result, step: 'tests' }, tail);
+    output({ ...result, step: 'tests', cause, failedTests }, tail);
   }
-  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail };
+  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail, cause, failedTests, timeoutRetried };
 }
 // A green rerun only clears a failure it actually re-executed. Per previously failed file the rerun must
 // run at least as many assertions as the failing run did (a vanished assertion fails closed), and, when
@@ -683,7 +783,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       });
   };
   const failureEvent = async error => {
-    const detail = { ref, step: error.step ?? step, stderrTail: error.stderrTail ?? '', main: main ?? null };
+    const detail = { ref, step: error.step ?? step, stderrTail: error.stderrTail ?? '', cause: error.cause, failedTests: error.failedTests ?? [], main: main ?? null };
     await outcome(root, env, ref, 'failed', { ...detail, reason: error.message }, deps);
   };
   const lock = marker(root, env, ref);
@@ -804,9 +904,14 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
     for (let offset = 0; offset < tests.length; offset += chunkSize) {
       const chunk = tests.slice(offset, offset + chunkSize);
-      const check = (selected, attempt, tree = scratch, runner = deps.testRunner) => syncTestEvidence({
-        root, scratch: tree, selected, env, io, runner,
-        testReport: join(scratchParent, `tests-${offset / chunkSize}-${attempt}.json`) });
+      const check = async (selected, attempt, tree = scratch, runner = deps.testRunner) => {
+        const evidence = await syncTestEvidence({
+          root, scratch: tree, selected, env, io, runner,
+          testReport: join(scratchParent, `tests-${offset / chunkSize}-${attempt}.json`) });
+        if (evidence.green && evidence.timeoutRetried) event(root,
+          { kind: 'overlay-main-timeout-retried', ref, files: selected.length }, { env });
+        return evidence;
+      };
       let evidence = await check(chunk, 'initial');
       // The remote process may still be running: neither publication nor a local rerun is safe.
       if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
@@ -849,7 +954,10 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
           && evidence.failedAssertions.every(identity => identity !== null)
           && comparison.complete && comparison.failedAssertions.every(identity => identity !== null)
           && coveredWithMultiplicity(evidence.failedAssertions, comparison.failedAssertions);
-      } catch { /* Unknown main evidence must retain the ordinary operator-review failure. */ }
+      } catch (error) {
+        if (['timeout', 'killed'].includes(error.cause?.kind)) throw error;
+        // Unknown main evidence must retain the ordinary operator-review failure.
+      }
       setStep('tests');
       if (mainRed) {
         updateSyncState(sidecar(root, env), state => {
@@ -906,7 +1014,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const failedStep = cause.step ?? step;
     const message = cleanText(cause.message ?? cause);
     const error = Object.assign(new Error(message.startsWith(`${failedStep}: `) ? message : `${failedStep}: ${message}`),
-      { step: failedStep, stderrTail: cause.stderrTail ?? '' });
+      { step: failedStep, stderrTail: cause.stderrTail ?? '', cause: cause.cause, failedTests: cause.failedTests ?? [] });
     try {
       // Publication has its own retry path; conflicts require a human immediately.
       if (main && !publicationStarted) {
