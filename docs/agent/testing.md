@@ -4787,3 +4787,7 @@ The shared CLI GraphQL page fixture must include the commit `oid` and contexts
 completeness. Pre-stage's targeted reread and operator landing use the complete
 check/status reader before forwarding provenance. Preserve the pre-stage
 incomplete/wrong-head matrix and operator unreadable-status refusal.
+The ordinary drain's fresh merge revalidation also hydrates from the complete
+check/status reader; its flattened `gh pr view` rollup is insufficient. The
+pre-stage CLI suite pins unreadable check-run and commit-status refusal before
+enqueue, alongside the successful ordinary cascade and cached pre-stage paths.

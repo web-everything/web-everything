@@ -5119,7 +5119,12 @@ async function runCli() {
       const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
       updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
-      return await resolveChecks(repo, data);
+      const resolved = await resolveChecks(repo, data);
+      // Flattened `gh pr view` rows carry no completeness or head provenance.
+      // Revalidation must use the same complete, head-scoped read as pre-stage.
+      const checks = readReviewChecks({ repo: repo || localSlug, headSha: data.headRefOid });
+      return { ...resolved, statusCheckRollup: checks,
+        rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead };
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is

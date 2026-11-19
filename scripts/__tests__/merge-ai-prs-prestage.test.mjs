@@ -36,6 +36,7 @@ if (a[0] === 'api') {
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
   if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:pr.statusCheckRollup.filter(c => c.name)}]);
   if (path.includes('/status?')) out([{statuses:pr.statusCheckRollup.filter(c => c.context)}]);
   if (a[1] === 'graphql') {
@@ -105,6 +106,17 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
 }
 
 describe('real drain pre-stage path', () => {
+  it.each(['check-runs', 'status'])('fresh cascade revalidation refuses unreadable %s evidence', endpoint => world(({pr,run}) => {
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.unreadableCheckRows = endpoint;
+    const next = run();
+    expect(next.calls.some(a => a.some(x => x.includes(`/commits/${sha}/${endpoint}?`)))).toBe(true);
+    expect(next.report.revalidationAborted, next.stderr).toEqual(expect.arrayContaining([
+      expect.objectContaining({num:42,reason:expect.stringContaining('could not re-read the PR fresh')}),
+    ]));
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+  }));
+
   it.each(['dependency-held', 'cascade', 'prestage'])('shadow adds zero gh calls compared with off (%s)', async path => {
     const traces = [];
     for (const shadowMode of ['off', 'shadow']) {
