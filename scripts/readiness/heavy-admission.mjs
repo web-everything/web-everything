@@ -375,6 +375,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     remote: { ...ADMISSION_POLICY_STANDARD.remote, elasticSlots: { ...ADMISSION_POLICY_STANDARD.remote.elasticSlots }, bundle: { ...ADMISSION_POLICY_STANDARD.remote.bundle } },
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
+  let invalidPlatformManifest = false;
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
     let value = admissionLeaf(settings, leaf);
     sources[leaf] = 'standard';
@@ -382,7 +383,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       let v;
       try { v = admissionLeaf(block, leaf); }
       catch (error) {
-        if (leaf !== 'remote.clientPath' && !leaf.startsWith('remote.slotUnits') && !leaf.startsWith('remote.elasticSlots') && leaf !== 'remote.autoSlotUnits') throw error;
+        if (leaf !== 'remote.clientPath' && leaf !== 'remote.manifest' && !leaf.startsWith('remote.slotUnits') && !leaf.startsWith('remote.elasticSlots') && leaf !== 'remote.autoSlotUnits') throw error;
         v = Symbol('unreadable admission setting'); // invalid even in the trusted platform layer
       }
       if (v === undefined) continue;
@@ -401,6 +402,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       if (valid(v)) { value = v; sources[leaf] = layer; }
       else {
         invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
+        if (layer === 'platform' && leaf === 'remote.manifest') invalidPlatformManifest = true;
         if (leaf === 'remote.slotUnitsByKind') { value = {}; sources[leaf] = layer; }
         if (leaf === 'remote.elasticSlots.enabled') { value = false; sources[leaf] = layer; }
         if (leaf === 'remote.autoSlotUnits') { value = 1; sources[leaf] = layer; }
@@ -421,6 +423,10 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     const target = keys.slice(0, -1).reduce((v, key) => v[key], settings);
     target[keys.at(-1)] = value;
   }
+  if (invalidPlatformManifest) {
+    settings.remote.enabled = false;
+    sources['remote.enabled'] = 'platform (invalid remote.manifest; local execution required)';
+  }
   return { settings, sources, invalid, ignored };
 }
 
@@ -432,21 +438,24 @@ const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
  * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
- * remote client code. A read that fails keeps the last
+ * remote client code or manifest validation. `home` injects the canonical host file's directory for tests.
+ * Redirected preferences always take remote.manifest from that canonical file, defaulting on read failure.
+ * A read that fails keeps the last
  * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
  */
 export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
-  let platform; let tool; let path; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
+  let platform; let tool; let path; let hostPath; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   checkoutRoot ??= repoRoot;
   const overrideOk = privateAdmissionPool(env, checkoutRoot) || isUnderTest(env) || isUnderTest(process.env);
   try {
     envSelected = Boolean(overrideOk && env.WE_PLATFORM_PREFERENCES);
-    path = envSelected ? env.WE_PLATFORM_PREFERENCES : join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
+    hostPath = join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
+    path = envSelected ? env.WE_PLATFORM_PREFERENCES : hostPath;
   }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const key = JSON.stringify([path, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const key = JSON.stringify([path, hostPath, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
@@ -467,6 +476,23 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     const { clientPath, ...remote } = platform.remote;
     platform = { ...platform, remote };
     ignored.push(`platform.remote.clientPath=${clientPathForLog(clientPath)} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`);
+  }
+  if (envSelected) {
+    const { manifest, ...remote } = platform?.remote ?? {};
+    if (manifest !== undefined) ignored.push(`platform.remote.manifest=${oneLine(JSON.stringify(manifest))} (ignored: redirected preferences; only the canonical host preferences file may select manifest validation)`);
+    let hostManifest;
+    try {
+      if (!hostPath) throw new Error('canonical host preferences path unavailable');
+      if (statSync(hostPath).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
+      hostManifest = JSON.parse(readFileSync(hostPath, 'utf8'))?.heavyAdmission?.remote?.manifest;
+    } catch (e) {
+      // Never inherit redirected or last-good manifest values when canonical evidence is unavailable.
+      if (e?.code !== 'ENOENT') {
+        readFailed = true;
+        errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
+      }
+    }
+    platform = { ...platform, remote: { ...remote, ...(hostManifest !== undefined ? { manifest: hostManifest } : {}) } };
   }
   if (repoRoot) try {
     const settingsDir = join(repoRoot, 'scripts', 'settings');

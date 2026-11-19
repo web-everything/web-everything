@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { extname, isAbsolute, relative, dirname, join } from 'node:path';
+import { extname, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import * as filesystem from 'node:fs/promises';
 import { pathParts, splitPaths } from './forge-exec-run.mjs';
@@ -7,7 +7,6 @@ import { pathParts, splitPaths } from './forge-exec-run.mjs';
 export const FORGE_MANIFEST_FILE_CAP = 1048576;
 // HEAD measured 146,012,107 blob bytes when S1 landed; 512 MiB leaves room for growth.
 export const FORGE_MANIFEST_TOTAL_CAP = 512 * 1024 * 1024;
-export const FORGE_MANIFEST_COVERAGE_CAP = 64 * 1024 * 1024;
 // Largest HEAD blob was 829,088 bytes: no remote test input needs an exception.
 export const FORGE_MANIFEST_SIZE_EXCEPTIONS = Object.freeze([]);
 // Fatal UTF-8 decoding of all HEAD blobs found only these binary asset types.
@@ -46,7 +45,8 @@ export async function trackedTree({ cwd, exec, head, refuse, onHead }) {
   const untracked = await exec({ file: 'git', args: ['ls-files', '-o', '--exclude-standard', '-z'], cwd });
   if (untracked.code !== 0 || !Buffer.isBuffer(untracked.stdout) || untracked.stdout.length > TREE_LIMIT
     || (untracked.stdout.length && untracked.stdout.at(-1) !== 0)) throw refuse('untracked', '.');
-  for (const path of splitPaths(untracked.stdout)) if (!entries.has(path.toString('base64'))) throw refuse('untracked', path);
+  for (const path of splitPaths(untracked.stdout)) if (!path.equals(Buffer.from('coverage/coverage-final.json'))
+    && !entries.has(path.toString('base64'))) throw refuse('untracked', path);
   return { entries, head, algorithm };
 }
 
@@ -64,85 +64,6 @@ export function validateTrackedFile({ path, content, st, tree, refuse, sizeExcep
   validateManifestFileBounds({ path, content, oid: entry.oid, refuse, sizeExceptions });
   const oid = createHash(tree.algorithm).update(`blob ${content.length}\0`).update(content).digest('hex');
   if (oid !== entry.oid || !!(st.mode & 0o111) !== (entry.mode === '100755')) throw refuse('dirty', path);
-}
-
-const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-const shape = (value, required, optional = []) => object(value)
-  && required.every(key => Object.hasOwn(value, key)) && Object.keys(value).every(key => required.includes(key) || optional.includes(key));
-const integer = value => Number.isSafeInteger(value) && value >= 0;
-const count = integer;
-const position = value => shape(value, ['line', 'column']) && integer(value.line) && integer(value.column);
-const location = value => shape(value, ['start', 'end']) && position(value.start) && position(value.end);
-const map = (value, valid) => object(value) && Object.entries(value).every(([key, entry]) => /^(0|[1-9]\d*)$/.test(key) && Number.isSafeInteger(Number(key)) && valid(entry));
-// Free text is the exfiltration channel: names must also bind to HEAD source
-// below; branch types are a closed set. vitest.config.ts uses coverage-v8:
-// its bundled v8-to-istanbul getInnerIstanbul writes neither hash nor
-// _coverageSchema, and istanbul-lib-coverage preserves arbitrary extra fields.
-// There is no provider schema constant or HEAD-computable hash to authorize:
-// refuse both fields (including hex strings), rather than treating encoding as binding.
-const ANONYMOUS_NAME = /^\(anonymous_(0|[1-9]\d{0,5})\)$/;
-const label = value => typeof value === 'string' && (/^[A-Za-z_$][\w$]{0,99}$/.test(value) || ANONYMOUS_NAME.test(value));
-const BRANCH_TYPES = new Set(['if', 'binary-expr', 'cond-expr', 'switch', 'default-arg', 'logical-assignment', 'branch']);
-const fn = value => shape(value, ['name', 'decl', 'loc'], ['line']) && label(value.name)
-  && location(value.decl) && location(value.loc) && (!Object.hasOwn(value, 'line') || integer(value.line));
-const branch = value => shape(value, ['type', 'loc', 'locations'], ['line']) && BRANCH_TYPES.has(value.type)
-  && location(value.loc) && Array.isArray(value.locations) && value.locations.every(location)
-  && (!Object.hasOwn(value, 'line') || integer(value.line));
-
-export async function validateCoverage({ content, cwd, tree, refuse, path, exec }) {
-  if (content.length > FORGE_MANIFEST_COVERAGE_CAP) throw refuse('oversize', path);
-  const invalid = () => refuse('coverage-invalid', path);
-  let coverage;
-  try { coverage = JSON.parse(utf8(content)); } catch { throw invalid(); }
-  if (!object(coverage)) throw invalid();
-  for (const [key, value] of Object.entries(coverage)) {
-    const repoPath = isAbsolute(key) ? relative(cwd, key) : key;
-    // Reject normalization tricks, paths outside cwd and paths not in the pinned tree.
-    try { pathParts(Buffer.from(repoPath)); } catch { throw invalid(); }
-    if (isAbsolute(key) && key !== join(cwd, repoPath)) throw invalid();
-    const blob = tree.entries.get(Buffer.from(repoPath).toString('base64'));
-    if (!blob || !['100644', '100755'].includes(blob.mode)
-      || !shape(value, ['path', 'statementMap', 'fnMap', 'branchMap', 's', 'f', 'b'], ['all'])
-      || value.path !== key || !map(value.statementMap, location) || !map(value.fnMap, fn) || !map(value.branchMap, branch)
-      || !map(value.s, count) || !map(value.f, count) || !map(value.b, hits => Array.isArray(hits) && hits.every(count))
-      || (Object.hasOwn(value, 'all') && typeof value.all !== 'boolean')) throw invalid();
-    const sameKeys = (hits, locations) => Object.keys(hits).length === Object.keys(locations).length
-      && Object.keys(locations).every(key => Object.hasOwn(hits, key));
-    if (!sameKeys(value.s, value.statementMap) || !sameKeys(value.f, value.fnMap) || !sameKeys(value.b, value.branchMap)
-      || Object.entries(value.b).some(([key, hits]) => hits.length !== value.branchMap[key].locations.length)) throw invalid();
-    let source;
-    try {
-      const result = await exec({ file: 'git', args: ['cat-file', 'blob', blob.oid], cwd });
-      if (result.code !== 0 || !Buffer.isBuffer(result.stdout)
-        || createHash(tree.algorithm).update(`blob ${result.stdout.length}\0`).update(result.stdout).digest('hex') !== blob.oid) throw invalid();
-      source = utf8(result.stdout);
-    } catch { throw invalid(); }
-    const lines = source.split(/\r\n|[\n\r\u2028\u2029]/);
-    const line = n => Number.isSafeInteger(n) && n >= 1 && n <= lines.length;
-    const boundedPosition = p => line(p.line) && p.column <= lines[p.line - 1].length + 1;
-    const boundedLocation = loc => boundedPosition(loc.start) && boundedPosition(loc.end)
-      && (loc.start.line < loc.end.line || loc.start.line === loc.end.line && loc.start.column <= loc.end.column);
-    // Audit of the remaining fields: paths name a HEAD blob; names are HEAD
-    // identifiers or source-bounded anonymous indices; types and all are closed
-    // enums. Map indices/array lengths and positions are bounded by HEAD source;
-    // hit counts are safe nonnegative integers attached to those locations.
-    const boundedKeys = map => Object.keys(map).every(key => Number(key) <= source.length);
-    // Token boundaries include Unicode identifier continuations so an ASCII
-    // substring inside a larger JS identifier cannot authorize an arbitrary name.
-    const identifiers = new Set(source.match(/(?<![$\u200c\u200d\p{ID_Continue}])[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*/gu) ?? []);
-    const sourceName = name => {
-      const anonymous = ANONYMOUS_NAME.exec(name);
-      return anonymous ? Number(anonymous[1]) <= source.length : identifiers.has(name);
-    };
-    if (![value.statementMap, value.fnMap, value.branchMap].every(boundedKeys)
-      || !Object.values(value.statementMap).every(boundedLocation)
-      || !Object.values(value.fnMap).every(fn => boundedLocation(fn.decl) && boundedLocation(fn.loc)
-        && (!Object.hasOwn(fn, 'line') || line(fn.line))
-        && sourceName(fn.name))
-      || !Object.values(value.branchMap).every(branch => boundedLocation(branch.loc)
-        && branch.locations.length > 0 && branch.locations.length <= source.length + 1 && branch.locations.every(boundedLocation)
-        && (!Object.hasOwn(branch, 'line') || line(branch.line)))) throw invalid();
-  }
 }
 
 export async function logManifestVerdict({ env, mode, error, head }) {

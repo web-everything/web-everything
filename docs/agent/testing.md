@@ -3580,7 +3580,7 @@ integration case that runs prune as root then reserves every slot as the operato
 
 ### Remote diff coverage inputs
 
-Remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
+Legacy remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
 then assert its manifest digest and snapshot bytes. Preserve source mtimes through staging
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
@@ -3591,7 +3591,7 @@ projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY
 and the complete target corpus; reject unsafe links or incomplete inputs before
 transfer. These projected inputs require full shipping.
 
-For remote `check:standards`, observe both output streams for skipped gates,
+For legacy remote `check:standards`, observe both output streams for skipped gates,
 `no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
 remote result to fall back through local admission; an invalid receipt keeps the
 result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
@@ -3900,7 +3900,7 @@ Remote transport stubs must answer the worktree-binding probe before inventory o
 use `fixtures/forge-bound-git.mjs` in injected-Git fixtures so transport-failure tests
 reach their intended run/finish branch. Keep their exact dispatch and no-local-rerun assertions.
 
-Coverage report rewrites must restore the timestamp captured from the open source file.
+Legacy coverage report rewrites must restore the timestamp captured from the open source file.
 Re-reading the staged timestamp and converting it again can truncate another microsecond,
 making coverage older than a source with the same original mtime. The absolute-path coverage
 table in `scripts/readiness/__tests__/remote-exec.test.mjs` pins equal fractional mtimes and
@@ -4819,28 +4819,26 @@ pinned HEAD blob and executable mode. Resolve it from the standard and platform 
 only; checkout settings and `WE_HEAVY_ADMISSION_REMOTE_MANIFEST` cannot override it, even
 in private pools. The policy log includes its source.
 Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
-Coverage is structure-validated Istanbul JSON, including absolute paths under the checkout;
-it is transported as input, never generated on Forge. Named functions must occur as whole
-identifier tokens in the covered HEAD blob, read through the injected Git executor. Locations
-must fit that source, counters must be safe nonnegative integers, counter/map keys must match,
-and branch counter arrays must match the location counts. Unknown fields, unreadable HEAD
-source or untracked paths refuse remote execution. Sibling snapshots keep their existing
-index-based selection and identity checks; tracked runs also apply the path+oid size
-exceptions and binary allowlist, and count sibling bytes against the main manifest's total cap.
-Size/type refusals keep their manifest reason and are logged; operators can run locally or
-review a path+oid size exception. Legacy sibling behavior remains unchanged.
+Coverage is never shipped in tracked mode, including `coverage/coverage-final.json` when
+ignored, untracked, staged or committed. Structure validation cannot bind coverage counters
+to genuine execution or HEAD. Commands that consume coverage input (`check:standards` or
+an explicitly supplied `DIFF_COVERAGE_BASE`, the existing standards/Git-input signal) refuse
+with `coverage-local` and run locally, even if the report is absent. Ordinary test commands
+omit the report without reading it. Generating coverage with `--coverage` does not itself
+consume a local coverage report. Legacy coverage inclusion, portability rewriting and
+full-ship selection remain unchanged.
+Sibling snapshots keep their existing index-based selection and identity checks; tracked
+runs also apply the path+oid size exceptions and binary allowlist, and count sibling bytes
+against the main manifest's total cap. Size/type refusals keep their manifest reason and
+are logged; operators can run locally or review a path+oid size exception.
 
-The configured `@vitest/coverage-v8` provider's bundled `v8-to-istanbul` writes
-neither `hash` nor `_coverageSchema`; `istanbul-lib-coverage` preserves extra fields
-without validating them. `istanbul-lib-instrument` is not installed by this checkout.
-Tracked admission therefore refuses either field, even hexadecimal values: there is
-no provider schema constant or HEAD-derived hash to bind here. The real-provider
-fixture calls `V8CoverageProvider.convertCoverage` on committed source and admits
-its `branch` type and boolean `all` flag. Numeric map keys must be canonical safe
-integers bounded by HEAD source length; anonymous indices and branch-array lengths
-are also source-bounded. Absolute paths must equal the canonical checkout path,
-so normalization cannot hide arbitrary text in discarded segments. Refusal retains
-the operator's local-execution fallback.
+`remote.manifest` comes only from the canonical host preferences path, including when
+`WE_PLATFORM_PREFERENCES` redirects other settings for a private pool or test. Inject `home`
+into `loadAdmissionPolicy` to test that path without reading the real home file. Unreadable
+or malformed canonical evidence uses the standard manifest default for redirected callers;
+it never uses the redirected manifest or a cached last-good host manifest. An invalid
+platform manifest value disables remote execution with a policy source explaining the local
+execution requirement, even if private tool/environment settings enable remote execution.
 
 Every tracked refusal and every legacy shadow verdict appends metadata only to
 `~/.plateau/forge-manifest-refusals.jsonl`; `FORGE_MANIFEST_REFUSALS_LOG` overrides the path.
@@ -4855,7 +4853,8 @@ The real-Git `runRemote` regression replaces only SSH/rsync executables on PATH 
 asserts a completed legacy run still ships an untracked file while logging its
 shadow refusal; the injected-executor case compares calls against shadow disabled.
 `forge-manifest-tracked.test.mjs` exercises local fallback without remote dispatch,
-HEAD hashes, size bounds, binary extensions, coverage structure and setting provenance.
+HEAD hashes, size bounds, binary extensions, coverage omission and setting provenance.
+`heavy-admission.test.mjs` covers canonical manifest authority and invalid-policy local execution.
 For the non-UTF-8 refusal-log case, inject the raw Git inventory record: filesystem
 sandboxes may deny creating such filenames before the manifest code can observe them.
 The `forge-manifest-untracked-shipped` soak break uses the real manifest builder in a

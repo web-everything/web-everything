@@ -2971,3 +2971,78 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     expect(f.state.sleeps).toHaveLength(0);
   });
 });
+
+
+describe('canonical host manifest policy', () => {
+  function preferences(home, remote) {
+    const path = join(home, '.claude', 'platform-preferences.json');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ heavyAdmission: { remote } }));
+    return path;
+  }
+
+  it.each(['shared', 'private'])('redirected legacy cannot downgrade canonical tracked in a %s pool', pool => {
+    const home = join(lockRoot, 'host');
+    preferences(home, { manifest: 'tracked' });
+    const redirected = preferences(join(lockRoot, 'redirected'), { manifest: 'legacy', enabled: true, mode: 'always' });
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env: {
+      WE_PLATFORM_PREFERENCES: redirected,
+      ...(pool === 'private' ? { LANE_POOL_ROOT: join(lockRoot, 'private') } : {}),
+    } });
+    expect(policy.settings.remote).toMatchObject({ manifest: 'tracked', enabled: true, mode: 'always' });
+    expect(policy.sources['remote.manifest']).toBe('platform');
+    expect(policy.ignored).toContainEqual(expect.stringContaining('platform.remote.manifest="legacy"'));
+    expect(formatAdmissionPolicy(policy)).toContain('remote.manifest=tracked (platform)');
+  });
+
+  it('keeps the canonical manifest path in the policy cache identity', () => {
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'legacy' });
+    const trackedHome = join(lockRoot, 'tracked'), legacyHome = join(lockRoot, 'legacy');
+    preferences(trackedHome, { manifest: 'tracked' });
+    preferences(legacyHome, { manifest: 'legacy' });
+    const options = { repoRoot: lockRoot, env: { WE_PLATFORM_PREFERENCES: redirect } };
+    expect(loadAdmissionPolicy({ ...options, home: trackedHome }).settings.remote.manifest).toBe('tracked');
+    expect(loadAdmissionPolicy({ ...options, home: legacyHome }).settings.remote.manifest).toBe('legacy');
+  });
+
+  it.each(['missing', 'malformed', 'oversized', 'unreadable'])('uses the standard manifest when redirected canonical evidence is %s', fault => {
+    const home = join(lockRoot, 'host');
+    const host = preferences(home, { manifest: 'tracked' });
+    // Prime last-good host evidence: redirected callers must not use it after a failed read.
+    loadAdmissionPolicy({ home, repoRoot: lockRoot, env: {} });
+    rmSync(host);
+    if (fault === 'malformed') writeFileSync(host, '{');
+    if (fault === 'oversized') writeFileSync(host, ' '.repeat(256 * 1024 + 1));
+    if (fault === 'unreadable') mkdirSync(host);
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'tracked', enabled: true });
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env: { WE_PLATFORM_PREFERENCES: redirect } });
+    expect(policy.settings.remote).toMatchObject({ manifest: 'legacy', enabled: true });
+    expect(policy.sources['remote.manifest']).toBe('standard');
+    if (fault !== 'missing') expect(policy.invalid).toContainEqual(expect.stringContaining('canonical platform manifest:'));
+  });
+
+  it.each(['direct', 'redirected'])('invalid canonical remote.manifest disables remote execution for %s preferences', async mode => {
+    const home = join(lockRoot, 'host');
+    preferences(home, { manifest: 'trackd', enabled: true, mode: 'always' });
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'legacy', enabled: true, mode: 'always' });
+    const env = { LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true',
+      ...(mode === 'redirected' ? { WE_PLATFORM_PREFERENCES: redirect } : {}) };
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env });
+    expect(policy.settings.remote.enabled).toBe(false);
+    expect(policy.invalid).toContain('platform.remote.manifest="trackd"');
+    expect(policy.sources['remote.enabled']).toBe('platform (invalid remote.manifest; local execution required)');
+    const remoteExec = vi.fn(), log = vi.fn();
+    expect(await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'fixture.test.mjs'],
+      cwd: lockRoot, lockRoot, env, policy, remoteExec, log, loadPerCore: () => 0 })).toEqual({ handled: false });
+    expect(remoteExec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('local (remote.enabled=false (platform (invalid remote.manifest; local execution required)))'));
+  });
+
+  it('private tool and environment enablement cannot undo an invalid platform manifest', () => {
+    const policy = resolveAdmissionPolicy({ platform: { remote: { manifest: 'trackd', enabled: true } },
+      tool: { remote: { enabled: true, manifest: 'legacy' } },
+      env: { LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true' } });
+    expect(policy.settings.remote.enabled).toBe(false);
+    expect(formatAdmissionPolicy(policy)).toContain('invalid remote.manifest; local execution required');
+  });
+});

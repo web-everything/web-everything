@@ -9,7 +9,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
-import {trackedTree, validateTrackedFile, validateManifestFileBounds, validateCoverage, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_COVERAGE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
+import {trackedTree, validateTrackedFile, validateManifestFileBounds, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
 export {FORGE_MANIFEST_SIZE_EXCEPTIONS, FORGE_MANIFEST_BINARY_EXTENSIONS} from './forge-manifest-tracked.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
@@ -651,9 +651,8 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
   }
-  // Only this ignored coverage input is transportable; it uses the same leaf
-  // safety checks and digests below as ordinary inventory entries.
-  if (!trackedOnly) files.push(...ignoredPaths.filter(path => path.equals(Buffer.from('coverage/coverage-final.json'))));
+  // Legacy retains its ignored coverage input. Tracked mode never transports coverage.
+  if (!trackedOnly && !trackedMode) files.push(...ignoredPaths.filter(path => path.equals(Buffer.from('coverage/coverage-final.json'))));
   // Index evidence still rejects unsupported gitlinks, including injected inventories.
   const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
   if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
@@ -674,7 +673,8 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
     start = i + 1;
   }
   if (tree) for (const key of indexBlobs.keys())
-    if (!tree.entries.has(key)) throw manifestRefusal('untracked',Buffer.from(key,'base64'));
+    if (!Buffer.from(key,'base64').equals(Buffer.from('coverage/coverage-final.json'))
+      && !tree.entries.has(key)) throw manifestRefusal('untracked',Buffer.from(key,'base64'));
   // The runner restores HEAD symlinks into its index and cannot prove from the
   // manifest that the client still has them: a link deleted, retargeted or turned
   // into a file here (staged or not) can leave an identical-looking projection.
@@ -775,6 +775,7 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
   let admittedBytes=0;
   const admittedSizes=new Map();
   const leaves = await orderedPool(files, MANIFEST_CONCURRENCY, async path => {
+    if (manifestMode === 'tracked' && path.equals(Buffer.from('coverage/coverage-final.json'))) return {excluded:path};
     if (trackedLinks.has(path.toString('hex'))) return;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
     let publicOid;
@@ -821,17 +822,14 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
     if(previous && stable && st.size===previous.size && executable===previous.executable)
       return {entry:{path,sha256:previous.sha256,executable,tracked}};
     const hashDone=beginSub('hashing');
-    const coverageInput=!trackedOnly && path.equals(Buffer.from('coverage/coverage-final.json'));
     if (manifestMode === 'tracked') {
-      const cap=coverageInput ? FORGE_MANIFEST_COVERAGE_CAP : FORGE_MANIFEST_FILE_CAP;
       const oid=tree ? tree.entries.get(path.toString('base64'))?.oid : indexBlobs.get(path.toString('base64'));
-      if (st.size>cap && (coverageInput || !sizeExceptions.some(exception=>Buffer.from(exception.path).equals(path)&&exception.oid===oid)))
+      if (st.size>FORGE_MANIFEST_FILE_CAP && !sizeExceptions.some(exception=>Buffer.from(exception.path).equals(path)&&exception.oid===oid))
         throw manifestRefusal('oversize',path);
     }
     const content = await readManifestFile(absolute,st,fs);
     if (tree) {
-      if (coverageInput) await validateCoverage({content,cwd,tree,refuse:manifestRefusal,path,exec});
-      if (!coverageInput || tree.entries.has(path.toString('base64'))) validateTrackedFile({path,content,st,tree,refuse:manifestRefusal,sizeExceptions});
+      validateTrackedFile({path,content,st,tree,refuse:manifestRefusal,sizeExceptions});
     } else if (manifestMode === 'tracked') {
       validateManifestFileBounds({path,content,oid:indexBlobs.get(path.toString('base64')),refuse:manifestRefusal,sizeExceptions});
     }
@@ -874,6 +872,7 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
     const leaves=[];
     for (const entry of targets) {
       const path=Buffer.concat([directoryPrefix(link.linkPath),entry.path.subarray(link.sourcePrefix.length)]);
+      if (manifestMode === 'tracked' && path.equals(Buffer.from('coverage/coverage-final.json'))) continue;
       // Only the established Claude bridges may bypass their dot-directory prefix;
       // their remaining components and all other aliases obey the normal policy.
       const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
@@ -1534,6 +1533,12 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         logicalHead=protocolText(evidence.stdout,128).trim();
         if(evidence.code!==0||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(logicalHead))throw new Error('Missing Git evidence');
       }
+      // These commands consume the local coverage report; no coverage bytes may cross the tracked boundary.
+      if (manifestMode === 'tracked' && standardsNeedGit) {
+        const error=manifestRefusal('coverage-local',Buffer.from('coverage/coverage-final.json'));
+        await logManifestVerdict({env,mode:manifestMode,error,head:logicalHead});
+        throw error;
+      }
       if (Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE')) {
         try {
           const evidence=await exec({file:'git',args:['rev-parse','--verify','--end-of-options',executionEnv.DIFF_COVERAGE_BASE+'^{commit}'],cwd});
@@ -1707,7 +1712,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
-      return fallback(['untracked','dirty','oversize','total-oversize','binary-type','mode','coverage-invalid','gitlink-unsupported','ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['untracked','dirty','oversize','total-oversize','binary-type','mode','coverage-local','gitlink-unsupported','ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');
