@@ -6,6 +6,8 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { resolveToolsRoot } from '../tools-root.mjs';
+import { PLATFORM_FILE_MAX_BYTES } from '../platform-preferences-io.mjs';
+import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH } from '../policy-cascade.mjs';
 import { maybeReexecFromToolsRoot, TOOLS_ROOT_ENTRIES } from '../tools-root-guard.mjs';
 
 const script = 'scripts/readiness/heavy-admission.mjs';
@@ -39,14 +41,14 @@ const liveGuardFixture = () => {
   const repo = resolve('.');
   const gitDir = realSpawnSync('git', ['rev-parse', '--absolute-git-dir'], { encoding: 'utf8', cwd: repo }).stdout.trim();
   fs.rmSync(join(root, '.git'), { recursive: true }); fs.symlinkSync(gitDir, join(root, '.git'));
-  for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs']) {
+  for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs', 'platform-preferences-io.mjs']) {
     write(join(ownRoot, 'scripts/lib', name), fs.readFileSync(join(repo, 'scripts/lib', name), 'utf8'));
   }
   return { ...process.env, ...env, WE_TOOLS_ROOT_REEXEC: undefined,
     WE_PLATFORM_PREFERENCES: join(base, 'absent.json') };
 };
 const rejectionCases = [
-  ['tools-root input exceeds byte limit; use local tooling', o => write(join(root, 'package.json'), ' '.repeat(256 * 1024 + 1))],
+  ['tools-root input exceeds byte limit; use local tooling', o => write(join(root, 'package.json'), ' '.repeat(PLATFORM_FILE_MAX_BYTES + 1))],
   ['platform preferences must be an object', o => {
     const prefs = join(base, 'prefs.json'); write(prefs, '[]'); o.env = { WE_PLATFORM_PREFERENCES: prefs };
   }],
@@ -99,6 +101,23 @@ describe('tools.root resolution and guard', () => {
     expect(resolveToolsRoot({ ...options, env: {} })).toEqual({ active: true, root, sha });
     expect(resolveToolsRoot({ ...options, env: { WE_TOOLS_ROOT: 'relative' } }).reason).toMatch(/absolute/);
   });
+
+  it.each([PLATFORM_PREFERENCES_PATH, ...LEGACY_PLATFORM_PREFERENCES_PATHS])(
+    'repository-supplied tools.root in %s cannot activate re-execution', async repositoryPath => {
+      const repositoryPrefs = join(base, 'repository-preferences.json');
+      write(repositoryPrefs, JSON.stringify({ tools: { root } }));
+      const observedFs = { ...fs, openSync: vi.fn((path, ...args) =>
+        fs.openSync(path === repositoryPath ? repositoryPrefs : path, ...args)) };
+      // The target is a valid checkout; its only authorization is in a repository-owned layer.
+      expect(resolveToolsRoot({ ...options, env: {}, fs: observedFs })).toEqual({ active: false });
+      const o = { ...guardOptions(), env: {}, fs: observedFs };
+      await maybeReexecFromToolsRoot(o);
+      expect(o.spawnSync).not.toHaveBeenCalled();
+      expect(o.exit).not.toHaveBeenCalled();
+      expect(o.appendEvent).not.toHaveBeenCalled();
+      expect(observedFs.openSync.mock.calls.every(([path]) => path !== repositoryPath)).toBe(true);
+    },
+  );
 
   it.each(TOOLS_ROOT_ENTRIES)('allows the explicitly opted-in entry %s', async entry => {
     write(join(ownRoot, entry), '// local entry'); write(join(root, entry), '// tools entry');
@@ -198,7 +217,8 @@ describe('tools.root resolution and guard', () => {
     expect(resolveToolsRoot({ ...options, env: { WE_PLATFORM_PREFERENCES: path } }).active).toBe(true);
     write(path, '{broken');
     expect(resolveToolsRoot({ ...options, env: { WE_PLATFORM_PREFERENCES: path } })).toEqual({ active: false, reason: expect.any(String) });
-    expect(resolveToolsRoot({ ...options, env: {}, fs: { ...fs, openSync: () => { throw Error('denied'); } } }).reason).toBe('denied');
+    expect(resolveToolsRoot({ ...options, env: {}, fs: { ...fs, openSync: () => { throw Error('denied'); } } }).reason)
+      .toBe('denied');
   });
 
   it.each(['relative', 'missing script', 'not a repo', 'wrong package', 'bad git', 'not a checkout root', 'unknown sha'])('falls back with one diagnostic for %s', async kind => {
@@ -243,7 +263,7 @@ describe('tools.root resolution and guard', () => {
   });
 
   it.each(['preferences', 'package'])('bounds %s read requests and cumulative bytes, with local fallback for oversized input', kind => {
-    const limit = 256 * 1024;
+    const limit = PLATFORM_FILE_MAX_BYTES;
     const path = kind === 'preferences' ? join(base, 'oversized.json') : join(root, 'package.json');
     write(path, ' '.repeat(limit * 2 + 17));
     let bytesRead = 0;
@@ -322,7 +342,7 @@ describe('tools.root resolution and guard', () => {
     const repo = resolve('.');
     const gitDir = realSpawnSync('git', ['rev-parse', '--absolute-git-dir'], { encoding: 'utf8', cwd: repo }).stdout.trim();
     fs.rmSync(join(root, '.git'), { recursive: true }); fs.symlinkSync(gitDir, join(root, '.git'));
-    for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs']) {
+    for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs', 'platform-preferences-io.mjs']) {
       write(join(ownRoot, 'scripts/lib', name), fs.readFileSync(join(repo, 'scripts/lib', name), 'utf8'));
     }
     const eventsUrl = pathToFileURL(join(repo, 'scripts/lib/daemon-events.mjs')).href;
@@ -375,7 +395,7 @@ describe('tools.root resolution and guard', () => {
     const gitDir = realSpawnSync('git', ['rev-parse', '--absolute-git-dir'], { encoding: 'utf8', cwd: repo }).stdout.trim();
     const tool = join(base, 'live-tools'); checkout(tool);
     fs.rmSync(join(tool, '.git'), { recursive: true }); fs.symlinkSync(gitDir, join(tool, '.git'));
-    for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs']) {
+    for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs', 'platform-preferences-io.mjs']) {
       write(join(ownRoot, 'scripts/lib', name), fs.readFileSync(join(repo, 'scripts/lib', name), 'utf8'));
     }
     const eventsUrl = pathToFileURL(join(repo, 'scripts/lib/daemon-events.mjs')).href;

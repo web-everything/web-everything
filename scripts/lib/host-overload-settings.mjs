@@ -1,13 +1,14 @@
 /** Host overload policy: standard → platform preferences → tool → environment.
  * Invalid/unreadable policy refuses background work. All reads are bounded; sources go to stderr.
  */
+import { PLATFORM_FILE_MAX_BYTES } from './platform-preferences-io.mjs';
 import { openSync, readSync, closeSync } from 'node:fs';
-import { homedir, userInfo } from 'node:os';
+import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, readPlatformPreferences, readOperatorPolicy } from './policy-cascade.mjs';
 export const hostStateRoot = () => join(userInfo().homedir, '.cache', 'we-host-overload');
-export function boundedText(path, maxBytes = 256 * 1024) {
+export function boundedText(path, maxBytes = PLATFORM_FILE_MAX_BYTES) {
   const fd = openSync(path, 'r');
   try {
     const bytes = Buffer.alloc(maxBytes + 1);
@@ -101,11 +102,7 @@ export function loadHostOverloadSettings({ env = process.env, log, toolPath = jo
     return text;
   } });
   if (p.errors.length) throw Error(`host-overload: ${p.errors.join(', ')}`);
-  let legacy = {};
-  // Existing host preferences use this location; the canonical cascade file wins when both are present.
-  try { legacy = flatten(JSON.parse(boundedText(env.WE_PLATFORM_PREFERENCES || join(homedir(), '.claude', 'platform-preferences.json'))), 'platform legacy'); }
-  catch (e) { if (e.code !== 'ENOENT') throw e; }
   let tool = {};
   try { tool = JSON.parse(boundedText(toolPath)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  return resolveHostOverloadSettings({ platform: expand({ ...legacy, ...canonical }), tool, env, log });
+  return resolveHostOverloadSettings({ platform: expand(canonical), tool, env, log });
 }

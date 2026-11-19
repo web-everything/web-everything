@@ -2,13 +2,14 @@
  * Unset means local tooling. Invalid or unavailable evidence also falls back locally, with a reason.
  * No tool-layer default; this setting deliberately uses the host preferences location.
  */
+import { PLATFORM_FILE_MAX_BYTES } from './platform-preferences-io.mjs';
 import * as nativeFs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { CLONES_DIR_NAME } from './daemon-clone-layout.mjs';
 
-export function boundedToolsText(path, fs = nativeFs, limit = 256 * 1024) {
+export function boundedToolsText(path, fs = nativeFs, limit = PLATFORM_FILE_MAX_BYTES) {
   const fd = fs.openSync(path, 'r');
   try {
     const bytes = Buffer.alloc(limit + 1);
@@ -39,6 +40,7 @@ export function resolveToolsRoot({ scriptRelPath, env = process.env, home = home
   try {
     let candidate = env.WE_TOOLS_ROOT;
     if (candidate === undefined) {
+      // Executable tooling selection is host-only: repository platform layers cannot authorize re-exec.
       let prefs;
       try { prefs = JSON.parse(boundedToolsText(env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'), fs)); }
       catch (error) { if (error?.code === 'ENOENT') return { active: false }; throw error; }
