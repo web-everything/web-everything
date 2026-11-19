@@ -108,8 +108,9 @@ async function proveFindings(findings, base, head, deps, observe = () => {}) {
       const ownClass = /\b([A-E][1-9])\b/.exec(text)?.[1];
       // R1085: an UNTAGGED finding whose text looks security-related is treated as B-class whatever the reproduction model
       // says, so it blocks in prove mode (conservative keyword check; false positives are fine, card B: class tags).
-      const securityText = !ownClass && SECURITY_TEXT.test(text);
-      return { text, sourceText, class: ownClass ?? (securityText ? 'B1' : answers[i]?.class), card: /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(text)?.[0] };
+      // An explicit non-B class tag must not suppress this check either (it would hide security text).
+      const securityText = !ownClass?.startsWith('B') && SECURITY_TEXT.test(text);
+      return { text, sourceText, class: securityText ? 'B1' : (ownClass ?? answers[i]?.class), card: /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(text)?.[0] };
     });
     extra.findingKeys = detailed.flatMap((f, i) => {
       const loc = parseFindingLocation(f.text);
