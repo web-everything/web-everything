@@ -14,6 +14,7 @@ export function exercise(runReviewJob) {
       root: '.', now: () => 1000, newActorId: () => 'test', readPrevCompletion: () => null,
       report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
       acquireLane: () => ({ lanePath: '.' }), prepareLane: () => ({ head }), releaseLane: () => {}, log: () => {},
+      liveHead: () => head,
       concurrentSeatsSetting: () => ({ enabled: true, value: true, source: 'standard' }),
       startSpeculativeSeats: () => { calls.push('start'); return { readSink: 'sink', startedAt: Date.now() }; },
       runLoop: o => {

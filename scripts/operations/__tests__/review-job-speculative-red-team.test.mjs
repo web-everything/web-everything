@@ -634,6 +634,7 @@ describe('added seats concurrent evidence', () => {
     const { io, calls } = jobIo({ verdict, over: {
       speculativeRedTeamSetting: () => ({ enabled: false }),
       runRedTeam: undefined,
+      liveHead: () => REV,
       concurrentSeatsSetting: () => ({ enabled, value: enabled, source: 'tool' }),
       startSpeculativeSeats: () => { calls.push(['seats-start']); return { readSink: '/jobs/seats-read', startedAt: Date.now() }; },
       runLoop: o => { calls.push(['loop']); expect(o.readSink).toBe(enabled ? '/jobs/seats-read' : null);
@@ -657,8 +658,7 @@ describe('added seats concurrent evidence', () => {
     expect(calls).toContainEqual(['log', expect.stringContaining('seatsConcurrent counters: started=1 used=1 discarded=0')]);
   });
   it.each([
-    ['bounce', { verdict: 'changes' }], ['park', { verdict: 'needs-human', stopped: 'confirm' }],
-    ['head move', { moved: true }], ['missing read sink', { extra: { speculativeSeatsReadSunk: () => false } }],
+    ['head move', { moved: true }],
     ['failed pass', { extra: { awaitSpeculativeSeats: () => ({ spec: null }) } }],
     ['timed out pass', { extra: { awaitSpeculativeSeats: () => ({ spec: PASS, timedOut: true }) } }],
     ['missing final input', { stopped: 'step-refused' }],
@@ -674,11 +674,40 @@ describe('added seats concurrent evidence', () => {
     expect(kinds(calls)).not.toContain('seats-sequential');
     expect(kinds(calls)).toContain('seats-cleanup');
   });
-  it('preserves the final-head gate fail-open policy on an unreadable live-head lookup', () => {
-    const { io, calls } = seatsIo({ extra: { finalHeadSeatsSetting: () => ({ mode: 'on' }), liveHead: () => { throw Error('unreadable'); } } });
+  it.each(['off', 'shadow', 'on'])('discards unreadable live-head evidence even with final-head seats %s', mode => {
+    const { io, calls } = seatsIo({ extra: { finalHeadSeatsSetting: () => ({ mode }), liveHead: () => { throw Error('unreadable'); } } });
     const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
-    expect(out.extraSeats.status).toBe('ran');
-    expect(kinds(calls)).toContain('seats-finish');
+    expect(out.extraSeats.status).toBe('discarded');
+    expect(kinds(calls)).not.toContain('seats-finish');
+    expect(kinds(calls)).not.toContain('seats-sequential');
+  });
+  it.each([
+    ['sink write failed', { speculativeSeatsReadSunk: () => false }],
+    ['worker no-read', { awaitSpeculativeSeats: () => ({ spec: { status: 'no-read' } }) }],
+    ['start failed', { startSpeculativeSeats: () => { throw Error('start failed'); },
+      runLoop: () => ({ status: 0, stdout: JSON.stringify(payload('accept')) }) }],
+  ])('falls back to sequential seats with valid loop input when %s', (_label, extra) => {
+    const { io, calls } = seatsIo({ extra });
+    expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).extraSeats.status).toBe('ran');
+    expect(kinds(calls).filter(k => k === 'seats-sequential')).toHaveLength(1);
+    expect(kinds(calls)).not.toContain('seats-finish');
+  });
+  it.each(['off', 'shadow', 'on'])('bounce/park discard retains sequential final-head policy %s', mode => {
+    for (const [verdict, stopped] of [['changes', 'complete'], ['needs-human', 'confirm']]) {
+      const { io, calls } = seatsIo({ verdict, stopped, extra: { finalHeadSeatsSetting: () => ({ mode }) } });
+      const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+      const skip = mode === 'on' && verdict === 'changes';
+      expect(out.extraSeats.status).toBe(skip ? 'skipped' : 'ran');
+      expect(kinds(calls)).toContain('seats-discard');
+      expect(kinds(calls)).not.toContain('seats-finish');
+      expect(kinds(calls).includes('seats-sequential')).toBe(!skip);
+      expect(calls).toContainEqual(['log', expect.stringContaining('added seats discarded — review')]);
+    }
+  });
+  it.each([null, '', 'bad', 'b'.repeat(40)])('discards unknown or moved live head %s without fallback', liveHead => {
+    const { io, calls } = seatsIo({ extra: { liveHead: () => liveHead } });
+    expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).extraSeats.status).toBe('discarded');
+    expect(kinds(calls)).not.toContain('seats-finish');
     expect(kinds(calls)).not.toContain('seats-sequential');
   });
   it('off retains sequential order', () => {

@@ -16,7 +16,7 @@ import {
   reviewSeatRoutes, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE, REVIEW_SEAT_MODELS,
 } from '../review-dispatch.mjs';
 import {
-  runExtraSeatsCli, speculateExtraSeats, finishExtraSeats, recordDiscardedSeats, runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
+  runExtraSeatsCli, speculateExtraSeats, finishExtraSeats, redTeamReadFingerprint, recordDiscardedSeats, runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
   PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MS, resolveProbeIntervalMs, probeDue, quotaHoldOrProbe,
   claudeFindingsFromLoop, buildSeatTask, SEAT_ANSWER_CONTRACT, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
@@ -1859,6 +1859,49 @@ describe('split added seats pass', () => {
     expect((await finishExtraSeats({ pass, loopPayload, env: {} }, io)).status).toBe('discarded');
     expect(rows).toEqual([]);
   });
+  it.each(['diffText', 'title', 'body', 'netChangedFiles'])('discards a changed %s at the same commit', async field => {
+    const { io, rows } = fakeSeatIo();
+    const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {} }, io);
+    const loopPayload = structuredClone(LOOP_PAYLOAD);
+    loopPayload.findings.read[field] = field === 'netChangedFiles' ? ['different.mjs'] : 'different';
+    expect(await finishExtraSeats({ pass, loopPayload, env: {} }, io)).toMatchObject({ status: 'discarded', reason: expect.stringContaining('read differs') });
+    expect(rows).toEqual([]);
+  });
+  it('discards a persisted pass without a read fingerprint', async () => {
+    const { io, rows } = fakeSeatIo();
+    const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {} }, io);
+    delete pass.readFingerprint;
+    expect((await finishExtraSeats({ pass, loopPayload: LOOP_PAYLOAD, env: {} }, io)).status).toBe('discarded');
+    expect(rows).toEqual([]);
+  });
+  it('discarded quota exhaustion establishes and re-arms a hold with reset evidence', async () => {
+    const resetsAt = new Date(NOW + 24 * 60 * 60_000).toISOString();
+    const { io, rows } = fakeSeatIo({ runSeat: async () => ({ report: { quotaState: 'exhausted', quotaUsedPercent: 100, quotaResetsAt: resetsAt } }) });
+    const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {} }, io);
+    recordDiscardedSeats({ pr: 5, repo: REPO, pass, reason: 'head moved' }, io);
+    expect(rows.filter(r => r.dispatchKind === 'review-seat-speculative-discard')).toHaveLength(pass.calls.length);
+    const quotaRows = rows.filter(r => r.dispatchKind === REVIEW_SEAT_DISPATCH_KIND);
+    expect(quotaRows.length).toBeGreaterThan(0);
+    for (const row of quotaRows) expect(row).toMatchObject({ discarded: true, status: 'quota-exhausted', quotaResetsAt: resetsAt, quotaUsedPercent: 100, seatVerdict: null, findings: [] });
+    const provider = pass.calls[0].provider;
+    expect(quotaHold(rows, provider, NOW + 1)).toContain('quota exhausted');
+    expect(quotaHold(rows, provider, NOW + 2 * 60 * 60_000)).toContain(resetsAt);
+    expect(probeDue(rows, provider, NOW + DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_INTERVAL_MS)).toBe(true);
+    io.now = () => NOW + DEFAULT_PROBE_INTERVAL_MS;
+    recordDiscardedSeats({ pr: 5, repo: REPO, pass, reason: 'parked' }, io);
+    expect(probeDue(rows, provider, NOW + DEFAULT_PROBE_INTERVAL_MS + 1, DEFAULT_PROBE_INTERVAL_MS)).toBe(false);
+    expect(quotaHoldOrProbe(rows, provider, NOW + DEFAULT_PROBE_INTERVAL_MS + 1, {})).toContain('quota exhausted');
+  });
+  it('a discarded clean probe clears an older quota hold without applying findings', async () => {
+    const { io, rows } = fakeSeatIo();
+    const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {} }, io);
+    const provider = pass.calls[0].provider;
+    rows.push({ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, provider, status: 'quota-exhausted', scoredAt: new Date(NOW - DEFAULT_PROBE_INTERVAL_MS).toISOString() });
+    expect(quotaHold(rows, provider, NOW)).not.toBeNull();
+    recordDiscardedSeats({ pr: 5, repo: REPO, pass, reason: 'parked' }, io);
+    expect(quotaHold(rows, provider, NOW + 1)).toBeNull();
+    expect(rows.filter(r => r.discarded).every(r => r.seatVerdict === null && r.findings.length === 0)).toBe(true);
+  });
   it('records every reserved call once as unscored discarded spend, never as seat results', () => {
     const { io, rows } = fakeSeatIo();
     const reservations = [{ callId: 'one', provider: 'codex', model: 'm', rev: 'a'.repeat(40) }, { callId: 'two', provider: 'agy-gemini', model: 'm', rev: 'a'.repeat(40) }];
@@ -1901,7 +1944,7 @@ it('seats-speculate CLI writes pass and reservation files before seats-finish ap
 it('incomplete added-seat passes write no comparison rows', async () => {
   const { io, rows } = fakeSeatIo();
   for (const calls of [[], [{}]]) {
-    const result = await finishExtraSeats({ pass: { status: 'speculated', rev: LOOP_PAYLOAD.findings.read.netBasis.rev, calls }, loopPayload: LOOP_PAYLOAD, env: {} }, io);
+    const result = await finishExtraSeats({ pass: { status: 'speculated', rev: LOOP_PAYLOAD.findings.read.netBasis.rev, readFingerprint: redTeamReadFingerprint(LOOP_PAYLOAD.findings.read), calls }, loopPayload: LOOP_PAYLOAD, env: {} }, io);
     expect(result.status).toBe('discarded');
   }
   expect(rows).toEqual([]);

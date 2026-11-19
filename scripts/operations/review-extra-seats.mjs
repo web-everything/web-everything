@@ -814,7 +814,7 @@ export async function speculateExtraSeats({ pr, repo, lanePath, read, env = proc
     } finally {
       if (scratch) { try { io.removeScratch(scratch); } catch { io.log(`review scratch cleanup failed; TTL sweep will retry`); } }
     }
-    return { status: 'speculated', rev, durationMs: io.now() - startedAt, calls: callsMade, reservations, skipped, callsUsedToday: totalUsedToday, dailyCap: totalDailyCap, providerUsage };
+    return { status: 'speculated', rev, readFingerprint: redTeamReadFingerprint(read), durationMs: io.now() - startedAt, calls: callsMade, reservations, skipped, callsUsedToday: totalUsedToday, dailyCap: totalDailyCap, providerUsage };
   } catch (e) {
     return { status: 'error', reason: String(e?.message ?? e).slice(0, MAX_TEXT) };
   }
@@ -826,6 +826,9 @@ export async function finishExtraSeats({ loopPayload, pass, env = process.env } 
   if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
   const rev = loopPayload?.findings?.read?.netBasis?.rev;
   if (!isPinnedRev(rev) || pass.rev !== rev) return { status: 'discarded', reason: 'added seats head differs from final loop head' };
+  if (!pass.readFingerprint || pass.readFingerprint !== redTeamReadFingerprint(loopPayload?.findings?.read)) {
+    return { status: 'discarded', reason: 'added seats read differs from final loop read' };
+  }
   if (!Array.isArray(pass.calls) || !pass.calls.length || !pass.calls.every(c => c?.callId && Array.isArray(c.seats) && c.seats.length && c.call?.status && c.parsed && typeof c.parsed === 'object')) {
     return { status: 'discarded', reason: 'incomplete added seats pass' };
   }
@@ -850,6 +853,14 @@ export function recordDiscardedSeats({ pr, repo, pass, reserved, reason }, io = 
     const row = buildRedTeamDiscardRow({ pr, repo, pass: completed, reserved: r, reason, now: io.now() });
     try { io.append({ ...row, seat: 'added-seats', lens: null }); rowsWritten += 1; }
     catch (e) { io.log(`added seats: discard spend NOT written — ${e.message}`); }
+    // Quota observations survive discard: a failed probe must re-arm the provider hold,
+    // and a clean probe must be able to clear it, without publishing a seat verdict.
+    if (call) {
+      for (const quotaRow of buildSeatRows({ ...call, claudeFindings: null })) {
+        try { io.append({ ...quotaRow, discarded: true, seatVerdict: null, findings: [], findingsCount: 0, confirmedCount: 0, scoredAt: row.scoredAt }); }
+        catch (e) { io.log(`added seats: discarded quota evidence NOT written — ${e.message}`); }
+      }
+    }
   }
   return { status: reservations.size === rowsWritten ? 'recorded' : 'error', rowsWritten };
 }

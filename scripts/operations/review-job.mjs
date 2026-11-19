@@ -950,7 +950,7 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
   }
 }
 
-/** Added seats are evidence only: every refused or incomplete pass is terminal, never rerun. */
+/** Added seats are evidence only; unstarted calls may fall back to the sequential policy. */
 export function settleSpeculativeSeats({ spec, out, input }, io) {
   const discard = reason => {
     let spend;
@@ -959,20 +959,27 @@ export function settleSpeculativeSeats({ spec, out, input }, io) {
       if (Number.isFinite(pass?.durationMs)) spec.seatsMs = pass.durationMs;
       spend = io.recordDiscardedSeats?.({ pr: out.pr, repo: out.repo, pass, reserved, reason });
     } catch (e) { spend = { status: 'error', reason: tail(e?.message ?? e, 200) }; }
+    io.log?.(`review-job ${out.sessionSlug}: added seats discarded — ${reason}`);
     return { status: 'discarded', reason, spend };
   };
   try {
-    if (['bounced', 'parked', BLOCKED_ON_INFRA].includes(out.outcome)) return discard(`review ${out.outcome}`);
+    // Bounce/park discard is specified by the operator; the old sequential policy still decides
+    // whether replacement seats are owed (off/shadow must retain their existing semantics).
+    if (['bounced', 'parked'].includes(out.outcome)) return { ...discard(`review ${out.outcome}`), sequential: Boolean(input) };
+    if (out.outcome === BLOCKED_ON_INFRA) return discard(`review ${out.outcome}`);
     if (!input) return discard('no final loop input');
-    if (io.speculativeSeatsReadSunk?.(spec) === false) return discard('the review loop wrote no read sink');
+    if (io.speculativeSeatsReadSunk?.(spec) === false) return { ...discard('the review loop wrote no read sink'), sequential: true };
     const waited = io.awaitSpeculativeSeats(spec, { timeoutMs: Math.max(0, (spec.wallMs ?? resolveSeatTimeoutMs() + 5 * 60_000) - (Date.now() - spec.startedAt)) });
     const pass = waited?.spec;
     if (Number.isFinite(pass?.durationMs)) spec.seatsMs = pass.durationMs;
+    if (!waited?.timedOut && pass?.status === 'no-read') return { ...discard(pass.reason ?? 'no added seats read'), sequential: true };
     if (waited?.timedOut || pass?.status !== 'speculated') return discard(pass?.reason ?? 'added seats pass failed or incomplete');
     const rev = input.loopPayload?.findings?.read?.netBasis?.rev;
     if (!isRealHead(rev) || pass.rev !== rev) return discard('added seats head differs from final loop head');
     const gate = finalHeadSeatsGate(input, io);
     if (gate.skip) return discard(`final-head seats: ${gate.reason}`);
+    const liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo });
+    if (!isRealHead(liveHead) || liveHead.toLowerCase() !== pass.rev.toLowerCase()) return discard('added seats live head differs or is unreadable');
     const result = io.finishSpeculativeSeats({ ...input, handle: spec });
     if (result?.status !== 'ran') return discard(result?.reason ?? 'added seats finish failed');
     return result;
@@ -1079,8 +1086,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
-  // Settle added evidence after the arc. Concurrent passes never alter the verdict or rerun on discard;
-  // disabled concurrency or a missing start hook retains the single-shot path.
+  // Settle added evidence after the arc. Discarded calls never alter the verdict;
+  // unstarted calls and bounce/park use the old sequential policy when input is valid.
   const concurrentSeats = seatsBox.concurrent ?? null;
   const seatsStartedAt = io.now();
   if (concurrentSeats || (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function')) {
@@ -1088,7 +1095,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     try {
       if (concurrentSeats) {
         extraSeats = settleSpeculativeSeats({ spec: concurrentSeats, out, input: seatsBox.input }, io);
-      } else {
+      }
+      if (!concurrentSeats || extraSeats?.sequential) {
         let gate;
         try { gate = finalHeadSeatsGate(seatsBox.input, io); } catch (e) { gate = { skip: false, reason: `gate error (fail-open): ${tail(e?.message ?? e, 200)}` }; }
         extraSeats = gate.skip ? { status: 'skipped', reason: `final-head seats: ${gate.reason}` } : io.runExtraSeats(seatsBox.input);
