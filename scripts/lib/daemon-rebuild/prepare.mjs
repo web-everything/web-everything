@@ -1,10 +1,14 @@
 /** @file scripts/lib/daemon-rebuild/prepare.mjs — Locked preparation phase.
  * Split out of daemon-rebuild.mjs (move-only).
  */
+import { rebuildReaders } from './evidence-context.mjs';
+
+
+import { timeoutRetryAt, resolveRecovery } from './recovery.mjs';
 
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState, readReadyCandidate,
+  alertsFilePath, readRebuildState, readRebuildStateStrict, writeRebuildState, readReadyCandidate,
 } from './state.mjs';
 import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -40,6 +44,7 @@ import {
 
 /** Read the overlay audit trail, returning no evidence when it is missing or unreadable. */
 export function readOverlayEventLog(root, env) {
+  if (rebuildReaders()) return rebuildReaders().overlayEvents(root, env);
   try {
     const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
     return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
@@ -89,11 +94,17 @@ export function contentContainedInBuild(git, sha, build) {
  * `doRebuild` did in its Steps 0-4.5. Returns EITHER `{terminal:true, result, alerts}` (a final `rebuildClone`
  * result — the caller returns it as-is) or `{terminal:false, plan, prevHead, alerts}` (proceed to build +
  * smoke a candidate — see {@link rebuildClone}). In readyOnly mode recovery may update bookkeeping,
- * but clone-tree mutations defer to the next normal daemon tick.
+ * but clone-tree mutations defer to the next normal daemon tick. Strict early/recovery
+ * preparation defers all bookkeeping too; only the real build lease may be written.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
+  root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false, admissionEvidence, launchedBy,
 }) {
+  const strictState = !!admissionEvidence || launchedBy === 'early' || launchedBy === 'recovery';
+  if (readyOnly && adoptOnly && !strictState) {
+    return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: [] };
+  }
+  readyOnly ||= strictState;
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
     env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
@@ -102,7 +113,7 @@ export async function prepareRebuild({
   if (process.env.VITEST === 'true' && env?.WE_OVERLAY_STALE === undefined) env = { ...env, WE_OVERLAY_STALE: '0' };
   // Status must not refresh the live index while an excluded spawner may still be reading it.
   if (readyOnly) env = { ...env, GIT_OPTIONAL_LOCKS: '0' };
-  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  stEnv ??= { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];
   const nowMs = () => now();
@@ -111,6 +122,7 @@ export async function prepareRebuild({
   const alert = (kind, detail) => {
     alertsList.push({ kind, detail });
     log?.error?.(`daemon-rebuild: ${kind}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ''}`);
+    if (strictState) return;
     try {
       const file = alertsFilePath(root, stEnv);
       mkdirSync(dirname(file), { recursive: true });
@@ -131,7 +143,16 @@ export async function prepareRebuild({
     detail: 'Deferred to the next daemon tick holding the normal clone write lock.',
   });
 
-  const state = readRebuildState(root, stEnv);
+  // Admission's pre-lock read is only an early refusal filter. All checks and writes
+  // use fresh evidence read under the clone write lock held by this phase.
+  let state;
+  try {
+    // Detached/re-attached jobs carry provenance, never the admission snapshot.
+    rebuildReaders()?.validate(root, stEnv);
+    state = strictState ? readRebuildStateStrict(root, stEnv) : readRebuildState(root, stEnv);
+  } catch {
+    return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: alertsList };
+  }
   const writeState = () => writeRebuildState(root, state, stEnv);
   // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
   // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.
@@ -144,6 +165,7 @@ export async function prepareRebuild({
   };
 
   const finishVerifiedSwaps = async () => {
+    if (strictState) return; // Tick-start owns registration removal and swap-evidence cleanup.
     try {
       if (!state.inProgress && !state.unverified && !state.quarantine && state.adopted?.head
         && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled
@@ -173,6 +195,7 @@ export async function prepareRebuild({
     if (readyOnly && error?.code !== 'ENOENT') return mutationDue('index-lock-unverified');
   }
 
+  if (strictState && state.inProgress) return mutationDue('in-progress-recovery');
   if (state.inProgress) {
     const staleMs = Number(env?.WE_DAEMON_REBUILD_STALE_MS) || 30 * 60_000;
     const sameHost = state.inProgress.host === hostname();
@@ -234,6 +257,7 @@ export async function prepareRebuild({
   // PR #2731 review: the pre-fix recovery could leave `state.unverified` — a build reset onto but never smoked.
   // This design never writes it, so treat it exactly like an unmarked inProgress record at its target: roll back
   // to its verified prevHead so this tick re-smokes it off-lock, instead of reading HEAD as up-to-date.
+  if (strictState && state.unverified) return mutationDue('unverified-recovery');
   if (state.unverified) {
     const uv = state.unverified;
     if (verifyRev(git, 'HEAD') === uv.head && uv.head !== uv.prevHead) {
@@ -397,7 +421,7 @@ export async function prepareRebuild({
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
   // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
-  if (chainOf.fresh?.size > 0) {
+  if (!strictState && chainOf.fresh?.size > 0) {
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
   // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
@@ -416,25 +440,25 @@ export async function prepareRebuild({
       const noticeKey = event.kind === 'overlay-pinned' ? newTip : `unaudited-tip:${newTip}`;
       pinnedNow[ref] = noticeKey;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
-      if (event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      if (!strictState && event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
       if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
     }
     alert(event.kind, event.detail);
-    if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
+    if (!strictState && event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
       const { pr, ref, files } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
     }
     // x5059uu — a parked newcomer wakes its own PR's fixer with the established overlays it must merge in.
-    if (event.kind === 'overlay-newcomer-parked' && event.detail.pr != null) {
+    if (!strictState && event.kind === 'overlay-newcomer-parked' && event.detail.pr != null) {
       const { pr, ref, files, collidesWith } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
     }
   }
-  if (JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
+  if (!strictState && JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
     state.pinnedNotified = Object.keys(pinnedNow).length ? pinnedNow : null;
     writeState();
   }
-  for (const [pr, wake] of readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {
+  for (const [pr, wake] of strictState ? [] : readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {
     if (wake.clone === root && !overlaysBefore.some((o) => o.pr === pr && o.ref === wake.ref)) {
       clearOverlayConflictWake(env, pr);
     }
@@ -446,9 +470,10 @@ export async function prepareRebuild({
     // dispatch either: when the clone sits on its last smoke-verified build, record it as HELD there, so
     // `main-staleness.mjs#assertMainNotStale` dispatches from that build (x5wbsbc) instead of refusing every
     // tick as stale, and `daemon-held-on-last-good` flags it after 15 min. The next adoption clears it.
-    if (/^pinned-overlay-/.test(plan.reason) && state.adopted?.head && state.adopted.head === prevHead) {
+    if (!strictState && /^pinned-overlay-/.test(plan.reason) && state.adopted?.head && state.adopted.head === prevHead) {
       const d = plan.detail || {};
       state.held = {
+        retryAt: null, attempts: 1,
         since: state.held?.since ?? nowIso(),
         reason: plan.reason,
         failed: `${d.ref ?? '?'}${d.pr != null ? ` (PR #${d.pr})` : ''}: ${d.message ?? plan.reason}`,
@@ -481,13 +506,14 @@ export async function prepareRebuild({
     };
     let setting;
     try { setting = autoRebase.resolveAutoRebaseSwitch(env); } catch { setting = { enabled: false, source: 'unavailable' }; detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
-    if (setting.enabled) {
+    if (!strictState && setting.enabled) {
       try { detail.autoRebase = { ...await autoRebase.kickAutoRebase({ root, env, lost }), source: setting.source }; }
       catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
     }
     alert('established-overlay-hold', detail);
-    if (state.adopted?.head && state.adopted.head === prevHead) {
+    if (!strictState && state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {
+        retryAt: null, attempts: 1,
         since: state.held?.since ?? nowIso(),
         reason: 'established-overlay-conflict',
         failed: `${lost.map((l) => l.ref).join(', ')}: conflict with main`,
@@ -502,8 +528,9 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
   if ((plan.finalSha !== prevHead || plan.decisions.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
+  if (strictState && plan.decisions.some(d => d.action === 'remove')) return mutationDue('overlay-removal');
   for (const d of plan.decisions) {
-    if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
+    if (!strictState && d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
       // Bind the removal to the registration the plan judged: a re-registration after planning is not removed.
@@ -550,14 +577,16 @@ export async function prepareRebuild({
 
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
   if (plan.upToDate) {
-    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
+    if (!strictState && (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held)) {
       state.adopted = {
         head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
       };
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
     }
-    await dropReady('up-to-date', plan.finalSha); // current already — nothing a passed-but-unadopted build could add
+    // A between-tick probe must not re-read/delete ready evidence that arrived after
+    // its strict snapshot. The next normal tick owns ready cleanup and forced watches.
+    if (!readyOnly) await dropReady('up-to-date', plan.finalSha);
     return terminal({ moved: false, reason: 'up-to-date', plan });
   }
 
@@ -566,7 +595,7 @@ export async function prepareRebuild({
   // instead of being thrown away and re-smoked. Checked before the rejection/backoff short-circuits: a passed
   // plain-main fallback answers exactly the inputs the reject-cache would otherwise stop at.
   {
-    const ready = readReadyCandidate(root, stEnv);
+    const ready = admissionEvidence ? admissionEvidence.ready : readReadyCandidate(root, stEnv);
     if (ready) {
       if (readyOnly) return mutationDue('ready-candidate-adopt');
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
@@ -685,6 +714,7 @@ export async function prepareRebuild({
         });
         writeState();
         const fin = await finalizeRebuild({
+          readyPassedAt: ready.passedAt,
           root,
           env,
           log,
@@ -727,6 +757,10 @@ export async function prepareRebuild({
   const forceBypass = !forceBlockedReason(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
   if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
     alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
+  }
+  if (!forceBypass && state.held?.reason === 'smoke-env-timeout') {
+    const retryAt = timeoutRetryAt(state.held, resolveRecovery({ env, log: m => log.error?.(m) }));
+    if (!Number.isFinite(retryAt) || nowMs() < retryAt) return terminal({ moved: false, reason: 'smoke-env-timeout-backoff', plan });
   }
   if (!forceBypass && state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
     const retryAtMs = Date.parse(state.rejected.retryAt || '');
@@ -819,8 +853,16 @@ export async function prepareRebuild({
   // PR #2731 review — single flight: phase 2 runs unlocked, so without this a sibling daemon sharing the clone
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
+  // Between-tick admission only decides whether work is due. It must not claim/release
+  // a transient lease (which used to require a second fail-open read-modify-write).
+  if (strictState && adoptOnly) {
+    return terminal({ moved: false,
+      reason: buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() }) ? 'rebuild-in-progress' : 'needs-build',
+      plan,
+    });
+  }
   const lease = claimBuildLease({
-    state, plan, root, run, env: stEnv, nowMs: nowMs(), adoptOnly,
+    state, plan, root, run, env: stEnv, nowMs: nowMs(), adoptOnly, cleanupAbandoned: !strictState,
   });
   if (!lease) {
     const b = state.building;

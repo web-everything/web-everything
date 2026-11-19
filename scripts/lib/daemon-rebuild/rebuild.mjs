@@ -2,7 +2,11 @@
  * (locked prepare → unlocked candidate smoke → locked finalize). Split out of daemon-rebuild.mjs (move-only); the
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
+import { createRebuildReaders, RebuildEvidenceError } from './evidence-readers.mjs';
+import { rebuildReaders, withRebuildReaders } from './evidence-context.mjs';
 
+
+import { resolveRecovery } from './recovery.mjs';
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
@@ -88,6 +92,10 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
   return kept;
 }
 
+function isBetweenTickLaunch(options) {
+  return !options.adoptOnly && options.launchOnly === true && options.asJob === true
+    && (options.launchedBy === 'early' || options.launchedBy === 'recovery');
+}
 
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
@@ -101,11 +109,44 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
- * @returns {Promise<object>}
+ * @returns {Promise<object>} Legacy result shape, with phase waits in a non-enumerable `timing` record.
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
+  const strict = options.launchedBy === 'early' || options.launchedBy === 'recovery';
+  if (!strict) return rebuildCloneWithReaders(emitEvent, options, false);
+  // Between-tick launches leave force-watch checks and rollback to the next tick.
+  const readers = createRebuildReaders({ strict, read: options.evidenceRead });
+  return withRebuildReaders(readers, async () => {
+    const startedAtMs = Date.now();
+    try {
+      if (readers) readers.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
+      return await rebuildCloneWithReaders(emitEvent, options, strict);
+    } catch (error) {
+      if (!(error instanceof RebuildEvidenceError)) throw error;
+      (options.log ?? console).error?.(error.message);
+      if (!isBetweenTickLaunch(options)) await forceWatch(options, emitEvent, startedAtMs);
+      return { moved: false, reason: 'state-unreadable' };
+    }
+  });
+}
+
+async function rebuildCloneWithReaders(emitEvent, options, strict) {
   const startedAtMs = Date.now();
   const result = await rebuildCloneInternal(options);
+  const { waitInFlightTickMs, waitSmokeSlotMs } = result;
+  // Keep the caller's enumerable result contract stable. The CLI explicitly serializes this record
+  // for the detached job; ordinary equality checks, spreads and JSON retain the legacy shape.
+  if (waitInFlightTickMs !== undefined || waitSmokeSlotMs !== undefined) {
+    delete result.waitInFlightTickMs;
+    delete result.waitSmokeSlotMs;
+    Object.defineProperty(result, 'timing', { value: { waitInFlightTickMs, waitSmokeSlotMs } });
+  }
+  // A refused between-tick launch must preserve evidence for operator repair, including
+  // pending adoptions, event/alert state and any force-watch rollback bookkeeping.
+  if (result.reason === 'state-unreadable') {
+    (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
+  }
+  if ((strict && isBetweenTickLaunch(options)) || (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted)) return result;
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
@@ -122,20 +163,28 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       }, eventOptions);
     }
     // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
-    await checkPendingAdoptions({
+    if (result.reason !== 'state-unreadable') await checkPendingAdoptions({
+      overdueMs: resolveRecovery({ env: options.env, log: m => options.log?.error?.(m) }).overlayOverdueMs,
       root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
       emit: (event) => emitEvent(event, eventOptions),
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
-  await forceWatch(options, emitEvent, startedAtMs);
+  if (!(strict && isBetweenTickLaunch(options))) await forceWatch(options, emitEvent, startedAtMs);
   return result;
 }
 
 /** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
- *  clone to the last-good build on a failed check or a crash loop. Never throws; the job process (readyOnly) skips it. */
+ *  clone to the last-good build on a failed check or a crash loop. Never throws; readyOnly and between-tick launches skip it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
-  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false } = options;
-  if (!root || readyOnly) return;
+  // Watch rollback follows tick-start policy: unrelated strict admission evidence must
+  // not prevent ready cleanup or persistence of an already-owed rollback.
+  return withRebuildReaders(undefined, () => forceWatchAtTick(options, emitEvent, startedAtMs));
+}
+
+async function forceWatchAtTick(options, emitEvent, startedAtMs) {
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, adoptOnly = false } = options;
+  const betweenTicks = !adoptOnly && isBetweenTickLaunch(options);
+  if (!root || readyOnly || betweenTicks) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
     await runForceWatchTick({
@@ -187,17 +236,22 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
+  asJob, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
+  spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
+  stEnv = { ...env, ...(stateOpts?.env || {}) },
 } = {}) {
+  if (readyOnly && adoptOnly && !admissionEvidence && launchedBy !== 'early' && launchedBy !== 'recovery') {
+    return { moved: false, reason: 'state-unreadable' };
+  }
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
-      root, env, log, mainOnly, entries,
+      root, env: stEnv, log, mainOnly, entries, launchOnly, launchedBy, waitInFlightTickMs,
       adopt: (o = {}) => rebuildCloneInternal({
         root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
-        dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
+        dispatchSmoke, admissionWaitMs, launchedBy, ...o, stEnv, adoptOnly: true, asJob: false,
       }),
     });
   }
@@ -209,7 +263,7 @@ async function rebuildCloneInternal({
     if (adoptOnly) return { moved: false, adopted: false, reason: 'needs-build', alerts: [] };
     // Versioned builds take no clone lease to renew while queued, but their live smoke
     // shares the same host capacity and deadline as an unversioned candidate.
-    const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
+    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep });
     try {
       if (!slot.acquired) return { moved: false, reason: 'smoke-queue-timeout' };
       return await versionedRebuild({ ctx: vctx, log });
@@ -221,7 +275,7 @@ async function rebuildCloneInternal({
   // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
   // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.
   const skipDecider = readyOnly ? null : (skipCheck === undefined ? makeSkipCheck({ root, entries, env }) : skipCheck);
-  if (readyOnly && readReadyCandidate(root, { ...env, ...(stateOpts?.env || {}) })) {
+  if (readyOnly && (admissionEvidence ? admissionEvidence.ready : readReadyCandidate(root, stEnv))) {
     return { moved: false, reason: 'ready-pending', alerts: [] };
   }
   const lockRootFromEnv = env && env.WE_DAEMON_CLONE_LOCK_ROOT;
@@ -230,7 +284,7 @@ async function rebuildCloneInternal({
   // rebuild is opportunistic (the next tick retries it), so it now waits at most WE_DAEMON_REBUILD_LOCK_WAIT_MS
   // (default 60s), says so when it starts waiting, and records the give-up.
   const baseWaitMs = Number(env?.[REBUILD_LOCK_WAIT_ENV]) > 0 ? Number(env[REBUILD_LOCK_WAIT_ENV]) : DEFAULT_REBUILD_LOCK_WAIT_MS;
-  const starvedCount = readRebuildStarvation(root, { ...env, ...(stateOpts?.env || {}) });
+  const starvedCount = readRebuildStarvation(root, stEnv);
   const waitMs = rebuildLockWaitMs({ env, starvedCount, readyOnly });
   if (readyOnly) {
     log.error?.(`daemon-rebuild: detached rebuild job — waiting up to ${Math.round((lockOpts.waitMs ?? waitMs) / 1000)}s for in-flight ticks to drain (writer reservation refuses new reads meanwhile)`);
@@ -251,7 +305,6 @@ async function rebuildCloneInternal({
     ...(sleep ? { sleep } : {}),
     ...lockOpts,
   };
-  const stEnv = { ...env, ...(stateOpts?.env || {}) };
   // fix-rebuild-finalize: once a candidate has passed, the wait for readers is the longer finalize wait — the
   // writer reservation refuses every NEW read slot meanwhile, so this only outlasts ticks already in flight.
   const finalizeWaitMs = Number(env?.[FINALIZE_LOCK_WAIT_ENV]) > 0 ? Number(env[FINALIZE_LOCK_WAIT_ENV]) : DEFAULT_FINALIZE_LOCK_WAIT_MS;
@@ -263,20 +316,25 @@ async function rebuildCloneInternal({
   // ── Phase 1 (locked, fast) ───────────────────────────────────────────────────────────────────────────────
   // A passed candidate waiting on THIS head (an unlocked peek — prepareRebuild re-checks it under the lock) is
   // adopted by this phase, so it earns the finalize wait: this is the tick boundary the sibling yields at.
-  const pendingReady = readReadyCandidate(root, stEnv);
+  const pendingReady = admissionEvidence ? admissionEvidence.ready : readReadyCandidate(root, stEnv);
   const readyOnHead = !!pendingReady
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
-  const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
-  }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
+  let prepareEnteredMs = null;
+  const prep = await withWriteLock(root, () => {
+    prepareEnteredMs = now();
+    return prepareRebuild({
+      root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly, admissionEvidence, launchedBy,
+    });
+  }, readyOnHead ? finalizeLockOpts : admissionLockOpts);
+  const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
-    if (starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
+    if (!rebuildReaders() && starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
       writeRebuildStarvation(root, 0, stEnv);
     }
-  } else if (prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
+  } else if (!rebuildReaders() && prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
   if (!prep.ok) {
     if (prep.reason === 'tick-in-progress') {
       log.error?.(`daemon-rebuild: gave up after ${Math.round((now() - startedMs) / 1000)}s — reader ${prep.heldBy ?? '?'} still ticking; this tick runs on the current tree and the next one retries (#4044)`);
@@ -284,10 +342,10 @@ async function rebuildCloneInternal({
       // Not counted as rebuild starvation: escalating to the long starved wait would re-block the very reader.
       log.error?.(`daemon-rebuild: backed off — reader ${prep.heldBy ?? '?'} was refused ${prep.starved ?? '?'} consecutive time(s) and has priority; nothing was moved, the next tick retries (#4044 reader fairness)`);
     }
-    return { moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
+    return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0, moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
   }
   if (prep.value.terminal) {
-    return { ...prep.value.result, alerts: prep.value.alerts };
+    return { ...prep.value.result, alerts: prep.value.alerts, waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0 };
   }
   const {
     plan, prevHead, lease, overlays: overlaysBefore = [], alerts: prepAlerts,
@@ -314,6 +372,7 @@ async function rebuildCloneInternal({
     const forced = readForceAdopt(root, stEnv, now);
     const priority = !!forced && /^[0-9a-f]{40}$/.test(String(forced.sha ?? '').toLowerCase())
       && typeof forced.ruling === 'string' && forced.ruling.trim() !== '' && typeof forced.quote === 'string' && forced.quote.trim() !== '';
+    const smokeSlotStartedMs = now();
     const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep, priority,
       onWait: async () => {
         const renewed = await withWriteLock(root, () => {
@@ -325,6 +384,7 @@ async function rebuildCloneInternal({
         if (!renewed.ok) throw new Error(`daemon-rebuild: could not renew queued build lease (${renewed.reason}) — the next tick retries`);
       },
     });
+    const waitSmokeSlotMs = Math.max(0, now() - smokeSlotStartedMs);
     try {
       if (!slot.acquired) {
         try {
@@ -334,13 +394,15 @@ async function rebuildCloneInternal({
             writeRebuildState(root, st, stEnv);
           }, finalLockOpts);
         } catch { /* the owner's next call takes an unreleased lease back anyway */ }
-        return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
+        return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs, moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
       }
-      return await smokeAndAdopt({
+      const result = await smokeAndAdopt({
         root, env, stEnv, log, run, runSmoke,
         stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
         finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
       });
+      // Preserve the smoke result's identity; the public wrapper hides these transport fields.
+      return Object.assign(result ?? {}, { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs });
     } finally {
       await slot.release();
     }

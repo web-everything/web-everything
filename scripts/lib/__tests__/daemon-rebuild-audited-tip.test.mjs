@@ -10,6 +10,7 @@ import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../dae
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
+import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Same temp/Git helpers as overlay-pin; local tracking refs avoid network IO entirely.
@@ -962,4 +963,41 @@ describe('unaudited-tip evidence and policy', () => {
     expect(closed(ref, 'abc')).toBe(false);
     expect(makeAuditedTipGate({ ...f.env, WE_FIX_READY_PATH: join(f.dir, 'missing') })(ref, 'abc')).toBe(false);
   });
+});
+
+
+it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; allows a proven adopted pin', async launchedBy => {
+  const f = await fixture();
+  f.env.WE_DAEMON_STATE_DIR = join(f.dir, 'state');
+  f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
+  addOverlay(f.root, { ref, pr: 42 }, { env: f.env });
+  gitOk(f.root, ['reset', '--hard', f.adopted.finalSha]);
+  const main = gitOk(f.root, ['commit-tree', `${f.base}^{tree}`, '-p', f.base, '-m', 'advance main']);
+  gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', main]);
+  const plan = await f.plan();
+  const ready = { prevHead: f.adopted.finalSha, tree: gitOk(f.root, ['rev-parse', `${plan.finalSha}^{tree}`]),
+    passedAt: new Date().toISOString(), kind: 'candidate', forced: false, adopt: plan };
+  const check = () => rebuildClone({ root: f.root, env: f.env, launchedBy, readyOnly: true, asJob: false,
+    versions: null, log: { error() {} } });
+  for (const [sha, pinnedFrom, pr] of [[f.b, 'arbitrary', 42], [f.b, 'x'.repeat(1024), 42], [f.b, f.b, 42], [f.b, f.a, 42],
+    [f.a, 'f'.repeat(40), 42], [f.a, f.b, 99]]) {
+    writeReadyCandidate(f.root, { ...ready, adopt: { ...plan, applied: [{ ref, pr, sha, pinnedFrom }] } }, f.env);
+    expect(() => readReadyCandidateStrict(f.root, f.env)).toThrow();
+    expect(readReadyCandidateStrict(f.root, f.env, readFileSync, { strictPins: false }).adopt.applied[0])
+      .toEqual({ ref, pr, sha, pinnedFrom });
+    expect((await check()).reason).toBe('state-unreadable');
+    expect(readReadyCandidate(f.root, f.env).adopt.applied[0].pinnedFrom).toBe(pinnedFrom);
+  }
+  writeReadyCandidate(f.root, ready, f.env);
+  expect(readReadyCandidateStrict(f.root, f.env).adopt.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
+  expect((await check()).reason).toBe('ready-pending');
+  // An oversized/truncated history is incomplete proof; preserve evidence for operator repair.
+  expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, { run: (args, opts) => args[0] === 'log'
+    ? { status: null, error: Object.assign(new Error('history exceeds maxBuffer'), { code: 'ENOBUFS' }) }
+    : spawnSync('git', args, opts) })).toThrow('Unreadable ready pin history');
+  const args = { ready, plan, prevHead: ready.prevHead, treeOf: () => ready.tree, stillWanted: () => true,
+    verifyBuilt: () => true, auditedTip: () => false, nowMs: Date.now(), maxAgeMs: 60000 };
+  expect(matchReadyCandidate(args).adopt).toBeTruthy();
+  expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
+    .toBe('ready-audit-revoked');
 });

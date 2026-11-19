@@ -1,6 +1,8 @@
 /** @file scripts/lib/daemon-rebuild/lease.mjs — Lock waits, writer preference (rebuild starvation), and the
  * single-flight build lease. Split out of daemon-rebuild.mjs (move-only).
  */
+import { rebuildReaders } from './evidence-context.mjs';
+
 
 import { readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -21,12 +23,13 @@ export const DEFAULT_STARVE_ESCALATE_AFTER = 2;
 export const STARVED_LOCK_WAIT_ENV = 'WE_DAEMON_REBUILD_STARVED_WAIT_MS';
 export const DEFAULT_STARVED_LOCK_WAIT_MS = 3 * 60_000;
 
-function starvePath(root, env = process.env) {
+export function starvePath(root, env = process.env) {
   return join(stateDir(env), `${cloneKey(root)}.starve.json`);
 }
 
 /** Consecutive `tick-in-progress` give-ups for this clone (missing/corrupt = 0). */
 export function readRebuildStarvation(root, env = process.env) {
+  if (rebuildReaders()) return rebuildReaders().starvation(root, env);
   try {
     const n = JSON.parse(readFileSync(starvePath(root, env), 'utf8'))?.count;
     return Number.isInteger(n) && n > 0 ? n : 0;
@@ -34,6 +37,7 @@ export function readRebuildStarvation(root, env = process.env) {
 }
 
 export function writeRebuildStarvation(root, count, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   try {
     const file = starvePath(root, env);
     mkdirSync(dirname(file), { recursive: true });
@@ -156,14 +160,14 @@ export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now
  * `plan`, tearing down an abandoned lease's leftover candidate first. Returns the lease, or `null` when a live
  * sibling build already holds it. Mutates `state.building`; the caller writes the state.
  */
-export function claimBuildLease({ state, plan, root, run, env, nowMs, adoptOnly = false, startTimeOf = processStartMs }) {
+export function claimBuildLease({ state, plan, root, run, env, nowMs, adoptOnly = false, startTimeOf = processStartMs, cleanupAbandoned = true }) {
   if (buildLeaseIsLive(state.building, { env, nowMs, startTimeOf })) return null;
-  if (state.building?.path && leaseOwnerIsGone(state.building, startTimeOf)) removeCandidate({ root, path: state.building.path, run, env });
+  if (cleanupAbandoned && state.building?.path && leaseOwnerIsGone(state.building, startTimeOf)) removeCandidate({ root, path: state.building.path, run, env });
   const token = `${process.pid}-${randomBytes(4).toString('hex')}`;
   const lease = {
     token, pid: process.pid, host: hostname(), startedAt: new Date(nowMs).toISOString(),
     target: plan.finalSha, inputsKey: plan.inputsKey, path: candidateWorktreePath(root, env, token),
-    ...(adoptOnly ? { adoptOnly: true } : {}),
+    adoptOnly,
   };
   state.building = lease;
   ACTIVE_BUILD_TOKENS.add(token);

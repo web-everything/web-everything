@@ -40,7 +40,9 @@ import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
 import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
-import { alertsFilePath, readReadyCandidate } from './state.mjs';
+import { readPendingAdoptionsStrict } from '../overlay-adoption.mjs';
+import { recoveryDue, resolveRecovery } from './recovery.mjs';
+import { readRebuildStateStrict, readReadyCandidateStrict, alertsFilePath } from './state.mjs';
 import { processStartMs } from './lease.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
@@ -141,13 +143,23 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
 }
 
 function readConsumed(dir) {
-  try { return new Set(JSON.parse(readFileSync(join(dir, CONSUMED_FILE), 'utf8'))); } catch { return new Set(); }
+  try {
+    const ids = JSON.parse(readFileSync(join(dir, CONSUMED_FILE), 'utf8'));
+    if (!Array.isArray(ids) || !ids.every(id => typeof id === 'string' && id)) throw new Error('Invalid consumed jobs');
+    return new Set(ids);
+  } catch (error) { if (error?.code !== 'ENOENT') throw error; return new Set(); }
 }
 function writeConsumed(dir, set) {
   try { writeFileSync(join(dir, CONSUMED_FILE), `${JSON.stringify([...set])}\n`); } catch { /* best-effort */ }
 }
 function readResult(dir, id) {
-  try { return JSON.parse(readFileSync(join(dir, `${id}${RESULT_SUFFIX}`), 'utf8')); } catch { return null; }
+  try {
+    const result = JSON.parse(readFileSync(join(dir, `${id}${RESULT_SUFFIX}`), 'utf8'));
+    if (!result || typeof result !== 'object' || Array.isArray(result)
+      || typeof result.reason !== 'string'
+      || ('readyRecorded' in result && typeof result.readyRecorded !== 'boolean')) throw new Error('Invalid rebuild result');
+    return result;
+  } catch (error) { if (error?.code !== 'ENOENT') throw error; return null; }
 }
 function removeJobFiles(dir, id) {
   try { deleteRun(id, dir); } catch { /* gone */ }
@@ -176,22 +188,46 @@ function clockFor(dir) {
 export async function rebuildCloneAsJob({
   root, env = process.env, log = console, mainOnly = false, entries = [], adopt,
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
+  launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
+  recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
+  readState = readRebuildStateStrict, readPending = readPendingAdoptionsStrict,
+  readReady = (root, env) => readReadyCandidateStrict(root, env, readFileSync,
+    { strictPins: launchOnly || launchedBy === 'early' || launchedBy === 'recovery' }),
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
+  // Refuse before preparation or reattach can erase evidence or launch an existing job.
+  const unreadable = () => {
+    say('state-unreadable: rebuild/ready/pending-adoptions/job evidence is unreadable or invalid; repair persisted evidence before retrying');
+    return { moved: false, reason: 'state-unreadable' };
+  };
+  let initialReady;
+  let initialState;
+  let consumed;
+  const results = new Map();
+  let initialFinished;
+  try {
+    initialState = readState(root, env);
+    initialReady = readReady(root, env);
+    readPending(root, { env });
+    consumed = readConsumed(store.dir);
+    initialFinished = store.list().records.filter(r => r.job.kind === REBUILD_JOB_KIND.kind
+      && TERMINAL_JOB_STATUSES.includes(r.job.status));
+    for (const r of initialFinished) results.set(r.id, readResult(store.dir, r.id));
+  } catch { return unreadable(); }
   mkdirSync(store.dir, { recursive: true });
+  if (store.list().corrupt?.length) return { moved: false, reason: 'rebuild-job-running', unknownJobState: true };
   const kind = REBUILD_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
   const snap = snapshot ?? { repoDir: root, install: cloneNodeModulesInstaller(root) };
   const tickClock = clock ?? clockFor(store.dir);
 
   // 1. Consume finished jobs once (oldest first) and say what each did — the job's outcome reaches the daemon log.
-  const consumed = readConsumed(store.dir);
   const finishedJobs = [];
-  for (const r of mine().filter((x) => TERMINAL_JOB_STATUSES.includes(x.job.status) && !consumed.has(x.id))
+  for (const r of initialFinished.filter((x) => !consumed.has(x.id))
     .sort((a, b) => Date.parse(a.job.finishedAt || 0) - Date.parse(b.job.finishedAt || 0))) {
     consumed.add(r.id);
-    const res = readResult(store.dir, r.id);
+    const res = results.get(r.id);
     const outcome = r.job.status === 'failed'
       ? { id: r.id, status: 'failed', reason: r.job.error ?? 'unknown' }
       : { id: r.id, status: r.job.status, reason: res?.reason ?? 'no-result', readyRecorded: !!res?.readyRecorded, target: res?.target ?? null };
@@ -213,7 +249,7 @@ export async function rebuildCloneAsJob({
     const after = store.list().records;
     const referenced = after.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []);
     try { evict({ jobsDir: store.dir, referenced }); } catch (e) { say(`snapshot eviction failed: ${e.message}`); }
-    const cons = readConsumed(store.dir);
+    const cons = consumed;
     for (const r of after) {
       if (r.job.kind !== kind || !TERMINAL_JOB_STATUSES.includes(r.job.status) || !cons.has(r.id)) continue;
       if (now() - Date.parse(r.job.finishedAt || 0) < FINISHED_REBUILD_JOB_KEEP_MS) continue;
@@ -227,7 +263,7 @@ export async function rebuildCloneAsJob({
   // Without a ready record and with a job in flight there is nothing to adopt, so the adopt-only pass (which can reach
   // a versioned inline build) is left until the job settles, exactly as before.
   let inFlight = mine().find((x) => !TERMINAL_JOB_STATUSES.includes(x.job.status)) ?? null;
-  let r = inFlight && !readReadyCandidate(root, env) ? null : await adopt();
+  let r = launchOnly || (inFlight && !initialReady) ? null : await adopt();
   // Only a completed adoption short-circuits; a ready record that did not adopt must not suppress job recovery below.
   if (r?.moved || r?.adopted) {
     housekeeping();
@@ -243,26 +279,44 @@ export async function rebuildCloneAsJob({
     }
     inFlight = null; // finished during the pass — fall through, the next tick consumes it
   }
-  r ??= await adopt();
+  // Between ticks, use the same admission checks without adopting or repairing the live tree.
+  r ??= await adopt(launchOnly ? { readyOnly: true, admissionEvidence: { state: initialState, ready: initialReady } } : undefined);
+  // Preparation refused: do not evict snapshots or rewrite consumed-job evidence.
+  if (launchOnly && !r?.moved && !r?.adopted && r?.reason !== 'needs-build') return { ...r, finishedJobs };
+  let recover = false;
+  if (!launchOnly && !r?.moved && !r?.adopted
+    // Sticky rejections must still wait for changed inputs or operator intervention.
+    && ['needs-build', 'up-to-date'].includes(r?.reason)) {
+    try {
+      recover = recoveryDue({ state: readState(root, env), pending: readPending(root, { env }), nowMs: now(), settings: recoverySettings });
+    } catch { return { ...unreadable(), finishedJobs }; }
+  }
   if (r?.moved || r?.adopted) {
     housekeeping();
     return { ...r, finishedJobs };
   }
 
   // Reattach can finish a job and publish a candidate during this call. Keep it for adoption.
-  if (r?.reason !== 'needs-build' || readReadyCandidate(root, env)) {
+  let ready;
+  try { if (!launchOnly) readState(root, env); ready = readReady(root, env); }
+  catch { return { ...unreadable(), finishedJobs }; }
+  if ((r?.reason !== 'needs-build' && !recover) || ready) {
     housekeeping();
     return { ...r, ...(r?.reason === 'needs-build' ? { reason: 'ready-pending' } : {}), finishedJobs };
   }
 
-  // 4. A build is due. Space builds by `minIntervalMs` after one that did not record a ready candidate (a
+  // 4. A build is due. Space all recovery launches, and ordinary builds after one without a ready candidate (a
   //    transient hold writes no reject record; without this the job would re-smoke back to back).
   const last = mine().filter((x) => TERMINAL_JOB_STATUSES.includes(x.job.status))
     .sort((a, b) => Date.parse(b.job.finishedAt || 0) - Date.parse(a.job.finishedAt || 0))[0];
-  const lastRes = last ? readResult(store.dir, last.id) : null;
+  let lastRes;
+  try {
+    readConsumed(store.dir);
+    lastRes = last ? readResult(store.dir, last.id) : null;
+  } catch { return { ...unreadable(), finishedJobs }; }
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
-  if (last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
+  if (last && (recover || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
@@ -272,7 +326,7 @@ export async function rebuildCloneAsJob({
   try {
     queued = enqueueJob({
       store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
-      input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null,
+      input: { root: resolve(root), entries, launchedBy: recover ? 'recovery' : launchedBy, waitInFlightTickMs, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null,
         daemonReader: { root: resolve(root), owner: `${hostname()}:${process.pid}`, pid: process.pid, startedMs: processStartMs(process.pid) } },
     });
   } catch (e) {
@@ -293,6 +347,7 @@ export async function rebuildCloneAsJob({
 export function rebuildChildArgs(input, cliPath) {
   return [
     cliPath, `--clone=${input.root}`, '--ready-only', '--json',
+    ...(['early', 'recovery'].includes(input.launchedBy) ? [`--launched-by=${input.launchedBy}`] : []),
     ...(input.entries || []).map((e) => `--entry=${e}`),
     ...(input.mainOnly ? ['--main-only'] : []),
   ];
@@ -388,6 +443,20 @@ export function reportReaderWaitTimeout({
   return outcome;
 }
 
+/** Job result producer: local reader drain and host smoke capacity remain separate clocks. */
+export function buildRebuildJobResult(input, r, timeout, nowMs = Date.now()) {
+  // Accept pre-migration child output as well as the explicit CLI timing record.
+  const timing = r.timing ?? r;
+  return {
+    launchedBy: input.launchedBy ?? 'tick-start',
+    waitInFlightTickMs: (input.waitInFlightTickMs ?? 0) + (timing.waitInFlightTickMs ?? 0),
+    waitSmokeSlotMs: timing.waitSmokeSlotMs ?? null,
+    finishedAt: nowMs, reason: r.reason ?? null, ...(r.mutation ? { mutation: r.mutation } : {}),
+    readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
+    alerts: (r.alerts || []).map((a) => a.kind), ...(timeout ?? {}),
+  };
+}
+
 export async function jobMain({
   runChild = runRebuildChild, reportTimeout = reportReaderWaitTimeout, env = process.env,
   ppid = process.ppid, host = hostname(),
@@ -405,11 +474,7 @@ export async function jobMain({
         const childEnv = rebuildChildEnv(env, { ppid, host, daemonReader: input.daemonReader });
         const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
         const timeout = reportTimeout({ root: input.root, env, r });
-        const result = {
-          finishedAt: Date.now(), reason: r.reason ?? null, ...(r.mutation ? { mutation: r.mutation } : {}), readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
-          alerts: (r.alerts || []).map((a) => a.kind),
-          ...(timeout ?? {}),
-        };
+        const result = buildRebuildJobResult(input, r, timeout);
         writeFileSync(join(dir, `${jobId}${RESULT_SUFFIX}`), `${JSON.stringify(result)}\n`);
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.mutation ? ` (${result.mutation})` : ''}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);
         return { reason: result.reason, readyRecorded: result.readyRecorded };

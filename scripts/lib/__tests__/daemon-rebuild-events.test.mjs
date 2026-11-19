@@ -269,7 +269,7 @@ describe('rebuildClone coordination events', () => {
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
       'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',
       'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
-      'index-locked', 'invalid-probation', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
+      'index-locked', 'invalid-ready-applied', 'invalid-probation', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',
@@ -278,8 +278,8 @@ describe('rebuildClone coordination events', () => {
       'ready-adopted', 'ready-pending', 'ready-recorded', 'rebuild-in-progress', 'rebuild-job-running',
       'rebuild-job-spaced', 'rebuild-job-started', 'recovered-adopted', 'ref-gone', 'ref-unresolved',
       'ready-audit-revoked', 'rejected-since', 'root-changed-during-smoke', 'skipped-unrelated', 'smoke-backoff',
-      'smoke-env-load', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'smoke-queue-timeout', 'stack-base-moved',
-      'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
+      'smoke-env-load', 'smoke-env-timeout-backoff', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'smoke-queue-timeout', 'stack-base-moved',
+      'stack-contained', 'state-file-busy', 'state-unreadable', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unaudited-tip-held', 'unknown', 'unsafe-ref',
       'untracked-collision', 'unverified-build', 'up-to-date',
     ]);
