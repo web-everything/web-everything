@@ -36,6 +36,11 @@
       "num": "8001",
       "gates": [
         {
+          "name": "runtime-only",
+          "pass": true,
+          "observed": "env"
+        },
+        {
           "name": "already-done",
           "pass": true,
           "observed": null
@@ -129,6 +134,11 @@
       "num": "8002",
       "gates": [
         {
+          "name": "runtime-only",
+          "pass": true,
+          "observed": "env"
+        },
+        {
           "name": "already-done",
           "pass": true,
           "observed": null
@@ -200,6 +210,11 @@
     {
       "num": "8003",
       "gates": [
+        {
+          "name": "runtime-only",
+          "pass": true,
+          "observed": "env"
+        },
         {
           "name": "already-done",
           "pass": true,
@@ -293,6 +308,11 @@
       "num": "8004",
       "gates": [
         {
+          "name": "runtime-only",
+          "pass": true,
+          "observed": "env"
+        },
+        {
           "name": "already-done",
           "pass": true,
           "observed": null
@@ -328,6 +348,11 @@
       "num": "8005",
       "gates": [
         {
+          "name": "runtime-only",
+          "pass": true,
+          "observed": "env"
+        },
+        {
           "name": "already-done",
           "pass": true,
           "observed": null
@@ -360,6 +385,11 @@
     {
       "num": "8006",
       "gates": [
+        {
+          "name": "runtime-only",
+          "pass": true,
+          "observed": "env"
+        },
         {
           "name": "already-done",
           "pass": true,

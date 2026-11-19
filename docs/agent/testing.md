@@ -4919,3 +4919,14 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Soak probes after runtime admission changes
+
+Retry-bound probes must seed an infra entry, inject unrestricted fixture settings, and require the child
+to execute and report a timeout. Use the injected elapsed clock to model child duration without host-load
+timing flakes. A source detector must recognize the remaining shared deadline, and landed-fix wrappers
+must assert detection so a stale marker cannot silently switch a regression to expected-fail.
+Diagnostic filing probes retain the canonical landing target through the real target validator; substitute
+an inert child only at the OS spawn seam. Refusals and harness crashes fail the scenario even when the
+checkout remains clean. CLI golden fixtures pin both the runtime-file path and priority environment,
+and retain the additive runtime admission trace in their full-output comparison.

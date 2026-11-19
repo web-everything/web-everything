@@ -9,7 +9,7 @@ import { assertRuntimeAdmitted, withRuntimeAdmission, withRuntimeAdmissionTick, 
 const now = Date.parse('2026-11-18T13:14:00Z');
 const freeLanes = [20, 21];
 const nums = rows => rows.map(row => String(row.num));
-const card = (num, extra = {}) => ({ num, status: 'open', kind: 'task', size: 1,
+const card = (num, extra = {}) => ({ num, status: 'open', kind: 'story', size: 1,
   buildQueued: true, scope: ['we:scripts/shared.mjs'], preparedDate: '2026-11-18', ...extra });
 function settings(ids) {
   return readBuildPrioritySettings({ env: {}, read: () => ({}), now,
