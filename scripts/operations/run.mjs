@@ -104,7 +104,7 @@ import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacit
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readSettings } from '../lib/settings-files.mjs';
+import { readSettings, readSettingsChecked } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
@@ -269,7 +269,7 @@ export const CLI_ONLY_OPERATIONS = Object.freeze({
 });
 
 export const OPERATIONS = Object.freeze({
-  [BRIEF_MODE_OP]: () => ({ declaration: briefModeOperation({ collect: () => loadDeliveryRoutes(readSettings) }),
+  [BRIEF_MODE_OP]: () => ({ declaration: briefModeOperation({ collect: () => loadDeliveryRoutes(readSettingsChecked) }),
     sinks: {}, finish: finishBriefMode }),
   [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
     const routing = resolveAiRouting();
