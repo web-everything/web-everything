@@ -99,6 +99,8 @@ import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
 import { sampleHost } from '../../scripts/lib/host-sample.mjs';
 import { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
+import { readCompletePrComments } from '../../scripts/conveyor/pr-comments-complete.mjs';
+import { drainRedTeamQueue, loadRedTeamQueueDrainSettings } from '../../scripts/lib/red-team-queue-drain.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue, readLiveRedTeamPr } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
@@ -1454,6 +1456,41 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 let redTeamDispatchQueue;
 const redTeamGateRetryHistory = new Map();
 let lastRedTeamQueueFloorLine;
+/** Separate interval pass: never depends on the review planner producing refusal rows. */
+export function cliRedTeamQueueDrain({ log = console } = {}) {
+  if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+  const note = line => log.error(line);
+  redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: note });
+  const floor = loadRedTeamQueueFloor({ log: note });
+  const settings = loadRedTeamQueueDrainSettings({ log: note });
+  const budget = liveReviewRoundBudget();
+  const host = defaultReviewHostAdmission({ log: note });
+  const paused = planClaudeAuthDispatchGate().paused;
+  let lanes = 0;
+  try {
+    // Recovery lanes are a host-wide pool shared by the queued repositories.
+    const repos = [...new Set(redTeamDispatchQueue.entries().map(e => e.repo))];
+    lanes = repos.length ? Math.min(...repos.map(repo => defaultRecoveryLaneNumbers({ repo }).length)) : 0;
+  } catch { /* Unknown lanes hold admission. */ }
+  const provider = createGhProvider();
+  return drainRedTeamQueue({ queue: redTeamDispatchQueue, readLivePr: readLiveRedTeamPr, log: note,
+    capacity: { minConcurrent: floor.minConcurrent,
+      // All live review rounds conservatively bound red teams too; never infer free seats from unknown ps.
+      inFlight: budget.live, lanes, budget, alertAfterMin: settings.alertAfterMin,
+      remainingStarts: !paused && host.admitted ? host.maxPerTick : 0 },
+    runRecovery: options => {
+      const row = options.plan.refusals[0];
+      const raw = provider.readPrState(options.repo, row.prNumber);
+      if (raw?.state !== 'OPEN' || raw.headRefOid !== row.headSha) {
+        throw new Error('live recovery PR/head unreadable; retry next interval');
+      }
+      const comments = readCompletePrComments(row.prNumber, { repo: options.repo });
+      const rawPrs = [{ ...raw, number: row.prNumber, comments }];
+      return runRedTeamOnSkip({ ...options, rawPrs, dispatch: d => dispatchReviewJob(d) });
+    },
+  });
+}
+
 export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   const livePrs = new Map();
@@ -2133,11 +2170,24 @@ async function main() {
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged): a relevant PR event ends the sleep
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
-  const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
-      root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
-    }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
-  );
+  let drainBusy = false;
+  const drainEffects = withGithubAppAuth({ tickOnce: () => cliRedTeamQueueDrain() }, REVIEW_DAEMON_APP_AUTH_OPTS);
+  const drainTimer = setInterval(async () => {
+    if (drainBusy || stopping
+      || ['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+    drainBusy = true;
+    try { await drainEffects.tickOnce(); }
+    catch (error) { console.error(`review-daemon: red-team queue drain failed: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}`); }
+    finally { drainBusy = false; }
+  }, 60_000);
+  let stoppedReason;
+  try {
+    ({ stoppedReason } = await runDaemonLoop(
+      withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+        root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
+      }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
+    ));
+  } finally { clearInterval(drainTimer); }
   if (!stopping) {
     console.error(`review-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });
