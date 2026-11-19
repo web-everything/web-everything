@@ -1,3 +1,5 @@
+import { HEAD, workflowRow, workflowEvidence } from '../soak/fixtures/workflow-edit-protection.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-gate-hold-class.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -32,7 +34,7 @@ import { describe, it, expect } from 'vitest';
 import { mapGraphqlPr } from '../../lib/pr-list-paged.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
-  staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
+  staleRequiredBaseRepair, reviewHoldOnlyRed, reviewHoldCiWaivable, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
@@ -1841,6 +1843,30 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     labels: [...lbl('review:changes', 'review:human', 'merge-status:conflicting', 'advisory:changes')],
     ...over,
   });
+
+  it.each([
+    ['main', 'main', 'clean', true],
+    ['main', 'main', 'manifest-only', true],
+    ['main', 'lane/stacked-base', 'clean', false],
+    ['main', 'lane/stacked-base', 'manifest-only', false],
+    ['main', 'main', 'real', false],
+    ['main', 'main', 'unsupported', false],
+    ['main', 'main', undefined, false],
+    ['main', 'main', null, false],
+    ['main', undefined, 'clean', false],
+    ['trunk', 'trunk', 'clean', true],
+    ['trunk', 'main', 'manifest-only', false],
+  ])('conflictFixMechanical requires the default base and an allowed disposition (default=%s, base=%s, disposition=%s → %s)',
+    (defaultBranch, baseRefName, conflictDisposition, expected) => {
+      const plan = planReconcile({
+        prs: [prConflict({ baseRefName, conflictDisposition, comments: [finding()] })],
+        agents: [], now: NOW, defaultBranch,
+      });
+      expect(plan.refusals).toEqual([]);
+      expect(plan.dispatch).toEqual([expect.objectContaining({
+        kind: 'fix', prNumber: 2549, isConflict: true, conflictFixMechanical: expected,
+      })]);
+    });
 
   it('a conflict-labelled bounce with zero prior conflict-fix rounds is dispatched `fix`, even though the shared cap is fully spent', () => {
     // Flood the thread with REARM/advisory markers past `NEGOTIATION_ROUND_CAP` — the shared cap this bounce
@@ -3724,6 +3750,41 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
       kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
     }));
   });
+
+  it('does not waive CI for a review-hold advisory while another required check is still pending', () => {
+    const rollup = heldRollup().map(row => row.name === 'test' ? { name: 'test', status: 'IN_PROGRESS', conclusion: '' } : row);
+    const result = planReconcile({
+      prs: [pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup })],
+      requiredChecks, agents: [], durableCounts: {}, now: NOW, advisoryReviewOnHumanHandoff: 'on',
+    });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it('does not waive CI for a review-hold advisory when a green required check is from another head', () => {
+    const rollup = heldRollup().map(row => row.name === 'test' ? { ...row, head_sha: 'f'.repeat(40) } : row);
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup });
+    expect(reviewHoldOnlyRed(rollup, requiredChecks, source.headRefOid)).toBe(false);
+    expect(reviewHoldOnlyRed(heldRollup(), requiredChecks, source.headRefOid)).toBe(true);
+    const result = planReconcile({ prs: [source], requiredChecks, agents: [], durableCounts: {}, now: NOW,
+      advisoryReviewOnHumanHandoff: 'on' });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(false);
+  });
+
+  it.each(['SKIPPED', 'NEUTRAL'])('does not waive CI for a review-hold advisory when a required check concluded %s', conclusion => {
+    const required = [...requiredChecks, 'lint'];
+    const rollup = [...heldRollup(), check('lint', conclusion)];
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup });
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks: required })).toBe(false);
+    const result = planReconcile({ prs: [source], requiredChecks: required, agents: [], durableCounts: {}, now: NOW,
+      advisoryReviewOnHumanHandoff: 'on' });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it('still waives CI for a review-hold advisory when only the held gates are red', () => {
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup() });
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(true);
+  });
 });
 
 describe('fix waiting episode', () => {
@@ -4879,4 +4940,20 @@ it('paged fetch evidence remains unknown to the planner even when every fetched 
   expect(result.refusals.flatMap(row => [row, row.reviewRefusal])).toContainEqual(expect.objectContaining({
     // No review-gate row was observed, so no more specific reason exists: rows-incomplete stays the (fail-closed) reason.
     kind: 'review-ci', ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) }));
+});
+
+it('admits PR 7106 workflow-edit protection on review:pending without a ci-heal', () => {
+  const evidence = workflowEvidence();
+  // Complete exact-head evidence: the review CI contract refuses an unproven listing.
+  const prs = excusePrMergeGateHolds([pr1563({ number: 7106, headRefOid: HEAD, rowsHead: HEAD, rowsComplete: true,
+    labels: lbl('review:pending'), comments: [], statusCheckRollup: [workflowRow,
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] })], {
+    repo: 'owner/repo', mergeGateSetting: 'on',
+    readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),
+      runGh: argv => argv[1].endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }),
+  });
+  const plan = planReconcile({ prs, requiredChecks: ['test', 'merge-gate'], now: NOW, agents: [],
+    advisoryReviewOnHumanHandoff: 'on' });
+  expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 7106 }));
+  expect(plan.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
 });

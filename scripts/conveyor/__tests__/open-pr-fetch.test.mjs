@@ -286,6 +286,8 @@ describe('rollup connection completeness at the fetch boundary', () => {
   const nodes = [{ __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }];
   it.each([
     ['complete', { pageInfo: { hasNextPage: false }, totalCount: 1, nodes }, true],
+    ['paged failure', { pageInfo: { hasNextPage: true }, totalCount: 2,
+      nodes: [{ __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE' }] }, false],
     ['paged', { pageInfo: { hasNextPage: true }, totalCount: 1, nodes }, false],
     ['count mismatch', { pageInfo: { hasNextPage: false }, totalCount: 2, nodes }, false],
     ['missing pageInfo', { totalCount: 1, nodes }, false],

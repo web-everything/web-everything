@@ -52,6 +52,7 @@ import {
   readLockEntry,
   releaseLockDir,
   heartbeat,
+  heartbeatOwn,
   parseLockEntry,
   isLeaseExpired,
   lockIdFor,
@@ -378,7 +379,7 @@ function clearReaderStarved(starvedRoot, readerKey) {
 /** The live starved reader (if any, other than `owner`) that writers must yield to. A claim lapses with the same
  *  lease as a lock entry (`lastRefusedAt` older than `leaseMinutes`) or when its same-host pid is dead — those
  *  are removed on sight, so a crashed reader can never hold writers off. */
-function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after, startedBeforeMs = null }) {
+function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after, startedBeforeMs = null, ignoreOwners = [] }) {
   if (!(after > 0)) return null;
   for (const rec of readStarvedRecords(starvedRoot)) {
     const asEntry = { owner: rec.owner, pid: rec.pid, heartbeatAt: rec.lastRefusedAt };
@@ -386,7 +387,7 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
       try { rmSync(rec.file, { force: true }); } catch { /* best-effort */ }
       continue;
     }
-    if (rec.owner === owner) continue;
+    if (rec.owner === owner || ignoreOwners.includes(rec.owner)) continue;
     // Bounded: the override lives only inside one writer wait (capped by waitMs); the starved reader's claim is
     // kept, so the writer's NEXT attempt (and its start check) yields to it again. A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
     // Fail closed: a record with a missing/invalid timestamp is treated as older, so the writer still yields.
@@ -710,7 +711,7 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * Reader fairness: before reserving, and on every drain poll, a live starved reader (refused
  * `readerPriorityAfter` times in a row) makes this writer back off — `reader-priority`, writer key released. Only
  * ever during the drain wait, before anything moved; a writer that returned ok is never interrupted.
- * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress'|'reader-priority', heldBy:string|null, starved?:number}>}
+ * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress'|'reader-priority'|'lock-lost', heldBy:string|null, starved?:number}>}
  */
 export async function acquireWrite(root, opts = {}) {
   const {
@@ -769,7 +770,7 @@ export async function acquireWrite(root, opts = {}) {
     const waitedPast = !claim && writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
       && waited < writerWaitPriorityMs + windowMs;
     const r = findPriorityReader(starvedRoot, {
-      owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
+      owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter, ignoreOwners,
       startedBeforeMs: waitedPast ? startMs : null,
     });
     return r;
@@ -779,12 +780,19 @@ export async function acquireWrite(root, opts = {}) {
     noteRefusal(startMs, yieldTo.owner, true);
     return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
   }
-  const currentWriter = readLockEntry(writerRoot, WRITER_KEY);
-  const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe(currentWriter), leaseMinutes);
+  const writerToken = randomUUID();
+  const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe, leaseMinutes, { writerToken });
   if (!writerReserve.ok) {
     return { ok: false, reason: 'concurrent-mover', heldBy: writerReserve.heldBy };
   }
 
+  // The reservation is immutable; a resumed drain must never rewrite a successor's entry.
+  const entryFile = join(writerRoot, lockIdFor(WRITER_KEY), 'lock.json');
+  const readRecord = () => { try { return readFileSync(entryFile, 'utf8'); } catch { return null; } };
+  const record = readRecord();
+  const stillOurs = () => record !== null && readRecord() === record
+    && readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken === writerToken;
+  const lockLost = () => ({ ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null });
   const deadline = startMs + waitMs;
   let lastHeartbeatMs = startMs;
   let lastBlockers = [];
@@ -792,9 +800,10 @@ export async function acquireWrite(root, opts = {}) {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const nowMsN = now();
+    if (!stillOurs()) return lockLost();
     // live 2026-10-11 rebuild-job livelock: keep the reservation live through a long drain.
     if (nowMsN - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-      heartbeat(writerRoot, WRITER_KEY, owner, new Date(nowMsN).toISOString(), pid);
+      if (!heartbeatOwn(writerRoot, WRITER_KEY, owner, new Date(nowMsN).toISOString()) || !stillOurs()) return lockLost();
       lastHeartbeatMs = nowMsN;
     }
     const blockers = [];
@@ -815,6 +824,7 @@ export async function acquireWrite(root, opts = {}) {
     lastBlockers = blockers;
     // Still draining — nothing moved yet — so backing off to a starved reader is always safe.
     const starvedReader = priorityFor(nowMsN);
+    if (!stillOurs()) return lockLost();
     if (starvedReader) {
       releaseLockDir(writerRoot, WRITER_KEY);
       noteRefusal(nowMsN, starvedReader.owner, true);
@@ -889,9 +899,10 @@ export async function withReadLock(root, fn, opts = {}) {
 /**
  * Run `fn` while holding the WRITE lock on `root` (see {@link acquireWrite} for the wait/timeout semantics).
  * Same heartbeat-while-held / always-release-in-finally shape as {@link withReadLock}.
+ * The callback receives `stillHeld()` to fence publication after asynchronous work.
  * @template T
  * @param {string} root
- * @param {() => (T|Promise<T>)} fn
+ * @param {(stillHeld: () => boolean) => (T|Promise<T>)} fn
  * @param {object} [opts]  same shape as {@link acquireWrite}
  * @returns {Promise<{ok:true, value:T}|{ok:false, reason:string, heldBy:string|null}>}
  */
@@ -903,16 +914,41 @@ export async function withWriteLock(root, fn, opts = {}) {
   if (!acquired.ok) return acquired;
 
   const { writerRoot } = cloneLockDirs(root, lockRoot);
+  // heartbeatOwn leaves this entry immutable: compare the whole acquisition record, including
+  // any fencing token, rather than accepting a replacement with the same owner string.
+  const entryFile = join(writerRoot, lockIdFor(WRITER_KEY), 'lock.json');
+  const readRecord = () => { try { return readFileSync(entryFile, 'utf8'); } catch { return null; } };
+  const record = readRecord();
+  const writerToken = readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken;
+  const stillOurs = () => record !== null && writerToken != null && readRecord() === record
+    && readLockEntry(writerRoot, WRITER_KEY)?.owner === owner
+    && readLockEntry(writerRoot, WRITER_KEY)?.meta?.writerToken === writerToken;
+  let lost = false;
+  const loseLock = () => {
+    if (lost) return;
+    lost = true;
+    clearInterval(timer);
+    (opts.log || console.error)('daemon-clone-lock: write lock lost; result withheld');
+  };
   const timer = setInterval(() => {
-    try { heartbeat(writerRoot, WRITER_KEY, owner, new Date().toISOString(), pid); } catch { /* best-effort */ }
+    try {
+      if (!stillOurs() || !heartbeatOwn(writerRoot, WRITER_KEY, owner, new Date().toISOString()) || !stillOurs()) loseLock();
+    } catch { loseLock(); }
   }, HEARTBEAT_INTERVAL_MS);
   if (typeof timer.unref === 'function') timer.unref();
   try {
-    const value = await fn();
+    if (!stillOurs()) loseLock();
+    if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
+    const value = await fn(() => {
+      if (!stillOurs()) loseLock();
+      return !lost;
+    });
+    if (!stillOurs()) loseLock();
+    if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
     return { ok: true, value };
   } finally {
     clearInterval(timer);
-    releaseWrite(root, { owner, lockRoot });
+    if (!lost && stillOurs()) releaseWrite(root, { owner, lockRoot });
   }
 }
 

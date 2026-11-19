@@ -170,7 +170,9 @@ describe('normal-path parity with the pre-extraction decisions', () => {
     if (!before.length) expect(input.readEvidence).not.toHaveBeenCalled();
     const queue = createRedTeamDispatchQueue({ file: 'fixture/queue.json',
       readFile: () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); },
-      writeFile: () => {}, rename: () => {}, unlink: () => {}, now: () => 1 });
+      writeFile: () => {}, rename: () => {}, unlink: () => {}, now: () => 1,
+      // The queue admits only rows whose live PR reads back open at the planned head.
+      readLivePr: () => ({ state: 'OPEN', headRefOid: head }) });
     const sync = vi.spyOn(queue, 'sync');
     runWithRedTeamQueue({ queue, repo, plan, rawPrs: input.rawPrs,
       capacity: { lanes: 1, remainingStarts: 1 }, readNetFiles: () => ({ ok: false }),

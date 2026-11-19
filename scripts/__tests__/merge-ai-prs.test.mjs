@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, readFreshQueueRollup, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +18,276 @@ import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
+
+describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
+  const clean = { decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND', mergeable: 'MERGEABLE', hasManifest: false,
+    certifyLabel: true, aiGenerated: false, testGreen: true };
+
+  it('is true for behind + clean + certified + green, including AI certification', () => {
+    expect(isBehindButClean(clean)).toBe(true);
+    expect(isBehindButClean({ ...clean, certifyLabel: false, aiGenerated: true })).toBe(true);
+  });
+
+  it.each([
+    ['CONFLICTING', { mergeable: 'CONFLICTING' }],
+    ['DIRTY', { state: 'DIRTY' }],
+    ['hasManifest', { hasManifest: true }],
+    ['uncertified', { certifyLabel: false, aiGenerated: false }],
+    ['not testGreen', { testGreen: false }],
+    ['already merge', { decision: 'merge' }],
+    ['off default base', { offDefaultBase: true }],
+    ['unknown mergeability', { mergeable: 'UNKNOWN' }],
+    ['unknown state', { state: 'UNKNOWN' }],
+    ['invalid manifest evidence', { hasManifest: null }],
+    ['another blocker reason', { reason: unlandableStateReason('BEHIND') + '; reviewDecision=CHANGES_REQUESTED' }],
+    ['codeql blocked', { codeqlBlocked: true }],
+    ['review held', { reviewHeld: true }],
+    ['required check read error', { requiredCheckReadError: true }],
+    ['invalid green evidence', { testGreen: 'true' }],
+    ['invalid certification evidence', { certifyLabel: 'true' }],
+  ])('is false for %s', (_name, patch) => {
+    expect(isBehindButClean({ ...clean, ...patch })).toBe(false);
+  });
+
+  it.each(['decision', 'state', 'mergeable', 'hasManifest', 'certifyLabel', 'testGreen'])('fails closed with missing %s', key => {
+    const incomplete = { ...clean };
+    delete incomplete[key];
+    expect(isBehindButClean(incomplete)).toBe(false);
+  });
+
+  it('fails closed with missing verdict fields', () => {
+    for (const v of [undefined, null, {}]) expect(isBehindButClean(v)).toBe(false);
+  });
+});
+
+describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
+  const clean = { repo: 'fixture/repo', decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND',
+    mergeable: 'MERGEABLE', hasManifest: false, certifyLabel: true, testGreen: true, headSha: 'a'.repeat(40) };
+  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, reclassified = true, patch = {}, prPatch = {}, rosterSource = 'live', requiredNames = ['test', 'smoke'], queueRequiredChecks = ['test', 'smoke'] } = {}) => {
+    const verdict = { ...clean, ...patch };
+    const before = { ...verdict };
+    const rebaseDropManifest = vi.fn(() => ({ action: 'skip', reason: 'fixture rebase probe' }));
+    const mergeStrategy = { queueOwnsFreshness: vi.fn(() => ownsFreshness) };
+    const operation = routeRebaseBeforeEnqueue(verdict, {
+      setting, mergeStrategy, manifestFree: () => manifestFree,
+      reclassifiesMerge: () => reclassified && classifyPr(retainCheckedQueueHead({ ...freshPr, ...prPatch }, {
+        hold: true, queueOwnsFreshness: ownsFreshness, requiredCheck: 'test', queueRequiredChecks, rosterSource, requiredNames,
+      }), { requiredCheck: 'test', defaultBranch: 'main', queueRequiredChecks }).decision === 'merge',
+      rebase: rebaseDropManifest,
+    });
+    const args = { laneRef: 'lane/fixture', base: 'origin/main' };
+    const result = operation?.(args);
+    return { verdict, before, operation, rebaseDropManifest, mergeStrategy, args, result };
+  };
+
+  const freshPr = { rowsComplete: true, number: 42, title: 'Retained head', body: 'What changed and why', headRefOid: clean.headSha,
+    baseRefName: 'main', mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }],
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+  const revalidate = (verdict, { patch = {}, setting = 'conflict-only', queueOwnsFreshness = true,
+    expectedHeadSha = clean.headSha, rosterSource = 'live', requiredNames = ['test', 'smoke'], queueRequiredChecks = ['test', 'smoke'] } = {}) => revalidateWithUnknownRetry({
+    read: async () => retainBypassedQueueHead({ ...freshPr, ...patch }, { verdict, setting, queueOwnsFreshness, expectedHeadSha, requiredCheck: 'test', queueRequiredChecks, rosterSource, requiredNames }),
+    opts: { defaultBranch: 'main', expectedHeadSha, requiredCheck: 'test', queueRequiredChecks }, setting: { retries: 0 },
+  });
+
+  it('conflict-only retains a clean BEHIND head without rebase, passes fresh revalidation and enqueues it', async () => {
+    const { verdict, operation, rebaseDropManifest, mergeStrategy } = route();
+    expect(verdict).toEqual({ ...clean, decision: 'merge', rebaseDrop: 'skipped-behind-clean',
+      reason: 'behind main but clean; merge queue tests PR + main - enqueued on its existing head' });
+    expect(operation).toBe(null);
+    expect(rebaseDropManifest).not.toHaveBeenCalled();
+    expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledOnce();
+    expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledWith(clean.repo);
+    const fresh = await revalidate(verdict);
+    expect(fresh.decision).toBe('merge');
+    expect(fresh.headSha).toBe(clean.headSha);
+    const enqueue = vi.fn();
+    if (fresh.decision === 'merge') enqueue(fresh.headSha);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(enqueue).toHaveBeenCalledWith(clean.headSha);
+    expect(rebaseDropManifest).not.toHaveBeenCalled();
+  });
+
+  const testGreen = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
+  const incompleteChecks = [
+    ['failing smoke', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE' }]],
+    ['skipped smoke', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'SKIPPED' }]],
+    ['neutral smoke', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'NEUTRAL' }]],
+    ['missing conclusion', [testGreen, { name: 'smoke', status: 'COMPLETED' }]],
+    ['nameless row', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }, null]],
+    ['conflicting smoke rows', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }]],
+    ['missing smoke', [testGreen]],
+    ['pending smoke', [testGreen, { name: 'smoke', status: 'IN_PROGRESS', conclusion: null }]],
+    ['smoke from another head', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: 'other-head' }]],
+    ['malformed smoke', [testGreen, { name: 'smoke', conclusion: 'SUCCESS' }]],
+    ['missing configured required test', [{ name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }]],
+  ];
+
+  it.each(incompleteChecks)('BEHIND with %s preserves the legacy rebase and skip, without enqueue', async (_name, statusCheckRollup) => {
+    const { verdict, before, operation, rebaseDropManifest, args } = route({ prPatch: { statusCheckRollup } });
+    expect(verdict).toEqual(before);
+    expect(operation).toBe(rebaseDropManifest);
+    expect(rebaseDropManifest).toHaveBeenCalledTimes(1);
+    expect(rebaseDropManifest).toHaveBeenCalledWith(args);
+    const fresh = await revalidate(verdict, { patch: { statusCheckRollup } });
+    expect(fresh.decision).toBe('skip');
+    const enqueue = vi.fn();
+    if (verdict.decision === 'merge' && fresh.decision === 'merge') enqueue(fresh.headSha);
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('required [test, integration] with only test green does not bypass (no test->integration implication)', () => {
+    const pr = { ...freshPr, statusCheckRollup: [testGreen] };
+    const opts = { hold: true, queueOwnsFreshness: true, requiredCheck: 'test',
+      queueRequiredChecks: ['integration'], rosterSource: 'live', requiredNames: ['test', 'integration'] };
+    expect(retainCheckedQueueHead(pr, opts)).toBe(pr);
+    const both = { ...freshPr, statusCheckRollup: [testGreen, { name: 'integration', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    expect(retainCheckedQueueHead(both, opts)).not.toBe(both);
+  });
+
+  it.each(incompleteChecks)('fresh bypass and approved-human retention refuse %s after admission', async (_name, statusCheckRollup) => {
+    const { verdict } = route();
+    expect(verdict.decision).toBe('merge');
+    const pr = { ...freshPr, statusCheckRollup };
+    expect(retainCheckedQueueHead(pr, { hold: true, queueOwnsFreshness: true,
+      requiredCheck: 'test', queueRequiredChecks: ['smoke'], rosterSource: 'live', requiredNames: ['test', 'smoke'] })).toBe(pr);
+    const fresh = await revalidate(verdict, { patch: { statusCheckRollup } });
+    expect(fresh.decision).toBe('skip');
+    const enqueue = vi.fn();
+    if (fresh.decision === 'merge') enqueue(fresh.headSha);
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('unknown required checks preserve the legacy path and refuse fresh retention', async () => {
+    const { verdict, before, operation, rebaseDropManifest } = route({ queueRequiredChecks: null });
+    expect(verdict).toEqual(before);
+    expect(operation).toBe(rebaseDropManifest);
+    expect(rebaseDropManifest).toHaveBeenCalledTimes(1);
+    const admitted = route().verdict;
+    expect((await revalidate(admitted, { queueRequiredChecks: null })).decision).toBe('skip');
+  });
+
+  it.each(['unavailable', 'declared', 'fallback', undefined])('roster source %s refuses bypass and fresh retention', async (source) => {
+    // Explicitly override the fixture default for the absent-source case.
+    const rosterSource = source ?? null;
+    const result = route({ rosterSource });
+    expect(result.verdict).toEqual(result.before);
+    expect(result.operation).toBe(result.rebaseDropManifest);
+    expect((await revalidate(route().verdict, { rosterSource })).decision).toBe('skip');
+  });
+
+  it('accepts a cache roster and unions its secondary requirements with the queue', async () => {
+    expect(route({ rosterSource: 'cache' }).operation).toBe(null);
+    expect(route({ requiredNames: ['test', 'smoke', 'secondary'] }).operation).not.toBe(null);
+    expect((await revalidate(route().verdict, { requiredNames: ['test', 'smoke', 'secondary'] })).decision).toBe('skip');
+  });
+
+  it.each([false, undefined])('incomplete/capped evidence (%s) cannot hide a newer smoke failure', async (rowsComplete) => {
+    const statusCheckRollup = [...freshPr.statusCheckRollup,
+      ...Array.from({ length: 98 }, () => ({ name: 'advisory', status: 'COMPLETED', conclusion: 'SUCCESS' }))];
+    const patch = { rowsComplete, statusCheckRollup };
+    const result = route({ prPatch: patch });
+    expect(result.verdict).toEqual(result.before);
+    expect(result.operation).toBe(result.rebaseDropManifest);
+    expect((await revalidate(route().verdict, { patch })).decision).toBe('skip');
+  });
+
+  it('preserves raw run_attempt supersession instead of collapsing by timestamps', () => {
+    const statusCheckRollup = [testGreen,
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', run_id: 1, run_attempt: 1, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', run_id: 1, run_attempt: 2, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' }];
+    expect(route({ prPatch: { statusCheckRollup } }).operation).toBe(null);
+  });
+
+  it('approved-human retention accepts all required checks green but preserves a BEHIND conflict', () => {
+    const options = { hold: true, queueOwnsFreshness: true, requiredCheck: 'test', queueRequiredChecks: ['smoke'], rosterSource: 'live', requiredNames: ['test', 'smoke'] };
+    expect(retainCheckedQueueHead(freshPr, options).mergeStateStatus).toBe('CLEAN');
+    const conflicting = { ...freshPr, mergeable: 'CONFLICTING' };
+    expect(retainCheckedQueueHead(conflicting, options)).toBe(conflicting);
+  });
+
+  it.each([
+    ['bypass disabled', { setting: 'always' }],
+    ['queue no longer owns freshness', { queueOwnsFreshness: false }],
+    ['unknown queue freshness ownership', { queueOwnsFreshness: null }],
+    ['fresh conflict', { patch: { mergeable: 'CONFLICTING' } }],
+    ['fresh unknown mergeability', { patch: { mergeable: 'UNKNOWN' } }],
+    ['fresh DIRTY state', { patch: { mergeStateStatus: 'DIRTY' } }],
+    ['fresh missing head', { patch: { headRefOid: null } }],
+    ['fresh moved head', { patch: { headRefOid: 'new-head' } }],
+    ['missing pinned head', { expectedHeadSha: null }],
+    ['fresh red CI', { patch: { statusCheckRollup: [] } }],
+    ['fresh missing certification', { patch: { labels: [] } }],
+    ['fresh review hold', { patch: { labels: [...freshPr.labels, { name: 'review:changes' }] } }],
+    ['fresh requested changes', { patch: { reviewDecision: 'CHANGES_REQUESTED' } }],
+    ['fresh required review', { patch: { reviewDecision: 'REVIEW_REQUIRED' } }],
+    ['fresh missing body', { patch: { body: '' } }],
+    ['fresh off-default base', { patch: { baseRefName: 'lane/other' } }],
+    ['fresh fix claim', { patch: { fixClaim: { who: 'fixer' } } }],
+    ['fresh unreadable checks', { patch: { requiredCheckReadError: 'unreadable' } }],
+  ])('fresh revalidation refuses retained BEHIND head with %s', async (_name, options) => {
+    const { verdict } = route();
+    expect((await revalidate(verdict, options)).decision).toBe('skip');
+  });
+
+  it('fresh revalidation refuses BEHIND without proof this pinned head took the bypass', async () => {
+    expect((await revalidate(clean)).decision).toBe('skip');
+    const { verdict } = route();
+    expect((await revalidate({ ...verdict, headSha: 'other-head' })).decision).toBe('skip');
+  });
+
+  it.each([
+    ['always still calls rebaseDropManifest for a queue-owned clean BEHIND PR', { setting: 'always' }],
+    ['direct-merge repo still calls rebaseDropManifest under conflict-only', { ownsFreshness: false }],
+    ['unknown freshness ownership still calls rebaseDropManifest', { ownsFreshness: null }],
+    ['CONFLICTING still calls rebaseDropManifest', { patch: { mergeable: 'CONFLICTING' } }],
+    ['DIRTY still calls rebaseDropManifest', { patch: { state: 'DIRTY' } }],
+    ['manifest PR still calls rebaseDropManifest', { patch: { hasManifest: true } }],
+    ['unproven manifest-free head still calls rebaseDropManifest', { manifestFree: false }],
+    ['a guard that classifyPr still fails (body/review hold) still calls rebaseDropManifest', { reclassified: false }],
+    ['missing manifest evidence still calls rebaseDropManifest', { patch: { hasManifest: undefined } }],
+  ])('%s', (_name, options) => {
+    const { verdict, before, operation, rebaseDropManifest, args, result } = route(options);
+    expect(verdict).toEqual(before);
+    expect(verdict.decision).toBe('skip');
+    expect(operation).toBe(rebaseDropManifest);
+    expect(rebaseDropManifest).toHaveBeenCalledOnce();
+    expect(rebaseDropManifest).toHaveBeenCalledWith(args);
+    expect(result).toEqual({ action: 'skip', reason: 'fixture rebase probe' });
+  });
+});
+
+describe('resolveRebaseBeforeEnqueue — setting and provenance', () => {
+  it('defaults to conflict-only from the standard', () => {
+    expect(resolveRebaseBeforeEnqueue({})).toEqual({ value: 'conflict-only', source: 'standard' });
+  });
+
+  it.each(['conflict-only', 'always'])('environment override selects %s over settings', value => {
+    expect(resolveRebaseBeforeEnqueue({ WE_DRAIN_REBASE_BEFORE_ENQUEUE: value }, {
+      platform: { rebaseBeforeEnqueue: 'always' }, tool: { rebaseBeforeEnqueue: 'always' },
+    })).toEqual({ value, source: 'env' });
+  });
+
+  it('resolves platform then tool settings before environment', () => {
+    const platform = { rebaseBeforeEnqueue: 'always' };
+    expect(resolveRebaseBeforeEnqueue({}, { platform })).toEqual({ value: 'always', source: 'platform' });
+    expect(resolveRebaseBeforeEnqueue({}, { platform, tool: { rebaseBeforeEnqueue: 'conflict-only' } }))
+      .toEqual({ value: 'conflict-only', source: 'tool' });
+  });
+
+  it.each(['invalid', '', null, false, 1, 'always\n', 'x'.repeat(10000)])('invalid environment value %# fails closed to always with visible provenance', value => {
+    expect(resolveRebaseBeforeEnqueue({ WE_DRAIN_REBASE_BEFORE_ENQUEUE: value }))
+      .toEqual({ value: 'always', source: 'env (invalid; fail closed to always)' });
+  });
+
+  it.each(['platform', 'tool'])('invalid %s setting, including object values, fails closed to always', source => {
+    for (const value of ['invalid', null, {}, { nested: 'conflict-only' }, ['conflict-only']]) {
+      expect(resolveRebaseBeforeEnqueue({}, { [source]: { rebaseBeforeEnqueue: value } }))
+        .toEqual({ value: 'always', source: `${source} (invalid; fail closed to always)` });
+    }
+  });
+});
 
 describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
   const reason = 'branch is BEHIND main — rebase needed';
@@ -126,7 +396,7 @@ describe('fast-drain round listing snapshot', () => {
     const write = vi.fn();
     const log = vi.fn();
     const result = await readFastDrainRoundListing({ path: 'round.json', repo, onlyPr: '42', now, env: {},
-      read: () => raw, write, listLive: live, readTarget: target, log, lock: async fn => ({ ok: true, value: await fn() }), ...extra });
+      read: () => raw, write, listLive: live, readTarget: target, log, lock: async fn => ({ ok: true, value: await fn(() => true) }), ...extra });
     return { result, live, target, write, log };
   };
   it('uses fresh same-repo rows and still re-reads and reclassifies the moved target', async () => {
@@ -164,18 +434,22 @@ describe('fast-drain round listing snapshot', () => {
     expect((await probe(snap({ writtenAt: now - 200_000 }), { env: { WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC: '300' } })).live).not.toHaveBeenCalled();
     const { live, log } = await probe(snap(), { env: { WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC: 'NaN' } });
     expect(live).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('TTL=180s, source=standard'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('TTL=60s, source=standard'));
   });
   it('falls back live for an oversized snapshot', async () => {
     expect((await probe(' '.repeat(64 * 1024 * 1024 + 1))).live).toHaveBeenCalledOnce();
   });
-  it('falls back to a live listing on population-lock timeout', async () => {
-    const { live, log } = await probe(null, { lock: async () => ({ ok: false, reason: 'timeout' }) });
-    expect(live).toHaveBeenCalledOnce();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('cache lock unavailable, live fallback'));
+  it('defers instead of starting an uncoordinated listing on population-lock failure', async () => {
+    const live = vi.fn();
+    await expect(probe(null, { listLive: live, lock: async () => ({ ok: false, reason: 'timeout' }) }))
+      .rejects.toThrow('lock unavailable (timeout) — retry next pass');
+    expect(live).not.toHaveBeenCalled();
   });
-  it('falls back live when the lock directory is unwritable', async () => {
-    expect((await probe(null, { lock: async () => { throw new Error('EACCES'); } })).live).toHaveBeenCalledOnce();
+  it('defers when the lock directory is unwritable', async () => {
+    const live = vi.fn();
+    await expect(probe(null, { listLive: live, lock: async () => { throw new Error('EACCES'); } }))
+      .rejects.toThrow('lock unreadable — retry next pass');
+    expect(live).not.toHaveBeenCalled();
   });
   it('re-evaluates new-head failed checks instead of the cached green checks', async () => {
     const { result } = await probe(snap(), { readTarget: async () => ({ ...old, state: 'OPEN', headRefOid: 'moved',
@@ -218,7 +492,7 @@ describe('round listing freshness at the CLI boundary', () => {
     expect(buildLiveListingsByRepo([{ repo: 'fixture/repo', rows: [{ number: 42 }], listing: 'snapshot' }]).has('fixture/repo')).toBe(false);
   });
 
-  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false } = {}) => {
+  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0 } = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
@@ -229,7 +503,7 @@ describe('round listing freshness at the CLI boundary', () => {
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
       const snapshot = join(dir, 'round.json');
-      writeFileSync(snapshot, JSON.stringify({ repo: 'fixture/repo', writtenAt: Date.now(), defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
+      writeFileSync(snapshot, JSON.stringify({ repo: 'fixture/repo', writtenAt: Date.now() - snapshotAgeMs, defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
       if (sendBack) {
         // Neither PR has a follow-up entry. Only live rows know that manually queued #43 is now held.
         // Keep the target held but selected, so an empty candidate set does not trigger a label-lag re-poll.
@@ -288,6 +562,23 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('fixture/repo'))).toBe(true);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
+  it('re-lists fresh snapshot context live without resolving the stored default branch', () => {
+    const { stderr, calls } = run('snapshot');
+    expect(stderr).toContain('served-from-snapshot');
+    const localListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+    expect(localListings).toHaveLength(1);
+    expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
+    expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
+  });
+  it('discovers blockers live after an expired round is refreshed too', () => {
+    const { payload, stderr, calls } = run('snapshot', { snapshotAgeMs: 60_001 });
+    expect(stderr).toContain('listed-live');
+    const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+    expect(liveListings).toHaveLength(2);
+    expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
+  });
   it('ignores --listing-snapshot when WE_FAST_DRAIN_LISTING=live', () => {
     const { stderr, calls } = run('live');
     expect(stderr).not.toContain('served-from-snapshot');
@@ -313,11 +604,14 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
       && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
     expect(liveListings).toHaveLength(1);
   });
+
+
   it('keeps eviction on live evidence when round snapshots are disabled', () => {
     const { calls, stderr } = run('live', { sendBack: 'red-team:blocked' });
     expect(stderr).not.toContain('served-from-snapshot');
     expect(calls.filter(a => a.some(v => v.includes('dequeuePullRequest')))).toHaveLength(1);
   });
+
   it.each([true, false])('retries unreadable eviction evidence without stale mutations (reconcile=%s)', reconcile => {
     const { calls, stderr } = run('snapshot', { sendBack: 'red-team:blocked', reconcile, failListing: true });
     expect(calls.some(a => a.some(v => v.includes('dequeuePullRequest')))).toBe(false);
@@ -328,4 +622,97 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
   const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
+});
+
+it('retries a failed default-branch read on a later call and caches the successful read', async () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  const start = source.indexOf('  const resolveDefaultBranch = async (repo) => {');
+  const end = source.indexOf('\n  let [listings]', start);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const cache = new Map();
+  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure'))
+    .mockResolvedValueOnce({ stdout: 'trunk\n' });
+  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
+    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, read, null, true);
+  await resolveDefaultBranch('fixture/repo');
+  expect(cache.has('fixture/repo')).toBe(false);
+  await resolveDefaultBranch('fixture/repo');
+  expect(cache.get('fixture/repo')).toBe('trunk');
+  await resolveDefaultBranch('fixture/repo');
+  expect(read).toHaveBeenCalledTimes(2);
+});
+
+describe('headTreeLacksManifestFile — authoritative manifest-path probe', () => {
+  const sha = 'a'.repeat(40);
+  const mk = (lsTree, show, root = '') => (args) => {
+    if (args[0] === 'cat-file') return '';
+    if (args[0] === 'ls-tree' && args.includes('--name-only')) return root;
+    if (args[0] === 'ls-tree') { if (lsTree instanceof Error) throw lsTree; return lsTree; }
+    if (args[0] === 'show') { if (show instanceof Error) throw show; return show; }
+    return '';
+  };
+  const call = (git) => headTreeLacksManifestFile({ headRef: 'lane/x', headSha: sha, prNumber: 1, git });
+  it('true only when the head tree lists no manifest path', () => { expect(call(mk('', ''))).toBe(true); });
+  it('false when a root fix-evidence scratch file exists (rebaseDropManifest would strip it)', () => {
+    expect(call(mk('', '', 'package.json\n.fix-abc-evidence.md'))).toBe(false);
+  });
+  it('true when the root holds only ordinary files', () => { expect(call(mk('', '', 'package.json\nREADME.md'))).toBe(true); });
+  it('false for a malformed manifest file (parses to null but the path exists)', () => {
+    expect(call(mk('100644 blob abc\t.lane-manifest.json', '{not json'))).toBe(false);
+  });
+  it('false for a manifest without item', () => {
+    expect(call(mk('100644 blob abc\t.lane-manifest.json', '{}'))).toBe(false);
+  });
+  it('false (fail closed) when git cannot read the head', () => {
+    expect(call(mk(new Error('boom'), ''))).toBe(false);
+  });
+  it('false without a full head sha', () => {
+    expect(headTreeLacksManifestFile({ headRef: 'lane/x', headSha: 'abc', prNumber: 1, git: mk('', '') })).toBe(false);
+  });
+});
+
+
+describe('fresh queue rollup completeness', () => {
+  const headRefOid = 'a'.repeat(40);
+  const success = name => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+  const pr = { headRefOid, mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE',
+    statusCheckRollup: [success('test'), success('smoke')] };
+  const page = (nodes, totalCount, hasNextPage, endCursor = null) => ({ stdout: JSON.stringify({ data: { repository: {
+    object: { oid: headRefOid, statusCheckRollup: { contexts: { nodes, totalCount, pageInfo: { hasNextPage, endCursor } } } },
+  } } }) });
+  const retained = fresh => retainCheckedQueueHead(fresh, { hold: true, queueOwnsFreshness: true,
+    requiredCheck: 'test', queueRequiredChecks: ['smoke'], requiredNames: ['test', 'smoke'], rosterSource: 'live' });
+
+  it('reads past the cap to preserve a newer secondary required failure', async () => {
+    const first = [...pr.statusCheckRollup, ...Array.from({ length: 98 }, () => success('advisory'))];
+    const failure = { ...success('smoke'), conclusion: 'FAILURE' };
+    const exec = vi.fn().mockResolvedValueOnce(page(first, 101, true, 'next')).mockResolvedValueOnce(page([failure], 101, false));
+    const fresh = await readFreshQueueRollup(pr, { repo: 'owner/repo', exec });
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls[1][1].at(-1)).toContain('after:"next"');
+    expect(fresh.rowsComplete).toBe(true);
+    expect(fresh.statusCheckRollup).toHaveLength(101);
+    expect(retained(fresh)).toBe(fresh);
+  });
+
+  it('a complete all-success read permits BEHIND retention', async () => {
+    const fresh = await readFreshQueueRollup(pr, { repo: 'owner/repo', exec: async () => page(pr.statusCheckRollup, 2, false) });
+    expect(fresh.rowsComplete).toBe(true);
+    expect(retained(fresh).mergeStateStatus).toBe('CLEAN');
+  });
+
+  it.each(['failed page', 'missing metadata', 'short connection', 'oversized connection', 'foreign head'])('%s leaves BEHIND for skip/rebase', async kind => {
+    const exec = vi.fn(async () => {
+      if (kind === 'failed page') throw new Error('unreadable');
+      if (kind === 'missing metadata') return { stdout: '{}' };
+      if (kind === 'short connection') return page(pr.statusCheckRollup, 3, false);
+      if (kind === 'foreign head') return { stdout: page(pr.statusCheckRollup, 2, false).stdout.replace(headRefOid, 'b'.repeat(40)) };
+      return page(Array.from({ length: 100 }, () => success('advisory')), 1001, true, `cursor-${exec.mock.calls.length}`);
+    });
+    const fresh = await readFreshQueueRollup(pr, { repo: 'owner/repo', exec });
+    expect(fresh.rowsComplete).toBe(false);
+    expect(retained(fresh)).toBe(fresh);
+    if (kind === 'oversized connection') expect(exec).toHaveBeenCalledTimes(10);
+  });
 });

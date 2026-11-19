@@ -15,7 +15,7 @@ import { join } from 'node:path';
 
 import {
   installReviewJobExitHooks, BLOCKED_ON_INFRA, DEFERRED_NO_LANE, MAX_LANE_DEFERRALS, REVIEW_JOB_KIND, REVIEW_JOB_LANE_WAIT_MS,
-  classifyReviewLoopOutcome, crashLabelFromLoop, loopFailureLabel, decideJobClaim, dispatchReviewByMode, dispatchReviewJob,
+  classifyReviewLoopOutcome, crashLabelFromLoop, loopFailureLabel, createReviewJobIo, decideJobClaim, dispatchReviewByMode, dispatchReviewJob,
   jobRecordToAgentRow, laneCooloffActive, listAgentsWithReviewJobs, listReviewJobAgents, nextLaneDeferral,
   parseReviewLoopStdout, readJobRecord, resolveReviewDispatchMode, runReviewJob, writeJobRecord,
 } from '../review-job.mjs';
@@ -183,6 +183,27 @@ function fakeIo(over = {}) {
 }
 
 describe('runReviewJob — the arc, no Claude wrapper session', () => {
+  it.each(['unreadable', 'oversized', 'rewrite-removal'])('scrub %s failure prevents fetching and writes its reason to the terminal record', failure => {
+    const exec = vi.fn((file, args) => {
+      if (file === 'gh') return JSON.stringify({ headRefOid: 'a'.repeat(40) });
+      if (args[0] === 'config') {
+        if (failure === 'unreadable') throw Error('config read failed');
+        if (failure === 'oversized') throw Object.assign(Error('config output exceeded maxBuffer'), { code: 'ENOBUFS' });
+        if (args.includes('--unset-all')) throw Error('config is read-only');
+        return 'local\0url.review-marker::fixture.insteadof\nhttps://github.com/\0';
+      }
+      throw Error('must not reach transport');
+    });
+    const prepareLane = createReviewJobIo({ exec, readConfig: () => ({ status: 1, stdout: '', stderr: '' }), env: {}, log: () => {} }).prepareLane;
+    const { io, calls } = fakeIo({ prepareLane });
+    const out = runReviewJob({ pr: 229, repo: 'web-everything/web-everything' }, io);
+    const label = 'review lane setup failed: review lane config scrub failed; inspect and repair lane configuration before retrying; inspect the PR head and retry';
+    expect(out).toMatchObject({ outcome: BLOCKED_ON_INFRA, label });
+    expect(calls.filter(c => c[0] === 'report' && c[1] === 'done').map(c => c[2]))
+      .toEqual([expect.objectContaining({ status: 'done', outcome: BLOCKED_ON_INFRA, label })]);
+    expect(exec.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    expect(calls.some(c => c[0] === 'loop')).toBe(false);
+  });
   it('claims, reports started, acquires, runs the loop ONCE under a fresh actor id, reports done, releases, unclaims', () => {
     const { io, calls } = fakeIo();
     const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
