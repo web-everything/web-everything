@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { enqueueStuckTrace, drainStuckTraces, TRACE_TRIGGERS } from '../stuck-trace.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
 import { runMergeWatch } from '../pass-daemons/pr-merge-watch-pass.mjs';
+import { isUnderTest } from '../../lib/under-test.mjs';
 
 const repo = 'example/widgets', head = 'a'.repeat(40), now = '2026-11-10T12:00:00Z';
 afterEach(() => {
@@ -35,8 +36,10 @@ function fixture(t) {
 // These integration cases inject all trace IO and use private state/feed paths.
 // Clear both runner flags only for them so the production digest branch is exercised.
 function productionFixture(t) {
-  vi.stubEnv('VITEST', undefined);
-  vi.stubEnv('WE_UNDER_TEST', undefined);
+  // Vitest 1.x stringifies undefined; empty strings disable both truthiness-based guards.
+  vi.stubEnv('VITEST', '');
+  vi.stubEnv('WE_UNDER_TEST', '');
+  assert.equal(isUnderTest(), false, 'fixture must exercise the production branch');
   return fixture(t);
 }
 
