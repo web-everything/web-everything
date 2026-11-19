@@ -24,6 +24,7 @@ import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
+import { parseAdvisories, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 /** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
@@ -517,6 +518,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // died before `advise` too, or a failing review would be resumed every tick.
   const attemptsSinceWake = history.filter(r => Number.isFinite(r.startedAt) && r.startedAt >= wake).length;
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count, attemptsSinceWake,
+    reviewStartedAt: Number.isFinite(last.startedAt) ? last.startedAt : null,
     why, retryAt, persistenceFailed: false, exhausted: false,
     ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
       releases, source: retry?.source ?? 'standard' } } : {}) };
@@ -607,7 +609,7 @@ const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:
  * `seatDisabled` (importing the seat policy closes a cycle): an unruled finding of a since-disabled seat keeps the
  * pause, the conservative side. Outcomes:
  * - `send-back`: some live-head finding is ruled `block` (operator or policy or reviewer) and none is pending.
- * - `resume`: every live-head finding is ruled `card` or `not-real`.
+ * - `resume`: every live-head finding is ruled `card` or `not-real`, or a same-head hold has no referral finding.
  * - `stay` (fail closed, with `why`): anything unreadable, pending, missing, malformed, or not on the live head.
  * Never accepts and never touches `review:human`: the caller acts on the outcome.
  * @returns {null | {outcome:'send-back'|'resume'|'stay', head:string|null, why:string,
@@ -625,6 +627,46 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   if (hold.persistenceFailed) return stay('the referral save failed on this head; its own retry budget owns the pause');
   if (hold.noVerdict) return stay('no verdict ever landed on this head; the no-verdict retries own the pause');
   if (hold.cause) return stay(`the verdict ledger cannot answer for this PR (${hold.cause})`);
+  if (!Array.isArray(pr.comments)) return stay('the comment thread is unreadable; read the full thread before resuming');
+  if ((pr.comments.length >= GH_LIST_COMMENT_CAP && pr.commentsComplete !== true) || pr.commentsComplete === false) return stay('the comment thread may be truncated; read the full thread before resuming');
+  // Zero findings is proof only when the head's finished review left its advisory: that is the evidence the review ran
+  // and raised nothing. Without it (a lost write-back) the pause stays; onClean is honoured like any clean resume.
+  const noFinding = why => {
+    if (hold.kind !== 'same-head') return stay(why);
+    // The newest advisory comment itself must carry exactly one outcome line, and it must be `accept`: parseAdvisories
+    // reads a missing outcome as `accept` and a body can embed extra outcome lines, so the comment text is checked here.
+    const trusted = pr.comments.filter(isTrustedMarkerAuthor);
+    const adv = parseAdvisories(trusted)[0];
+    const body = String(trusted[adv?.index]?.body ?? '');
+    // Every line that mentions an advisory outcome counts (a duplicate or malformed one keeps the hold), and the single
+    // one must be a well-formed explicit accept.
+    const outcomes = body.split(/\r?\n/).filter(l => /advisory\s+outcome/i.test(l))
+      .map(l => (/^\*\*Advisory outcome:\*\* `accept`(?:\s.*)?$/.test(l) ? 'accept' : 'malformed'));
+    // parseAdvisories skips a comment missing a Verdict or Net basis line, so a newer malformed advisory note must not be
+    // passed over: the newest advisory-note comment on the thread has to be the parsed one.
+    const notes = trusted.map((c, i) => ({ i, at: Date.parse(c?.createdAt) || 0, note: String(c?.body ?? '').includes('ADVISORY REVIEW, NOT A RECORDED VERDICT') }))
+      .filter(n => n.note).sort((a, b) => b.at - a.at || b.i - a.i);
+    // Tie the advisory to the held review: exactly one finished attempt since the wake (the advisory is that review's
+    // write-back, not an older one), and the advisory cannot predate the PR or the held review's start.
+    const prAt = Date.parse(pr.createdAt);
+    const sameReview = hold.count === 1 && hold.attemptsSinceWake === 1 && Number.isFinite(prAt) && adv?.time >= prAt
+      && Number.isFinite(hold.reviewStartedAt) && adv.time >= hold.reviewStartedAt;
+    // An unreadable comment (non-string body) could hide a pending referral, and a second `Net basis` line could name another head.
+    const readable = pr.comments.every(c => c && typeof c.body === 'string');
+    const basisLines = body.split(/\r?\n/).filter(l => /net\s+basis/i.test(l)).length;
+    // The advisory note must LEAD the comment (a quoted or fenced example inside another comment is not a review).
+    const leads = body.trimStart().startsWith('**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**');
+    // Only a `review:human` PR is released this way (its next step is the human /review); a non-human PR would be sent to another panel.
+    const human = (Array.isArray(pr.labels) ? pr.labels : []).some(l => (typeof l === 'string' ? l : l?.name) === 'review:human');
+    // Producer footers are never fenced: any code fence in the note means its fields may be quoted examples.
+    const fenced = body.includes('```') || body.includes('~~~');
+    const clean = adv && human && !fenced && leads && readable && basisLines === 1 && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
+      && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
+    if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);
+    if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);
+    return { outcome: 'resume', head, findings: [], counts: {},
+      why: `no referral finding exists on head ${head.slice(0, 9)}; no ruling is owed` };
+  };
   let live;
   try { live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable }); }
   catch (e) { return stay(`the referral state is unreadable (${String(e?.message ?? e).split('\n')[0]})`); }
@@ -635,7 +677,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
       + (named.length ? ` (${named.join(', ')})` : ` (${live.pendingReasons.join(', ')})`));
   }
   const records = live.records.filter(r => r.head === head && r.repo === repo && r.pr === Number(pr.number));
-  if (!records.length) return stay('no referral record names the live head');
+  if (!records.length) return noFinding('no referral record names the live head');
   const findings = [];
   for (const record of records) {
     const state = referralRecordState(record, { repo, pr: Number(pr.number), head, body: typeof pr.body === 'string' ? pr.body : '',
@@ -662,7 +704,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
         actor: named.operator ? named.actor : 'reviewer', rationale: named.rationale ?? named.reason ?? '' });
     }
   }
-  if (!findings.length) return stay('the live-head records name no active referral');
+  if (!findings.length) return noFinding('the live-head records name no active referral');
   const counts = {};
   for (const f of findings) counts[f.result] = (counts[f.result] ?? 0) + 1;
   const blocked = findings.filter(f => f.result === 'block');
@@ -720,8 +762,12 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     if (Array.isArray(pr.comments) && pr.comments.length >= GH_LIST_COMMENT_CAP
       && runs.some(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)) {
       try {
-        const full = readComments({ repo, number: pr.number });
-        if (Array.isArray(full)) pr = { ...pr, comments: full };
+        const read = readComments({ repo, number: pr.number });
+        // A reader may report { comments, complete }; a bare array is complete only when it is below the
+        // list cap (a capped page, such as `gh pr view --json comments`, may hide later events and stays incomplete).
+        const full = Array.isArray(read) ? read : read?.comments;
+        const complete = Array.isArray(read) ? read.length < GH_LIST_COMMENT_CAP : read?.complete === true;
+        if (Array.isArray(full)) pr = { ...pr, comments: full, commentsComplete: complete };
       }
       catch { /* Keep the list snapshot when the full thread is unavailable. */ }
     }
