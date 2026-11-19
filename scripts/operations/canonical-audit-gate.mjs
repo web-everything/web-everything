@@ -25,8 +25,8 @@ function validPreExisting(f) {
   try { return findingKey({ file: parts[0], symbol: parts[1], class: parts[2] }) === f.key; } catch { return false; }
 }
 
-// The shared evaluator skips unusable records. At admission, corrupt evidence must
-// refuse before that skip can expose an older pass (including a carried pass).
+// The shared evaluator skips unusable records. Corrupt evidence for the opening head
+// must refuse before that skip can expose an older pass (including a carried pass).
 function wellFormedAudit(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)
     || !validSha(record.head) || !validSha(record.base)
@@ -78,7 +78,19 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     } catch {
       return refuse('canonical-audit-missing', 'the audit record file has an unreadable/truncated line');
     }
-    if (!records.every(wellFormedAudit)) {
+    let malformedHead = false;
+    records = records.filter(record => {
+      if (wellFormedAudit(record)) return true;
+      // Only a full, unambiguous foreign head can be isolated. Unknown identities still fail closed.
+      if (typeof record?.head === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(record.head)
+        && record.head.toLowerCase() !== fullSha) {
+        warn(`ignoring malformed canonical audit record for another head ${record.head.toLowerCase()}`);
+        return false;
+      }
+      malformedHead = true;
+      return false;
+    });
+    if (malformedHead) {
       return refuse('canonical-audit-missing', 'the audit record file has a malformed record; inspect and repair the audit record file');
     }
     policy = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, log: warn });
@@ -131,9 +143,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   if (evidence.reason === 'pre-existing-exemption-disabled') {
     return refuse('canonical-audit-missing', 'saved pre-existing exemption is disabled by audit settings');
   }
-  // Apply current policy to the selected evidence, so a fresh clean audit can supersede an exemption.
-  if (evidence.ok && evidence.record?.preExisting?.length
-    && (policy.value.releaseStage === 'prod' || policy.value.preExistingMode === 'block')) {
+  if (evidence.reason === 'pre-existing-exemption-forbidden') {
     return refuse('canonical-audit-missing', 'saved pre-existing exemption is forbidden by current audit policy');
   }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.

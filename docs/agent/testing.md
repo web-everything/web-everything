@@ -4798,6 +4798,43 @@ model finding text. A confirmed held card satisfies existence (D5). Security fix
 for every B class must supply separate `written`, `expedite`, and `needsYou` confirmations,
 and exercise a persisted-card write that drops the needs-you line. Keep the block-mode
 stdout/record golden unchanged when changing proof-mode policy.
+
+Saved exemptions must pass the current enabled, `prove`, and `prerelease` checks in
+`canonicalAuditEvidence`, so prototype loading and PR opening enforce the same policy.
+Apply the policy to the selected record: a fresh clean audit can replace old exemption
+evidence. Before appending, the audit writer checks the computed verdict against both
+remaining findings and `preExisting.line`, using the same contradiction detector as
+`findAudit`. Preserve CR boundaries before stripping controls; check LF, CRLF, U+2028,
+U+2029, fullwidth verdicts and invisible characters. Contradictory exemptions return
+`WEAKENED` without writing a ledger record and name retry or human review as recovery.
+PR opening skips malformed records with a full, known different head, including records
+with a matching fingerprint. Malformed records for the current head, ambiguous identities,
+and unreadable JSON lines still refuse admission. Valid carried WEAKENED evidence still vetoes.
+
+Live fixture replay, 2026-11-19 (PR #7089 operator send-back): the actual audit `main`
+wrote a temporary JSONL ledger, and the actual `checkCanonicalAuditForOpen` read it.
+Commit resolution, main coverage, Codex output and trusted settings were injected;
+no network or production ledger was used. The source fixture keeps `X` unchanged and
+changes only `Y`, with a confirmed B2 SAME proof and security-card receipt. The model
+answer was `WEAKENED\nx.mjs:2 unsafe return\u2028WEAKENED`.
+
+```text
+Before:
+item1 {"exitCode":0,"verdict":"NOT WEAKENED","recordsWritten":1,"laterCleanOpens":false,"prePoisonedCleanOpens":false}
+item2 {"prove":{"prototype":true,"open":true},"block":{"prototype":true,"open":false},"prod":{"prototype":true,"open":false}}
+After:
+item1 {"exitCode":1,"verdict":"WEAKENED","recordsWritten":0,"laterCleanOpens":true,"prePoisonedCleanOpens":true}
+item2 {"prove":{"prototype":true,"open":true},"block":{"prototype":false,"open":false},"prod":{"prototype":false,"open":false}}
+```
+
+For item 2 the fixture first saved a valid B2 exemption under enabled/prove/prerelease,
+then tightened only the mode or only the stage. `prototype` is the shared evidence
+reader used by prototype-load; `open` is the PR-opening gate. The regression cases
+live in `codex-audit.test.mjs` (separator variants) and `canonical-audit-gate.test.mjs`
+(writer-to-admission, existing poison, current policy for exact and carried evidence,
+and clean re-audit recovery). A before-only local run reported 13 failures and 296
+passes. Under the fix launcher's proof-only protocol, the launcher owns the unit
+after-run; direct fixture replay above supplies the observed behavior after repair.
 ## Stuck trace isolation
 
 The stuck-trace node:test fixtures inject both operations and the event sink. Keep

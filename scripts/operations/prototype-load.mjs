@@ -216,8 +216,14 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   }
   // Judge the selected record, so a newer clean audit can replace disabled exemption evidence.
   // Admission supplies its already-resolved trusted policy; other readers resolve the running checkout.
-  if (pass?.preExisting?.length && (auditOptions.auditPolicy ?? resolveAuditSettings().value).preExistingExemptionEnabled !== true) {
-    return { ok: false, reason: 'pre-existing-exemption-disabled', record: original.get(pass) ?? pass };
+  if (pass?.preExisting?.length) {
+    const policy = auditOptions.auditPolicy ?? resolveAuditSettings().value;
+    if (policy.preExistingExemptionEnabled !== true) {
+      return { ok: false, reason: 'pre-existing-exemption-disabled', record: original.get(pass) ?? pass };
+    }
+    if (policy.preExistingMode !== 'prove' || policy.releaseStage !== 'prerelease') {
+      return { ok: false, reason: 'pre-existing-exemption-forbidden', record: original.get(pass) ?? pass };
+    }
   }
   return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };
 }
