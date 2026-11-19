@@ -768,6 +768,17 @@ export function readPinnedCarryDiff({ exec, headSha, carriedHeadSha, expected } 
   } catch { return null; } // Retain the hold; retry or request full human review.
 }
 
+/** Merge-path refusal, independent of review escalation: a candidate with no pinned, scored net diff must not merge. */
+export function pinnedDiffMergeRefusal({ exec, headSha, baseRev } = {}) {
+  const reason = 'net diff unscored or head mismatch; retry or request human review of the full diff';
+  if (typeof exec !== 'function') return reason;
+  try {
+    const basis = resolvePinnedDiffBasis({ exec, headSha });
+    requireScoredNetDiff(computeNetDiffSignals({ exec, basis, baseRev }), headSha);
+    return null;
+  } catch { return reason; }
+}
+
 /** The production tamper-park callback, shared with the carry wiring regression tests. */
 export function createTamperParkCarryCallback({ pr, repo, exec, dryRun = false, ...options } = {}) {
   return evidence => applyHumanClearanceCarry({ ...options, evidence, pr, repo, exec, dryRun,
@@ -6384,6 +6395,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           v.decision = 'skip'; v.reason = gate.reason; v.humanRequired = !!gate.humanRequired;
           continue;
         }
+      }
+      {
+        const bypassCwd = isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo);
+        const bypassExec = (v.headRef && (isLocalRepo(v.repo) || bypassCwd))
+          ? (cmd, args, opts) => execFileSync(cmd, args, { cwd: bypassCwd, ...opts }) : null;
+        const refusal = pinnedDiffMergeRefusal({ exec: bypassExec, headSha: v.listedHeadSha, baseRev: v.base });
+        if (refusal) { v.decision = 'skip'; v.reason = refusal; continue; }
       }
       if (hasUnclearedReviewLabel(v.prLabels, { allowPending })) {
         v.decision = 'skip';
