@@ -55,6 +55,7 @@ function snapshotInvocation(args, primitive) {
       }
       for (const key of Reflect.ownKeys(snapshot.env)) {
         if (typeof key !== 'string') throw new SyntaxError('environment names must be strings');
+        if (key.includes('=') || key.includes('\0')) throw new SyntaxError('environment names must not contain = or NUL');
         if (!['string', 'number', 'boolean', 'undefined'].includes(typeof snapshot.env[key]) && snapshot.env[key] !== null) {
           throw new SyntaxError('environment values must be literal data');
         }
