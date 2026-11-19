@@ -1046,6 +1046,118 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
 
 import { readRecoveryWitness, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
 import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
+describe('head clearance for parked recovery reviews', () => {
+  it.each([
+    ['advisory parked at clearance', {}, {}, true],
+    ['failed advisory bookkeeping', { effects: [{ type: 'review.scoped-rereview-shadow', status: 'failed' }] }, {}, true],
+    ['advisory parked without clearance', {}, { clearance: undefined }, false],
+    ['clearance on another head', {}, { clearance: { sha: 'a'.repeat(40), at: 20_000 } }, false],
+    ['written after clearance', {}, { stat: () => ({ mtimeMs: 20_001 }) }, false],
+    ['pending label', { effects: [{ type: 'review.label-swap', status: 'pending' }] }, {}, false],
+    ['in-flight label', { effects: [{ type: 'review.label-swap', status: 'in-flight' }] }, {}, false],
+    ['no verdict', { verdict: null }, {}, false],
+    ['rejection', { verdict: { verdict: 'changes' } }, {}, false],
+    ['non-advisory pending step', { pending: { kind: 'effect', step: 'label' } }, {}, false],
+    ['refused effect', { pending: null, effects: [{ type: 'review.label-swap', status: 'refused' }] }, {}, true],
+    ['refused outcome', { pending: null, effects: [], outcome: 'refused' }, {}, true],
+    ['refused effect without clearance', { pending: null, effects: [{ status: 'refused' }] }, { clearance: undefined }, false],
+    ['refused outcome without clearance', { pending: null, effects: [], outcome: 'refused' }, { clearance: undefined }, false],
+    ['unreadable record', {}, { read: () => { throw Error('unreadable'); } }, false],
+    ['unreadable clearance time', {}, { clearance: { sha: 'b'.repeat(40), at: null } }, false],
+  ])('%s', (_name, patch, options, passes) => {
+    const f = fixture();
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+      verdict: { verdict: 'needs-human', humanRequired: true },
+      stepTimings: [{ step: 'read', startedAt: new Date(10_000).toISOString() }],
+      pending: { kind: 'effect', step: 'advise' }, effects: [
+        { type: 'review.advisory-note', status: 'applied' },
+        { type: 'review.scoped-rereview-shadow', status: 'pending' },
+      ], ...patch };
+    const args = { ...f, clearance: { sha: f.head, at: 20_000 }, now: 30_000,
+      list: () => ['review-pr-parked'], read: () => run, stat: () => ({ mtimeMs: 20_000 }), ...options };
+    if (_name === 'unreadable record') {
+      expect(() => readRecoveryWitness(args)).toThrow('unreadable');
+      return;
+    }
+    const result = readRecoveryWitness(args);
+    if (passes) expect(result.newest).toEqual(run);
+    else expect(result.ok).toBe(false);
+    if (!passes) expect(result.reason).toBe('review-unfinished');
+    // Clearance is a recovery-only authority, never a new drain settlement path.
+    if (passes) expect(readDrainRedTeamEvidence(args)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+});
+
+describe('completed accepts release later advisory bookkeeping in recovery', () => {
+  it.each(['accept', 'prevention-outstanding', 'accept-written-later', 'alone', 'other-head', 'other-pr', 'other-repo',
+    'label', 'no-verdict', 'changes', 'refused-effect', 'refused-outcome', 'incomplete-accept', 'unreadable', 'scan-capped'])(
+    'fails closed unless the same-head completed accept is observed: %s', kind => {
+      const f = fixture();
+      const completed = { id: 'review-pr-completed', op: 'review-pr', input: { repo: f.repo, pr: f.pr },
+        ...payload(f.head), pending: null, effects: [{ type: 'review.label-swap', status: 'applied' }],
+        stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }] };
+      const parked = { ...completed, id: 'review-pr-parked',
+        stepTimings: [{ step: 'read', startedAt: new Date(15_000).toISOString() }],
+        pending: { kind: 'effect', step: 'advise' },
+        effects: [{ type: 'review.scoped-rereview-shadow', status: 'pending' }] };
+      if (kind === 'prevention-outstanding') completed.verdict = { verdict: kind };
+      if (kind === 'other-head') completed.findings = { read: { netBasis: { rev: 'a'.repeat(40) } } };
+      if (kind === 'other-pr') completed.input = { ...completed.input, pr: f.pr + 1 };
+      if (kind === 'other-repo') completed.input = { ...completed.input, repo: 'other/repo' };
+      if (kind === 'label') parked.effects = [{ type: 'review.label-swap', status: 'pending' }];
+      if (kind === 'no-verdict') parked.verdict = null;
+      if (kind === 'changes') parked.verdict = { verdict: 'changes' };
+      if (kind === 'refused-effect') parked.effects = [{ type: 'review.label-swap', status: 'refused' }];
+      if (kind === 'refused-outcome') parked.outcome = 'refused';
+      if (kind === 'incomplete-accept') completed.pending = { kind: 'effect', step: 'record' };
+      const args = { ...f, now: 30_000,
+        list: () => kind === 'alone' ? [parked.id] : [completed.id, parked.id],
+        read: id => { if (kind === 'unreadable' && id === completed.id) throw Error('unreadable accept'); return id === completed.id ? completed : parked; },
+        stat: path => ({ mtimeMs: path.includes('completed') ? kind === 'accept-written-later' ? 21_000 : 12_000 : 20_000 }),
+        ...(kind === 'scan-capped' ? { scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, platform: {}, env: {} }, warn: () => {} } : {}) };
+      if (kind === 'unreadable') expect(() => readRecoveryWitness(args)).toThrow('unreadable accept');
+      else if (['accept', 'prevention-outstanding', 'accept-written-later'].includes(kind)) {
+        expect(readRecoveryWitness(args).newest).toEqual(parked);
+        expect(readDrainRedTeamEvidence(args)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      } else expect(readRecoveryWitness(args)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    });
+});
+
+describe('cleared quarantined recovery reviews', () => {
+  it.each(['accept', 'prevention-outstanding', 'advisory', 'no-clearance', 'other-clearance', 'other-head', 'late',
+    'changes', 'other-pr', 'other-repo', 'read-error', 'parse-error', 'conflict', 'scan-capped'])(
+    'requires exact, readable, pre-clearance quarantine evidence: %s', kind => {
+      const f = fixture(), dir = join(f.runsDir, '..', 'runs-quarantine');
+      const run = { ...newRunRecord({ id: 'review-pr-quarantined', op: 'review-pr', input: {
+        repo: kind === 'other-repo' ? 'other/repo' : f.repo, pr: kind === 'other-pr' ? f.pr + 1 : f.pr } }),
+        ...payload(kind === 'other-head' ? 'a'.repeat(40) : f.head),
+        verdict: kind === 'advisory' ? { verdict: 'needs-human', humanRequired: true,
+          lensVerdicts: { correctness: 'accept', security: 'accept' } }
+          : { verdict: ['changes', 'prevention-outstanding'].includes(kind) ? kind : 'accept' },
+        pending: { kind: 'effect', step: 'record', stepIndex: 3 } };
+      const path = writeRun(run, dir);
+      utimesSync(path, 20, kind === 'late' ? 21 : 20);
+      if (kind === 'parse-error') writeFileSync(path, '{');
+      if (['conflict', 'scan-capped'].includes(kind)) {
+        const other = writeRun({ ...run, id: 'review-pr-conflict', verdict: { verdict: 'changes' } }, dir);
+        utimesSync(other, 20, 20);
+      }
+      const args = { ...f, clearance: kind === 'no-clearance' ? undefined
+        : { sha: kind === 'other-clearance' ? 'a'.repeat(40) : f.head, at: 20_000 },
+        ...(kind === 'read-error' ? { quarantine: { read: () => { throw Error('quarantine unreadable'); } } } : {}),
+        ...(kind === 'scan-capped' ? { scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, platform: {}, env: {} }, warn: () => {} } : {}) };
+      if (['late', 'changes', 'read-error', 'parse-error', 'conflict', 'scan-capped'].includes(kind)) {
+        expect(() => readRecoveryWitness(args)).toThrow(kind === 'scan-capped' ? /scan-capped.*inspect/ : /quarantin|refusing to read/);
+      } else {
+        const result = readRecoveryWitness(args);
+        if (['accept', 'prevention-outstanding', 'advisory'].includes(kind)) {
+          expect(result.newest).toEqual(run);
+          expect(redTeamOwedFor(result.newest)).toBe(kind !== 'prevention-outstanding');
+        } else expect(result.newest).toBeNull();
+      }
+    });
+});
+
 describe('bounded review evidence scans', () => {
   // Records 10 s apart by mtime. A record is written after its read step starts, so its mtime bounds that start.
   const big = { list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),
