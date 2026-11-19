@@ -175,7 +175,8 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       }
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });
       if (cleared?.ok !== true) return { ok: false, reason: cleared?.reason ?? 'finished publication hold clear unconfirmed' };
-      const confirmed = confirmPublicationHoldClear({ repo, pr, headSha: head, readAt, posted: cleared, gh, readGh: liveGh, env, postHold });
+      const confirmed = confirmPublicationHoldClear({ repo, pr, headSha: head, readAt, posted: cleared,
+        knownHoldIds: holds.map(status => status.id), gh, readGh: liveGh, env, postHold });
       if (!confirmed.ok) return confirmed;
       if (markerStat) rmSync(`${path}.unpublished`, { force: true });
       return { ok: true };

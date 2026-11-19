@@ -1859,7 +1859,7 @@ describe('finished publication hold recovery', () => {
     const gh = vi.fn(() => JSON.stringify(readStatus().statuses));
     return { ...f, path, readCheck, readComments, readLivePr, readStatus, postHold, lock, gh };
   }
-  it.each(['same-second failure', 'newer-id pending', 'unreadable', 'page bound'])('keeps the marker and restores a failure hold after a raced clear: %s', kind => {
+  it.each(['same-second failure', 'newer-id pending', 'new missing timestamp', 'new invalid timestamp', 'unreadable', 'page bound'])('keeps the marker and restores a failure hold after a raced clear: %s', kind => {
     const f = setup();
     const original = f.readStatus().statuses[0];
     const since = Math.floor(Date.now() / 1000) * 1000;
@@ -1874,7 +1874,8 @@ describe('finished publication hold recovery', () => {
           if (kind === 'page bound') return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ ...original, id: 1000 - i, state: 'success', created_at: new Date(since).toISOString() })));
           return JSON.stringify([{ ...original, id: kind === 'newer-id pending' ? 12 : 9,
             state: kind === 'newer-id pending' ? 'pending' : 'failure', description: 'held: ' + 'x'.repeat(300),
-            created_at: new Date(kind === 'newer-id pending' ? since - 1000 : since).toISOString() }, original]);
+            created_at: kind === 'new missing timestamp' ? undefined : kind === 'new invalid timestamp' ? 'invalid'
+              : new Date(kind === 'newer-id pending' ? since - 1000 : since).toISOString() }, original]);
         });
       }
       return { ok: true, status: { id: 11, created_at: new Date(since).toISOString() } };
@@ -1883,6 +1884,15 @@ describe('finished publication hold recovery', () => {
     expect(existsSync(f.path)).toBe(true);
     expect(f.postHold.mock.calls.map(([arg]) => arg.held)).toEqual([false, true]);
     expect(f.postHold.mock.calls[1][0].reason.length).toBeLessThanOrEqual(134);
+  });
+  it('clears a pre-read hold without created_at and removes its retry marker', () => {
+    const f = setup();
+    const original = { ...f.readStatus().statuses[0] };
+    delete original.created_at;
+    f.readStatus.mockReturnValue({ total_count: 1, statuses: [original] });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(f.postHold.mock.calls.map(([arg]) => arg.held)).toEqual([false]);
+    expect(existsSync(f.path)).toBe(false);
   });
   it('keeps the hold for a newer same-head confirmed break or unreadable live PR; a clean result clears', () => {
     const f = setup();

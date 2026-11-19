@@ -699,14 +699,16 @@ export function ownsPublicationHold(status, ownsHold, isTrusted = isTrustedMarke
 }
 
 /** Verify a clear against writers that bypass the check lock, including holds buried by our success.
+ * Unknown hold ids are concurrent even without readable timestamps; known holds may lack timestamps.
  * Read past that success to the pre-read second; a capped/unreadable history restores a hold for operator inspection. */
-export function confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted, gh, readGh = gh, env = process.env,
+export function confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted, knownHoldIds, gh, readGh = gh, env = process.env,
   postHold = postRedTeamPublicationHold }) {
   const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
   const freshGh = (args, options = {}) => readGh(args, { ...options, env: freshEnv,
     throttle: { ...options.throttle, env: freshEnv } });
   const since = Math.floor(readAt / 1000) * 1000;
   const success = posted.status;
+  const knownHolds = knownHoldIds === undefined ? undefined : new Set(knownHoldIds);
   let reason;
   try {
     const { statuses, complete } = readStatusHistory({ repo, headSha, gh: freshGh,
@@ -715,7 +717,8 @@ export function confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted,
         && (!Number.isSafeInteger(success?.id) || status.id < success.id) });
     if (!complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound; operator must inspect publication`);
     const concurrent = statuses.find(status => status.context === redTeamPublicationContext(pr) && status.state !== 'success'
-      && (Date.parse(status.created_at) >= since || Date.parse(status.created_at) > Date.parse(success?.created_at)
+      && ((knownHolds ? !knownHolds.has(status.id) : !Number.isFinite(Date.parse(status.created_at)))
+        || Date.parse(status.created_at) >= since || Date.parse(status.created_at) > Date.parse(success?.created_at)
         || (Number.isSafeInteger(success?.id) && status.id > success.id)));
     if (!concurrent) return { ok: true };
     reason = `concurrent publication hold appeared during clear: ${concurrent.description}`;
@@ -756,7 +759,7 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
     return { ok: true, cleared: false, reason: 'a publication hold that is not the live helper\'s is set; left to its owner' };
   const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh, env });
   if (!posted.ok) return posted;
-  const confirmed = confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted, gh, env });
+  const confirmed = confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted, knownHoldIds: holds.map(status => status.id), gh, env });
   return confirmed.ok ? { ok: true, cleared: true } : confirmed;
 }
 

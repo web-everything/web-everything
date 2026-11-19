@@ -654,7 +654,9 @@ describe('red-team check run contract', () => {
         // A round writer's success lands after the helper's (GitHub ids only grow, so it takes the next id).
         io.gh(['api', 'repos/o/r/check-runs', '--method', 'POST'],
           { input: JSON.stringify(api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null })) });
-        expect(publish(io)).toMatchObject({ ok: true });
+        // The fresh check is posted, but the earlier timestamp-free hold is below the prior success,
+        // absent from this clear's pre-read holds, and therefore refuses post-clear confirmation.
+        expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringContaining('concurrent publication hold') });
         expect(check_runs.map(r => `${r.id}:${api.isLiveCheckRun(r)}`)).toEqual(['40:true', '41:false', '42:true']);
       });
       it.each([
@@ -674,20 +676,22 @@ describe('red-team check run contract', () => {
         expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok, ...(ok ? { cleared } : {}) });
         expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(cleared ? 1 : 0);
       });
-      it.each(['clean', 'same-second failure', 'newer-id pending', 'unreadable', 'page bound'])('clearLivePublicationHold verifies its success with fresh history: %s', kind => {
+      it.each(['clean', 'known missing timestamp', 'same-second failure', 'newer-id pending', 'new missing timestamp', 'new invalid timestamp', 'new old timestamp', 'unreadable', 'page bound'])('clearLivePublicationHold verifies its success with fresh history: %s', kind => {
         const context = 'red-team/publication #7';
         const since = Math.floor(Date.now() / 1000) * 1000;
         const history = [{ id: 5, context, state: 'failure', description: 'held: live red-team check not clear: x',
           created_at: new Date(since - 10_000).toISOString(), creator: { login: 'web-everything' } }];
+        if (kind === 'known missing timestamp') delete history[0].created_at;
         const posts = [];
         const gh = vi.fn((args, options) => {
           if (args.includes('POST')) {
             const body = JSON.parse(options.input);
             posts.push(body);
             if (body.state === 'success') {
-              if (!['clean', 'unreadable', 'page bound'].includes(kind)) history.unshift({ ...history[0],
+              if (!['clean', 'known missing timestamp', 'unreadable', 'page bound'].includes(kind)) history.unshift({ ...history[0],
                 id: kind === 'newer-id pending' ? 12 : 9, state: kind === 'newer-id pending' ? 'pending' : 'failure',
-                created_at: new Date(kind === 'newer-id pending' ? since - 1000 : since).toISOString(),
+                created_at: kind === 'new missing timestamp' ? undefined : kind === 'new invalid timestamp' ? 'invalid'
+                  : new Date(['newer-id pending', 'new old timestamp'].includes(kind) ? since - 1000 : since).toISOString(),
                 description: 'held: ' + 'x'.repeat(300) });
               return JSON.stringify({ id: 11, created_at: new Date(since).toISOString() });
             }
@@ -703,14 +707,22 @@ describe('red-team check run contract', () => {
           return JSON.stringify(history);
         });
         const out = api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh, env: { WE_GH_READ_MEMO_DIR: 'stale' } });
-        if (kind === 'clean') expect(out).toEqual({ ok: true, cleared: true });
+        if (['clean', 'known missing timestamp'].includes(kind)) expect(out).toEqual({ ok: true, cleared: true });
         else {
           expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/concurrent publication hold|post-clear history unreadable/) });
           expect(out.cleared).not.toBe(true);
           expect(posts.at(-1).state).toBe('failure');
           expect(posts.at(-1).description.length).toBeLessThanOrEqual(140);
         }
-        expect(posts.map(post => post.state)).toEqual(kind === 'clean' ? ['success'] : ['success', 'failure']);
+        expect(posts.map(post => post.state)).toEqual(['clean', 'known missing timestamp'].includes(kind) ? ['success'] : ['success', 'failure']);
+      });
+      it.each([undefined, 'invalid'])('confirmPublicationHoldClear fails closed without known ids and timestamp %s', created_at => {
+        const postHold = vi.fn(() => ({ ok: true }));
+        const gh = vi.fn(() => JSON.stringify([{ id: 5, context: 'red-team/publication #7',
+          state: 'failure', description: 'held: unknown', created_at }]));
+        expect(api.confirmPublicationHoldClear({ repo: 'o/r', pr: 7, headSha: HEAD, readAt: Date.now(),
+          posted: { status: { id: 11 } }, gh, postHold })).toMatchObject({ ok: false });
+        expect(postHold).toHaveBeenCalledWith(expect.objectContaining({ held: true }));
       });
       // Red-team break on c639d9ba108e: 100 unrelated statuses on the head, no publication context. The combined
       // summary proves the context absent, so the clearer settles (ok, nothing posted) instead of failing on the full
