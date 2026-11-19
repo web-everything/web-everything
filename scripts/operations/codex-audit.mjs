@@ -101,7 +101,10 @@ async function proveFindings(findings, base, head, deps, observe = () => {}) {
       const loc = parseFindingLocation(text);
       const sourceText = loc ? deps.readHeadFile(loc.file, head) : undefined;
       if (loc && typeof sourceText !== 'string') throw new Error('unreadable head source');
-      return { text, sourceText, class: answers[i]?.class, card: /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(text)?.[0] };
+      // The finding keeps its OWN class (a class tag written in its text); the reproduction model's class is never
+      // copied over it. A differing model class then blocks in classifyPreExisting as a class conflict.
+      const ownClass = /\b([A-E][1-9])\b/.exec(text)?.[1];
+      return { text, sourceText, class: ownClass ?? answers[i]?.class, card: /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(text)?.[0] };
     });
     extra.findingKeys = detailed.flatMap((f, i) => {
       const loc = parseFindingLocation(f.text);

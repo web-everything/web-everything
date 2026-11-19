@@ -634,17 +634,18 @@ describe('prototype-load ruled-WEAKENED admission', () => {
 });
 
 describe('prototype-load canonical audit admission', () => {
-  it.each(['current', 'mode revoked', 'card removed', 'needs-you removed', 'new protected path', 'unreadable settings'])('revalidates persisted exemptions before loading: %s', kind => {
-    const key = 'x.mjs|X|B2', line = 'x.mjs:2 unsafe return';
+  it.each(['current', 'mode revoked', 'card removed', 'B-class security exemption', 'new protected path', 'unreadable settings'])('revalidates persisted exemptions before loading: %s', kind => {
+    const cls = kind === 'B-class security exemption' ? 'B2' : 'E1';
+    const key = `x.mjs|X|${cls}`, line = 'x.mjs:2 unsafe return';
     const exemption = { key, line, relation: 'SAME', cardHash: cardHash(key), base: { sha: TREE, path: 'x.mjs', line: 2, quote: 'return unsafe();' } };
-    const card = `- [R1053] today ET: pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${TREE.slice(0, 10)}: ${line}`;
-    const escalation = `- [R1053][needs-you] today ET: security pre-existing (B2) ${key}`;
+    const card = `- [R1053] today ET: pre-existing audit finding (${cls}) in we:x.mjs#X, reproduces on main ${TREE.slice(0, 10)}: ${line}`;
+    const escalation = cls.startsWith('B') ? `- [R1053][needs-you] today ET: security pre-existing (${cls}) ${key}` : '';
     const exemptionFiles = {
       [resolve(dirname(fileURLToPath(import.meta.url)), '../../settings/codex-audit.json')]: kind === 'unreadable settings' ? '{bad' : JSON.stringify({ audit: {
         preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, releaseStage: 'prerelease', cards: { requirePayBy: false },
         ...(kind === 'new protected path' ? { raceBlockPaths: ['x.mjs'] } : {}),
       } }),
-      '/home/test/workspace/.operations/handoff/cards-to-file.md': [kind === 'card removed' ? '' : card, kind === 'needs-you removed' ? '' : escalation].join('\n'),
+      '/home/test/workspace/.operations/handoff/cards-to-file.md': [kind === 'card removed' ? '' : card, escalation].join('\n'),
       '/home/test/workspace/.operations/coordination/pre-existing-findings.jsonl': JSON.stringify({ key, cardHash: exemption.cardHash }),
     };
     const f = auditedFixture('refuse', { exemptionFiles, auditBaseInMain: TREE,

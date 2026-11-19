@@ -66,6 +66,8 @@ export function revalidateExemptions(record, { settingsOptions = {}, readFile = 
       if (!validPreExisting(f)) return false;
       const [path, symbol, cls] = f.key.split('|');
       if (protectedPath(path, [...policy.raceBlockPaths, ...policy.guardFloorPaths])) return false;
+      // R1085: a B-class (security) exemption is never valid, whatever cards exist; only a human ruling clears it.
+      if (cls.startsWith('B')) return false;
       if (!PREEXISTING_ELIGIBLE.includes(cls) || productionFindingBlocks(cls, policy.releaseStage)) return false;
       const cardPresent = lines.some(l => l.startsWith('- [R1053] ')
         && l.endsWith(` ET: pre-existing audit finding (${cls}) in we:${path}#${symbol}, reproduces on main ${f.base.sha.slice(0, 10)}: ${f.line}`));
