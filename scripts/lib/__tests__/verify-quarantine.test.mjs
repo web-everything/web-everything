@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createFailureCollector } from '../verify-failures.mjs';
 import { applyRevertRedToVerdict } from '../verify-revert-red.mjs';
 import { reachesChanged } from '../red-cause.mjs';
+import * as quarantine from '../verify-quarantine.mjs';
 
 const now = Date.parse('2026-11-18T12:00:00Z');
 const file = 'scripts/lib/__tests__/daemon-jobs-runtime.test.mjs';
@@ -18,7 +19,65 @@ const verdict = (extra = {}) => quarantinedVerdict(input(extra));
 const withEntries = entries => ({ ok: true, list: { version: 1, mode: 'quarantine', entries } });
 const closed = result => expect(result).toMatchObject({ excused: false, files: [], why: expect.any(String) });
 
+// Execute the actual post-gate wiring with real failure collection and dependency reads.
+function runLaneQuarantine(changedFiles, readRepoFile = path => readFileSync(path, 'utf8')) {
+  const source = readFileSync('scripts/verify-lane.mjs', 'utf8');
+  const start = source.indexOf('const diffFiles =');
+  const end = source.indexOf('// #5466 — the revert-red check, inside', start);
+  const failed = 'scripts/lib/__tests__/operator-override-host-isolation.test.mjs';
+  const collector = createFailureCollector();
+  collector.push(` FAIL ${failed} > isolates the host home\n Test Files  1 failed\n`, 'stderr');
+  const failureDetails = collector.finish();
+  const args = { resolvedGate: { decision: { changedFiles }, standardsCommand: 'standards' }, editedDuringRun: [],
+    tryGit: () => 'base', headSha: 'head', exitCode: 1, signal: null, infrastructureNow: () => null,
+    phaseTimeout: null, failureDetails, quarantineEligible,
+    phaseResults: [phase([failed], { failureDetails }), { phase: 'standards', result: { exitCode: 0 } }],
+    quarantinedVerdict: args => quarantinedVerdict({ ...args, now }), readQuarantine: () => withEntries([entry(failed)]),
+    REPO: '.', runAllPhases: true, reachesChanged, readRepoFile, process: { stderr: { write() {} } }, phasedTestGate: true,
+    quarantineTouchesDiff: quarantine.quarantineTouchesDiff };
+  return new Function(...Object.keys(args), source.slice(start, end) + '; return { exitCode, quarantined };')(...Object.values(args));
+}
+
 describe('verify post-hoc quarantine', () => {
+  it.each(['vitest.setup.ts', 'vitest.globalSetup.mjs', 'vitest.config.ts', 'vitest.shared.ts',
+    'scripts/lib/test-tmp-root.mjs', 'scripts/test-cache/trace-setup.mjs'])('keeps runner-loaded dependency %s regressions red through the gate wiring', changed => {
+    expect(runLaneQuarantine([changed])).toEqual({ exitCode: 1, quarantined: null });
+  });
+  it('keeps missing runner configuration evidence red through the gate wiring', () => {
+    expect(runLaneQuarantine(['unrelated.mjs'], path => {
+      if (path === 'vitest.config.ts') throw new Error('unreadable');
+      return '';
+    }).exitCode).toBe(1);
+  });
+  it('still excuses a failure with a proven unrelated diff through the gate wiring', () => {
+    expect(runLaneQuarantine(['unrelated.mjs'], () => '').exitCode).toBe(0);
+  });
+  it('still excuses an unrelated diff with the actual runner config and directory resolution probes', () => {
+    expect(runLaneQuarantine(['unrelated.mjs'], path => path === 'unrelated.mjs' ? '' : readFileSync(path, 'utf8')).exitCode).toBe(0);
+  });
+  it.each(['setupFiles', 'globalSetup'])('follows %s in an imported config fragment and its transitive helper', key => {
+    const sources = {
+      'vitest.config.ts': "import './runner-options.mjs';",
+      'runner-options.mjs': `export default { ${key}: ['./custom-bootstrap.mjs'] };`,
+      'custom-bootstrap.mjs': "import './bootstrap-helper.mjs';",
+      'bootstrap-helper.mjs': '',
+      'scripts/lib/__tests__/operator-override-host-isolation.test.mjs': '',
+    };
+    expect(runLaneQuarantine(['bootstrap-helper.mjs'], path => {
+      if (Object.hasOwn(sources, path)) return sources[path];
+      throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+    }).exitCode).toBe(1);
+  });
+  it.each(['unreadable', 'oversized'])('keeps %s runner dependency evidence red', reason => {
+    expect(runLaneQuarantine(['unrelated.mjs'], path => {
+      if (path === 'vitest.config.ts') return "export default { setupFiles: ['./bootstrap.mjs'] };";
+      if (path === 'bootstrap.mjs') {
+        if (reason === 'oversized') return ' '.repeat(2_000_001);
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      }
+      return '';
+    }).exitCode).toBe(1);
+  });
   it('keeps a combined test-and-standards command red: standards execution is unproven', () => {
     closed(verdict({ phased: false }));
     closed(verdict({ phased: undefined }));

@@ -91,7 +91,7 @@ import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
-import { quarantineEligible, quarantinedVerdict } from './lib/verify-quarantine.mjs';
+import { quarantineEligible, quarantinedVerdict, quarantineTouchesDiff } from './lib/verify-quarantine.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
 import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory, gateCommandsEqual, matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
@@ -1136,8 +1136,8 @@ if (exitCode !== 0 && !signal && !infrastructureNow(exitCode, signal, failureDet
       // Lane clones keep a local branch named `main` whatever they carry, so main means "HEAD is origin/main's tip".
       // A missing origin/main is unknown (undefined), never "not main": the verdict keeps red.
       onMain: (() => { const tip = tryGit(['rev-parse', 'origin/main']); return tip ? tip === headSha : undefined; })(),
-      // reachesChanged reads missing/unreadable files as "outside"; unreadable evidence must stay unknown instead.
-      touchesDiff: (file) => { if (![file, ...diffFiles].every(f => { try { readRepoFile(f); return true; } catch { return false; } })) return 'unknown'; const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } });
+      // Runner-loaded setup/config dependencies affect every test, even without a test-file import.
+      touchesDiff: (file) => quarantineTouchesDiff({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }) });
     if (verdict.excused) {
       quarantined = { files: verdict.files, why: verdict.why };
       exitCode = 0;

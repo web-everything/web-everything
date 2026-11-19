@@ -2,6 +2,41 @@ import { stripVTControlCharacters } from 'node:util';
 import { decideCiSkip, validateQuarantineList } from './red-main-quarantine.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
 import { remoteInfrastructureFailure } from './verify-remote-routing.mjs';
+import { reachesChanged } from './red-cause.mjs';
+import { isLocalFullSuiteTrigger } from '../readiness/test-selection.mjs';
+
+/** Include runner-loaded dependencies before claiming an unchanged test is outside the diff. */
+export function quarantineTouchesDiff({ testFile, changedFiles, readFile }) {
+  if (!Array.isArray(changedFiles)) return 'unknown';
+  if (changedFiles.some(isLocalFullSuiteTrigger)) return true;
+  try {
+    // Require the WE unit gate's default config; absent evidence keeps red.
+    const config = 'vitest.config.ts';
+    for (const file of [testFile, config, ...changedFiles]) readFile(file);
+    // setupFiles/globalSetup are strings, not imports. Treat relative literals throughout the config
+    // closure as edges, including imported config fragments and conditional setup arrays. Extra edges
+    // only keep red. Preserve the walker's source-size bound before expanding these literals.
+    const runnerRead = file => {
+      const source = readFile(file);
+      if (source.length > 2_000_000) throw new Error('runner dependency source exceeds walk bound');
+      return source + '\n' + [...source.matchAll(/(['"])(\.{1,2}\/[^'"\n]+)\1/g)]
+        .map(([, quote, path]) => `import ${quote}${path}${quote};`).join('\n');
+    };
+    let incomplete = false;
+    const runner = reachesChanged({ testFile: config, changedFiles, readFile: file => {
+      try { return runnerRead(file); } catch (error) {
+        // Missing extension and directory candidates are normal resolution probes.
+        // Permission/IO failures are not proof of independence.
+        if (!['ENOENT', 'ENOTDIR', 'EISDIR'].includes(error?.code)) incomplete = true;
+        throw error;
+      }
+    } });
+    if (runner === 'reaches') return true;
+    if (incomplete || runner === 'unknown') return 'unknown';
+    const test = reachesChanged({ testFile, changedFiles, readFile });
+    return test === 'unknown' ? 'unknown' : test === 'reaches';
+  } catch { return 'unknown'; }
+}
 
 /** Complete test-only red evidence, checked before doing any quarantine IO. PURE. */
 export function quarantineEligible(phaseResults) {
