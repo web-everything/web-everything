@@ -263,7 +263,7 @@ describe('#4194 cost controls — kill switch, cap, quota', () => {
   it('card xn2wf9t — per-provider caps are resolved and counted separately, with codex\'s own legacy fallback', () => {
     expect(resolveProviderCap('codex', {})).toBe(PROVIDER_CAP_DEFAULT.codex);
     expect(resolveProviderCap('agy-claude', {})).toBe(PROVIDER_CAP_DEFAULT['agy-claude']);
-    expect(PROVIDER_CAP_DEFAULT).toEqual({ codex: 80, 'agy-claude': 300, 'agy-gemini': 0 });
+    expect(PROVIDER_CAP_DEFAULT).toEqual({ codex: 600, 'agy-claude': 10, 'agy-gemini': 0 });
     expect(resolveProviderCap('agy-gemini', {})).toBe(0);
     expect(resolveProviderCap('agy-gemini', { [PROVIDER_CAP_ENV['agy-gemini']]: '5' })).toBe(5);
     expect(resolveProviderCap('codex', { [PROVIDER_CAP_ENV.codex]: '5' })).toBe(5);

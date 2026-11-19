@@ -6,6 +6,7 @@ import { resolveAiRouting } from '../../lib/ai-routing.mjs';
 import { DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
 import { createRoutingPolicyReader, resolveOperationRoute, resolveOperationEffort } from '../../lib/dispatch-routing-policy-io.mjs';
 import * as routingPolicyIo from '../../lib/dispatch-routing-policy-io.mjs';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { selectReviewSeatProvider } from '../../lib/provider-routing.mjs';
 import { createRedTeamIo, speculateRedTeam, reserveSeatCalls, RED_TEAM_MODELS, RECHECK_MODEL } from '../review-extra-seats.mjs';
 
@@ -50,7 +51,7 @@ async function recheck(readAiRouting = empty, readsRepo = false, extra = {}) {
 }
 
 test('red-team empty and all-inherit match today’s provider, model and effort', async () => {
-  const available = ['codex', 'agy-claude'];
+  const available = ['codex'];
   const configured = resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team', available, policy: DEFAULT_ROUTING_POLICY });
   const provider = configured?.provider ?? selectReviewSeatProvider({ lens: 'red-team', available, scorecards: [] }).provider;
   for (const resolver of [empty, () => setting('red-team', inherit)]) {
@@ -91,17 +92,17 @@ test('overlay model/effort warning logs once across both roles and repeated call
   } finally { stderr.mockRestore(); }
 });
 
-test('red-team overlays only provider and ignores executors', async () => {
-  const { calls, reservations } = await seat(() => ({ value: { 'red-team': { coordinator: { provider: 'agy-claude' }, executors: ['codex'] } } }));
-  assert.deepEqual(reservations, ['agy-claude']);
-  assert.equal(calls[0].provider, 'agy-claude');
-  const configured = resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team', available: ['agy-claude'], policy: DEFAULT_ROUTING_POLICY });
-  assert.equal(calls[0].model, configured?.model ?? RED_TEAM_MODELS['agy-claude'].model);
-  assert.equal(calls[0].effort, configured?.effort ?? resolveOperationEffort('review-seat', 'agy-claude', 'red-team'));
+test('red-team overlay cannot select emergency agy-claude while ordinary budget remains', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'astra', effort: 'high', fallback: [] };
+  const { calls, reservations, logs } = await seat(() => ({ value: { 'red-team': { coordinator: { provider: 'agy-claude' }, executors: ['codex'] } } }), { readRoutingPolicy: () => policy });
+  assert.deepEqual(reservations, ['codex']);
+  assert.equal(calls[0].provider, 'codex');
+  assert.ok(logs.some(line => line.includes('agy-claude unavailable')));
 });
 
 for (const fallback of [[], [{ provider: 'agy-gemini', model: 'flash', effort: 'high' }]]) {
-  test.each(['high', 'xhigh'])(`red-team provider overlay works without a matching repository fallback (%s, ${fallback.length} fallbacks)`, async effort => {
+  test.each(['high', 'xhigh'])(`red-team emergency overlay preserves ordinary routing without a matching repository fallback (%s, ${fallback.length} fallbacks)`, async effort => {
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     policy.operations['review-seat:red-team'] = {
       provider: 'codex', model: 'astra', effort, fallback,
@@ -119,14 +120,12 @@ for (const fallback of [[], [{ provider: 'agy-gemini', model: 'flash', effort: '
     assert.equal(baseline.calls[0].effort, effort);
     const actual = await seat(() => resolved, { readRoutingPolicy });
     assert.equal(actual.result.status, 'speculated', actual.result.reason);
-    assert.deepEqual(actual.reservations, ['agy-claude']);
-    assert.equal(actual.calls[0].provider, 'agy-claude');
-    assert.equal(actual.calls[0].model, RED_TEAM_MODELS['agy-claude'].model);
-    assert.equal(actual.calls[0].effort, 'high');
+    assert.deepEqual(actual.reservations, baseline.reservations);
+    assert.deepEqual(actual.calls, baseline.calls);
   });
 }
 
-test('red-team overlay retains a matching fallback’s configured model and effort', async () => {
+test('red-team emergency overlay preserves ordinary routing even with a matching fallback', async () => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
   policy.operations['review-seat:red-team'] = {
     provider: 'codex', model: 'astra', effort: 'high',
@@ -135,8 +134,8 @@ test('red-team overlay retains a matching fallback’s configured model and effo
   const { result, calls } = await seat(() => setting('red-team', { provider: 'agy-claude', model: 'sonnet' }),
     { readRoutingPolicy: () => policy });
   assert.equal(result.status, 'speculated', result.reason);
-  assert.equal(calls[0].provider, 'agy-claude');
-  assert.equal(calls[0].model, policy.aliases['agy-claude']['opus-5-5']);
+  assert.equal(calls[0].provider, 'codex');
+  assert.equal(calls[0].model, policy.aliases.codex.astra);
   assert.equal(calls[0].effort, 'high');
 });
 
@@ -150,22 +149,20 @@ for (const unavailable of ['CLI', 'quota', 'cap']) {
           scoredAt: new Date(NOW).toISOString(), callStatus: 'quota', quotaUsedPercent: 100,
           quotaResetsAt: new Date(NOW + 3600000).toISOString() }] } : {}),
     };
-    const env = unavailable === 'cap' ? { WE_REVIEW_SEAT_CAP_CODEX: '0' } : {};
-    // Missing, invalid and unavailable overlays must retain the exhausted policy's refusal.
+    const env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', ...(unavailable === 'cap' ? { WE_REVIEW_SEAT_CAP_CODEX: '0' } : {}) };
     for (const resolver of [empty, () => setting('red-team', { provider: 'bogus', model: 'sonnet' }),
       () => setting('red-team', { provider: 'codex', model: 'astra' })]) {
       const baseline = await seat(resolver, overrides, env);
       assert.equal(baseline.result.status, 'skipped');
-      assert.match(baseline.result.reason, /no available route/);
       assert.deepEqual(baseline.reservations, []);
       assert.deepEqual(baseline.calls, []);
+      assert.match(baseline.result.reason, /no available route/);
     }
     const actual = await seat(() => setting('red-team', { provider: 'agy-claude', model: 'sonnet' }), overrides, env);
-    assert.equal(actual.result.status, 'speculated', actual.result.reason);
-    assert.deepEqual(actual.reservations, ['agy-claude']);
-    assert.equal(actual.calls[0].provider, 'agy-claude');
-    assert.equal(actual.calls[0].model, RED_TEAM_MODELS['agy-claude'].model);
-    assert.equal(actual.calls[0].effort, 'high');
+    assert.equal(actual.result.status, 'skipped');
+    assert.deepEqual(actual.reservations, []);
+    assert.deepEqual(actual.calls, []);
+    assert.match(actual.result.reason, /no available route/);
   });
 }
 
@@ -289,20 +286,20 @@ test('recheck provider overlay ignores executors', async () => {
 
 for (const reason of ['held', 'capped', 'CLI unavailable', 'reservation denied']) {
   test(`red-team overlay cannot use a provider that is ${reason}`, async () => {
-    const overrides = reason === 'held' ? { readRecords: () => [{ dispatchKind: 'review-seat', provider: 'agy-claude',
+    const overrides = reason === 'held' ? { readRecords: () => [{ dispatchKind: 'review-seat', provider: 'agy-gemini',
       scoredAt: new Date(NOW).toISOString(), callStatus: 'quota', quotaUsedPercent: 100,
       quotaResetsAt: new Date(NOW + 3600000).toISOString() }] }
-      : reason === 'CLI unavailable' ? { cliAvailable: provider => provider !== 'agy-claude' }
-        : reason === 'reservation denied' ? { reserveCalls: ({ provider }) => ({ used: 300, callIds: provider === 'agy-claude' ? [] : ['fallback'] }) } : {};
-    const resolved = setting('red-team', route);
+      : reason === 'CLI unavailable' ? { cliAvailable: provider => provider !== 'agy-gemini' }
+        : reason === 'reservation denied' ? { reserveCalls: ({ provider }) => ({ used: 200, callIds: provider === 'agy-gemini' ? [] : ['fallback'] }) } : {};
+    const resolved = setting('red-team', { provider: 'agy-gemini', model: RED_TEAM_MODELS['agy-gemini'].model, effort: 'high' });
     assert.deepEqual(resolved.invalid, []);
     const { calls: baselineCalls } = await seat(empty, overrides,
-      reason === 'capped' ? { WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0' } : {});
+      { WE_REVIEW_SEAT_CAP_AGY_GEMINI: reason === 'capped' ? '0' : '20' });
     const { calls, logs } = await seat(() => resolved, overrides,
-      reason === 'capped' ? { WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0' } : {});
+      { WE_REVIEW_SEAT_CAP_AGY_GEMINI: reason === 'capped' ? '0' : '20' });
     assert.deepEqual(calls, baselineCalls);
     assert.equal(calls[0].provider, 'codex');
-    assert.ok(logs.some(line => line.includes('agy-claude unavailable')));
+    assert.ok(logs.some(line => line.includes('agy-gemini unavailable')));
   });
 }
 
@@ -437,4 +434,85 @@ test('recheck overlay validation refuses an incomplete counting-Claude-seat poli
     spawnRecheck: async () => { spawned = true; },
   }), /claude route in fallback to count/);
   assert.equal(spawned, false);
+});
+
+const builderSeat = (builder, overrides = {}, env = {}) => seat(empty, overrides, env,
+  (args, io) => speculateRedTeam({ ...args, read: { ...args.read,
+    body: buildDelegationMarker({ provider: builder, model: 'gpt-6-astra', taskType: 'bugfix' }) } }, io));
+
+test('builder preference preserves policy model and effort in both directions', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', effort: 'xhigh',
+    fallback: [{ provider: 'agy-gemini', model: 'flash', effort: 'medium' }] };
+  for (const [builder, provider, model, effort] of [
+    ['codex', 'agy-gemini', policy.aliases['agy-gemini'].flash, 'medium'],
+    ['claude', 'codex', policy.aliases.codex.sol, 'xhigh'],
+  ]) {
+    const actual = await builderSeat(builder, { readRoutingPolicy: () => policy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
+    assert.equal(actual.result.status, 'speculated', actual.result.reason);
+    assert.deepEqual([actual.calls[0].provider, actual.calls[0].model, actual.calls[0].effort], [provider, model, effort]);
+  }
+});
+
+test('operator review-seat:red-team override wins over builder preference', async () => {
+  const readRoutingPolicy = createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+    preferences: () => ({ errors: [], prefs: { routingOverrides: {
+      'review-seat:red-team': { provider: 'codex', model: 'sol', effort: 'xhigh', fallback: [] },
+    } } }), emit: () => {},
+  });
+  const actual = await builderSeat('codex', { readRoutingPolicy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
+  assert.equal(actual.result.status, 'speculated', actual.result.reason);
+  assert.deepEqual([actual.calls[0].provider, actual.calls[0].model, actual.calls[0].effort],
+    ['codex', DEFAULT_ROUTING_POLICY.aliases.codex.sol, 'xhigh']);
+});
+
+for (const defect of ['model', 'effort']) {
+  test(`builder routing refuses invalid policy ${defect} without dispatch`, async () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', effort: 'high', fallback: [], [defect]: 'bogus' };
+    const actual = await builderSeat('claude', { readRoutingPolicy: () => policy });
+    assert.equal(actual.result.status, 'skipped');
+    assert.match(actual.result.reason, /unknown model|unknown effort/);
+    assert.deepEqual(actual.calls, []);
+    assert.deepEqual(actual.reservations, []);
+  });
+}
+
+for (const blocked of ['zero cap', 'operator disabled', 'outside chain']) {
+  test(`builder cap fallback refuses Gemini when ${blocked} and emergency is unavailable`, async () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    if (blocked === 'operator disabled') policy.operations['review-seat:red-team'].disabledProviders = ['agy-gemini'];
+    if (blocked === 'outside chain') policy.operations['review-seat:red-team'] = {
+      provider: 'codex', model: 'astra', effort: 'high', fallback: [],
+    };
+    const actual = await builderSeat('claude', { readRoutingPolicy: () => policy }, {
+      WE_REVIEW_SEAT_CAP_CODEX: '0', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0',
+      WE_REVIEW_SEAT_CAP_AGY_GEMINI: blocked === 'zero cap' ? '0' : '20',
+    });
+    assert.equal(actual.result.status, 'skipped');
+    assert.match(actual.result.reason, /daily-cap|no available route/);
+    assert.deepEqual(actual.calls, []);
+    assert.deepEqual(actual.reservations, []);
+  });
+}
+
+test('operator-disabled emergency provider is never dispatched at ordinary caps', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-seat:red-team'].disabledProviders = ['agy-claude'];
+  const actual = await builderSeat('codex', { readRoutingPolicy: () => policy }, { WE_REVIEW_SEAT_CAP_CODEX: '0' });
+  assert.equal(actual.result.status, 'skipped');
+  assert.deepEqual(actual.calls, []);
+  assert.deepEqual(actual.reservations, []);
+});
+
+test('emergency provider at its standard ten-call cap refuses dispatch and logs the reason', async () => {
+  const actual = await builderSeat('codex', { readRecords: () => Array.from({ length: 10 }, (_, index) => ({
+    dispatchKind: 'review-seat', provider: 'agy-claude', callId: `spent-${index}`,
+    scoredAt: new Date(NOW).toISOString(), status: 'ok',
+  })) }, { WE_REVIEW_SEAT_CAP_CODEX: '0' });
+  assert.equal(actual.result.status, 'skipped');
+  assert.match(actual.result.reason, /agy-claude: daily-cap: 10\/10/);
+  assert.ok(actual.logs.some(line => /red team skipped:.*10\/10/.test(line)));
+  assert.deepEqual(actual.calls, []);
+  assert.deepEqual(actual.reservations, []);
 });

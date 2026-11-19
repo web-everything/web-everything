@@ -4874,6 +4874,30 @@ planner together using a rollup with `detailsUrl` and no check id. Workflow prot
 head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
 step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
 negative cases, rather than matching planner source text.
+## Live review seat policy (R1077)
+
+`review-seat-caps.test.mjs` covers live `review.seatDailyCaps` reads through the shared
+policy cascade, injected settings IO, invalid layers and legacy environment precedence.
+`review-red-team.test.mjs` exercises the launcher with both builder companies, unknown
+builder evidence, `review.redTeam.routeByBuilder=false`, daily-cap fallback and a raced
+reservation. Keep the pinned-head co-author read ahead of routing; the scratch checkout
+is created only after provider selection. Standard daily caps are Codex 600, agy-gemini 0
+(off; operator opt-in through `review.seatDailyCaps.agy-gemini` or `enabledProviders`), agy-claude 10 (red-team emergency only). Codex builders prefer agy-gemini;
+if disabled or capped, use Codex and log same-vendor acceptance. Claude builders prefer
+Codex, then agy-gemini at cap. Unknown builders and `routeByBuilder=false` retain policy
+routing among the ordinary providers. Log each cap fallback, including reservation races.
+Never choose agy-claude by default: only exhaustion of both ordinary providers' budgets
+permits the logged emergency route. Exhausting even the emergency budget retains the
+existing cap hold. Tests cover emergency selection, all budgets exhausted, and missing
+CLIs with ordinary budget left (no emergency).
+
+R1077 audit: builder preference stays within the resolved policy chain or inherited
+red-team roster; operator routing overrides win, and policy model/effort validation
+still runs. Exhausting an explicit chain refuses dispatch rather than inventing a
+route. `ai-routing-red-team-sites.test.mjs` retains the cap/quota refusal cases and
+covers builder policy models, efforts, operator precedence and disabled fallbacks.
+Explicit settings zero defeats `enabledProviders`; unreadable or malformed seat
+settings warn and use repo defaults, including Gemini's disabled default.
 ## Overlay main-sync interrupted test evidence
 
 A heavy-admission test timeout or killed process is incomplete evidence even if it left a green

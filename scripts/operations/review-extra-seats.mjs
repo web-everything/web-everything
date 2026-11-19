@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { redTeamRouteByBuilder, readReviewSeatPolicy } from '../lib/review-seat-caps.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
@@ -1852,20 +1853,34 @@ export async function speculateRedTeam({
     let deferredByCap = false;
     const routingPolicy = (io.readRoutingPolicy ?? readRoutingPolicy)();
     const routingEntry = routingPolicy.operations['review-seat:red-team'];
+    const readSeatSettings = io.readSeatSettings ?? (options => readReviewSeatPolicy({ ...options, log: io.log }));
+    const routeByBuilder = redTeamRouteByBuilder(env, readSeatSettings);
+    let builderHeadMessage = '';
+    if (routeByBuilder) {
+      try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
+    }
+    const builder = resolveBuilder({ body: read.body, headMessage: builderHeadMessage });
+    const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-gemini'
+      : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
+    const operatorKeys = (io.readRoutingPolicy ?? readRoutingPolicy).operatorKeys?.() ?? [];
+    const operatorRoute = ['review-seat:red-team', 'review-seat', '*'].some(key => operatorKeys.includes(key));
     const providers = rosterForKey('review-seat:red-team');
-    const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    const capped = new Set();
+    const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry, readSeatSettings)]));
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {
+      if (usedByProvider[p] >= caps[p]) {
+        deferredByCap = true;
+        capped.add(p);
+        unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`);
+        continue;
+      }
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
       if (hold) {
         deferredByCap = true;
+        capped.add(p);
         unavailable.push(`${p}: ${hold}`);
-        continue;
-      }
-      if (usedByProvider[p] >= caps[p]) {
-        deferredByCap = true;
-        unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`);
         continue;
       }
       available.push(p);
@@ -1875,18 +1890,38 @@ export async function speculateRedTeam({
     let lastReason = null;
     let configuredRoute = null;
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
+      // agy-claude is eligible only after both ordinary providers exhaust their budgets.
+      const emergency = ['codex', 'agy-gemini'].every(p => capped.has(p));
+      const candidates = available.filter(p => p !== 'agy-claude' || emergency);
+      if (!candidates.length) break;
       let routeError = null;
-      try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
-      catch (error) { configuredRoute = null; routeError = error; }
       try {
-        configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available,
-          operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
-        // A valid overlay can supply a route even when the default chain is exhausted.
-        // Without one, preserve the policy failure rather than selecting outside its chain.
+        configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available: candidates, policy: routingPolicy });
+      } catch (error) { configuredRoute = null; routeError = error; }
+      try {
+        if (preferred && !operatorRoute && !routeError) {
+          // Prefer a builder-independent vendor only within the resolved chain (or inherited roster).
+          const chain = configuredRoute;
+          const routes = chain ? [chain, ...(chain.fallback ?? [])] : [];
+          const chosen = candidates.includes(preferred) && (!chain || routes.some(route => route.provider === preferred))
+            ? preferred : chain?.provider ?? candidates[0];
+          if (chosen) {
+            const defaults = routes.find(route => route.provider === chosen);
+            configuredRoute = validateAiSeatRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key,
+              available: candidates, policy: routingPolicy, operatorKeys,
+              aiRouting: { provider: chosen, model: defaults?.model ?? RED_TEAM_MODELS[chosen].model,
+                effort: defaults?.effort ?? resolveOperationEffort('review-seat', chosen, RED_TEAM_SEAT.key, routingPolicy) } });
+          }
+        }
+        configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available: candidates,
+          operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy, operatorKeys });
         if (routeError && !configuredRoute) throw routeError;
       } catch (error) { lastReason = error.message; break; }
-      const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
+      const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
+      if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
+      if (pick.provider === 'agy-claude') io.log('red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
+      if (preferred === 'agy-gemini' && pick.provider === 'codex') io.log('red team: same-vendor codex fallback accepted for Codex builder');
       let reservation;
       try {
         reservation = io.reserveCalls({ provider: pick.provider, want: 1, dailyCap: caps[pick.provider], now });
@@ -1898,11 +1933,17 @@ export async function speculateRedTeam({
       else {
         deferredByCap = true;
         lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`;
+        capped.add(pick.provider);
+        unavailable.push(`${pick.provider}: ${lastReason}`);
+        io.log(`red team: ${lastReason}; retrying fallback provider`);
         available = available.filter((x) => x !== pick.provider);
       }
     }
-    if (!callId) return { status: 'skipped', ...(deferredByCap ? { deferredByCap: true } : {}),
-      reason: `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}` };
+    if (!callId) {
+      const reason = `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}`;
+      io.log(`red team skipped: ${reason}`);
+      return { status: 'skipped', ...(deferredByCap ? { deferredByCap: true } : {}), reason };
+    }
     const { model: defaultModel, effort: defaultEffort } = RED_TEAM_MODELS[provider];
     const effort = configuredRoute?.effort ?? resolveOperationEffort("review-seat", provider, RED_TEAM_SEAT.key);
     const model = configuredRoute?.model ?? defaultModel;
@@ -2180,8 +2221,8 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       catch (e) { base.log(`red-team status labels: ${e.message}`); }
       return outcome;
     },
-    readHeadMessage: (dir) => {
-      const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B'], { encoding: 'utf8', timeout: 20_000 });
+    readHeadMessage: (dir, rev = 'HEAD') => {
+      const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B', rev], { encoding: 'utf8', timeout: 20_000 });
       return r.status === 0 ? String(r.stdout ?? '') : '';
     },
     runRecheck: async ({ pr, lanePath, rev, readsRepo = true, mandate, input, shape }) => {

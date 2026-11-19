@@ -1495,6 +1495,7 @@
   "scripts/operations/__tests__/review-red-team.test.mjs": 0.81,
   "scripts/operations/__tests__/review-ruling-resume.test.mjs": 7.5,
   "scripts/operations/__tests__/review-scratch-cleanup.test.mjs": 53.94,
+  "scripts/lib/__tests__/review-seat-caps.test.mjs": 0.1,
   "scripts/operations/__tests__/review-seat-caps.test.mjs": 0.01,
   "scripts/operations/__tests__/review-seat-pool.test.mjs": 28.09,
   "scripts/operations/__tests__/review-seat-runner.test.mjs": 1.42,
