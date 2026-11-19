@@ -12,5 +12,6 @@
 # consumed once per process). guard-prototype-tracker.mjs blocks a push to a declared #3383 POC branch whose
 # tracker card (backlog/3383-*.md) has gone stale — see that file's own header for the full rationale.
 payload="$(cat)"
+printf '%s' "$payload" | node scripts/gitleaks-guard.mjs pre-push || exit $?
 printf '%s' "$payload" | node scripts/guard-git-push.mjs "$@" || exit $?
 printf '%s' "$payload" | node scripts/guard-prototype-tracker.mjs "$@" || exit $?

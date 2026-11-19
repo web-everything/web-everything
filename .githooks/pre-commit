@@ -14,6 +14,8 @@
 # only; refuses only a placeholder/missing author or committer — a real identity always passes.
 node scripts/guard-git-identity.mjs || exit $?
 
+node scripts/gitleaks-guard.mjs pre-commit || exit $?
+
 npm run --silent lint:locus || exit $?
 
 # Inventory write-time regen (#3071-adjacent incident, PR #1404 — a research topic was added without

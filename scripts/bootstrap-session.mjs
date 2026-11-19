@@ -54,7 +54,7 @@
  *   node scripts/bootstrap-session.mjs install     # apply on ANY host (the explicit opt-in)
  *   node scripts/bootstrap-session.mjs uninstall   # drop the SessionStart registration
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, copyFileSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, copyFileSync, symlinkSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
@@ -62,6 +62,8 @@ import { fileURLToPath } from 'node:url';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { CONSTELLATION_REPOS, repoKeyForDir, siblingKeys } from './lib/constellation-repos.mjs';
 import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT, invokedAsScript } from './lib/git-identity.mjs';
+import { DEFAULT_CREDENTIAL_PROTECTION } from './lib/credential-protection.mjs';
+import { loadCredentialProtection } from './lib/credential-protection-settings.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -515,6 +517,107 @@ export function outputStyleStatus({ settings, write, dryRun = false, apply } = {
 export const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
 export const BOOTSTRAP_PATH = join(REPO_ROOT, 'scripts', 'bootstrap-session.mjs');
 
+/** R1082. Permission globs cannot exempt .env.example/sample/template. The Bash matcher can. */
+export function credentialDenyRules(policy = DEFAULT_CREDENTIAL_PROTECTION) {
+  return policy.protectedPaths.flatMap(({ path }) => {
+    const patterns = path === '.env*' ? ['**/.env', '**/.env.*', '**/.env*']
+      : ['~/.netrc', '~/.config/gh/hosts.yml'].includes(path) ? [path] : [path, `${path}/**`];
+    return ['Read', 'Edit', 'Write'].flatMap(tool => patterns.map(p => `${tool}(${p})`));
+  });
+}
+export function credentialHookEntry(hooksDir = join(homedir(), '.plateau', 'hooks')) {
+  // Single-quote shell paths, including a HOME with spaces or an apostrophe.
+  const path = join(hooksDir, 'credential-read-deny.mjs').replace(/'/g, "'\\''");
+  return { matcher: 'Bash|Read|Edit|Write|NotebookEdit', hooks: [{ type: 'command', command: `node '${path}'` }] };
+}
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+/** PURE additive merge. Ownership is stored separately, never in Claude's settings schema. */
+export function withCredentialDeny(settings, { policy = DEFAULT_CREDENTIAL_PROTECTION, hooksDir, ownership = {} } = {}) {
+  const next = structuredClone(settings ?? {});
+  next.permissions ??= {};
+  const deny = next.permissions.deny ?? [];
+  const rules = credentialDenyRules(policy).filter(rule => !deny.includes(rule));
+  next.permissions.deny = [...deny, ...rules];
+  next.hooks ??= {};
+  const hooks = next.hooks.PreToolUse ?? [];
+  const entry = credentialHookEntry(hooksDir);
+  const addHook = !hooks.some(h => sameJson(h, entry));
+  next.hooks.PreToolUse = addHook ? [...hooks, entry] : hooks;
+  return { settings: next, ownership: { ...ownership,
+    rules: [...new Set([...(ownership.rules ?? []), ...rules])],
+    hooks: [...(ownership.hooks ?? []), ...(addHook ? [entry] : [])] },
+  diff: { rules, hooks: addHook ? [entry] : [] } };
+}
+/** PURE: exact owned entries only; foreign order and entries survive. */
+export function withoutCredentialDeny(settings, ownership = {}) {
+  const next = structuredClone(settings ?? {});
+  if (Array.isArray(next.permissions?.deny)) next.permissions.deny = next.permissions.deny.filter(r => !(ownership.rules ?? []).includes(r));
+  if (Array.isArray(next.hooks?.PreToolUse)) next.hooks.PreToolUse = next.hooks.PreToolUse.filter(h => !(ownership.hooks ?? []).some(o => sameJson(o, h)));
+  return next;
+}
+export function credentialDenyStatus({ settings, ownership = {}, hooksDir, policy,
+  artifactsMatch = false, write = false, dryRun = false, apply } = {}) {
+  const merged = withCredentialDeny(settings, { ownership, hooksDir, policy });
+  const changed = merged.diff.rules.length || merged.diff.hooks.length || !artifactsMatch;
+  if (!changed) return { id: 'credential-deny', status: 'ok', detail: 'credential rules and hook in sync' };
+  const detail = JSON.stringify({ ...merged.diff, ...(!artifactsMatch ? { deploy: ['credential-read-deny.mjs', 'credential-protection.mjs', 'credential-protection.json'] } : {}) });
+  if (dryRun) return { id: 'credential-deny', status: 'planned', detail: `would add ${detail}` };
+  if (!write) return { id: 'credential-deny', status: 'drift', detail: `missing ${detail}; run node scripts/bootstrap-session.mjs install` };
+  if (typeof apply !== 'function') return { id: 'credential-deny', status: 'drift', detail: 'credential installer unavailable' };
+  apply(merged);
+  return { id: 'credential-deny', status: 'ok', detail: `applied ${detail}` };
+}
+
+/** All targets injectable; callers must use scratch HOME for installation tests. */
+export function syncCredentialDeny({ settings, write = false, dryRun = false, uninstall = false,
+  home = homedir(), root = REPO_ROOT, hooksDir = join(home, '.plateau', 'hooks'),
+  applySettings = writeSettings, policy = loadCredentialProtection().settings } = {}) {
+  const manifestPath = join(hooksDir, 'credential-protection-install.json');
+  const ownership = readJsonConfig(manifestPath);
+  if (settings === null || ownership === null) return { id: 'credential-deny', status: 'drift', detail: 'unreadable settings or credential ownership manifest; repair before install/uninstall' };
+  if ((settings?.permissions?.deny !== undefined && !Array.isArray(settings.permissions.deny))
+    || (settings?.hooks?.PreToolUse !== undefined && !Array.isArray(settings.hooks.PreToolUse))
+    || (ownership.rules !== undefined && !Array.isArray(ownership.rules))
+    || (ownership.hooks !== undefined && !Array.isArray(ownership.hooks))) {
+    return { id: 'credential-deny', status: 'drift', detail: 'invalid credential settings/ownership arrays; repair before install/uninstall' };
+  }
+  const files = {
+    'credential-read-deny.mjs': readFileSync(join(root, 'scripts/hooks/credential-read-deny.mjs'), 'utf8').replace("'../lib/credential-protection.mjs'", "'./credential-protection.mjs'"),
+    'credential-protection.mjs': readFileSync(join(root, 'scripts/lib/credential-protection.mjs'), 'utf8'),
+    'credential-protection.json': `${JSON.stringify(policy, null, 2)}\n`,
+  };
+  const current = name => { try { return readFileSync(join(hooksDir, name), 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+  if (uninstall) {
+    const detail = JSON.stringify({ removeRules: ownership.rules ?? [], removeHooks: ownership.hooks ?? [], removeFiles: Object.keys(ownership.files ?? {}) });
+    if (dryRun || !write) return { id: 'credential-deny', status: dryRun ? 'planned' : 'drift', detail: `would remove ${detail}` };
+    applySettings(withoutCredentialDeny(settings, ownership));
+    // Never remove a deployed file subsequently changed by the operator.
+    for (const [name, content] of Object.entries(ownership.files ?? {})) {
+      if (Object.hasOwn(files, name) && current(name) === content) unlinkSync(join(hooksDir, name));
+    }
+    if (existsSync(manifestPath)) unlinkSync(manifestPath);
+    return { id: 'credential-deny', status: 'ok', detail: `removed ${detail}` };
+  }
+  for (const name of Object.keys(files)) {
+    const before = current(name);
+    if (before !== null && before !== files[name] && before !== ownership.files?.[name]) {
+      return { id: 'credential-deny', status: 'drift', detail: `foreign/modified ${name}; move it aside or review before installing` };
+    }
+  }
+  return credentialDenyStatus({ settings, ownership, hooksDir, policy, write, dryRun,
+    artifactsMatch: existsSync(manifestPath) && Object.entries(files).every(([name, content]) => current(name) === content),
+    apply: merged => {
+      mkdirSync(hooksDir, { recursive: true });
+      const ownedFiles = { ...(ownership.files ?? {}) };
+      for (const [name, content] of Object.entries(files)) {
+        if (current(name) === null || Object.hasOwn(ownedFiles, name)) { writeFileSync(join(hooksDir, name), content); ownedFiles[name] = content; }
+      }
+      // Journal ownership first, so interrupted installs can safely be reapplied/uninstalled.
+      writeFileSync(manifestPath, `${JSON.stringify({ ...merged.ownership, files: ownedFiles }, null, 2)}\n`);
+      applySettings(merged.settings);
+    } });
+}
+
 const isOurs = (h) => typeof h?.command === 'string' && h.command.includes('bootstrap-session.mjs');
 
 /**
@@ -910,6 +1013,7 @@ export function gitDirStatus({ gitDir, settings, write, dryRun = false } = {}) {
 export function defaultIo() {
   return {
     readSettings, writeSettings, readTrust, writeTrust, installHook, uninstallHook, runSkills,
+    syncCredentialDeny,
     readGitIdentity: () => readGitIdentity(REPO_ROOT),
     exists: existsSync,
     symlink: (target, path) => symlinkSync(target, path, 'dir'),
@@ -920,7 +1024,13 @@ export function defaultIo() {
 
 export function main(argv, io = defaultIo()) {
   const has = (f) => argv.includes(f);
-  if (argv[0] === 'uninstall') { io.out(`bootstrap-session: ${io.uninstallHook()}`); return 0; }
+  if (argv[0] === 'uninstall') {
+    const dryRun = has('--dry-run'), check = has('--check');
+    const result = io.syncCredentialDeny?.({ settings: io.readSettings(), uninstall: true, dryRun, write: !dryRun && !check, applySettings: io.writeSettings });
+    if (result) io.out(`credential-deny: ${result.status} ${result.detail}`);
+    if (!dryRun && !check) io.out(`bootstrap-session: ${io.uninstallHook()}`);
+    return result?.status === 'drift' ? 1 : 0;
+  }
   const explicitInstall = argv[0] === 'install';
   const readOnlyFlag = has('--check') || has('--dry-run');
   const detected = detectHost(io.env);
@@ -1020,6 +1130,9 @@ export function main(argv, io = defaultIo()) {
   report.steps.push(styleSettings === null
     ? { id: 'style', status: 'drift', detail: unreadableConfig(SETTINGS_PATH) }
     : outputStyleStatus({ settings: styleSettings, write, dryRun: has('--dry-run'), apply: io.writeSettings }));
+
+  if (io.syncCredentialDeny) report.steps.push(io.syncCredentialDeny({ settings: io.readSettings(), write,
+    dryRun: has('--dry-run'), applySettings: io.writeSettings }));
 
   // The git author every commit from this checkout would carry. REPORT-ONLY, never a write: the identity is the
   // operator's own config. In `report.steps` so `--check`'s drift gate sees it (the 2026-10-05..20 "test" author

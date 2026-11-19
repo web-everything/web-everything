@@ -70,6 +70,7 @@
 | **Manually developing / testing an edit in a lane** — pick a lane, boot its own dev pair (export `.env.local` ports), the FUI-sibling symlink (#1943), rendering via static build | [docs/agent/testing.md](docs/agent/testing.md) → "Developing & manually testing in a lane" |
 | Comparing **Claude Code / Codex / Antigravity CLI** capabilities — hooks, permissions, tools, config, models, streams, identity, resume; source evidence and open questions | [docs/agent/agent-cli-capability-map.md](docs/agent/agent-cli-capability-map.md) |
 | Dev environment & scripts | `DEV_GUIDE.md` |
+| Credential read boundary, secret scanning, and manual GitHub push protection | [docs/agent/credential-protection.md](docs/agent/credential-protection.md) |
 | Canonical specs (per-entry) | `src/_data/{blocks,plugs,intents,protocols,semantics,references}.json`; backlog = `backlog/*.md` |
 
 ## Repository inventory

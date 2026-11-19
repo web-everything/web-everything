@@ -1,0 +1,39 @@
+# Credential protection (R1082)
+
+An agent reading credentials can copy them into tracked files and leak them through
+commit/push. Four layers reduce that risk:
+
+- User-level `permissions.deny` blocks Read/Edit/Write on protected paths.
+- The separate PreToolUse hook denies matching Bash and file-tool requests from
+  agents (`agent_id`, `agent_type`, or `WE_CONVEYOR_WORKER=1`); operator requests ask.
+- Git hooks run gitleaks on staged content and each actual pushed range. New refs
+  scan their reachable history, including older commits. Findings/scanner errors block.
+- GitHub push protection provides a server-side backstop.
+
+Configure `scripts/settings/credential-protection.json` (R528). Settings resolve
+standard → platform `credentialProtection` → tool → environment (`WE_GITLEAKS_MODE`
+only), reporting effective values and sources. Invalid/unreadable settings restore
+the strict defaults, including requiring gitleaks; repair settings to recover.
+`auto` runs an installed gitleaks or prints **secret scan SKIPPED** with an install
+hint; `require` fails when missing; `off` visibly disables scanning.
+
+Apply deliberately with `node scripts/bootstrap-session.mjs install`; preview with
+`node scripts/bootstrap-session.mjs install --dry-run`, verify with `--check`, and
+undo owned entries with `node scripts/bootstrap-session.mjs uninstall` (also supports
+`--dry-run`). Settings and hooks merge without replacing foreign entries. An external
+ownership manifest in `~/.plateau/hooks/` records additions; modified hook files
+require operator review. Use a scratch `HOME` for tests, never the real HOME.
+
+SSH (including `ssh -i`), ssh-add, Git, gh auth, scp/rsync credential handling and
+directory listings (`ls`, including `-l`) follow normal permission flow. Content
+reads, copies, archives, transforms, interpreters referencing protected paths and input
+redirections deny. The Bash matcher exempts exact `.env.example`, `.env.sample`,
+`.env.template`; permission deny globs cannot express exceptions and cover these too.
+This lexical guard is not OS isolation: computed paths, aliases, symlinks and programs
+opening unnamed secrets remain outside its proof. Direct Git hook bypass remains
+possible; combine these layers with restricted worker credentials and server protection.
+
+Manually enable GitHub **Repo Settings > Code security > Secret protection > Push
+protection**. For Enterprise, configure the corresponding organization-level secret
+protection policy as well. Confirm availability and enforcement in the repository's
+settings; this bootstrap does not change GitHub configuration.
