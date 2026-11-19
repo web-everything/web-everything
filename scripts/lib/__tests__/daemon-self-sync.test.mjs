@@ -19,6 +19,43 @@ import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness
 import { acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 
+// R986 pure-core fallback: exercise a consumer through the real wrapper with injected IO.
+// Based on the WIP restart-gate fixture (emptyState/okLock/closure); production probation IO is still unwired.
+it('self-sync core consumer: healthy unaffected sibling tick does NOT promote an unproven changed daemon', async () => {
+  const modulePath = '../daemon-rebuild/probation.mjs';
+  const { freezeProbation, recordProof, evaluateProbation } = await import(modulePath);
+  const adopted = Date.parse('2026-11-15T12:00:00.000Z');
+  const good = 'a'.repeat(40), head = 'b'.repeat(40);
+  let probation = freezeProbation({
+    adoptionId: '11111111-1111-4111-8111-111111111111', sha: head, provenGood: good,
+    adoptedAt: new Date(adopted).toISOString(), registered: [{ id: 'worker' }, { id: 'healthy' }],
+    readClosure: (daemon, sha) => ({ complete: true, files: { 'entry.mjs': daemon.id === 'healthy' ? good : sha } }),
+  });
+  const initial = probation;
+  const tick = vi.fn(() => {
+    probation = recordProof(probation, 'healthy', {
+      boot: { daemonId: 'healthy', pid: process.pid, head, startedAt: new Date(adopted).toISOString() },
+      tick: { daemonId: 'healthy', pid: process.pid, head, lastTickDoneAt: new Date(adopted + 1).toISOString() },
+    }, adopted + 2);
+    return 'ticked';
+  });
+  const onRestart = vi.fn();
+  const w = withSelfSync({ tickOnce: tick }, {
+    root: '/clone', entries: ['healthy.mjs'], env: {}, log: { error: vi.fn() },
+    now: () => adopted + 2, onRestart, readHead: () => head,
+    acquireRead: () => ({ ok: true }), releaseRead: vi.fn(),
+    readState: () => ({ adopted: null, rejected: null, inProgress: null, quarantine: null }),
+    rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
+    importClosure: () => ({ files: new Set(['healthy.mjs']), complete: true, bareDeps: false, jsonNames: new Set() }),
+    diffFiles: () => [], versions: null, background: false,
+  });
+  await expect(w.tickOnce()).resolves.toBe('ticked');
+  expect(tick).toHaveBeenCalledOnce();
+  expect(onRestart).not.toHaveBeenCalled();
+  expect(probation).toBe(initial);
+  expect(evaluateProbation(probation, adopted + 2)).toEqual({ action: 'pending', owed: ['worker'] });
+});
+
 describe('decideSelfSync — pure', () => {
   const base = { fetched: true, behind: 3, dirty: false, onBase: true };
   it('behind on a clean main → merge', () => expect(decideSelfSync(base).action).toBe('merge'));

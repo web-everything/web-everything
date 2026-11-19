@@ -48,6 +48,7 @@ describe('defaultReadPrs production list path is cheap and loud (504 incident 20
       readShared: ({ fields }) => { asked = fields; return [{ number: 7, labels: [], comments: [], statusCheckRollup: [] }]; },
       readRest: rest });
     expect(asked.split(',')).not.toContain('author');
+    expect(asked.split(',')).toEqual(expect.arrayContaining(['rowsHead', 'rowsComplete']));
     expect(rest).toHaveBeenCalledWith('repos/o/r/pulls/7', expect.any(Object));
     expect(prs[0].author).toMatchObject({ login: 'dependabot[bot]', is_bot: true });
   });
@@ -473,4 +474,16 @@ describe('clock skew: settlement is proven by server timestamps only, never the 
     // entry 1 was re-fetched in a listing whose newest server updatedAt is U+3000 (>= 2 s past U): settled; entry 3 is that newest PR: not
     expect(Object.keys(probe2.mock.calls[0][0].cache)).toEqual(['1']);
   });
+});
+
+
+it('direct gh fallback keeps check evidence incomplete and sends only gh fields', async () => {
+  const { defaultReadPrs, PR_LIST_JSON_FIELDS } = await import('../reconcile-pass.mjs');
+  const exec = vi.fn(() => JSON.stringify([{ number: 9, labels: [], comments: [], statusCheckRollup: [] }]));
+  const prs = defaultReadPrs({ repo: 'o/r', exec, readCommits: () => [] });
+  expect(prs[0].rowsComplete).not.toBe(true);
+  const args = exec.mock.calls[0][1];
+  expect(args[args.indexOf('--json') + 1]).toBe(PR_LIST_JSON_FIELDS);
+  expect(PR_LIST_JSON_FIELDS.split(',')).not.toContain('rowsHead');
+  expect(PR_LIST_JSON_FIELDS.split(',')).not.toContain('rowsComplete');
 });

@@ -8,11 +8,10 @@
  *
  *   One file, two roles:
  *   1. TICK SIDE — {@link rebuildCloneAsJob}, what `rebuildClone` delegates to when the caller is opted in
- *      ({@link resolveRebuildAsJob}). Per tick it (a) consumes finished jobs once and logs their outcome, (b) while
- *      a job is in flight runs the runtime's reattach pass and returns `rebuild-job-running` at once, (c) otherwise
- *      runs the ordinary rebuild in ADOPT-ONLY mode — the locked, fast prepare that adopts a ready candidate
- *      (a smoke-passed build the job recorded) or a skip-unrelated move, under the existing match and last-good
- *      rules, unchanged — and when that says a build is due, queues one job. It never builds or smokes.
+ *      ({@link resolveRebuildAsJob}). Per tick it consumes finished outcomes, then runs the ordinary rebuild
+ *      in ADOPT-ONLY mode before inspecting or reattaching jobs. A passed build wins even when main advanced;
+ *      the existing matching and last-good checks still apply. With no ready candidate, it watches an in-flight
+ *      job or queues one when the adoption pass says a build is due. It never builds or smokes.
  *   2. JOB CHILD — this file run as a script (the kind's `entry`) from a pinned code snapshot. Its one step spawns
  *      `daemon-rebuild.mjs --ready-only` as an ASYNC child (the smoke's synchronous children never starve this
  *      process's heartbeat), which runs the unchanged prepare → candidate worktree → live smoke → fallback / hold
@@ -41,7 +40,8 @@ import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
 import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
-import { alertsFilePath } from './state.mjs';
+import { alertsFilePath, readReadyCandidate } from './state.mjs';
+import { processStartMs } from './lease.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -223,8 +223,18 @@ export async function rebuildCloneAsJob({
     writeConsumed(store.dir, cons);
   };
 
+  // Adoption always precedes reattach: even a queued/retryable job must yield to a passed build.
+  // Without a ready record and with a job in flight there is nothing to adopt, so the adopt-only pass (which can reach
+  // a versioned inline build) is left until the job settles, exactly as before.
+  let inFlight = mine().find((x) => !TERMINAL_JOB_STATUSES.includes(x.job.status)) ?? null;
+  let r = inFlight && !readReadyCandidate(root, env) ? null : await adopt();
+  // Only a completed adoption short-circuits; a ready record that did not adopt must not suppress job recovery below.
+  if (r?.moved || r?.adopted) {
+    housekeeping();
+    return { ...r, finishedJobs };
+  }
+
   // 2. A job in flight: reattach (launch / stalled / dead handling) and tick on the current tree.
-  let inFlight = mine().find((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)) ?? null;
   if (inFlight) {
     await pass();
     const cur = store.read(inFlight.id);
@@ -233,12 +243,16 @@ export async function rebuildCloneAsJob({
     }
     inFlight = null; // finished during the pass — fall through, the next tick consumes it
   }
-
-  // 3. Adopt-only: a ready candidate (or a skip-unrelated move) is adopted here, fast, under the existing rules.
-  const r = await adopt();
-  if (r?.reason !== 'needs-build') {
+  r ??= await adopt();
+  if (r?.moved || r?.adopted) {
     housekeeping();
     return { ...r, finishedJobs };
+  }
+
+  // Reattach can finish a job and publish a candidate during this call. Keep it for adoption.
+  if (r?.reason !== 'needs-build' || readReadyCandidate(root, env)) {
+    housekeeping();
+    return { ...r, ...(r?.reason === 'needs-build' ? { reason: 'ready-pending' } : {}), finishedJobs };
   }
 
   // 4. A build is due. Space builds by `minIntervalMs` after one that did not record a ready candidate (a
@@ -258,7 +272,8 @@ export async function rebuildCloneAsJob({
   try {
     queued = enqueueJob({
       store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
-      input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null },
+      input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null,
+        daemonReader: { root: resolve(root), owner: `${hostname()}:${process.pid}`, pid: process.pid, startedMs: processStartMs(process.pid) } },
     });
   } catch (e) {
     say(`could not queue a rebuild job (${String(e?.message || e).split('\n')[0]}) — the next tick retries`);
@@ -313,12 +328,13 @@ export function runRebuildChild({
   });
 }
 
-/** The ready-only child excludes just its spawner; the next daemon tick still honours its writer slot. */
-export function rebuildChildEnv(env = process.env, { ppid = process.ppid, host = hostname() } = {}) {
+/** Pass the persisted target session as well as the live spawner; only ready-only preparation may exclude them. */
+export function rebuildChildEnv(env = process.env, { ppid = process.ppid, host = hostname(), daemonReader = null } = {}) {
   const childEnv = { ...env, [REBUILD_AS_JOB_ENV]: '0' };
   for (const k of Object.keys(childEnv)) if (k.startsWith('DAEMON_JOB_')) delete childEnv[k];
-  for (const k of ['OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS']) delete childEnv[k];
+  for (const k of ['OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS', 'WE_DAEMON_REBUILD_READER']) delete childEnv[k];
   if (ppid > 1) childEnv.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS = `${host}:${ppid}`;
+  if (daemonReader) childEnv.WE_DAEMON_REBUILD_READER = JSON.stringify(daemonReader);
   return childEnv;
 }
 
@@ -386,7 +402,7 @@ export async function jobMain({
       name: 'rebuild',
       run: async ({ jobId, input }) => {
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} building ${input.target ?? 'main + overlays'} for ${input.root}\n`);
-        const childEnv = rebuildChildEnv(env, { ppid, host });
+        const childEnv = rebuildChildEnv(env, { ppid, host, daemonReader: input.daemonReader });
         const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
         const timeout = reportTimeout({ root: input.root, env, r });
         const result = {

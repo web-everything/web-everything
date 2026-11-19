@@ -2335,6 +2335,7 @@ export function planReconcile({
     const realFixRounds = countRealFixRounds(pr);
     const openSendBacks = openOperatorSendBacks(pr);
     const base = {
+      ...(pr.timeoutRetry?.reason === 'log-unreadable' ? { ciLogEvidenceReason: 'log-unreadable' } : {}),
       ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions, roundExtensionAnchor: {
@@ -4021,6 +4022,7 @@ export function planReconcile({
       const advisoryAlsoPending = withPhase.labels.includes(ADVISORY_LABELS.CHANGES);
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', isConflict: true, advisoryPending: advisoryAlsoPending,
+        conflictFixMechanical: pr.baseRefName === defaultBranch && ['clean', 'manifest-only'].includes(pr.conflictDisposition),
         findings, attempts: conflictAttempts, cap: conflictFixCapHere,
         why: `bounced with ${findings} finding(s) via a mechanical conflict-resolution route (merge-status:conflicting),`
           + ` nothing live is working it, and ${conflictAttempts} of ${conflictFixCapHere} conflict-fix attempts are spent`

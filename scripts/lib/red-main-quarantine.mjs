@@ -119,6 +119,9 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
   const next = { version: 1, entries, ...(Array.isArray(base.fixPrs) ? { fixPrs: base.fixPrs } : {}), ...(base.mode !== undefined ? { mode: base.mode } : {}) };
   const v = validateQuarantineList(next);
   if (!v.ok) return { ok: false, error: v.errors.join('; ') };
+  // The cap is global across every live entry and job, for manual adds as well as the safety net.
+  const liveFiles = new Set(activeEntries(next, { now }).map((e) => testFileOf(e.test)));
+  if (liveFiles.size > QUARANTINE_SAFETY_NET_DEFAULTS.maxTests) return { ok: false, error: `quarantine cap ${QUARANTINE_SAFETY_NET_DEFAULTS.maxTests} reached (${liveFiles.size} live files)` };
   return { ok: true, list: next, events };
 }
 
@@ -383,6 +386,7 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = 
   const changed = new Set(changedFiles);
   const touched = tests.filter((t) => changed.has(testFileOf(t)));
   const rest = tests.filter((t) => !changed.has(testFileOf(t)));
+  // Every shard uses file exclusions: named cases must run rather than suppress unrelated assertions.
   const { args, unsupported } = vitestExcludeArgs(rest);
   const skip = args.map((a) => a.slice('--exclude='.length));
   return { skip, unsupported, why: `skipping ${skip.length} quarantined test file(s)${touched.length ? `; running ${touched.length} this PR changes` : ''}` };

@@ -639,6 +639,22 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
   }
+  // The runner restores HEAD symlinks into its index and cannot prove from the
+  // manifest that the client still has them: a link deleted, retargeted or turned
+  // into a file here (staged or not) can leave an identical-looking projection.
+  // So refuse remote use when the client index differs from HEAD at any HEAD link.
+  if(head!==undefined) {
+    const changed=await exec({file:'git',args:['diff-index','--cached','--raw','-z','--no-renames',head,'--'],cwd});
+    if(changed.code!==0||!Buffer.isBuffer(changed.stdout)||changed.stdout.length>LIMIT
+      ||(changed.stdout.length&&changed.stdout.at(-1)!==0))throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+    const fields=splitPaths(changed.stdout);
+    if(fields.length%2)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+    for(let i=0;i<fields.length;i+=2) {
+      const meta=fields[i].toString('latin1').match(/^:([0-7]{6}) ([0-7]{6}) [a-f0-9]{40,64} [a-f0-9]{40,64} [ACDMTUXB]$/);
+      if(!meta)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+      if(meta[1]==='120000')throw manifestRefusal('head-symlink-changed',fields[i+1]);
+    }
+  }
   const trackedLinks=new Map();
   for(const key of indexLinks.keys()) {
     const link={linkPath:Buffer.from(key,'base64'),linkOid:indexBlobs.get(key)};
@@ -1435,7 +1451,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     try{return await ssh('finish', {nonce,run,...(cancel.signal.aborted?{cancel:true}:{})});}finally{done();}
   };
   try {
-    let expected, expectedManifest, delta, transferBytes=0, transferCount=0, bundlePlan;
+    let receiptCapabilities, expected, expectedManifest, delta, transferBytes=0, transferCount=0, bundlePlan;
     try {
       const manifestDone=begin('manifest-build');
       const substages=substageTimer(clock),beginSub=stage=>substages.begin(stage);
@@ -1521,7 +1537,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       const inputDigest = delta ? await digestDeltaInput(delta,workStage,cwd,exec) : await digestInput(workStage, selected);
       stageDone();
       const prepareDone=begin('forge-prepare');
-      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1},...(slotUnits > 1 ? {slotUnits} : {}),...(bundleTransport?{gitBundle:true}:{}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
+      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1,throttle:1},...(slotUnits > 1 ? {slotUnits} : {}),...(bundleTransport?{gitBundle:true}:{}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
       prepareDone();
       if(prepared.code !== 0) {
         // Prepare precedes every byte transfer and cannot have started work.
@@ -1529,6 +1545,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         throw new Error('Prepare failed');
       }
       const preparation = JSON.parse(protocolText(prepared.stdout,4096));
+      receiptCapabilities = preparation.receiptCapabilities;
       run = preparation.run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
       // Tell the admission wrapper which Forge run this client now owns, so a stale slot marker can be judged per run.
@@ -1618,7 +1635,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');
@@ -1653,10 +1670,10 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       }
       // x40a9dk: a cancelled client is terminated only when the protected finish succeeded (it reaps the worker
       // UID and removes the run), answering either a matching receipt or the null of a run killed before one.
-      if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code))) {
-        return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code,receiptCapabilities))) {
+        return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code,receiptCapabilities)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
-      if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(!result || !verifyReceipt(text,expected,result.code,receiptCapabilities)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {
         for (const stream of ['stdout', 'stderr']) {
           inspectStandardsLine(tails[stream]);
@@ -1678,7 +1695,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         const index=timings.findLastIndex(t=>t.stage==='finish-receipt');
         timings.splice(index,0,{stage:'forge-install',startedAtET:easternTimestamp(runAt),ms:reply.timings.installMs},{stage:'forge-run',startedAtET:easternTimestamp(runAt+reply.timings.installMs),ms:reply.timings.runMs});
       }
-      return {mode:'remote',code:result.code,run};
+      return {mode:'remote',code:result.code,run,...(reply.resources ? {resources:reply.resources,slotUnits} : {}),...(reply.timings ? {runMs:reply.timings.runMs} : {})};
     } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {
     try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }
@@ -1686,9 +1703,11 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   }
 }
 
-export function verifyReceipt(text, expected, code) {
+export function verifyReceipt(text, expected, code, receiptCapabilities) {
   try {
     const receipt=JSON.parse(text);
+    const resourceKeys=['cpuUsec','memoryPeakBytes','oomKills'];
+    const throttleKeys=receiptCapabilities?.throttle===1 ? ['nrThrottled','throttledUsec'] : [];
     const taskFields=['processCount','tasksMax','tasksNear','tasksNote'];
     const presentTasks=taskFields.filter(key=>Object.hasOwn(receipt,key));
     // This diagnostic is optional for old runners, but a partial or inconsistent note is not evidence.
@@ -1700,9 +1719,9 @@ export function verifyReceipt(text, expected, code) {
       && !/[\x00-\x1f\x7f-\x9f]/.test(receipt.tasksNote));
     return receipt && validTasks && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
       && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources'&&!taskFields.includes(key)).sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
-      && (!Object.hasOwn(receipt,'resources') || (receipt.resources && !Array.isArray(receipt.resources)
-        && Object.keys(receipt.resources).sort().join(',')==='cpuUsec,memoryPeakBytes,oomKills,slotCpus'
-        && ['cpuUsec','memoryPeakBytes','oomKills'].every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
+      && (!Object.hasOwn(receipt,'resources') && !throttleKeys.length || (receipt.resources && !Array.isArray(receipt.resources)
+        && [throttleKeys.length ? resourceKeys.concat(throttleKeys,'slotCpus').sort().join(',') : resourceKeys.concat('slotCpus').sort().join(',')].includes(Object.keys(receipt.resources).sort().join(','))
+        && resourceKeys.concat(throttleKeys.filter(key=>Object.hasOwn(receipt.resources,key))).every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
         && Number.isSafeInteger(receipt.resources.slotCpus)&&receipt.resources.slotCpus>=1))
       && (!Object.hasOwn(receipt,'timings') || (!!receipt.timings && Object.keys(receipt.timings).sort().join(',')==='installMs,runMs' && [receipt.timings.installMs,receipt.timings.runMs].every(ms=>Number.isSafeInteger(ms)&&ms>=0)))
       && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)

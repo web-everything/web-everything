@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
+import { appendReviewRunIndex } from '../lib/review-run-index.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { assertRunRecord, isValidRunId, parseRunRecord, serializeRunRecord } from './run-record.mjs';
 
@@ -191,6 +192,9 @@ export function writeRun(record, dir = resolveRunsDir()) {
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
   writeJsonAtomic(path, record); // temp file + validate + same-fs rename: safe across daemon processes
+  if (record.op === 'review-pr') {
+    try { appendReviewRunIndex(record, dir); } catch { /* discovery is best-effort; never fail a persisted run */ }
+  }
   return path;
 }
 
