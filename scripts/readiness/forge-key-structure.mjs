@@ -123,8 +123,13 @@ function encodedText(text) {
     ||/\\x[\da-f]{2}|%[\da-f]{2}|[\da-f]{2}:[\da-f]{2}/i.test(text)
     ||/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)
     // Lenient base64 ignores every non-alphabet character (whitespace and punctuation alike), so the gate does too.
-    // Only for readable text: binary fragments (replacement characters, NULs) stay terminal, so they do not re-expand.
-    ||(!/[�\0]/.test(text)&&text.replace(/[^A-Za-z0-9+/_=-]/g,'').length>=11);
+    // Readable text always expands. Binary-looking text (replacement characters or NULs) expands only when it is
+    // mostly alphabet (a consumer ignores junk before or around the material); sparse binary stays terminal so
+    // random fragments do not re-expand.
+    ||(()=>{
+      const stripped=text.replace(/[^A-Za-z0-9+/_=-]/g,'').length;
+      return stripped>=11&&(!/[�\0]/.test(text)||stripped*2>=text.length);
+    })();
 }
 
 // All representations (including mixed base64 alphabets) converge here, before detection.

@@ -75,6 +75,12 @@ describe('Forge key structure slice 1',()=>{
     expect(finding).toBeTruthy();
     expect(()=>manifestEntry(path,Buffer.from(text),false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
   });
+  it('base64 key material prefixed with replacement characters or NULs is still blocked (audit #7076)',()=>{
+    const ed=Buffer.from('302e020100300506032b657004220420'+'02'.repeat(32),'hex').toString('base64');
+    blocked(Buffer.from([0xff,0xfe,...Buffer.from(ed)]));
+    blocked(Buffer.from('�'+ed));
+    blocked(Buffer.from(['\0',ed,'\0'].join('')));
+  });
   it('comment scanning is linear (CodeQL js/redos on the brace and oth lookaheads)',()=>{
     const quote='"';
     const hostile='/*'+'*/'.repeat(40000)+' tail';
