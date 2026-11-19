@@ -40,6 +40,11 @@ import { EventEmitter } from 'node:events';
 const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 
+const CARBON_PROMOTION_CASES = [
+  { name: 'unpromoted (default)', env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
+  { name: 'manually promoted with a positive cap', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: true, seatCount: 3 },
+];
+
 const CLAUDE_FINDING = { summary: 'isMechanicalMergeCommit trusts the message headline alone, so a forged merge headline bypasses the gate', file: 'scripts/lib/ai-pr-authorship.mjs', line: 41 };
 const LOOP_PAYLOAD = {
   runId: 'review-pr-1', stopped: 'complete', verdict: { verdict: 'changes' },
@@ -437,12 +442,17 @@ describe('#4194 prompt, answer parsing, confirmation, rows', () => {
     expect(big).toMatch(/truncated/);
   });
 
-  it('parses the last fenced JSON; a seat missing from it is not ok', () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: parses the last fenced JSON; only seated lenses require answers`, () => {
+    const seats = reviewSeatRoutes({ env }).routes;
+    expect(seats).toHaveLength(seatCount);
+    expect(seats.some(s => s.provider === 'agy-gemini')).toBe(promoted);
     const text = answer({ 'claim-accuracy': { verdict: 'changes', findings: [{ summary: 'wrong count', category: null, file: 'a.md', line: 3, impactIfUnfixed: 'broken', failure_scenario: null }] } });
     const parsed = parseSeatAnswer(text, seats);
     expect(parsed['claim-accuracy']).toMatchObject({ ok: true, verdict: 'changes' });
     expect(parsed['claim-accuracy'].findings[0]).toMatchObject({ summary: 'wrong count', file: 'a.md', line: 3 });
-    expect(parsed['standards-conformance'].ok).toBe(false);
+    expect(parsed['extra-juror:correctness'].ok).toBe(false);
+    if (promoted) expect(parsed['standards-conformance'].ok).toBe(false);
+    else expect(parsed).not.toHaveProperty('standards-conformance');
   });
 
   it('finds an unfenced answer however its JSON is spaced or indented', () => {
@@ -551,13 +561,15 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(calls).toContainEqual(['log', 'added seats: skipping agy-gemini — daily-cap: 0/0 non-Claude seat calls already used today for agy-gemini']);
   });
 
-  it('runs all three providers in parallel, writes one evidence row per seat, stamps Claude confirmation, cleans up', async () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: runs the admitted providers, writes one evidence row per seat, stamps Claude confirmation, cleans up`, async () => {
     const { io, calls, rows } = fakeSeatIo();
-    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' } }, io);
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
     expect(r.status).toBe('ran');
-    expect(r.rowsWritten).toBe(3);
+    expect(r.rowsWritten).toBe(seatCount);
     expect(rows.map((x) => `${x.seat}:${x.lens}@${x.provider}`).sort()).toEqual([
-      'advisory-lens:claim-accuracy@agy-claude', 'advisory-lens:standards-conformance@agy-gemini', 'extra-juror:correctness@codex',
+      'advisory-lens:claim-accuracy@agy-claude',
+      ...(promoted ? ['advisory-lens:standards-conformance@agy-gemini'] : []),
+      'extra-juror:correctness@codex',
     ]);
     const juror = rows.find((x) => x.seat === 'extra-juror');
     expect(juror.findings[0]).toMatchObject({ confirmedByClaude: true });
@@ -566,28 +578,34 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     for (const row of rows) expect(row.changedFiles).toEqual(LOOP_PAYLOAD.findings.read.netChangedFiles);
     const claim = rows.find((x) => x.lens === 'claim-accuracy');
     expect(claim.findings[0]).toMatchObject({ confirmedByClaude: false });
-    expect(calls.filter((c) => c[0] === 'seat')).toHaveLength(3);
+    expect(calls.filter((c) => c[0] === 'seat')).toHaveLength(seatCount);
     expect(calls.find((c) => c[0] === 'scratch')[1]).toMatchObject({ lanePath: '/lane', rev: 'a'.repeat(40) });
     expect(calls.at(-1)).toEqual(['rm', '/tmp/seat-scratch']);
     expect(renderSeatSummary(r).join('\n')).toMatch(/also raised by Claude/);
     // Card xn2wf9t — per-provider usage is reported, not just a shared total.
     expect(r.providerUsage.codex).toMatchObject({ usedToday: 1, cap: PROVIDER_CAP_DEFAULT.codex });
     expect(r.providerUsage['agy-claude']).toMatchObject({ usedToday: 1, cap: PROVIDER_CAP_DEFAULT['agy-claude'] });
-    expect(r.providerUsage['agy-gemini']).toMatchObject({ usedToday: 1, cap: 5 });
+    expect(r.providerUsage['agy-gemini']).toMatchObject({ usedToday: promoted ? 1 : 0, cap: 5 });
   });
 
-  it('each antigravity seat gets an inline brief; the codex seat (OS read-only sandbox) reads the checkout', async () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: each admitted antigravity seat gets an inline brief; the codex seat reads the checkout`, async () => {
     const written = new Map();
     const { io } = fakeSeatIo({ writeFile: (p, text) => written.set(p, text) });
-    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' } }, io);
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
     expect(r.status).toBe('ran');
+    expect(r.rowsWritten).toBe(seatCount);
     const claude = [...written].find(([p]) => p.endsWith('task-agy-claude.md'))[1];
-    const gemini = [...written].find(([p]) => p.endsWith('task-agy-gemini.md'))[1];
+    const gemini = [...written].find(([p]) => p.endsWith('task-agy-gemini.md'));
     const cod = [...written].find(([p]) => p.endsWith('task-codex.md'))[1];
     expect(claude).toContain(LOOP_PAYLOAD.findings.read.diffText.trim());
     expect(claude).not.toContain('/tmp/seat-scratch');
-    expect(gemini).toContain(LOOP_PAYLOAD.findings.read.diffText.trim());
-    expect(gemini).not.toContain('/tmp/seat-scratch');
+    if (promoted) {
+      expect(gemini[1]).toContain(LOOP_PAYLOAD.findings.read.diffText.trim());
+      expect(gemini[1]).not.toContain('/tmp/seat-scratch');
+    } else {
+      expect(gemini).toBeUndefined();
+      expect(r.seats.some(s => s.provider === 'agy-gemini')).toBe(false);
+    }
     expect(cod).toContain('/tmp/seat-scratch');
   });
 
@@ -600,18 +618,20 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(calls.some((c) => ['reserve', 'scratch', 'seat'].includes(c[0]))).toBe(false);
   });
 
-  it('soak: a seat that fails, times out or throws never fails the run — it is only that seat\'s status', async () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: a seat that fails, times out or throws never fails the run — it is only that seat's status`, async () => {
     const { io, rows, calls } = fakeSeatIo({
       runSeat: async (o) => {
         if (o.provider === 'codex') throw new Error('spawn ENOENT');
         return { timedOut: true, report: null };
       },
     });
-    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' } }, io);
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
     expect(r.status).toBe('ran');
+    expect(rows).toHaveLength(seatCount);
     expect(rows.find((x) => x.provider === 'codex').status).toBe('error');
     expect(rows.find((x) => x.provider === 'agy-claude').status).toBe('timeout');
-    expect(rows.find((x) => x.provider === 'agy-gemini').status).toBe('timeout');
+    if (promoted) expect(rows.find((x) => x.provider === 'agy-gemini').status).toBe('timeout');
+    else expect(rows.some((x) => x.provider === 'agy-gemini')).toBe(false);
     expect(rows.every((x) => x.findingsCount === 0)).toBe(true);
     expect(calls.at(-1)).toEqual(['rm', '/tmp/seat-scratch']);
   });
@@ -1833,4 +1853,15 @@ else process.exitCode = 1;
     if (refuses) expect(call).toThrow(/outage/);
     else expect(call()).toEqual({ published: false, reason: 'outage' });
   });
+});
+
+// Historical multi-provider roster fixtures explicitly grant manual Carbon promotion.
+beforeEach(() => vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
+it('refuses the Carbon-pinned advisory routes before manual promotion', () => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
+  const plan = reviewSeatRoutes({ available: ['agy-gemini'] });
+  expect(plan.routes).toEqual([]);
+  expect(plan.skipped.length).toBeGreaterThan(0);
+  expect(plan.skipped.every(s => s.reason.includes('Carbon not promoted'))).toBe(true);
 });
