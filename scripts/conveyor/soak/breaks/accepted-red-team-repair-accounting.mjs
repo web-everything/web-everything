@@ -1,6 +1,5 @@
 /** PR #7080 / #7031: an admitted repair must survive refund accounting and CI-heal admission. */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acceptedRedTeamRepair, failingRedTeamRepair, ordinaryAcceptedRedTeamRepair, roundCommitGitOutput } from '../../__tests__/fixtures/accepted-red-team-repair.mjs';
@@ -95,18 +94,10 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/redteam-sent-back-accepted-owed', paths: [
     'scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs', 'scripts/operations/fix-run.mjs',
   ] },
-  fixPresent(root) {
-    // The soak registry's probe is synchronous. Replay injected IO in a bounded child rather
-    // than identifying a spelling in the launcher that can exist while it still refuses dispatch.
-    const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
-      import { pathToFileURL } from 'node:url';
-      import { resolve } from 'node:path';
-      const { default: b } = await import(pathToFileURL(resolve('scripts/conveyor/soak/breaks/accepted-red-team-repair-accounting.mjs')).href);
-      if (b.judge(await b.run()).length) process.exitCode = 1;
-      else process.stdout.write('fixed');
-    `], { cwd: root, encoding: 'utf8', timeout: 15_000, maxBuffer: 128 * 1024 });
-    return probe.status === 0 && probe.stdout === 'fixed';
-  },
+  // This break ships in the same tree as its fix, so the fix is present wherever the break exists.
+  // fixPresent must NOT replay the behaviour under test: a regression would then read as "fix absent",
+  // the harness would switch to it.fails, and the reproduced break would pass. A regression goes red.
+  fixPresent() { return true; },
   async run({ ordinaryLauncher = runFixCli } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'repair-replay-'));
     const env = { WE_COORDINATION_ROOT: root, WE_RESOURCE_CUTOVER: 'shadow', WE_RESOURCE_SHADOW: 'off' };
