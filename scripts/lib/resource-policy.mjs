@@ -5,13 +5,14 @@
  *   average, which read 49–82 while the CPU was 37–46% idle. The IO half (snapshot read, policy-cascade file read,
  *   shadow log) is we:scripts/lib/resource-admission.mjs.
  */
+import { decideMemoryPressure } from './memory-available.mjs';
 // Calibrated (x9xkupj, slice 2) from 1261 sampler snapshots 2026-10-09 19:27–23:01 ET plus the shadow log:
 // - CPU idle p5/p25/p50/p95 = 11/19/24/49%; load average 11–109 (never ≤ 9, ≤ 15 only 3% of samples). Every shadow
 //   pair was old "hold" (load) vs new "admit" (CPU idle 14–49%). So rebuild-smoke keeps a 5% floor (admits 97%) and
 //   load-flake-rearm a 20% floor (admits 68%): its re-dispatched fixer re-runs timing-sensitive tests.
 // - maxDiskBusyPct stays null (record, never gate): disk read 100% busy in 100% of samples, CPU 45% idle included —
 //   on this NVMe host busy% means "I/Os in flight", not saturation. A tool override or platform preference can set one.
-// - Memory pressure read level 2 in every sample, so maxMemPressureLevel 2 admits it; only level 4 (critical) holds.
+// - Memory warn can be sticky: levels 2/3 require scarcity corroboration; critical always holds.
 const kindPolicy = (cpu, cost = 'heavy') => Object.freeze({ class: cost, minCpuIdlePct: cpu,
   maxMemPressureLevel: 2, maxDiskBusyPct: null, waitMinutes: 2 });
 // Fixes tolerate busier CPUs; timing-sensitive flake re-verification needs a quiet host.
@@ -55,12 +56,16 @@ export function resolveResourcePolicy({ standard = RESOURCE_POLICY_STANDARD, pla
 }
 const finite = v => Number.isFinite(v) ? v : null;
 /** Pure decision: loadAvg1 is comparison evidence ONLY, never a condition. */
-export function decideAdmission({ kind, snapshot, policy = RESOURCE_POLICY_STANDARD, nowMs } = {}) {
+export function decideAdmission({ kind, snapshot, policy = RESOURCE_POLICY_STANDARD, nowMs, warnMinFreePct, warnSwapGrowthMb } = {}) {
   const resolved = resolveResourcePolicy({ tool: policy });
   const rule = kinds.includes(kind) ? resolved[kind] : resolved.build;
   // An unknown kind remains heavy even if a tool reclassifies build.
   const cost = kinds.includes(kind) ? rule.class : 'heavy';
+  const pressure = decideMemoryPressure({ pressureLevel: snapshot?.memory?.pressureLevel,
+    freePct: snapshot?.memory?.freePct, swapGrowthMb: snapshot?.memory?.swapGrowthMb, warnMinFreePct, warnSwapGrowthMb });
   const inputs = { cpuIdlePct: finite(snapshot?.cpu?.idlePct), memPressureLevel: finite(snapshot?.memory?.pressureLevel),
+    freePct: pressure.freePct, swapGrowthMb: pressure.swapGrowthMb,
+    warnMinFreePct: pressure.warnMinFreePct, warnSwapGrowthMb: pressure.warnSwapGrowthMb,
     diskBusyPct: finite(snapshot?.disk?.busyPct), loadAvg1: finite(snapshot?.cpu?.loadAvg?.[0]) };
   const sampledAt = Date.parse(snapshot?.sampledAt);
   const freshUntil = Date.parse(snapshot?.freshUntil);
@@ -76,8 +81,10 @@ export function decideAdmission({ kind, snapshot, policy = RESOURCE_POLICY_STAND
     projectedWaitMinutes: verdict === 'admit' ? 0 : rule.waitMinutes, snapshotAge, unknown, inputs });
   if (!snapshot || !Number.isFinite(sampledAt) || !Number.isFinite(freshUntil)) return result(cost === 'heavy' ? 'hold' : 'admit', 'snapshot-missing', true);
   if (nowMs > freshUntil + resolved.staleGraceMs) return result(cost === 'heavy' ? 'hold' : 'admit', 'snapshot-stale (age ' + snapshotAge + 's)', true);
-  if (inputs.memPressureLevel !== null && inputs.memPressureLevel > rule.maxMemPressureLevel)
-    return result('hold', 'memory pressure ' + inputs.memPressureLevel + ' > ' + rule.maxMemPressureLevel);
+  // A normal-only policy is a hard ceiling; policies tolerating warn use scarcity corroboration below.
+  if (rule.maxMemPressureLevel < 2 && inputs.memPressureLevel !== null && inputs.memPressureLevel > rule.maxMemPressureLevel)
+    return result('hold', `memory pressure ${inputs.memPressureLevel} > ${rule.maxMemPressureLevel}; ${pressure.reason}`);
+  if (pressure.held) return result('hold', pressure.reason);
   if (inputs.cpuIdlePct !== null && inputs.cpuIdlePct < rule.minCpuIdlePct)
     return result('wait', 'cpu idle ' + inputs.cpuIdlePct + '% < ' + rule.minCpuIdlePct + '%');
   if (inputs.diskBusyPct !== null && rule.maxDiskBusyPct !== null && inputs.diskBusyPct > rule.maxDiskBusyPct)

@@ -41,7 +41,7 @@ describe('resource sampler', () => {
     expect(memoryPressureLevel(' 4\n')).toBe(4);
     expect(memoryPressureLevel('2')).toBe(2);
     expect(memoryPressureLevel('1')).toBe(1);
-    expect(memoryPressureLevel('3')).toBeNull();
+    expect(memoryPressureLevel('3')).toBe(3);
     expect(memoryPressureLevel('1junk')).toBeNull();
   });
   it('fix-cap signals: parses swap use from `sysctl vm.swapusage` (live 2026-10-10: 26.5 of 27.6 GB)', () => {
@@ -57,6 +57,25 @@ describe('resource sampler', () => {
     expect(snapshot.schema).toBe('resource-snapshot/1');
     expect(snapshot.fsevents.backlog).toBeNull();
     expect(snapshot.errors).toEqual([]);
+  });
+  it('records swap MB and growth against the previous sample; missing reads break the delta', () => {
+    let used = 100; let tick = 0;
+    const sampler = createSampler({ exec: (cmd, args) => {
+      if (cmd === 'sysctl' && args[1] === 'vm.swapusage') return used === null ? 'unreadable' : `total = 4096M used = ${used}M free = 0M`;
+      if (cmd === 'sysctl') return '2';
+      return cmd === 'ioreg' ? ioreg : '';
+    }, now: () => tick++ * 10000, cpus: () => [], freemem: () => 45, totalmem: () => 100,
+    readHeavySlots: () => ({}), countLanes: () => 0 });
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 100, swapGrowthMb: null });
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 100, swapGrowthMb: 0 });
+    used = 612;
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 612, swapGrowthMb: 512 });
+    used = null;
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: null, swapGrowthMb: null });
+    used = 100;
+    expect(sampler.sample().memory.swapGrowthMb).toBeNull();
+    used = 0;
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 0, swapGrowthMb: -100 });
   });
   it('isolates probe failures and uses elapsed deltas with bounded subprocesses', () => {
     let tick = 0;

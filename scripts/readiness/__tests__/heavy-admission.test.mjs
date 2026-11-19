@@ -951,6 +951,50 @@ describe('stale-waiter reap (xaipsbs)', () => {
 // "Test plan (each fails before the fix)" bullets.
 
 describe('loadAdmissionDecision (pure)', () => {
+  it.each([2, 3])('admits sticky warn %s with 45%% free and flat swap, exposing all decision inputs', (pressureLevel) => {
+    expect(loadAdmissionDecision({ idlePctSamples: [81], pressureLevel, freePct: 45, swapGrowthMb: 0 }))
+      .toMatchObject({ held: false, freePct: 45, swapGrowthMb: 0, warnMinFreePct: 20, warnSwapGrowthMb: 256 });
+  });
+
+  it.each([2, 3])('holds warn %s with low free memory and logs both corroborators', (pressureLevel) => {
+    const d = loadAdmissionDecision({ idlePctSamples: [81], pressureLevel, freePct: 10, swapGrowthMb: 0 });
+    expect(d.held).toBe(true);
+    expect(d.reason).toBe(`mem pressure ${pressureLevel} (>=2) corroborated: free 10% (<20%), swap +0MB (<=256MB)`);
+  });
+
+  it('holds warn with swap growth above the threshold despite plenty of free memory', () => {
+    const d = loadAdmissionDecision({ pressureLevel: 2, freePct: 45, swapGrowthMb: 512 });
+    expect(d.held).toBe(true);
+    expect(d.reason).toContain('swap +512MB (>256MB)');
+  });
+
+  it('critical always holds even with 45% free and flat swap', () => {
+    expect(loadAdmissionDecision({ pressureLevel: 4, freePct: 45, swapGrowthMb: 0 })).toMatchObject({ held: true });
+  });
+
+  it.each([{}, { freePct: NaN, swapGrowthMb: NaN }, { freePct: 101 }, { freePct: -1 }])
+    ('warn fails closed when both corroborators are unreadable: %j', (inputs) => {
+      const d = loadAdmissionDecision({ pressureLevel: 2, ...inputs });
+      expect(d.held).toBe(true);
+      expect(d.reason).toContain('warn corroboration unavailable: free ?% (?20%), swap ?MB (?256MB)');
+    });
+
+  it.each([{ freePct: 45 }, { swapGrowthMb: 0 }, { freePct: 20, swapGrowthMb: 256 }, { swapGrowthMb: -512 }])
+    ('one clean corroborator suffices, including exact thresholds and shrinking swap: %j', (inputs) => {
+      expect(loadAdmissionDecision({ pressureLevel: 2, ...inputs }).held).toBe(false);
+    });
+
+  it('uncorroborated warn continues to the load backstop and CPU checks', () => {
+    const inputs = { pressureLevel: 2, freePct: 45, swapGrowthMb: 0 };
+    expect(loadAdmissionDecision({ ...inputs, load1: 60, cores: 12 }).reason).toContain('backstop');
+    expect(loadAdmissionDecision({ ...inputs, idlePctSamples: [5] }).reason).toContain('cpu idle');
+  });
+
+  it('respects pure threshold overrides', () => {
+    expect(loadAdmissionDecision({ pressureLevel: 2, freePct: 10, swapGrowthMb: 512,
+      warnMinFreePct: 5, warnSwapGrowthMb: 1024 })).toMatchObject({ held: false, warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+  });
+
   it.each([
     [[null, undefined, 40], { held: false, idlePct: 40 }],
     [[null, undefined], { held: false, idlePct: null, reason: 'no-sample' }],
@@ -974,7 +1018,7 @@ describe('loadAdmissionDecision (pure)', () => {
     expect(d.reason).toMatch(/idle/i);
   });
 
-  it('holds on elevated memory pressure alone, even with comfortable idle (#4343 test-plan case 3)', () => {
+  it('holds warn without corroboration data, even with comfortable idle (fail-safe)', () => {
     const d = loadAdmissionDecision({ idlePctSamples: [50], pressureLevel: 2 });
     expect(d.held).toBe(true);
     expect(d.reason).toMatch(/pressure/i);
@@ -1143,6 +1187,72 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
   });
   afterEach(() => { rmSync(telemetryRoot, { recursive: true, force: true }); });
 
+  const seedMemory = ({ available = 45, free = 1, swaps = [0, 100, 100, 100, 100] } = {}) => {
+    writeFileSync(join(telemetryRoot, `${dayKey}.jsonl`), [
+      busyLine(81, NOW.toISOString()),
+      metricLine('host.mem.pressure_level', 2, NOW.toISOString()),
+      metricLine('host.mem.total_bytes', 100, NOW.toISOString()),
+      ...(available === null ? [] : [metricLine('host.mem.available_bytes', available, NOW.toISOString())]),
+      metricLine('host.mem.free_bytes', free, NOW.toISOString()),
+      // Deliberately reverse input order to prove oldest/latest are selected by timestamp.
+      ...swaps.map((mb, i) => metricLine('host.mem.swap_used_bytes', mb * 1024 * 1024,
+        new Date(NOW.getTime() - (swaps.length - i) * 1000).toISOString())).reverse(),
+    ].join(''));
+  };
+
+  it('reads latest available percent and windowed swap growth, admitting sticky warn', () => {
+    seedMemory();
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW, window: 4 })).toMatchObject({ freePct: 45, swapGrowthMb: 0 });
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW, window: 5 })).toMatchObject({ swapGrowthMb: 100 });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: false, freePct: 45, swapGrowthMb: 0 });
+  });
+
+  it('falls back to free_bytes and holds low free memory', () => {
+    seedMemory({ available: null, free: 10 });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, freePct: 10 });
+  });
+
+  it('holds on windowed swap growth and keeps a single swap sample unknown', () => {
+    seedMemory({ swaps: [100, 100, 100, 100, 612] });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, swapGrowthMb: 512 });
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW, window: 1 }).swapGrowthMb).toBeNull();
+  });
+
+  it('uses the admission settings cascade, environment and validated call overrides', () => {
+    seedMemory({ available: 10, swaps: [100, 612] });
+    const platform = join(telemetryRoot, 'preferences.json');
+    writeFileSync(platform, JSON.stringify({ heavyAdmission: { warnMinFreePct: 5, warnSwapGrowthMb: 1024 } }));
+    const env = { WE_PLATFORM_PREFERENCES: platform };
+    const options = { env, root: telemetryRoot, now: NOW };
+    expect(resolveLoadAdmission(options)).toMatchObject({ held: false, warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+    expect(resolveLoadAdmission({ ...options, env: { ...env, WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15' } })).toMatchObject({ held: true, warnMinFreePct: 15 });
+    expect(resolveLoadAdmission({ ...options, warnSwapGrowthMb: 256 })).toMatchObject({ held: true, warnSwapGrowthMb: 256 });
+    expect(resolveLoadAdmission({ ...options, warnMinFreePct: NaN, warnSwapGrowthMb: -1 })).toMatchObject({ held: false, warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 5 }, tool: { warnSwapGrowthMb: 1024 }, env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15' } });
+    expect(formatAdmissionPolicy(p)).toContain('warnMinFreePct=15 (env WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT)');
+    expect(formatAdmissionPolicy(p)).toContain('warnSwapGrowthMb=1024 (tool)');
+    expect(resolveAdmissionPolicy({ platform: { warnMinFreePct: 101, warnSwapGrowthMb: -1 } }).invalid).toHaveLength(2);
+  });
+
+  it('the real shared admit({kind}) path uses the same settings and corroboration in enforce mode', async () => {
+    const { admit } = await vi.importActual('../../lib/resource-admission.mjs');
+    seedMemory();
+    mkdirSync(join(telemetryRoot, 'resource'));
+    const snapshot = { sampledAt: NOW.toISOString(), freshUntil: new Date(NOW.getTime() + 10000).toISOString(),
+      cpu: { idlePct: 81, loadAvg: [1] }, memory: { pressureLevel: 2, freePct: 45, swapGrowthMb: 0 } };
+    const decide = (env = {}) => resolveLoadAdmission({ env, root: telemetryRoot, now: NOW, mode: 'enforce', shadow: () => undefined,
+      admitFn: (args) => admit({ ...args, root: telemetryRoot }) });
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide()).toMatchObject({ held: false, resourceAdmission: { decidedBy: 'admit', legacyHeld: false } });
+    expect(decide({ WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '50' })).toMatchObject({ held: true, resourceAdmission: { legacyHeld: true } });
+    snapshot.memory = { pressureLevel: 3, freePct: 45, swapGrowthMb: 512 };
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide().reason).toContain('swap +512MB (>256MB)');
+    snapshot.memory = { pressureLevel: 2 };
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide().reason).toContain('warn corroboration unavailable');
+  });
+
   it('reads idle_pct off the busy_pct ATTRIBUTE, truncated to the last `window` samples by timestamp — an older 5th sample outside the window is excluded', () => {
     const file = join(telemetryRoot, `${dayKey}.jsonl`);
     writeFileSync(file, [
@@ -1247,7 +1357,7 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
   });
 
   it('a missing day file reads as all-null/empty — not a read error', () => {
-    expect(readLatestLoad({ root: telemetryRoot, now: NOW })).toEqual({ idlePctSamples: [], pressureLevel: null, load1: null, cores: null });
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW })).toEqual({ idlePctSamples: [], pressureLevel: null, load1: null, cores: null, freePct: null, swapGrowthMb: null });
   });
 
   it('THE LIVE BEFORE/AFTER CONTRACT: the SAME real sampled idle% reading is admitted under one floor and held under a stricter one — proves the gate reacts to the actual numbers, not a canned verdict', () => {
@@ -1308,7 +1418,7 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
 
   it('WE_LOAD_ADMISSION=off bypasses the read entirely (admits, no fixture file needed)', () => {
     const r = resolveLoadAdmission({ env: { [LOAD_ADMISSION_SWITCH_ENV]: 'off' }, root: telemetryRoot, now: NOW });
-    expect(r).toEqual({ held: false, idlePct: null, minIdlePct: DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, pressureLevel: null, minPressureLevel: DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL, load1: null, cores: null, perCore: null, backstopPerCore: DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, bypassed: 'off' });
+    expect(r).toEqual({ held: false, idlePct: null, minIdlePct: DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, pressureLevel: null, minPressureLevel: DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL, load1: null, cores: null, perCore: null, backstopPerCore: DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, bypassed: 'off', freePct: null, swapGrowthMb: null, warnMinFreePct: 20, warnSwapGrowthMb: 256 });
   });
 
   it('a knob param can never arm/disarm the off/CI bypass switches — the switches read the REAL env only, ignoring any param passed alongside them', () => {
@@ -1330,10 +1440,10 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
 describe('the `load-status` CLI mode as a real process (#4343)', () => {
   it.each([
     [null, 1, null, 'admitted — mem pressure 1 (threshold 2)'],
-    [null, 2, null, 'HELD — mem pressure 2 (>=2)'],
+    [null, 2, null, 'HELD — mem pressure 2 (>=2) warn corroboration unavailable: free ?% (?20%), swap ?MB (?256MB)'],
     [40, 1, null, 'admitted — cpu idle 40.0% (min 15%)'],
     [null, 1, 4, 'admitted — mem pressure 1 (threshold 2)'],
-    [40, 2, 4, 'HELD — mem pressure 2 (>=2)'],
+    [40, 2, 4, 'HELD — mem pressure 2 (>=2) warn corroboration unavailable: free ?% (?20%), swap ?MB (?256MB)'],
     [null, 1, 20, 'HELD — load1 20.00/4 cores (5.00 > backstop 4)'],
   ])('reports pressure and preserves held/idle/backstop precedence: idle=%j pressure=%j load1=%j', (idle, pressure, load1, text) => {
     const telemetryRoot = mkdtempSync(join(tmpdir(), 'load-admission-cli-test-'));

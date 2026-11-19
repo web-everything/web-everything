@@ -80,6 +80,17 @@ describe('memory-available', () => {
 describe('R553 hard memory floor (fail closed)', () => {
   const ok = { availableMb: 8192, floorMb: 2048, pressureLevel: 1 };
   it('admits a healthy host', () => { expect(decideMemoryFloor(ok)).toMatchObject({ admit: true }); });
+  it.each([2, 3])('admits sticky warn %s with a clean corroborator and still enforces the MB floor', (pressureLevel) => {
+    expect(decideMemoryFloor({ ...ok, pressureLevel, freePct: 45 }).admit).toBe(true);
+    expect(decideMemoryFloor({ ...ok, pressureLevel, swapGrowthMb: 0 }).admit).toBe(true);
+    expect(decideMemoryFloor({ ...ok, pressureLevel, freePct: 45, availableMb: 1000 }).admit).toBe(false);
+  });
+  it('uses shared thresholds for warn corroboration and reports the decision inputs', () => {
+    const inputs = { ...ok, pressureLevel: 2, freePct: 10, swapGrowthMb: 512 };
+    expect(decideMemoryFloor(inputs).reason).toContain('free 10% (<20%), swap +512MB (>256MB)');
+    expect(decideMemoryFloor({ ...inputs, warnMinFreePct: 5, warnSwapGrowthMb: 1024 }).admit).toBe(true);
+    expect(decideMemoryFloor({ ...ok, pressureLevel: 4, freePct: 45, swapGrowthMb: 0 }).admit).toBe(false);
+  });
   it('refuses below the floor, and admits exactly at it', () => {
     expect(decideMemoryFloor({ ...ok, availableMb: 2047 })).toMatchObject({ admit: false });
     expect(decideMemoryFloor({ ...ok, availableMb: 2048 }).admit).toBe(true);
@@ -90,7 +101,7 @@ describe('R553 hard memory floor (fail closed)', () => {
   });
   it.each([
     ['no available reading', { availableMb: null }], ['NaN available', { availableMb: NaN }], ['string available', { availableMb: '9999' }],
-    ['no pressure', { pressureLevel: null }], ['unknown pressure level', { pressureLevel: 3 }],
+    ['no pressure', { pressureLevel: null }], ['unknown pressure level', { pressureLevel: 5 }],
     ['no floor', { floorMb: undefined }], ['zero floor', { floorMb: 0 }], ['stale snapshot', { snapshotFresh: false }],
   ])('refuses an unreadable input: %s', (_n, patch) => { expect(decideMemoryFloor({ ...ok, ...patch }).admit).toBe(false); });
   it('refuses with no arguments at all', () => { expect(decideMemoryFloor().admit).toBe(false); });
