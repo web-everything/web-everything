@@ -4819,6 +4819,16 @@ pinned HEAD blob and executable mode. Resolve it from the standard and platform 
 only; checkout settings and `WE_HEAVY_ADMISSION_REMOTE_MANIFEST` cannot override it, even
 in private pools. The policy log includes its source.
 Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
+Tracked transport is always rsync: Git bundles contain history outside the validated
+leaf manifest. Git-dependent tests refuse with `bundle-local`, including needsGit
+routing with a cached bundle capability and the host-overload route; record the refusal
+in the manifest log before local execution. Presync resolves the same canonical policy
+as admission and skips tracked or manifest-related fail-closed policies before any Git,
+SSH, rsync, lock or cache-state operation. Its legacy delta behavior is unchanged.
+The explicit remote CLI may force enablement only when manifest policy has not failed
+closed; retain and log the canonical refusal reason when entering local admission.
+Tracked admission refuses external client overrides before importing them: an older
+installed client may ignore the manifest option. The built-in client enforces the boundary.
 Coverage is never shipped in tracked mode, including `coverage/coverage-final.json` when
 ignored, untracked, staged or committed. Structure validation cannot bind coverage counters
 to genuine execution or HEAD. Commands that consume coverage input (`check:standards` or

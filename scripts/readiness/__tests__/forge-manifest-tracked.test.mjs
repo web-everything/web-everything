@@ -4,8 +4,9 @@ import * as fs from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { buildManifest, runRemote, defaultExec, FORGE_MANIFEST_SIZE_EXCEPTIONS } from '../remote-exec.mjs';
-import { resolveAdmissionPolicy, formatAdmissionPolicy } from '../heavy-admission.mjs';
+import { buildManifest, runRemote, main, defaultExec, FORGE_MANIFEST_SIZE_EXCEPTIONS } from '../remote-exec.mjs';
+import { resolveAdmissionPolicy, formatAdmissionPolicy, decideRemote, runWithRemoteDecision, createRemoteExec } from '../heavy-admission.mjs';
+import { easternTimestamp } from '../forge-exec-run.mjs';
 
 let root, cwd, env, log;
 const git = args => {
@@ -124,6 +125,100 @@ it('refuses an unsupported coverage file symlink without dispatch', async () => 
 it('coverage-consuming tracked commands fall back locally even when the report is absent', async () => {
   await fallback('coverage-local', { argv: ['npm', 'run', 'check:standards'] });
   expect(await lines()).toEqual([expect.objectContaining({ reason: 'coverage-local' })]);
+});
+it.each(['HEAD', 'history'])('tracked bundles refuse Git-dependent tests before shipping committed coverage from %s', async state => {
+  await write('git.test.mjs', "import {spawnSync} from 'node:child_process'; spawnSync('git', ['status']);\n");
+  await coverage({ 'clean.txt': { ...coverageEntry('clean.txt'), s: { 0: 126879297332596 } } });
+  git(['add', '-f', 'coverage/coverage-final.json']); commit();
+  if (state === 'history') { git(['rm', 'coverage/coverage-final.json']); commit(); }
+  await fallback('bundle-local', { transport: 'git-bundle', argv: ['npx', 'vitest', 'run', 'git.test.mjs'] });
+  expect(await lines()).toEqual([expect.objectContaining({ mode: 'tracked', reason: 'bundle-local' })]);
+});
+it('tracked bundle requests ship only a full tracked rsync manifest despite a usable warm base', async () => {
+  await write('pure.test.mjs', '// pure test\n');
+  await coverage({ 'clean.txt': { ...coverageEntry('clean.txt'), s: { 0: 126879297332596 } } });
+  git(['add', '-f', 'coverage/coverage-final.json']); commit();
+  const calls = [], requests = [], run = 'r-' + 'a'.repeat(32);
+  let expected;
+  const result = await runRemote({ cwd, env, manifestMode: 'tracked', transport: 'git-bundle',
+    argv: ['npx', 'vitest', 'run', 'pure.test.mjs'], sshOptions: [], log: vi.fn(),
+    exec: async call => {
+      calls.push(call);
+      if (call.file === 'git') return defaultExec(call);
+      if (call.file === 'rsync') return { code: 0, stdout: '' };
+      const action = call.args.at(-1).split(' ').at(-1);
+      const request = call.input ? JSON.parse(call.input) : {};
+      requests.push({action,request});
+      if (action === 'true') return { code: 0, stdout: '' };
+      if (action === 'bases') return { code: 0, stdout: JSON.stringify({delta:1,bases:[{sha:git(['rev-parse','HEAD']),manifestDigest:'b'.repeat(64)}]}) };
+      if (action === 'prepare') return { code: 0, stdout: JSON.stringify({run,capabilities:{commandClasses:1,gitBundle:1,gitWorktree:2}}) };
+      if (action === 'run') { expected = request; return { code: 0, stdout: '' }; }
+      if (action === 'finish') return { code: 0, stdout: JSON.stringify({v:1,nonce:expected.nonce,run,
+        inputDigest:expected.inputDigest,argvDigest:expected.argvDigest,lock:expected.lock,manifestDigest:expected.manifestDigest,phase:'test',code:0}) };
+      throw new Error('Unexpected remote operation');
+    } });
+  expect(result).toMatchObject({ mode: 'remote', code: 0 });
+  expect(result.timings.find(t => t.stage === 'rsync').shipMode).toBe('full');
+  expect(calls.filter(c => c.file === 'rsync')).toHaveLength(1);
+  const copy = calls.find(c => c.file === 'rsync');
+  expect(copy.args).toContain('--files-from=-');
+  expect(copy.args.some(a => /bundle|copy-dest/.test(a))).toBe(false);
+  expect(copy.input.toString()).not.toContain('coverage/');
+  expect(requests.some(r => r.action === 'base-manifest')).toBe(false);
+  expect(requests.find(r => r.action === 'prepare').request.gitBundle).toBeUndefined();
+  expect(expected.baseSha).toBeUndefined(); expect(expected.bundle).toBeUndefined();
+  expect(Buffer.from(expected.manifest.paths, 'base64').toString()).not.toContain('coverage/');
+});
+
+it.each(['always', 'overloaded'])('tracked needsGit routing refuses bundles locally when %s and logs bundle-local', async mode => {
+  await write('git.test.mjs', "import {spawnSync} from 'node:child_process'; spawnSync('git', ['status']);\n"); commit();
+  const argv = ['npx', 'vitest', 'run', 'git.test.mjs'];
+  const policy = resolveAdmissionPolicy({ platform: { remote: {enabled:true,mode:mode === 'always' ? 'always' : 'above-threshold',transport:'git-bundle',manifest:'tracked'} } });
+  expect(decideRemote({policy,argv,cwd,loadPerCore:10,runnerBundleOk:true})).toMatchObject({remote:false,needsGit:true,manifestRefusal:'bundle-local'});
+  const remoteExec = vi.fn(), output = vi.fn();
+  expect(await runWithRemoteDecision({policy,argv,cwd,env,lockRoot:join(root,'heavy'),remoteExec,log:output,
+    loadPerCore:()=>0,hostOverloaded:()=>mode === 'overloaded'})).toEqual({handled:false});
+  expect(remoteExec).not.toHaveBeenCalled();
+  expect(output).toHaveBeenCalledWith(expect.stringContaining('bundle-local'));
+  expect(await lines()).toEqual([expect.objectContaining({mode:'tracked',reason:'bundle-local'})]);
+});
+
+it.each(['invalid', 'missing', 'malformed', 'oversized', 'invalid object', 'unreadable'])('explicit remote CLI preserves the canonical %s manifest refusal and runs locally', async fault => {
+  const home = join(root,'host'), hostPath = join(home,'.claude','platform-preferences.json');
+  await fs.mkdir(join(home,'.claude'),{recursive:true});
+  if (fault === 'invalid') await fs.writeFile(hostPath,JSON.stringify({heavyAdmission:{remote:{manifest:'trackd',enabled:true}}}));
+  if (fault === 'malformed') await fs.writeFile(hostPath,'{');
+  if (fault === 'oversized') await fs.writeFile(hostPath,' '.repeat(256*1024+1));
+  if (fault === 'invalid object') await fs.writeFile(hostPath,'[]');
+  if (fault === 'unreadable') await fs.mkdir(hostPath);
+  const redirected = join(root,'redirected.json');
+  await fs.writeFile(redirected,JSON.stringify({heavyAdmission:{remote:{manifest:'legacy',enabled:true,mode:'always'}}}));
+  const remoteExec = vi.fn(), local = vi.fn(async()=>17), output = vi.fn();
+  const argv = ['npx','vitest','run','clean.test.mjs'];
+  expect(await main({argv,cwd,home,env:{...env,WE_PLATFORM_PREFERENCES:redirected},lockRoot:join(root,'heavy'),remoteExec,local,log:output})).toBe(17);
+  expect(remoteExec).not.toHaveBeenCalled(); expect(local).toHaveBeenCalledWith(argv);
+  expect(output).toHaveBeenCalledWith(expect.stringContaining(fault === 'invalid' ? 'invalid remote.manifest; local execution required' : 'canonical remote.manifest unavailable; local execution required'));
+});
+it.each(['legacy','tracked'])('explicit remote CLI still forces enabled/always for valid %s policy and dispatches the effective transport', async manifest => {
+  const home = join(root,'host'); await fs.mkdir(join(home,'.claude'),{recursive:true});
+  await fs.writeFile(join(home,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{manifest,enabled:false,transport:'git-bundle'}}}));
+  await write('pure.test.mjs','// pure test\n'); commit();
+  const remoteExec = vi.fn(async()=>({mode:'remote',code:0})), local = vi.fn(), output = vi.fn();
+  const now = Date.now();
+  expect(await main({argv:['npx','vitest','run','pure.test.mjs'],cwd,home,env,lockRoot:join(root,'heavy'),remoteExec,local,log:output,
+    clock:()=>now,readTelemetry:async()=>({sampledAtET:easternTimestamp(now),cores:8,loadPerCore:0.1,memFreePct:96,activeRuns:0,recent:[]})})).toBe(0);
+  expect(local).not.toHaveBeenCalled();
+  expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({manifestMode:manifest,transport:manifest === 'tracked' ? 'rsync' : 'git-bundle'}));
+  expect(output).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=true (explicit remote CLI request); mode=always'));
+});
+it('tracked admission refuses an external client before importing code that could ignore manifestMode', async () => {
+  const clientPath = join(root,'remote-exec.mjs'); await fs.writeFile(clientPath,'export function runRemote() {}');
+  const policy = resolveAdmissionPolicy({platform:{remote:{manifest:'tracked',clientPath}}});
+  const importClient = vi.fn(), output = vi.fn();
+  const execute = createRemoteExec({policy,cwd,env,laneRoots:[],importClient,log:output});
+  expect(await execute({manifestMode:'tracked',transport:'rsync'})).toMatchObject({mode:'not-started',terminated:true,reason:'remote client override: tracked manifest requires built-in client'});
+  expect(importClient).not.toHaveBeenCalled();
+  expect(output).toHaveBeenCalledWith(expect.stringContaining('tracked manifest requires built-in client'));
 });
 it('legacy still ships ignored coverage with text and crafted counters with shadow on or off', async () => {
   const value = { 'clean.txt': { ...coverageEntry('clean.txt'), text: 'private', s: { 0: 126879297332596 } } };

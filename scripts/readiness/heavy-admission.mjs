@@ -427,7 +427,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     settings.remote.enabled = false;
     sources['remote.enabled'] = 'platform (invalid remote.manifest; local execution required)';
   }
-  return { settings, sources, invalid, ignored };
+  return { settings, sources, invalid, ignored, ...(invalidPlatformManifest ? { manifestFailClosed: true } : {}) };
 }
 
 const admissionPolicyCache = new Map();
@@ -505,6 +505,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
   } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
   if (canonicalManifestReadFailed) {
+    policy.manifestFailClosed = true;
     policy.settings.remote.enabled = false;
     policy.sources['remote.enabled'] = 'platform (canonical remote.manifest unavailable; local execution required)';
   }
@@ -805,10 +806,10 @@ export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = 
   const remote = policy.settings.remote;
   const enabled = `remote.enabled=${remote.enabled} (${policy.sources['remote.enabled'] ?? 'standard'})`;
   if (!remote.enabled) return { remote: false, reason: enabled };
-  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
+  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk), remote.manifest);
   if (!Number.isFinite(loadPerCore)) return { remote: false, reason: `${enabled}; load-unreadable` };
   const above = loadPerCore > remote.loadPerCoreThreshold;
-  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
+  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk), remote.manifest);
 }
 
 /** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
@@ -831,11 +832,15 @@ export function writeRunnerCapabilities({ root, host, capabilities, clock = Date
 
 /** R501: a remote decision for a run naming a git-spawning test file becomes local with the named reason `needs-git`. */
 /** R593: git-needing tests stay remote only when transport=git-bundle AND the runner recently advertised gitBundle:1. */
-function bundleKeepsRemote(remote, runnerBundleOk) { return remote.transport === 'git-bundle' && runnerBundleOk === true; }
-function withNeedsGit(decision, argv, cwd, bundleOk = false) {
+function bundleKeepsRemote(remote, runnerBundleOk) { return remote.manifest === 'legacy' && remote.transport === 'git-bundle' && runnerBundleOk === true; }
+function withNeedsGit(decision, argv, cwd, bundleOk = false, manifestMode = 'legacy') {
   if (!decision.remote || bundleOk) return decision;
-  let route; try { route = routeNeedsGit({ argv, cwd: cwd ?? process.cwd() }); } catch { return decision; }
-  return route.local ? { remote: false, needsGit: true, reason: `${decision.reason}; ${route.reason}: ${route.files.join(', ')}` } : decision;
+  let route; try { route = routeNeedsGit({ argv, cwd: cwd ?? process.cwd() }); } catch {
+    if (manifestMode === 'legacy') return decision;
+    route = {local:true,reason:'needs-git',files:[]};
+  }
+  const manifestRefusal = manifestMode === 'tracked' ? 'bundle-local' : undefined;
+  return route.local ? { remote: false, needsGit: true, ...(manifestRefusal ? {manifestRefusal} : {}), reason: `${decision.reason}; ${manifestRefusal ?? route.reason}: ${route.files.join(', ')}` } : decision;
 }
 
 const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
@@ -1048,6 +1053,9 @@ export function createRemoteExec({
       return { mode: 'not-started', terminated: true, reason: `remote client override: ${reason}` };
     };
     if (client.reason) return ignored(client.reason);
+    // An installed older client may ignore manifestMode. Only the built-in
+    // client is known to enforce this checkout's tracked boundary.
+    if (policy.settings.remote.manifest === 'tracked') return ignored('tracked manifest requires built-in client');
     let remote;
     try {
       remote = await importClient(pathToFileURL(client.clientPath).href);
@@ -1264,10 +1272,14 @@ export async function runWithRemoteDecision({
   const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock, unknownOk: !externalClient });
   let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
   if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
-    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);
+    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, bundleKeepsRemote(policy.settings.remote, runnerBundleOk), policy.settings.remote.manifest);
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
-  if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
+  if (decision.needsGit) recordRemoteFallback({lockRoot, reason: decision.manifestRefusal ?? 'needs-git', cwd, argv, env, clock});
+  if (decision.manifestRefusal) {
+    const {logManifestVerdict} = await import('./forge-manifest-tracked.mjs');
+    await logManifestVerdict({env,mode:policy.settings.remote.manifest,error:{code:decision.manifestRefusal}});
+  }
   if (!decision.remote) return { handled: false };
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason, detail = null) => {
@@ -1493,7 +1505,7 @@ export async function runWithRemoteDecision({
     });
     const dispatch = () => {
       executionRun = null;
-      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, manifestMode: policy.settings.remote.manifest, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.manifest === 'tracked' ? 'rsync' : policy.settings.remote.transport, manifestMode: policy.settings.remote.manifest, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: (run, metadata) => {
         if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;

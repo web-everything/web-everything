@@ -1307,7 +1307,11 @@ async function acquirePresyncLock(path,fs) {
 }
 // One presync round. Every failure is recorded in the lane state and never
 // thrown: a run must behave exactly as without presync.
-export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,fs=filesystem,sshOptions,env=process.env,clock=Date.now}={}) {
+export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,fs=filesystem,sshOptions,env=process.env,clock=Date.now,home}={}) {
+  const {loadAdmissionPolicy} = await import('./heavy-admission.mjs');
+  const policy = loadAdmissionPolicy({env,checkoutRoot:cwd,home});
+  if (policy.manifestFailClosed || policy.settings.remote.manifest !== 'legacy')
+    return {status:'skipped',reason:policy.manifestFailClosed ? policy.sources['remote.enabled'] : 'tracked-manifest'};
   if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))return {status:'failed',reason:'invalid-host'};
   try {exec=await bindGit({cwd,env,exec});}catch {return {status:'failed',reason:'unbound-worktree'};}
   const gitDir=exec[gitBinding].dir;
@@ -1444,11 +1448,21 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const {collect:collectGuard} = guardCollector;
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
-  const bundleTransport=resolveTransport(transport)==='git-bundle';
+  const bundleRequested=resolveTransport(transport)==='git-bundle';
+  // Git history is outside the tracked leaf manifest, even when its tip is clean.
+  const bundleTransport=manifestMode === 'legacy' && bundleRequested;
   const standardsNeedGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
-  // git-bundle only: a test file that spawns git also gets a real worktree (otherwise it stays on the git-less snapshot).
+  // Legacy bundles provide a real worktree. Tracked runs must keep Git-dependent tests local.
   let testNeedsGit=false;
-  if(bundleTransport&&!standardsNeedGit)testNeedsGit=detectTestNeedsGit({argv,cwd});
+  if(!standardsNeedGit) {
+    if(bundleRequested)testNeedsGit=detectTestNeedsGit({argv,cwd});
+    else if(manifestMode === 'tracked')testNeedsGit=detectTestNeedsGit({argv,cwd,unproven:()=>false});
+  }
+  if (manifestMode === 'tracked' && testNeedsGit) {
+    const error=manifestRefusal('bundle-local','.');
+    await logManifestVerdict({env,mode:manifestMode,error});
+    return fallback(error.code,error.detail);
+  }
   const needsGit=standardsNeedGit||testNeedsGit;
   let bundleDirectory;
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
@@ -1814,10 +1828,13 @@ export async function main(options = {}) {
   if (!isAllowedCommand(normalizeRemoteArgv(splitGuardReport(options.argv).argv))) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
   const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
-  const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});
-  const policy = {...loaded,settings:{...loaded.settings,remote:{...loaded.settings.remote,enabled:true,mode:'always'}},sources:{...loaded.sources}};
-  policy.sources['remote.enabled'] = 'explicit remote CLI request';
-  policy.sources['remote.mode'] = 'explicit remote CLI request';
+  const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd,home:options.home});
+  const policy = {...loaded,settings:{...loaded.settings,remote:{...loaded.settings.remote}},sources:{...loaded.sources}};
+  if (!loaded.manifestFailClosed) {
+    Object.assign(policy.settings.remote,{enabled:true,mode:'always'});
+    policy.sources['remote.enabled'] = 'explicit remote CLI request';
+    policy.sources['remote.mode'] = 'explicit remote CLI request';
+  }
   let capturedTimings;
   const remoteExecutor=options.remoteExec ?? (async decisionOptions=>adaptLegacyRemoteResult(await runRemote({...options,...decisionOptions})));
   const result = await runWithRemoteDecision({
