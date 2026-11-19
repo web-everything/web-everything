@@ -12,12 +12,14 @@
  * A shard with zero assigned files (more shards than break files) is a clean, logged no-op success — not an
  * error — so the shard count can grow ahead of the break count without turning red.
  * CI appends quarantine-skip's whole-file exclusions. Apply them AFTER assignment so quarantining a test
- * never moves other tests between shards. A fully quarantined shard is also a logged no-op success.
+ * never moves other tests between shards. A shard emptied by anything but active job-tagged quarantine entries FAILS
+ * (shard-plan.mjs), as do more than 5 exclusions.
  */
 
 import { spawnSync } from 'node:child_process';
 import { shardFiles, parseShardArg, REPO_ROOT } from './shard-files.mjs';
 import { admittedArgv } from '../../readiness/heavy-admission.mjs';
+import { planShard } from './shard-plan.mjs';
 
 function main(argv) {
   const { shard, total } = parseShardArg(argv, 'usage: run-shard.mjs --shard=<i>/<N>');
@@ -25,13 +27,14 @@ function main(argv) {
   // These are exact repo-relative file identities, not Vitest globs. CI's quarantine adapter owns the
   // eligibility guards (main, repair PRs, changed files, expiry and unknown evidence all run everything).
   const excluded = new Set(argv.filter((a) => a.startsWith('--exclude=')).map((a) => a.slice('--exclude='.length)));
-  const files = assigned.filter((file) => !excluded.has(file));
-  const skipped = assigned.length - files.length;
+  // `--quarantined=<file>` is emitted ONLY by quarantine-skip for an active entry tagged for this exact job.
+  const quarantined = new Set(argv.filter((a) => a.startsWith('--quarantined=')).map((a) => a.slice('--quarantined='.length)));
+  const plan = planShard({ assigned, excluded, quarantined });
+  const { files, skipped } = plan;
   if (skipped) process.stdout.write(`soak shard ${shard}/${total}: ${skipped} quarantined file(s) skipped.\n`);
-
-  if (!files.length) {
-    process.stdout.write(`soak shard ${shard}/${total}: ${assigned.length ? 'all assigned files quarantined' : 'no scenario files assigned to this shard'} — nothing to run.\n`);
-    return 0;
+  if (plan.exit !== null) {
+    process.stdout.write(`soak shard ${shard}/${total}: ${plan.message}.\n`);
+    return plan.exit;
   }
 
   process.stdout.write(`soak shard ${shard}/${total}: running ${files.length} file(s):\n${files.map((f) => `  ${f}`).join('\n')}\n`);
