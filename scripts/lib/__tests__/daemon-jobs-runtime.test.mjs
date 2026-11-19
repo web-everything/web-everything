@@ -27,6 +27,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = resolve(HERE, '..', 'daemon-jobs-runtime.mjs');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// A killed orphan stays a zombie (kill(pid, 0) still succeeds) when its reaper never waits, e.g. a container PID 1
+// that is not an init. A zombie is dead for these tests.
+const isAlive = (pid) => {
+  try { process.kill(pid, 0); } catch { return false; }
+  try { return !/^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return true; }
+};
 async function waitFor(fn, timeoutMs = 10_000) {
   const end = Date.now() + timeoutMs;
   for (;;) {
@@ -607,7 +613,7 @@ describe('stopping a job that owns subprocesses', () => {
     let out = '';
     parent.stdout.on('data', (b) => { out += b; });
     const childPid = Number(await waitFor(() => out.trim()));
-    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const alive = isAlive;
     try {
       await waitFor(() => readProcStart(parent.pid));
       const handle = formatJobHandle({ host: hostName(), pid: parent.pid, procStart: readProcStart(parent.pid) });
@@ -628,7 +634,7 @@ describe('stopping a job that owns subprocesses', () => {
     let out = '';
     parent.stdout.on('data', (b) => { out += b; });
     const childPid = Number(await waitFor(() => out.trim()));
-    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const alive = isAlive;
     try {
       const procStart = await waitFor(() => readProcStart(parent.pid));
       const handle = formatJobHandle({ host: hostName(), pid: parent.pid, procStart });
