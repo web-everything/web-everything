@@ -18,7 +18,7 @@ import { basename, dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
-import { retireRegistration } from '../daemon-overlay.mjs';
+import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
 import { assertHumanOperator, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
@@ -28,6 +28,7 @@ import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, t
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
+import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason, urgentKeyPath, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -235,7 +236,8 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
   return merged;
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
+  readState = readOverlayState,
+  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
   carryLogPath, recordCarry = recordWaiverCarry,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
@@ -460,21 +462,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           deps: {
             // Explicit operator withdrawal uses the existing guarded retirement transaction:
             // entry identity, durable drop intent and post-drop tip check all stay enforced.
-            prove: () => {
-              const state = readOverlayState(out.clone, { env: childEnv });
-              const stacked = state.overlays.some((r) => r.ref !== input.remove && r.stackBases?.includes(input.remove));
-              if (state.corrupt || stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
-              const current = requireGit('ls-remote', 'origin', `refs/heads/${input.remove}`).split(/\s+/)[0];
-              // stackBases is only a cache. Re-prove ancestry under the add guard so
-              // an uncached or newly registered stack top cannot lose its base.
-              for (const other of state.overlays.filter((r) => r.ref !== input.remove)) {
-                if (!safeRegistrationRef(other.ref)) return { action: 'keep', reason: 'unreadable-stack-evidence' };
-                requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
-                const otherTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${other.ref}^{commit}`);
-                if (!validSha(otherTip) || ancestor(tip, otherTip)) return { action: 'keep', reason: 'stacked-dependents' };
-              }
-              return { action: 'retire', tip: current, reason: input.reason };
-            },
+            prove: () => proveOverlayWithdrawal({ root: out.clone, ref: input.remove, tip, reason: input.reason, env: childEnv, git }),
             tip: (ref) => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0],
           } }));
         const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load',
@@ -533,27 +521,78 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
+      let urgentCiFailed = false;
       const readTestCheck = testCheck || (({ sha }) => {
+        let apiUnavailable = false;
         const gh = (args) => {
           try { return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: gitRepo, env: childEnv,
             encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024, throttle: { caller: 'prototype-load', ...(exec !== execFileSync ? { exec: (ghArgs, ghOpts) => exec('gh', ghArgs, ghOpts) } : {}) } })) }; }
-          catch { return { code: 1, stdout: '' }; }
+          catch (e) {
+            if (e.code === 'ENOBUFS' || /maxBuffer/i.test(String(e.message))) throw e;
+            apiUnavailable = true;
+            return { code: 1, stdout: '' };
+          }
         };
         const origin = resolveOriginRepository({ git: (args) => git(...args), gh });
-        if (!origin.repo) return null;
+        if (!origin.repo) {
+          if (apiUnavailable) return null;
+          throw new Error('unreadable CI repository');
+        }
         const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
         if (result.code !== 0) return null;
+        const data = JSON.parse(result.stdout);
+        // Any observed exact-SHA failure vetoes urgent loading, independently of suite selection or binding.
+        urgentCiFailed = input.urgent && Array.isArray(data?.check_runs) && data.check_runs.some(r =>
+          r?.head_sha === sha && r.status === 'completed'
+          && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(r.conclusion));
+        if (urgentCiFailed) return null;
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
-        const evidence = testCheckEvidence(JSON.parse(result.stdout), sha);
+        if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
+          || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count
+          || data.check_runs.some(r => !r || !Number.isSafeInteger(r.id) || !validSha(r.head_sha)
+            || typeof r.name !== 'string' || !Number.isSafeInteger(r.app?.id) || !Number.isSafeInteger(r.check_suite?.id)
+            || !['queued', 'in_progress', 'completed'].includes(r.status)
+            || (r.status === 'completed' ? !['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion) : r.conclusion !== null)))
+          throw new Error('malformed, incomplete or oversized CI checks');
+        const evidence = testCheckEvidence(data, sha);
         if (!evidence) return null;
         // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
         const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
         if (runs.code !== 0) return null;
-        return testWorkflowBound(evidence, JSON.parse(runs.stdout), sha, config.testWorkflowPath) ? evidence : null;
+        const runsData = JSON.parse(runs.stdout);
+        if (!Number.isInteger(runsData?.total_count) || runsData.total_count < 0 || runsData.total_count > 100
+          || !Array.isArray(runsData.workflow_runs) || runsData.workflow_runs.length !== runsData.total_count
+          || runsData.workflow_runs.some(r => !r || !Number.isSafeInteger(r.check_suite_id) || !validSha(r.head_sha) || typeof r.path !== 'string'))
+          throw new Error('malformed, incomplete or oversized CI workflows');
+        const bound = testWorkflowBound(evidence, runsData, sha, config.testWorkflowPath);
+        if (input.urgent && !bound) throw new Error('unbound CI workflow');
+        return bound ? evidence : null;
       });
-      const checkRun = await readTestCheck({ sha: input.sha, branch: input.branch });
-      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success')
-        return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
+      if (input.urgent && !urgentReason(input.reason)) return stop('no-ready', { detail: 'no-urgent-marker', fallback: 'Supply --reason with at least 10 characters after trimming, or wait for passing CI.' });
+      let checkRun;
+      try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
+      catch (e) { return stop('no-ready', { detail: 'ci-evidence-unreadable', error: String(e.message || e),
+        fallback: 'Repair the CI evidence reader or wait for complete, readable CI evidence (at most 100 checks and workflow runs), then retry.' }); }
+      if (urgentCiFailed || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
+        return stop('no-ready', { detail: 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
+      if (input.urgent && checkRun != null && !(checkRun.sha === input.sha && checkRun.name === 'test'
+        && (['queued', 'in_progress'].includes(checkRun.status)
+          || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
+        return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
+      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
+        if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
+        let ledger, shards, expectedSteps, origin;
+        try {
+          origin = normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin'));
+          ledger = fs.readFileSync(urgentLedger(env.HOME), 'utf8');
+          const plan = ciUnitPlan(fs.readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8'));
+          shards = plan.length;
+          expectedSteps = ['fetch-main-history', 'install-fui', 'install', ...plan.map(s => `unit:${s.group ?? 'unit'}:${s.shard}`), 'coverage', 'hostPaths', 'integration', 'standards'];
+        } catch { /* Missing or unreadable evidence fails closed below. */ }
+        const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
+        if (!urgent.ok) return stop('no-ready', urgent);
+        checkRun = urgent.evidence;
+      }
       const canonical = out.canonicalAudit.record;
       // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
       // becomes this sha's latest readiness. Keep the fingerprint that evidence already stores for this exact sha, or
@@ -757,29 +796,55 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const movedTip = requireGit('rev-parse', `origin/${out.effectiveRef}`);
       if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip });
       stage = 'register-failed';
-      if (input.replace) {
-        const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
-          `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
-        out.registration = result;
-        const data = lastJson(result);
-        if (data?.registered === true) out.registered = true;
-        if (result.code !== 0 || data?.replaced !== true) {
-          return stop(out.registered ? 'replace-incomplete' : 'register-failed', { detail: data?.refused || 'replace failed',
-            fallback: `The old registration ${input.replace} was kept. Fix the refusal and rerun.` });
+      let urgentIntent;
+      const appendUrgent = record => {
+        const file = urgentLedger(env.HOME, 'urgent-loads');
+        fs.mkdirSync(dirname(file), { recursive: true });
+        fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+      };
+      if (input.urgent) {
+        urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
+        // Persist intent before any registration mutation; failure refuses admission.
+        appendUrgent(urgentIntent);
+      }
+      try {
+        if (input.replace) {
+          const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
+            `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
+          out.registration = result;
+          const data = lastJson(result);
+          if (data?.registered === true) out.registered = true;
+          if (result.code !== 0 || data?.replaced !== true) {
+            return stop(out.registered ? 'replace-incomplete' : 'register-failed', { detail: data?.refused || 'replace failed',
+              fallback: `The old registration ${input.replace} was kept. Fix the refusal and rerun.` });
+          }
+          const evidence = data.conflictCheck;
+          if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+            return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
+          }
+          out.replaced = input.replace;
+        } else if (out.registered !== 'already') {
+          const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
+          out.registration = result;
+          if (result.code !== 0) return stop('register-failed');
+          out.registered = true;
+          const evidence = lastJson(result)?.conflictCheck;
+          if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+            return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
+          }
         }
-        const evidence = data.conflictCheck;
-        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
-          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
-        }
-        out.replaced = input.replace;
-      } else if (out.registered !== 'already') {
-        const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
-        out.registration = result;
-        if (result.code !== 0) return stop('register-failed');
-        out.registered = true;
-        const evidence = lastJson(result)?.conflictCheck;
-        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
-          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
+      } finally {
+        // The command can fail after persisting the registration (for example, on event append).
+        // Cancel tracking only with readable evidence that this clone/ref is absent.
+        if (urgentIntent && !out.registered) {
+          let absent = false;
+          try {
+            const state = await readState(out.clone, { env: childEnv });
+            absent = state?.corrupt === false && Array.isArray(state.overlays)
+              && state.overlays.every(e => safeRegistrationRef(e?.ref) && e.ref !== out.effectiveRef);
+          } catch { /* Unknown state keeps the persisted urgent intent monitored. */ }
+          if (absent) appendUrgent({ ...urgentIntent,
+            type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
         }
       }
       const readyPath = expand(config.readyRecordPath);
