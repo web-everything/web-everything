@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-/** R1082 commit/push backstop. Never substitutes a guessed HEAD range for push evidence.
+/** R1082 commit/push backstop. Require mode refuses absent push ranges.
  * New remote refs scan all history reachable from the pushed SHA; updates scan remote..local.
- * Missing/unreadable/malformed ref evidence fails closed: retry the push with valid Git stdin.
+ * Malformed/unreadable evidence fails closed; auto mode visibly falls back for empty ranges.
  */
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { delimiter, join, resolve } from 'node:path';
@@ -43,6 +43,21 @@ export function gitleaksGuard({ phase, input = '', mode = 'auto', env = process.
   try { commands = phase === 'pre-commit' ? [['protect', '--staged', '--redact']]
     : pushedRanges(input).map(range => ['detect', '--redact', `--log-opts=${range}`]); }
   catch (e) { log(e.message); return 1; }
+  if (phase === 'pre-push' && commands.length === 0) {
+    if (mode === 'require') {
+      log('No pre-push ranges supplied; mode=require refuses unscanned push. Retry through Git with ref evidence.');
+      return 1;
+    }
+    log('No pre-push ranges supplied; mode=auto falls back to scanning HEAD~1..HEAD (HEAD for a single commit). This does not verify all pushed history.');
+    const parent = run('git', ['rev-list', '--max-count=2', 'HEAD'], { env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+    const commits = String(parent.stdout ?? '').trim().split('\n');
+    if (parent.error || parent.status !== 0 || commits.length > 2
+      || !commits.every(sha => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha))) {
+      log('Cannot determine HEAD parent; repair Git evidence and retry.');
+      return 1;
+    }
+    commands = [['detect', '--redact', `--log-opts=${commits.length === 2 ? 'HEAD~1..HEAD' : 'HEAD'}`]];
+  }
   for (const args of commands) {
     const result = run(binary, args, { env, stdio: ['ignore', 'inherit', 'inherit'], timeout: 300000, maxBuffer: 1024 * 1024 });
     if (result.error || result.status !== 0) { log('gitleaks refused this operation (findings or scanner failure); inspect scanner output and repair before retrying.'); return 1; }

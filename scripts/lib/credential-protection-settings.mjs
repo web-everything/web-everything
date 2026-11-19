@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, readPlatformPreferences } from './policy-cascade.mjs';
-import { DEFAULT_CREDENTIAL_PROTECTION, STRICT_CREDENTIAL_PROTECTION, validProtectedPaths } from './credential-protection.mjs';
+import { DEFAULT_CREDENTIAL_PROTECTION, STRICT_CREDENTIAL_PROTECTION, validProtectedPaths, withProtectedPathFloor } from './credential-protection.mjs';
 
 export function resolveCredentialProtection({ platform = {}, tool = {}, env = {}, invalid = false, log = () => {} } = {}) {
   const object = v => v && typeof v === 'object' && !Array.isArray(v);
@@ -15,10 +15,14 @@ export function resolveCredentialProtection({ platform = {}, tool = {}, env = {}
     || (key === 'gitleaks' ? object(value) && Object.keys(value).every(k => k === 'mode')
       : Object.hasOwn(valid, key)));
   const r = resolveCascade({ standard: DEFAULT_CREDENTIAL_PROTECTION, platform, tool,
-    envValues: { gitleaks: env.WE_GITLEAKS_MODE === undefined ? undefined : { mode: env.WE_GITLEAKS_MODE } }, valid });
+    envValues: { gitleaks: env.WE_GITLEAKS_MODE === 'require' ? { mode: 'require' } : undefined }, valid });
   const strict = invalid || !shape(platform) || !shape(tool) || r.invalid.length > 0;
   const settings = strict ? structuredClone(STRICT_CREDENTIAL_PROTECTION) : r.value;
+  settings.protectedPaths = withProtectedPathFloor(settings.protectedPaths);
   delete settings.$comment;
+  if (env.WE_GITLEAKS_MODE !== undefined && env.WE_GITLEAKS_MODE !== 'require') {
+    log('credential-protection: ignored WE_GITLEAKS_MODE; environment may only select require.');
+  }
   log(`credential-protection: ${strict ? 'INVALID evidence; strict defaults (restore settings to recover)' : Object.entries(r.sources).filter(([k]) => k !== '$comment').map(([k, source]) => `${k}=${JSON.stringify(k.split('.').reduce((v, p) => v?.[p], settings))} (${source})`).join(', ')}`);
   return { settings, sources: strict ? { fallback: 'strict-defaults' } : r.sources };
 }

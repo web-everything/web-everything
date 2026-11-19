@@ -12,10 +12,23 @@ commit/push. Four layers reduce that risk:
 
 Configure `scripts/settings/credential-protection.json` (R528). Settings resolve
 standard → platform `credentialProtection` → tool → environment (`WE_GITLEAKS_MODE`
-only), reporting effective values and sources. Invalid/unreadable settings restore
+only, and only to select `require`), reporting effective values and sources. Weaker
+environment values are ignored with a notice. Invalid/unreadable settings restore
 the strict defaults, including requiring gitleaks; repair settings to recover.
 `auto` runs an installed gitleaks or prints **secret scan SKIPPED** with an install
-hint; `require` fails when missing; `off` visibly disables scanning.
+hint and returns success when the scanner is missing: this is the intended operator
+policy. Set `mode: "require"` for the strict option, which refuses missing scanners.
+`off` visibly disables scanning when selected in the settings file.
+
+Custom `protectedPaths` always extend the built-in floor: `~/.ssh`, `~/.gnupg`,
+`~/.aws`, `~/.docker`, `~/.kube`, `~/.netrc`, `~/.secrets`,
+`~/.config/gh/hosts.yml`, and `.env*`. They cannot remove these protections.
+`.env*` matches the basename in any directory, including outside the repository.
+
+When pre-push evidence yields no ranges (including deletion-only input), `require`
+refuses the push and asks for ref evidence. `auto` prints a notice and scans
+`HEAD~1..HEAD`, or `HEAD` for a single commit. That fallback does not verify all
+pushed history. Malformed evidence still refuses the operation.
 
 Apply deliberately with `node scripts/bootstrap-session.mjs install`; preview with
 `node scripts/bootstrap-session.mjs install --dry-run`, verify with `--check`, and
@@ -24,8 +37,10 @@ undo owned entries with `node scripts/bootstrap-session.mjs uninstall` (also sup
 ownership manifest in `~/.plateau/hooks/` records additions; modified hook files
 require operator review. Use a scratch `HOME` for tests, never the real HOME.
 
-SSH (including `ssh -i`), ssh-add, Git, gh auth, scp/rsync credential handling and
-directory listings (`ls`, including `-l`) follow normal permission flow. Content
+Only `ssh` (including `ssh -i` and remote command text), `ssh-add`, and directory
+listings (`ls`, including `-l`) bypass argument checks. Redirects and nested local
+commands remain checked. Git, gh, scp, rsync, and curl deny protected path arguments;
+Git/gh commands without those arguments follow normal permission flow. Content
 reads, copies, archives, transforms, interpreters referencing protected paths and input
 redirections deny. The Bash matcher exempts exact `.env.example`, `.env.sample`,
 `.env.template`; permission deny globs cannot express exceptions and cover these too.
