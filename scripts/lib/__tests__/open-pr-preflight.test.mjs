@@ -17,14 +17,11 @@ describe('open-pr preflight presentation', () => {
     expect(mergeBlockers([audit], [audit, verify], [])).toEqual([audit, verify]);
     expect(audit.hint).toContain(`waiver request for sha ${'a'.repeat(40)}`);
   });
-  it('plans --check without requiring a body and renders neutral success/queue outcomes', () => {
+  it('plans --check without requiring a body and renders preflight success', () => {
     const plan = planOpen({ ref: 'lane/x', base: 'main', mode: 'no-wait', check: true });
     expect(plan.argv).toContain('--check');
-    for (const [reason, outcome] of [['check-ok', 'checked'], ['pr-limit-queued', 'queued']]) {
-      const result = classifySubmit({ status: 0, stdout: JSON.stringify({ reason }) });
-      expect(result.outcome).toBe(outcome);
-      expect(describeSubmit(result).failed).toBe(false);
-    }
-    expect(describeSubmit({ outcome: 'queued' }).line).toContain('opens automatically when a slot frees');
+    const result = classifySubmit({ status: 0, stdout: JSON.stringify({ reason: 'check-ok' }) });
+    expect(result.outcome).toBe('checked');
+    expect(describeSubmit(result).failed).toBe(false);
   });
 });

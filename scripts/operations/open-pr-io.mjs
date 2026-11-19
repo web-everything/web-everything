@@ -226,7 +226,7 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
       }
     }
     let audit;
-    try { audit = canonicalAudit({ repo: cwd, ref: arg('ref'), sha: arg('sha'), env, ...(checking ? { fetchMain: () => {} } : {}) }); }
+    try { audit = canonicalAudit({ repo: cwd, ref: arg('ref'), sha: arg('sha'), env, refreshMain: checking }); }
     catch { audit = { ok: false, reason: 'canonical-audit-missing', message: 'canonical audit check failed; resolve the full head sha and run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' }; }
     if (audit?.ok !== true) collect('canonical-audit', audit?.reason || 'canonical-audit-missing',
       audit?.message || 'canonical audit check returned no decision', audit?.sha || arg('sha'));

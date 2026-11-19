@@ -1054,7 +1054,6 @@
   "scripts/lib/__tests__/open-pr-cap-scope.test.mjs": 0.05,
   "scripts/lib/__tests__/open-pr-items.test.mjs": 0.1,
   "scripts/lib/__tests__/open-pr-preflight.test.mjs": 0.05,
-  "scripts/lib/__tests__/pr-limit-queue.test.mjs": 0.3,
   "scripts/lib/__tests__/operation-io-fidelity.test.mjs": 0.14,
   "scripts/lib/__tests__/operator-cli-fresh.test.mjs": 1.48,
   "scripts/lib/__tests__/operator-identity.test.mjs": 0.02,

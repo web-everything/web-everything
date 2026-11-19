@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,7 +11,6 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
   body = 'Description', earlyPr = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
-  const queue = join(dir, 'queue.json');
   const root = resolve('scripts');
   const sha = 'a'.repeat(40);
   const record = `import { appendFileSync } from 'node:fs'; const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
@@ -64,49 +63,56 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
       '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, '--no-wait', '--json',
       ...(check ? ['--check'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
-    { cwd: dir, env: { ...process.env, WE_PR_LIMIT_QUEUE_FILE: queue, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
+    { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
     return { status: child.status, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
-      effects: readFileSync(trace, 'utf8').trim().split('\n').map(s => JSON.parse(s)),
-      queue: existsSync(queue) ? JSON.parse(readFileSync(queue, 'utf8')) : [] };
+      effects: readFileSync(trace, 'utf8').trim().split('\n').map(s => JSON.parse(s)) };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 describe('pr-land pre-push checkpoint', () => {
   it.each([false, true])('refuses an empty create body when the early PR exists=%s and no PR exists at create', earlyPr => {
-    const { status, result, effects, queue } = run({ check: false, count: 0, body: '', earlyPr });
+    const { status, result, effects } = run({ check: false, count: 0, body: '', earlyPr });
     expect(status).toBe(3);
     expect(result.reason).toBe('empty-body');
     expect(effects.filter(([cmd]) => cmd === 'pr-lookup')).toHaveLength(earlyPr ? 2 : 1);
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
-    expect(queue).toEqual([]);
   });
   it.each([true, false])('reports verify and soak blockers together with hints, check=%s', check => {
-    const { status, result, effects, queue } = run({ check, fail: true });
+    const { status, result, effects } = run({ check, fail: true });
     expect(status).toBe(3);
-    expect(result.blockers.map(b => b.reason)).toEqual(['verify-red', 'soak-declaration']);
+    expect(result.blockers.map(b => b.reason)).toEqual(check
+      ? ['verify-red', 'soak-declaration', 'pr-limit'] : ['verify-red', 'soak-declaration']);
     expect(result.detail).toContain('run verify-lane'); expect(result.detail).toContain('module + .soak.test.mjs');
     expect(effects.some(([cmd, args]) => cmd === 'create' || cmd === 'size-admission' || args?.[0] === 'push')).toBe(false);
-    expect(queue).toEqual([]);
   });
-  it('check-ok reports would queue without push, create, card filing or queue write', () => {
-    const { status, result, effects, queue } = run();
-    expect(status).toBe(0); expect(result.reason).toBe('check-ok');
-    expect(result.detail).toContain('pr-limit: would queue (15/15)');
+  it('check reports capacity as a blocker hint without push, create or card filing', () => {
+    const { status, result, effects } = run();
+    expect(status).toBe(3); expect(result.reason).toBe('pr-limit');
+    expect(result.blockers).toMatchObject([{ gate: 'pr-limit', reason: 'pr-limit' }]);
+    expect(result.detail).toContain('pr-limit: at 15/15, a real open would be refused');
     expect(effects.some(([cmd, args]) => cmd === 'create' || cmd === 'size-admission' || args?.[0] === 'push')).toBe(false);
-    expect(queue).toEqual([]);
   });
-  it('over-limit create leaves the ref pushed and persists a ready PR, never a refusal', () => {
-    const { status, result, effects, queue } = run({ check: false });
-    expect(status).toBe(0); expect(result.reason).toBe('pr-limit-queued');
+  it('check succeeds below capacity without a pr-limit blocker or info line', () => {
+    const { status, result, effects } = run({ count: 0 });
+    expect(status).toBe(0); expect(result.reason).toBe('check-ok');
+    expect(result.detail).not.toContain('pr-limit');
+    expect(result.info).toEqual([]);
+    expect(effects.some(([cmd, args]) => cmd === 'create' || cmd === 'size-admission' || args?.[0] === 'push')).toBe(false);
+  });
+  it('over-limit create refuses with the original detail and leaves the ref pushed', () => {
+    const { status, result, effects } = run({ check: false });
+    expect(status).toBe(3); expect(result.reason).toBe('pr-limit');
+    expect(result.detail).toContain('(ref lane/preflight left pushed on origin — re-run pr-land once the count drops, or use one of the overrides named above)');
     expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'push')).toBe(true);
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
-    expect(queue).toMatchObject([{ ref: 'lane/preflight', draft: false, body: expect.stringContaining('Description') }]);
   });
-  it.each(['forceOpen', 'branchAllowed', 'globalOff', 'exempt'])('%s bypasses queue admission', override => {
-    const { effects, queue } = run({ check: false, override, exempt: override === 'exempt' });
+  it.each(['forceOpen', 'branchAllowed', 'globalOff', 'exempt'])('%s bypasses capacity admission', override => {
+    const { effects } = run({ check: false, override, exempt: override === 'exempt' });
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
-    expect(queue).toEqual([]);
+    const { status, result } = run({ override, exempt: override === 'exempt' });
+    expect(status).toBe(0); expect(result.reason).toBe('check-ok');
+    expect(result.detail).not.toContain('pr-limit');
   });
 });

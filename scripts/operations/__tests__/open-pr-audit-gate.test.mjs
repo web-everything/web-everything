@@ -26,7 +26,7 @@ describe('combined open-pr preflight', () => {
     expect(result.detail).toContain('run verify-lane'); expect(result.detail).toContain(`waiver request for sha ${sha}`);
     expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check');
   });
-  it('check success never spawns non-check pr-land, writes a bypass body or fetches audit refs', () => {
+  it('check success requests a main refresh without publishing or writing a bypass body', () => {
     const spawn = vi.fn(() => ({ status: 0, stdout: '{"reason":"check-ok"}' }));
     const review = vi.fn(() => ({ action: 'pass', bypass: { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' } }));
     const audit = vi.fn(() => ({ ok: true, sha }));
@@ -34,7 +34,8 @@ describe('combined open-pr preflight', () => {
       prepGate: () => ({ ok: true }) });
     expect(run({ argv: ['--ref=lane/audit', '--check'] }).outcome).toBe('checked');
     expect(review.mock.calls[0][0].readOnly).toBe(true);
-    expect(audit.mock.calls[0][0].fetchMain()).toBeUndefined();
+    expect(audit.mock.calls[0][0].refreshMain).toBe(true);
+    expect(audit.mock.calls[0][0]).not.toHaveProperty('fetchMain');
     expect(spawn).toHaveBeenCalledOnce();
     expect(spawn.mock.calls[0][1]).toContain('--check');
     expect(spawn.mock.calls[0][1].some(a => a.startsWith('--body-file='))).toBe(false);
@@ -56,7 +57,7 @@ function runner(canonicalAudit) {
 
 // Keep both producers' default checker. Replace only filesystem/process effects in a child,
 // never the checker or evaluator; no real Git, credentials, network, or .git writes.
-function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
+function defaultProducer({ direct = false, dry = false, check = false, failMain = false, records = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'default-audit-gate-'));
   const trace = join(dir, 'effects.jsonl');
   const preload = join(dir, 'effects.mjs');
@@ -79,7 +80,10 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
       if (cmd !== 'git') throw new Error('unexpected process: ' + cmd);
       const a = args[0] === '-C' ? args.slice(2) : args;
       if (a[0] === 'rev-parse') return ${JSON.stringify(sha)};
-      if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') return '';
+      if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') {
+        if (${failMain}) throw new Error('fixture main remote unavailable');
+        return '';
+      }
       if (a[0] === 'fetch') throw new Error("couldn't find remote ref");
       if (a[0] === 'merge-base') return a.includes('--is-ancestor') ? '' : ${JSON.stringify(base)};
       if (a[0] === 'diff') return a.includes('--name-only') ? 'docs/guide.md\\n'
@@ -94,7 +98,7 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
     };
     syncBuiltinESMExports();
   `);
-  const argv = [`--repo=${dir}`, '--ref=lane/audit', `--sha=${sha}`, '--title=docs: update guide', '--body=Documentation update', '--json', ...(dry ? ['--dry-run'] : [])];
+  const argv = [`--repo=${dir}`, '--ref=lane/audit', `--sha=${sha}`, '--title=docs: update guide', '--body=Documentation update', '--json', ...(dry ? ['--dry-run'] : []), ...(check ? ['--check'] : [])];
   let entry = join(root, 'scripts/pr-land.mjs');
   if (!direct) {
     entry = join(dir, 'open.mjs');
@@ -126,6 +130,30 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
 }
 
 describe('default canonical checker integration', () => {
+  it.each([false, true])('check calls the default Git fetch port before accepting audit evidence, direct=%s', direct => {
+    const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { result, effects } = defaultProducer({ direct, check: true, records: [record] });
+    const fetches = effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'));
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0][1].slice(-3)).toEqual(['fetch', 'origin', 'main']);
+    const fetchIndex = effects.indexOf(fetches[0]);
+    expect(effects.findIndex(([cmd, args]) => cmd === 'git' && args.includes('--is-ancestor'))).toBeGreaterThan(fetchIndex);
+    expect(result.reason).not.toBe('canonical-audit-missing');
+    expect(result.blockers?.some(b => b.gate === 'canonical-audit')).not.toBe(true);
+    if (!direct) expect(result.outcome).toBe('checked');
+    expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push') || args.includes('create'))).toBe(false);
+  });
+  it.each([false, true])('check refuses passing stale audit evidence and reports a failed main refresh, direct=%s', direct => {
+    const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { status, result, effects } = defaultProducer({ direct, check: true, failMain: true, records: [record] });
+    expect(result.reason).toBe('canonical-audit-missing');
+    expect(result.detail).toContain('main not refreshed: fixture main remote unavailable');
+    if (direct) expect(status).toBe(3);
+    else expect(result.outcome).toBe('refused');
+    expect(effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'))).toHaveLength(1);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args.includes('--is-ancestor'))).toBe(false);
+    expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push') || args.includes('create'))).toBe(false);
+  });
   it.each([false, true])('default open-pr checker refuses missing evidence for docs-only changes, dry=%s', dry => {
     const { result, effects } = defaultProducer({ dry });
     expect(result).toMatchObject({ outcome: 'refused', reason: 'canonical-audit-missing' });

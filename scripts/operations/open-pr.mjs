@@ -75,8 +75,8 @@ export const SUBMIT_PR_EFFECT = 'open-pr.submit';
  */
 export const OPEN_MODES = Object.freeze(['park', 'label-on-green', 'no-wait', 'land']);
 
-/** Submission outcomes distinguish an open, refusal, environment failure, preflight and deliberate wait. */
-export const SUBMIT_OUTCOMES = Object.freeze(['opened', 'refused', 'unrun', 'checked', 'queued']);
+/** Submission outcomes distinguish an open, refusal, environment failure and preflight. */
+export const SUBMIT_OUTCOMES = Object.freeze(['opened', 'refused', 'unrun', 'checked']);
 
 /**
  * Plan the invocation. PURE.
@@ -416,7 +416,6 @@ export function extractSubmitResult(payload) {
 
 /** Human submit summary; the effect completing does not mean the home opened a PR. */
 export function describeSubmit(result) {
-  if (result.outcome === 'queued') return { line: 'submit: queued: opens automatically when a slot frees', failed: false };
   if (result.outcome === 'checked') return { line: `submit: check ok${result.detail ? ' — ' + result.detail : ''}`, failed: false };
   if (result.outcome === 'opened' && result.labelStep === 'deferred') {
     return { line: `submit: opened #${result.pr}${result.url ? ` ${result.url}` : ''} — ${result.detail}`, failed: false };

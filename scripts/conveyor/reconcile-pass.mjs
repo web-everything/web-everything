@@ -1,4 +1,3 @@
-import { drainPrLimitQueue } from '../lib/pr-limit-queue.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { isDrainTransientPath } from '../lib/transient-paths.mjs';
@@ -1699,7 +1698,6 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
  */
 export function runReconcilePass({
   readOnly = false,
-  drainQueue = drainPrLimitQueue,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1769,7 +1767,6 @@ export function runReconcilePass({
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
-  if (!readOnly) { try { drainQueue({ repoKey, env }); } catch { /* best-effort once per tick */ } }
   const step = (name, fn) => {
     const startedAt = stepNow();
     // Preserve the original failure output for the smoke classifier when a read throws.

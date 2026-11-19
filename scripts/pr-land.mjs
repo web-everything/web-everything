@@ -90,7 +90,6 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { blocker, formatBlockers, mergeBlockers } from './lib/open-pr-preflight.mjs';
-import { enqueue, drainPrLimitQueue } from './lib/pr-limit-queue.mjs';
 import { createSizeAdmissionRunner } from './lib/pr-size-admission.mjs';
 
 /** Shared, injected admission for direct and operation-based producers. */
@@ -781,9 +780,6 @@ async function runCli() {
   // any OTHER (rogue/buggy) push to main stays blocked. The initial lane/* push does NOT use this (not main).
   const gitPushMain = (args) => execFileSync('git', ['push', ...args], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAIN_PUSH_OK: '1' } }).toString().trim();
   const tryGit = (args) => { try { return gitC(args); } catch { return null; } };
-  if (!DRY_RUN && !CHECK) {
-    try { drainPrLimitQueue(); } catch { /* best-effort: queue failure never fails this run */ }
-  }
   const blockers = [];
   const collect = (gate, reason, detail, sha) => blockers.push(blocker(gate, reason, detail, sha));
   const forge = createGhLandProvider({ cwd: REPO }); // #3585 — every bare `gh` call below goes through this port
@@ -905,7 +901,7 @@ async function runCli() {
   };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
 
-  admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, ...(CHECK ? { fetchMain: () => {} } : {}) }, {
+  admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK }, {
     refuse: DRY_RUN ? emit : result => collect('canonical-audit', result.reason, result.detail, refSha),
   });
 
@@ -1096,13 +1092,14 @@ async function runCli() {
       repoKey: repoKeyForLimit, limit, openCount, cardOnlyExcluded, acceptedExcluded, stackedExcluded, excludeCardOnly, changedFiles: changedFilesForLimit, branch: REF,
       branchAllowed: isBranchAllowedLive(REF), globalOff: isGlobalOffLive(), forceOpen: FORCE_OPEN, forceReason: FORCE_OPEN_REASON,
     });
-    return { ...limitDecision, count: openCount, limit };
+    return { ...limitDecision, repoKey: repoKeyForLimit, count: openCount, limit };
   }
 
   const info = [];
   if (CHECK && !existingSoakPr) {
     const decision = prLimitDecision();
-    info.push(`pr-limit: ${decision.allowed ? 'would open' : 'would queue'} (${decision.count ?? '?'}/${decision.limit})`);
+    if (!decision.allowed) collect('pr-limit', 'pr-limit',
+      `pr-limit: at ${decision.count ?? '?'}/${decision.limit}, a real open would be refused`);
   }
   const allBlockers = mergeBlockers(blockers);
   if (allBlockers.length) emit({ repo: REPO, merged: false, ref: REF, sha: refSha,
@@ -1162,13 +1159,9 @@ async function runCli() {
     // PR (the `else` branch below) — fixing/re-pushing to an already-open PR is never blocked by this.
     {
       const limitDecision = prLimitDecision();
-      if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · pr-limit: ${limitDecision.reason}\n`);
+      if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · pr-limit(${limitDecision.repoKey}): ${limitDecision.reason}\n`);
       if (!limitDecision.allowed) {
-        enqueue({ repoSlug: originSlugOf(REPO), ref: REF, sha: refSha, base: BASE,
-          title: createParams.title, body: createParams.body, draft: false,
-          parkLabel: PLAN.parkLabel || 'review:pending' });
-        emit({ repo: REPO, merged: false, reason: 'pr-limit-queued', ref: REF, sha: refSha,
-          detail: 'queued: opens automatically when a slot frees' }, 0);
+        emit({ repo: REPO, merged: false, reason: 'pr-limit', detail: `${limitDecision.reason} (ref ${REF} left pushed on ${REMOTE} — re-run pr-land once the count drops, or use one of the overrides named above)` }, 3);
       }
     }
 

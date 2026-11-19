@@ -8,6 +8,7 @@ export const HINTS = Object.freeze({
   'soak-declaration': 'needs a soak break under scripts/conveyor/soak/breaks/ (module + .soak.test.mjs) or a body waiver',
   'prep-block-missing': 'PREP block expects plain `Acceptance:` lines',
   'pre-pr-review-missing': 'run pre-pr-review for the full head sha',
+  'pr-limit': 're-run once the count drops, or use an authorized pr-limit override',
   'empty-body': 'pass --body-file with a non-empty PR description',
   'closing-keyword-body': 'replace fixes/closes/resolves #N with card N or PR N',
   'locus-prefix': 'prefix code paths with their repository locus (for example we:scripts/)',
