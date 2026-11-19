@@ -4961,3 +4961,11 @@ side effects, including completion-only options (encoding, timeout, maxBuffer, k
 injected IO and descriptor fields. Oversized sparse argv refuses with dense literal argv as
 the fallback. Keep old login-shell resume fixtures on plain `-c` so they still exercise resume
 evidence; dedicated startup rows prove login/interactive refusal before guards.
+
+The CI unit shards install zsh when the runner image lacks it. Keep the real startup-file
+and plain-shell probes mandatory; a missing executable is a test-environment failure.
+Local runs of `scripts/__tests__/agent-launch.test.mjs` also require sh, bash and zsh on PATH.
+When merging upstream changes to an approved launcher module, review the module diff before
+refreshing its structural fingerprint, even when the launcher function itself is unchanged.
+Scripts that introduce sandbox tokens must also enter `SANDBOX_BEARING_FILES` in
+`scripts/lib/permission-change.mjs`, preserving its unreadable-diff refusal coverage.

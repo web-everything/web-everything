@@ -28,7 +28,7 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
     "fingerprint": "module-sha256-v2:3dbd00e5f8942e80e870984de53f9c0d022c7d546368fabf195d0bc91dd2fa4d",
     "function": "probeAgents",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:eea135e56b774c685f9f8daacc70264360d5eaedc144a25c15f7dad6da27dfee",
+    "moduleFingerprint": "module-sha256-v2:03084179f2391c2aa1a13b100950a9e00a4e7d82c994abdca186a73a20021e24",
   },
   {
     "file": "scripts/conveyor/liveness-sweep.mjs",
@@ -56,7 +56,7 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
     "fingerprint": "module-sha256-v2:79586a75fe2888a15a582764cbacb1788aaaecf76f699b62d7faf1e57016f15b",
     "function": "freshAgentStatus",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:d93daba086cebc9ac353fb82812a083f64ee61d1ea3120db4defc8df96690f13",
+    "moduleFingerprint": "module-sha256-v2:7fd3dd8ec01b46639238293ce43da58ed5e3b1668e60ddccecb23fee7b7c9d5a",
   },
   {
     "file": "scripts/conveyor/session-reaper.mjs",
@@ -238,7 +238,7 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
     "fingerprint": "module-sha256-v2:6b111aca40fda63d4d80a1d38344cdd38947d2a99b0c6b60fa5a35b586604539",
     "function": "runAgent",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:c58ea393fc7d776d9dd8d5ce5837fc5f29992635c94c82e7fe0f80405d54bf22",
+    "moduleFingerprint": "module-sha256-v2:f402c5d1ea95649565f92884ab150db5a769e3c4be3f5f3a243c6c2dcc63f8d3",
   },
   {
     "file": "scripts/probes/worker-result-probe.mjs",

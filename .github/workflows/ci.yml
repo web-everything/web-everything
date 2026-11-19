@@ -250,6 +250,18 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
+      # agent-launch.test.mjs exercises real zsh startup/refusal and plain -c controls.
+      # Runner images need not ship zsh; keep these probes mandatory on every shard assignment.
+      - name: Install unit-test shell dependencies
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        timeout-minutes: 3
+        run: |
+          if ! command -v zsh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends zsh
+          fi
+          zsh --version
+
       # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
       # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
       # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
