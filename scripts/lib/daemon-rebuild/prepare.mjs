@@ -419,16 +419,16 @@ export async function prepareRebuild({
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   for (const event of plan.alerts || []) {
-    // unaudited-tip shares the once-per-(ref, new tip) record, but under a kind-tagged value: a tip held back for
-    // audit on one tick can be pinned on the next (its record lands, then it conflicts), and that pin notice must
-    // still log. The record is pruned as soon as a plan stops reporting it.
+    // Audit notices have their own namespace: dedupe must never erase park authorization for the adopted head.
+    // The record is pruned as soon as a complete plan stops reporting it.
     if (event.kind === 'overlay-pinned' || event.kind === 'overlay-unaudited-tip') {
       const { ref, pr, newTip, files } = event.detail;
+      const key = event.kind === 'overlay-unaudited-tip' ? `unaudited-tip:${ref}` : ref;
       const noticeKey = event.kind === 'overlay-pinned' ? newTip : `unaudited-tip:${newTip}`;
-      pinnedNow[ref] = noticeKey;
+      pinnedNow[key] = noticeKey;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
       if (event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
-      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
+      if (pinnedBefore[key] === noticeKey || (event.kind === 'overlay-unaudited-tip' && pinnedBefore[ref] === noticeKey)) continue;
     }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
@@ -483,8 +483,9 @@ export async function prepareRebuild({
   // original (never set aside as stack-contained) beside its registered auto-rebase repair. Holding on it would keep
   // the repair from ever being adopted. Only a tip the running build already carries qualifies: a changed tip says
   // nothing about the older live heads it replaced. Ancestry git cannot confirm keeps the overlay lost (fail closed).
+  // An identity-only marker preserves audit history, not content; its second parent cannot excuse the loss.
   const contains = (sha, build) => !!build && git(['merge-base', '--is-ancestor', sha, build]).status === 0;
-  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
+  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha && !l.identityOnly
     && contains(l.sha, prevHead) && contains(l.sha, plan.finalSha)));
   if (!mainOnly && lost.length > 0) {
     const detail = {

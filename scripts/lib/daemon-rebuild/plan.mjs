@@ -975,6 +975,18 @@ export async function planRebuild({
     });
   }
 
+  // Parking omits the conflicting tree, but must retain the adopted identity for the next exact-tip audit.
+  // Add markers only after loss detection: their ancestry is bookkeeping, not proof that the content survived.
+  if (typeof auditedTip === 'function') {
+    for (const lost of establishedLost) {
+      const keep = adoptedTips.get(lost.ref) ?? (establishedRefs.has(lost.ref) ? lost.sha : null);
+      if (keep && recordHold(lost.ref, lost.pr, keep, null)) {
+        lost.identityOnly = true;
+        adoptedTips.set(lost.ref, keep);
+      }
+    }
+  }
+
   const inputsKey = createHash('sha256')
     .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => a.resolvedVia
       ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null] : [a.ref, a.sha]) }))

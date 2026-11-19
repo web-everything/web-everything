@@ -12,7 +12,7 @@ export default {
   id: 'established-overlay-conflict-park',
   title: 'an established overlay conflict holds only until the park deadline and retains registration',
   card: 'main-fix: bounded established overlay hold',
-  fixedBy: { sha: 'same-pr', where: 'same-pr', paths: ['scripts/lib/daemon-rebuild/prepare.mjs'] },
+  fixedBy: { sha: 'same-pr', where: 'same-pr', paths: ['scripts/lib/daemon-rebuild/prepare.mjs', 'scripts/lib/daemon-rebuild/plan.mjs'] },
   // This break ships with the fix: reverting the fix must fail, never become an expected failure.
   fixPresent() { return true; },
   async run() {
@@ -67,7 +67,11 @@ export default {
         check(r.alerts.some(a => a.kind === 'established-overlay-hold'), 'hold must alert');
       }
       const r = await tick(start + parkMinutes * 60_000 + 1);
-      check(r.terminal === false && r.plan?.finalSha === main, 'expired hold must proceed to build advancing main');
+      check(r.terminal === false && git('-C', root, 'rev-parse', `${r.plan.finalSha}^{tree}`)
+        === git('-C', root, 'rev-parse', `${main}^{tree}`), 'expired hold must proceed to build advancing main');
+      check(git('-C', root, 'log', '-1', '--format=%P%x09%s', r.plan.finalSha)
+        === `${main} ${sha}\tdaemon-rebuild: merge overlay ${ref} onto ${main} (identity marker)`,
+      'parked build must preserve the adopted identity without applying its content');
       check(readRebuildState(root, env).held === null, 'expired hold must clear');
       check(readOverlays(root, { env }).some(o => o.ref === ref), 'parked overlay must remain registered');
       check(r.alerts.some(a => a.kind === 'established-overlay-parked' && a.detail.ref === ref && a.detail.sha === sha), 'park must alert with the lost overlay tip');

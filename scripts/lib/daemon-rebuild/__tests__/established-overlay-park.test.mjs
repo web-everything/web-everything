@@ -10,9 +10,11 @@ import * as localState from '../local-state.mjs';
 import * as lease from '../lease.mjs';
 import * as repair from '../../lane-repair.mjs';
 import { addOverlay, readOverlays } from '../../daemon-overlays.mjs';
+import { revokedAppliedTips } from '../audited-tip.mjs';
 
 const ref = 'lane/live', sha = 'a'.repeat(40), head = 'b'.repeat(40), main = 'c'.repeat(40);
 const start = Date.parse('2026-11-18T10:00:00Z');
+const planRebuild = planner.planRebuild;
 describe('bounded established overlay hold', () => {
   let root, env, plan, time, mechanismFiles, classification;
   beforeEach(() => {
@@ -63,6 +65,115 @@ describe('bounded established overlay hold', () => {
   const held = () => readRebuildState(root, env).held;
   const parked = (r) => r.alerts.filter(a => a.kind === 'established-overlay-parked');
   const needsYou = (r) => r.alerts.filter(a => a.kind === 'established-overlay-needs-you');
+  // A conflicts with main; the registered B would merge cleanly, but has no exact-tip audit.
+  const movingTipScenario = ({ markerFails = false } = {}) => {
+    const tip = 'e'.repeat(40), base = 'f'.repeat(40), tree = '1'.repeat(40), marker = 'd'.repeat(40);
+    let current = head;
+    const parents = new Map([[head, [base, sha]], [sha, [base]], [tip, [sha]], [main, [base]]]);
+    const records = new Map([[head, `${base} ${sha}\tdaemon-rebuild@localhost\tdaemon-rebuild: merge overlay ${ref} onto ${base}`]]);
+    const ancestor = (a, b) => a === b || (parents.get(b) ?? []).some(p => ancestor(a, p));
+    const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
+    const git = (args) => {
+      if (args[0] === 'rev-parse') {
+        const rev = args.at(-1);
+        return ok(rev === 'HEAD' ? current : rev.endsWith('^{tree}') ? tree
+          : rev === `refs/remotes/origin/${ref}^{commit}` ? tip : main);
+      }
+      if (args[0] === 'log') {
+        if (args[1] === '-1') return ok('1');
+        const lines = [];
+        for (let at = args[3]; at && at !== main; at = parents.get(at)?.[0]) {
+          if (records.has(at)) lines.push(records.get(at));
+        }
+        return ok(lines.join('\n'));
+      }
+      if (args[0] === 'merge-base' && args[1] === '--is-ancestor') {
+        return { ...ok(), status: ancestor(args[2], args[3]) ? 0 : 1 };
+      }
+      if (args[0] === 'merge-base') return ok(base);
+      if (args[0] === 'diff') return ok();
+      if (args[0] === 'cherry') return ok(`+ ${args[2]}`);
+      if (args[0] === 'merge-tree') return args.at(-1) === sha
+        ? { ...ok(), status: 1 } : ok('2'.repeat(40));
+      if (args[0] === 'commit-tree') {
+        if (markerFails) return { ...ok(), status: 1, stderr: 'object database unavailable' };
+        expect(args[1]).toBe(tree);
+        const ps = args.flatMap((arg, i) => arg === '-p' ? [args[i + 1]] : []);
+        const subject = args.at(-1);
+        expect(subject).toContain('(identity marker)');
+        parents.set(marker, ps);
+        records.set(marker, `${ps.join(' ')}\tdaemon-rebuild@localhost\t${subject}`);
+        return ok(marker);
+      }
+      if (args[0] === 'commit-graph') return ok();
+      return run(args);
+    };
+    const audit = vi.fn(() => false);
+    planner.planRebuild.mockImplementation(o => planRebuild({ ...o, auditedTip: audit, edgeResolve: false, stackMode: 'independent' }));
+    vi.spyOn(localState, 'findUnsafeLocalState').mockReturnValue({ safe: true, untracked: [] });
+    vi.spyOn(repair, 'probeBrokenRefs').mockReturnValue({ probeFailed: false, broken: [] });
+    vi.spyOn(repair, 'diagnoseLane').mockReturnValue({ ok: true, problems: [] });
+    return { tip, marker, audit, git,
+      advance: (next) => { current = next; },
+      prepare: (mode) => prepareRebuild({ root, env, run: git, now: () => time, prBaseChain: () => [], ...mode }),
+    };
+  };
+  it('parking preserves adopted identity across advanced HEAD and still revokes an unaudited registered tip', async () => {
+    const s = movingTipScenario();
+    const parkedBuild = await s.prepare({ adoptOnly: true });
+    expect(parked(parkedBuild)).toHaveLength(1);
+    expect(parkedBuild.plan.applied).toEqual([]);
+    expect(parkedBuild.plan.finalSha).toBe(s.marker);
+    expect(held()).toBeNull();
+    // Model adoption of the main-tree build, with no overlay content in adopted.applied.
+    writeRebuildState(root, { ...readRebuildState(root, env), adopted: { head: s.marker, applied: [] } }, env);
+    s.advance(s.marker);
+    s.audit.mockClear();
+    const next = await planRebuild({ git: s.git, headSha: s.marker, mainRef: 'origin/main',
+      overlays: [{ ref }], auditedTip: s.audit, edgeResolve: false, stackMode: 'independent' });
+    expect(s.audit).toHaveBeenCalledWith(ref, s.tip);
+    expect(next.applied).toEqual([]);
+    expect(next.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-unaudited-tip' }));
+    expect(next.auditAdopted).toContain(ref);
+    expect(revokedAppliedTips({ applied: [{ ref, sha: s.tip }], auditedTip: s.audit,
+      auditAdopted: next.auditAdopted })).toEqual([ref]);
+  });
+  it('adopt-only then ready-only twice parks once without restarting the hold on audit notices', async () => {
+    const s = movingTipScenario();
+    const results = [];
+    for (const mode of [{ adoptOnly: true }, { readyOnly: true }, { adoptOnly: true }, { readyOnly: true }]) {
+      const r = await s.prepare(mode);
+      results.push(r);
+      expect(r.terminal).toBe(false);
+      expect(held()).toBeNull();
+      expect(readRebuildState(root, env).pinnedNotified[ref]).toBe(`established-overlay-parked:${sha}`);
+      time += 31 * 60_000;
+    }
+    expect(results.flatMap(parked)).toHaveLength(1);
+    expect(results.flatMap(r => r.alerts).filter(a => a.kind === 'established-overlay-hold')).toEqual([]);
+    expect(results.flatMap(r => r.alerts).filter(a => a.kind === 'overlay-unaudited-tip')).toHaveLength(1);
+    expect(readOverlayEventLog(root, env).filter(e => e.kind === 'established-overlay-parked')).toHaveLength(1);
+  });
+  it('refuses the build when the parked adopted identity marker cannot be written', async () => {
+    const s = movingTipScenario({ markerFails: true });
+    const r = await s.prepare({ adoptOnly: true });
+    expect(r.terminal).toBe(true);
+    expect(r.result.reason).toBe('pinned-overlay-hold-marker-failed');
+    expect(parked(r)).toEqual([]);
+    expect(readRebuildState(root, env).adopted.head).toBe(head);
+  });
+  it('migrates a persisted audit notice to its namespace without repeating it or erasing the park', async () => {
+    const tip = 'e'.repeat(40);
+    const state = readRebuildState(root, env);
+    state.pinnedNotified = { [ref]: `unaudited-tip:${tip}` };
+    writeRebuildState(root, state, env);
+    plan.alerts = [{ kind: 'overlay-unaudited-tip', detail: { ref, newTip: tip, adopted: sha } }];
+    const r = await tick();
+    expect(r.alerts.some(a => a.kind === 'overlay-unaudited-tip')).toBe(false);
+    expect(readRebuildState(root, env).pinnedNotified).toEqual({
+      [ref]: `established-overlay-parked:${sha}`, [`unaudited-tip:${ref}`]: `unaudited-tip:${tip}`,
+    });
+  });
   const expectProtectedHold = async () => {
     const r = await tick();
     expect(r.result.reason).toBe('established-overlay-conflict');

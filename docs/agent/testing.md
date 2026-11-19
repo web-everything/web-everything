@@ -175,6 +175,10 @@ last-good indefinitely and emits one needs-you notice per ref/tip via `pinnedNot
 Park notices survive only while the same registered tip remains lost in a complete plan.
 The clean-reapplication regression verifies a recurring conflict starts a fresh 30-minute hold,
 including the exact deadline boundary and one new park alert after expiry.
+Parking retains the adopted head in a tree-neutral identity marker; its ancestry must never
+count as preserved overlay content. Exact-tip audit checks and revocation continue after adoption.
+Audit-notice dedupe uses `unaudited-tip:<ref>` keys independently of the ref's park authorization,
+including migration of historical notices and repeated adopt-only/ready-only preparations.
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
 before push, then `addOverlay` compares the same snapshot under the overlay list mutex before
