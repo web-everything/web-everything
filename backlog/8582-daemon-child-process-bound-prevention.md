@@ -1,10 +1,11 @@
 ---
+bornAs: x8q4n2s
 kind: story
 size: 2
 status: open
 dateOpened: "2026-11-17"
 tags: []
-related: ["x2fybk1"]
+related: ["8581"]
 ---
 
 # Prevent missing bounds on daemon host inspection subprocesses

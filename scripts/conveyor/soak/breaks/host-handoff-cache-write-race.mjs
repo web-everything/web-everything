@@ -7,7 +7,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 export default {
   id: 'host-handoff-cache-write-race',
   title: 'Ownership cannot survive a failed fresh read after handoff',
-  card: 'PR #6945 / x2fybk1',
+  card: 'PR #6945 / 8581',
   fixedBy: { sha: 'PR #6945 R970 R971 repair', where: 'lane/daemon-host-guard',
     paths: ['scripts/lib/daemon-host-guard.mjs', 'scripts/operations/daemon-preflight.mjs'] },
   fixPresent() {
