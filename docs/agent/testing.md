@@ -4770,3 +4770,13 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+
+## Live review seat policy (R1077)
+
+`review-seat-caps.test.mjs` covers live `review.seatDailyCaps` reads through the shared
+policy cascade, injected settings IO, invalid layers and legacy environment precedence.
+`review-red-team.test.mjs` exercises the launcher with both builder companies, unknown
+builder evidence, `review.redTeam.routeByBuilder=false`, daily-cap fallback and a raced
+reservation. Keep the pinned-head co-author read ahead of routing; the scratch checkout
+is created only after provider selection. Both exhausted budgets retain the existing cap hold.

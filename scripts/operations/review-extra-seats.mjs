@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { redTeamRouteByBuilder, readReviewSeatPolicy } from '../lib/review-seat-caps.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
@@ -1852,8 +1853,18 @@ export async function speculateRedTeam({
     let deferredByCap = false;
     const routingPolicy = (io.readRoutingPolicy ?? readRoutingPolicy)();
     const routingEntry = routingPolicy.operations['review-seat:red-team'];
-    const providers = rosterForKey('review-seat:red-team');
-    const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    const readSeatSettings = io.readSeatSettings ?? (options => readReviewSeatPolicy({ ...options, log: io.log }));
+    const routeByBuilder = redTeamRouteByBuilder(env, readSeatSettings);
+    let builderHeadMessage = '';
+    if (routeByBuilder) {
+      try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
+    }
+    const builder = resolveBuilder({ body: read.body, headMessage: builderHeadMessage });
+    const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-claude'
+      : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
+    const builderProviders = preferred ? [preferred, preferred === 'codex' ? 'agy-claude' : 'codex'] : null;
+    const providers = builderProviders ?? rosterForKey('review-seat:red-team');
+    const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry, readSeatSettings)]));
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
@@ -1876,15 +1887,21 @@ export async function speculateRedTeam({
     let configuredRoute = null;
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
       let routeError = null;
-      try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
+      try { configuredRoute = builderProviders ? null : resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
       catch (error) { configuredRoute = null; routeError = error; }
       try {
-        configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available,
+        if (!builderProviders) configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available,
           operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
         // A valid overlay can supply a route even when the default chain is exhausted.
         // Without one, preserve the policy failure rather than selecting outside its chain.
         if (routeError && !configuredRoute) throw routeError;
       } catch (error) { lastReason = error.message; break; }
+      if (builderProviders) {
+        const chosen = builderProviders.find(p => available.includes(p));
+        if (!chosen) break;
+        configuredRoute = { provider: chosen, model: chosen === 'codex' ? 'sol' : 'claude-sonnet-5-5', effort: 'high' };
+        if (chosen !== preferred) io.log(`red team: builder route ${preferred} unavailable (${unavailable.join('; ') || lastReason}); fallback to ${chosen}`);
+      }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
@@ -2180,8 +2197,8 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       catch (e) { base.log(`red-team status labels: ${e.message}`); }
       return outcome;
     },
-    readHeadMessage: (dir) => {
-      const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B'], { encoding: 'utf8', timeout: 20_000 });
+    readHeadMessage: (dir, rev = 'HEAD') => {
+      const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B', rev], { encoding: 'utf8', timeout: 20_000 });
       return r.status === 0 ? String(r.stdout ?? '') : '';
     },
     runRecheck: async ({ pr, lanePath, rev, readsRepo = true, mandate, input, shape }) => {

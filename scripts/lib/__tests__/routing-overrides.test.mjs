@@ -284,7 +284,7 @@ describe('operator routing overrides', () => {
     expect(resolveRoutingProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '7' }, entry)).toBe(7);
     expect(resolveRoutingProviderCap('agy-gemini', {}, DEFAULT_ROUTING_POLICY.operations[key])).toBe(0);
     expect(resolveRoutingProviderCap('codex', {}, { disabledProviders: ['codex'] })).toBe(0);
-    expect(resolveRoutingProviderCap('codex', {}, { enabledProviders: ['codex'] })).toBe(80);
+    expect(resolveRoutingProviderCap('codex', {}, { enabledProviders: ['codex'] })).toBe(600);
     expect(resolveRoutingProviderCap('agy-claude', {}, { enabledProviders: ['agy-claude'] })).toBe(300);
   });
 

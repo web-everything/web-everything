@@ -61,6 +61,8 @@ function fakeIo(over = {}) {
   const trials = [];
   const ledgerBox = {};
   const io = {
+    // Historical cases pin the old route; R1077 cases below explicitly exercise the new default.
+    readSeatSettings: () => ({ tool: { redTeam: { routeByBuilder: false } }, platform: {} }),
     now: () => NOW,
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
     log: (l) => calls.push(['log', l]),
@@ -988,5 +990,52 @@ describe('security classification policy transitions', () => {
       else process.env.WE_PLATFORM_PREFERENCES_FILE = previous;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('R1077 builder company routing', () => {
+  const input = body => ({ pr: 5, repo: REPO, lanePath: '/lane', read: payload('accept', body).findings.read, env: {} });
+  const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6-astra' : 'claude-sonnet-5-5', taskType: 'bugfix' });
+  const policyIo = over => fakeIo({ readSeatSettings: () => ({ tool: {}, platform: {} }), ...over });
+
+  it.each([['codex', 'agy-claude', 'claude-sonnet-5-5'], ['claude', 'codex', 'sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
+    const { io, calls } = policyIo();
+    expect((await speculateRedTeam(input(marker(builder)), io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider, model });
+  });
+
+  it('uses the pinned head co-author stamp when the PR has no builder marker', async () => {
+    const { io, calls } = policyIo({ readHeadMessage: vi.fn(() => 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>') });
+    await speculateRedTeam(input('no marker'), io);
+    expect(io.readHeadMessage).toHaveBeenCalledWith('/lane', REV);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'sol' });
+  });
+
+  it.each(['codex', 'claude'])('falls back and logs when the cross-company provider for %s is capped', async builder => {
+    const preferred = builder === 'codex' ? 'agy-claude' : 'codex';
+    const { io, calls } = policyIo({ readRecords: () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+      provider: preferred, callId: 'spent', scoredAt: new Date(NOW).toISOString(), status: 'ok' }] });
+    const args = input(marker(builder));
+    args.env = { [PROVIDER_CAP_ENV[preferred]]: '1' };
+    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe(preferred === 'codex' ? 'agy-claude' : 'codex');
+    expect(calls.some(c => c[0] === 'log' && /daily-cap.*fallback to/.test(c[1]))).toBe(true);
+  });
+
+  it('retries the other provider when the preferred reservation races with another caller', async () => {
+    const { io, calls } = policyIo();
+    const reserve = io.reserveCalls;
+    io.reserveCalls = o => o.provider === 'agy-claude' ? { used: o.dailyCap, callIds: [] } : reserve(o);
+    expect((await speculateRedTeam(input(marker('codex')), io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('codex');
+    expect(calls.some(c => c[0] === 'log' && /fallback to codex/.test(c[1]))).toBe(true);
+  });
+
+  it.each([['unknown', true], ['codex', false]])('keeps existing routing for builder=%s, routeByBuilder=%s', async (builder, enabled) => {
+    const { io, calls } = policyIo({ readHeadMessage: () => '', readSeatSettings: () => ({ platform: {}, tool: { redTeam: { routeByBuilder: enabled } } }) });
+    resolveOperationRoute.mockReturnValueOnce({ provider: 'codex', model: 'gpt-6-astra', effort: 'high' });
+    await speculateRedTeam(input(builder === 'unknown' ? 'no marker' : marker(builder)), io);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
   });
 });
