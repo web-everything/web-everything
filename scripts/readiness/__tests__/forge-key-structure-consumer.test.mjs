@@ -181,12 +181,16 @@ describe('Forge key structure consumer compatibility',()=>{
   });
 
   it.each([
+    // Each decoded string must remain expandable to consume a queue slot;
+    // short hex-decoded fragments are detected, then pruned as terminal views.
     ['candidate-count',()=>Buffer.from(Array.from({length:16400},(_,index)=>
-      index.toString(6).replace(/[0-5]/g,digit=>'abcdef'[Number(digit)]).padStart(6,'a')).join('!'))],
-    ['scan-step',()=>Buffer.alloc(4*1024*1024+1,125)],
+      JSON.stringify('value'+String(index).padStart(8,'0')).replace('v','\\u0076')).join('\n'))],
+    // Closing braces alone are terminal. The prefix starts canonicalization,
+    // where more than 4 MiB of closing tokens exhaust the shared step budget.
+    ['scan-step',()=>Buffer.concat([Buffer.from('g'.repeat(11)),Buffer.alloc(4*1024*1024+1,125)])],
   ])('I4 preserves %s exhaustion with default/bypassed precheck through finding and manifest admission',(_name,input)=>{
     const bytes=input();
-    expect(bytes.length).toBe(_name==='candidate-count'?114799:4194305);
+    expect(bytes.length).toBe(_name==='candidate-count'?344399:4194316);
     const exhausted='private-key-scan-budget-exhausted-use-local';
     expect(keyStructureFinding(bytes,{precheck:false})).toBe(exhausted);
     expect(keyStructurePrecheck(bytes)).toBe(true);
