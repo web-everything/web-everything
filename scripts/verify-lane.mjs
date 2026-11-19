@@ -91,6 +91,8 @@ import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
+import { quarantineEligible, quarantinedVerdict } from './lib/verify-quarantine.mjs';
+import { readQuarantine } from './lib/red-main-quarantine-io.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
 import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory, gateCommandsEqual, matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
@@ -1125,6 +1127,25 @@ try {
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
+// The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
+const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
+let quarantined = null;
+if (exitCode !== 0 && !signal && !infrastructureNow(exitCode, signal, failureDetails) && !phaseTimeout && quarantineEligible(phaseResults)) {
+  try {
+    const verdict = quarantinedVerdict({ phaseResults, read: readQuarantine({ board: REPO }), changedFiles: diffFiles, now: Date.now(), runAllPhases, phased: phasedTestGate === true, standardsRequired: !!resolvedGate?.standardsCommand,
+      // Lane clones keep a local branch named `main` whatever they carry, so main means "HEAD is origin/main's tip".
+      // A missing origin/main is unknown (undefined), never "not main": the verdict keeps red.
+      onMain: (() => { const tip = tryGit(['rev-parse', 'origin/main']); return tip ? tip === headSha : undefined; })(),
+      // reachesChanged reads missing/unreadable files as "outside"; unreadable evidence must stay unknown instead.
+      touchesDiff: (file) => { if (![file, ...diffFiles].every(f => { try { readRepoFile(f); return true; } catch { return false; } })) return 'unknown'; const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } });
+    if (verdict.excused) {
+      quarantined = { files: verdict.files, why: verdict.why };
+      exitCode = 0;
+      process.stderr.write(`verify-lane: quarantined (not red): ${verdict.files.join(', ')}\n`);
+    }
+  } catch { /* Unreadable quarantine evidence leaves the gate red. */ }
+}
+
 // #5466 — the revert-red check, inside the fixer's own verify: on a GREEN gate for a fix push (the fix role's own await
 // record names exactly this head), revert the fix's source changes, run only the tests it added or changed, and record
 // which of them stay green. AFTER the gate and BEFORE the marker, so the harness's exact-sha / clean-tree push check
@@ -1163,15 +1184,13 @@ const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'pha
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
 const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
-const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit, ...(flakes.length ? { flakes } : {}) };
-const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
 const infrastructureBase = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
   ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 const infrastructure = infrastructureBase && killedOutputTail && ['verify-timeout', 'verify-signal'].includes(infrastructureBase.reason)
   ? { ...infrastructureBase, outputTail: killedOutputTail } : infrastructureBase;
-// The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
-const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
+const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit, ...(flakes.length ? { flakes } : {}), ...(quarantined ? { quarantined } : {}) };
+const retryDetail = describeIsolatedRetry(retryAudit) + (quarantined ? ` quarantined (not red): ${quarantined.files.join(', ')}.` : '');
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
 const redCauseFields = classifyRedCause({ exitCode, signal, infrastructure, phaseResults, isolatedRetry, retriedFailures, changedFiles: diffFiles,
   touchesDiff: (file) => { const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } }) ?? {};
@@ -1209,14 +1228,14 @@ const startBody = onDisk && !onDisk.corrupt && onDisk.sha === headSha
 // overlapping `request` (a worker edits, or asks for another `--gate=`, mid-gate) re-stamps the marker with a
 // NEWER tree's hash or a different gate command, and inheriting either would record a green nobody verified.
 // The tree hash is recorded only if the tree held still from start, through the admission wait, to gate exit.
-const finished = verifyFinishBody(startBody, {
+const finished = { ...verifyFinishBody(startBody, {
   finishedAt: new Date().toISOString(),
   ...diagnostic,
   exitCode, signal, infrastructure,
   sha: headSha,
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
-});
+}), ...(quarantined ? { quarantined } : {}) };
 writeMarker({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 // R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
