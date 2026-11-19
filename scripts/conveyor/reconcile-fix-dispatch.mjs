@@ -2165,19 +2165,27 @@ export function runReconcileFixDispatch({
   const dispatched = [];
   let handled = 0;
   let deferred = [];
+  let conflictHandled = 0;
   let conflictExemptHandled = 0;
+  const conflictCap = Number.isSafeInteger(fixSettings.conflictFixesPerPass) && fixSettings.conflictFixesPerPass >= 0
+    && fixSettings.conflictFixesPerPass <= 24 ? fixSettings.conflictFixesPerPass : 0;
   const exemptCap = Number.isSafeInteger(fixSettings.conflictFixExemptPerPass) && fixSettings.conflictFixExemptPerPass >= 0
     ? fixSettings.conflictFixExemptPerPass : 0;
   console.error(`reconcile-fix-dispatch: fix.conflictFixExemptPerPass=${exemptCap} (source ${fixSettings.sources?.conflictFixExemptPerPass ?? 'invalid'})`);
+  console.error(`reconcile-fix-dispatch: fix.conflictFixesPerPass=${conflictCap} (source ${fixSettings.sources?.conflictFixesPerPass ?? 'invalid'})`);
   for (const entry of planned) {
     if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    const exempt = entry.isConflict === true && entry.conflictFixMechanical === true && !entry.restack
-      && conflictExemptHandled < exemptCap;
+    const conflict = entry.isConflict === true && !entry.restack;
+    const mechanical = conflict && entry.conflictFixMechanical === true;
+    // Shared total bounds mixed mechanical/unproven conflicts too; allowances never add together.
+    const exempt = conflict && conflictHandled < Math.max(conflictCap, exemptCap)
+      && (conflictHandled < conflictCap || (mechanical && conflictExemptHandled < exemptCap));
     if ((handled > 0 && deadlineAt != null && clock() > deadlineAt && !exempt) || yieldedForAdoption) {
       deferred.push(entry.pr);
       continue;
     }
-    if (exempt) conflictExemptHandled += 1;
+    if (conflict) conflictHandled += 1;
+    if (mechanical) conflictExemptHandled += 1;
     handled += 1;
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };

@@ -13,7 +13,7 @@ import { join, resolve } from 'node:path';
 import { isCardOnlyDiff } from '../../ci-card-only.mjs';
 import { readPinnedDiff } from '../pinned-diff-basis.mjs';
 import {
-  PR_LIMIT_DEFAULTS, PR_LIMIT_ENV, resolvePrLimit,
+  PR_LIMIT_DEFAULTS, PR_LIMIT_ENV, resolvePrLimit, resolvePrLimitFrom, readPrLimit,
   EXEMPT_PATH_PREFIXES, isExemptPath, isExemptChangeset,
   countBackpressurePrs, decideOpenPr,
   emptyLimitState, parseLimitState, serializeLimitState, parseDurationMs,
@@ -28,27 +28,99 @@ import {
 } from '../pr-limit.mjs';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import * as settingsFiles from '../settings-files.mjs';
+import * as policyCascade from '../policy-cascade.mjs';
 
 describe('resolvePrLimit', () => {
+  const layers = { platform: {}, tool: {} };
+  const cap = (we) => ({ limits: { we } });
+
   it('defaults to the operator-set per-repo caps', () => {
-    expect(resolvePrLimit('we')).toBe(15);
-    expect(resolvePrLimit('frontierui')).toBe(5);
-    expect(resolvePrLimit('plateau-app')).toBe(5);
+    for (const [key, value] of Object.entries(PR_LIMIT_DEFAULTS)) {
+      expect(resolvePrLimit(key, {}, layers)).toBe(value);
+      expect(resolvePrLimitFrom(key)).toEqual({ limit: value, source: 'standard' });
+    }
     expect(PR_LIMIT_DEFAULTS).toEqual({ we: 15, frontierui: 5, 'plateau-app': 5 });
   });
 
-  it('an env override wins, per repo, independently', () => {
-    expect(resolvePrLimit('we', { [PR_LIMIT_ENV.we]: '3' })).toBe(3);
-    expect(resolvePrLimit('frontierui', { [PR_LIMIT_ENV.we]: '3' })).toBe(5); // unaffected by WE's override
+  it('platform 25 beats default 15', () => {
+    expect(resolvePrLimitFrom('we', { platform: cap(25) })).toEqual({ limit: 25, source: 'platform' });
   });
 
-  it('ignores a non-numeric or negative override', () => {
-    expect(resolvePrLimit('we', { [PR_LIMIT_ENV.we]: 'nope' })).toBe(15);
-    expect(resolvePrLimit('we', { [PR_LIMIT_ENV.we]: '-1' })).toBe(15);
+  it('tool beats default, platform beats tool, and env beats platform', () => {
+    expect(resolvePrLimitFrom('we', { tool: cap(20) })).toEqual({ limit: 20, source: 'tool' });
+    expect(resolvePrLimitFrom('we', { tool: cap(20), platform: cap(25) })).toEqual({ limit: 25, source: 'platform' });
+    expect(resolvePrLimitFrom('we', { tool: cap(20), platform: cap(25), env: { WE_PR_LIMIT_WE: '30' } }))
+      .toEqual({ limit: 30, source: 'env' });
   });
 
-  it('an unknown repo key has no cap (Infinity — nothing principled to enforce)', () => {
-    expect(resolvePrLimit('unknown-repo', {})).toBe(Infinity);
+  it('env overrides each repo independently', () => {
+    expect(resolvePrLimit('we', { WE_PR_LIMIT_WE: '3' }, layers)).toBe(3);
+    expect(resolvePrLimit('frontierui', { WE_PR_LIMIT_WE: '3' }, layers)).toBe(5);
+  });
+
+  it.each([0, 101, 'abc', 2.5, -1])('ignores invalid %s at each layer, preserving the lower layer', (bad) => {
+    expect(resolvePrLimitFrom('we', { tool: cap(bad) })).toEqual({ limit: 15, source: 'standard' });
+    expect(resolvePrLimitFrom('we', { tool: cap(20), platform: cap(bad) })).toEqual({ limit: 20, source: 'tool' });
+    expect(resolvePrLimitFrom('we', { platform: cap(25), env: { WE_PR_LIMIT_WE: String(bad) } }))
+      .toEqual({ limit: 25, source: 'platform' });
+    expect(resolvePrLimit('we', { WE_PR_LIMIT_WE: String(bad) }, layers)).toBe(15);
+  });
+
+  it.each([1, 100])('accepts inclusive bound %s in every layer', (value) => {
+    expect(resolvePrLimitFrom('we', { tool: cap(value) })).toEqual({ limit: value, source: 'tool' });
+    expect(resolvePrLimitFrom('we', { platform: cap(value) })).toEqual({ limit: value, source: 'platform' });
+    expect(resolvePrLimitFrom('we', { env: { WE_PR_LIMIT_WE: String(value) } })).toEqual({ limit: value, source: 'env' });
+  });
+
+  it('ignores numeric strings in settings layers', () => {
+    expect(resolvePrLimitFrom('we', { tool: cap('20'), platform: cap('25') }).limit).toBe(15);
+  });
+
+  it('an unknown repo key stays uncapped despite overrides', () => {
+    expect(resolvePrLimit('unknown-repo', {}, { tool: { limits: { 'unknown-repo': 10 } }, platform: {} })).toBe(Infinity);
+  });
+
+  it('reads both settings layers afresh on every call and survives unreadable tool settings', () => {
+    const read = vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({ prLimit: cap(20) });
+    const platform = vi.spyOn(policyCascade, 'platformPreference').mockReturnValue(cap(25));
+    try {
+      expect(resolvePrLimit('we', {})).toBe(25);
+      platform.mockReturnValue({});
+      read.mockReturnValue({ prLimit: cap(22) });
+      expect(resolvePrLimit('we', {})).toBe(22);
+      read.mockImplementation(() => { throw new Error('unreadable'); });
+      expect(resolvePrLimit('we', {})).toBe(15);
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(platform).toHaveBeenCalledTimes(3);
+    } finally { read.mockRestore(); platform.mockRestore(); }
+  });
+
+  it('logs effective limit provenance through the scope reader logger', () => {
+    const log = vi.spyOn(policyCascade, 'logCascadeSources').mockImplementation(() => {});
+    const env = { WE_PR_LIMIT_WE: '30' };
+    try {
+      expect(readPrLimit('we', env, layers)).toEqual({ limit: 30, source: 'env' });
+      expect(log).toHaveBeenCalledWith('prLimit', {
+        value: { limits: { we: 30 } }, sources: { 'limits.we': 'env' },
+      }, { env });
+    } finally { log.mockRestore(); }
+  });
+
+  it('status prints each effective cap and source using the supplied environment', () => {
+    const read = vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({ prLimit: { limits: { frontierui: 12 } } });
+    const platform = vi.spyOn(policyCascade, 'platformPreference').mockReturnValue(cap(25));
+    const countRepos = vi.fn(() => Object.keys(PR_LIMIT_DEFAULTS).map((repoKey) => ({ repoKey, count: 0 })));
+    let output = '';
+    try {
+      expect(runPrLimitCli(['status'], { env: { WE_PR_LIMIT_PLATEAU_APP: '9' }, path: '', countRepos,
+        stdout: { write: (text) => { output += text; } } })).toBe(0);
+      expect(JSON.parse(output).counts).toEqual([
+        { repoKey: 'we', count: 0, limit: 25, limitSource: 'platform' },
+        { repoKey: 'frontierui', count: 0, limit: 12, limitSource: 'tool' },
+        { repoKey: 'plateau-app', count: 0, limit: 9, limitSource: 'env' },
+      ]);
+      expect(countRepos).toHaveBeenCalledWith({ env: { WE_PR_LIMIT_PLATEAU_APP: '9' } });
+    } finally { read.mockRestore(); platform.mockRestore(); }
   });
 });
 
