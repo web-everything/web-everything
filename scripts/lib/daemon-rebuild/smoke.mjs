@@ -6,6 +6,7 @@ import {
   SMOKE_ENVIRONMENT_VERDICTS, loadDifferentialEnabled, envLoadRetryDelayMs, isLoadShapedRow, busyPoolSkippedChecks,
   redactDetail,
 } from './smoke-classify/index.mjs';
+import { envTimeoutRetry, resolveRecovery } from './recovery.mjs';
 import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
@@ -681,9 +682,11 @@ export async function smokeAndAdopt({
   const hold = async (reason, failed, extra = {}, mutateMore) => {
     let since = null;
     const state = (await locked((st) => {
+      if (reason === 'smoke-env-timeout') Object.assign(extra, envTimeoutRetry(st.held, now(), resolveRecovery({ env, log: m => log.error?.(m) })));
       mutateMore?.(st);
       since = st.held?.since ?? nowIso();
       st.held = {
+        retryAt: null, attempts: 1,
         since,
         reason,
         failed: failed.map((r) => r.name).join(','),
@@ -696,6 +699,7 @@ export async function smokeAndAdopt({
       };
     }, { release: true })) ?? readRebuildState(root, stEnv);
     alert('daemon-held-on-last-good', {
+      ...(state.held?.retryAt ? { retryAt: state.held.retryAt, attempts: state.held.attempts } : {}),
       details: failed.map(rejectionDetail),
       reason, failed: failed.map((r) => r.name).join(','), since: since ?? state.held?.since ?? null, lastGood: prevHead, target: plan.finalSha,
       message: 'the new build failed its live smoke — staying on the last working build and still dispatching from it (x5wbsbc)',

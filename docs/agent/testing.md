@@ -4895,6 +4895,12 @@ sequentially. Keep fake executable PATH setup in `beforeAll` and all large-outpu
 assertions inside the original per-test deadlines; increasing the setup timeout does not resolve the import stall.
 ## Ready-candidate adoption during overlay churn
 
+`rebuildClone` keeps phase waits in a non-enumerable `timing` record to preserve existing result
+equality. The rebuild CLI explicitly serializes it for detached jobs; `daemon-rebuild-early-timing.test.mjs`
+checks the legacy shape and runs the actual CLI subprocess to verify timing transfer into the job result.
+Do not reconstruct CLI serialization in the test: removing the producer's timing serialization must fail it.
+Adoption latency remains in adoption state.
+
 `daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
 refs and descendant advances remain pending after adoption, and the next adopt-only tick
 must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
@@ -5172,3 +5178,118 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## Between-tick rebuild launch probes
+
+`daemon-rebuild-early-launch.test.mjs` runs with Node's test runner and also registers with Vitest.
+Its hermetic `withSelfSync` probe drives the injected watcher timer between ticks, with real job-store
+queue tests and no Git/network children. `daemon-rebuild-early-timing.test.mjs` advances separate
+reader-lock, planning, smoke-slot and smoke clocks so planning/smoke time cannot masquerade as queue wait.
+The early-launch setting is off by default; `daemon-rebuild-settings.json` `earlyLaunch.entries`
+opts in an entry such as `health-watch.mjs`. `WE_DAEMON_REBUILD_EARLY_LAUNCH=0|1` overrides enablement;
+`WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS` overrides the trailing debounce. Missing or oversized event
+history defers to tick-start. The declared self-sync rebuild path must resolve to job mode;
+`WE_DAEMON_REBUILD_AS_JOB=0` or an inline setting prevents early launch. The watcher only queues a job; ready candidates still adopt at tick boundaries.
+`launchOnly` must run the shared adopt-only preparation with `readyOnly: true` before queuing, so sticky
+rejections and smoke retry/backoff refusals still apply. `daemon-rebuild/__tests__/rebuild-job.test.mjs`
+checks persisted refusal state through real preparation with controlled Git IO, including clean admission.
+Early admission and timed recovery use `readRebuildStateStrict`: only ENOENT is empty state.
+The declared schema requires every top-level slot, with explicit null for an unused slot.
+For present records the admission inventory is: adopted head/inputsKey/mainSha/applied/at;
+inProgress pid/host/startedAt/prevHead/target/inputsKey/mainSha/applied/verified; quarantine
+prevHead/reason; unverified head/prevHead; building token/pid/host/startedAt/target/inputsKey/path/adoptOnly;
+held reason/since/updatedAt/retryAt/attempts; rejected inputsKey/reason/at/retryAt/attempts and
+harnessBroken/externalOnly/envLoad/dispatchSmoke booleans. retryAt may be null for a sticky
+rejection or a non-timeout hold; timeout holds and transient rejection flags require a date.
+busySkippedTrees/forceUnverifiedTrees contain strings; smokePassed entries require key/tree/passedAt;
+pinnedNotified is a string-valued map. Applied entries require ref/sha and a nonempty string for any pinnedFrom.
+Strict ready pins require sha and pinnedFrom to be distinct full 40-hex SHAs. Strict ready pins also prove the registered ref/PR,
+exact held remote tip, and latest rebuild-authored second-parent adopted SHA on
+the running head. Malformed or unproven pins refuse as `state-unreadable`;
+operator repair is required. Tick-start keeps the legacy pin exemption.
+Ready records require prevHead/tree/passedAt/kind/forced and adopt.finalSha/inputsKey/mainSha/applied.
+Fallbacks also require forInputsKey/dropRefs/failed, with ref/sha/pr on each drop (pr may be null).
+Optional diagnostic ready metadata remains typed when present.
+
+The job fixture injects EACCES/EIO and corrupt JSON, and a recursive table deletes and mistypes
+every required field, asserting refusal, untouched bytes and no job. Historical incomplete files
+are deliberately refused until operator repair; the legacy reader retains its compatibility behavior
+for ordinary tick consumers. Producers write explicit policy defaults rather than admission
+inventing them. The pre-lock strict state read is an early refusal filter only. Launch-only
+preparation re-reads and validates state under the clone write lock, using that locked snapshot
+for every check; an unreadable locked read refuses as `state-unreadable`.
+The ready snapshot still passes through `admissionEvidence`; missing handoff refuses.
+The early/recovery race tests publish rejection, hold, lease or corrupt state between admission
+and lock acquisition, assert the second strict read holds the lock, and verify newer evidence
+survives refusal. Interrupted-rebuild bookkeeping defers to tick-start. Clean admission remains covered.
+Between-tick admission never takes
+a transient build lease, avoiding a second read-modify-write during lease release. An up-to-date
+ready-only probe also leaves ready cleanup to the next tick: the fixture plants corrupt ready evidence
+during planning and asserts that the indirect cleanup reader neither rereads nor deletes it.
+
+The launch-path fallback audit covers state, prepare, rebuild, rebuild-job, recovery and
+overlay-adoption. Rebuild-state coercions are confined to the legacy reader; strict validation
+covers prepare's recovery/array/map/backoff defaults. Ready adoption and its lazy overlay-event-log
+reader cannot run in launch-only admission: a ready snapshot defers immediately. Consumed-job and
+finished-result bookkeeping use the strict precheck snapshots (including the finished-job roster);
+later result/ready probes remain strict. Between-tick launches return before the wrapper's
+best-effort pending-adoption notifications and force-watch. Remaining settings defaults choose
+bounded standard policy; Git/process proof defaults retain holds or deny mutation; diagnostic
+and best-effort logging defaults do not authorize launch or erase persisted evidence.
+Job admission also strictly reads pending adoptions before job bookkeeping. Any `state-unreadable`
+refusal logs the repair requirement and skips pending-adoption notifications/rewrites, including at
+tick-start; the mixed overdue/malformed-record fixture asserts that the wrapper preserves file bytes.
+Only explicit `launchOnly: true`, `asJob: true` early/recovery launches outside adopt-only skip
+best-effort wrapper notifications and force-watch, including after successful queueing. Tick-start and unknown launch sources retain force-watch health checks and rollback
+even when carrying `launchOnly: true`; strict early/recovery provenance defers them
+also for inline and adopt-only callers.
+Both rebuild soak wrappers also require an unconditional positive test, so a behavioural `fixPresent`
+regression cannot turn the protected behaviour into an expected failure.
+
+Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (Vitest)
+and the `rebuild-held-recovery` soak break. Environment timeout
+backoff lives on `state.held`, leaving candidate rejection semantics intact. Legacy holds
+without a deadline derive one from `updatedAt`/`since`; invalid timestamps stay held for
+operator repair. Recovery settings use the shared policy cascade and the detached job
+queue retains its in-flight guard before considering any recovery trigger.
+Recovery uses the existing rebuild minimum interval (including jitter), even after a ready-recorded
+job; a `still-rejected` adopt-only result never launches recovery. The overdue threshold must be
+at most 15 minutes (the default); settings may only shorten it, and oversized settings clamp
+to that maximum and log the originating policy layer. The unit fixture drives the real ready-only rebuild through a
+timeout and a later passing smoke on unchanged inputs; the soak fixture checks queueing only.
+
+
+### Detached rebuild evidence policy
+
+Early watcher jobs carry `early`; both timed env-timeout retries and overdue-registration
+recovery jobs carry `recovery`. Only the ordinary tick-start launch carries `tick-start`.
+`createRebuildReaders` derives one strict policy from that provenance at `rebuildClone` entry.
+Its async scope covers indirect legacy consumers as well as prepare, smoke, lease renewal,
+cleanup and ready publication. Keep evidence entry points connected to this scope when adding
+readers; do not add a child-specific permissive fallback. Tick-start installs no policy.
+The build lease lives in the strictly validated rebuild state. Ready, pending adoptions,
+overlay registry/events, starvation, force request/watch, conflict wakes and pending drops
+also refuse malformed or unreadable evidence; only ENOENT is absent. Writes revalidate evidence
+before replacing or deleting it. Refusal requires operator repair of the persisted evidence.
+`daemon-rebuild/__tests__/evidence-readers.test.mjs` tables both provenances against each reader
+and corrupt JSON, EACCES and wrong shapes, at entry and after waiting for the write lock,
+asserting unchanged bytes. It also pins indirect legacy-reader inheritance and late ready
+corruption before publication/cleanup. The recovery suite pins both recovery launch origins
+and successful strict-child smoke/ready publication. Existing real CLI child probes retain
+legacy tick-start behavior and prove early/recovery entry refusal before Git IO.
+
+
+Strict early/recovery preparation defers these mutators to tick-start: index-lock
+unlink; interrupted/unverified recovery state writes and rollback; quarantine reset;
+`finishPendingSwaps` (registration removal, events, swap deletion, needs-you reports);
+`healWrongBranch`; `ensureSafeToMove` (claim/store recovery); `repairCloneRefs`;
+sidecar pruning; `detectOverlayStale`; `persistStackBases`; conflict-wake mark/clear;
+pin-notice, hold and up-to-date state writes; `kickAutoRebase`; registration removal
+and overlay events; ready cleanup, forced-watch transitions and ready/skip-unrelated
+finalization. Alert-file appends, wrapper pending-adoption rewrites/notifications,
+force-watch checks/rollback, and starvation writes also defer. Fetch and deterministic
+plan object creation remain part of rebuilding; admission never claims a lease, while
+the detached child may claim its actual build lease before smoke, without deleting
+an abandoned lease's candidate worktree. The actionable-swap
+fixture asserts registry, event and swap bytes survive launch plus child prepare,
+with only the child's build lease changing in rebuild state, and proves the same
+swap removes the original registration when ordinary cleanup is called.
