@@ -171,7 +171,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(spawnSync).toHaveBeenCalledWith('sh', ['scripts/ci/fetch-main-history.sh'], expect.objectContaining({ cwd: '/repo' }));
     const heavy = spawnSync.mock.calls.filter(([, args]) => args[0].endsWith('scripts/readiness/heavy-admission.mjs'));
     expect(heavy).toHaveLength(17);
-    expect(heavy.slice(0, 3).map(([, a, o]) => [a.slice(4), o.cwd])).toEqual([
+    expect(heavy.slice(0, 3).map(([, a, o]) => [a.slice(5), o.cwd])).toEqual([
       [['npm', 'ci'], '/frontierui'], [['npm', 'run', 'build:tools'], '/frontierui'], [['npm', 'ci'], '/repo']]);
     expect(spawnSync.mock.calls.every(([, , o]) => !JSON.stringify(o.env).includes(urgentKeyPath('/home/test')) && !Object.keys(o.env).some(k => k.startsWith('URGENT_')))).toBe(true);
     const keyReadOrder = fs.readFileSync.mock.invocationCallOrder[fs.readFileSync.mock.calls.findIndex(([p]) => p.endsWith('.key'))];
@@ -179,10 +179,10 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(heavy.every(([, args, opts]) => args.includes('--wait-ms=60000') && opts.maxBuffer > 0 && opts.timeout > 0)).toBe(true);
     expect(heavy.slice(3, 13).every(([, args]) => args.includes('vitest') && args.includes('scripts/example.test.mjs'))).toBe(true);
     const coverageArgs = JSON.parse(packageText).scripts['test:coverage:shard'].split(' -- ')[1].split(' ');
-    expect(heavy[3][1].slice(4, -1)).toEqual(coverageArgs);
-    expect(heavy[13][1].slice(4)).toEqual(['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9']);
-    expect(heavy[14][1].slice(4)).toEqual(['node', 'scripts/lint-host-paths.mjs']);
-    expect(heavy[15][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--']);
+    expect(heavy[3][1].slice(5, -1)).toEqual(coverageArgs);
+    expect(heavy[13][1].slice(5)).toEqual(['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9']);
+    expect(heavy[14][1].slice(5)).toEqual(['node', 'scripts/lint-host-paths.mjs']);
+    expect(heavy[15][1].slice(5)).toEqual(['npm', 'run', 'test:integration:vitest', '--']);
     expect(heavy[16][1]).toContain('check:standards');
     expect(fs.copyFileSync.mock.calls).toEqual(Array.from({ length: 9 }, (_, i) => ['/repo/coverage/coverage-final.json', `/repo/coverage-shards/coverage-shard-${i + 1}/coverage-final.json`]));
     expect(fs.rmSync).toHaveBeenCalledWith('/repo/coverage-shards', { recursive: true, force: true });
@@ -357,7 +357,7 @@ describe('CI gate mirroring fails closed', () => {
       if (output.startsWith('$')) { expect(() => deps.integration()).toThrow(); expect(spawnSync).toHaveBeenCalledTimes(1); }
       else {
         deps.integration();
-        expect(spawnSync.mock.calls[1][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--', ...(output ? [output] : [])]);
+        expect(spawnSync.mock.calls[1][1].slice(5)).toEqual(['npm', 'run', 'test:integration:vitest', '--', ...(output ? [output] : [])]);
         expect(spawnSync.mock.calls.every(([, , opts]) => !opts.shell)).toBe(true);
       }
     }
@@ -471,7 +471,9 @@ describe('urgent-verify blocker fixes', () => {
 
 // Isolation: urgent-verify runs in its own detached worktree (real temp git repos, doubles only for the steps).
 import { afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, realpathSync, rmSync, chmodSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { spawnSync as spawnSyncReal } from 'node:child_process';
 const tempParents = []; // os.tmpdir() is the hermetic per-run root; still remove what we make (tmp-leak budget)
 afterAll(() => { for (const p of tempParents.splice(0)) rmSync(p, { recursive: true, force: true }); });
 import { execFileSync } from 'node:child_process';
@@ -595,5 +597,64 @@ describe('urgent-verify red exits non-zero', () => {
   });
   it('a missing verdict never exits 0', () => {
     expect(finish({ run: {}, code: 0, lines: [] }).code).not.toBe(0);
+  });
+});
+
+describe('urgent-verify signing isolation', () => {
+  const keyOf = t => urgentKeyPath(pjoin(t.parent, 'home'));
+  const ledgerOf = t => urgentLedger(pjoin(t.parent, 'home'));
+  const ledgerText = t => { try { return readFileSync(ledgerOf(t), 'utf8'); } catch { return ''; } };
+  it('a step cannot read the signing key', async () => {
+    const t = tempRepo(); let leaked = false;
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => { try { readFileSync(keyOf(t)); leaked = true; } catch { /* EACCES expected */ } }));
+    expect(leaked).toBe(false);
+  });
+  it('the key and ledger are usable again afterwards (parent signs last)', async () => {
+    const t = tempRepo();
+    expect(await urgentVerify({ sha: t.head }, isoDeps(t, () => {}))).toMatchObject({ ok: true });
+    expect(ledgerText(t)).toContain('"result":"green"');
+    expect(readFileSync(keyOf(t)).length).toBe(32);
+  });
+  it('a step that appends a receipt to the ledger gives red and no green record', async () => {
+    const t = tempRepo(); mkdirSync(pjoin(t.parent, 'home/workspace/.operations/coordination'), { recursive: true });
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, () => { writeFileSync(ledgerOf(t), '{"forged":true}\n'); }));
+    expect(r).toMatchObject({ ok: false, marker: { result: 'red' }, failure: { message: expect.stringContaining('signing state changed') } });
+    expect(ledgerText(t)).not.toContain('"result":"green"');
+  });
+  it('a step that creates the ledger when absent, or replaces the key, gives red', async () => {
+    const a = tempRepo();
+    expect(await urgentVerify({ sha: a.head }, isoDeps(a, () => { mkdirSync(dirname(ledgerOf(a)), { recursive: true }); writeFileSync(ledgerOf(a), 'x\n'); })))
+      .toMatchObject({ ok: false, failure: { message: expect.stringContaining('signing state changed') } });
+    const b = tempRepo();
+    expect(await urgentVerify({ sha: b.head }, isoDeps(b, () => { chmodSync(keyOf(b), 0o600); writeFileSync(keyOf(b), Buffer.alloc(32, 1)); })))
+      .toMatchObject({ ok: false, failure: { message: expect.stringContaining('signing state changed') } });
+  });
+  it('a lock left by a crashed run heals on the next start', async () => {
+    const t = tempRepo(), home = pjoin(t.parent, 'home');
+    createUrgentDeps({ home }).readKey(); chmodSync(keyOf(t), 0o000);
+    expect(await urgentVerify({ sha: t.head }, isoDeps(t, () => {}))).toMatchObject({ ok: true });
+  });
+  it('step children get the throwaway HOME, parent-side git calls keep the real one', () => {
+    const calls = [], spawnSync = (cmd, args, o) => { calls.push({ args, home: o.env.HOME, cache: o.env.npm_config_cache }); return { status: 0, stdout: '' }; };
+    const d = createUrgentDeps({ cwd: '/r', home: '/home/real', env: { PATH: '/bin', HOME: '/home/real' }, spawnSync, stepHome: '/tmp/step-home' });
+    d.standards(); d.head();
+    expect(calls[0]).toMatchObject({ home: '/tmp/step-home', cache: '/home/real/.npm' });
+    expect(calls[1].home).toBe('/home/real');
+  });
+  it('every admission call requires a slot (no-pool / bypass means refusal)', () => {
+    const argvs = [], spawnSync = (cmd, args) => { argvs.push(args); return { status: 0, stdout: '' }; };
+    const d = createUrgentDeps({ cwd: '/r', spawnSync });
+    d.standards(); d.shard({ shard: '1/1' });
+    const admission = argvs.filter(a => String(a[0]).endsWith('heavy-admission.mjs'));
+    expect(admission.length).toBeGreaterThan(0);
+    for (const a of admission) expect(a).toContain('--require-admission');
+  });
+  it('heavy-admission --require-admission refuses (126) when there is no pool, and does not run the command', () => {
+    const t = tempRepo(), marker = pjoin(t.parent, 'ran');
+    const r = spawnSyncReal(process.execPath, [pjoin(process.cwd(), 'scripts/readiness/heavy-admission.mjs'), 'run', '--require-admission', '--', process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'x')`],
+      { cwd: t.repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: t.parent, LANE_POOL_ROOT: pjoin(t.parent, 'no-such-pool') } });
+    expect(r.status).toBe(126);
+    expect(r.stderr).toMatch(/require-admission refused: admission bypassed \(no-pool\)/);
+    expect(existsSync(marker)).toBe(false);
   });
 });

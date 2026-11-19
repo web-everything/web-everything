@@ -3268,7 +3268,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
   }
   if (mode === 'run') {
     if (dashDashIdx === -1 || dashDashIdx === argv.length - 1) {
-      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--remote-client=] [--container] [--container-node-modules] -- <command…>\n`);
+      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--remote-client=] [--container] [--container-node-modules] [--require-admission] -- <command…>\n`);
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
@@ -3316,6 +3316,12 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     const forceLocal = flags.local === true;
     if (forceLocal) process.stderr.write(`heavy-admission run: location=local reason=--local (source: flag --local; remote dispatch skipped, a local admission slot is still required)\n`);
     const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
+    // `--require-admission` (urgent-verify): a bypass (no-pool, held, off, ci) would run the command with no slot.
+    // Evidence-requiring callers want a refusal instead of a silent unslotted run.
+    if (flags['require-admission'] === true && bypass) {
+      process.stderr.write(`✗ heavy-admission run: --require-admission refused: admission bypassed (${bypass}); the command was NOT run.\n`);
+      process.exit(126);
+    }
     // The Mac verify driver holds local phase capacity, but its gate may run on
     // Forge. Consume this internal handoff once; local fallback stays reentrant.
     const forgeGate=process.env.WE_FORGE_GATE_DISPATCH==='1';
