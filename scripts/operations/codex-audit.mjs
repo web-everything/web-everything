@@ -147,6 +147,9 @@ async function proveFindings(findings, base, head, deps, observe = () => {}) {
     const blocking = findings.filter((_, i) => classified[i].blocking);
     for (const c of classified) if (c.blocking) deps.stderr(`Base proof blocked: ${c.reason}.\n`);
     extra.preExisting = classified.filter(c => !c.blocking).map(c => c.preExisting);
+    if (deps.preExistingExemptionEnabled?.() !== true) {
+      return { ...extra, preExisting: [], shadowPreExisting: extra.preExisting, findings, verdict: 'WEAKENED' };
+    }
     extra.findingKeys = detailed.flatMap((f, i) => {
       const loc = parseFindingLocation(f.text);
       return classified[i].blocking && loc && answers[i]?.class
@@ -214,7 +217,7 @@ export async function main(argv, deps) {
     try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
     try {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings, ...(result.modelVerdict ? { modelVerdict: result.modelVerdict, findingKeys: result.findingKeys, preExisting: result.preExisting } : {}), ...(fingerprint ? { fingerprint } : {}) });
+        questionHash: QUESTION_HASH, verdict, findings, ...(result.modelVerdict ? { modelVerdict: result.modelVerdict, findingKeys: result.findingKeys, preExisting: result.preExisting, ...(result.shadowPreExisting ? { shadowPreExisting: result.shadowPreExisting } : {}) } : {}), ...(fingerprint ? { fingerprint } : {}) });
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;

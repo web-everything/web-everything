@@ -25,7 +25,7 @@ const BASE = 'b'.repeat(40); const HEAD = 'a'.repeat(40);
 const proofFor = f => ({ ok: true, base: BASE, head: HEAD, fingerprint: proofFingerprint(f) });
 // Hermetic trusted settings: the resolver module is mocked so every call validates the layer the test sets, never the
 // disk or platform file or ambient env. computeVerdict itself has no settings argument a caller could use.
-const AUDIT = Object.freeze({ verdict: { mode: 'model' }, preExisting: { mode: 'prove', baseRecheckMax: 3 }, releaseStage: 'prerelease',
+const AUDIT = Object.freeze({ preExistingExemption: { enabled: true }, verdict: { mode: 'model' }, preExisting: { mode: 'prove', baseRecheckMax: 3 }, releaseStage: 'prerelease',
   raceBlockPaths: [], guardFloorPaths: [], priorQuestionHashes: [], recheck: { max: 1 }, cards: { requireOnMain: true, requirePayBy: true } });
 const trustedLayer = (over = {}) => ({ audit: { ...AUDIT, ...over }, env: {} });
 const settingsLayer = vi.hoisted(() => ({ current: null }));
@@ -823,6 +823,14 @@ describe('R473 structured concurrency evidence', () => {
       expect((await run(f, { relationProofs: [proofFor(g)] })).verdict).toBe('WEAKENED');
       expect((await run(f, { relationProofs: [proofFor(f)], base: undefined })).verdict).toBe('WEAKENED');
     });
+    it('default-off and disabled exemption block D2 despite valid proof and a caller requesting enablement', async () => {
+      const f = d2();
+      for (const preExistingExemption of [undefined, { enabled: false }]) {
+        const layer = trustedLayer({ preExistingExemption });
+        expect((await compute([f], options('prerelease', { relationProofs: [proofFor(f)], readCard: rc,
+          preExistingExemptionEnabled: true }), layer)).verdict).toBe('WEAKENED');
+      }
+    });
     it('mode block and mode allow both block even with a valid proof; default settings block', async () => {
       const f = d2();
       for (const preExistingMode of ['block', 'allow', 'bogus']) expect((await run(f, { relationProofs: [proofFor(f)], preExistingMode })).verdict).toBe('WEAKENED');
@@ -1353,8 +1361,8 @@ describe('AU1 PR-A is inert', () => {
     // lands" (PR #6381 merge with AU1 PR-B). A comment marker after code on the same line still counts as code.
     const hits = [...new Set(matches.filter(m => !m || (/\.(mjs|js|cjs|ts)$/.test(m.file) && !/__tests__\/|\.test\./.test(m.file)
       && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text))).map(m => m?.file ?? 'unparsed grep line'))];
-    // R1053 S1b: only the audit adapters wire the pure modules and trusted settings.
-    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/canonical-audit-gate.mjs', 'scripts/operations/codex-audit-io.mjs']);
+    // Audit adapters and the canonical evidence reader wire trusted settings; saved exemptions must obey current policy.
+    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/canonical-audit-gate.mjs', 'scripts/operations/codex-audit-io.mjs', 'scripts/operations/prototype-load.mjs']);
     const callers = spawnSync('git', ['grep', '--untracked', '-nE', 'audit-finding-key\\.mjs|audit-base-repro\\.mjs', '--', 'scripts', 'skills-src', '.claude', 'src'],
       { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
     expect(callers.error).toBeUndefined();

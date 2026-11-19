@@ -634,15 +634,16 @@ describe('prototype-load ruled-WEAKENED admission', () => {
 });
 
 describe('prototype-load canonical audit admission', () => {
-  it.each(['current', 'mode revoked', 'card removed', 'B-class security exemption', 'new protected path', 'unreadable settings'])('revalidates persisted exemptions before loading: %s', kind => {
+  it.each(['current', 'exemption disabled', 'mode revoked', 'card removed', 'B-class security exemption', 'new protected path', 'unreadable settings'])('revalidates persisted exemptions before loading: %s', kind => {
     const cls = kind === 'B-class security exemption' ? 'B2' : 'E1';
     const key = `x.mjs|X|${cls}`, line = 'x.mjs:2 unsafe return';
     const exemption = { key, line, relation: 'SAME', cardHash: cardHash(key), base: { sha: TREE, path: 'x.mjs', line: 2, quote: 'return unsafe();' } };
-    const card = `- [R1053] today ET: pre-existing audit finding (${cls}) in we:x.mjs#X, reproduces on main ${TREE.slice(0, 10)}: ${line}`;
+    const card = `- [R1053] today ET: pre-existing audit finding (${cls}) in we:x.mjs#X, reproduces on main ${TREE.slice(0, 10)}: we:${line}`;
     const escalation = cls.startsWith('B') ? `- [R1053][needs-you] today ET: security pre-existing (${cls}) ${key}` : '';
     const exemptionFiles = {
       [resolve(dirname(fileURLToPath(import.meta.url)), '../../settings/codex-audit.json')]: kind === 'unreadable settings' ? '{bad' : JSON.stringify({ audit: {
-        preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, proveMode: { clearEnabled: true }, releaseStage: 'prerelease', cards: { requirePayBy: false },
+        preExistingExemption: { enabled: kind !== 'exemption disabled' },
+        preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, proveMode: { clearEnabled: true }, releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: false },
         ...(kind === 'new protected path' ? { raceBlockPaths: ['x.mjs'] } : {}),
       } }),
       '/home/test/workspace/.operations/handoff/cards-to-file.md': [kind === 'card removed' ? '' : card, escalation].join('\n'),
@@ -654,8 +655,10 @@ describe('prototype-load canonical audit admission', () => {
       if (kind === 'current') {
         expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true } });
       } else {
-        expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'exemption-stale' } });
-        expect(out.fallback).toMatch(/human review|restore/i);
+        const disabled = kind === 'exemption disabled' || kind === 'unreadable settings';
+        expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
+          canonicalAudit: { ok: false, reason: disabled ? 'pre-existing-exemption-disabled' : 'exemption-stale' } });
+        expect(out.fallback).toMatch(disabled ? /codex-audit/ : /human review|restore/i);
         expect(mutations(f, 'add')).toHaveLength(0);
       }
     });

@@ -1,8 +1,12 @@
 /** @file Pure base-reproduction protocol and fail-closed classification; no worktrees, cards or callers wired. */
 import { createHash } from 'node:crypto';
+import vm from 'node:vm';
+import { parse } from 'acorn';
 import { FINDING_CLASSES, matchesSome, debtCardVerified, productionFindingBlocks } from './audit-verdict.mjs';
 import { GUARD_FLOOR, AUDITOR_FLOOR, REVIEW_AUTH_FLOOR, LOCK_PRIMITIVES, LOCK_HOLDERS, LOCK_USERS } from '../lib/audit-settings.mjs';
 import { findingKey, parseFindingLocation, symbolAt, symbolRangeAt } from '../lib/audit-finding-key.mjs';
+import { assertPublishableContent } from '../backlog/guarded-write.mjs';
+import { qualifyBareBasenames } from '../lib/qualify-bare-basenames.mjs';
 
 export const PREEXISTING_ELIGIBLE = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
 export const protectedPath = (path, extra = []) => matchesSome(path, [...GUARD_FLOOR, ...AUDITOR_FLOOR, ...REVIEW_AUTH_FLOOR,
@@ -10,6 +14,67 @@ export const protectedPath = (path, extra = []) => matchesSome(path, [...GUARD_F
 
 const unknown = () => ({ status: 'UNDETERMINED' });
 const findingText = f => typeof f === 'string' ? f : f?.text;
+
+/** Verify the scanner's header, rather than accepting its name in unrelated leading code. */
+function startsWithSymbolHeader(tree, symbol) {
+  const first = tree.body[0];
+  const isFunction = node => ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node?.type);
+  if (isFunction(first)) return first.id?.name === symbol;
+  if (first?.type === 'VariableDeclaration') {
+    const declaration = first.declarations[0];
+    return declaration.id?.name === symbol && isFunction(declaration.init);
+  }
+  const expression = first?.type === 'ExpressionStatement' ? first.expression : null;
+  if (isFunction(expression)) return expression.id?.name === symbol;
+  const method = expression?.type === 'ObjectExpression' ? expression.properties[0] : null;
+  return method?.method === true && method.key?.name === symbol && isFunction(method.value);
+}
+
+/** The approximate scanner's extent is evidence only if the real parser accepts it. Never execute it. */
+function verifiedRange(source, range) {
+  if (!range) return null;
+  const lines = source.split('\n').slice(range.start - 1, range.end);
+  if (!lines[0]?.includes(range.symbol)) return null;
+  const snippet = lines.join('\n');
+  for (const form of [snippet, `({\n${snippet}\n})`, `(\n${snippet}\n)`]) {
+    try {
+      new vm.Script(form);
+      if (startsWithSymbolHeader(parse(form, { ecmaVersion: 2020 }), range.symbol)) return range;
+    } catch { /* Try method shorthand / expression context. */ }
+  }
+  return null;
+}
+
+/** Find the widest function containing the scanned symbol. Unknown syntax supplies no extent. */
+function enclosingRange(source, range) {
+  if (!range) return null;
+  try {
+    const tree = parse(source, { ecmaVersion: 2020, sourceType: 'module', locations: true });
+    let widest = range;
+    const visit = node => {
+      if (!node || typeof node !== 'object') return;
+      if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type)
+        && node.loc.start.line <= widest.start && node.loc.end.line >= widest.end) {
+        widest = { start: node.loc.start.line, end: node.loc.end.line };
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach(visit);
+        else if (value?.type) visit(value);
+      }
+    };
+    visit(tree);
+    return widest;
+  } catch { return null; }
+}
+
+/** Finding paths belong to WE; preserve explicit loci, URLs and npm scopes. */
+function qualifyFindingPaths(text) {
+  return text.replace(/[\w./@+-]+\/[\w./@+-]+/g, (path, offset) => {
+    const before = text.slice(0, offset);
+    if (path.startsWith('/') || path.startsWith('@') || /[\w:~]$/.test(before)) return path;
+    return `we:${path}`;
+  });
+}
 
 /** Fixed mandate; numbered findings are fenced data, never instructions. */
 export function REPRO_QUESTION(findings) {
@@ -73,11 +138,10 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       if (a.class.startsWith('B')) return block('security finding');
       if (productionFindingBlocks(a.class, auditPolicy.releaseStage)) return block('production finding');
       // Pay-by authority is the persisted card, just as in computeVerdict. The model may name a card but cannot set its date.
-      // D5: the held card is checked below; requireOnMain does not add a second existence check here.
       const body = typeof finding?.card === 'string' && /^backlog\/[A-Za-z0-9._-]+\.md(?![\s\S])/.test(finding.card)
         ? readCard(finding.card) : null;
       if (!debtCardVerified(body, auditPolicy.releaseStage, { requirePayBy: auditPolicy.requirePayBy,
-        requireOnMain: false, now })) return block('debt pay-by policy');
+        requireOnMain: auditPolicy.requireOnMain, now })) return block('debt pay-by policy');
       const text = findingText(finding), location = parseFindingLocation(text);
       if (!location || (finding?.file && finding.file !== location.file) || (finding?.line && finding.line !== location.line)) return block('invalid head location');
       if (isProtectedPath(location.file) !== false) return block('protected path');
@@ -93,20 +157,29 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       if (typeof source !== 'string' || !quoteLines || !a.quote.trim()
         || !source.split('\n').slice(base.line - 1, base.line - 1 + quoteLines).join('\n').includes(a.quote)) return block('base quote not at the claimed base line');
       const symbol = finding?.symbol || symbolAt(finding?.sourceText, location.line);
-      const range = symbolRangeAt(source, base.line), quoteEnd = base.line + quoteLines - 1;
+      const range = verifiedRange(source, symbolRangeAt(source, base.line)), quoteEnd = base.line + quoteLines - 1;
       if (symbol === '<top>' ? range !== null || base.line < location.line - 3 || quoteEnd > location.line + 3
         : !range || range.symbol !== symbol || base.line < range.start || quoteEnd > range.end) return block('base quote outside the finding symbol');
       // Removed lines leave no head line: any hunk touching the finding's symbol (either side) or its base line is a change.
-      const headRange = symbolRangeAt(finding?.sourceText, location.line);
-      const [hs, he] = headRange ? [headRange.start - 1, headRange.end] : [location.line - 3, location.line + 3];
-      const [bs, be] = range ? [range.start, range.end] : [base.line - 3, quoteEnd + 3];
+      const headRange = verifiedRange(finding?.sourceText, symbolRangeAt(finding?.sourceText, location.line));
+      // This approximate scanner also returns null for unsupported function syntax. Without a
+      // known extent, only an unchanged file can prove that a distant guard was not edited.
+      const headExtent = enclosingRange(finding?.sourceText, headRange), baseExtent = enclosingRange(source, range);
+      const [hs, he] = headExtent ? [headExtent.start - 1, headExtent.end] : [0, Infinity];
+      const [bs, be] = baseExtent ? [baseExtent.start, baseExtent.end] : [1, Infinity];
       const inside = (set, lo, hi) => [...(set ?? [])].some(n => n >= lo && n <= hi);
       if (changedLines.removed?.get(base.path)?.has(base.line) || inside(changedLines.removed?.get(base.path), bs, be)
-        || inside(changedLines.deletedAt?.get(location.file), hs, he) || inside(changed, hs, he)) return block('head or base symbol touched by the diff');
+        || inside(changedLines.deletedAt?.get(location.file), hs, he) || inside(changed, hs, he)) {
+        return block(headExtent && baseExtent ? 'head or base symbol touched by the diff' : 'unknown symbol extent in a changed file');
+      }
       const key = findingKey({ file: location.file, symbol, class: a.class });
       const security = a.class.startsWith('B'), receipt = cardWritten(key);
       if (security ? receipt?.written !== true || receipt.expedite !== true || receipt.needsYou !== true
         : receipt !== true) return block('card or security expedite/needs-you not confirmed');
+      const cardText = cardLine({ date: '', cls: a.class, path: location.file, symbol,
+        sha10: baseSha.slice(0, 10), text });
+      try { assertPublishableContent('backlog/held-card.md', `# held\n\n${cardText}`); }
+      catch { return block('held card not publishable'); }
       return { blocking: false, preExisting: { line: text, key, base: { sha: baseSha, ...base, quote: a.quote },
         relation: 'SAME', cardHash: cardHash(key) }, reason: 'verified pre-existing finding',
       ...(security ? { expedite: true, tag: 'security', needsYou: true } : {}) };
@@ -151,4 +224,5 @@ export function parseDiffChangedLines(diffU0Text, numstatText) {
 
 export const cardHash = key => createHash('sha256').update(key).digest('hex');
 export const cardLine = ({ date, cls, path, symbol, sha10, text }) =>
-  `- [R1053] ${date} ET: pre-existing audit finding (${cls}) in we:${path}#${symbol}, reproduces on main ${sha10}: ${text}`;
+  `- [R1053] ${date} ET: pre-existing audit finding (${cls}) in we:${path}#${symbol}, reproduces on main ${sha10}: ${qualifyBareBasenames(qualifyFindingPaths(text), [path]).text}`
+    .replace(/\r\n|[\r\n\u2028\u2029]/g, ' ');

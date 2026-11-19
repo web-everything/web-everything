@@ -13,9 +13,37 @@ const full = (over = {}) => ({ verdict: { mode: 'model' }, preExisting: { mode: 
   raceBlockPaths: [], guardFloorPaths: [], priorQuestionHashes: [], recheck: { max: 1 }, cards: { requireOnMain: true, requirePayBy: true }, ...over });
 const resolve = (audit, env = {}) => resolveAuditSettings({ fileRead: file(audit), platform: null, env, log: () => {} });
 const STRICT_PATHS = [...GUARD_FLOOR, '**'];
-const STRICT = { verdictMode: 'shadow', preExistingMode: 'block', preExistingShadow: false, proveClearEnabled: false, releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0, requireOnMain: true, requirePayBy: true };
+const STRICT = { preExistingExemptionEnabled: false, verdictMode: 'shadow', preExistingMode: 'block', preExistingShadow: false, proveClearEnabled: false, releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0, requireOnMain: true, requirePayBy: true };
 
 describe('audit settings (R528)', () => {
+  it('pre-existing exemption defaults off; file and platform may enable and report provenance', () => {
+    expect(resolve({}).value.preExistingExemptionEnabled).toBe(false);
+    const on = resolve({ preExistingExemption: { enabled: true } });
+    expect(on.value.preExistingExemptionEnabled).toBe(true);
+    expect(on.sources.preExistingExemptionEnabled).toBe('file');
+    const platform = resolveAuditSettings({ fileRead: file({}), platform: { preExistingExemption: { enabled: true } }, env: {}, log: () => {} });
+    expect(platform.value.preExistingExemptionEnabled).toBe(true);
+    expect(platform.sources.preExistingExemptionEnabled).toBe('platform');
+  });
+  it('exemption env may disable but cannot enable', () => {
+    const key = AUDIT_SETTINGS_ENV.preExistingExemptionEnabled;
+    const off = resolve({ preExistingExemption: { enabled: true } }, { [key]: 'false' });
+    expect(off.value.preExistingExemptionEnabled).toBe(false);
+    expect(off.sources.preExistingExemptionEnabled).toBe('env');
+    expect(resolve({}, { [key]: 'true' }).value.preExistingExemptionEnabled).toBe(false);
+    expect(resolve({ preExistingExemption: { enabled: false } }, { [key]: 'true' }).value.preExistingExemptionEnabled).toBe(false);
+  });
+  it.each([null, {}, [], 'true', 1])('invalid exemption %j fails closed even over an enabled platform', enabled => {
+    const result = resolveAuditSettings({ fileRead: file({ preExistingExemption: { enabled } }),
+      platform: { preExistingExemption: { enabled: true } }, env: {}, log: () => {} });
+    expect(result.value.preExistingExemptionEnabled).toBe(false);
+    expect(result.sources.preExistingExemptionEnabled).toBe('strictest');
+  });
+  it('invalid exemption env disables an enabled file', () => {
+    const result = resolve({ preExistingExemption: { enabled: true } }, { WE_AUDIT_PREEXISTING_EXEMPTION_ENABLED: 'TRUE' });
+    expect(result.value.preExistingExemptionEnabled).toBe(false);
+    expect(result.sources.preExistingExemptionEnabled).toBe('strictest');
+  });
   it.each(['raceBlockPaths', 'guardFloorPaths'])('strict path grammar rejects malformed %s at settings load', key => {
     for (const pattern of ['custom/a+b.mjs', '---a/scripts/x.mjs']) {
       for (const layer of ['file', 'platform', 'env']) {

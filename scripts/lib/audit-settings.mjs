@@ -60,6 +60,8 @@ export const AUDITOR_FLOOR = Object.freeze(['scripts/operations/audit-verdict.mj
   'scripts/codex-direct-task.mjs', 'scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);
 /** Modules the auditor imports or launches directly that no other floor entry names (the source-scan test pins each). */
 const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
+  // Base proof and the filer share path qualification; changing it changes which findings can be exempted.
+  'scripts/lib/qualify-bare-basenames.mjs',
   // The audit launcher's imports, and the transcript-check settings its policy reads.
   'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
   'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',
@@ -299,7 +301,9 @@ export const LOCK_USERS = Object.freeze([
   // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
   'scripts/conveyor/pr-live-owner-watch-io.mjs',
   // The timeout-evidence pool probes the throttle with acquireGhSlotSync/releaseGhSlotSync.
-  'scripts/conveyor/timeout-evidence-pool.mjs']);
+  'scripts/conveyor/timeout-evidence-pool.mjs',
+  // The shared stuck-trace queue serializes enqueue, claims and completion through withFileLock.
+  'scripts/conveyor/stuck-trace.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
@@ -350,13 +354,14 @@ export const AUDIT_SETTINGS_ENV = Object.freeze({
   verdictMode: 'WE_AUDIT_VERDICT_MODE', preExistingMode: 'WE_AUDIT_PREEXISTING_MODE', preExistingShadow: 'WE_AUDIT_PREEXISTING_SHADOW', proveClearEnabled: 'WE_AUDIT_PROVE_CLEAR_ENABLED', releaseStage: 'WE_AUDIT_RELEASE_STAGE',
   raceBlockPaths: 'WE_AUDIT_RACE_BLOCK_PATHS', guardFloorPaths: 'WE_AUDIT_GUARD_FLOOR_PATHS',
   recheckMax: 'WE_AUDIT_RECHECK_MAX', baseRecheckMax: 'WE_AUDIT_BASE_RECHECK_MAX',
+  preExistingExemptionEnabled: 'WE_AUDIT_PREEXISTING_EXEMPTION_ENABLED',
   requireOnMain: 'WE_AUDIT_CARDS_REQUIRE_ON_MAIN', requirePayBy: 'WE_AUDIT_CARDS_REQUIRE_PAY_BY',
 });
 const MAX_RECHECK = 3;
 const STRICTEST = Object.freeze({ verdictMode: 'shadow', preExistingMode: 'block', preExistingShadow: false, proveClearEnabled: false, releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0,
-  requireOnMain: true, requirePayBy: true });
+  preExistingExemptionEnabled: false, requireOnMain: true, requirePayBy: true });
 const DEFAULTS = Object.freeze({ verdictMode: 'model', preExistingMode: 'block', preExistingShadow: false, proveClearEnabled: false, releaseStage: 'prerelease', recheckMax: 1, baseRecheckMax: 3,
-  requireOnMain: true, requirePayBy: true });
+  preExistingExemptionEnabled: false, requireOnMain: true, requirePayBy: true });
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 // Preserve strictest recovery for unreadable settings; a well-shaped list with a malformed
@@ -380,7 +385,7 @@ const validHashes = v => Array.isArray(v) && v.length <= 64
 const validCount = v => Number.isInteger(v) && v >= 0 && v <= MAX_RECHECK;
 const enumOf = key => v => RANKS[key].includes(v);
 const VALID = Object.freeze({ verdictMode: enumOf('verdictMode'), preExistingMode: enumOf('preExistingMode'), releaseStage: enumOf('releaseStage'),
-  recheckMax: validCount, baseRecheckMax: validCount, preExistingShadow: v => typeof v === 'boolean', proveClearEnabled: v => typeof v === 'boolean', requireOnMain: v => typeof v === 'boolean', requirePayBy: v => typeof v === 'boolean' });
+  recheckMax: validCount, baseRecheckMax: validCount, preExistingExemptionEnabled: v => typeof v === 'boolean', preExistingShadow: v => typeof v === 'boolean', proveClearEnabled: v => typeof v === 'boolean', requireOnMain: v => typeof v === 'boolean', requirePayBy: v => typeof v === 'boolean' });
 
 function readFile(path, read) {
   try {
@@ -399,7 +404,7 @@ function auditVariants(obj) {
 // A key for a warning: JSON-quoted, with every non-printable-ASCII character escaped so an invisible one shows.
 const showKey = k => JSON.stringify(k).replace(/[^\x20-\x7e]/gu, c => `\\u${c.codePointAt(0).toString(16).padStart(4, '0')}`);
 const SECTION_PATHS = Object.freeze({ __proto__: null, verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'],
-  preExistingShadow: ['preExisting', 'shadow'], proveClearEnabled: ['proveMode', 'clearEnabled'], baseRecheckMax: ['preExisting', 'baseRecheckMax'], recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'],
+  preExistingExemptionEnabled: ['preExistingExemption', 'enabled'], preExistingShadow: ['preExisting', 'shadow'], proveClearEnabled: ['proveMode', 'clearEnabled'], baseRecheckMax: ['preExisting', 'baseRecheckMax'], recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'],
   requirePayBy: ['cards', 'requirePayBy'] });
 // A null-prototype map: a polluted Object.prototype can never turn a setting name into an inherited path.
 const pathOf = key => SECTION_PATHS[key] ?? [key];
@@ -472,13 +477,14 @@ function unknownKeys(layer) {
 const parseEnv = (key, raw) => {
   if (typeof raw !== 'string') return undefined;
   if (['recheckMax', 'baseRecheckMax'].includes(key)) return /^\d+$/.test(raw) ? Number(raw) : undefined;
-  if (['requireOnMain', 'requirePayBy', 'preExistingShadow', 'proveClearEnabled'].includes(key)) return raw === 'true' ? true : raw === 'false' ? false : undefined;
+  if (['preExistingExemptionEnabled', 'requireOnMain', 'requirePayBy', 'preExistingShadow', 'proveClearEnabled'].includes(key)) return raw === 'true' ? true : raw === 'false' ? false : undefined;
   return raw;
 };
 // The value a setting takes effect as: preExisting mode allow is never trusted and resolves to block.
 const effective = (key, v) => (key === 'preExistingMode' && v === 'allow' ? 'block' : v);
 /** Is `candidate` at least as strict as `current`? Compared as they take effect, so allow ranks with block. */
 function tighter(key, candidate, current) {
+  if (key === 'preExistingExemptionEnabled') return candidate === false || current === true;
   if (RANKS[key]) return RANKS[key].indexOf(effective(key, candidate)) <= RANKS[key].indexOf(effective(key, current));
   if (key === 'recheckMax' || key === 'baseRecheckMax') return candidate <= current;
   if (key === 'preExistingShadow' || key === 'proveClearEnabled') return candidate === false || current === true;

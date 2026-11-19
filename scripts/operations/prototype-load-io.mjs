@@ -8,6 +8,7 @@
  * Real deps bind only in defaultDeps.
  */
 import { revalidateExemptions } from './canonical-audit-gate.mjs';
+import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { readStore, storePath } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
@@ -510,8 +511,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return ancestor(base, 'origin/main');
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
+      const auditPolicy = resolveAuditSettings({ fileRead: (path, encoding) => fs.readFileSync(path, encoding),
+        platformRead: (path, encoding) => fs.readFileSync(path, encoding), env }).value;
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: out.gate }) };
+        { ruledWeakened: out.gate, auditPolicy }) };
       if (out.canonicalAudit.ok && out.canonicalAudit.record?.preExisting?.length
         && !revalidateExemptions(out.canonicalAudit.record, {
           readFile: (path, encoding) => fs.readFileSync(path, encoding), env, now,

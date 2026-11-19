@@ -9,6 +9,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 import { parseCards } from '../file-held-cards.mjs';
+import { cardLine as renderCardLine } from '../audit-base-repro.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
 const settingsOverride = vi.hoisted(() => ({ text: null }));
@@ -238,8 +239,9 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     try {
       const f = adapter(undefined, { settingsOptions: { env: {}, platform: { releaseStage: 'prod' },
         fileRead: () => JSON.stringify({ audit: { releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: true } } }) } });
+      expect(f.deps.preExistingExemptionEnabled()).toBe(false);
       expect(f.deps.auditPolicy()).toEqual({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true });
-      for (const name of ['releaseStage', 'requirePayBy', 'requireOnMain']) {
+      for (const name of ['preExistingExemptionEnabled', 'releaseStage', 'requirePayBy', 'requireOnMain']) {
         expect(log.mock.calls.flat().join('')).toContain(`audit.${name}=`);
         expect(log.mock.calls.flat().join('')).toMatch(new RegExp(`audit\\.${name}=.* source=`));
       }
@@ -602,13 +604,22 @@ describe('R1053 prove mode', () => {
   const reply = (cls = 'E1', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
   function proof(answer = reply()) {
     const f = fixture(`WEAKENED\n${finding}`);
-    Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true }),
-      preExistingMode: () => 'prove', proveClearEnabled: () => true, baseRecheckMax: () => 6, protectedPaths: () => [],
+    Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false }),
+      preExistingExemptionEnabled: () => true, preExistingMode: () => 'prove', proveClearEnabled: () => true, baseRecheckMax: () => 6, protectedPaths: () => [],
       reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
     return f;
   }
+  it.each([undefined, false, 'true'])('disabled or missing exemption %j retains all findings and records shadow evidence', async enabled => {
+    const f = proof();
+    if (enabled === undefined) delete f.deps.preExistingExemptionEnabled;
+    else f.deps.preExistingExemptionEnabled = () => enabled;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', modelVerdict: 'WEAKENED', findings: [finding],
+      findingKeys: ['x.mjs|X|B2'], preExisting: [], shadowPreExisting: [{ line: finding, key: 'x.mjs|X|B2', relation: 'SAME' }] });
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+  });
   it.each([
     ['2026-11-18T17:00:00.000Z', '2026-11-18 12:00'],
     ['2026-11-18T05:00:00.000Z', '2026-11-18 00:00'],
@@ -623,7 +634,7 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.fileCard).toHaveBeenCalledOnce();
     const { cardLine } = f.deps.fileCard.mock.calls[0][0];
-    const text = `pre-existing audit finding (E1) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: ${finding}`;
+    const text = `pre-existing audit finding (E1) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: we:${finding}`;
     expect(cardLine).toBe(`- [R1053] ${date} ET: ${text}`);
     const cards = parseCards(cardLine);
     expect(cards).toHaveLength(1);
@@ -701,6 +712,41 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.shadowProof).not.toHaveBeenCalled();
   });
+  it.each(['\u2028', '\u2029', '\r', '\r\n', '\n'])('round-trips serialized card separators %j', separator => {
+    const card = renderCardLine({ date: '2026-11-18 12:00', cls: 'E2', path: 'x.mjs', symbol: 'X',
+      sha10: BASE.slice(0, 10), text: `${finding}${separator}see the probe` });
+    expect(card).not.toMatch(/[\r\n\u2028\u2029]/);
+    const cards = parseCards(card);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].text).toContain(`we:${finding} see the probe`);
+  });
+  it.each(['\u2028', '\u2029'])('serializes a fileable card with separator %j', async separator => {
+    const f = proof(reply('E2'));
+    const text = `${finding}${separator}see the probe`;
+    f.deps.runCodex = () => `WEAKENED\n${text}`;
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+    const { cardLine } = f.deps.fileCard.mock.calls[0][0];
+    expect(cardLine).not.toMatch(/[\r\n\u2028\u2029]/);
+    const cards = parseCards(cardLine);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].text).toContain(`we:${finding} see the probe`);
+    expect(f.records[0]).toMatchObject({ verdict: 'NOT WEAKENED', preExisting: [{ line: text }] });
+  });
+  it.each(['function serve(req = defaultRequest()) {', 'function serve(req): Response {'])
+    ('retains SAME evidence when an unrecognized function has a changed guard: %s', async declaration => {
+      const f = proof('#1 REPRODUCES SAME CLASS=B2 BASE=x.mjs:9\nQUOTE: return unsafeResponse(req);');
+      const base = [declaration, '  requireAuth(req);', ...Array.from({ length: 6 }, (_, i) => `  const v${i} = ${i};`),
+        '  return unsafeResponse(req);', '}'].join('\n');
+      const text = 'x.mjs:9 unsafe response';
+      f.deps.runCodex = () => `WEAKENED\n${text}`;
+      f.deps.readBaseFile = () => base;
+      f.deps.readHeadFile = () => base.replace('requireAuth', 'skipAuth');
+      f.deps.diffText = () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -2 +2 @@\n-  requireAuth(req);\n+  skipAuth(req);\n';
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [text], preExisting: [] });
+      expect(f.deps.fileCard).not.toHaveBeenCalled();
+    });
   it.each(['E1', 'E2'])('production policy blocks %s before filing', async cls => {
     const f = proof(reply(cls));
     f.deps.auditPolicy = () => ({ releaseStage: 'prod', requirePayBy: false, requireOnMain: true });
@@ -724,10 +770,11 @@ describe('R1053 prove mode', () => {
       expect(f.deps.readCard).toHaveBeenCalledWith('backlog/debt.md');
     }
   });
-  it('confirmed held card satisfies requireOnMain for D2', async () => {
+  it('requireOnMain refuses D2 without a main card despite held-card confirmation', async () => {
     const f = proof(reply('D2'));
-    expect(await main(ARGS, f.deps)).toBe(0);
-    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+    f.deps.auditPolicy = () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
   });
   it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s stays WEAKENED regardless of confirmed security receipts', async cls => {
     for (const confirmed of [true, false]) {
@@ -822,6 +869,15 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.records[0].findings).toEqual([finding]);
     expect(f.records[0].preExisting).toHaveLength(1);
+  });
+  it('disabled exemption retains both exemptible and blocking findings', async () => {
+    const f = proof(reply() + '\n' + reply().replace('#1', '#2'));
+    f.deps.runCodex = () => `WEAKENED\n${finding}\n${finding}`;
+    f.deps.baseRecheckMax = () => 1;
+    f.deps.preExistingExemptionEnabled = () => false;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [finding, finding], preExisting: [] });
+    expect(f.records[0].shadowPreExisting).toHaveLength(1);
   });
   it('a6 block mode preserves captured stdout and record bytes', async () => {
     const golden = JSON.parse(realFs.readFileSync(new NodeURL('./fixtures/codex-audit-block.json', import.meta.url), 'utf8'));
