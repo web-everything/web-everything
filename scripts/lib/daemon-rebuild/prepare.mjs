@@ -648,7 +648,7 @@ export async function prepareRebuild({
         // null = no declaration recorded (legacy/unknown): the omission check refuses rather than assume "none".
         dependsOn: (ref) => {
           const deps = (overlaysBefore || []).find((o) => o?.ref === ref)?.dependsOn;
-          return Array.isArray(deps) ? deps : null;
+          return Array.isArray(deps) && deps.every((d) => typeof d === 'string' && d.trim()) ? deps : null; // malformed = unknown
         },        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
