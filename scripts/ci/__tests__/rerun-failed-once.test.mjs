@@ -111,7 +111,17 @@ describe('single failed-file retry core', () => {
     expect(resolvePolicy({ platform: {}, log })).toEqual(policy);
     expect(resolvePolicy({ platform: { maxFiles: 4 }, tool: { enabled: false }, env: { WE_CI_UNIT_RERUN_MAX_FILES: '3' }, log })).toEqual({ enabled: false, maxFiles: 3 });
     expect(log.mock.calls.flat().join('\n')).toMatch(/enabled=false \(tool\).*maxFiles=3 \(env\)/);
-    expect(resolvePolicy({ platform: {}, tool: { maxFiles: 0 }, env: { WE_CI_UNIT_RERUN_ENABLED: 'bad' }, log })).toEqual(policy);
+  });
+  it.each([
+    { tool: { maxFiles: 0 } },
+    { tool: { enabled: 'false' } },
+    { platform: { maxFiles: -1 } },
+    { env: { WE_CI_UNIT_RERUN_ENABLED: 'bad' } },
+    { env: { WE_CI_UNIT_RERUN_MAX_FILES: 'ten' } },
+  ])('a malformed setting at any layer disables retries (fail closed) %j', input => {
+    const log = vi.fn();
+    expect(resolvePolicy({ platform: {}, log, ...input }).enabled).toBe(false);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/invalid .*retries disabled/);
   });
 });
 

@@ -14,15 +14,24 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export function resolvePolicy({ tool, platform, env = {}, log = console.error } = {}) {
   const enabled = env.WE_CI_UNIT_RERUN_ENABLED;
-  return cascadePolicy('ciUnitRerun', tool, {
-    standard: { enabled: true, maxFiles: 10 }, platform, operatorOverride: {},
-    envValues: {
-      enabled: enabled === undefined ? undefined : /^(true|1)$/.test(enabled) ? true : /^(false|0)$/.test(enabled) ? false : enabled,
-      maxFiles: env.WE_CI_UNIT_RERUN_MAX_FILES === undefined ? undefined : Number(env.WE_CI_UNIT_RERUN_MAX_FILES),
-    },
-    valid: { enabled: v => typeof v === 'boolean', maxFiles: v => Number.isSafeInteger(v) && v > 0 },
+  const envValues = {
+    enabled: enabled === undefined ? undefined : /^(true|1)$/.test(enabled) ? true : /^(false|0)$/.test(enabled) ? false : enabled,
+    maxFiles: env.WE_CI_UNIT_RERUN_MAX_FILES === undefined ? undefined : Number(env.WE_CI_UNIT_RERUN_MAX_FILES),
+  };
+  const valid = { enabled: v => typeof v === 'boolean', maxFiles: v => Number.isSafeInteger(v) && v > 0 };
+  const value = cascadePolicy('ciUnitRerun', tool, {
+    standard: { enabled: true, maxFiles: 10 }, platform, operatorOverride: {}, envValues, valid,
     env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log,
   }).value;
+  // Fail closed: a malformed setting at any layer (a typo'd disable, a bad cap) turns retries OFF rather than
+  // falling back to the permissive default, so a broken config can never grant failure recovery.
+  const invalid = [['platform', platform], ['tool', tool], ['env', envValues]].flatMap(([layer, values]) =>
+    Object.entries(values ?? {}).filter(([k, v]) => v !== undefined && valid[k] && !valid[k](v)).map(([k]) => `${k} (${layer})`));
+  if (invalid.length) {
+    log(`ciUnitRerun: invalid ${invalid.join(', ')}; retries disabled`);
+    return { ...value, enabled: false };
+  }
+  return value;
 }
 
 /** PURE: validate JSON evidence and normalize runner-absolute filenames to portable record keys. */
