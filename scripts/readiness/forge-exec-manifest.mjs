@@ -220,9 +220,14 @@ export function credentialBufferFinding(content) {
 // `PRIVATE KEY` appear in real docs and workflow files; a refusal falls the whole Forge run back to local,
 // so those words alone must not block. A PEM private-key block with a body, every token format and the
 // structural key detectors still do.
-const pemPrivateBlock=/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]{0,16}[A-Za-z0-9+/_-]{40}/;
+// The body is any base64-looking line after the header (optionally after a few header lines), so a PEM wrapped
+// at 32 columns, or an encrypted PKCS#8 block, is caught as well as a 64-column one.
+const pemPrivateBlock=/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]{0,300}?[\r\n][ \t]*[A-Za-z0-9+/_-]{16,}={0,2}[ \t]*(?:[\r\n]|$)/;
 const ordinaryPatterns=secretText.slice(2);
-const ordinaryTextFinding=text=>pemPrivateBlock.test(text)?'private-key-block':ordinaryPatterns.find(([pattern])=>pattern.test(text))?.[1]??null;
+const ordinaryViewFinding=text=>pemPrivateBlock.test(text)?'private-key-block':ordinaryPatterns.find(([pattern])=>pattern.test(text))?.[1]??null;
+// Same three views as the credential-named scan: raw, escapes decoded (`ghp_`), backslashes dropped.
+const ordinaryTextFinding=text=>ordinaryViewFinding(text)
+  ??(text.includes('\\')?ordinaryViewFinding(decodeEscapes(text))??ordinaryViewFinding(text.replace(/\\/g,'')):null);
 export function ordinaryBufferFinding(content) {
   for(const encoding of ['latin1','utf8','utf16le']) {
     const finding=ordinaryTextFinding(content.toString(encoding));

@@ -41,6 +41,18 @@ describe('Forge scans all manifest content',()=>{
     expect(admit('docs/setup.md',Buffer.from(`Set the GitHub App ${words} secret.`))).toHaveProperty('sha256');
     expect(admit('ci.yml',Buffer.from(`private-key: \${{ secrets.APP_${['PRIVATE','KEY'].join('_')} }}\n# -----BEGIN CERTIFICATE-----`))).toHaveProperty('sha256');
   });
+  it('refuses a PEM wrapped at 32 columns, an encrypted PKCS#8 PEM and JSON-escaped tokens',()=>{
+    const wrap=(pem,width)=>{
+      const [head,...rest]=pem.trim().split('\n'),tail=rest.pop();
+      return [head,...rest.join('').match(new RegExp(`.{1,${width}}`,'g')),tail].join('\n');
+    };
+    const encrypted=privateKey.export({format:'pem',type:'pkcs8',cipher:'aes-256-cbc',passphrase:'x'});
+    for(const text of [wrap(material.PEM.toString(),32),wrap(encrypted.toString(),32),encrypted.toString()])
+      for(const tracked of [true,false])refused('docs/notes.md',Buffer.from(text),tracked,'content-detected credential');
+    const token='gh'+'p_'+'A1b2C3d4'.repeat(5);
+    refused('docs/notes.md',Buffer.from('"\\u0067'+token.slice(1)+'"'),true,'content-detected credential');
+    refused('docs/notes.md',Buffer.from('gh\\x70_'+token.slice(4)),false,'content-detected credential');
+  });
   it('refuses a PNG-signed file hiding a JWK behind nested brackets (scan exhaustion fails closed)',()=>{
     const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('['.repeat(65)),Buffer.from(material.JWK)]);
     for(const tracked of [true,false])refused('a.png',png,tracked,'content-detected credential');
