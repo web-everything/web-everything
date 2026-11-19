@@ -132,9 +132,7 @@ import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from 
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
-import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
-const DRAIN_SEED_MAX_AGE_MS = 6 * 60 * 60_000; // listing seed: any snapshot this young; rows are re-verified against the live listing
-// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
+import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
 import {
@@ -5718,9 +5716,10 @@ async function runCli() {
           // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
           let seed = snapshotSeed || [];
           if (!snapshotSeed) {
-            // Cache-only: the seed is checked against the live page row (updatedAt + head SHA) before use, so an old
-            // snapshot is safe. A fresh-or-refresh read here ran a second full paged listing (60-200 s) inside the pass.
-            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true, ignoreDirty: true, ttlMs: DRAIN_SEED_MAX_AGE_MS })) || []; } catch { seed = []; }
+            // Cache-only, and never older than the heavy-field age limit (the seed is re-stamped fresh when used, so a
+            // snapshot older than the limit must not seed). The old fresh-or-refresh read ran a second full paged
+            // listing (60-200 s) inside the pass.
+            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true, ignoreDirty: true, ttlMs: paging.heavyMaxAgeSeconds * 1000 })) || []; } catch { seed = []; }
           }
           listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
