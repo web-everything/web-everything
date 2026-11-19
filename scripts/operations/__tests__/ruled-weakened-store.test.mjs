@@ -107,6 +107,18 @@ describe('ops ruled-weakened evidence', () => {
       .toMatchObject({ ruledWeakened: { layer: 'ops' } });
     expect(readyEvidence([carriedRecord], liveInput, union({ warn }), 'd'.repeat(64))).toBeNull();
   });
+  it.each([null, undefined, 'd'.repeat(64)])('a fingerprint-bearing store entry cannot authorize another sha without an exact live match: %s', liveFp => {
+    const fingerprint = 'c'.repeat(64);
+    append(entry({ fingerprint }));
+    const liveInput = { ...input, sha: 'b'.repeat(40) };
+    expect(readyEvidence([{ ...record, fingerprint }], liveInput, union(), liveFp)).toBeNull();
+    expect(readyEvidence([{ ...record, sha: liveInput.sha, fingerprint }], liveInput, union(), liveFp)).toBeNull();
+  });
+  it('a store entry without a fingerprint cannot authorize another sha even when readiness carries', () => {
+    append();
+    const fingerprint = 'c'.repeat(64);
+    expect(readyEvidence([{ ...record, fingerprint }], { ...input, sha: 'b'.repeat(40) }, union(), fingerprint)).toBeNull();
+  });
   it('malformed optional fingerprints remain unreadable and grant no waiver', () => {
     fs.mkdirSync(join(path, '..'), { recursive: true });
     for (const fingerprint of [null, true, 12, '', 'c'.repeat(63), 'z'.repeat(64)]) {

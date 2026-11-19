@@ -1,7 +1,10 @@
 /** Canonical audit-waiver store: append operator rulings; prune explicitly. Invalid or unreadable evidence grants no waiver. */
 import nodeFs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { withLedgerAppendLock } from '../lib/ledger-append-lock.mjs';
+
+export const findingsHash = findings => createHash('sha256').update(JSON.stringify(findings)).digest('hex');
 
 export function storePath(env = process.env) {
   if (typeof env.HOME !== 'string' || !env.HOME.trim()) throw new Error('ruled-weakened store requires HOME');

@@ -3,14 +3,15 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordEntries, recordWaivers } from '../ruled-weakened-record.mjs';
-import { readStore } from '../ruled-weakened-store.mjs';
+import { QUESTION_HASH } from '../codex-audit.mjs';
+import { findingsHash, readStore } from '../ruled-weakened-store.mjs';
 
 const sha = 'a'.repeat(40), head = 'b'.repeat(40), ref = 'lane/a';
 const FP = 'c'.repeat(64);
 const now = '2026-11-19T12:00:00.000Z';
 const request = { ref, sha, ruling: 'UNTRUSTED', findings: ['Verbatim. ', 'second finding'] };
-const approval = { ref, sha, ruling: 'R123' };
-const audit = { head: sha, findings: ['Verbatim. ', 'second finding'] };
+const approval = { ref, sha, ruling: 'R123', findingsHash: findingsHash(request.findings) };
+const audit = { head: sha, base: head, questionHash: QUESTION_HASH, verdict: 'WEAKENED', at: now, findings: ['Verbatim. ', 'second finding'] };
 const options = overrides => ({ approvals: [approval], requests: [request], rulings: '**R123**', entries: [],
   latestAudit: () => audit, headOf: () => sha, carries: () => false, now, ...overrides });
 
@@ -52,11 +53,39 @@ describe('bounded approved waiver selection', () => {
       { ref: `${ref} (description)`, sha: sha.toUpperCase(), ruling: 'WITHDRAWN' }] })).counts.added).toBe(0);
   });
   it('an approval for findings A does not cover a sha whose audit says B', () => {
-    const swapped = { head: sha, findings: ['a different, unapproved finding'] };
+    const swapped = { ...audit, findings: ['a different, unapproved finding'] };
     const result = recordEntries(options({ latestAudit: () => swapped }));
     expect(result.entries).toEqual([]);
     expect(result.counts['skipped-invalid']).toBe(1);
     expect(recordEntries(options({ requests: [{ ...request, findings: undefined }] })).counts.added).toBe(0);
+  });
+  it.each([undefined, '0'.repeat(64)])('missing or mismatched approval findingsHash %s grants nothing', hash => {
+    expect(recordEntries(options({ approvals: [{ ...approval, findingsHash: hash }] })).counts)
+      .toMatchObject({ added: 0, 'skipped-invalid': 1 });
+  });
+  it('a replacement request for the same ref and sha needs its own approval findingsHash', () => {
+    const findings = ['replacement finding'];
+    const replacement = { ...request, findings };
+    const cfg = { requests: [replacement], latestAudit: () => ({ ...audit, findings }) };
+    expect(recordEntries(options(cfg)).counts).toMatchObject({ added: 0, 'skipped-invalid': 1 });
+    expect(recordEntries(options({ ...cfg, approvals: [{ ...approval, findingsHash: findingsHash(findings) }] })).counts.added).toBe(1);
+  });
+  it.each([
+    ['foreign question', { questionHash: 'foreign' }],
+    ['non-WEAKENED verdict', { verdict: 'NOT WEAKENED' }],
+    ['wrong head', { head }],
+    ['missing timestamp', { at: undefined }],
+    ['invalid timestamp', { at: 'invalid' }],
+    ['missing base', { base: undefined }],
+    ['symbolic base', { base: 'origin/main' }],
+    ['base equals head', { base: sha }],
+    ['contradictory findings', { findings: ['NOT WEAKENED'] }],
+  ])('rejects a noncanonical audit: %s', (_, changes) => {
+    const value = { ...audit, ...changes };
+    expect(recordEntries(options({ latestAudit: () => value,
+      requests: [{ ...request, findings: value.findings }],
+      approvals: [{ ...approval, findingsHash: findingsHash(value.findings) }] })).counts)
+      .toMatchObject({ added: 0, 'skipped-invalid': 1 });
   });
   it('missing approval never trusts the request ruling', () => {
     expect(recordEntries(options({ approvals: [], requests: [{ ...request, ruling: 'R123' }] })).counts.added).toBe(0);

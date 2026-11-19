@@ -5147,17 +5147,17 @@ evidence is distinct from two readable, unequal fingerprints, which still drop a
 The repo-owned `scripts/operations/ruled-weakened-record.mjs` replaces approval replay in the
 external handoff recorder. Run it from the target repository: it checks current origin heads
 with one bounded `ls-remote` lookup and permits older approved heads only with the shared
-net-diff carry proof. Approvals supply rulings, the latest canonical audit supplies verbatim
-findings, and WITHDRAWN requests veto recording. Replays deduplicate `(ref, sha, ruling)`
+net-diff carry proof. Approvals supply rulings and `findingsHash` (SHA-256 of
+`JSON.stringify(findings)`); the latest canonical WEAKENED audit supplies verbatim findings,
+and WITHDRAWN requests veto recording. Replays deduplicate `(ref, sha, ruling)`
 inside the append/prune lock. Unreadable evidence refuses writes; inputs above 16 MiB require
 archiving old records before retrying. Hermetic recorder proofs live in
 `scripts/operations/__tests__/ruled-weakened-record.test.mjs`.
 
-Prototype-load may use an exact-head or same-diff waiver for the canonical audit before any
-fix-ready record exists. This never supplies readiness: refusing ready records still block,
-and fresh readiness still requires the live SHA's passing test evidence. Fresh WEAKENED
-readiness retains the waiver ruling and canonical findings for the next load. The fallback
-regressions live in `scripts/operations/__tests__/prototype-load.test.mjs`.
+Prototype-load requires a fix-ready record carrying the waiver's ruling and verbatim disclosure
+before admitting a canonical WEAKENED audit. A waiver alone refuses and names
+`scripts/operations/fix-ready-record.mjs` as the recovery step. These regressions live in
+`scripts/operations/__tests__/prototype-load.test.mjs`.
 The recorder, store and load gate share the handoff R-number shape, including one lowercase
 letter suffix such as `R1063a` and combined rulings joined by `+`.
 
@@ -5168,7 +5168,7 @@ returns it only after the shared `carriesAcross` comparison succeeds. The store 
 preserves this optional 64-hex fingerprint, while legacy entries without it remain readable
 and malformed fingerprints refuse validation. The named `recorder-to-load same-diff waiver
 admission` regression records an old approval through the real append/read store path, then
-loads the equivalent live head with no pre-existing readiness. It also rejects changed code
+loads the equivalent live head with matching carried fix-ready evidence. It also rejects changed code
 and changed canonical findings; an added-count assertion alone does not prove usable carry.
 ## Forge sweep partial work
 

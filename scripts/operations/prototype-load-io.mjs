@@ -509,13 +509,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return ancestor(base, 'origin/main');
       } catch { return false; } };
       const liveFp = liveFingerprint([...auditRecords, ...config.ruledWeakened]);
-      const waiver = !out.gate ? waiverForHead(config.ruledWeakened, input, liveFp) : null;
-      const auditGate = out.gate || (waiver ? { ruledWeakened: {
-        ruling: waiver.ruling, findings: waiver.findings, layer: waiver.layer } } : null);
+      const waiver = !out.gate?.ruledWeakened ? waiverForHead(config.ruledWeakened, input, liveFp) : null;
+      const auditGate = out.gate;
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
         { ruledWeakened: auditGate }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
-        fallback: waiver ? `waiver exists but no fix-ready record. Run the canonical audit/readiness so a fix-ready record is written, then retry prototype-load.` : `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
+        fallback: waiver ? `waiver exists but no fix-ready record. Run scripts/operations/fix-ready-record.mjs with auditRuling and auditDisclosed matching the waiver, then retry prototype-load.` : `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
       if (auditGate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${auditGate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${auditGate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${auditGate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.

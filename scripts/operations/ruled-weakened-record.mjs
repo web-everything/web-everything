@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { appendEntry, readStore, storePath, validateEntry } from './ruled-weakened-store.mjs';
+import { appendEntry, readStore, storePath, validateEntry, findingsHash } from './ruled-weakened-store.mjs';
+import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 
 const bareRef = ref => String(ref ?? '').replace(/\s*\(.*\)\s*$/, '').trim();
@@ -17,14 +18,18 @@ const validRef = ref => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*
 
 /** Pure selection with synchronous injected lookups. carries returns the proven net-diff fingerprint, or null; a boolean alone grants no waiver. */
 export function recordEntries({ approvals, requests, rulings, entries, latestAudit, headOf, carries, now }) {
-  const approved = new Map(approvals.map(a => [key(a), a.ruling]));
+  const approved = new Map(approvals.map(a => [key(a), a]));
   const withdrawn = new Set(requests.filter(r => r.ruling === 'WITHDRAWN').map(key));
   const seen = new Set(entries.map(identity));
   const added = [];
   const counts = { added: 0, 'skipped-not-head': 0, 'skipped-duplicate': 0, 'skipped-invalid': 0 };
   for (const request of requests) {
-    const ref = bareRef(request.ref), sha = shaKey(request.sha), ruling = approved.get(key(request));
+    const ref = bareRef(request.ref), sha = shaKey(request.sha), approval = approved.get(key(request));
+    const ruling = approval?.ruling;
     if (withdrawn.has(key(request))) { counts['skipped-invalid']++; continue; }
+    if (!Array.isArray(request.findings) || approval?.findingsHash !== findingsHash(request.findings)) {
+      counts['skipped-invalid']++; continue;
+    }
     // Match the store/gate's accepted R-number syntax. Request ruling/findings are never authority.
     if (!validRef(ref) || !validSha(sha) || typeof ruling !== 'string' || !/^R\d+[a-z]?(?:\+R\d+[a-z]?)*$/.test(ruling)
       || ruling.split('+').some(id => !new RegExp(`\\*\\*${id}\\*\\*|\\b${id}\\b[^\\n]*\\(20\\d\\d-`).test(rulings))) {
@@ -41,7 +46,10 @@ export function recordEntries({ approvals, requests, rulings, entries, latestAud
         entry = { ...entry, fingerprint };
       }
       const audit = latestAudit(sha);
-      if (!audit || shaKey(audit.head) !== sha) throw Error('no canonical audit');
+      if (!audit || shaKey(audit.head) !== sha || shaKey(audit.base) === sha
+        || audit.questionHash !== QUESTION_HASH || audit.verdict !== 'WEAKENED'
+        || typeof audit.at !== 'string'
+        || !findAudit([audit], { head: audit.head, base: audit.base, questionHash: QUESTION_HASH })) throw Error('no canonical WEAKENED audit');
       // The approval covers exactly the findings quoted in the request for this sha; an audit that says anything
       // else (a replacement finding) is not covered and grants no waiver.
       if (!Array.isArray(request.findings) || JSON.stringify(request.findings) !== JSON.stringify(audit.findings)) throw Error('audit findings differ from the approved request');

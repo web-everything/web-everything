@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
+import { findingsHash } from '../ruled-weakened-store.mjs';
 import { recordWaivers } from '../ruled-weakened-record.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
@@ -3389,7 +3390,7 @@ it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))(
 });
 
 
-describe('canonical audit waiver fallback without ready evidence', () => {
+describe('canonical audit waiver requires ready evidence', () => {
   const findings = ['Accepted finding, verbatim.'];
   const waiver = { ref: BASE.branch, sha: SHA, ruling: 'R396', findings };
   const FP = '1'.repeat(64), OLD = 'd'.repeat(40);
@@ -3397,22 +3398,37 @@ describe('canonical audit waiver fallback without ready evidence', () => {
     ready: '', audits: auditLines([auditRecord({ verdict: 'WEAKENED', findings })]),
     auditBaseInMain: TREE, settings: { ruledWeakened: [entry] }, ...options,
   });
-  it('admits the canonical audit via waiver alone and writes readiness only after passing test evidence', async () => {
+  const ready = (entry = waiver) => ({ ref: entry.ref, sha: entry.sha, tests: 'green', audit: 'WEAKENED', auditRuling: entry.ruling, auditDisclosed: entry.findings });
+  it('refuses waiver alone and names the fix-ready-record writer', async () => {
     const f = make({ ...waiver, sha: SHA.toUpperCase() });
-    expect(await f.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true }, gate: { source: 'canonical-check-run' } });
-    expect(f.readyWrites.at(-1)).toMatchObject({ tests: 'green', audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(out.fallback).toContain('waiver exists but no fix-ready record');
+    expect(out.fallback).toContain('scripts/operations/fix-ready-record.mjs');
+    expect(f.readyWrites).toHaveLength(0);
+    expect(f.admitted).toHaveLength(0);
   });
-  it('accepts approved suffixed R-numbers through fresh readiness and the next load', async () => {
-    const entry = { ...waiver, ruling: 'R123a+R396' };
-    const f = make(entry);
-    expect(await f.run()).toMatchObject({ ok: true });
-    const { path, ...ready } = f.readyWrites.at(-1);
-    expect(ready.auditRuling).toBe(entry.ruling);
-    expect(await make(entry, { ready: auditLines([ready]) }).run()).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: entry.ruling } } });
+  it('admits a waiver with a matching fix-ready record, including suffixed R-numbers', async () => {
+    for (const ruling of ['R396', 'R123a+R396']) {
+      const entry = { ...waiver, ruling };
+      expect(await make(entry, { ready: auditLines([ready(entry)]) }).run())
+        .toMatchObject({ ok: true, gate: { source: 'ready-record', ruledWeakened: { ruling } } });
+    }
   });
-  it('accepts a waiver bound by same-diff carry', async () => {
-    const f = make({ ...waiver, sha: OLD, fingerprint: FP }, { fingerprint: () => FP });
-    expect(await f.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+  it('a ready record without ruling and disclosure cannot admit a waived WEAKENED audit', async () => {
+    const out = await make(waiver, { ready: auditLines([{ ...ready(), audit: 'NOT WEAKENED', auditRuling: undefined, auditDisclosed: undefined }]) }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(out.fallback).toContain('waiver exists but no fix-ready record');
+    expect(out.fallback).toContain('scripts/operations/fix-ready-record.mjs');
+  });
+  it('same-diff waiver alone refuses; a matching carried fix-ready record admits', async () => {
+    const entry = { ...waiver, sha: OLD, fingerprint: FP };
+    const out = await make(entry, { fingerprint: () => FP }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(out.fallback).toContain('waiver exists but no fix-ready record');
+    expect(await make(entry, { ready: auditLines([{ ...ready(entry), fingerprint: FP }]),
+      audits: auditLines([auditRecord({ head: OLD, fingerprint: FP, verdict: 'WEAKENED', findings })]), fingerprint: () => FP }).run())
+      .toMatchObject({ ok: true, canonicalAudit: { ok: true } });
   });
   it.each([
     ['wrong sha', { sha: OLD }], ['wrong ref', { ref: 'lane/other' }],
@@ -3431,7 +3447,7 @@ describe('canonical audit waiver fallback without ready evidence', () => {
     }
   });
   it('allows a same-diff carried audit but still requires canonical base coverage', async () => {
-    const options = { audits: auditLines([auditRecord({ head: OLD, fingerprint: FP, verdict: 'WEAKENED', findings })]), fingerprint: () => FP };
+    const options = { ready: auditLines([{ ...ready(), fingerprint: FP }]), audits: auditLines([auditRecord({ head: OLD, fingerprint: FP, verdict: 'WEAKENED', findings })]), fingerprint: () => FP };
     expect(await make(waiver, options).run()).toMatchObject({ ok: true });
     expect(await make(waiver, { ...options, auditBaseInMain: undefined }).run())
       .toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
@@ -3440,14 +3456,14 @@ describe('canonical audit waiver fallback without ready evidence', () => {
     const out = await make(waiver, { audits: '' }).run();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
     expect(out.fallback).toContain('waiver exists but no fix-ready record');
-    expect(out.fallback).toContain('audit/readiness so a fix-ready record is written');
+    expect(out.fallback).toContain('scripts/operations/fix-ready-record.mjs');
     const other = await make({ ...waiver, sha: OLD }, { audits: '' }).run();
     expect(other.fallback).toContain('codex-audit --base=origin/main');
     expect(other.fallback).not.toContain('waiver exists');
   });
-  it('does not bypass absent test evidence or write a ready record', async () => {
+  it('waiver alone refuses before test evidence and never writes a ready record', async () => {
     const f = make(waiver, { testCheck: async () => null });
-    expect(await f.run()).toMatchObject({ ok: false, canonicalAudit: { ok: true }, stopReason: 'no-ready', detail: 'no-passing-test-check', gate: null });
+    expect(await f.run()).toMatchObject({ ok: false, canonicalAudit: { ok: false }, stopReason: 'no-canonical-audit', gate: null });
     expect(f.readyWrites).toHaveLength(0);
     expect(f.admitted).toHaveLength(0);
   });
@@ -3466,7 +3482,7 @@ describe('recorder-to-load same-diff waiver admission', () => {
       const OLD = 'd'.repeat(40), FP = '1'.repeat(64), findings = ['Accepted old-head finding.'];
       const waiverStore = join(dir, 'ruled-weakened.jsonl');
       const request = { ref: BASE.branch, sha: OLD, ruling: 'untrusted', fingerprint: '9'.repeat(64), findings };
-      const approval = { ref: BASE.branch, sha: OLD, ruling: 'R396' };
+      const approval = { ref: BASE.branch, sha: OLD, ruling: 'R396', findingsHash: findingsHash(findings) };
       const audit = auditRecord({ head: OLD, fingerprint: FP, verdict: 'WEAKENED', findings });
       expect(recordWaivers({ path: waiverStore, env: { HOME: dir }, repo: '.',
         read: file => file.endsWith('rulings.md') ? '**R396**' : JSON.stringify(file.endsWith('waiver-requests.jsonl')
@@ -3478,11 +3494,11 @@ describe('recorder-to-load same-diff waiver admission', () => {
       const persisted = JSON.parse(nodeFs.readFileSync(waiverStore, 'utf8'));
       expect(persisted).toMatchObject({ sha: OLD, fingerprint: FP, ruling: 'R396', findings });
       const make = (fingerprint = FP, records = [audit]) => auditedFixture('refuse', {
-        ready: '', waiverStore, audits: auditLines(records), auditBaseInMain: TREE, fingerprint: () => fingerprint,
+        ready: auditLines([{ ref: BASE.branch, sha: OLD, fingerprint: FP, tests: 'green', audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings }]), waiverStore, audits: auditLines(records), auditBaseInMain: TREE, fingerprint: () => fingerprint,
       });
       const admitted = make();
       expect(await admitted.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true },
-        gate: { source: 'canonical-check-run' }, registered: true });
+        gate: { source: 'ready-record' }, registered: true });
       expect(admitted.readyWrites.at(-1)).toMatchObject({ sha: SHA, auditRuling: 'R396', auditDisclosed: findings });
       expect(await make('2'.repeat(64)).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
       expect(await make(FP, [{ ...audit, findings: ['changed findings'] }]).run())
