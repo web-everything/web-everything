@@ -82,6 +82,16 @@ describe('single failed-file retry core', () => {
     if (status !== 'missing') retry.assertionResults.push({ fullName: 'previously passed', status });
     expect(retryVerdict(original, report(retry), metadata).passed).toBe(false);
   });
+  it.each(['skipped', 'pending', 'todo', 'missing'])('failed-assertion recovery refuses a previously passed assertion becoming %s', status => {
+    const original = planRetry(report(entry('a.test.mjs', 'failed', { assertionResults: [
+      { fullName: 'suite fails', status: 'failed' }, { fullName: 'previously passed', status: 'passed' },
+    ] })), policy, root);
+    const retry = passingEntry();
+    if (status !== 'missing') retry.assertionResults.push({ fullName: 'previously passed', status });
+    expect(retryVerdict(original, report(retry), metadata).passed).toBe(false);
+    retry.assertionResults = [{ fullName: 'suite fails', status: 'passed' }, { fullName: 'previously passed', status: 'passed' }];
+    expect(retryVerdict(original, report(retry), metadata).passed).toBe(true);
+  });
   it.each([report(entry('a.test.mjs')), report(), undefined, report(entry('a.test.mjs', 'skipped')), report(entry('a.test.mjs', 'passed', { testExecError: {} }))])('a second failure or incomplete evidence fails the shard', text => {
     const verdict = retryVerdict(first, text, metadata);
     expect(verdict.passed).toBe(false);

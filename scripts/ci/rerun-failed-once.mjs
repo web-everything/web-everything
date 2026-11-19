@@ -77,7 +77,9 @@ export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCo
   try { results = parseReport(rerunText, root); } catch { /* incomplete evidence records failures */ }
   const files = first.map(({ file, failedTests, tests }) => {
     const retry = results.find(r => r.file === file);
-    const required = failedTests.length ? failedTests : tests.filter(t => t.status === 'passed').map(t => t.name);
+    // Every assertion that ran in run 1 (failed OR passed) must pass in the retry: a failed one that recovers,
+    // and a passing one that must not vanish or turn skipped while the shard goes green.
+    const required = tests.filter(t => t.status === 'passed' || t.status === 'failed').map(t => t.name);
     const recovered = retry?.passed
       && required.every(name => retry.tests.some(t => t.name === name && t.status === 'passed'))
       && (failedTests.length > 0 || retry.tests.some(t => t.status === 'passed'));
