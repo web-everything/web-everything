@@ -624,7 +624,7 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.fileCard).toHaveBeenCalledOnce();
     const { cardLine } = f.deps.fileCard.mock.calls[0][0];
-    const text = `pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: ${finding}`;
+    const text = `pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: we:${finding}`;
     expect(cardLine).toBe(`- [R1053] ${date} ET: ${text}`);
     const cards = parseCards(cardLine);
     expect(cards).toHaveLength(1);
@@ -636,7 +636,7 @@ describe('R1053 prove mode', () => {
     expect(card).not.toMatch(/[\r\n\u2028\u2029]/);
     const cards = parseCards(card);
     expect(cards).toHaveLength(1);
-    expect(cards[0].text).toContain(`${finding} see the probe`);
+    expect(cards[0].text).toContain(`we:${finding} see the probe`);
   });
   it.each(['\u2028', '\u2029'])('serializes a fileable card with separator %j', async separator => {
     const f = proof(reply('E2'));
@@ -648,7 +648,7 @@ describe('R1053 prove mode', () => {
     expect(cardLine).not.toMatch(/[\r\n\u2028\u2029]/);
     const cards = parseCards(cardLine);
     expect(cards).toHaveLength(1);
-    expect(cards[0].text).toContain(`${finding} see the probe`);
+    expect(cards[0].text).toContain(`we:${finding} see the probe`);
     expect(f.records[0]).toMatchObject({ verdict: 'NOT WEAKENED', preExisting: [{ line: text }] });
   });
   it.each(['function serve(req = defaultRequest()) {', 'function serve(req): Response {'])

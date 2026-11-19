@@ -5091,6 +5091,10 @@ same locked library helper; recovery failure must prevent retirement and unload 
 A null result from the approximate symbol scanner is not proof of top-level scope.
 Keep distant guard replacement and deletion cases for default-call parameters and typed
 functions in `audit-base-repro.test.mjs`; an unknown extent requires an unchanged file.
+Verify scanned base and head ranges with the real JS parser: regexp braces can truncate an
+otherwise named function. Keep independent base/head truncation cases and complete function,
+method and arrow controls. Check the serialized held card with the filer's publish guard;
+path qualification must happen in the shared card renderer so proof and persisted text agree.
 In `codex-audit.test.mjs`, pass generated cards through the real held-card parser,
 including U+2028/U+2029 finding text. Normalize line separators at serialization while
 preserving the original finding in the audit record and keeping block-mode bytes pinned.
