@@ -34,12 +34,22 @@ function refuses(root,probe) {
   return !result.error&&result.status===0;
 }
 
+// The fix commit. A tree that has it in its history is "fixed" even if both behaviours later regress, so a
+// regression turns this break red instead of silently downgrading to expected-fail. Shallow or exported trees
+// without the history fall back to the behaviour probe (a tree that really refuses a disguised key is fixed).
+const FIX_SHA='pending';
+function containsFixCommit(root) {
+  if(!/^[0-9a-f]{40}$/.test(FIX_SHA))return false;
+  const result=spawnSync('git',['merge-base','--is-ancestor',FIX_SHA,'HEAD'],{cwd:root,timeout:10000});
+  return !result.error&&result.status===0;
+}
+
 export default {
   id:'forge-manifest-scan-all',
   title:'Forge refuses a private key disguised as ordinary documentation',
   card:'Forge manifest scan-all security fix',
-  fixedBy:{sha:'pending',where:'forge-manifest-scan-all',paths:['scripts/readiness/forge-exec-manifest.mjs']},
-  fixPresent:root=>refuses(root,'sizeCap'),
+  fixedBy:{sha:FIX_SHA,where:'forge-manifest-scan-all',paths:['scripts/readiness/forge-exec-manifest.mjs']},
+  fixPresent:root=>containsFixCommit(root)||refuses(root,'sizeCap')||refuses(root,'disguisedKey'),
   async run() {
     return {violations:refuses(process.env.SOAK_TREE_ROOT||ROOT,'disguisedKey')
       ?[]:['disguised credential admitted or scan evidence unavailable']};

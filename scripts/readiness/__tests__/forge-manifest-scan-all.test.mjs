@@ -3,7 +3,7 @@ import {generateKeyPairSync} from 'node:crypto';
 import {performance} from 'node:perf_hooks';
 import {gzipSync} from 'node:zlib';
 import {describe,expect,it} from 'vitest';
-import {CONTENT_SCAN_MAX_BYTES,manifestEntry} from '../forge-exec-manifest.mjs';
+import {CONTENT_SCAN_MAX_BYTES,credentialBufferFinding,manifestEntry} from '../forge-exec-manifest.mjs';
 
 const {privateKey}=generateKeyPairSync('rsa',{modulusLength:1024});
 const jwk=privateKey.export({format:'jwk'});
@@ -83,6 +83,13 @@ describe('Forge scans all manifest content',()=>{
     const gz=gzipSync(Buffer.from(material.PEM));
     for(const tracked of [true,false])for(const bytes of [der,Buffer.from(der.toString('base64')),Buffer.from(gz.toString('base64')),Buffer.from(gz.toString('hex'))])
       refused('docs/notes.md',bytes,tracked,'content-detected credential');
+  });
+  it('credential-named files and the shared buffer scanner also see gzip layers',()=>{
+    const gz=gzipSync(Buffer.from(JSON.stringify(jwk)));
+    for(const bytes of [gz,Buffer.from(gz.toString('base64'))])
+      expect(credentialBufferFinding(bytes)).toBeTruthy();
+    for(const tracked of [true,false])
+      refused('docs/token.md',Buffer.from(gz.toString('base64')),tracked,'credential');
   });
   it('refuses a PNG-signed file hiding a JWK behind nested brackets (scan exhaustion fails closed)',()=>{
     const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('['.repeat(65)),Buffer.from(material.JWK)]);

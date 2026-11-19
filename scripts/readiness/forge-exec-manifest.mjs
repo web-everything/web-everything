@@ -207,14 +207,18 @@ const nonCallKeyword=/(?<![\w$.])(?:return|typeof|await|void|yield|delete|throw|
 const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 const maxExpressionValue=1024;
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
-export function credentialBufferFinding(content) {
+export function credentialBufferFinding(content,layers=0) {
+  // Gzip (the file itself or a decoded candidate) hides content from every text view: decompress and rescan.
+  const compressed=gzipLayerFinding(content,layers,credentialBufferFinding);
+  if(compressed)return compressed;
   for(const encoding of ['latin1','utf8','utf16le']) {
     const finding=textFinding(content.toString(encoding));
     if(finding)return finding;
   }
   // swap16 requires whole code units; a trailing byte cannot encode a token character.
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
-  return textFinding(swapped.toString('utf16le'))??keyStructureFinding(content);
+  return textFinding(swapped.toString('utf16le'))
+    ??keyStructureFinding(content,bytes=>bytes===content?null:gzipLayerFinding(bytes,layers+1,credentialBufferFinding));
 }
 
 // Ordinary (non credential-named) files: high-confidence evidence only. The loose words `-----BEGIN` and
@@ -242,12 +246,12 @@ const ordinaryTextFinding=text=>ordinaryViewFinding(text)
   ??(text.includes('\\')?ordinaryViewFinding(decodeEscapes(text))??ordinaryViewFinding(text.replace(/\\/g,'')):null);
 // Gzip hides any content from every other view: decompress (bounded) and scan the result too. A stream that
 // claims gzip but cannot be decompressed within the bound is refused. Applies to the file and to decoded candidates.
-function gzipLayerFinding(content,layers) {
+function gzipLayerFinding(content,layers,scan=ordinaryBufferFinding) {
   if(!(content.length>2&&content[0]===0x1f&&content[1]===0x8b))return null;
   if(layers>=3)return 'nested-compressed-content';
   let inner;
   try {inner=gunzipSync(content,{maxOutputLength:CONTENT_SCAN_MAX_BYTES*4});} catch {return 'unreadable-compressed-content';}
-  return ordinaryBufferFinding(inner,layers+1);
+  return scan(inner,layers+1);
 }
 export function ordinaryBufferFinding(content,layers=0) {
   const compressed=gzipLayerFinding(content,layers);
