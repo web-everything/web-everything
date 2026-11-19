@@ -473,7 +473,6 @@ export async function prepareRebuild({
     if (!strictState && /^pinned-overlay-/.test(plan.reason) && state.adopted?.head && state.adopted.head === prevHead) {
       const d = plan.detail || {};
       state.held = {
-        retryAt: null, attempts: 1,
         since: state.held?.since ?? nowIso(),
         reason: plan.reason,
         failed: `${d.ref ?? '?'}${d.pr != null ? ` (PR #${d.pr})` : ''}: ${d.message ?? plan.reason}`,
@@ -513,7 +512,6 @@ export async function prepareRebuild({
     alert('established-overlay-hold', detail);
     if (!strictState && state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {
-        retryAt: null, attempts: 1,
         since: state.held?.since ?? nowIso(),
         reason: 'established-overlay-conflict',
         failed: `${lost.map((l) => l.ref).join(', ')}: conflict with main`,

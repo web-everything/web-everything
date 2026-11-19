@@ -88,13 +88,13 @@ const fields = (v, required, optional = {}) => object(v)
 const boolean = v => typeof v === 'boolean';
 const nullable = valid => v => v === null || valid(v);
 const backoff = { retryAt: nullable(date), attempts: positive };
-// Admission schema: every persisted discriminator and every value defaulted/coerced by
-// readState/prepare is required. Null is an explicit absence, never an omitted field.
-// Old incomplete files require operator repair; only ENOENT creates EMPTY_STATE.
+// Admission requires identity/audit evidence. Legacy records omit backoff and false
+// flags; validate those fields when present, and require deadlines for scheduled retries.
+// Other incomplete files require operator repair; only ENOENT creates EMPTY_STATE.
 export const rebuildStateSchema = {
-  held: v => fields(v, { reason: string, since: date, updatedAt: date, ...backoff })
+  held: v => fields(v, { reason: string, since: date, updatedAt: date }, backoff)
     && (v.reason !== 'smoke-env-timeout' || date(v.retryAt)),
-  rejected: v => fields(v, { inputsKey: string, reason: string, at: date, ...backoff,
+  rejected: v => fields(v, { inputsKey: string, reason: string, at: date }, { ...backoff,
     harnessBroken: boolean, externalOnly: boolean, envLoad: boolean, dispatchSmoke: boolean })
     && (!(v.harnessBroken || v.externalOnly || v.envLoad) || date(v.retryAt)),
   adopted: v => fields(v, { head: string, inputsKey: string, applied, mainSha: string, at: date }),
@@ -147,13 +147,8 @@ export function writeRebuildState(root, state, env = process.env) {
   const file = rebuildStatePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
-  // Producers materialize known policy defaults. Admission never repairs a persisted
-  // file or invents missing identities, applied tips, timestamps or timeout deadlines.
+  // Preserve producer record shapes, including absent backoff and false flags.
   const persisted = { ...EMPTY_STATE, ...state };
-  if (persisted.rejected) persisted.rejected = {
-    retryAt: null, attempts: 1, harnessBroken: false, externalOnly: false, envLoad: false, dispatchSmoke: false,
-    ...persisted.rejected,
-  };
   writeFileSync(tmp, JSON.stringify(persisted, null, 2), 'utf8');
   renameSync(tmp, file);
 }

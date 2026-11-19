@@ -686,7 +686,6 @@ export async function smokeAndAdopt({
       mutateMore?.(st);
       since = st.held?.since ?? nowIso();
       st.held = {
-        retryAt: null, attempts: 1,
         since,
         reason,
         failed: failed.map((r) => r.name).join(','),

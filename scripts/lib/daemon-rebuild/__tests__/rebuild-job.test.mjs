@@ -490,7 +490,13 @@ function requiredPaths(value, prefix = []) {
 const requiredCases = [
   ...requiredPaths(completeState()).map(path => ['state', path]),
   ...requiredPaths(completeReady()).map(path => ['ready', path]),
-].flatMap(([kind, path]) => (path[0] === 'pinnedNotified' && path.length > 1 ? ['wrong-type'] : ['missing', 'wrong-type']).map(mode => [kind, path.join('.'), mode]));
+].flatMap(([kind, path]) => {
+  const optional = kind === 'state' && (
+    (path[0] === 'pinnedNotified' && path.length > 1)
+    || (path[0] === 'rejected' && ['retryAt', 'attempts', 'harnessBroken', 'externalOnly', 'envLoad', 'dispatchSmoke'].includes(path[1]))
+    || (path[0] === 'held' && path[1] === 'attempts'));
+  return (optional ? ['wrong-type'] : ['missing', 'wrong-type']).map(mode => [kind, path.join('.'), mode]);
+});
 
 it.each(requiredCases)('%s required field %s %s refuses without changing evidence', async (kind, dotted, mode) => {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
@@ -522,6 +528,24 @@ it('complete declared state and ready schemas are admitted without coercion', ()
   expect(readRebuildStateStrict(root, env)).toEqual(completeState());
   expect(readReadyCandidateStrict(root, env)).toEqual(completeReady());
 });
+
+it.each([
+  ['rejected', { inputsKey: 'inputs', reason: 'failed', at: stamp }],
+  ['held', { reason: 'smoke-rejected', since: stamp, updatedAt: stamp }],
+  ['held', { reason: 'established-overlay-conflict', since: stamp, updatedAt: stamp }],
+])('legacy %s records persist and pass strict admission without adding defaults: %j', (key, record) => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  writeRebuildState(root, { [key]: record }, env);
+  expect(JSON.parse(readFileSync(rebuildStatePath(root, env), 'utf8'))[key]).toEqual(record);
+  expect(readRebuildStateStrict(root, env)[key]).toEqual(record);
+});
+
+it.each(['harnessBroken', 'externalOnly', 'envLoad'])(
+  'strict rejection still requires a retry deadline when %s is true', flag => {
+    const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+    writeRebuildState(root, { rejected: { inputsKey: 'inputs', reason: 'failed', at: stamp, [flag]: true } }, env);
+    expect(() => readRebuildStateStrict(root, env)).toThrow('Invalid rebuild state rejected');
+  });
 
 it.each([undefined, null, {}, [null], [{ ref: 'lane/x' }], [{ ref: 'lane/x', sha: 'tip', pinnedFrom: true }]])(
   'exact ready matching refuses incomplete applied evidence %j before an audit exemption', applied => {
