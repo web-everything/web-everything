@@ -548,7 +548,7 @@ describe('infra-blocked source guards — resume never strands work and never me
   });
   it('#2659 review 3 — a resume that OPENED a PR (a pr number in the result) clears the record, even if CI went red', () => {
     // execFileSync throws on pr-land's non-zero exit (red/timeout); the catch still reads a pr number off stdout.
-    expect(src).toMatch(/if \(res\.pr != null\) return \{ ok: true/);
+    expect(src).toMatch(/if \(Number\.isSafeInteger\(res\?\.pr\) && res\.pr > 0\) return \{ ok: true/);
   });
 });
 

@@ -3,12 +3,62 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cliRetryInfraBlocked } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
-import { resumeOpen, infraRecoveryCard, parseInfraStore } from '../../conveyor/infra-blocked.mjs';
+import { resumeOpen, infraRecoveryCard, parseInfraStore, recordInfraBlock } from '../../conveyor/infra-blocked.mjs';
 import { decideRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmission, setRuntimeAdmissionCards, withRuntimeAdmissionTick } from '../runtime-admission.mjs';
 import { readBuildPrioritySettings } from '../build-queue.mjs';
 
 const admission = { assertRuntimeAdmitted, withRuntimeAdmission };
 const only = ids => ({ mode: 'only', only: true, ids });
+it('infra context cannot shrink stored group membership or admit only the lead', () => {
+  const entry = { num: '12', groupMembers: ['13'], builderContext: 'historical' };
+  const readContext = () => ({ entry: { payload: { num: '12', groupMembers: [] } } });
+  expect(infraRecoveryCard(entry, { readContext }).groupMembers).toEqual(['13']);
+  const exec = vi.fn();
+  expect(resumeOpen(entry, { admission, exec, readContext, readSettings: () => only(['12']) }))
+    .toMatchObject({ ok: false, refused: true, admission: true });
+  expect(exec).not.toHaveBeenCalled();
+  expect(infraRecoveryCard(entry, { readContext: () => ({ entry: { payload: { num: '12', groupMembers: ['14', '13'] } } }) }).groupMembers)
+    .toEqual(['13', '14']);
+});
+it('context-less historical membership is unknown until explicitly recorded', () => {
+  const exec = vi.fn();
+  const entry = { num: '12', ref: 'lane/12' };
+  expect(resumeOpen(entry, { admission, exec, readSettings: () => ({ mode: 'lift' }) }))
+    .toMatchObject({ ok: false, refused: true, admission: true, reason: 'unproven infra recovery identity' });
+  expect(exec).not.toHaveBeenCalled();
+  for (const groupMembers of [[], ['13']]) {
+    const stored = recordInfraBlock([], { ...entry, groupMembers });
+    const restored = parseInfraStore(JSON.stringify(stored))[0];
+    expect(infraRecoveryCard(restored).groupMembers).toEqual(groupMembers);
+  }
+});
+it('re-recording a rebuilt infra entry preserves the union of known members', () => {
+  const entry = { num: '12', ref: 'lane/12', sha: 'old', groupMembers: ['13'] };
+  const stored = recordInfraBlock([entry], { ...entry, sha: 'new', groupMembers: ['14'] });
+  expect(parseInfraStore(JSON.stringify(stored))[0].groupMembers).toEqual(['13', '14']);
+});
+it.each([null, { held: true }, { only: true }])('empty batches freshly check settings and refuse %j', settings => {
+  const effect = vi.fn();
+  const readSettings = vi.fn(() => settings);
+  expect(withRuntimeAdmission([], 'route', effect, { readSettings }))
+    .toMatchObject({ outcome: 'runtime-refused', reason: 'runtime-malformed' });
+  expect(readSettings).toHaveBeenCalledTimes(1);
+  expect(effect).not.toHaveBeenCalled();
+  expect(withRuntimeAdmission([], 'route', effect, { readSettings: () => ({ mode: 'lift' }) })).toBeUndefined();
+  expect(effect).toHaveBeenCalledTimes(1);
+});
+it('an empty batch under a valid only-list has no identities to refuse', () => {
+  const effect = vi.fn(() => 'launched');
+  expect(withRuntimeAdmission([], 'route', effect, { readSettings: () => only([]) })).toBe('launched');
+  expect(effect).toHaveBeenCalledTimes(1);
+});
+it.each(['', '{}', 'not json', 'null', '{"pr":false}', '{"pr":0}', '{"pr":"bad"}'])('successful subprocess output %j without a PR is an infra failure', output => {
+  const sha = 'a'.repeat(40);
+  const exec = vi.fn(command => command === 'git' ? sha : output);
+  expect(resumeOpen({ num: '12', ref: 'lane/12', sha, groupMembers: [] }, { admission, exec, readSettings: () => ({ mode: 'lift' }) }))
+    .toEqual({ ok: false, detail: 'pr-land returned no PR number; entry retained for retry' });
+  expect(exec.mock.calls.at(-1)[0]).toBe('node');
+});
 it.each([
   [{ num: 12 }, only(['12']), true],
   [{ num: 13 }, only(['12']), false],
@@ -63,12 +113,12 @@ it('records unique refusals on the row and logs once per tick', async () => {
 
 it.each([only([]), { held: true }, only(['13'])])('infra recovery refuses before exec and reports the retained card with %j', async settings => {
   const exec = vi.fn();
-  const stored = [{ num: '12', ref: 'lane/12' }];
+  const stored = [{ num: '12', groupMembers: [], ref: 'lane/12' }];
   const report = await withRuntimeAdmissionTick(() => settings, async () => cliRetryInfraBlocked({ exec, readEntries: () => stored }));
   expect(exec).not.toHaveBeenCalled();
   expect(report.failed).toEqual([{ num: '12', refused: true, reason: settings.held ? 'runtime-malformed' : 'runtime-only' }]);
   expect(report.runtimeRefused).toHaveLength(1);
-  expect(stored).toEqual([{ num: '12', ref: 'lane/12' }]);
+  expect(stored).toEqual([{ num: '12', groupMembers: [], ref: 'lane/12' }]);
 });
 it('infra recovery refuses an unchecked group and scopes admitted retries to one card', async () => {
   const exec = vi.fn(() => JSON.stringify({ retried: ['12'] }));
@@ -109,7 +159,7 @@ it('historical infra records recover group membership from the original dispatch
   expect(parseInfraStore(JSON.stringify([{ num: '12', groupMembers: ['13'] }]))[0].groupMembers).toEqual(['13']);
 });
 it('a damaged historical infra identity is retained and a healthy following entry still executes', async () => {
-  const entries = [{ num: '12', builderContext: '{' }, { num: '13' }];
+  const entries = [{ num: '12', builderContext: '{' }, { num: '13', groupMembers: [] }];
   const before = structuredClone(entries);
   const exec = vi.fn(() => JSON.stringify({ retried: ['13'] }));
   const result = await withRuntimeAdmissionTick(() => only(['12', '13']), async () =>
@@ -211,7 +261,7 @@ it.each([[], 'bad settings', Promise.resolve({})].map(settings => [settings]))('
 
 it.each([null, {}, '13', [null], [undefined], ['12\n'], Array(1)].map(members => [members]))(
   'malformed infra group %j refuses only its card and continues the retry pass', async groupMembers => {
-    const entries = [{ num: '12', groupMembers }, { num: '13' }];
+    const entries = [{ num: '12', groupMembers }, { num: '13', groupMembers: [] }];
     const before = structuredClone(entries);
     const exec = vi.fn(() => JSON.stringify({ retried: ['13'] }));
     const report = await withRuntimeAdmissionTick(() => ({ mode: 'lift' }), async () =>

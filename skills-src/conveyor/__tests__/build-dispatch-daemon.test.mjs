@@ -1132,7 +1132,7 @@ describe('cliRetryInfraBlocked — passes the primary store path to the child re
     writeFileSync(file, '[]');
     const calls = [];
     const exec = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return '{"retried":["7"]}'; };
-    const r = cliRetryInfraBlocked({ readEntries: () => [{ num: '7' }], exec, env: { PATH: '/bin' }, home });
+    const r = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec, env: { PATH: '/bin' }, home });
     expect(r).toEqual({ retried: ['7'], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] });
     expect(calls).toHaveLength(1);
     expect(calls[0].args.slice(-2)).toEqual(['retry', '--num=7']);
@@ -1143,7 +1143,7 @@ describe('cliRetryInfraBlocked — passes the primary store path to the child re
     mkdirSync(join(home, 'workspace', 'webeverything', '.conveyor'), { recursive: true });
     writeFileSync(join(home, 'workspace', 'webeverything', '.conveyor', 'infra-blocked.json'), '[]');
     const calls = [];
-    cliRetryInfraBlocked({ readEntries: () => [{ num: '7' }], exec: (c, a, o) => { calls.push(o); return '{}'; }, env: { CONVEYOR_INFRA_FILE: '/custom/path.json' }, home });
+    cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec: (c, a, o) => { calls.push(o); return '{}'; }, env: { CONVEYOR_INFRA_FILE: '/custom/path.json' }, home });
     expect(calls[0].env.CONVEYOR_INFRA_FILE).toBe('/custom/path.json');
   });
 
@@ -1154,7 +1154,7 @@ describe('cliRetryInfraBlocked — passes the primary store path to the child re
       .mockReturnValueOnce(JSON.stringify({ retried: ['8'], resumed: [{ num: '8', pr: 88 }] }))
       .mockReturnValueOnce(JSON.stringify({ retried: ['9'], resumed: [{ num: '9', pr: 99 }] }));
     const result = cliRetryInfraBlocked({ now: () => 0, exec,
-      readEntries: () => ['7', '8', '9'].map(num => ({ num })), env: {}, home });
+      readEntries: () => ['7', '8', '9'].map(num => ({ num, groupMembers: [] })), env: {}, home });
     expect(exec.mock.calls.map(([, args]) => args.at(-1))).toEqual(['--num=7', '--num=8', '--num=9']);
     expect(result).toEqual({ error: 'retry probe failed', retried: ['7', '8', '9'],
       resumed: [{ num: '8', pr: 88 }, { num: '9', pr: 99 }], surfaced: [], waiting: [],
@@ -1167,14 +1167,14 @@ describe('cliRetryInfraBlocked — passes the primary store path to the child re
       .mockReturnValueOnce(JSON.stringify({ error: 'second error', retried: ['8'] }))
       .mockReturnValueOnce(JSON.stringify({ retried: ['9'] }));
     const result = cliRetryInfraBlocked({ now: () => 0, exec,
-      readEntries: () => ['7', '8', '9'].map(num => ({ num })), env: {}, home });
+      readEntries: () => ['7', '8', '9'].map(num => ({ num, groupMembers: [] })), env: {}, home });
     expect(exec).toHaveBeenCalledTimes(3);
     expect(result.error).toBe('first error\nsecond error');
     expect(result.retried).toEqual(['7', '8', '9']);
   });
 
   it('a throwing exec is captured as `{error}`, never thrown', () => {
-    const r = cliRetryInfraBlocked({ readEntries: () => [{ num: '7' }], exec: () => { throw new Error('boom'); }, env: {}, home });
+    const r = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec: () => { throw new Error('boom'); }, env: {}, home });
     expect(r.error).toMatch(/boom/);
   });
 });
@@ -1186,20 +1186,20 @@ describe('cliRetryInfraBlocked — bounds the child so a slow retry can never st
 
   it('passes `timeout` (and a `killSignal`) through to exec, defaulting to INFRA_RETRY_TIMEOUT_MS', () => {
     let capturedOpts;
-    cliRetryInfraBlocked({ now: () => 0, readEntries: () => [{ num: '7' }], exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x' });
+    cliRetryInfraBlocked({ now: () => 0, readEntries: () => [{ num: '7', groupMembers: [] }], exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x' });
     expect(capturedOpts.timeout).toBe(INFRA_RETRY_TIMEOUT_MS);
     expect(capturedOpts.killSignal).toBe('SIGTERM');
   });
 
   it('an explicit `timeoutMs` override reaches exec as its `timeout` option', () => {
     let capturedOpts;
-    cliRetryInfraBlocked({ now: () => 0, readEntries: () => [{ num: '7' }], exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x', timeoutMs: 5000 });
+    cliRetryInfraBlocked({ now: () => 0, readEntries: () => [{ num: '7', groupMembers: [] }], exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x', timeoutMs: 5000 });
     expect(capturedOpts.timeout).toBe(5000);
   });
 
   it('shares one elapsed deadline across multiple infra retries and retains excess entries for the next tick', () => {
     let elapsed = 0;
-    const entries = ['7', '8', '9', '10'].map(num => ({ num }));
+    const entries = ['7', '8', '9', '10'].map(num => ({ num, groupMembers: [] }));
     const before = structuredClone(entries);
     const timeouts = [];
     const exec = vi.fn((cmd, args, opts) => {
@@ -1242,7 +1242,7 @@ describe('cliRetryInfraBlocked — bounds the child so a slow retry can never st
   it('a retry that would otherwise run 5x the bound is cut short near the bound, not left to run to completion', () => {
     const exec = fakeExecRespectingTimeout(250); // "would take" 250ms unbounded
     const start = Date.now();
-    const result = cliRetryInfraBlocked({ readEntries: () => [{ num: '7' }], exec, env: {}, home: '/x', timeoutMs: 50 });
+    const result = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec, env: {}, home: '/x', timeoutMs: 50 });
     const elapsed = Date.now() - start;
     expect(elapsed).toBeLessThan(200); // well short of the full 250ms the slow retry would have taken
     expect(result.timedOut).toBe(true);
@@ -1250,7 +1250,7 @@ describe('cliRetryInfraBlocked — bounds the child so a slow retry can never st
 
   it('a retry well under the bound completes normally and is unaffected', () => {
     const exec = fakeExecRespectingTimeout(10);
-    const result = cliRetryInfraBlocked({ readEntries: () => [{ num: '7' }], exec, env: {}, home: '/x', timeoutMs: 50 });
+    const result = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec, env: {}, home: '/x', timeoutMs: 50 });
     expect(result).toEqual({ retried: [], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] });
     expect(result.timedOut).toBeUndefined();
   });

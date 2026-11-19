@@ -1356,6 +1356,7 @@
   "scripts/lib/__tests__/ruling-ledger.test.mjs": 0.33,
   "scripts/lib/__tests__/run-abandoned.test.mjs": 0.05,
   "scripts/lib/__tests__/run-cli-batch.test.mjs": 1.18,
+  "scripts/lib/__tests__/runtime-admission.test.mjs": 0.04,
   "scripts/lib/__tests__/rust-scan-bridge.test.mjs": 0.16,
   "scripts/lib/__tests__/salvage-index.test.mjs": 4.96,
   "scripts/lib/__tests__/same-gap-judge.test.mjs": 0.04,

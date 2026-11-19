@@ -69,6 +69,9 @@ export function withRuntimeAdmission(card, kind, effect, { readSettings } = {}) 
   // carries its own full persisted group; admission of the batch is atomic too.
   const cards = Array.isArray(card) ? card : [card];
   const identities = [...(tick?.roster ?? [])];
+  // Even a batch with no identities must prove that settings permit the effect.
+  if (!cards.length && !identities.length
+    && decideRuntimeAdmission({}, kind, settings).reason === 'runtime-malformed') identities.push({ card: {}, kind });
   let invalid = false;
   for (const lead of cards) {
     const members = lead?.groupMembers === undefined ? [] : lead.groupMembers;

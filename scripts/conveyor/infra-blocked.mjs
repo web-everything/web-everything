@@ -250,7 +250,7 @@ export function infraHas(store, num) {
  * `attempt = 1`, `firstFailedAt = lastAttemptAt = now`, `nextRetryAt = now + backoff(1)`. `now` is injected.
  * @returns {Array<object>} a NEW array (never mutates the input)
  */
-export function recordInfraBlock(store, { num, ref, sha = null, base = 'main', repo = null, cause = 'infra', body = null, builderContext = null } = {}, now = Date.now(), backoff = {}) {
+export function recordInfraBlock(store, { num, ref, sha = null, base = 'main', repo = null, cause = 'infra', body = null, builderContext = null, groupMembers } = {}, now = Date.now(), backoff = {}) {
   const s = Array.isArray(store) ? store : [];
   if (normNum(num) === '' || !ref) return s;
   if (infraHas(s, num)) {
@@ -262,12 +262,15 @@ export function recordInfraBlock(store, { num, ref, sha = null, base = 'main', r
     const cur = s.find((e) => normNum(e?.num) === key);
     if (sha == null || String(sha) === String(cur?.sha ?? '')) return s;
     return s.map((e) => (normNum(e?.num) === key
-      ? { ...e, ref: String(ref), sha: String(sha), body: typeof body === 'string' ? body : e.body, builderContext, refusals: 0 }
+      ? { ...e, ref: String(ref), sha: String(sha), body: typeof body === 'string' ? body : e.body, builderContext,
+        ...(groupMembers !== undefined ? { groupMembers: Array.isArray(e.groupMembers) && Array.isArray(groupMembers)
+          ? [...new Set([...e.groupMembers, ...groupMembers])] : groupMembers } : {}), refusals: 0 }
       : e));
   }
   const nowMs = toMs(now) || Number(now) || Date.now();
   const entry = {
     num: String(num),
+    ...(groupMembers !== undefined ? { groupMembers } : {}),
     ref: String(ref),
     sha: sha != null ? String(sha) : null,
     base: String(base || 'main'),
@@ -697,12 +700,20 @@ function parseArgv(argv) {
 
 /** Historical infra records retain the dispatch context, which owns the full group. */
 export function infraRecoveryCard(entry, { readContext } = {}) {
-  if (!entry.builderContext) return entry;
+  if (!entry.builderContext) {
+    // Absence is unknown on historical records, not proof of an ungrouped dispatch.
+    if (entry.groupMembers === undefined) throw new Error('unproven infra recovery identity');
+    return entry;
+  }
   if (typeof readContext !== 'function') throw new Error('unproven infra recovery identity');
   const context = readContext({ WE_BUILD_PR_CONTEXT: entry.builderContext });
   const card = context?.entry?.payload;
   if (!card || normNum(card.num) !== normNum(entry.num)) throw new Error('unproven infra recovery identity');
-  return { ...entry, ...card };
+  if ((entry.groupMembers !== undefined && !Array.isArray(entry.groupMembers))
+    || (card.groupMembers !== undefined && !Array.isArray(card.groupMembers))) {
+    throw new Error('unproven infra recovery identity');
+  }
+  return { ...entry, ...card, groupMembers: [...new Set([...(entry.groupMembers ?? []), ...(card.groupMembers ?? [])])] };
 }
 
 /**
@@ -800,10 +811,11 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
     const launched = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }), { readSettings });
     if (launched?.outcome === 'runtime-refused') return { ...launched, admission: true };
     const res = parse(launched);
-    return { ok: true, prNumber: res.pr ?? null, detail: res.detail || 'resume-opened' };
+    if (Number.isSafeInteger(res?.pr) && res.pr > 0) return { ok: true, prNumber: res.pr, detail: res.detail || 'resume-opened' };
+    return { ok: false, detail: 'pr-land returned no PR number; entry retained for retry' };
   } catch (e) {
     const res = parse(e.stdout);
-    if (res.pr != null) return { ok: true, prNumber: res.pr, detail: res.detail || `PR #${res.pr} opened (${res.reason || 'non-green'})` };
+    if (Number.isSafeInteger(res?.pr) && res.pr > 0) return { ok: true, prNumber: res.pr, detail: res.detail || `PR #${res.pr} opened (${res.reason || 'non-green'})` };
     // #4348-open-pr-retry addendum — WHICH BUCKET pr-land's own `reason` falls in, reusing `open-pr.mjs`'s
     // declared table rather than a second opinion: `refused` means a GUARD ANSWERED (`unverified`, `check-red`,
     // `bad-ref`, …) — fixable only by a code/data change, never by waiting, so the caller must NOT spend the

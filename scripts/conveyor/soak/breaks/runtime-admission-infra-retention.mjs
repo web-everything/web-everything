@@ -13,9 +13,9 @@ const lift = () => ({ mode: 'lift' });
 const sha = 'a'.repeat(40);
 
 export function retryProbe(groupMembers) {
-  const entries = [{ num: '12', groupMembers }, { num: '13' }];
+  const entries = [{ num: '12', groupMembers }, { num: '13', groupMembers: [] }];
   const before = JSON.stringify(entries), calls = [];
-  const report = withRuntimeAdmission({ num: '13' }, 'infra-recovery', () => cliRetryInfraBlocked({
+  const report = withRuntimeAdmission({ num: '13', groupMembers: [] }, 'infra-recovery', () => cliRetryInfraBlocked({
     now: () => 0, env: {}, readEntries: () => entries,
     exec: (_command, args) => {
       calls.push(args.at(-1));
@@ -38,8 +38,8 @@ export async function replay() {
   try {
     const file = join(dir, 'infra.json');
     process.env.CONVEYOR_INFRA_FILE = file;
-    for (const scenario of ['missing-adapter', 'only', 'malformed', 'identity', 'revoked', 'guard']) {
-      const entry = { num: '12', ref: 'lane/12', sha, cause: 'network', attempt: 2,
+    for (const scenario of ['missing-adapter', 'only', 'malformed', 'identity', 'revoked', 'guard', 'unknown', 'empty-output']) {
+      const entry = { num: '12', ...(scenario === 'unknown' ? {} : { groupMembers: [] }), ref: 'lane/12', sha, cause: 'network', attempt: 2,
         refusals: 3, nextRetryAt: '2020-01-01T00:00:00.000Z',
         ...(scenario === 'identity' ? { builderContext: 'broken' } : {}) };
       const original = JSON.stringify([entry]);
@@ -60,6 +60,7 @@ export async function replay() {
             if (scenario === 'revoked') settings = { only: true, ids: [] };
             return sha;
           }
+          if (scenario === 'empty-output') return '{}';
           if (scenario === 'guard') {
             const error = new Error('guard refused');
             error.stdout = JSON.stringify({ reason: 'unverified', detail: 'guard refused' });
@@ -68,7 +69,11 @@ export async function replay() {
           throw new Error('unexpected publish');
         },
       });
-      if (scenario === 'guard') {
+      if (scenario === 'empty-output') {
+        const stored = JSON.parse(readFileSync(file, 'utf8'))[0];
+        if (stored.attempt !== 3 || stored.refusals !== 0 || report.resumed.length
+          || report.failed[0]?.refused || report.failed[0]?.admission) violations.push('missing PR lost infra retry accounting');
+      } else if (scenario === 'guard') {
         const stored = JSON.parse(readFileSync(file, 'utf8'))[0];
         if (stored.refusals !== 4 || stored.attempt !== 2 || !report.failed[0]?.refused
           || report.failed[0]?.admission) violations.push('real guard lost refusal accounting');

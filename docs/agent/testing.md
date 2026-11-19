@@ -5085,3 +5085,12 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+## Runtime infra recovery identity
+
+Context-less infra records need explicit `groupMembers` evidence (`[]` proves an ungrouped
+dispatch); historical absence is unknown and requires operator repair of the original dispatch
+context or stored membership. Recovery unions context and stored members so neither source can
+shrink admission. Keep the runtime-admission unit cases and infra-retention soak replay covering
+unknown identity without budget changes, and successful subprocess output without a PR as a
+retained infra retry with an attempt bump.
