@@ -8,6 +8,7 @@ import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
+import { parseCards } from '../file-held-cards.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
 const settingsOverride = vi.hoisted(() => ({ text: null }));
@@ -232,6 +233,43 @@ function adapter(report = { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAK
 }
 
 describe('audit IO with injected filesystem and subprocesses', () => {
+  it('resolves exemption policy through the settings cascade and logs provenance', () => {
+    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const f = adapter(undefined, { settingsOptions: { env: {}, platform: { releaseStage: 'prod' },
+        fileRead: () => JSON.stringify({ audit: { releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: true } } }) } });
+      expect(f.deps.auditPolicy()).toEqual({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true });
+      for (const name of ['releaseStage', 'requirePayBy', 'requireOnMain']) {
+        expect(log.mock.calls.flat().join('')).toContain(`audit.${name}=`);
+        expect(log.mock.calls.flat().join('')).toMatch(new RegExp(`audit\\.${name}=.* source=`));
+      }
+    } finally { log.mockRestore(); }
+  });
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('persists and verifies both security lines for %s, including replay', cls => {
+    const files = new Map();
+    const f = adapter();
+    f.fs.readFileSync.mockImplementation(path => files.get(path) ?? '');
+    f.fs.appendFileSync.mockImplementation((path, text) => files.set(path, (files.get(path) ?? '') + text));
+    const input = { key: `x.mjs|X|${cls}`, cardLine: `held ${cls}`, expedite: true, needsYou: true };
+    expect(f.deps.fileCard(input)).toEqual({ written: true, expedite: true, needsYou: true });
+    const held = [...files.values()].find(text => text.startsWith(`held ${cls}`));
+    expect(held).toContain(`[needs-you]`);
+    expect(held).toContain(`security pre-existing (${cls}) x.mjs|X|${cls}`);
+    const count = f.fs.appendFileSync.mock.calls.length;
+    expect(f.deps.fileCard(input)).toEqual({ written: true, expedite: true, needsYou: true });
+    expect(f.fs.appendFileSync).toHaveBeenCalledTimes(count);
+    for (const patch of [{ expedite: false }, { needsYou: false }]) {
+      expect(() => f.deps.fileCard({ ...input, ...patch })).toThrow('security escalation required');
+    }
+  });
+  it('cannot confirm security when the needs-you line was not persisted', () => {
+    const files = new Map(), f = adapter();
+    f.fs.readFileSync.mockImplementation(path => files.get(path) ?? '');
+    f.fs.appendFileSync.mockImplementation((path, text) => files.set(path,
+      (files.get(path) ?? '') + text.split('\n').filter(line => !line.includes('[needs-you]')).join('\n')));
+    expect(() => f.deps.fileCard({ key: 'x.mjs|X|B2', cardLine: 'held', expedite: true, needsYou: true }))
+      .toThrow('card persistence verification failed');
+  });
   it('refuses a contradictory launcher report before the persistence adapter runs', async () => {
     const f = adapter({ exitCode: 0, timedOut: false,
       lastMessage: 'NOT WEAKENED\nWEAKENED\nscripts/gate.mjs:12 the fail-closed guard was removed' });
@@ -554,5 +592,211 @@ describe('findAudit ordering and clock trust (#7011)', () => {
     const second = rec('WEAKENED', '2026-11-17T10:00:00Z');
     expect(find([first, second])).toBe(second);
     expect(find([second, first])).toBe(first);
+  });
+});
+
+
+describe('R1053 prove mode', () => {
+  const source = 'function X() {\n  return unsafeValue;\n}\nfunction Y() {\n  return changedValue;\n}';
+  const finding = 'x.mjs:2 unsafe return';
+  const reply = (cls = 'E1', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
+  function proof(answer = reply()) {
+    const f = fixture(`WEAKENED\n${finding}`);
+    Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true }),
+      preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
+      reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
+      diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
+      numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
+    return f;
+  }
+  it.each([
+    ['2026-11-18T17:00:00.000Z', '2026-11-18 12:00'],
+    ['2026-11-18T05:00:00.000Z', '2026-11-18 00:00'],
+    ['2026-11-18T00:04:59.000Z', '2026-11-17 19:04'],
+    ['2026-03-08T06:59:59.000Z', '2026-03-08 01:59'],
+    ['2026-03-08T07:00:00.000Z', '2026-03-08 03:00'],
+    ['2026-11-01T05:59:59.000Z', '2026-11-01 01:59'],
+    ['2026-11-01T06:00:00.000Z', '2026-11-01 01:00'],
+  ])('round-trips the real audit card through held-card parsing at %s', async (now, date) => {
+    const f = proof();
+    f.deps.now = () => now;
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+    const { cardLine } = f.deps.fileCard.mock.calls[0][0];
+    const text = `pre-existing audit finding (E1) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: ${finding}`;
+    expect(cardLine).toBe(`- [R1053] ${date} ET: ${text}`);
+    const cards = parseCards(cardLine);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ raw: cardLine, tag: 'R1053', date: date.slice(0, 10), text });
+  });
+  it.each(['success', 'proof error', 'append error', 'setting error'])('shadow keeps block output and record unchanged: %s', async kind => {
+    const normal = proof(); normal.deps.preExistingMode = () => 'block';
+    await main(ARGS, normal.deps);
+    const f = proof(); f.deps.preExistingMode = () => 'block';
+    f.deps.preExistingShadow = () => { if (kind === 'setting error') throw Error('settings'); return true; };
+    f.deps.shadowProof = vi.fn(row => { if (kind === 'append error') throw Error('disk'); });
+    if (kind === 'proof error') f.deps.reproOnBase = () => { throw Error('timeout'); };
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.output).toEqual(normal.output); expect(f.errors).toEqual(normal.errors); expect(f.records).toEqual(normal.records);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+    if (kind !== 'setting error') {
+      expect(f.deps.shadowProof).toHaveBeenCalledOnce();
+      const row = f.deps.shadowProof.mock.calls[0][0];
+      expect(row).toMatchObject({ at: AT, base: BASE, head: HEAD, modelFindings: [finding], mode: 'block' });
+      if (kind === 'proof error') expect(row.wouldBlock).toEqual([{ line: finding, reason: expect.stringContaining('human review') }]);
+      else expect(row.wouldExempt).toEqual([{ line: finding, key: 'x.mjs|X|E1', class: 'E1' }]);
+    }
+  });
+  it.each(['disabled', 'missing sink'])('shadow does no proof work when %s', async kind => {
+    const f = proof(); f.deps.preExistingMode = () => 'block';
+    f.deps.preExistingShadow = () => kind !== 'disabled';
+    if (kind === 'disabled') f.deps.shadowProof = vi.fn();
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.reproOnBase).not.toHaveBeenCalled();
+  });
+  it('persists the unchanged audit timestamp and output before shadow proof reads the clock', async () => {
+    const f = proof(); f.deps.preExistingMode = () => 'block'; f.deps.preExistingShadow = () => true;
+    let ticks = 0; f.deps.now = () => new Date(Date.parse(AT) + ticks++ * 1000).toISOString();
+    f.deps.shadowProof = vi.fn();
+    const repro = f.deps.reproOnBase;
+    f.deps.reproOnBase = (...args) => {
+      expect(f.records[0].at).toBe(AT); expect(f.output.join('')).toBe(`WEAKENED\n${finding}\n`);
+      return repro(...args);
+    };
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0].at).toBe(AT);
+  });
+  it('shadow records the real classifier reason for a changed line without filing', async () => {
+    const f = proof(); f.deps.preExistingMode = () => 'block'; f.deps.preExistingShadow = () => true;
+    f.deps.shadowProof = vi.fn();
+    f.deps.diffText = () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -2 +2 @@\n-old\n+unsafe\n';
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.shadowProof.mock.calls[0][0]).toMatchObject({ wouldExempt: [],
+      wouldBlock: [{ line: finding, reason: expect.stringContaining('head line changed') }] });
+    expect(f.deps.fileCard).not.toHaveBeenCalled(); expect(f.errors).toEqual([]);
+  });
+  it.each(['prove', 'clear'])('shadow never runs for %s audits', async kind => {
+    const f = proof(); f.deps.preExistingShadow = () => true; f.deps.shadowProof = vi.fn();
+    if (kind === 'clear') { f.deps.preExistingMode = () => 'block'; f.deps.runCodex = () => 'NOT WEAKENED'; }
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.shadowProof).not.toHaveBeenCalled();
+  });
+  it.each(['E1', 'E2'])('production policy blocks %s before filing', async cls => {
+    const f = proof(reply(cls));
+    f.deps.auditPolicy = () => ({ releaseStage: 'prod', requirePayBy: false, requireOnMain: true });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it('missing policy dep blocks every finding and names human review', async () => {
+    const f = proof(); delete f.deps.auditPolicy;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0]).toMatchObject({ findings: [finding], preExisting: [] });
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+    expect(f.errors.join('')).toContain('human review');
+  });
+  it('required pay-by ignores model dates and clears only with a valid persisted card', async () => {
+    for (const body of [null, '', 'mustPayBefore: 2099-02-31', 'mustPayBefore: 2099-01-01']) {
+      const f = proof(reply('D2'));
+      f.deps.auditPolicy = () => ({ releaseStage: 'prerelease', requirePayBy: true, requireOnMain: true });
+      f.deps.runCodex = () => `WEAKENED\n${finding} backlog/debt.md mustPayBefore: 2099-01-01`;
+      f.deps.readCard = vi.fn(() => body);
+      expect(await main(ARGS, f.deps)).toBe(body === 'mustPayBefore: 2099-01-01' ? 0 : 1);
+      expect(f.deps.readCard).toHaveBeenCalledWith('backlog/debt.md');
+    }
+  });
+  it('confirmed held card satisfies requireOnMain for D2', async () => {
+    const f = proof(reply('D2'));
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+  });
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s stays WEAKENED regardless of confirmed security receipts', async cls => {
+    for (const confirmed of [true, false]) {
+      const f = proof(reply(cls));
+      f.deps.fileCard = vi.fn(() => ({ written: true, expedite: true, needsYou: confirmed }));
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'WEAKENED', findings: [finding], preExisting: [] });
+      expect(f.errors.join('')).toContain('security finding; human review required');
+      expect(f.deps.fileCard).not.toHaveBeenCalled();
+    }
+  });
+  it('the repro prompt names the head and the diff range', async () => {
+    const f = proof();
+    await main(ARGS, f.deps);
+    expect(f.deps.reproOnBase.mock.calls[0][0]).toMatch(/Compare with head [0-9a-f]{40}: read git diff [0-9a-f]{40}\.\.\.[0-9a-f]{40}/);
+  });
+  it('a1 clears X while only Y changes and confirms exactly one card before recording', async () => {
+    const f = proof();
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'NOT WEAKENED', findings: [],
+      preExisting: [{ line: finding, key: 'x.mjs|X|E1', relation: 'SAME' }] });
+    expect(f.deps.fileCard).toHaveBeenCalledTimes(1);
+    expect(f.output.join('')).toBe('NOT WEAKENED\n');
+  });
+  it('a2 blocks a changed flagged line and records its head symbol key', async () => {
+    const f = proof();
+    f.deps.diffText = () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -2 +2 @@\n-oldValue\n+unsafeValue\n';
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0].findingKeys).toEqual(['x.mjs|X|E1']);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it.each(['UNDETERMINED', 'malformed', 'missing', 'quote absent', 'timeout', 'card throws', 'missing dep', 'numstat absent', 'read throws', 'card unconfirmed'])(
+    'a3 fails closed: %s', async kind => {
+      const f = proof();
+      if (kind === 'UNDETERMINED') f.deps.reproOnBase = () => reply('E1', kind);
+      if (kind === 'malformed') f.deps.reproOnBase = () => 'bad';
+      if (kind === 'missing') f.deps.reproOnBase = () => '';
+      if (kind === 'quote absent') f.deps.readBaseFile = () => 'other source';
+      if (kind === 'timeout') f.deps.reproOnBase = () => { throw Error('timeout'); };
+      if (kind === 'card throws') f.deps.fileCard = () => { throw Error('disk'); };
+      if (kind === 'missing dep') delete f.deps.fileCard;
+      if (kind === 'numstat absent') f.deps.numstatText = () => '';
+      if (kind === 'read throws') f.deps.readHeadFile = () => { throw Error('missing'); };
+      if (kind === 'card unconfirmed') f.deps.fileCard = () => false;
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [finding], preExisting: [] });
+    });
+  it.each([['ABSENT', 'SAME'], ['REPRODUCES', 'WORSENED']])('a4 security %s %s blocks', async (status, relation) => {
+    const f = proof(reply('B1', status, relation));
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it('B-class security findings never clear in prove mode', async () => {
+    const f = proof(reply('B1'));
+    f.deps.runCodex = vi.fn(async () => `WEAKENED\n${finding} [B1]`);
+    f.deps.fileCard = vi.fn(() => ({ written: true, expedite: true, needsYou: true }));
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.reproOnBase).toHaveBeenCalledOnce();
+    expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'WEAKENED', findings: [`${finding} [B1]`], preExisting: [] });
+    expect(f.output.join('')).toBe(`WEAKENED\n${finding} [B1]\n`);
+    expect(f.errors.join('')).toContain('security finding; human review required');
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it('keeps an explicit B1 finding WEAKENED when a perfect SAME reproduction replies E1', async () => {
+    const f = proof(reply('E1'));
+    const securityFinding = 'B1 authentication bypass in x.mjs:2 unsafe return';
+    f.deps.runCodex = vi.fn(async () => `WEAKENED\n${securityFinding}`);
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.reproOnBase).toHaveBeenCalledOnce();
+    expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'WEAKENED',
+      findings: [securityFinding], preExisting: [] });
+    expect(f.output.join('')).toBe(`WEAKENED\n${securityFinding}\n`);
+    expect(f.errors.join('')).toContain('ineligible or conflicting class; human review required');
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it('a5 findings beyond the bound block for human review', async () => {
+    const f = proof(reply() + '\n' + reply().replace('#1', '#2'));
+    f.deps.runCodex = () => `WEAKENED\n${finding}\n${finding}`;
+    f.deps.baseRecheckMax = () => 1;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0].findings).toEqual([finding]);
+    expect(f.records[0].preExisting).toHaveLength(1);
+  });
+  it('a6 block mode preserves captured stdout and record bytes', async () => {
+    const golden = JSON.parse(realFs.readFileSync(new NodeURL('./fixtures/codex-audit-block.json', import.meta.url), 'utf8'));
+    const f = proof(); f.deps.preExistingMode = () => 'block';
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.output.join('')).toBe(golden.stdout);
+    expect(JSON.stringify(f.records[0]) + '\n').toBe(golden.record);
+    expect(f.deps.reproOnBase).not.toHaveBeenCalled();
   });
 });

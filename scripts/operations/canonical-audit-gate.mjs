@@ -8,6 +8,23 @@ import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
+import { resolveAuditSettings } from '../lib/audit-settings.mjs';
+import { join } from 'node:path';
+import { cardHash, PREEXISTING_ELIGIBLE, protectedPath } from './audit-base-repro.mjs';
+import { findingKey } from '../lib/audit-finding-key.mjs';
+import { FINDING_CLASSES, debtCardVerified, productionFindingBlocks, readCardFromMain } from './audit-verdict.mjs';
+
+function validPreExisting(f) {
+  if (!f || typeof f !== 'object' || Array.isArray(f) || typeof f.line !== 'string'
+    || typeof f.key !== 'string' || f.relation !== 'SAME'
+    || typeof f.cardHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(f.cardHash) || f.cardHash !== cardHash(f.key)
+    || !f.base || typeof f.base.sha !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/i.test(f.base.sha)
+    || typeof f.base.path !== 'string' || !f.base.path.trim()
+    || !Number.isSafeInteger(f.base.line) || f.base.line < 1 || typeof f.base.quote !== 'string' || !f.base.quote.trim()) return false;
+  const parts = f.key.split('|');
+  if (parts.length !== 3 || !parts[0] || !parts[1] || !FINDING_CLASSES.includes(parts[2])) return false;
+  try { return findingKey({ file: parts[0], symbol: parts[1], class: parts[2] }) === f.key; } catch { return false; }
+}
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
@@ -17,6 +34,11 @@ function wellFormedAudit(record) {
     || typeof record.questionHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.questionHash)
     || typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at))
     || (record.fingerprint != null && (typeof record.fingerprint !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.fingerprint)))
+    || (Object.hasOwn(record, 'modelVerdict') && !['WEAKENED', 'NOT WEAKENED'].includes(record.modelVerdict))
+    || (['modelVerdict', 'findingKeys', 'preExisting'].some(k => Object.hasOwn(record, k))
+      && (!['modelVerdict', 'findingKeys', 'preExisting'].every(k => Object.hasOwn(record, k))
+        || !Array.isArray(record.findingKeys) || !record.findingKeys.every(k => typeof k === 'string')
+        || !Array.isArray(record.preExisting) || !record.preExisting.every(validPreExisting)))
     || !Array.isArray(record.findings) || !record.findings.every(f => typeof f === 'string')) return false;
   // Validate verdict/contradiction syntax with the canonical parser, even for a
   // historical question. The original hash still determines evidence eligibility.
@@ -24,8 +46,46 @@ function wellFormedAudit(record) {
   return findAudit([candidate], { head: candidate.head, base: candidate.base, questionHash: QUESTION_HASH, priorQuestionHashes: [] }) === candidate;
 }
 
+// Re-read present-day authority; an old proof is never a permanent exemption.
+export function revalidateExemptions(record, { settingsOptions = {}, readFile = readFileSync, readCards,
+  readCard = readCardFromMain, env = process.env, now = Date.now, warn = message => console.warn(message) } = {}) {
+  try {
+    const settings = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, ...settingsOptions });
+    const policy = settings.value;
+    for (const name of ['preExistingMode', 'releaseStage', 'requirePayBy']) warn(`audit.${name}=${policy[name]} source=${settings.sources[name]}`);
+    if (policy.preExistingMode !== 'prove' || Object.values(settings.sources).includes('strictest')) return false;
+    const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();
+    const persisted = readCards ? readCards() : {
+      cards: readFile(join(home, 'workspace/.operations/handoff/cards-to-file.md'), 'utf8'),
+      index: readFile(join(home, 'workspace/.operations/coordination/pre-existing-findings.jsonl'), 'utf8'),
+    };
+    if (typeof persisted.cards !== 'string' || typeof persisted.index !== 'string') return false;
+    const lines = persisted.cards.split(/\r?\n/);
+    persisted.index.split(/\r?\n/).filter(l => l.trim()).forEach(l => JSON.parse(l));
+    return record.preExisting.every(f => {
+      if (!validPreExisting(f)) return false;
+      const [path, symbol, cls] = f.key.split('|');
+      if (protectedPath(path, [...policy.raceBlockPaths, ...policy.guardFloorPaths])) return false;
+      // R1085: a B-class (security) exemption is never valid, whatever cards exist; only a human ruling clears it.
+      if (cls.startsWith('B')) return false;
+      if (!PREEXISTING_ELIGIBLE.includes(cls) || productionFindingBlocks(cls, policy.releaseStage)) return false;
+      const cardPresent = lines.some(l => l.startsWith('- [R1053] ')
+        && l.endsWith(` ET: pre-existing audit finding (${cls}) in we:${path}#${symbol}, reproduces on main ${f.base.sha.slice(0, 10)}: ${f.line}`));
+      // An index receipt cannot substitute for the actual, exact key-bearing card line.
+      if (!cardPresent) return false;
+      if (cls.startsWith('B') && !lines.some(l => l.startsWith('- [R1053][needs-you] ')
+        && l.endsWith(` ET: security pre-existing (${cls}) ${f.key}`))) return false;
+      const pathToCard = /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(f.line)?.[0];
+      const body = pathToCard ? readCard(pathToCard) : null;
+      if (pathToCard && typeof body !== 'string') return false;
+      return debtCardVerified(body, policy.releaseStage, { requirePayBy: policy.requirePayBy, requireOnMain: false, now });
+    });
+  } catch { return false; }
+}
+
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, ancestor: ancestorOpt,
+  settingsOptions = {}, readCards, readCard = readCardFromMain, now = Date.now,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
@@ -106,6 +166,10 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     evidence = { ok: false, reason: 'no-record' };
   }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.
+  if (evidence.ok && evidence.record?.preExisting?.length && !revalidateExemptions(evidence.record,
+    { settingsOptions, readFile, readCards, readCard, env, now, warn })) {
+    return refuse('canonical-audit-exemption-stale', 'pre-existing exemption authority is stale or unreadable; restore current policy/card evidence or request human review');
+  }
   if (evidence.ok && evidence.record?.head === fullSha) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
   return evidence.reason === 'weakened'
     ? refuse('canonical-audit-weakened', `latest canonical audit for ${fullSha} is WEAKENED and no ruledWeakened waiver matches ref+sha+findings`)

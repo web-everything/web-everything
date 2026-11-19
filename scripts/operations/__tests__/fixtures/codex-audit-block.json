@@ -1,0 +1,4 @@
+{
+  "stdout": "WEAKENED\nx.mjs:2 unsafe return\n",
+  "record": "{\"at\":\"2026-11-01T12:00:00.000Z\",\"base\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"head\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"baseRef\":\"origin/main\",\"questionHash\":\"c911fc8450ac5a4864dd1ef78284b88321e32671cc66880a8d84a9b2f4a6c284\",\"verdict\":\"WEAKENED\",\"findings\":[\"x.mjs:2 unsafe return\"]}\n"
+}

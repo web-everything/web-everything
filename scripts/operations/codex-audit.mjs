@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { stripVTControlCharacters } from 'node:util';
+import { findingKey, parseFindingLocation, symbolAt } from '../lib/audit-finding-key.mjs';
+import { REPRO_QUESTION, parseReproAnswer, parseDiffChangedLines, classifyPreExisting, cardLine } from './audit-base-repro.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
@@ -13,7 +15,7 @@ const clean = text => stripVTControlCharacters(text).replace(/[\x00-\x09\x0b-\x1
 const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
 
 // Check whole verdict lines, including controls/Unicode that can disguise a contradiction.
-function hasConflictingVerdict(verdict, findings) {
+export function hasConflictingVerdict(verdict, findings) {
   const opposite = verdict === 'NOT WEAKENED' ? 'WEAKENED' : 'NOT WEAKENED';
   return findings.some(line => typeof line === 'string' && [...line.split(LINE_BREAK), ...clean(line).split(LINE_BREAK)].some(part =>
     clean(part).normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').trim() === opposite));
@@ -74,7 +76,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
     if (isCurrent) sawCurrent = true;
     if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
-    if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
+    if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, [...record.findings, ...(Array.isArray(record.preExisting) ? record.preExisting.map(f => f?.line) : [])])) continue;
     // A self-reported time more than FUTURE_SKEW_MS ahead of now is untrustworthy: unusable (and, for a current-question
     // record, still blocks the prior fallback above). Among usable records the LATER-WRITTEN (ledger order) one wins, never
     // the later self-reported timestamp, so a forged far-future pass cannot outrank a subsequently appended WEAKENED.
@@ -85,6 +87,86 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   }
   // A current-question record always decides; a prior-question record only speaks when no current-question record exists (even an unusable one blocks the fallback).
   return sawCurrent ? latest : prior;
+}
+
+/** Unknown evidence retains every finding; card failures never clear an audit. */
+async function proveFindings(findings, base, head, deps, observe = () => {}) {
+  const extra = { modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [] };
+  try {
+    for (const name of ['reproOnBase', 'readBaseFile', 'readHeadFile', 'diffText', 'numstatText', 'baseRecheckMax', 'protectedPaths', 'fileCard', 'auditPolicy']) {
+      if (typeof deps[name] !== 'function') throw new Error('missing proof dependency');
+    }
+    const answers = parseReproAnswer(await deps.reproOnBase(`${REPRO_QUESTION(findings)}\nCompare with head ${head}: read git diff ${base}...${head} and answer WORSENED if it adds a reaching path, removes a guard, or makes the weakness easier to trigger.\n`, findings, base), findings.length);
+    const detailed = findings.map((text, i) => {
+      const loc = parseFindingLocation(text);
+      const sourceText = loc ? deps.readHeadFile(loc.file, head) : undefined;
+      if (loc && typeof sourceText !== 'string') throw new Error('unreadable head source');
+      // The finding keeps its OWN class (a class tag written in its text); the reproduction model's class is never
+      // copied over it. A differing model class then blocks in classifyPreExisting as a class conflict.
+      const ownClass = /\b([A-E][1-9])\b/.exec(text)?.[1];
+      return { text, sourceText, class: ownClass ?? answers[i]?.class, card: /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(text)?.[0] };
+    });
+    extra.findingKeys = detailed.flatMap((f, i) => {
+      const loc = parseFindingLocation(f.text);
+      return loc && answers[i]?.class ? [findingKey({ file: loc.file, symbol: symbolAt(f.sourceText, loc.line), class: answers[i].class })] : [];
+    });
+    const changedLines = parseDiffChangedLines(await deps.diffText(base, head), await deps.numstatText(base, head));
+    const baseFiles = new Map();
+    for (const a of answers) if (a.base && !baseFiles.has(a.base.path)) {
+      const source = deps.readBaseFile(a.base.path, base);
+      if (typeof source !== 'string') throw new Error('unreadable base source');
+      baseFiles.set(a.base.path, source);
+    }
+    const options = { findings: detailed, answers, baseSha: base, headSha: head,
+      readBaseFile: path => baseFiles.get(path), changedLines, recheckMax: deps.baseRecheckMax(), protectedPaths: deps.protectedPaths(),
+      auditPolicy: deps.auditPolicy(), readCard: deps.readCard };
+    const candidates = classifyPreExisting({ ...options, cardWritten: key => /\|B[1-7]$/.test(key) ? { written: true, expedite: true, needsYou: true } : true });
+    const written = new Map();
+    // Match the held-card grammar exactly; h23 keeps local midnight at 00:00.
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).formatToParts(new Date(deps.now())).map(({ type, value }) => [type, value]));
+    const date = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      if (c.blocking) continue;
+      const { key } = c.preExisting, [path, symbol, cls] = key.split('|');
+      const receipt = await deps.fileCard({ key, cardLine: cardLine({ date, cls, path, symbol, sha10: base.slice(0, 10), text: findings[i] }),
+        expedite: c.expedite === true, needsYou: c.needsYou === true });
+      written.set(key, receipt);
+    }
+    const classified = classifyPreExisting({ ...options, cardWritten: key => written.get(key) });
+    observe(classified);
+    const blocking = findings.filter((_, i) => classified[i].blocking);
+    for (const c of classified) if (c.blocking) deps.stderr(`Base proof blocked: ${c.reason}.\n`);
+    extra.preExisting = classified.filter(c => !c.blocking).map(c => c.preExisting);
+    extra.findingKeys = detailed.flatMap((f, i) => {
+      const loc = parseFindingLocation(f.text);
+      return classified[i].blocking && loc && answers[i]?.class
+        ? [findingKey({ file: loc.file, symbol: symbolAt(f.sourceText, loc.line), class: answers[i].class })] : [];
+    });
+    return { ...extra, findings: blocking, verdict: findings.length && !blocking.length ? 'NOT WEAKENED' : 'WEAKENED' };
+  } catch {
+    observe(findings.map(() => ({ blocking: true, reason: 'incomplete proof; human review required' })));
+    deps.stderr('Base proof incomplete or card write failed; findings block pending human review of the full diff.\n');
+    return { ...extra, preExisting: [], findings, verdict: 'WEAKENED' };
+  }
+}
+
+// Shadow evidence has no authority: suppress proof output and replace every persistence effect.
+async function shadowFindings(findings, base, head, deps) {
+  try {
+    if (deps.preExistingMode?.() !== 'block' || deps.preExistingShadow?.() !== true || typeof deps.shadowProof !== 'function') return;
+    let classified;
+    await proveFindings([...findings], base, head, { ...deps, stderr: () => {},
+      fileCard: ({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true,
+    }, rows => { classified = rows; });
+    await deps.shadowProof({ at: deps.now(), base, head, modelFindings: [...findings],
+      wouldExempt: classified.flatMap(c => c.blocking ? [] : [{ line: c.preExisting.line,
+        key: c.preExisting.key, class: c.preExisting.key.split('|').at(-1) }]),
+      wouldBlock: classified.flatMap((c, i) => c.blocking ? [{ line: findings[i], reason: c.reason }] : []), mode: 'block' });
+  } catch { /* Observational only, including settings/proof/log failures. */ }
 }
 
 /** Inject resolveSha, runCodex, appendRecord, now, stdout and stderr for hermetic execution. */
@@ -110,22 +192,27 @@ export async function main(argv, deps) {
     if (typeof answer !== 'string') throw new Error('missing final message');
     const lines = answer.split(/\r?\n/);
     while (lines.length && !lines[0].trim()) lines.shift();
-    const verdict = lines.shift();
+    let verdict = lines.shift();
     if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
-    const findings = lines.filter(line => line.trim()).map(clean);
+    let findings = lines.filter(line => line.trim()).map(clean);
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
+    if (deps.preExistingMode?.() === 'prove' && verdict === 'WEAKENED') {
+      Object.assign(result, await proveFindings(findings, base, head, deps));
+      ({ verdict, findings } = result);
+    }
     // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
     let fingerprint = null;
     try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
     try {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings, ...(fingerprint ? { fingerprint } : {}) });
+        questionHash: QUESTION_HASH, verdict, findings, ...(result.modelVerdict ? { modelVerdict: result.modelVerdict, findingKeys: result.findingKeys, preExisting: result.preExisting } : {}), ...(fingerprint ? { fingerprint } : {}) });
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;
     }
     deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[verdict, ...findings].join('\n')}\n`);
+    if (verdict === 'WEAKENED') await shadowFindings(findings, base, head, deps);
     return verdict === 'NOT WEAKENED' ? 0 : 1;
   } catch {
     (deps?.stderr ?? (text => process.stderr.write(text)))('UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n');
