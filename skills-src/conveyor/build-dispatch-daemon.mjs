@@ -48,6 +48,8 @@ import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispa
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { readCiJobLog } from '../../scripts/lib/gh-ci-log.mjs';
+import { stripVTControlCharacters } from 'node:util';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -2552,6 +2554,32 @@ function lastDraftAuthorActivity(candidate) {
   return dates.length ? Math.max(...dates) : NaN;
 }
 
+/** Attribute a diagnostic without filtering the whole log used by the CI-heal context pack.
+ * Missing/ambiguous step ownership returns no evidence; published summaries cannot establish attribution. */
+function firstFailedStepError(job, log) {
+  if (!Array.isArray(job?.steps) || !job.steps.some(step => step?.conclusion === 'failure')) return '';
+  const intervals = job.steps.filter(step => step?.conclusion !== 'skipped').map(step => ({
+    conclusion: step?.conclusion, start: Date.parse(step?.started_at), end: Date.parse(step?.completed_at),
+  }));
+  if (intervals.some(({ start, end }) => !Number.isFinite(start) || !Number.isFinite(end) || start > end)) return '';
+  // Step times have SECOND resolution while log stamps are fractional: a step owns the half-open range
+  // [start, completed_at + 1s). A line inside a shared boundary second is then owned by both neighbours,
+  // so it is ambiguous and never attributed to the failed step alone.
+  for (const interval of intervals) interval.end += 1000;
+  let failedStep = false;
+  for (const line of stripVTControlCharacters(log).split('\n')) {
+    const timestamp = /^\uFEFF?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))(?=\s|$)/.exec(line);
+    if (timestamp) {
+      const at = Date.parse(timestamp[1]);
+      const owners = intervals.filter(({ start, end }) => start <= at && at < end);
+      failedStep = owners.length > 0 && owners.every(step => step.conclusion === 'failure');
+    }
+    // Untimestamped continuations inherit the preceding timestamp's ownership.
+    if (failedStep && /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) return line;
+  }
+  return '';
+}
+
 /** Builder-only gate-failure recovery. Unknown liveness fails closed, including a crash between
  * reserving an attempt and recording its handle. The existing orphan retry policy supplies the cap.
  * State is PR-bound, never head-bound: a failed fix pushing another red head cannot reset its budget. */
@@ -2615,6 +2643,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     ...(io.isPidAlive ? { isPidAlive: io.isPidAlive } : {}),
   }).runs[0].live;
   const candidates = [];
+  const unattributed = [];
   const repo = CONSTELLATION_REPOS.we.slug;
   const api = io.api ?? (path => ghRestGetJson(`repos/${repo}/${path}`).json);
   const paged = io.paged ?? ghRestGetPaged;
@@ -2661,13 +2690,24 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     const failed = effectiveChecks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
     if (!failed) continue;
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
-    let firstError = annotations.find(a => a.annotation_level === 'failure')?.message
-      || failed.output?.summary || failed.output?.text || 'No error detail published by the check.';
-    // GitHub Actions often publishes no annotations; retrieve the job's actual first error.
+    let firstError = annotations.find(a => a?.annotation_level === 'failure'
+      && typeof a.message === 'string' && a.message.trim())?.message.trim() ?? '';
+    // A whole job log contains passing-step errors too. Diagnose only attributable failed-step
+    // evidence; the existing CI-heal context pack stages the whole log separately for the fixer.
     const job = /\/job\/(\d+)/.exec(failed.details_url ?? '')?.[1];
-    if (job && !annotations.some(a => a.annotation_level === 'failure')) {
-      const log = String(gh(['run', 'view', '--repo', repo, '--job', job, '--log-failed']));
-      firstError = log.split('\n').find(line => /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) || firstError;
+    if (job && !firstError) {
+      const result = readCiJobLog({ repo, jobId: job,
+        // Forward the helper's exec options: without its maxBuffer a log over Node's 1 MiB default is ENOBUFS.
+        exec: (_command, args, opts) => gh(args, opts) });
+      // A failed log read aborts recovery, as the raw `gh` throw did before: never fall back to a stale
+      // published "No error detail" and keep dispatching repair on evidence that could not be read.
+      if (!result.ok) throw new Error(`job ${job} log unreadable (${result.reason}): ${result.detail ?? ''}`);
+      // Step metadata that cannot be read aborts for the same reason: no attributable failed step, no repair.
+      firstError = firstFailedStepError(api(`actions/jobs/${job}`), result.text);
+    }
+    if (!firstError) {
+      unattributed.push({ pr: pr.number, num, action: 'unattributed', reason: 'no-attributable-failure-evidence' });
+      continue;
     }
     candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
       scope: (pr.files ?? []).map(f => `we:${f.path}`), isDraft: true, builderAuthored: true,
@@ -2677,7 +2717,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
   const path = pr => join(dir, `${pr}.json`);
   const route = c => ({ num: c.num, route: `red-draft-${c.pr}` });
   let lanes;
-  return recoverBuilderDrafts({ candidates, allowResume, dryRun, staleMinutes, effects: {
+  const recovered = await recoverBuilderDrafts({ candidates, allowResume, dryRun, staleMinutes, effects: {
     readState: pr => existsSync(path(pr)) ? JSON.parse(readFileSync(path(pr), 'utf8')) : null,
     writeState: (pr, state) => {
       mkdirSync(dir, { recursive: true });
@@ -2701,6 +2741,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       gh(['pr', 'edit', String(c.pr), '--repo', repo, '--add-label', 'blocked:needs-human']);
     },
   } });
+  return [...unattributed, ...recovered];
 }
 
 /** Real IO adapters; exported for isolated tests against a temporary coordination root. */

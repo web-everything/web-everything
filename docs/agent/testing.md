@@ -149,6 +149,12 @@ identity; old persisted records without it start fresh. Keep enqueue result reco
 emission in one helper, test each outcome and delivery failures, and exercise exported helpers
 instead of evaluating extracted source with `new Function`.
 
+The post-plan detector regressions in `scripts/lib/daemon-rebuild/__tests__/overlay-stale.test.mjs`
+cover consecutive conflicts, moved tips, registration identity, open PR/pin exclusions, unknown evidence,
+read-only stale inspection, and event/attention publication. F1 refuses pending drop intents before planning;
+F3 proves supersession against the applied carrier SHA even when `pinnedFrom` names a newer fetched tip.
+The static case forbids registration mutation APIs in the detector; a local Git fixture exercises merge-tree.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
@@ -4284,8 +4290,18 @@ so a crashed re-review cannot hold a PR forever. A run waiting on a pending step
 abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
 Unreadable records still throw, never skip.
 
-The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
-test `settings-files`; use heavy admission.
+Review discovery first tries the bounded `<runs-dir-name>-review-index.json` sidecar beside the
+resolved runs directory. The run-store writer updates it fail-soft under a file lock; drain's complete
+open-PR context advances persisted per-id verification (50 review records total per tick). Partial
+backfills are staged, never published. Indexed payloads still pass the same PR/head, ordering and
+unfinished-review checks. Missing/corrupt/unverified/overflowed hints take the original bounded scan;
+`scan-capped` still holds. Indexed payload read attempts and the fallback share one
+`runs.scan.maxParses` budget, including failed reads; cached indexed payloads count once.
+Index bounds are 512 PR keys, 32 ids per key and 1 MiB per file. Per-PR
+overflow becomes an empty sentinel, forcing fallback instead of silently discarding a review.
+On a persistent backfill error or overflow, inspect omitted records manually; the index cannot clear
+unknown evidence. The scoped regressions are `review-run-index`, `drain-red-team-evidence`,
+`stream-filter-runs`, and the settings layout test `settings-files`; use heavy admission.
 
 
 ## Refused referral reviews re-read standing rulings
@@ -4684,6 +4700,13 @@ At `a19d094c84a838c161105da3296c3558467fc319`, interacting `records` and `owed` 
 remove `review` and return `pass`. Rejecting accessors returns the original state untouched,
 keeps both daemons owed, calls no getters, and returns `pending`.
 These pure-core probes do not establish live daemon integration or merge compatibility.
+## GitHub Actions job-log readers
+
+Use `ciJobLogApiArgs` or `readCiJobLog` from `scripts/lib/gh-ci-log.mjs` for fixer-evidence and CI-heal job-log reads, with the caller’s existing throttled exec wrapper and output limits. Every successful helper read returns the whole raw job log, including passing steps, with `filtered: false`; logs without escapes remain byte-identical. The shared transport permits ANSI bytes; display callers retain their own control-character cleanup. The transport never filters the log or requests step metadata. Builder-draft recovery separately uses job-step metadata to attribute `firstError`, including untimestamped continuations; it never promotes a passing-step error from the whole log into a repair target. Without a nonempty failure annotation or a diagnostic attributable to a failed step, recovery reports `unattributed` and does not reserve capacity, dispatch repair, write retry state or escalate. Published summaries and no-detail placeholders never substitute for attribution; unreadable log or metadata requests abort recovery. Its whole-log fixer context still comes from the shared CI-heal context pack. Finding-producing readers remain on their `origin/main` transport, deferred to the follow-up **finding-producing log readers on gh 2.104**. The timeout classifier's `reconcile-pass.mjs` plain raw reader and `fix-facts.mjs` plain/raw and `readLog` paths also retain plain `gh api <path>` without `--allow-escape-sequences`, deferred to **timeout classifier on unfiltered logs: treat as unknown and retry, never eligible**. Only the timeout classifier consumes `makeFixEvidenceReader.readLog`; it has no failed-step attribution, so permitting escape-coded whole-job logs could promote a passing-step timeout into rerun eligibility. The structural regression in `scripts/lib/__tests__/gh-ci-log.test.mjs` checks both `scripts/` and `skills-src/` and explicitly allowlists these deferred readers; new bypasses are forbidden. In the mixed `reconcile-pass.mjs`, the main-fixed signature reader and timeout classifier are separately pinned.
+
+Only explicit `filtered: true` provenance may supply a failing-test list. For whole-job logs (`filtered: false`) or missing provenance, both fixer renderers report `unknown (unfiltered log)` and fence an ANSI-stripped tail as context; passing-step `FAIL` fixtures and errors must never become repair targets. `ci-log-evidence.mjs` caps tails by UTF-8 bytes and lines, retaining the end of even an oversized final line and directing the fixer to inspect the full log when truncated. Strip ANSI before timestamp ownership matching too: a coloured passing-step timestamp must end failed-step ownership. Context-pack, fix-run, operator prompt and builder-draft recovery tests pin these guarantees.
+
+A failed log read is `log-unreadable`: it refuses evidence-based mechanical reruns while ordinary bounded repair remains available. Actual request timeouts stay unknown and retry. Escape errors remain `{ eligible: false, reason: 'log-unreadable' }`; the named follow-up does not change that mapping in this slice. `ci-log-unreadable.test.mjs` supplies an escape-coded passing-step timeout plus an unrelated deploy failure and asserts plain argv, one failed log read, no retry and no eligibility across the direct, facts-disabled, facts-enabled and facts raw-API paths. Unreadable logs retain the readable-failure repair route. In particular, bounced CI-heal entries must still reach `ci-heal-pr-dispatch` and its unsettled-worker, unconfirmed-accounting and per-head loop hold/park guards. `ci-heal-pr-dispatch.test.mjs` exercises each refusal with real planner output; `ci-log-unreadable.test.mjs` pins routing parity and preserves the existing joined fixer for trusted current-head review findings, including the log evidence reason in its brief. Helper, context-pack and builder-draft recovery regressions cover whole-log context and unreadable evidence.
 ## Review job exit evidence
 
 Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
@@ -4723,6 +4746,50 @@ hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-la
 and other incidental holds retain failure. Empty or malformed required rosters always
 return `unknown` with `roster-unavailable`, including persisted options containing the
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
+
+## Antigravity binary maintenance
+
+`scripts/operations/__tests__/agy-upgrade-check.test.mjs` injects command execution,
+child spawn/kill, time, filesystem and attention publication. No real agy or brew
+runs. Its timeout probes assert exact child PID SIGKILL and completion without a
+close event; output overflow also kills the child. The persisted dead-health
+probe checks both model families, malformed/future/expired records and normal
+quota fallback. Keep the two maintenance JSON files excluded from the legacy
+root quota scan: malformed optional health must not become a quota parse error.
+The run lock serializes scheduled ticks; a killed checker requires operator
+inspection and removal of its leftover lock before maintenance can resume.
+
+## Binary maintenance hold regressions
+
+Keep binary health/cache under the evidence directory's `binary/` subfolder; root JSON names remain legacy quota observations. Test unreadable health as a closed hold, recovery followed by an identical outage through the real attention publisher, and refused child kills at every maintenance step with reporting before lock release.
+
+Register binary maintenance's exclusive lock in `LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`.
+The source scan in `scripts/operations/__tests__/audit-verdict.test.mjs` requires every lock holder
+to stay on the protected audit floor, so concurrency findings block publication.
+
+## Review index completeness proof
+
+Appending a review id is only a discovery hint. Trust requires a completed backfill's
+`completeThroughMtimeMs`, stat-only id/mtime/file-identity snapshot, rebuilt PR keys, and acknowledged
+create-only poison markers. Listing or open-set changes retain verified id/mtime/file-identity
+and ownership rows; requeue changed/new ids and drop removed ids. An unreadable or mismatched
+candidate aborts the batch without publishing completeness, persists verified progress, and
+records a blocking id with a 60-second retry cooldown. Other ids advance during cooldown;
+completeness remains unpublished until every blocking record is verified or removed. Failed appends poison the whole sidecar independently of its write lock; only a
+complete rebuild acknowledges those markers. Readers stat the current listing before parsing
+indexed ids. Unknown or rewritten unindexed ids require strict record identity verification
+(at most 20 reads, sharing the evidence scan budget); unrelated PR ownership permits the hit.
+Same-PR, unreadable or over-bound unknown evidence, missing watermarks, unreadable listings
+or new poison markers force the unchanged bounded fallback. File identity also detects atomic replacements with
+unchanged mtimes when marker creation fails. Even an older/coarse mtime cannot hide an unknown id.
+Oversized snapshots retain the bounded scan and its scan-capped
+HOLD; inspect omitted runs manually. Optional backfill side effects, including argument and
+directory resolution, must return the drain context unchanged on exceptions.
+For every bounded-read risk, the test plan must name a regression counting actual read attempts
+or asserting the read range, including the default shared budget across repositories. Inject a
+failure after a successful staged read to prove no partial completeness can be published.
+Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
+through heavy admission.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
@@ -4796,3 +4863,9 @@ route. `ai-routing-red-team-sites.test.mjs` retains the cap/quota refusal cases 
 covers builder policy models, efforts, operator precedence and disabled fallbacks.
 Explicit settings zero defeats `enabledProviders`; unreadable or malformed seat
 settings warn and use repo defaults, including Gemini's disabled default.
+## Owed CI rerun execution
+
+The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
+Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
+daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
+refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".

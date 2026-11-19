@@ -379,7 +379,7 @@ function clearReaderStarved(starvedRoot, readerKey) {
 /** The live starved reader (if any, other than `owner`) that writers must yield to. A claim lapses with the same
  *  lease as a lock entry (`lastRefusedAt` older than `leaseMinutes`) or when its same-host pid is dead — those
  *  are removed on sight, so a crashed reader can never hold writers off. */
-function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after, startedBeforeMs = null }) {
+function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after, startedBeforeMs = null, ignoreOwners = [] }) {
   if (!(after > 0)) return null;
   for (const rec of readStarvedRecords(starvedRoot)) {
     const asEntry = { owner: rec.owner, pid: rec.pid, heartbeatAt: rec.lastRefusedAt };
@@ -387,7 +387,7 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
       try { rmSync(rec.file, { force: true }); } catch { /* best-effort */ }
       continue;
     }
-    if (rec.owner === owner) continue;
+    if (rec.owner === owner || ignoreOwners.includes(rec.owner)) continue;
     // Bounded: the override lives only inside one writer wait (capped by waitMs); the starved reader's claim is
     // kept, so the writer's NEXT attempt (and its start check) yields to it again. A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
     // Fail closed: a record with a missing/invalid timestamp is treated as older, so the writer still yields.
@@ -770,7 +770,7 @@ export async function acquireWrite(root, opts = {}) {
     const waitedPast = !claim && writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
       && waited < writerWaitPriorityMs + windowMs;
     const r = findPriorityReader(starvedRoot, {
-      owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
+      owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter, ignoreOwners,
       startedBeforeMs: waitedPast ? startMs : null,
     });
     return r;
