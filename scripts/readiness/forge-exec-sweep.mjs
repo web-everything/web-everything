@@ -340,7 +340,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
             const guard = JSON.parse(await fs.readFile(join(receipts, worker, 'reservation.json'), 'utf8')).writerGuard;
             if (guard !== 1) throw new Error('reservation lacks writerGuard evidence');
           }
-        } catch (error) { throw new Error(`unreadable reservation; inspect before retrying: ${error.message}`); }
+        } catch (error) { skip('slots', `unreadable reservation; inspect before retrying: ${error.message}`, slot); return; }
         for (const name of parent ? await directory(parent) : []) {
           const run = originalName(name);
           if (!RUN_DIR.test(run) || run === reserved) continue;

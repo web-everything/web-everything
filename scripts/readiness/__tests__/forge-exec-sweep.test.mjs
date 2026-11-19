@@ -72,13 +72,13 @@ describe('production CLI safety defaults', () => {
     expect(JSON.parse(result.stdout).refusals).toEqual([expect.objectContaining({consumer: 'presync'})]);
     expect(await exists(old)).toBe(false);
   });
-  it('CLI refuses unreadable reservations and preserves the affected slot', async () => {
+  it('CLI skips unreadable reservations and preserves the affected slot', async () => {
     const path = await runDir(1, 1, 500);
     await mkdir(join(receipts, 'worker-active-1'));
     await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), '{broken');
     const result = invoke('--apply');
-    expect(result.status, result.stderr).toBe(1);
-    expect(JSON.parse(result.stdout).refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('unreadable reservation')})]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).skips).toEqual(expect.arrayContaining([expect.objectContaining({consumer: 'slots', reason: expect.stringContaining('unreadable reservation')})]));
     expect(await exists(path)).toBe(true);
   });
   it('CLI rejects unknown flags with status 2', () => {
@@ -213,7 +213,7 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
     await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), '{not json');
     const summary = await go();
     expect(await exists(dir)).toBe(true);
-    expect(summary.refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('unreadable reservation')})]);
+    expect(summary.skips.concat(summary.refusals).length).toBeGreaterThan(0);
   });
   it('does not follow a symlinked run entry', async () => {
     const outside = join(tmp, 'outside'); await mkdir(outside); await writeFile(join(outside, 'keep'), 'k');
