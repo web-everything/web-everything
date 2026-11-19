@@ -1314,7 +1314,8 @@ describe('#4135 — job mode: a pending lane is handed to launchGate, never spaw
     store.update(b.id, (r) => markFailed(r, { at, reason: 'refused beside a survivor' }));
     const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, () => createVerifyGateJobs({ store,
       reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, evict: () => {}, snapshot: {},
-      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {} }));
+      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {},
+      scanLane: () => [] }));
     const spawnGate = vi.fn(() => new Promise(() => {}));
     const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
       runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate }) });
@@ -1363,7 +1364,7 @@ describe('PR 4764 round 10 — a held lane never spends the global in-flight bud
       const result = await runVerifyDispatch({ poolRoot, spawnGate, inFlight: new Map(), awaitSettle: false, maxInFlight: 1, ...mode,
         laneHeld: (d) => (d === laneDir ? 'job j1 holds the lane' : null) });
       expect(result.deferred).toEqual([expect.objectContaining({ lane: 1, reason: 'lane-held' })]);
-      expect(result.dispatched).toMatchObject([{ lane: 2 }]);
+      expect(result.dispatched, JSON.stringify(result)).toMatchObject([{ lane: 2 }]);
     }
     expect(launchGate).toHaveBeenCalledTimes(1);
   });
@@ -1380,13 +1381,14 @@ describe('PR 4764 round 10 — a held lane never spends the global in-flight bud
     writeFileSync(gatePath(store.dir, a.id), JSON.stringify({ pid: 910, handle: 'h:910:x', runId: 'run-a' })); // A's gate survives
     const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, () => createVerifyGateJobs({ store,
       reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, evict: () => {}, snapshot: {},
-      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {} }));
+      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {},
+      scanLane: () => [] }));
     const spawnGate = vi.fn(() => new Promise(() => {}));
     const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
       runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate, maxInFlight: 1 }) });
     const result = await effects.tickOnce();
     expect(effects.inFlight.get(laneDir)).toMatchObject({ jobId: a.id });
-    expect(result.dispatched).toMatchObject([{ lane: 2 }]);
+    expect(result.dispatched, JSON.stringify(result)).toMatchObject([{ lane: 2 }]);
     expect(spawnGate).toHaveBeenCalledTimes(1);
   });
 });

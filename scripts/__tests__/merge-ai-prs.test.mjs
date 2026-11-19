@@ -80,7 +80,7 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     return { verdict, before, operation, rebaseDropManifest, mergeStrategy, args, result };
   };
 
-  const freshPr = { rowsComplete: true, number: 42, title: 'Retained head', body: 'What changed and why', headRefOid: clean.headSha,
+  const freshPr = { rowsComplete: true, rowsHead: clean.headSha, number: 42, title: 'Retained head', body: 'What changed and why', headRefOid: clean.headSha,
     baseRefName: 'main', mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
       { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
@@ -198,6 +198,14 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
       { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', run_id: 1, run_attempt: 1, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' },
       { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', run_id: 1, run_attempt: 2, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' }];
     expect(route({ prPatch: { statusCheckRollup } }).operation).toBe(null);
+  });
+
+  it.each([undefined, 'other-head'])('fresh retention refuses absent or other-head provenance (%s)', async rowsHead => {
+    const { verdict } = route();
+    expect((await revalidate(verdict, { patch: { rowsHead } })).decision).toBe('skip');
+    const pr = { ...freshPr, rowsHead };
+    expect(retainCheckedQueueHead(pr, { hold: true, queueOwnsFreshness: true,
+      requiredCheck: 'test', queueRequiredChecks: ['smoke'], requiredNames: ['test', 'smoke'], rosterSource: 'live' })).toBe(pr);
   });
 
   it('approved-human retention accepts all required checks green but preserves a BEHIND conflict', () => {
@@ -699,6 +707,7 @@ describe('fresh queue rollup completeness', () => {
   it('a complete all-success read permits BEHIND retention', async () => {
     const fresh = await readFreshQueueRollup(pr, { repo: 'owner/repo', exec: async () => page(pr.statusCheckRollup, 2, false) });
     expect(fresh.rowsComplete).toBe(true);
+    expect(fresh.rowsHead).toBe(headRefOid);
     expect(retained(fresh).mergeStateStatus).toBe('CLEAN');
   });
 

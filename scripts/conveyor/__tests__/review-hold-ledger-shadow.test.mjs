@@ -28,7 +28,7 @@ const rawKey = '["judge","scripts/a.mjs",1,"broken"]';
 const hashed = `sha256:${createHash('sha256').update(rawKey).digest('hex')}`;
 const referral = (sha = head) => ev(EVENT_TYPES.REFERRAL, { headSha: sha, findingKeys: [hashed] }, 1);
 const ruling = (findingKey, r = 'not-real') => ev(EVENT_TYPES.RULING, { findingKey, ruling: r }, 2);
-const pr = (o = {}) => ({ number: 3988, headRefOid: head, headRefName: 'lane/x', body: '', createdAt: iso(at - 3_600_000),
+const pr = (o = {}) => ({ number: 3988, headRefOid: head, rowsComplete: true, rowsHead: head, headRefName: 'lane/x', body: '', createdAt: iso(at - 3_600_000),
   labels: [{ name: 'review:human' }], comments: [], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], referralHold: null, blockRuledReferrals: [], ...o });
 const env = (o = {}) => ({ ...o });

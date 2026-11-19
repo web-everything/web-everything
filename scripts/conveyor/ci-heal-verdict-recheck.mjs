@@ -24,6 +24,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
+import { reviewCiPrerequisites } from '../lib/review-ci-gate.mjs';
 import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 
@@ -72,9 +73,19 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 }
 
 /** No known required set means no evidence that CI is green. Pure. */
-export function ciGreenForEscalation({ rollup, requiredChecks }) {
+export function ciGreenForEscalation({ rollup, requiredChecks, headSha, rowsHead, rowsComplete, rosterSource }) {
+  if (rowsComplete !== true || rowsHead !== headSha) return false;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
-  const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
+  // Aggregate hydration metadata cannot override a row explicitly bound to another head.
+  const rows = Array.isArray(rollup) ? rollup : [];
+  // A required (or implying) row bound to another head is unproven: never let a current-head row imply it away.
+  // Check each row so a current-head rerun cannot hide foreign-head evidence of the same name.
+  const prerequisites = [...requiredChecks, CODEQL_CHECK_NAME];
+  if (rows.some(row => {
+    const { wrongHeads, needed } = reviewCiPrerequisites({ headSha, requiredChecks: prerequisites, checks: [row] });
+    return needed.some(name => wrongHeads.has(name));
+  })) return false;
+  const { red, pending, missing } = requiredCheckStates({ rollup: rows, requiredChecks });
   return !red.length && !pending.length && !missing.length;
 }
 

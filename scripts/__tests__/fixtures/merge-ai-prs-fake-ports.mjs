@@ -20,7 +20,9 @@ if (a[0] === 'api') {
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
-  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
+  if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
+  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:pr.statusCheckRollup.filter(c => c.name)}]);
+  if (path.includes('/status?')) out([{statuses:pr.statusCheckRollup.filter(c => c.context)}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {

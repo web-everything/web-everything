@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readReviewChecks } from './lib/review-ci-gate-io.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -1089,7 +1090,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       queueBlocker = `; required-checks-not-successful: ${absent.map(name => `${name} (missing)`).join(', ')}`;
       return false;
     }
-    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [] });
+    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [],
+      rowsComplete: pr.rowsComplete, rowsHead: pr.rowsHead });
     if (!gate.allowed) {
       queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;
       return false;
@@ -1480,7 +1482,7 @@ export async function readFreshQueueRollup(pr, { repo, exec = execFileP } = {}) 
       // The latest-per-name reducer orders runs by `id`/`completedAt`; keep them so a stale success cannot mask a newer failure.
       rows.push(...connection.nodes.map(n => (n?.__typename === 'CheckRun' && n.databaseId != null ? { ...n, id: n.databaseId } : n)));
       if (!connection.pageInfo.hasNextPage) return rows.length === total
-        ? { ...pr, statusCheckRollup: rows, rowsComplete: true } : unresolved;
+        ? { ...pr, statusCheckRollup: rows, rowsComplete: true, rowsHead: commit.oid } : unresolved;
       after = connection.pageInfo.endCursor;
       if (typeof after !== 'string' || !after || cursors.has(after)) return unresolved;
       cursors.add(after);
@@ -1497,7 +1499,7 @@ export function retainCheckedQueueHead(pr, { requiredCheck = 'test', queueRequir
   requiredNames = queueRequiredChecks, rosterSource, expectedHeadSha, holds = [], ...options } = {}) {
   if (!pr || pr.requiredCheckReadError || !Array.isArray(queueRequiredChecks) || !Array.isArray(requiredNames)) return pr;
   const required = [...new Set([...requiredNames, requiredCheck, ...queueRequiredChecks])];
-  if (resolveRequiredChecks({ rows: pr.statusCheckRollup, rowsHead: pr.headRefOid,
+  if (resolveRequiredChecks({ rows: pr.statusCheckRollup, rowsHead: pr.rowsHead,
     rowsComplete: pr.rowsComplete, requiredNames: required, rosterSource,
     head: expectedHeadSha ?? pr.headRefOid, holds }).state !== 'pass') return pr;
   return retainApprovedHumanQueueHead(pr, options);
@@ -5239,8 +5241,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       const resolved = await resolveChecks(repo, data);
+      // Flattened `gh pr view` rows carry no completeness or head provenance.
+      // Revalidation must use the same complete, head-scoped read as pre-stage.
+      const checks = readReviewChecks({ repo: repo || localSlug, headSha: data.headRefOid });
+      const hydrated = { ...resolved, statusCheckRollup: checks,
+        rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead };
       return data.mergeStateStatus === 'BEHIND' && mergeStrategy.queueOwnsFreshness(repo)
-        ? readFreshQueueRollup(resolved, { repo: repo || localSlug }) : resolved;
+        ? readFreshQueueRollup(hydrated, { repo: repo || localSlug }) : hydrated;
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
@@ -5722,7 +5729,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
         if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');
         // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
-        return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+        const resolved = await resolveChecks(null, pr);
+        const checks = readReviewChecks({ repo: localSlug, headSha: pr.headRefOid });
+        return attachLiveFixClaim({ ...resolved, statusCheckRollup: checks,
+          rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead },
+        { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),

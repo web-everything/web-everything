@@ -1,5 +1,6 @@
 import { HEAD, workflowRow, workflowEvidence } from '../../conveyor/soak/fixtures/workflow-edit-protection.mjs';
 // @vitest-environment node
+import { completeCheckRows } from './helpers/complete-check-rows.mjs';
 import { isCandidacyHold, deferCandidacyHoldsOnPrEvent, loadMergeGateHoldSetting, excusePrMergeGateHolds } from '../merge-gate-hold-class.mjs';
 import { formatPrResult, workflowEditFact } from '../merge-gate-ci.mjs';
 import { runDraftPromotionStep } from '../../conveyor/draft-promotion-loop.mjs';
@@ -231,7 +232,7 @@ describe('settings and row evidence', () => {
 });
 const identity = x => x;
 function plan({ setting = 'on', draft = false, testRed = false, readVerdict = () => verdict(), ...extra } = {}) {
-  return runReconcilePass({ env: { WE_REVIEW_START_AFTER: 'ci-green' }, readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: draft, statusCheckRollup: [row, { ...green, conclusion: testRed ? 'FAILURE' : 'SUCCESS' }] }],
+  return runReconcilePass({ env: { WE_REVIEW_START_AFTER: 'ci-green' }, readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], rowsComplete: true, rowsHead: sha, isDraft: draft, statusCheckRollup: [row, { ...green, conclusion: testRed ? 'FAILURE' : 'SUCCESS' }] }],
     readAgents: () => [], enrich: identity, readRequiredChecks: () => ({ checks: ['test', 'merge-gate'] }), readChecks: () => [row, green],
     readMergeGateVerdict: readVerdict, readFreeze: () => ({ error: 'not needed' }), mergeGateSetting: { value: setting },
     enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
@@ -258,7 +259,7 @@ describe('reconcile planner and fresh promotion', () => {
 
 it('reads a shared freeze at most once across a pass', () => {
   const readFreeze = vi.fn(() => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }));
-  const readPrs = () => [5008, 5009].map(number => ({ number, headRefOid: sha, headRefName: `lane/${number}-example`, baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: true, statusCheckRollup: [row, green] }));
+  const readPrs = () => [5008, 5009].map(number => ({ number, headRefOid: sha, headRefName: `lane/${number}-example`, baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], rowsComplete: true, rowsHead: sha, isDraft: true, statusCheckRollup: [row, green] }));
   const result = plan({ readPrs, readFreeze, readVerdict: ({ prNumber }) => ({ ...verdict(log5008), num: prNumber }) });
   expect(readFreeze).toHaveBeenCalledTimes(1);
   expect(result.dispatch.filter(d => d.kind === 'promote-draft')).toHaveLength(2);
@@ -332,7 +333,7 @@ describe('fresh review CI merge-gate holds', () => {
   function gate(extra = {}) {
     // Historical strict-CI fixture: keep its original refusal contract independent of shipped start timing.
     return readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo, pr: 4965, readHead: () => sha, readLabels: () => [],
-      readChecks: () => [rest, { context: 'legacy', state: 'success' }],
+      readChecks: ({ headSha: rowsHead }) => completeCheckRows([rest, { context: 'legacy', state: 'success' }], rowsHead),
       readRequired: () => ({ source: 'live', checks: ['merge-gate', 'legacy'] }),
       readMergeGateVerdict: () => verdict(), readFreeze: () => ({ error: 'unused' }), mergeGateSetting: 'on', ...extra });
   }
@@ -341,7 +342,7 @@ describe('fresh review CI merge-gate holds', () => {
     expect(gate({ readMergeGateVerdict: readVerdict }).allowed).toBe(true);
     expect(readVerdict).toHaveBeenCalledWith({ repo, jobId: 123, prNumber: 4965 });
     expect(rest.conclusion).toBe('failure');
-    expect(gate({ readChecks: () => [rest, { context: 'legacy', state: 'failure' }] })).toMatchObject({
+    expect(gate({ readChecks: ({ headSha: rowsHead }) => completeCheckRows([rest, { context: 'legacy', state: 'failure' }], rowsHead) })).toMatchObject({
       allowed: false, affected: [{ name: 'legacy', reason: 'failure' }],
     });
   });
@@ -414,8 +415,8 @@ describe('fresh review CI merge-gate holds', () => {
   });
   it('does not excuse a legacy merge-gate status', () => {
     const readMergeGateVerdict = vi.fn(() => verdict());
-    expect(gate({ readChecks: () => [{ context: 'merge-gate', state: 'failure' },
-      { context: 'legacy', state: 'success' }], readMergeGateVerdict })).toMatchObject({
+    expect(gate({ readChecks: ({ headSha: rowsHead }) => completeCheckRows([{ context: 'merge-gate', state: 'failure' },
+      { context: 'legacy', state: 'success' }], rowsHead), readMergeGateVerdict })).toMatchObject({
       allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }],
     });
     expect(readMergeGateVerdict).not.toHaveBeenCalled();
@@ -443,7 +444,7 @@ merge-gate: HOLD — held`;
   const failed = { name: 'merge-gate', status: 'completed', conclusion: 'failure', head_sha: sha,
     details_url: 'https://github.com/owner/repo/actions/runs/100/job/123' };
   const probe = (extra = {}) => readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'owner/repo', pr: 4965,
-    readHead: () => sha, readLabels: () => [], readChecks: () => [failed, { name: 'test', status: 'completed', conclusion: 'success', head_sha: sha }],
+    readHead: () => sha, readLabels: () => [], readChecks: ({ headSha: rowsHead }) => completeCheckRows([failed, { name: 'test', status: 'completed', conclusion: 'success', head_sha: sha }], rowsHead),
     readRequired: () => ({ source: 'live', checks: ['test', 'merge-gate'] }),
     readMergeGateVerdict: () => verdict(freshHead), readFreeze: () => ({ error: 'unused' }), mergeGateSetting: 'on', ...extra });
   it('lets the review that produces the red-team check start on a fresh head', () => {
@@ -529,13 +530,11 @@ describe('facts-first review CI merge-gate refusals', () => {
     expect(live).toHaveBeenCalledTimes(1);
     expect(live).toHaveBeenCalledWith({ repo, pr, readRequired, mergeGateSetting: 'on', policy: { startAfter: 'ci-green', startEarly: 'off' } });
   });
-  it('still trusts a completed test failure without reading the live gate', async () => {
-    const live = vi.fn(() => ({ allowed: true }));
-    expect(await gate('test', live)).toMatchObject({ allowed: false,
-      reason: 'required-checks-not-successful', factsSource: 'store',
-      affected: [{ name: 'test', reason: 'failure' }],
-    });
-    expect(live).not.toHaveBeenCalled();
+  it('rechecks a completed test failure live because store rows are incomplete', async () => {
+    const refusal = { allowed: false, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] };
+    const live = vi.fn(() => refusal);
+    expect(await gate('test', live)).toBe(refusal);
+    expect(live).toHaveBeenCalledTimes(1);
   });
 });
 

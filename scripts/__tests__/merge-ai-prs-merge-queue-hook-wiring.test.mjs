@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const TIMEOUT_SCALE = 3; // Allow extra time for CLI subprocesses on loaded shards.
@@ -25,6 +26,9 @@ const F = process.env.MQ_FIXTURE;
 const prs = JSON.parse(fs.readFileSync(F, 'utf8'));
 const landed = n => fs.existsSync(F + '.merged-' + n);
 const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const completeCheckReadFixture = ${completeCheckReadFixture};
+const checkPages = completeCheckReadFixture(prs, a);
+if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 if (a[0] === 'api' && a[1] === 'graphql') {
@@ -306,6 +310,9 @@ const slugOf = () => (ri >= 0 ? a[ri + 1] : process.env.GH_REPO || db.local);
 const prsOf = (slug) => db.repos[slug] || [];
 const mark = (slug, n) => F + '.merged-' + slug.replace(/\\//g, '_') + '-' + n;
 const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const completeCheckReadFixture = ${completeCheckReadFixture};
+const checkPages = completeCheckReadFixture(prsOf((a.find(v => v.startsWith('repos/')) || '').split('/').slice(1, 3).join('/')), a);
+if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') { const s = slugOf(); out(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number)))); }
 if (a[0] === 'api' && a[1] === 'graphql') {

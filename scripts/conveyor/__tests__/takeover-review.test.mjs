@@ -24,6 +24,7 @@ const rearm = (h) => ({ author: BOT, createdAt: at(h), body: '<!-- conveyor-rear
 
 function pr(head, comments, labels = ['review:changes', 'review:human']) {
   return {
+    rowsComplete: true, rowsHead: head,
     number: 7, headRefName: 'lane/x-thing', headRefOid: head, isDraft: false, createdAt: at(0),
     labels: labels.map((name) => ({ name })), files: [{ path: 'src/a.mjs' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],

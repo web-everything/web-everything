@@ -53,7 +53,7 @@ function run({ id = 'review-pr-parked', time = at, failure = false, attempted = 
   return r;
 }
 // `body` / `createdAt` are what `gh pr list` returns; the live release reads them exactly as the gate does.
-const pr = (overrides = {}) => ({ number: 3481, headRefOid: head, headRefName: 'lane/referrals',
+const pr = (overrides = {}) => ({ rowsComplete: true, rowsHead: overrides.headRefOid ?? head, number: 3481, headRefOid: head, headRefName: 'lane/referrals',
   body: '<!-- authored-by-actor: author -->', createdAt: iso(at - 3_600_000),
   labels: [{ name: 'review:human' }], comments: [], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...overrides });

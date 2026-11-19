@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { workflowEditHold, requestOperatorQueueEntry, isAlreadyQueuedError, readMergeQueueState } from '../lib/merge-queue-enqueue.mjs';
 export { readMergeQueueState } from '../lib/merge-queue-enqueue.mjs';
 import { readQueueRequiredChecks } from '../lib/drain-merge-strategy.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { labelOnGreenVerdict } from '../merge-ai-prs.mjs';
 import { loadMergeDeliveryPolicy } from '../lib/merge-delivery-policy.mjs';
@@ -196,7 +197,15 @@ export function createLandHumanOnlyReader({ exec = execFileSync, credential = ()
       }
     }
     const names = requiredChecks({ repo, branch: defaultBranch || 'main' });
-    const ci = Array.isArray(names) ? { names, ...reviewCiGate({ headSha: head, requiredChecks: names, checks: live?.statusCheckRollup }) } : { names: null, allowed: false };
+    let ci = { names: Array.isArray(names) ? names : null, allowed: false };
+    if (Array.isArray(names) && names.length) {
+      try {
+        const checks = readReviewChecks({ repo, headSha: head, run: args => exec('gh', args,
+          { encoding: 'utf8', timeout: 120_000, maxBuffer: 64 * 1024 * 1024 }) });
+        ci = { names, ...reviewCiGate({ headSha: head, requiredChecks: names, checks,
+          rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead }) };
+      } catch { ci.reason = 'unreadable-ci'; }
+    }
     return {
       repo, number: num, head, defaultBranch, nodeId: live?.id ?? null,
       pr: { state: live?.state, isDraft: live?.isDraft === true, baseRefName: live?.baseRefName, mergeable: live?.mergeable, mergeStateStatus: live?.mergeStateStatus },

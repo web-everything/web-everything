@@ -151,7 +151,7 @@ describe('ensure one sampler job', () => {
     store.update(first.record.id, r => markLaunching(r, { at: new Date(args.now).toISOString() }));
     ensureSamplerJob({ store, ...args });
     const step = vi.fn();
-    const result = await runJob({ steps: [{ name: 'sample-loop', run: step }],
+    const result = await runJob({ steps: [{ name: 'sample-loop', run: step }], readStart: () => 'fixture-start',
       env: { DAEMON_JOB_ID: first.record.id, DAEMON_JOB_ATTEMPT: '1', OPERATION_RUNS_DIR: store.dir } });
     expect(result).toMatchObject({ outcome: 'refused', code: 'already-finished' });
     expect(step).not.toHaveBeenCalled();
