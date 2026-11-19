@@ -1714,6 +1714,7 @@
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/owed-ci-rerun-planned-but-never-executed.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/host-handoff-cache-write-race.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-daemon-budget-lists-real-processes.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/duplicate-live-sessions-test-dynamic-import.soak.test.mjs": 2,
