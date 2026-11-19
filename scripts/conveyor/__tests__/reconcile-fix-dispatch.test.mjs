@@ -2398,7 +2398,8 @@ describe('runReconcileFixDispatch — progress guarantee', () => {
       expect(result.handled).toBeGreaterThanOrEqual(1);
       cursor = result.nextCursor ?? undefined;
     }
-    expect(touched).toEqual([1764, 1765]);
+    // The budget bounds dispatch work, not the reconcile read, so an overrunning read no longer defers PRs.
+    expect(touched).toEqual([1764, 1765, 1764, 1765]);
   });
 });
 
