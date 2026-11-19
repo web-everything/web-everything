@@ -1,4 +1,4 @@
-/** R1094 S1 shadow ledger. Reads existing holders; ONLY pool-shadow.jsonl is written.
+/** R1094 S1 shadow ledger. Collector reads holders; the CLI sink writes pool-shadow.jsonl.
  * Observations can overlap (e.g. a build and its heavy verification). Count conservatively;
  * use each source's liveness/expiry rules without acquiring or reaping anything.
  */
@@ -10,9 +10,9 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { fixDispatchClaimRoot, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from '../conveyor/fix-claim-store.mjs';
 import { buildDispatchClaimRoot, listBuildDispatchClaims } from '../conveyor/build-dispatch-claim.mjs';
 import { jobsDir, listJobs, describeJob } from '../operations/start-build-jobs.mjs';
-import { reviewJobsDir, readJobRecord, pidAlive } from '../operations/review-job-store.mjs';
+import { reviewJobsDir, readJobRecord } from '../operations/review-job-store.mjs';
 import { sharedRunsDir } from '../operations/run-store.mjs';
-import { readSlotStatuses, probeSlotAlive, MAX_AGE_MS } from '../operations/red-team-slots.mjs';
+import { readSlotStatuses, buildSlotReport, probeSlotAlive, MAX_AGE_MS } from '../operations/red-team-slots.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { admissionLockRoot, heldSlots, listWaiting, loadAdmissionPolicy, readLaneLease } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot, workspaceFor } from './lane-pool-paths.mjs';
@@ -133,11 +133,25 @@ export function poolSourcePaths({ env = process.env, repoRoot = ROOT, coord = re
     snapshot: join(coord, 'resource', 'snapshot.json') };
 }
 
+/** Only ESRCH proves death; invalid PIDs and unexpected probe failures are unknown. */
+export function poolPidAlive(pid, kill = (p, signal) => process.kill(p, signal)) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try { kill(pid, 0); return true; }
+  catch (error) { return error?.code === 'ESRCH' ? false : error?.code === 'EPERM' ? true : null; }
+}
+
 /** Every source is independently guarded. Missing roots are unknown even when a legacy reader returns []. */
-export function readPoolSource(source, { paths, nowMs = Date.now(), caps = {}, isAlive = pidAlive,
+export function readPoolSource(source, { paths, nowMs = Date.now(), caps = {}, isAlive = poolPidAlive,
   snapshotReader = readSnapshot, coord, jobDescribe = describeJob,
-  roundBudget = liveReviewRoundBudget, slotAlive = data => probeSlotAlive(data, {
-    killAlive: isAlive, readStart: pidStartTime, host: hostname(), namespace: pidNamespace() }) } = {}) {
+  roundBudget = liveReviewRoundBudget, slotAlive = data => {
+    if (!Number.isInteger(data.pid) || data.pid <= 0) return null;
+    return probeSlotAlive(data, {
+      killAlive: pid => {
+        const alive = isAlive(pid);
+        if (typeof alive !== 'boolean') throw Error('red-team liveness unknown; inspect process access');
+        return alive;
+      }, readStart: pidStartTime, host: hostname(), namespace: pidNamespace() });
+  } } = {}) {
   try {
     const dir = paths[source];
     let holders = [], extra = {};
@@ -181,10 +195,10 @@ export function readPoolSource(source, { paths, nowMs = Date.now(), caps = {}, i
       const rows = readSlotStatuses(dir, { now: nowMs })
         .filter(r => nowMs - r.mtimeMs <= MAX_AGE_MS);
       if (rows.length !== files.length) throw Error('red-team inventory incomplete; inspect recent status files');
-      holders = rows.filter(r => r.data && ['queued', 'running'].includes(r.data.status) && slotAlive(r.data) !== false).map(r => {
-        if (!r.data.repo || !r.data.pr || !r.data.head) throw Error('red-team identity incomplete');
-        return holder('redTeam', r.data, 2, 'studio.units', `${r.data.repo}:${r.data.pr}:${r.data.head}`);
-      });
+      const report = buildSlotReport({ statuses: rows, now: nowMs, aliveFn: slotAlive });
+      const occupied = rows.filter(r => ['queued', 'running'].includes(r.data.status));
+      holders = report.slots.flatMap((slot, index) => slot.pidAlive === false ? [] :
+        [holder('redTeam', occupied[index].data, 2, 'studio.units', `${slot.repo}:${slot.pr}:${slot.head}`)]);
     } else if (source === 'buildJobs') {
       const files = jsonFiles(dir), rows = listJobs(dir);
       if (files.length !== rows.length || rows.some(r => !r.id || !r.handle)) throw Error('incomplete build job');
@@ -260,7 +274,7 @@ export function appendShadowRows(rows, { env = process.env, coord, mode = 'shado
 
 export function collectResourcePool({ env = process.env, repoRoot = ROOT, nowMs = Date.now(),
   coord = resolveCoordinationRoot({ env }), settings = loadPoolSettings({ env }), paths = poolSourcePaths({ env, repoRoot, coord }),
-  readSource = readPoolSource, caps, append = appendShadowRows } = {}) {
+  readSource = readPoolSource, caps } = {}) {
   let capError;
   if (!caps) {
     try {
@@ -307,10 +321,5 @@ export function collectResourcePool({ env = process.env, repoRoot = ROOT, nowMs 
   const report = { mode: settings.value.mode, configuredMode: settings.configuredMode, unknown, holders, sources,
     settings, budgets, summary, queuedDemand, rows, capError, builderFloor: settings.value.builderFloor };
   report.digest = digestLine(report);
-  report.shadowAppended = false;
-  if (settings.value.mode !== 'off') {
-    try { report.shadowAppended = append(rows, { env, coord, mode: settings.value.mode }); }
-    catch { /* Shadow evidence must never break the readout or its callers. */ }
-  }
   return report;
 }

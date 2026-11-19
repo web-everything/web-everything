@@ -5160,3 +5160,13 @@ Red-team pool completeness compares only status files within the canonical
 `MAX_AGE_MS` mtime window. Apply that exclusion before JSON/size validation so
 aged-out attempt metadata cannot poison the live inventory; corrupt or oversized
 recent evidence remains unknown. Pin the inclusive age boundary in fixtures.
+
+
+## Resource pool shadow read boundary
+
+`collectResourcePool` only reads evidence; inject settings, paths, caps and source reads to
+exercise it without filesystem access. Shadow JSONL append/rotation belongs to the
+`finishResourcePool` log sink bound by `scripts/operations/run.mjs`, including JSON CLI
+runs; off mode skips that sink. Validate recent red-team evidence with `buildSlotReport`
+before treating a source as complete. Missing PIDs retain holders; unexpected PID probe
+errors close the source, and only ESRCH or a proven identity mismatch releases capacity.

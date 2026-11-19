@@ -13,6 +13,22 @@ it('renders mode, sources, holders and a digest; preserves JSON verdict digest',
   const text = renderResourcePool(report);
   for (const term of ['mode shadow', 'configured enforce', 'fix: UNKNOWN', 'pr-1', report.digest]) expect(text).toContain(term);
   expect(text).not.toContain('bad\nfile');
-  expect(finishResourcePool({ run: { verdict: report }, code: 0, lines: ['json'], json: true }).lines).toEqual(['json']);
-  expect(finishResourcePool({ run: { verdict: report }, code: 0 }).lines).toEqual([text]);
+  expect(finishResourcePool()({ run: { verdict: report }, code: 0, lines: ['json'], json: true }).lines).toEqual(['json']);
+  expect(finishResourcePool()({ run: { verdict: report }, code: 0 }).lines).toEqual([text]);
+});
+
+it('shadow rows are written only through the finish sink, including JSON runs', () => {
+  const log = vi.fn();
+  const report = { mode: 'shadow', rows: [{ kind: 'build' }] };
+  const finish = finishResourcePool({ log });
+  expect(log).not.toHaveBeenCalled();
+  const args = { run: { verdict: report }, code: 0, lines: ['json'], json: true };
+  expect(finish(args)).toEqual({ code: 0, lines: ['json'] });
+  expect(log).toHaveBeenCalledTimes(1);
+  expect(log).toHaveBeenCalledWith(report.rows, { mode: 'shadow' });
+  log.mockClear();
+  finish({ ...args, run: { verdict: { ...report, mode: 'off' } } });
+  finish({ ...args, run: {} });
+  expect(log).not.toHaveBeenCalled();
+  expect(() => finishResourcePool({ log: () => { throw Error('disk'); } })(args)).not.toThrow();
 });

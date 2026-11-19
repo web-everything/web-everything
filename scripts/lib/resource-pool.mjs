@@ -22,17 +22,20 @@ export function grantDecision({ budget, held, queuedDemand = {}, class: priority
     || held.some(h => typeof h.source !== 'string' || !h.source.trim() || h.unknown || h.sourceOk === false || !validClass(h.class) || !finite(h.size))
     || !queuedDemand || typeof queuedDemand !== 'object' || Array.isArray(queuedDemand)
     || Object.entries(queuedDemand).some(([c, n]) => !validClass(c) || !finite(n))
-    || !finite(classes?.[priority]?.max)) return result('unknown', 'incomplete pool evidence');
+    || !finite(classes?.[priority]?.max)
+    || [1, 2, 3, 4].some(c => !finite(classes?.[c]?.reserve) || !finite(classes?.[c]?.max) || classes[c].reserve > classes[c].max)) return result('unknown', 'incomplete pool evidence');
   const total = held.reduce((n, h) => n + h.size, 0);
   const own = held.filter(h => Number(h.class) === Number(priority)).reduce((n, h) => n + h.size, 0);
   if (own + size > classes[priority].max) return result('hold', 'class max');
   const free = budget - total;
   const higher = Object.entries(queuedDemand).filter(([c]) => Number(c) < Number(priority)).reduce((n, [, d]) => n + d, 0);
+  const unmetReserve = [1, 2, 3].filter(c => c < Number(priority)).reduce((n, c) =>
+    n + Math.max(0, classes[c].reserve - held.filter(h => Number(h.class) === c).reduce((sum, h) => sum + h.size, 0)), 0);
   const builders = held.filter(h => Number(h.class) === 4).reduce((n, h) => n + h.size, 0);
   // The floor belongs to builders: other classes cannot consume its unoccupied portion.
   const overdraw = Number(priority) === 1 ? class1Overdraw : 0;
-  if (Number(priority) !== 4 && free + overdraw - size < Math.max(0, builderFloor - builders)) return result('hold', 'builder floor');
-  return free + overdraw - higher >= size ? result('grant', 'capacity available') : result('hold', 'capacity or higher-class demand');
+  if (Number(priority) !== 4 && free + overdraw - higher - unmetReserve - size < Math.max(0, builderFloor - builders)) return result('hold', 'builder floor');
+  return free + overdraw - higher - unmetReserve >= size ? result('grant', 'capacity available') : result('hold', 'capacity, higher-class reserves or demand');
 }
 
 /** 1 unit = 1 GiB memory headroom above the measured floor, capped at the legacy 30u envelope.

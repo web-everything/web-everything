@@ -1,11 +1,13 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
+import fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readPoolSource, SOURCES, collectResourcePool, loadPoolSettings, appendShadowRows, poolSourcePaths, readPoolSettingsChecked } from './resource-pool-io.mjs';
+import { readPoolSource, SOURCES, collectResourcePool, loadPoolSettings, appendShadowRows, poolSourcePaths, readPoolSettingsChecked, poolPidAlive } from './resource-pool-io.mjs';
 import { liveReviewRoundBudget } from '../../skills-src/conveyor/review-daemon.mjs';
 import { reviewJobsDir } from '../operations/review-job-store.mjs';
+import { resourcePoolOperation } from '../operations/resource-pool.mjs';
 import { assessResourceStatus } from '../operations/resource-status.mjs';
 import { lockIdFor } from '../readiness/file-locks.mjs';
 let root, paths;
@@ -98,15 +100,23 @@ it('collects every named source, propagates throws to unknown and keeps all pool
   expect(report.rows.every(r => r.poolDecision === 'unknown')).toBe(true);
   expect(report.digest).toContain('studio ?/30u');
   expect(report.sources.find(s => s.source === 'reviews').error).toContain('unreadable');
-  expect(report.shadowAppended).toBe(true);
+  expect(existsSync(join(root, 'resource/pool-shadow.jsonl'))).toBe(false);
 });
-it('off collector never calls the append port; enforce is shadow only', () => {
-  const append = vi.fn();
-  const common = { coord: root, paths, caps: {}, append, readSource: source => ({ source, ok: true, holders: [] }) };
-  expect(collectResourcePool({ ...common, settings: settings('off') }).mode).toBe('off'); expect(append).not.toHaveBeenCalled();
-  const report = collectResourcePool({ ...common, settings: settings('enforce') });
-  expect(report).toMatchObject({ configuredMode: 'enforce', mode: 'shadow' });
-  expect(append.mock.calls[0][1].mode).toBe('shadow');
+it('collect is filesystem-pure with injected reads, including shadow and enforce modes', () => {
+  const common = { coord: root, paths, caps: {}, nowMs,
+    readSource: source => ({ source, ok: true, holders: [] }) };
+  for (const mode of ['off', 'shadow', 'enforce']) {
+    const resolved = settings(mode);
+    const probes = ['readFileSync', 'readdirSync', 'statSync', 'openSync', 'writeFileSync', 'appendFileSync', 'mkdirSync', 'renameSync', 'rmSync']
+      .map(name => vi.spyOn(fs, name).mockImplementation(() => { throw Error('unexpected filesystem access'); }));
+    try {
+      const declaration = resourcePoolOperation({ collect: () => collectResourcePool({ ...common, settings: resolved }) });
+      expect(declaration.steps[0].step.kind).toBe('compute');
+      const report = declaration.steps[0].step.fn();
+      expect(report).toMatchObject({ configuredMode: mode, mode: mode === 'off' ? 'off' : 'shadow' });
+      for (const probe of probes) expect(probe).not.toHaveBeenCalled();
+    } finally { for (const probe of probes) probe.mockRestore(); }
+  }
 });
 it('unreadable/invalid settings force unknown shadow even when environment requests enforce', () => {
   for (const read of [() => { throw Error('bad file'); }, () => ({ value: { mode: 'enforce', builderFloor: 1000 }, taint: [] })]) {
@@ -136,15 +146,10 @@ it('reads heavy queued demand without treating corrupt waiting markers as zero',
   put(join(waiting, 'broken.json'), '{broken');
   expect(read('heavy')).toMatchObject({ ok: false, unknown: true });
 });
-it('a throwing append port cannot escape the collector', () => {
-  expect(() => collectResourcePool({ coord: root, paths, settings: settings(), caps: {},
-    readSource: source => ({ source, ok: true, holders: [] }), append: () => { throw Error('disk'); } })).not.toThrow();
-});
-
 it('uses the same job-store helper under the registered dispatcher clone, preserving env precedence', () => {
   const repoRoot = join(root, '.lanes/we/lane-21');
-  expect(poolSourcePaths({ env: {}, repoRoot }).reviews).toBe(reviewJobsDir({}, join(root, 'wev-review-daemon')));
-  expect(poolSourcePaths({ env: { OPERATION_REVIEW_JOBS_DIR: paths.reviews }, repoRoot }).reviews).toBe(paths.reviews);
+  expect(poolSourcePaths({ env: { LANE_POOL_ROOT: paths.lanes }, repoRoot }).reviews).toBe(reviewJobsDir({}, join(root, 'wev-review-daemon')));
+  expect(poolSourcePaths({ env: { LANE_POOL_ROOT: paths.lanes, OPERATION_REVIEW_JOBS_DIR: paths.reviews }, repoRoot }).reviews).toBe(paths.reviews);
 });
 it('counts live rounds with the dispatch gate despite more than 20000 historical entries', () => {
   for (let i = 0; i < 20001; i++) put(join(paths.rounds, `ended-${i}.json`), { status: 'ended' });
@@ -235,4 +240,42 @@ it('keeps red-team records exactly at the canonical age boundary eligible and fa
   const file = join(paths.redTeam, 'boundary.json'); put(file, '{broken');
   const boundary = new Date(nowMs - 48 * 60 * 60 * 1000); utimesSync(file, boundary, boundary);
   expect(read('redTeam').unknown).toBe(true);
+});
+
+it.each([{}, { status: null }, { status: 42 }, { status: 'running', repo: 'we', pr: 'bad', head: 'abc' },
+  { status: 'running', repo: 'we', pr: 0, head: 'abc' }, { status: 'queued', repo: 'we', pr: 1 }])(
+  'recent incomplete red-team evidence is UNKNOWN: %j', data => {
+    put(join(paths.redTeam, 'slot.json'), data);
+    expect(read('redTeam')).toMatchObject({ ok: false, unknown: true });
+  });
+it.each(['running', 'queued'])('retains %s red-team slots without a PID', status => {
+  put(join(paths.redTeam, 'slot.json'), { status, repo: 'we', pr: 1, head: 'abc' });
+  expect(read('redTeam', { isAlive: () => false })).toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
+});
+it.each([null, undefined, 'unknown'])('unknown red-team PID verdict %j closes the source', alive => {
+  present('redTeam');
+  expect(read('redTeam', { isAlive: () => alive })).toMatchObject({ ok: false, unknown: true,
+    error: expect.stringContaining('inspect process access') });
+});
+it('a throwing PID probe closes red-team evidence rather than freeing capacity', () => {
+  present('redTeam');
+  expect(read('redTeam', { isAlive: () => { throw Error('probe failed'); } }).unknown).toBe(true);
+});
+it.each([['ESRCH', false], ['EPERM', true], ['EIO', null], [undefined, null]])(
+  'pool PID probe preserves three-valued liveness for %s', (code, alive) => {
+    const kill = () => { throw Object.assign(Error('probe'), { code }); };
+    expect(poolPidAlive(42, kill)).toBe(alive);
+    present('redTeam');
+    const result = read('redTeam', { isAlive: pid => poolPidAlive(pid, kill) });
+    if (alive === null) expect(result.unknown).toBe(true);
+    else expect(result.holders).toHaveLength(alive ? 1 : 0);
+  });
+it.each([undefined, null, 0, -1, '42', NaN])('invalid pool PID %j is unknown without a kill call', pid => {
+  const kill = vi.fn();
+  expect(poolPidAlive(pid, kill)).toBeNull(); expect(kill).not.toHaveBeenCalled();
+});
+
+it('preserves remote red-team holder host while retaining unknown liveness', () => {
+  put(join(paths.redTeam, 'slot.json'), { status: 'running', repo: 'we', pr: 1, head: 'abc', pid: 42, host: 'remote' });
+  expect(read('redTeam')).toMatchObject({ ok: true, holders: [{ host: 'remote' }] });
 });

@@ -25,6 +25,12 @@ export function resourcePoolOperation({ collect } = {}) {
     read: compute({ reads: [], fn: () => collect() }),
   });
 }
-export function finishResourcePool({ run, code, lines, json = false }) {
-  return json || !run?.verdict ? { code, lines } : { code, lines: [renderResourcePool(run.verdict)] };
+/** Only the CLI binds the shadow log sink; collecting a GET never writes evidence. */
+export function finishResourcePool({ log } = {}) {
+  return ({ run, code, lines, json = false }) => {
+    if (run?.verdict && run.verdict.mode !== 'off') {
+      try { log?.(run.verdict.rows, { mode: run.verdict.mode }); } catch { /* evidence only */ }
+    }
+    return json || !run?.verdict ? { code, lines } : { code, lines: [renderResourcePool(run.verdict)] };
+  };
 }

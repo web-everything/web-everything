@@ -17,8 +17,8 @@ describe('shadow grant arithmetic', () => {
     ['class1 overdraw bound', { budget: 4, held: [h(4, 4)], class: 1, size: 3 }, 'hold'],
     ['other classes cannot overdraw', { budget: 4, held: [h(4, 4)], class: 2 }, 'hold'],
     ['builder floor protects unused builder units', { budget: 5, class: 3 }, 'hold'],
-    ['builder can consume its floor', { budget: 4, size: 4 }, 'grant'],
-    ['occupied builders satisfy floor', { budget: 6, held: [h(4, 4)], class: 3 }, 'grant'],
+    ['builder can consume its floor', { budget: 14, size: 4 }, 'grant'],
+    ['occupied builders satisfy floor', { budget: 14, held: [h(4, 4)], class: 3 }, 'grant'],
     ['shrink does not preempt holders', { budget: 1, held: [h(4, 6)] }, 'hold'],
     ['unknown budget fails closed', { budget: { unknown: true } }, 'unknown'],
     ['unknown source fails closed', { unknown: true }, 'unknown'],
@@ -31,6 +31,26 @@ describe('shadow grant arithmetic', () => {
     const input = { ...base, ...patch }, before = structuredClone(input);
     expect(grantDecision(input).decision).toBe(decision);
     expect(input).toEqual(before);
+  });
+  it.each([
+    ['builder floor and higher reserves coexist', { budget: 12, class: 3, builderFloor: 4 }, 'hold'],
+    ['builder floor plus higher reserves exact boundary', { budget: 14, class: 3, builderFloor: 4 }, 'grant'],
+    ['C2 preserves C1 reserve', { class: 2, budget: 7, size: 6 }, 'hold'],
+    ['C2 at reserve boundary', { class: 2, budget: 8, size: 6 }, 'grant'],
+    ['C3 preserves C1 and C2', { class: 3, budget: 9 }, 'hold'],
+    ['C3 at reserve boundary', { class: 3, budget: 10 }, 'grant'],
+    ['builders preserve all higher reserves', { budget: 14, size: 14 }, 'hold'],
+    ['builders can consume remaining four units', { budget: 14, size: 4 }, 'grant'],
+    ['partially occupied higher reserves', { budget: 14, held: [h(1, 1), h(2, 3)], size: 5 }, 'hold'],
+    ['partial reserve exact boundary', { budget: 14, held: [h(1, 1), h(2, 3)], size: 4 }, 'grant'],
+    ['excess occupancy cannot cancel another reserve', { budget: 14, held: [h(1, 4)], size: 3 }, 'hold'],
+    ['fully occupied reserves', { budget: 14, held: [h(1, 2), h(2, 6), h(3, 2)], size: 4 }, 'grant'],
+    ['configured reserves', { budget: 14, classes: { ...CLASSES, 2: { reserve: 8, max: 8 } }, size: 3 }, 'hold'],
+    ['missing reserve closes evidence', { classes: { ...CLASSES, 1: { max: 4 } } }, 'unknown'],
+    ['malformed reserve closes evidence', { classes: { ...CLASSES, 2: { reserve: -1, max: 8 } } }, 'unknown'],
+    ['queue demand also protects capacity', { budget: 14, size: 4, queuedDemand: { 1: 1 } }, 'hold'],
+  ])('%s', (_, patch, expected) => {
+    expect(grantDecision({ ...base, builderFloor: 0, ...patch }).decision).toBe(expected);
   });
   it('all new instant leaves have bounded validators and safe fallback directions', () => {
     for (const [key, leaf] of Object.entries(CAPACITY_LEAVES).filter(([k]) => k.startsWith('resourcePool.'))) {

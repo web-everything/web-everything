@@ -96,7 +96,7 @@ import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './h
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
 import { resourcePoolOperation, RESOURCE_POOL_OP, finishResourcePool } from './resource-pool.mjs';
-import { collectResourcePool } from '../lib/resource-pool-io.mjs';
+import { collectResourcePool, appendShadowRows } from '../lib/resource-pool-io.mjs';
 import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
 import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
@@ -529,7 +529,7 @@ export const OPERATIONS = Object.freeze({
   [RESOURCE_POOL_OP]: () => ({
     declaration: resourcePoolOperation({ collect: collectResourcePool }),
     sinks: {},
-    finish: finishResourcePool,
+    finish: finishResourcePool({ log: appendShadowRows }),
   }),
   // Card xkuflno — read-only resource snapshot and shadow admission verdicts; IO bound here.
   [RESOURCE_STATUS_OP]: () => ({
