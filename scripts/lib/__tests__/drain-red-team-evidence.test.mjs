@@ -1846,7 +1846,8 @@ describe('finished publication hold recovery', () => {
     const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json.unpublished`);
     mkdirSync(redTeamStatusDir(f.env), { recursive: true });
     writeJsonAtomic(path, marker);
-    const readCheck = vi.fn(() => ({ ok: true }));
+    utimesSync(path, 1_800_000_000, 1_800_000_000);
+    const readCheck = vi.fn(() => ({ ok: true, completedAt: new Date(1_800_000_001_000).toISOString() }));
     const readComments = vi.fn(() => [cleanResultComment(f)]);
     const postHold = vi.fn(() => ({ ok: true }));
     const lock = vi.fn(fn => fn());
@@ -1863,6 +1864,39 @@ describe('finished publication hold recovery', () => {
     expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
     expect(f.readCheck).toHaveBeenCalledTimes(1);
     expect(f.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['stale success older than the marker', new Date(1_799_999_999_000).toISOString()],
+    ['missing completion time', undefined],
+    ['invalid completion time', 'unreadable'],
+  ])('keeps the marker with %s despite an ordinary result comment', (_kind, completedAt) => {
+    const f = setup();
+    f.readCheck.mockReturnValue({ ok: true, completedAt });
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: expect.stringContaining('operator must inspect') });
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
+  it.each([1_800_000_000_000, 1_800_000_001_000])('accepts fresh success completed at or after the marker (%s)', at => {
+    const f = setup();
+    f.readCheck.mockReturnValue({ ok: true, completedAt: new Date(at).toISOString() });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(existsSync(f.path)).toBe(false);
+    expect(f.postHold).toHaveBeenCalledTimes(1);
+  });
+  it('preserves the poster-supplied sanitized writer environment', () => {
+    const f = setup();
+    f.env.GH_TOKEN = 'inherited-token';
+    const writerEnv = { WE_GH_ROLE: 'app', WE_GH_APP_ENFORCE: '1' };
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('{}');
+    f.postHold.mockImplementation(({ gh: post }) => {
+      post(['api', 'fixture'], { env: writerEnv });
+      return { ok: true };
+    });
+    try {
+      expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+      expect(gh).toHaveBeenCalledWith(['api', 'fixture'], { env: writerEnv });
+      expect(gh.mock.calls[0][1].env).toBe(writerEnv);
+    } finally { gh.mockRestore(); }
   });
   it.each(['not ok', 'unknown', 'throws'])('keeps the marker when the live check is %s', kind => {
     const f = setup();

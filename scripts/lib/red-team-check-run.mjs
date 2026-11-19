@@ -168,7 +168,7 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
     ? runs.find(run => !isPolicyClearRun(run)) ?? runs[0] : runs[0];
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
-  return { ok: true, reason: 'red-team check run succeeded on head' };
+  return { ok: true, reason: 'red-team check run succeeded on head', completedAt: latest.completed_at ?? null };
 }
 
 /** Title prefix of every run the policy-clear writer posts, so it can tell its own runs from a round's. Only runs

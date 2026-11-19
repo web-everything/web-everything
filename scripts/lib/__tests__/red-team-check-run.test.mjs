@@ -1271,6 +1271,14 @@ describe('red-team check run contract', () => {
     expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, checkRuns: [run()], appId: APP_ID })).toMatchObject({ ok: true });
   });
 
+  it('exposes the deciding round completion time rather than a newer policy-clear time', () => {
+    const completedAt = '2026-11-07T12:00:00Z';
+    const gh = vi.fn(() => JSON.stringify({ total_count: 2, check_runs: [run({ completed_at: completedAt }),
+      run({ id: 11, completed_at: '2026-11-07T13:00:00Z', output: { title: 'Policy-clear: Red team clear' } })] }));
+    expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
+      .toMatchObject({ ok: true, completedAt });
+  });
+
   it('success for PR A cannot authorize PR B sharing the same head SHA', () => {
     const gh = vi.fn(() => JSON.stringify({ total_count: 1, check_runs: [run()] }));
     expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }).ok).toBe(true);

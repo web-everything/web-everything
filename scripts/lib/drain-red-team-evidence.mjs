@@ -74,7 +74,7 @@ export function readFinishedPublicationHold({ repo, pr, head, env = process.env 
 /** Settle a finished writer's outbox, never republish its sealed check. The status claim prevents a round writer
  * changing the marker during confirmation; the shared check lock serializes the live check/hold boundary. */
 export function settleFinishedPublicationHold({ repo, pr, head, env = process.env,
-  gh = (args, options) => runGhSync(args, { ...options, env }),
+  gh = (args, options) => runGhSync(args, { env, ...options }),
   readCheck = key => {
     const app = resolveWeAppId({ env });
     return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh }) : app;
@@ -85,7 +85,8 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
   const path = statusPath({ repo, pr, head }, env);
   try {
     return withRedTeamStatusClaim(path, () => lock(() => {
-      try { statSync(`${path}.unpublished`); }
+      let markerStat;
+      try { markerStat = statSync(`${path}.unpublished`); }
       catch (error) {
         return error.code === 'ENOENT' ? { ok: true } : { ok: false, reason: 'finished publication marker unreadable' };
       }
@@ -93,6 +94,9 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
         return { ok: false, reason: 'publication marker is not a finished round for this head' };
       const fact = readCheck({ repo, pr, headSha: head });
       if (fact?.ok !== true) return { ok: false, reason: fact?.reason ?? 'red-team check not confirmed ok' };
+      const completedAt = Date.parse(fact.completedAt);
+      if (!Number.isFinite(completedAt) || !Number.isFinite(markerStat.mtimeMs) || completedAt < markerStat.mtimeMs)
+        return { ok: false, reason: 'red-team check not proven newer than finished marker; operator must inspect publication' };
       const result = redTeamResultCommentForHead(readComments(), pr, head);
       if (!result || result.carriedFrom) return { ok: false, reason: 'no ordinary red-team result on head' };
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });

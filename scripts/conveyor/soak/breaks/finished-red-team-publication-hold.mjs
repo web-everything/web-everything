@@ -1,6 +1,6 @@
 /** PR #6945: a posted ordinary result must retry the finished writer's unconfirmed publication hold. */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -41,8 +41,9 @@ export default {
       const env = { WE_SHARED_RUNS_DIR: join(scratch, 'runs') };
       const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json.unpublished`);
       writeJsonAtomic(path, { status: 'finished', remoteHold: true });
+      const completedAt = new Date(Math.ceil(statSync(path).mtimeMs)).toISOString();
       let held = true, posts = 0, checkOk = false, postOk = false;
-      const key = { repo, pr, head, env, lock: fn => fn(), readCheck: () => ({ ok: checkOk }),
+      const key = { repo, pr, head, env, lock: fn => fn(), readCheck: () => ({ ok: checkOk, completedAt }),
         readComments: () => comments, postHold: ({ held: next }) => {
           posts++;
           if (!postOk) return { ok: false, reason: 'transient post failure' };
