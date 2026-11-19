@@ -97,6 +97,7 @@ export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 // Fixed maximum: decline dedupe must never suppress a PR indefinitely.
 export const CATCH_UP_DECLINE_TTL_MS = 60 * 60_000;
 // Declines safe to dedupe: bound to a head/labels/checks snapshot. Everything else retries every catch-up.
+// red-team-pending and mq-same-head-failed survive main CI churn; sent-back and bornas-collision require the same mainCiRunId.
 export const CATCH_UP_DECLINE_DEDUPE_KINDS = Object.freeze(new Set(['mq-same-head-failed', 'red-team-pending', 'sent-back', 'bornas-collision']));
 const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
@@ -643,7 +644,8 @@ function unchangedDecline(pr, held, now, mainCiRunId) {
     && typeof pr.checksDigest === 'string' && pr.checksDigest && held.checksDigest === pr.checksDigest
     && Number.isFinite(pr.lastCheckCompletedAt) && pr.lastCheckCompletedAt <= held.at
     && Number.isFinite(pr.lastLabelChangedAt) && pr.lastLabelChangedAt <= held.at
-    && Number.isSafeInteger(mainCiRunId) && mainCiRunId > 0 && held.mainCiRunId === mainCiRunId);
+    && (held.reason === 'red-team-pending' || held.reason === 'mq-same-head-failed'
+      || Number.isSafeInteger(mainCiRunId) && mainCiRunId > 0 && held.mainCiRunId === mainCiRunId));
 }
 
 /** PURE: ordered candidates that fit the current queue, leaving eligibility to the drain. */
@@ -997,6 +999,7 @@ export function createEnqueueOnEvent({
           const current = result.prs.find(pr => pr.num === num);
           if (!current || !unchangedDecline(current, held, now(), result.mainCiRunId)) {
             // Existing wake backoffs must not mask a dedupe invalidation (including missing evidence).
+            declines.delete(num);
             backoff.delete(num);
             missBackoff.delete(num);
           }
@@ -1279,7 +1282,16 @@ export function createEnqueueOnEvent({
       // failure cannot withdraw a green wake; the drain re-reads current required checks.
       // A wake for a PR whose fast drain is running stays pending: the run loop never starts a second
       // drain for an active PR, and the next tick re-wakes it unless that run verified the enqueue.
-      if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) pending = notePending(pending, r.marked, { localSlug, now: now() });
+      if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) {
+        // Every local PR event invalidates memory, even if it cannot queue an immediate wake.
+        for (const mark of r.marked) {
+          const key = parseMarkKey(mark?.key);
+          if (!key || key.repo !== String(localSlug ?? '').toLowerCase()) continue;
+          // Only a PR holding a remembered decline loses its wake backoffs; untyped BLOCKED backoffs stay.
+          if (declines.delete(key.num)) { backoff.delete(key.num); missBackoff.delete(key.num); }
+        }
+        pending = notePending(pending, r.marked, { localSlug, now: now() });
+      }
     },
     /** Run due PRs now (bounded catch-up concurrency; serial events) if enabled and allowed; a no-op while a tick is already running. */
     tick() { return running && !runningCatchUpOnly ? running : startRun({}, running); },
