@@ -140,6 +140,16 @@ describe('shared checkouts correlate changes with every transcript tool update',
     expect(out.reasons).toContain('transcript malformed — escape check incomplete');
   });
 
+  it('a later update that renames the same step to run_command voids even with a valid in-lane path', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { tool_name: 'read_file', state: 'ACTIVE' }),
+      tool(join(cwd, 'file.txt'), { tool_name: 'run_command' }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('tool changed mid-step');
+  });
+
   it('opaque errored parameters alone do not imply a shared change', async () => {
     const fx = fixture();
     const out = await fx.run(undefined, () => [tool('', { status: 'TOOL_ERROR', tool_name: 'run_command', tool_info: { parameters: '{broken' } })]);
