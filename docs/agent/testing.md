@@ -2440,6 +2440,16 @@ or the admitted `npm run test:unit -- <file>` / `npm run check:standards` script
 If `run` exits 75 (host busy or queue full), do not loop: re-run it once with `run --wait-ms=540000 -- …`,
 which keeps re-trying admission itself (load gate and slot queue, holding its queue place) and still exits 75
 when the budget runs out. `heavyAdmission.runWaitMs` sets a default budget through the settings cascade.
+
+Runtime admission's spawn inventory checks the dispatch-lane `provider` boundary, where the
+card identity is still available before mechanical/agent routing. Its generic raw exec helpers
+also run read-only planner calls and trust retries; they are not separate conveyor admission
+sites. Keep the provider bypass regression when changing this inventory. Direct daemon exec
+launches remain inventoried. Prepare grouping must report excluded held candidates as well
+as exclude them from the selected group; exercise this with older planner output.
+Draft recovery must restore its prior persisted state if fresh runtime admission refuses
+after the pending-attempt write. The named regression in `build-red-draft-recovery.test.mjs`
+tightens admission during reservation and checks the rollback, no dispatch, and lease release.
 `WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
@@ -4856,6 +4866,105 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+### Builder runtime-only candidate admission
+
+`build-dispatch-runtime-only.test.mjs` drives the daemon with the real pure tick core and
+also with older planner output. Pass the once-per-tick `buildPriority` snapshot through
+`config.buildPriority`: filter new build/prepare candidates before cost admission, but keep
+the original queues for retiring existing guards. Filter the prepare group pool too: members
+are new work even when their lead is allowed. The runtime top ID obeys the configured prepare concurrency, light concurrency guard,
+and prepare-ahead window; listing it grants no additional capacity. Malformed runtime evidence holds new work and logs the
+operator fallback (repair or remove the runtime file). Lift/no-file output stays unchanged.
+
+Runtime-only build-priority regressions live in `scripts/lib/__tests__/build-priority-runtime.test.mjs`
+and `skills-src/conveyor/__tests__/build-dispatch-runtime-only.test.mjs`. Filter direct card aliases
+before dispatch lane/scope assignment; a listed ancestor lifts priority but does not grant membership.
+Keep `bornAs` and id metadata through queue projections so num-only build/prepare plans retain direct alias membership.
+The `runtime-only-assignment-and-alias` soak checks both pre-assignment filtering and
+the shared `assertRuntimeAdmitted`/`withRuntimeAdmission` boundary. Its companion test
+pins fix detection to true: removing a landed gate must not silently turn the scenario
+into an expected failure. Preserve grouped-provider refusals independently of runtime
+membership, including CI-heal: an admitted group still needs a group-capable provider.
+Runtime-only admission validates `bornAs` with the build-priority settings validator and requires a durable hash: numeric aliases never authorize another card, and a different hash never grants membership. Cover both build and prepare paths.
+
+
+## Runtime admission keeps launch groups whole
+
+At dispatch and resume spawn boundaries, admit the lead and every `groupMembers`
+entry before reserving a lane or writing session settings. A pending resume
+attempt/marker must be rolled back if the final spawn admission refuses. Refuse the whole group with `runtime-refused` evidence naming the
+refused members; never forward an admission-filtered group. Resume wrappers reload
+the original persisted group, and prompts already describe that whole group.
+The spawn inventory must reject member-dropping predicates and require an exiting
+all-members admission check. Keep the grouped-provider capability guard intact.
+`dispatch-lane-io.test.mjs` covers whole-group refusal and unchanged successful
+forwarding; `build-dispatch-orphan-adopt.test.mjs` covers persisted-group refusal
+including admission changing at the final spawn check, with unchanged claims,
+markers and attempt counts.
+
+Dispatch-lane must also re-read admission for the lead and every member immediately
+before calling the provider, after lane reservation and session/settings setup.
+`dispatch-lane-io.test.mjs` changes the allowlist during reservation and final settings
+setup, including unreadable evidence, and asserts no provider call, lane lease release,
+`runtime-refused`, and no in-flight run-store entry. Still-listed groups launch unchanged.
+
+## Runtime admission process inventory
+
+`runtime-admission-spawn-guard.test.mjs` inventories native process primitives, aliases and dispatch
+ports independently of argv shape. Each call needs an exiting admission refusal in the same function,
+or a reviewed file/function exception explaining a read, cleanup or diagnostic filing. Delivery and
+PR recovery ports are gated even when their callers already checked admission. Infra recovery scopes
+its child to the admitted card and rechecks in the child; historical dispatch contexts supply group
+membership, and unreadable context retains the recovery entry for operator repair.
+
+Infra recovery's deadline covers the whole pass, including reads and earlier retries; each child receives
+only the remaining timeout. Excess entries stay in the store and are reported as waiting for the next tick.
+A corrupt historical dispatch context refuses only that record. Keep the mixed damaged/healthy identity
+regression and the multi-entry elapsed-budget regression alongside the single-child timeout checks.
+
+Aggregate only infra recovery's six array fields; scalar error/deadline metadata must not enter the
+collection loop. Mixed error/success child responses must retain earlier results and continue recovery.
+
+
+The final runtime admission read belongs immediately at the child-process primitive,
+inside the spawner after marker/log/environment setup. Provider checks are early-outs.
+Mechanical providers are included in the spawn inventory without exceptions. Keep
+`runtime-admission.test.mjs`'s marker-read revocation cases for both lead and member,
+and its log-open revocation probe at the detached primitive. Diagnostic card filing
+uses its explicit diagnostic spawner and stays available under an empty allowlist.
+Nested boundaries carry every enclosing admitted roster and recheck it with fresh settings,
+even when the nested caller supplies only a lead. The diagnostic spawner accepts only the
+exact `scripts/operations/land-prevention-card.mjs` entry point; other targets throw
+`DiagnosticTargetError` before admission reads or IO. Delivery callers must use the gated
+spawner. Keep the lead-only nested revocation cases and diagnostic target rejection tests
+in `runtime-admission.test.mjs`, and the readonly exception's allowlist assertion in the spawn guard.
+Orphan resume pending writes must roll back on final refusal: remove the pending
+marker and restore any previous dead attempt count. The named final-refusal cases
+in `build-dispatch-orphan-adopt.test.mjs` prove a later tick sees dead work and recovers.
+
+
+## Infra recovery admission injection and watchdog isolation
+
+The watchdog reaches only `infra-retry-policy.mjs` through `branch-sync.mjs`; that leaf
+shares timing and caps without recovery IO or driver admission decisions. Keep the
+watchdog's pinned import closure independent of `infra-blocked.mjs` and runtime admission.
+The build daemon's `--infra-retry`
+entry injects the historical context reader and both shared admission functions into `runInfraBlocked` and
+`resumeOpen`. The runner retains its historical `infra-blocked.mjs retry` command; that CLI's
+main guard loads the same adapter and context reader through literal dynamic imports only when running `retry`.
+Keep the targets literal so import-closure consumers can prove the graph complete. Computed
+targets make review staleness, promotion and live-smoke checks fall back to treating all code as relevant.
+The CLI adapter-load failure regression must exit nonzero without changing recovery state;
+never fall back to recovery without admission.
+The watchdog never imports the recovery module. Direct library recovery without a
+complete adapter refuses before subprocess IO; retry through either CLI entry to restore the policy boundary.
+`infra-blocked.test.mjs` exercises the actual CLI with absent/lift runtime settings (including exact
+producer argv), an empty allowlist, and malformed settings, with subprocess and network effects stubbed.
+Preserve the named
+`withRuntimeAdmission` callback at the process primitive so the spawn inventory still
+recognizes fresh admission. `infra-blocked.test.mjs` covers absent/partial adapters;
+`runtime-admission.test.mjs` covers injected whole-group and final-read refusals;
+`driver-watchdog.test.mjs` pins the dependency closure without widening its list.
 
 ## Drain read-migration fixture imports
 
@@ -5085,3 +5194,14 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+## Soak probes after runtime admission changes
+
+Retry-bound probes must seed an infra entry, inject unrestricted fixture settings, and require the child
+to execute and report a timeout. Use the injected elapsed clock to model child duration without host-load
+timing flakes. A source detector must recognize the remaining shared deadline, and landed-fix wrappers
+must assert detection so a stale marker cannot silently switch a regression to expected-fail.
+Diagnostic filing probes retain the canonical landing target through the real target validator; substitute
+an inert child only at the OS spawn seam. Refusals and harness crashes fail the scenario even when the
+checkout remains clean. CLI golden fixtures pin both the runtime-file path and priority environment,
+and retain the additive runtime admission trace in their full-output comparison.

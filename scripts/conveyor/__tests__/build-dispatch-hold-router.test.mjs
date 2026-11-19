@@ -209,6 +209,37 @@ describe('routeHeldItems — the IO-shell orchestrator, every effect injected, a
     expect(outcomes).toEqual([{ num: '4380', route: 'already-done', action: 'already-in-flight' }]);
   });
 
+  it.each(['already-done', 'out-of-scope'])('%s: a refused spawn releases the real lease for the next tick; a true spawn keeps it', async route => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'hold-route-refused-'));
+    const entry = { num: '4380', route };
+    const reserveRoute = args => reserveHoldRoute({ ...args, lockRoot });
+    const releaseRoute = args => releaseHoldRoute({ ...args, lockRoot });
+    const run = result => routeHeldItems({ plan: [entry], reserveRoute, releaseRoute,
+      readSettings: () => ({}), spawnLand: async () => result });
+    try {
+      for (const [reason, expected] of [['runtime-only', 'runtime-refused'], ['runtime-refused', 'runtime-refused'],
+        ['capacity', 'capacity'], [undefined, 'not-spawned']]) {
+        expect(await run({ spawned: false, reason })).toEqual([{ ...entry, action: 'not-spawned', reason: expected }]);
+        expect(reserveRoute(entry).ok).toBe(true);
+        expect(releaseRoute(entry).released).toBe(true);
+      }
+      expect(await run({ spawned: true, pid: 123 })).toEqual([{ ...entry, action: 'landing-spawned' }]);
+      expect(reserveRoute(entry).ok).toBe(false);
+      expect(await run({ spawned: true })).toEqual([{ ...entry, action: 'already-in-flight' }]);
+    } finally {
+      rmSync(lockRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('a refused spawn remains not-spawned when best-effort lease release throws', async () => {
+    const outcomes = await routeHeldItems({
+      plan: [{ num: '4380', route: 'already-done' }], readSettings: () => ({}),
+      reserveRoute: () => ({ ok: true }), releaseRoute: () => { throw new Error('release failed'); },
+      spawnLand: async () => ({ spawned: false, reason: 'runtime-only' }),
+    });
+    expect(outcomes).toEqual([{ num: '4380', route: 'already-done', action: 'not-spawned', reason: 'runtime-refused' }]);
+  });
+
   it('a SYNCHRONOUSLY throwing spawn is captured per-item, never thrown past routeHeldItems, and releases '
     + 'the lease it just took (the spawn never even started — retry promptly, never wait out the full TTL)', async () => {
     const released = [];

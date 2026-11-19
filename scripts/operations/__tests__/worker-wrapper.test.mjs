@@ -15,6 +15,7 @@ import { validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
 import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../session-role.mjs';
 import { listDraftKeys } from '../worker-result-router.mjs';
+import { withRuntimeAdmission, withRuntimeAdmissionTick } from '../../lib/runtime-admission.mjs';
 import {
   MAX_AWAIT_RESUMES, RESULT_FILE_MAX_BYTES, resumeArgvFrom, resumeRequestPath, STRUCTURED_OUTPUT_SUFFIX, extractAgyResult, extractClaudeResult, launchDetached, runWorker, withStructuredOutput, workerWrapperEnabled,
 } from '../worker-wrapper.mjs';
@@ -497,6 +498,45 @@ describe('claude argv: the schema rides on fresh and resumed turns', () => {
 });
 
 describe('detached launch', () => {
+  it.each(['fix', 'ci-heal'])('revoking a persisted group member during the %s spec write refuses spawn and rolls setup back', async role => {
+    const dir = tmp();
+    const specDir = join(dir, 'specs');
+    const spawnFn = vi.fn();
+    let settings = { mode: 'only', ids: ['12', '13'] };
+    const identity = { num: '12', groupMembers: ['13'] };
+    const report = await withRuntimeAdmissionTick(() => settings, async () => withRuntimeAdmission(identity, role, () =>
+      launchDetached(spec({ role, item: '12', runtimeAdmission: identity, diagnosticsDir: dir }), {
+        specDir, spawnFn, writeSpec: (...args) => { writeFileSync(...args); settings = { mode: 'only', ids: ['12'] }; },
+      })));
+    expect(report).toMatchObject({ outcome: 'runtime-refused', spawned: false, runtimeRefused: [{ num: '13', kind: role, reason: 'runtime-only' }] });
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(existsSync(specDir)).toBe(false);
+    expect(existsSync(join(dir, 'wrapper.stderr'))).toBe(false);
+  });
+
+  it('refusal restores an existing spec and preserves existing diagnostic bytes', () => {
+    const specDir = tmp();
+    const specFile = join(specDir, 'build-4001.spec.json');
+    const stderrFile = join(specDir, 'wrapper.stderr');
+    writeFileSync(specFile, 'previous spec');
+    writeFileSync(stderrFile, 'previous diagnostic');
+    const spawnFn = vi.fn();
+    const result = launchDetached(spec({ diagnosticsDir: specDir }), { specDir, spawnFn, readRuntimeSettings: () => null });
+    expect(result).toMatchObject({ outcome: 'runtime-refused', reason: 'runtime-malformed' });
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(readFileSync(specFile, 'utf8')).toBe('previous spec');
+    expect(readFileSync(stderrFile, 'utf8')).toBe('previous diagnostic');
+  });
+
+  it('an admitted persisted group keeps the detached launch contract', () => {
+    const spawnFn = vi.fn(() => ({ pid: 4242, unref: vi.fn() }));
+    const s = spec({ runtimeAdmission: { num: '12', groupMembers: ['13'] } });
+    const result = launchDetached(s, { specDir: tmp(), spawnFn, readRuntimeSettings: () => ({ mode: 'only', ids: ['12', '13'] }) });
+    expect(result.wrapperPid).toBe(4242);
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(result.specFile, 'utf8')).runtimeAdmission).toEqual(s.runtimeAdmission);
+  });
+
   it('launchDetached spawns THIS file detached with the spec, and unrefs it', () => {
     const calls = [];
     const specDir = tmp();

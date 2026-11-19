@@ -63,14 +63,14 @@ const runReviewLoopOnce = options => driveReviewLoopOnce({
 // #4493 converge round-1 (4 of 5 jurors, independently): every existing `runReviewLoopOnce` test injects its own
 // `fileItem`, so nothing ever exercised the PRODUCTION DEFAULT wiring — the exact one-line swap
 // (`fileItem = fileItemForPreventionViaLandingJob`) this item's whole point is. Mocking only the bottom-most
-// seam (`defaultSpawnDetached`, in `../detached-dispatch.mjs`, which `prevention-landing-job.mjs` imports) lets a
+// seam (`defaultSpawnDiagnosticDetached`, in `../detached-dispatch.mjs`, which `prevention-landing-job.mjs` imports) lets a
 // test call `runReviewLoopOnce` with NO override at any layer and still prove no real subprocess/write happens.
 const { spawnDetachedCalls } = vi.hoisted(() => ({ spawnDetachedCalls: [] }));
 vi.mock('../detached-dispatch.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
-    defaultSpawnDetached: (argv, opts) => {
+    defaultSpawnDiagnosticDetached: (argv, opts) => {
       spawnDetachedCalls.push({ argv, opts });
       return { pid: 99999, on: () => {} };
     },
@@ -1123,10 +1123,10 @@ describe('runReviewLoopOnce — the mechanized branch renders a QUEUED landing j
   // #4493 converge round-1 finding (correctness/simplicity/standards-conformance/claim-accuracy, independently):
   // the wiring itself — `runReviewLoopOnce`'s DEFAULT `fileItem`, un-overridden — was the one thing no existing
   // test exercised. NO layer is injected here: `fileItem`, `spawnJob` and `logPathFor`/`resolveSettingsEnv` all
-  // resolve to their real production defaults; only `defaultSpawnDetached` (the actual `child_process.spawn`
+  // resolve to their real production defaults; only `defaultSpawnDiagnosticDetached` (the actual `child_process.spawn`
   // call) is mocked, at the module boundary declared above. This is the regression #4493 exists to close: if
   // `runReviewLoopOnce`'s default ever reverts to `fileItemForPrevention` (the in-process binding), this test
-  // reddens because NOTHING would reach `defaultSpawnDetached` at all.
+  // reddens because NOTHING would reach `defaultSpawnDiagnosticDetached` at all.
   it('with NO fileItem override anywhere, the real production wiring reaches the shared detached landing job — '
     + 'never `file-item` in process', async () => {
     spawnDetachedCalls.length = 0;

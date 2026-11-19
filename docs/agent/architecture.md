@@ -70,3 +70,18 @@ for (const injector of element.injectors()) console.log(injector.providers); // 
 const r = registry.parse('expr'); console.log(r.success, r.expressions, r.remaining); // parser
 ```
 Subclass `CustomAttribute` and log in `connectedCallback`/`disconnectedCallback` to trace lifecycle.
+
+
+## Runtime delivery launch admission
+
+Every gated delivery process or injected launch port runs inside the effect callback of
+`scripts/lib/runtime-admission.mjs#withRuntimeAdmission(cardOrGroup, kind, effect, options)`.
+Pass the complete persisted `groupMembers` roster through projections and recovery payloads.
+The wrapper reads fresh settings once for the entire group and returns
+`outcome: runtime-refused` without invoking the effect if any identity is excluded or
+membership evidence is malformed. Retain the work for a later tick; malformed evidence
+requires operator repair. Nested ports inherit the settings reader, never a snapshot.
+Keep preflight checks only for reservation, state-release, or early-refusal behavior;
+they cannot authorize a later process launch. `withRuntimeAdmissionTick` owns tick reporting.
+The AST spawn guard requires launches inside the wrapper's effect and rejects lead-only
+object projections; read-only process exceptions are explicit and checked for staleness.

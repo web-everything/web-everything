@@ -7,12 +7,14 @@
  *   mark bumps + reschedules, and the lane-detail derive matches the shape status-board reads. The atomic fs
  *   roundtrip is exercised at the boundary; the live gh/network/pr-land driver is the IO shell (not unit-tested).
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { collectImportClosure } from '../../lib/import-closure.mjs';
+import * as retryPolicy from '../infra-retry-policy.mjs';
 import {
   classifyPrOpenFailure,
   correlateCause,
@@ -40,6 +42,7 @@ import {
   DEFAULT_REFUSAL_INTERVAL_MS,
   DEFAULT_MAX_REFUSALS,
   resumeShaDecision,
+  resumeOpen,
 } from '../infra-blocked.mjs';
 
 const T0 = Date.parse('2026-07-24T00:00:00.000Z');
@@ -549,4 +552,117 @@ describe('infra-blocked source guards — resume never strands work and never me
     // execFileSync throws on pr-land's non-zero exit (red/timeout); the catch still reads a pr number off stdout.
     expect(src).toMatch(/if \(res\.pr != null\) return \{ ok: true/);
   });
+});
+
+
+describe('infra recovery requires an injected runtime admission adapter', () => {
+  it.each([undefined, {}, { assertRuntimeAdmitted: () => ({ admitted: true }) }, { withRuntimeAdmission: (_card, _kind, effect) => effect() }])(
+    'refuses missing or incomplete adapter %j before any subprocess', admission => {
+      const exec = vi.fn();
+      expect(resumeOpen({ num: '12', ref: 'lane/12', sha: 'a'.repeat(40) }, { admission, exec }))
+        .toMatchObject({ ok: false, refused: true, reason: 'runtime admission adapter missing',
+          detail: expect.stringContaining('Retry through the build daemon') });
+      expect(exec).not.toHaveBeenCalled();
+    });
+});
+
+describe('infra-blocked retry CLI supplies runtime admission', () => {
+  it('keeps both CLI admission dependencies in a complete static closure', () => {
+    const closure = collectImportClosure({ root: process.cwd(), entries: ['scripts/conveyor/infra-blocked.mjs'] });
+    expect(closure?.complete).toBe(true);
+    for (const file of ['scripts/lib/runtime-admission.mjs', 'scripts/operations/build-pr-authorship.mjs']) {
+      expect(closure.files.has(file), file).toBe(true);
+    }
+    // Preserve the public API while the watchdog uses the same implementation
+    // through the policy leaf, without reaching recovery or driver decisions.
+    expect(backoffMs).toBe(retryPolicy.backoffMs);
+    expect(retryDecision).toBe(retryPolicy.retryDecision);
+  });
+
+  it('fails closed before recovery when the admission adapter cannot load', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'infra-cli-load-failure-'));
+    try {
+      const loader = join(dir, 'loader.mjs');
+      const store = join(dir, 'infra.json');
+      const original = JSON.stringify(recordInfraBlock([], {
+        num: '12', ref: 'lane/12', sha: 'a'.repeat(40), body: 'Recorded body',
+      }, T0));
+      writeFileSync(store, original);
+      writeFileSync(loader, `
+        export async function resolve(specifier, context, nextResolve) {
+          if (specifier.endsWith('/runtime-admission.mjs')) throw new Error('adapter load denied');
+          return nextResolve(specifier, context);
+        }
+      `);
+      const result = spawnSync(process.execPath, ['--experimental-loader', loader,
+        join(process.cwd(), 'scripts/conveyor/infra-blocked.mjs'), 'retry'], {
+        encoding: 'utf8', timeout: 15_000,
+        env: { ...process.env, CONVEYOR_INFRA_FILE: store },
+      });
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain('infra-blocked: adapter load denied');
+      expect(result.stdout).toBe('');
+      expect(readFileSync(store, 'utf8')).toBe(original);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 20_000);
+
+  it.each(['absent', 'lift', 'only', 'malformed'])(
+    'preserves the resume command when unrestricted and refuses restricted recovery (%s)', mode => {
+      const dir = mkdtempSync(join(tmpdir(), 'infra-cli-admission-'));
+      try {
+        const store = join(dir, 'infra.json');
+        const runtime = join(dir, 'runtime.json');
+        const calls = join(dir, 'calls.jsonl');
+        const preload = join(dir, 'preload.mjs');
+        const sha = 'a'.repeat(40);
+        writeFileSync(store, JSON.stringify(recordInfraBlock([], {
+          num: '12', ref: 'lane/12', sha, body: 'Recorded body',
+        }, T0)));
+        if (mode !== 'absent') writeFileSync(runtime, mode === 'malformed' ? '{' : JSON.stringify({
+          mode, ids: [], at: new Date().toISOString(), setBy: 'test', ttlHours: 24,
+        }));
+        // Exercise the real CLI bootstrap and policy reads while keeping every
+        // network/subprocess effect hermetic, including unexpected commands.
+        writeFileSync(preload, `
+          import cp from 'node:child_process';
+          import { syncBuiltinESMExports } from 'node:module';
+          import { appendFileSync } from 'node:fs';
+          globalThis.fetch = async () => ({ ok: true, json: async () => ({ status: { indicator: 'none' } }) });
+          cp.execFileSync = (command, args) => {
+            appendFileSync(${JSON.stringify(calls)}, JSON.stringify([command, args]) + '\\n');
+            if (command === 'git' && args[0] === 'remote') return 'https://github.com/test/repo.git';
+            if (command === 'git' && args[0] === 'fetch') return '';
+            if (command === 'git' && args[0] === 'rev-parse') return ${JSON.stringify(sha)};
+            if (command === 'node' && args[0].endsWith('/scripts/pr-land.mjs')) return '{"pr":77}';
+            throw new Error('Unexpected subprocess: ' + command + ' ' + JSON.stringify(args));
+          };
+          syncBuiltinESMExports();
+        `);
+        const result = spawnSync(process.execPath, ['--import', preload,
+          join(process.cwd(), 'scripts/conveyor/infra-blocked.mjs'), 'retry'], {
+          encoding: 'utf8', timeout: 15_000,
+          env: { ...process.env, WE_BUILD_PRIORITY: '', CONVEYOR_INFRA_FILE: store,
+            WE_BUILD_PRIORITY_RUNTIME_FILE: runtime },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        const report = JSON.parse(result.stdout);
+        const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
+        if (mode === 'absent' || mode === 'lift') {
+          expect(report.resumed).toEqual([{ num: '12', pr: 77 }]);
+          const publish = commands.filter(([command]) => command === 'node');
+          expect(publish).toHaveLength(1);
+          expect(publish[0][1]).toEqual([
+            join(process.cwd(), 'scripts/pr-land.mjs'), '--ref=lane/12', `--sha=${sha}`, '--base=main',
+            '--label-on-green', '--no-require-verified', '--json',
+            expect.stringMatching(/^--body-file=/),
+          ]);
+          expect(readInfraStore(store)).toEqual([]);
+        } else {
+          expect(report.failed).toEqual([expect.objectContaining({ num: '12', refused: true,
+            reason: mode === 'only' ? 'runtime-only' : 'runtime-malformed' })]);
+          expect(commands.every(([command, args]) => command === 'git' && args[0] === 'remote')).toBe(true);
+          expect(readInfraStore(store)).toHaveLength(1);
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }, 20_000);
 });

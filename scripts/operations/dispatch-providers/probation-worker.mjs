@@ -1,3 +1,4 @@
+import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/dispatch-providers/probation-worker.mjs
  * @description THE PROBATION-WORKER DISPATCH PROVIDER (agy-launcher-probation, operator 2026-09-27) — runs an
@@ -173,7 +174,12 @@ export function probationWorkerDetachedProvider(request, {
   }
   let child;
   try {
-    child = spawnDetached(argv, { cwd: request?.cwd ?? REPO_ROOT, logPath: attempt?.logPath ?? logPathFor(sessionSlug), settingsEnv: request?.settingsEnv });
+    const spawnOptions = { cwd: request?.cwd ?? REPO_ROOT, logPath: attempt?.logPath ?? logPathFor(sessionSlug), settingsEnv: request?.settingsEnv, card: request };
+    child = withRuntimeAdmission(request, request?.launchKind ?? 'build', () => spawnDetached(argv, spawnOptions));
+    if (child?.outcome === 'runtime-refused') {
+      if (attempt) failAttempt(attempt.attemptId, 'runtime admission refused before wrapper spawn');
+      return child;
+    }
   } catch (error) {
     // A throw here means no wrapper exists, so the row begun above would otherwise stay handle-less and hold the
     // PR's CI-heal forever (#3577 review). Settling is best-effort: it must never mask the launch error itself.

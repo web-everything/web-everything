@@ -27,7 +27,7 @@
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -42,6 +42,7 @@ import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 import { withCodexUsage } from '../lib/codex-usage-ledger.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { markWorkerEnv } from './session-role.mjs';
+import { withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 
 /** The knob. `WE_WORKER_WRAPPER=on` routes a migrated launcher through this wrapper; anything else is the old path, byte for byte. */
 export const WORKER_WRAPPER_ENV = 'WE_WORKER_WRAPPER';
@@ -569,22 +570,36 @@ export function preserveLegacyWords(envelope, legacy) {
  * wrapper process; the v2 record's `pid` is the WORKER child the wrapper then spawns (a different process).
  * @returns {{wrapperPid: number, specFile: string}}
  */
-export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url) } = {}) {
+export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url), writeSpec = writeFileSync, readRuntimeSettings } = {}) {
   if (!specDir) throw new TypeError('operations: launchDetached needs specDir');
   if (!isValidSessionSlug(spec?.session)) throw new TypeError(`operations: launchDetached: invalid session slug ${JSON.stringify(spec?.session)}`);
+  const hadSpecDir = existsSync(specDir);
   mkdirSync(specDir, { recursive: true, mode: 0o700 });
   const specFile = join(specDir, `${spec.session}.spec.json`);
+  const previousSpec = existsSync(specFile) ? readFileSync(specFile) : null;
+  const stderrFile = spec.diagnosticsDir ? join(spec.diagnosticsDir, 'wrapper.stderr') : null;
+  const hadStderr = stderrFile ? existsSync(stderrFile) : false;
   // The spec file never carries `env` (it can hold tokens): the detached child inherits the launcher's environment
   // instead, with a static GH_TOKEN stripped and the worker marker set (the worker it spawns is sanitised again in runWorker).
   // Owner-only permissions; the child deletes it once read.
   const { env: _env, ...safe } = spec;
-  writeFileSync(specFile, `${JSON.stringify({ ...safe, specDir })}\n`, { mode: 0o600 });
+  writeSpec(specFile, `${JSON.stringify({ ...safe, specDir })}\n`, { mode: 0o600 });
   let stderrFd;
   let child;
   try {
-    if (spec.diagnosticsDir) stderrFd = openSync(join(spec.diagnosticsDir, 'wrapper.stderr'), 'a', 0o600);
-    child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: stderrFd === undefined ? 'ignore' : ['ignore', 'ignore', stderrFd], env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) });
+    if (stderrFile) stderrFd = openSync(stderrFile, 'a', 0o600);
+    const argv = [entry, `--spec=${specFile}`];
+    const opts = { detached: true, stdio: stderrFd === undefined ? 'ignore' : ['ignore', 'ignore', stderrFd], env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) };
+    child = withRuntimeAdmission(spec.runtimeAdmission ?? { num: spec.item, groupMembers: spec.groupMembers }, spec.role ?? 'build',
+      () => spawnFn(nodePath, argv, opts), { readSettings: readRuntimeSettings });
   } finally { if (stderrFd !== undefined) closeSync(stderrFd); }
+  if (child?.outcome === 'runtime-refused') {
+    if (previousSpec === null) rmSync(specFile, { force: true });
+    else writeFileSync(specFile, previousSpec);
+    if (stderrFile && !hadStderr) rmSync(stderrFile, { force: true });
+    if (!hadSpecDir) rmdirSync(specDir);
+    return child;
+  }
   child.unref?.();
   return { wrapperPid: child.pid, specFile };
 }

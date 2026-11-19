@@ -150,6 +150,7 @@
 import { planningRead, PLANNING_SNAPSHOT_ENV } from '../lib/planning-snapshot.mjs';
 import { childFailure } from '../lib/child-failure.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
+import { decideRuntimeAdmission, readBuildPrioritySettings } from '../lib/build-queue.mjs';
 import { normNum } from './queue-store.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -1278,6 +1279,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     .map(([num, timestamps]) => [num, recentPrepareRefusals(timestamps, refusalNow)])
     .filter(([, timestamps]) => timestamps.length > 0));
   const { queue = [], unshaped = [], needsSlice = [], decisions = [], lanes = [], prs = [], health = {}, infraBlocked = [] } = state;
+  const selectBeforeAssignment = (rows, settings) => rows.filter(row => decideRuntimeAdmission({ ...queue.find(c => normNum(c.num) === normNum(row.num)), ...row }, 'prepare', settings).admitted);
   // #3567 — the `needs-investigation` holds, read straight off THIS TICK's dispatch plan (not off `state`, the
   // way `unshaped`/`decisions` are): an investigation has no separate state-derivation step (no `prepared`
   // flag to persist), so a freshly-clearable SPAWN candidate is simply "held `needs-investigation` this tick"
@@ -1351,17 +1353,24 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   });
   // Evaluate refusal skips against LIVE guards, then exclude them before taking the prepare-ahead window.
   const prepareGuardNums = new Set(prepare.live.map(g => normNum(g.num)));
-  const prepareCandidates = (Array.isArray(plan.held) ? plan.held : [])
-    .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale' || (prepareAutoSize && h.reason === 'no-size')) && h.num != null);
+  const runtimeFilteredBuild = new Set(), runtimeFilteredPrepare = new Set();
+  const runtimeCandidates = (rows, removed) => {
+    const kept = selectBeforeAssignment(rows, config.buildPriority);
+    const nums = new Set(kept.map(r => normNum(r.num)));
+    for (const row of rows) if (!nums.has(normNum(row.num))) removed.add(normNum(row.num));
+    return kept;
+  };
+  const prepareCandidates = runtimeCandidates((Array.isArray(plan.held) ? plan.held : [])
+    .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale' || (prepareAutoSize && h.reason === 'no-size')) && h.num != null), runtimeFilteredPrepare);
   const refusalNotes = prepareCandidates.filter(h => !prepareHeld.has(normNum(h.num)))
     .map(h => prepareRefusalSkipNote(h.num, prepareRefusals, prepareGuardNums, prs, refusalNow)).filter(Boolean);
   const refusalSkippedNums = new Set(refusalNotes.map(note => normNum(note.num)));
   const eligiblePrepareCandidates = prepareCandidates.filter(h => !refusalSkippedNums.has(normNum(h.num)));
   const prepareWindow = prepareAheadNums({
-    queue, launch: plan.launch,
+    queue: selectBeforeAssignment(queue, config.buildPriority), launch: selectBeforeAssignment(plan.launch ?? [], config.buildPriority),
     held: prepareAutoSize && Array.isArray(plan.held)
-      ? plan.held.map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
-      : plan.held,
+      ? selectBeforeAssignment(plan.held, config.buildPriority).map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
+      : selectBeforeAssignment(plan.held ?? [], config.buildPriority),
     window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
     skip: [...prepareHeld, ...refusalSkippedNums],
   });
@@ -1443,7 +1452,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   const buildLive = [...build.live, ...durableBuildGuards];
 
   // 2. FILTER plan.launch through the live build guard (num OR lane), then record a guard per new build.
-  const guardFiltered = filterLaunches(plan.launch, buildLive);
+  const guardFiltered = filterLaunches(runtimeCandidates(plan.launch ?? [], runtimeFilteredBuild), buildLive);
   // #xupukxa — DEFENSE IN DEPTH: dispatch-plan.mjs already caps `plan.launch` against the concurrency ceiling
   // using its OWN, separately-read active-lease count; re-cap here against `lanes.length` (THIS tick's own
   // active-lane read) so a stale plan or a lease-count race between the two subprocess reads can never let
@@ -1573,9 +1582,9 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   //    straight to `planPrepareSpawns`, so a held kind short-circuits at its OWN `dispatch-paused` admission gate
   //    (traced, #xupukxa) and consumes no lane — an UNHELD sibling kind still gets the lanes it would have had.
   const prepareArgs = {
-    unshaped: scopeOrSizeNeeded,
-    decisions,
-    investigations,
+    unshaped: runtimeCandidates(scopeOrSizeNeeded, runtimeFilteredPrepare),
+    decisions: runtimeCandidates(decisions, runtimeFilteredPrepare),
+    investigations: runtimeCandidates(investigations, runtimeFilteredPrepare),
     needsPrepare: needsPrepareHeld,
     prepareHeldNums: [...prepareHeld],
     prs,
@@ -1820,6 +1829,9 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   }).building;
 
   const decisionsOut = {
+    ...((config.buildPriority?.only || config.buildPriority?.held) ? { runtimeOnly: {
+      filteredBuild: [...runtimeFilteredBuild], filteredPrepare: [...runtimeFilteredPrepare],
+    } } : {}),
     // Carry the planner's evidence verbatim; a reporter must never reconstruct its gates.
     admission: {
       queue,
@@ -2320,6 +2332,7 @@ async function main(argv) {
 
   // epic #3383 — dispatchPausedKinds carries the manual-pause marker's KIND SCOPE through verbatim (`null` =
   // blanket pause); dropping it here would silently re-widen a scoped pause back to holding all six kinds.
+  config.buildPriority = readBuildPrioritySettings();
   const out = planTick({ state, plan, freeLanes, bookkeeping, signals, prRearmCounts, prCiHealCounts, prCiHealRefunds, admission, liveAgentSessions, config, now: Date.now(), lastOperatorTurn, dispatchPaused, dispatchPausedKinds, dispatchPausedReason, loadAdmission, queueAdmission, itemSizes });
   // Always expose the observed phase costs, including in the builder log; the pure decision is unchanged.
   out.decisions.timings = timings;

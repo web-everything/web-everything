@@ -1,3 +1,4 @@
+import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
@@ -1405,7 +1406,7 @@ export function reserveBuildLane(payload, { enabled = process.env.WE_DISPATCH_RE
   const argv = ['scripts/lane-pool.mjs', 'acquire', `--lane=${lane}`, '--purpose=conveyor-delivery', `--session=${session}`,
     ...(scope ? [`--scope=${scope}`] : []), ...(payload?.num != null ? [`--item=${payload.num}`] : [])];
   try {
-    run('node', argv, { cwd: root, env: { ...env, LANE_SESSION: session }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 });
+    requireRuntimeLaunch(withRuntimeAdmission(payload, payload?.launchKind ?? 'build', () => run('node', argv, { cwd: root, env: { ...env, LANE_SESSION: session }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 })));
   } catch (e) {
     const why = String(e?.stderr || e?.message || e).replace(/\s+/g, ' ').slice(0, 240);
     throw notApplied(`lane-reserve-failed: lane-${lane} could not be reserved before launch for #${payload?.num ?? '?'} — ${why}`, { sessionId: session });
@@ -1505,7 +1506,9 @@ export function releaseReservedLane(reservation, { run = execFileSync, root = RE
 export function createDispatchSinks({
   root = REPO_ROOT,
   exec = execFileSync,
-  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts, { exec }),
+  spawnAgent = (argv, opts, card) => {
+    return requireRuntimeLaunch(withRuntimeAdmission(card, card?.launchKind ?? 'build', () => defaultSpawnAgent(argv, opts, { exec, card, readRuntimeSettings }), { readSettings: readRuntimeSettings }));
+  },
   // #3645/#3906 — EVERY REGISTERED KIND'S MODE, read from the environment ONCE, here, at sink-construction
   // time rather than per dispatch, so one tick cannot straddle two modes. Every row defaults to `agent` on main
   // (see `dispatch-provider-registry.mjs`), so an unset environment keeps every kind on `claude --bg`.
@@ -1520,9 +1523,13 @@ export function createDispatchSinks({
   // agy-launcher-probation — `on`/`off`, read ONCE here like `modes` (see `probationLaunchFromEnv`).
   probationLaunch = probationLaunchFromEnv(),
   providerAvailable = dispatchProviderAvailable,
-  provider = (request) => routeDispatchProvider(request, {
-    modes, registry, scriptExists, providerAvailable, agent: (r) => defaultClaudeProvider(r, { spawnAgent }), probationLaunch,
-  }),
+  provider = (request) => {
+    return requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => routeDispatchProvider(request, {
+      modes, registry, scriptExists, providerAvailable, agent: (r) => {
+        return requireRuntimeLaunch(withRuntimeAdmission(r, r?.launchKind ?? 'build', () => defaultClaudeProvider(r, { spawnAgent }), { readSettings: readRuntimeSettings }));
+      }, probationLaunch,
+    }), { readSettings: readRuntimeSettings }));
+  },
   mintSessionId = () => randomUUID(),
   now = () => new Date(),
   // x87v3ed — see {@link reserveBuildLane}. Injectable so a test can assert the order without a real lane pool.
@@ -1564,7 +1571,7 @@ export function createDispatchSinks({
   // file + `--settings` env, the `claude --bg` spawn env, the worker-wrapper env), instead of this process's own.
   // A read-only dispatcher (health-watch is `observer`) passes `{ ...process.env, WE_GITHUB_APP_ROLE: 'worker' }`
   // for a session that must write; process.env itself is never touched. `null` keeps every path byte-identical.
-  spawnEnv = null,
+  spawnEnv = null, readRuntimeSettings,
 } = {}) {
   return {
     // #4349 — `ctx` (`{key, runId, ...}`, from `effect-executor.mjs#applyPendingEffects`'s per-sink call) was
@@ -1574,6 +1581,19 @@ export function createDispatchSinks({
     // the two new `request` fields below, so this is additive-only.
     [DISPATCH_EFFECT]: async (payload, ctx = {}) => {
       assertNotALaneCheckout(root);
+      const runtimeRefused = [];
+      const admission = assertRuntimeAdmitted(payload, payload?.launchKind ?? 'build', { readSettings: readRuntimeSettings });
+      if (!admission.admitted) runtimeRefused.push({ num: String(payload?.num), kind: payload?.launchKind ?? 'build', reason: admission.reason });
+      const groupMembers = payload?.groupMembers ?? [];
+      const allMembersAdmitted = groupMembers.map(member => {
+        const kind = payload?.launchKind?.startsWith('prepare') ? 'prepare' : 'build';
+        const admission = assertRuntimeAdmitted({ num: member }, kind, { readSettings: readRuntimeSettings });
+        if (!admission.admitted) runtimeRefused.push({ num: String(member), kind, reason: admission.reason });
+        return admission.admitted;
+      }).every(Boolean);
+      if (!admission.admitted) throw notApplied(admission.reason, { outcome: 'runtime-refused', runtimeRefused });
+      if (!allMembersAdmitted) throw notApplied('runtime admission refused group', { outcome: 'runtime-refused', runtimeRefused });
+
       // #3168 — the loudest point in the whole path: right before the agent is actually spawned into the
       // fail-open lane, printed to THIS process's own stderr rather than left to surface only in the eventual
       // agent's own `acquire` stdout (which nobody here is watching). `payload.occupancyWarning` is `null` for
@@ -1612,7 +1632,7 @@ export function createDispatchSinks({
       let wrappedPid = null;
       let handle;
       try {
-        handle = await provider({
+        const request = {
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
           reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
@@ -1665,7 +1685,8 @@ export function createDispatchSinks({
           // (via `ensureWorktreeIsolation` above) the same durable settings.local.json this dispatch's cwd
           // already carries the gh-shim env/lane-grant overrides in.
           worktreeSettings,
-        });
+        };
+        handle = await requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => provider(request), { readSettings: readRuntimeSettings }));
       } catch (e) {
         // x87v3ed — a launch that definitely started nothing hands its reserved lane back; an INDETERMINATE one
         // (below) keeps it, because a session may be running in it.
@@ -1833,10 +1854,10 @@ export function routeDispatchProvider(request, {
   }
   const launchAgent = r => {
     if (grouped) throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
-    return agent(r);
+    return requireRuntimeLaunch(withRuntimeAdmission(r, r?.launchKind ?? 'build', () => agent(r)));
   };
   if (kind === 'build' && request.operatorPostBuild) {
-    return launchAgent({ ...request, probationWorker: null, policyRoute: null });
+    return requireRuntimeLaunch(withRuntimeAdmission(request, kind, () => launchAgent({ ...request, probationWorker: null, policyRoute: null })));
   }
   // A probation worker's checker runs inside the same detached arc, so its executable is owed before launch too.
   const checkerAvailable = worker => !worker?.checker || providerAvailable(worker.checker, { provider: worker.checker });
@@ -1870,29 +1891,29 @@ export function routeDispatchProvider(request, {
     if (chosen !== candidates[0]) console.error(`routing-policy-fallback: ${kind} → ${chosen.provider}/${chosen.model} (primary adapter unavailable)`);
     if (chosen.provider === 'claude') {
       request = { ...request, probationWorker: null, table: { model: chosen.model, effort: chosen.effort, tier: Object.entries(CLAUDE_NATIVE_MODEL_BY_TIER).find(([, id]) => id === chosen.model)?.[0] ?? null, reason: 'routing-policy' } };
-      return launchAgent(request);
+      return requireRuntimeLaunch(withRuntimeAdmission(request, kind, () => launchAgent(request)));
     }
     // Only a proven pre-launch refusal may advance the cascade. An indeterminate launch
     // stops here: another worker could otherwise race the first one in the same lane.
     const launch = () => {
       if (probationLaunchDecision(request, probationLaunch).launch) {
         if (grouped && kind !== 'prepare-item') throw notApplied('dispatch-lane: grouped probation requests require prepare-item');
-        return probation(request);
+        return requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => probation(request)));
       }
       if (grouped && kind !== 'build') throw notApplied('dispatch-lane: grouped preparation requires the probation prepare provider');
-      return registry[kind].provider({ ...request, probationWorker: null });
+      return requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => registry[kind].provider({ ...request, probationWorker: null })));
     };
     try { return launch(); } catch (error) {
       if (!error?.notApplied) throw error;
       const remaining = candidates.slice(candidates.indexOf(chosen) + 1);
       if (!remaining.length) throw error;
       console.error(`routing-policy-retry: ${kind} after definite pre-launch refusal of ${chosen.provider}/${chosen.model}`);
-      return routeDispatchProvider({ ...request, policyRoute: { ...remaining[0], fallback: remaining.slice(1), ...(vetoes.length ? { vetoes } : {}) },
+      return requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => routeDispatchProvider({ ...request, policyRoute: { ...remaining[0], fallback: remaining.slice(1), ...(vetoes.length ? { vetoes } : {}) },
         probationWorker: workerFor(remaining[0]) }, {
         modes, registry, agent, scriptExists, probationLaunch, probation, providerAvailable,
         // The resolved retry array is already expanded; never restart the primary on recursion.
         resolveCodexRoute: () => ({ ...remaining[0], retry: remaining.slice(1).filter(r => r.provider === 'codex') }),
-      });
+      })));
     }
   }
   // agy-launcher-probation — FIRST: an opened, non-critical ci-heal the router gave a probation worker runs on that
@@ -1918,7 +1939,7 @@ export function routeDispatchProvider(request, {
     if (!scriptExists(runScript)) {
       throw notApplied(`dispatch-lane: the probation launcher ${runScript} is not in this checkout — refusing before any process starts`);
     }
-    return probation(request);
+    return requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => probation(request)));
   }
   const entry = dispatchProviderEntry(kind, registry);
   if (entry && modes?.[kind] === 'mechanical') {
@@ -1929,10 +1950,10 @@ export function routeDispatchProvider(request, {
         + `script ${entry.runScript} is not in this checkout — refusing before any process starts`,
       );
     }
-    return entry.provider(request);
+    return requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => entry.provider(request)));
   }
   request.reportModel?.(request.table?.model ?? null);
-  return launchAgent(request);
+  return requireRuntimeLaunch(withRuntimeAdmission(request, kind, () => launchAgent(request)));
 }
 
 /**
@@ -1951,12 +1972,16 @@ export function routeDispatchProvider(request, {
  * @returns {string}
  */
 export function defaultClaudeProvider(request, {
-  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts),
+  spawnAgent = (argv, opts, card) => {
+    return requireRuntimeLaunch(withRuntimeAdmission(card, card?.launchKind ?? 'build', () => defaultSpawnAgent(argv, opts, { card })));
+  },
   // 117 S3b (D7 FINAL) — a fix / ci-heal launched here runs to completion through the detached worker wrapper instead
   // of `claude --bg` (same argv, `-p` + `--json-schema`, a v2 completion record). `false` keeps the old spawn exactly.
   wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
   launchWrapped = launchWrappedClaudeWorker,
 } = {}) {
+  // Preserve the early refusal before brief validation and session bookkeeping.
+  if (!assertRuntimeAdmitted(request, request?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
   if (request?.groupMembers?.length) {
     throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
   }
@@ -2014,15 +2039,16 @@ export function defaultClaudeProvider(request, {
   request.reportEffort?.(argv.find(arg => arg.startsWith('--effort='))?.slice(9) ?? argv[argv.indexOf('--effort') + 1]);
   const kind = String(request.launchKind || 'build');
   if (wrapKind(kind)) {
-    const launched = launchWrapped({
+    const launched = requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => launchWrapped({
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
-    });
+      runtimeAdmission: { num: request.num, bornAs: request.bornAs, id: request.id, groupMembers: request.groupMembers },
+    })));
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;
   }
-  const stdout = String(spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }) ?? '');
+  const stdout = String(requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }, request))) ?? '');
   return parseBackgroundedId(stdout) || request.sessionId;
 }
 
@@ -2049,11 +2075,11 @@ export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
  *
  * @param {string[]} argv
  * @param {object} [opts]
- * @param {{exec?: Function, grantTrust?: (dir: string) => void}} [io] - injected ONLY so the opts (and the
+ * @param {{exec?: Function, grantTrust?: (dir: string) => void, card?: object, readRuntimeSettings?: Function}} [io] - admission identity/settings and injected opts (and the
  *   retry) can be asserted.
  * @returns {string}
  */
-export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust } = {}) {
+export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust, card = {}, readRuntimeSettings } = {}) {
   const execOpts = {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL',
     // #x8mpubm follow-up (live-caught 2026-09-24) — this call inherits `process.env` unless told otherwise,
@@ -2070,12 +2096,15 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     // GH_TOKEN env `sanitizeSpawnEnv` returns is what gets marked, so neither guard undoes the other's work.
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   };
+  const launchAttempt = () => {
+    return requireRuntimeLaunch(withRuntimeAdmission(card, card?.launchKind ?? 'build', () => exec('claude', argv, execOpts), { readSettings: readRuntimeSettings }));
+  };
   try {
-    return exec('claude', argv, execOpts);
+    return launchAttempt();
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
     try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
-    return exec('claude', argv, execOpts);
+    return launchAttempt();
   }
 }
 
@@ -2105,10 +2134,11 @@ export function workerSpawnEnv(env = process.env) {
  * @returns {Promise<{stdout: string, stderr: string, resourceUsage: object|null}>}
  */
 export function spawnAgentToCompletion(argv, opts = {}, io = {}) {
-  return spawnToCompletion('claude', argv, {
+  const card = io.card ?? {};
+  return requireRuntimeLaunch(withRuntimeAdmission(card, card?.launchKind ?? 'build', () => spawnToCompletion('claude', argv, {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
-  }, io);
+  }, io)));
 }
 
 /** The dispatched agent's own standing identity, appended as a system prompt (#xqyyoje) — see the file's own
@@ -3529,4 +3559,11 @@ export function defaultListAgents({ exec = execFileSync, env = process.env, all 
     env,
   }) });
   return JSON.parse(String(out || '[]'));
+}
+
+// Preserve the dispatch IO contract: the launch wrapper returns refusal data; sinks
+// translate it to definite-not-started so their existing lease cleanup still runs.
+function requireRuntimeLaunch(result) {
+  if (result?.outcome === 'runtime-refused') throw notApplied('runtime admission refused: ' + result.reason, result);
+  return result;
 }

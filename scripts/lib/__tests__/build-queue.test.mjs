@@ -336,7 +336,7 @@ describe('#4355 build-queue --json clearance through a JIT-number rename (bornAs
       expect(out.cleared).toBe(1);
       expect(out.sidecar).toMatchObject({ entries: 1 });
       const row = out.queue.find((r) => String(r.num) === '9201');
-      expect(row).toMatchObject({ buildQueued: true, queuedAt: addedAt });
+      expect(row).toMatchObject({ buildQueued: true, queuedAt: addedAt, bornAs: 'x34h6a2' });
       expect(out.queue.find((r) => String(r.num) === '9202').buildQueued).toBe(false);
       // the cleared card is the builder's pick even though the uncleared one has a higher delivery class
       expect(String(run('--next').next.num)).toBe('9201');

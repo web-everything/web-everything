@@ -11,9 +11,10 @@
  *   - pid dead, no output                  → failure `launch-died`
  */
 import { spawn as nodeSpawn } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
+import { withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 
 export const LAUNCH_TIMEOUT_MS = 15 * 60_000;
 export const PENDING_LAUNCHES_DIRNAME = 'build-dispatch-launches';
@@ -22,18 +23,26 @@ const safe = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, '_');
 const recordPath = (root, id) => join(root, `${id}.pending.json`);
 
 /** Spawn `node <argv>` detached, stdout/stderr to files, and persist the pending record. Never waits. */
-export function startDetachedLaunch({ root, num, kind, base = null, attempt = new Date().toISOString(), argv, env, cwd, workDir, spawn = nodeSpawn, now = Date.now }) {
+export function startDetachedLaunch({ root, num, kind, runtimeAdmission, base = null, attempt = new Date().toISOString(), argv, env, cwd, workDir, spawn = nodeSpawn, now = Date.now }) {
+  const hadRoot = existsSync(root);
   mkdirSync(root, { recursive: true });
   const id = `${safe(num)}-${safe(kind)}-${safe(attempt)}`;
   const outFile = join(root, `${id}.out`);
   const errFile = join(root, `${id}.err`);
+  const previous = [outFile, errFile].map(file => existsSync(file) ? readFileSync(file) : null);
   const out = openSync(outFile, 'w');
   const err = openSync(errFile, 'w');
   let child;
   try {
-    child = spawn('node', argv, { cwd, env, detached: true, stdio: ['ignore', out, err] });
+    const opts = { cwd, env, detached: true, stdio: ['ignore', out, err] };
+    child = withRuntimeAdmission(runtimeAdmission ?? { num }, kind, () => spawn('node', argv, opts));
     child.unref?.();
   } finally { closeSync(out); closeSync(err); }
+  if (child?.outcome === 'runtime-refused') {
+    [outFile, errFile].forEach((file, i) => previous[i] === null ? rmSync(file, { force: true }) : writeFileSync(file, previous[i]));
+    if (!hadRoot) rmdirSync(root);
+    return child;
+  }
   const record = { id, num: String(num), kind, base, attempt, pid: child?.pid ?? null, startedAt: new Date(now()).toISOString(), outFile, errFile, workDir: workDir ?? null };
   writeFileSync(recordPath(root, id), JSON.stringify(record), { mode: 0o600 });
   return record;

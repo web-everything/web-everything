@@ -22,13 +22,16 @@
  * SEPARATE process whose own cwd IS the daemon clone (`w.simCloneRoot`) — exactly how a real dispatched
  * session's Bash tool invokes `review-set-label.mjs`. A harmless `runScript` override
  * (`fixtures/prevention-card-noop-job.mjs`) stands in for the real landing job, so the fixed code's genuine
- * `defaultSpawnDetached` spawn still runs for real but stays inert, rather than actually acquiring a lane in
+ * detached primitive still runs for real but stays inert, rather than actually acquiring a lane in
  * the background (that full arc is `land-prevention-card.test.mjs`'s own, separate, regression). The sim
  * world's own `we` template ships no `backlog/` directory at all (nothing else in this harness needs one), so
  * this scenario seeds and commits an empty one FIRST — otherwise `file-item`'s `read` step (a plain
  * `readdirSync`) refuses at `scandir ENOENT` before ever reaching a write, which would mask the very incident
  * this break exists to reproduce (verified while building this break: without a seeded `backlog/`, BOTH the
  * pre-fix and post-fix code read as innocently GREEN, for two entirely different, wrong reasons).
+ *
+ * The current diagnostic-only primitive validates its canonical target before the fixture substitutes
+ * the no-op at the OS spawn seam. A refused/failed probe or harness crash must fail even with a clean clone.
  *
  * RED (pre-fix) = the filer's call leaves a brand-new untracked `backlog/*.md` card in `w.simCloneRoot`, i.e.
  * the clone goes dirty. GREEN (post-fix) = the clone's `git status --porcelain` is byte-identical before and
@@ -84,7 +87,8 @@ export default {
   // longer mentions `defaultSpawnDetached` by name — so the ORIGINAL single-string check went stale on a
   // behavior-preserving refactor it never anticipated (live-caught, 2026-09-29, PR #2983 CI). Check either the
   // pre-#4493 shape (the reference still inline, for a tree that predates the extraction) or the post-#4493
-  // shape (the wrapper delegates to the shared leaf, which itself carries the reference) — both are "the fix is
+  // shape (the wrapper delegates to the shared leaf, which itself carries the reference), including the
+  // diagnostic-only spawner introduced by #7090 — all are "the fix is
   // present", by the SAME test #4317 always meant: nothing in the calling checkout drives `file-item` directly.
   fixPresent(root) {
     try {
@@ -92,7 +96,7 @@ export default {
       if (/defaultSpawnDetached/.test(wrapper)) return true;
       if (!/spawnPreventionLandingJob/.test(wrapper)) return false;
       const leaf = readFileSync(join(root, 'scripts/lib/prevention-landing-job.mjs'), 'utf8');
-      return /defaultSpawnDetached/.test(leaf);
+      return /defaultSpawn(?:Diagnostic)?Detached/.test(leaf);
     } catch { return false; }
   },
   async run({ log } = {}) {
@@ -125,6 +129,9 @@ export default {
         };
         const res = runProbe(modulePath, input, w.simCloneRoot, { ...process.env, ...w.env });
         api.say(`r00 fileApprovalPreventionCard exited ${res.status} → ${JSON.stringify(res.parsed)}${res.stderr ? ` stderr=${res.stderr.trim().split('\n')[0]}` : ''}`);
+        if (res.status !== 0 || res.parsed?.ok !== true) {
+          api.violation('probe', `prevention filing probe failed before proving the handoff: status=${res.status} result=${JSON.stringify(res.parsed)}`);
+        }
 
         const after = porcelainStatus(w.simCloneRoot);
         api.say(`r00 daemon clone status after the filer ran: ${after.trim() || '(clean)'}`);
@@ -137,8 +144,6 @@ export default {
     });
   },
   judge(report) {
-    return report.violations
-      .filter((v) => v.invariant === 'clean')
-      .map((v) => `${v.daemon ?? '-'} tick ${v.tick ?? '-'}: [${v.invariant}] ${v.detail}`);
+    return report.violations.map((v) => `${v.daemon ?? '-'} tick ${v.tick ?? '-'}: [${v.invariant}] ${v.detail}`);
   },
 };

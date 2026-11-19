@@ -80,6 +80,7 @@ import { readBuildDelivery } from './build-delivery-evidence.mjs';
 import { recordBuildFailure, clearBuildFailure, dispatchAttemptKey, claimAttemptKeys } from './build-dispatch-failures.mjs';
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
+import { assertRuntimeAdmitted, validRuntimeGroupMembers, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
 // Through the REGISTRY, never `dispatch-providers/build.mjs` directly: `detached-dispatch.mjs` imports the
 // registry, which imports `build.mjs` — entering that cycle at `build.mjs` (or at `detached-dispatch.mjs` first)
@@ -464,14 +465,26 @@ export function settleOrphanRow({ runId, key, outcome = 'orphan-released' }, sto
  *  minus a fresh attempt tag (a resume is not a new attempt at building; it continues the one that already
  *  finished). `runId`/`effectKey` name the ORIGINAL dispatch row, so the resumed wrapper settles that row on
  *  exit instead of leaving it in-flight forever (PR #2921 review). Returns the spawned pid. */
-export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = null, effectKey = null, groupMembers = [] }, { spawnDetached = defaultSpawnDetached, logPathFor = deliveryDispatchLogPath } = {}) {
+export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = null, effectKey = null, groupMembers = [], bornAs }, { spawnDetached = defaultSpawnDetached, logPathFor = deliveryDispatchLogPath, readSettings, beforeSpawn = () => {}, onRefused = () => {} } = {}) {
+  if (!assertRuntimeAdmitted({ num, bornAs }, 'resume', { readSettings }).admitted) return null;
+  const allMembersAdmitted = groupMembers.map(member => {
+    const admission = assertRuntimeAdmitted({ num: member }, 'resume', { readSettings });
+    if (!admission.admitted) onRefused({ num: String(member), kind: 'resume', reason: admission.reason });
+    return admission.admitted;
+  }).every(Boolean);
+  if (!allMembersAdmitted) return null;
   const argv = [
     String(dispatchProviderEntry('build').runScript),
     `--num=${num}`, `--lane=${lane}`, `--session=${sessionSlug}`, `--scope=${String(scope ?? '')}`, '--resume',
     ...(runId && effectKey ? [`--run-id=${runId}`, `--effect-key=${effectKey}`] : []),
     ...(groupMembers.length ? [`--group-members=${groupMembers.join(',')}`] : []),
   ];
-  const child = spawnDetached(argv, { cwd: REPO_ROOT, logPath: logPathFor(sessionSlug) });
+  beforeSpawn();
+  const logPath = logPathFor(sessionSlug);
+  const card = { num, bornAs, groupMembers };
+  const spawnOptions = { cwd: REPO_ROOT, logPath, card, kind: 'resume' };
+  const child = withRuntimeAdmission(card, 'resume', () => spawnDetached(argv, spawnOptions), { readSettings });
+  if (child?.outcome === 'runtime-refused') { child.runtimeRefused.forEach(onRefused); return null; }
   const pid = Number(child?.pid);
   if (!Number.isInteger(pid) || pid <= 0) {
     throw new Error(`build-dispatch-orphan-adopt: resume spawn for #${num} reported no pid — whether it is running cannot be told from here`);
@@ -518,7 +531,7 @@ export async function adoptOrphanedBuildClaims({
   releaseResumeMarker = ({ num }) => releaseBuildDispatchResume({ num }),
   settleRow = (o) => settleOrphanRow(o),
   placeHold = ({ num, reason }) => placeBuildDispatchHold({ num, reason }),
-  spawnResume = (o) => spawnResumeDelivery(o),
+  spawnResume, readSettings,
   markResume = (o) => markBuildDispatchResume(o),
   // xykwe0h — real-outcome evidence (a PR on the card's branch, or a resolved card) and session liveness.
   readDelivery = (num) => readBuildDelivery(num),
@@ -562,8 +575,10 @@ export async function adoptOrphanedBuildClaims({
       }
       // A marker bound to some OLDER row (or to none at all) is stale — it must never answer for this claim
       // again.
-      if (resumeMarker && !liveness.marker) clearMarker(num);
-      if (liveness.status !== 'dead') { results.push({ num, action: 'leave', reason: liveness.reason ? `${liveness.status} (${liveness.reason})` : liveness.status }); continue; }
+      if (liveness.status !== 'dead') {
+        if (resumeMarker && !liveness.marker) clearMarker(num);
+        results.push({ num, action: 'leave', reason: liveness.reason ? `${liveness.status} (${liveness.reason})` : liveness.status }); continue;
+      }
       // xykwe0h — a dead dispatch whose card was in fact DELIVERED (its session opened a PR, the PR merged, or the
       // card is resolved) settles as that real outcome. It is neither resumed nor called `orphan-released`.
       const delivery = readDelivery(num);
@@ -580,24 +595,55 @@ export async function adoptOrphanedBuildClaims({
       // reached `in-flight`) — there is nothing to resume FROM in that case (no lane, no sessionSlug), so
       // resumability resolves to `no-lane-or-session` and this always falls straight to RELEASE.
       const payload = row?.entry?.payload || {};
+      if (!validRuntimeGroupMembers(payload.groupMembers)) {
+        const refusal = withRuntimeAdmission({ ...payload, num }, 'resume', () => null, { readSettings });
+        results.push({ num, action: refusal.outcome, reason: refusal.reason, runtimeRefused: refusal.runtimeRefused });
+        continue;
+      }
       const attempts = Number(liveness.marker?.meta?.attempts) || 0;
       const resumability = resolveResumability({
         num, lane: payload.lane, sessionSlug: payload.sessionSlug, scope: payload.scope ?? null,
-        groupMembers: payload.groupMembers ?? [],
+        groupMembers: payload.groupMembers,
         rowStartedAt: row?.entry?.startedAt ?? null,
       });
       const decision = decideOrphanAction({ resumable: resumability.resumable, attempts, maxAttempts, allowResume, frozenReason });
+      if (decision.action !== 'resume' && resumeMarker && !liveness.marker) clearMarker(num);
       if (decision.action === 'leave') {
         results.push({ num, action: 'leave', reason: decision.reason });
       } else if (decision.action === 'resume') {
+        const admission = assertRuntimeAdmitted({ num, bornAs: payload.bornAs }, 'resume', { readSettings });
+        if (!admission.admitted) { results.push({ num, action: 'runtime-refused', reason: admission.reason }); continue; }
+        const runtimeRefused = [];
+        const groupMembers = payload.groupMembers === undefined ? [] : payload.groupMembers;
+        const allMembersAdmitted = groupMembers.map(member => {
+          const admission = assertRuntimeAdmitted({ num: member }, 'resume', { readSettings });
+          if (!admission.admitted) runtimeRefused.push({ num: String(member), kind: 'resume', reason: admission.reason });
+          return admission.admitted;
+        }).every(Boolean);
+        if (!allMembersAdmitted) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused group', runtimeRefused }); continue; }
         const binding = { runId: row.runId, rowKey: row.entry?.key, attempts: attempts + 1 };
-        markResume({ num, pid: null, ...binding });
+        let pendingWritten = false;
+        const beforeSpawn = () => { markResume({ num, pid: null, ...binding }); pendingWritten = true; };
+        const rollbackResume = () => {
+          if (!pendingWritten) return;
+          releaseResumeMarker({ num });
+          // Restore the previous dead attempt count; a refusal consumes no attempt.
+          if (liveness.marker) markResume({ ...liveness.marker.meta, num,
+            nowIso: liveness.marker.meta.resumedAt });
+        };
         let pid;
         try {
-          pid = spawnResume({
+          // The pending write precedes the final spawn check and must be undone on refusal.
+          if (spawnResume) beforeSpawn();
+          const request = {
             num, lane: payload.lane, scope: payload.scope, sessionSlug: payload.sessionSlug,
-            runId: row.runId, effectKey: row.entry?.key, groupMembers: payload.groupMembers ?? [],
-          });
+            bornAs: payload.bornAs,
+            runId: row.runId, effectKey: row.entry?.key, groupMembers,
+          };
+          pid = spawnResume ? withRuntimeAdmission(request, 'resume', () => spawnResume(request), { readSettings })
+            : withRuntimeAdmission(request, 'resume', () => spawnResumeDelivery(request, { readSettings, beforeSpawn, onRefused: refusal => runtimeRefused.push(refusal) }), { readSettings });
+          if (pid?.outcome === 'runtime-refused' || (pid === null && !spawnResume)) { rollbackResume(); results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn', ...(runtimeRefused.length ? { runtimeRefused } : {}) }); continue; }
+          if (!Number.isInteger(pid) || pid <= 0) throw new Error(`resume spawn for #${num} reported no pid`);
         } catch (e) {
           // Known NOT running — record it so the next pass counts this attempt dead at once, not after a TTL.
           try { markResume({ num, pid: null, ...binding, spawnFailed: true }); } catch { /* the pending marker still bounds it */ }
