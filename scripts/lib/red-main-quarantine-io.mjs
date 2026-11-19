@@ -14,7 +14,7 @@
  *       skip (CI runs everything — the safe direction). The main-fix PR / main always skip nothing: the fix PRs the
  *       list publishes always count, `--fix-prs` only adds to them.
  *   node scripts/lib/red-main-quarantine-io.mjs add --actor=<red-main-safety-net|operator> --broken-sha=<sha>
- *       --owner=<who> --reason=<why> --tests=<id,id> [--area=<dir/>] [--ttl-min=<n>]
+ *       --owner=<who> --reason=<why> --tests=<id,id> [--job=<CI job>] [--area=<dir/>] [--ttl-min=<n>]
  *   node scripts/lib/red-main-quarantine-io.mjs prune --actor=<..> --main-green=<true|false|unknown>
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
@@ -639,7 +639,7 @@ export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChan
   const brokenSha = typeof f['broken-sha'] === 'string' ? f['broken-sha'].toLowerCase() : f['broken-sha'];
   const out = write({
     actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(brokenSha).slice(0, 9)}, by ${f.actor})`,
-    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
+    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null, job: f.job }),
   });
   const result = out?.ok === false ? undefined : rerun({ brokenSha, ...(f.dir ? { dir: f.dir } : {}) });
   return result ? { ...out, rerun: result } : out;

@@ -377,7 +377,30 @@ exported from the design artifact). A brand-new surface with no target must **no
 nobody has drawn its baseline yet — you STILL Read the screenshot and do the by-eye pass (2), and note the
 documented skip on the automated diff. The automated layer only bites once a baseline is committed.
 
+### 7a. Quality bar before the PR: related tests, Codex audit (R968), PREP block, public text (R971)
+
+After step 7, use step 8's commands to complete this sequence once: resolve the card in the lane → make the single commit →
+run `verify-lane request`/`check` at that HEAD → push → run `codex-audit` on that exact sha → open the PR.
+The four requirements below apply to that sequence; they do not require an earlier commit or a second final-HEAD test run.
+
+1. **Related tests green on the exact commit, BEFORE the audit.** On the single final commit (card already resolved per step 8),
+   run the diff-driven related-test selection (`verify-lane.mjs request`/`check`, no explicit `--gate` override). Any later commit invalidates the
+   audit record and its waiver binding, so do not change code after this point without re-running both.
+2. **Codex audit on the net diff.** After pushing that verified HEAD, run
+   `node scripts/operations/run.mjs codex-audit --base=origin/main --head=<40-hex sha of your lane HEAD>` from the lane.
+   Open the PR only on the verdict `NOT WEAKENED`. On `WEAKENED`: fix the findings, re-test, re-audit; at most 2 repair
+   rounds. A new finding class in round 3 means stop and return `not-ready (audit-non-convergence)` with the findings;
+   never open the PR over a `WEAKENED` verdict and never write a waiver yourself.
+3. **PREP block in the PR body.** `open-pr --bodyFile=<file>` needs the block from `docs/agent/prep-gate.md`
+   (`PREP:` then `Acceptance:`, `Pre-mortem:`, `Files:`, `Tests:`, each with a real item of 8+ non-whitespace characters).
+4. **Public text carries no machine names or paths (R971).** Commit messages, PR bodies, comments, tests and docs must
+   not contain machine or host names, home-directory paths or usernames; use repo-relative paths and generic words.
+
 ### 8. Resolve the card in the lane, commit, publish HEAD to the `lane/...` ref + open the PR (label green ONLY after `test` passes)
+
+Use the same finalization order as step 7a: resolve the card in the lane → make the single commit →
+run `verify-lane request`/`check` at that HEAD → push → run `codex-audit` on that exact sha → open the PR.
+Any commit after the audit invalidates it: re-run tests and audit on the new HEAD.
 
 **Resolve the card FIRST — here, in the lane clone, just before the commit, and never earlier.** Resolving is the
 CLOSE of the claim/resolve lifecycle (`we:scripts/operations/resolve.mjs`). The claim rode this PR (step 2) and the
@@ -407,8 +430,8 @@ so you author it.
 Then commit only this item's files — **including the item's own `backlog/` card, which now carries the claim and
 the resolve** (explicit paths, never `git add -A`; implementation commit) on the lane's **current branch**
 (its local `main`) — do **NOT** `git checkout -b lane/...`; the single-branch hook blocks branch creation even
-inside a lane clone. You never create the `lane/...` branch locally: `pr-land` **publishes HEAD** to that ref
-for you via `--ref=... --sha=HEAD`. Then open the PR through the canonical producer — **never a hand-rolled
+inside a lane clone. You never create the `lane/...` branch locally: after final-HEAD verification, push HEAD to that
+remote ref, then complete step 7a's audit on the same full SHA. Then open the PR through the canonical producer — **never a hand-rolled
 `gh pr create`** (that skips the #2307 producer review-labeling). **Cross-locus item?** This step opens a
 **couple** — two PRs, impl-first / WE-last, manifest on the WE PR — see *Cross-locus items — the two-PR couple*
 below in place of the single-PR steps 8–10:
@@ -432,13 +455,18 @@ git commit -F <msgfile> <explicit-paths>
 
 # #2833/#3105/#5137 — verify the FINAL HEAD you are about to land, keyed to this exact commit. Same request-then-hand-off
 # shape as step 5 — you cannot run this yourself (guard-bash denies it); request it, record the wait with `mark`, and END YOUR
-# TURN (`awaiting verify for <sha>`). The harness resumes this session with the verdict: a `green` means run the `open-pr`
-# below; a `red` is repaired and re-marked (the third is a hard stop, see *Escalations*). A moved HEAD (something else
+# TURN (`awaiting verify for <sha>`). The harness resumes this session with the verdict: a `green` means push, audit,
+# then run `open-pr` below; a `red` is repaired and re-marked (the third is a hard stop, see *Escalations*). A moved HEAD (something else
 # committed) means `request` and `mark` again for the new HEAD. Never loop on `check`, never sleep-poll.
 node scripts/verify-lane.mjs request              # targets HEAD as of the commit you just made — @operation-home-ok: #xab3jh7 — request has no operation-level equivalent yet; folding it in is #xab3jh7
 node scripts/conveyor/await-verify.mjs mark --who={{SESSION_SLUG}} --item={{ITEM_NUM}} --ref=lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug> --kind=delivery --attempt=1
 
-# … END YOUR TURN HERE. After the harness's green resume message, and only then, publish: …
+# … END YOUR TURN HERE. After the harness's green resume message, and only then, push and audit that exact HEAD: …
+
+git push origin HEAD:refs/heads/lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug>
+node scripts/operations/run.mjs codex-audit --base=origin/main --head="$(git rev-parse HEAD)"
+
+# Open only after NOT WEAKENED, following step 7a's repair-round cap and stop rules.
 
 node scripts/operations/run.mjs open-pr --ref=lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug> --sha=HEAD --base={{DELIVERY_BASE}} \
   --bodyFile=<pr-body> --mode=label-on-green --requireVerified=true --json

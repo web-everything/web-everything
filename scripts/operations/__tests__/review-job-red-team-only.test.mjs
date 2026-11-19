@@ -81,13 +81,26 @@ describe('lane Git hardening', () => {
     const exec = (file, args, options) => {
       calls.push({ file, args, options });
       if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      if (args[0] === 'config') return '';
+      if (args[0] === 'remote') return `git@github.com:${repo}.git`;
       return args.includes('fetch') ? '' : `${head}\n`;
     };
-    const io = createReviewJobIo({ env, exec });
+    const io = createReviewJobIo({ env, exec, spawnPack: (file, args, options) => { calls.push({ file, args, options }); return { status: 0, stdout: Buffer.alloc(0) }; }, readConfig: (file, args, options) => {
+      calls.push({ file, args, options });
+      expect(options.timeout).toBe(30_000);
+      return { status: 1, stdout: '', stderr: '' };
+    } });
     expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
     const gitCalls = calls.filter(call => call.file === 'git');
-    expect(gitCalls).toHaveLength(method === 'prepareLane' ? 2 : 3);
-    for (const { options } of gitCalls) {
+    expect(gitCalls).toHaveLength(12);
+    expect(gitCalls.map(({ args }) => args.find(arg => [
+      'config', 'remote', 'init', 'fetch', 'rev-parse', 'pack-objects', 'index-pack', 'cat-file',
+    ].includes(arg)))).toEqual([
+      'config', 'config', 'remote', 'init', 'fetch', 'rev-parse',
+      'pack-objects', 'index-pack', 'rev-parse', 'rev-parse', 'cat-file', 'cat-file',
+    ]);
+    const isolatedCalls = new Set([4, 5, 6, 8, 10]);
+    for (const [index, { args, options }] of gitCalls.entries()) {
       // Read Git's effective configuration, not just our helper's object shape.
       // This executes no fetch, callback, or repository write.
       const config = key => execFileSync('git', ['config', '--get', key], {
@@ -96,11 +109,16 @@ describe('lane Git hardening', () => {
       expect(config('core.alternateRefsCommand')).toBe('true');
       expect(config('core.fsmonitor')).toBe('false');
       expect(config('core.hooksPath')).toBe('/dev/null');
-      expect(config('review.fixture')).toBe('preserved');
+      expect(() => config('review.fixture')).toThrow();
+      expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(options.env.GIT_CONFIG_SYSTEM).toBe(options.env.GIT_CONFIG_GLOBAL);
+      const { GIT_TEMPLATE_DIR: _template, ...templateFree } = gitCalls[0].options.env;
+      expect(options.env).toEqual(args[0] === 'init' || args.includes('index-pack') || args.includes('cat-file') || isolatedCalls.has(index)
+        ? templateFree : gitCalls[0].options.env);
       expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');
-      expect(options).toMatchObject({ cwd: '/lanes/lane-7', timeout: 180_000, maxBuffer: 1024 * 1024 });
+      expect(options).toMatchObject({ cwd: isolatedCalls.has(index) ? expect.stringMatching(/iso\.git$/) : args[0] === 'init' ? expect.stringMatching(/review-git-config-/) : '/lanes/lane-7', timeout: args.includes('--name-only') ? 30_000 : 180_000, maxBuffer: args.includes('pack-objects') || args.includes('index-pack') || args.includes('cat-file') ? 1024 ** 3 : 1024 * 1024 });
     }
     expect(env).toEqual(original);
   });
@@ -309,6 +327,7 @@ describe('red-team-only review job', () => {
       commit('reviewed ops head');
       const pinned = git(['-C', origin, 'rev-parse', 'HEAD']);
       git(['-C', origin, 'update-ref', `refs/pull/${pr}/head`, pinned]);
+      git(['-C', lanePath, 'remote', 'set-url', 'origin', `git@github.com:${repo}.git`]);
       expect(() => git(['-C', lanePath, 'cat-file', '-e', `${pinned}^{commit}`])).toThrow();
       expect(() => seats.makeScratch({ lanePath, rev: pinned })).toThrow(/not our ref/);
 
@@ -319,7 +338,10 @@ describe('red-team-only review job', () => {
         // Isolate the recovery boundary with H absent even if shared setup changes.
         prepareLane: () => ({ head: pinned }),
         readRedTeamOnlyPayload: () => ({ head: pinned, loopPayload }),
-        fetchRedTeamHead: createReviewJobIo().fetchRedTeamHead,
+        fetchRedTeamHead: createReviewJobIo({ exec: (file, args, options) => execFileSync(file,
+          args.includes('fetch') ? ['-c', 'protocol.file.allow=always', '-c',
+            `url.${origin}.insteadOf=git@github.com:${repo}.git`, ...args] : args,
+          { ...options, encoding: 'utf8' }) }).fetchRedTeamHead,
         redTeamStatus: input => events.push(input.status),
         runRedTeam: vi.fn(input => {
           scratch = seats.makeScratch({ lanePath: input.lanePath, rev: input.loopPayload.findings.read.netBasis.rev });
@@ -343,22 +365,37 @@ describe('red-team-only review job', () => {
       const exec = vi.fn((file, args, options) => {
         calls.push([file, args]);
         expect(options).toMatchObject({ timeout: 180_000, maxBuffer: 1024 * 1024 });
-        expect(args.slice(0, 2)).toEqual(['-C', '/lanes/lane-7']);
-        if (args[2] === 'fetch') {
+        expect(options.cwd).toEqual(args.includes('fetch') || args[1] === 'FETCH_HEAD^{commit}' || (args[1]?.endsWith('^{tree}') && /iso\.git$/.test(options.cwd)) ? expect.stringMatching(/iso\.git$/) : args[0] === 'init' ? expect.stringMatching(/review-git-config-/) : '/lanes/lane-7');
+        if (args[0] === 'config') return '';
+        if (args[0] === 'remote') return `git@github.com:${repo}.git`;
+        if (args.includes('fetch')) {
           if (kind === 'fetch-error') throw Error('fetch failed');
           return '';
         }
-        if (args[4] === 'FETCH_HEAD^{commit}') return kind === 'moved-head' ? 'b'.repeat(40) : `${head}\n`;
-        if (kind === 'missing-commit') throw Error('unknown commit');
-        return kind === 'wrong-commit' ? 'b'.repeat(40) : `${head}\n`;
+        if (args[1] === 'FETCH_HEAD^{commit}') return kind === 'moved-head' ? 'b'.repeat(40) : `${head}\n`;
+        if (args[1] === `${head}^{tree}` && options.cwd === '/lanes/lane-7') {
+          if (kind === 'missing-commit') throw Error('unknown commit');
+          if (kind === 'wrong-commit') return 'b'.repeat(40);
+        }
+        return `${head}\n`;
       });
-      const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec }).fetchRedTeamHead });
+      const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec, spawnPack: () => ({ status: 0, stdout: Buffer.alloc(0) }), readConfig: (file, args) => {
+        calls.push([file, args]);
+        return { status: 1, stdout: '', stderr: '' };
+      } }).fetchRedTeamHead });
       const out = runReviewJob({ repo, pr, redTeamOnly: true }, io);
-      expect(calls[0]).toEqual(['git', ['-C', '/lanes/lane-7', 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`]]);
+      expect(calls.slice(0, 5)).toEqual([
+        ['git', ['config', '--includes', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
+        ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
+        ['git', ['remote', 'get-url', 'origin']],
+        ['git', ['init', '--bare', '--quiet', '--template=', expect.stringMatching(/iso\.git$/)]],
+        ['git', ['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
+      ]);
       if (kind === 'ok') {
-        expect(calls.slice(1)).toEqual([
-          ['git', ['-C', '/lanes/lane-7', 'rev-parse', '--verify', 'FETCH_HEAD^{commit}']],
-          ['git', ['-C', '/lanes/lane-7', 'rev-parse', '--verify', `${head}^{commit}`]],
+        expect(calls.slice(5)).toEqual([
+          ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],
+          ['git', ['rev-parse', `${head}^{tree}`]],
+          ['git', ['rev-parse', `${head}^{tree}`]],
         ]);
         expect(out.redTeam.status).toBe('ran');
       } else {
@@ -1099,19 +1136,25 @@ describe('red-team-only review job', () => {
       const calls = [];
       const exec = vi.fn((file, argv, options) => {
         calls.push([file, argv]);
-        expect(options.cwd).toBe('/lanes/lane-7');
+        expect(options.cwd).toEqual(argv.includes('fetch') || argv[1] === 'FETCH_HEAD^{commit}' || (argv[1]?.endsWith('^{tree}') && /iso\.git$/.test(options.cwd)) ? expect.stringMatching(/iso\.git$/) : argv[0] === 'init' ? expect.stringMatching(/review-git-config-/) : '/lanes/lane-7');
         expect(options.timeout).toBeGreaterThan(0);
         expect(options.maxBuffer).toBe(1024 * 1024);
         if (kind === 'oversized-output') throw Object.assign(Error('output exceeded maxBuffer'), { code: 'ENOBUFS' });
         if (file === 'gh') return JSON.stringify({ headRefOid: kind === 'missing-head' ? null : head });
-        if (argv[0] === 'fetch') {
+        if (argv[0] === 'config') return '';
+        if (argv[0] === 'remote') return `git@github.com:${repo}.git`;
+        if (argv.includes('fetch')) {
           if (kind === 'fetch-error') throw Error('not our ref');
           return '';
         }
+        if (argv[0] === 'init' || argv[0] === 'update-ref') return '';
         if (argv[0] === 'rev-parse') return kind === 'moved-head' ? 'b'.repeat(40) : head;
         throw Error('unexpected command');
       });
-      const prepareLane = createReviewJobIo({ env: {}, exec }).prepareLane;
+      const prepareLane = createReviewJobIo({ env: {}, exec, spawnPack: () => ({ status: 0, stdout: Buffer.alloc(0) }), readConfig: (file, args) => {
+        calls.push([file, args]);
+        return { status: 1, stdout: '', stderr: '' };
+      } }).prepareLane;
       const io = fakeIo({ prepareLane, runRedTeam: vi.fn(() => {
         calls.push(['red-team']);
         return { status: 'ran' };
@@ -1120,8 +1163,14 @@ describe('red-team-only review job', () => {
       if (kind === 'ok') {
         expect(calls).toEqual([
           ['gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid']],
-          ['git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`]],
-          ['git', ['rev-parse', 'FETCH_HEAD^{commit}']], ['red-team'],
+          ['git', ['config', '--includes', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
+          ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
+          ['git', ['remote', 'get-url', 'origin']],
+          ['git', ['init', '--bare', '--quiet', '--template=', expect.stringMatching(/iso\.git$/)]],
+          ['git', ['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
+          ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],
+          ['git', ['rev-parse', `${head}^{tree}`]],
+          ['git', ['rev-parse', `${head}^{tree}`]], ['red-team'],
         ]);
         expect(out.redTeam.status).toBe('ran');
         expect(io.readRedTeamOnlyPayload).toHaveBeenCalledWith({ pr, repo, head });
@@ -1716,6 +1765,11 @@ describe('moved card-only skip settlement', () => {
       expect(file).toBe('git');
       expect(options.cwd).toBe(lanePath);
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
+      // A lane info/grafts or commit-graph file must not forge the parents this proof walks (PR #7012 self-review).
+      expect(options.env.GIT_GRAFT_FILE).toBe('/dev/null');
+      expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      const pins = Number(options.env.GIT_CONFIG_COUNT);
+      expect(Array.from({ length: pins }, (_, i) => options.env[`GIT_CONFIG_KEY_${i}`])).toContain('core.commitGraph');
       if (args[0] === 'merge-base') return '';
       if (args[0] === 'rev-list') return `${head} ${fromSha}`;
       if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';

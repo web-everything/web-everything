@@ -71,6 +71,36 @@ export function sessionMatches(name, kind, pr) {
 }
 
 /**
+ * Why did this tick not dispatch `pr`? Reads only what the daemon itself reported for the tick (its result rows and
+ * log lines), never re-derives a decision. An `owed` violation that says only "no dispatch" cannot be diagnosed from
+ * CI output alone (main went red on PR #10 twice with nothing else to go on). Pure.
+ * @param {{result?:any, logs?:string[]}} entry
+ * @param {number} pr
+ * @returns {string}
+ */
+export function explainNoDispatch(entry, pr) {
+  const result = entry?.result ?? {};
+  const n = Number(pr);
+  const parts = [];
+  const rowsFor = (rows) => (Array.isArray(rows) ? rows : []).filter((r) => Number(r?.prNumber ?? r?.pr ?? r?.number) === n);
+  const clip = (x) => String(x).replace(/\s+/g, ' ').slice(0, 200);
+  for (const key of ['notStarted', 'failed', 'pendingNotDispatched', 'refusals']) {
+    for (const r of rowsFor(result[key])) {
+      parts.push(`${key}: ${clip(r.reason ?? r.error ?? r.kind ?? (Array.isArray(r.reasons) ? r.reasons.join('; ') : JSON.stringify(r)))}`);
+    }
+  }
+  if ((Array.isArray(result.liveProcessPrs) ? result.liveProcessPrs : []).some((r) => Number(r?.prNumber ?? r) === n)) parts.push('a live process still holds this PR');
+  for (const key of ['deferredForLanes', 'deferredForCap', 'deferredForAuth']) {
+    if (Number(result[key]) > 0) parts.push(`${key}=${result[key]}${key === 'deferredForCap' && result.deferredForCapReason ? ` (${clip(result.deferredForCapReason)})` : ''}`);
+  }
+  const lines = (Array.isArray(entry?.logs) ? entry.logs : []).filter((l) => new RegExp(`#${n}(?![0-9])`).test(String(l)));
+  for (const l of lines.slice(0, 3)) parts.push(`log: ${clip(l)}`);
+  const dispatched = Array.isArray(result.dispatched) ? result.dispatched.map((d) => d?.prNumber ?? d?.pr).join(',') : '';
+  parts.push(`reviewsOwed=${result.reviewsOwed ?? '?'} dispatched=[${dispatched}]`);
+  return parts.join(' | ');
+}
+
+/**
  * Check one finished tick. Pure.
  * @param {object} o
  * @param {string} o.daemon
@@ -105,7 +135,8 @@ export function checkTick({ daemon, index, entry, facts, stale, staleStreak, owe
   for (const o of owed) {
     const waited = index - o.sinceTick + 1;
     if (waited > bounds.owedGraceTicks) {
-      v.push({ invariant: 'owed', detail: `PR #${o.pr} owed ${o.kind} for ${waited} ${daemon} ticks with no dispatch (grace ${bounds.owedGraceTicks})` });
+      const why = o.why ? `; daemon said: ${o.why}` : '';
+      v.push({ invariant: 'owed', detail: `PR #${o.pr} owed ${o.kind} for ${waited} ${daemon} ticks with no dispatch (grace ${bounds.owedGraceTicks})${why}` });
     }
   }
   return v;
