@@ -678,6 +678,25 @@ const isLiveHoldDescription = description => typeof description === 'string' && 
  * may cover a live success that failed its own checks (a crash, or a supersede that did not land). */
 const isPolicyClearHoldDescription = description => description === `held: ${POLICY_CLEAR_HOLD_PENDING}`;
 
+/** Non-success statuses above the newest trusted success. Call only after the summary names this context. */
+export function readUnsettledPublicationHolds({ repo, headSha, gh, context, isTrusted = isTrustedMarkerAuthor }) {
+  const trusted = status => isTrusted({ user: { login: String(status?.creator?.login ?? '') } });
+  const { statuses, complete } = readStatusHistory({ repo, headSha, gh, context,
+    decisive: status => status.state === 'success' && trusted(status) });
+  const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
+  const settled = ordered.findIndex(status => status.state === 'success' && trusted(status));
+  if (settled < 0 && !complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound`);
+  // The summary names this context, so a full history without it is contradictory evidence, never "nothing to clear".
+  if (!ordered.length) throw Error('history lacks the summarized publication context');
+  return (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
+}
+
+/** Authorship and the caller's description/state predicate must both establish ownership. */
+export function ownsPublicationHold(status, ownsHold, isTrusted = isTrustedMarkerAuthor) {
+  return ownsHold(status.description, status)
+    && isTrusted({ user: { login: String(status?.creator?.login ?? '') } });
+}
+
 /** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears
  * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,
  * from a trusted author). Any other hold there (a round writer's) is its owner's to clear, so nothing is posted
@@ -687,7 +706,6 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
   const context = redTeamPublicationContext(pr);
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
-  const trusted = status => isTrusted({ user: { login: String(status?.creator?.login ?? '') } });
   // A trusted success clears EVERY hold beneath it (the gate walks newest first and stops there), so the clear is
   // posted only when every hold above the newest trusted success is the live helper's own. Any other hold in that
   // range (a round writer's unconfirmed publication) is its owner's to clear: leave all of them.
@@ -702,17 +720,10 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
       throw Error('combined status unreadable or incomplete');
     if (!latest.some(status => status?.context === context)) return { ok: true, cleared: false, reason: 'no publication hold on head' };
     // Paged: the context's entries can sit behind any number of newer unrelated statuses.
-    const { statuses, complete } = readStatusHistory({ repo, headSha, gh, context,
-      decisive: status => status.state === 'success' && trusted(status) });
-    const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
-    const settled = ordered.findIndex(status => status.state === 'success' && trusted(status));
-    if (settled < 0 && !complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound`);
-    // The summary names this context, so a full history without it is contradictory evidence, never "nothing to clear".
-    if (!ordered.length) throw Error('history lacks the summarized publication context');
-    holds = (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
+    holds = readUnsettledPublicationHolds({ repo, headSha, gh, context, isTrusted });
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
   if (!holds.length) return { ok: true, cleared: false, reason: 'no publication hold on head' };
-  if (holds.some(status => !ownsHold(status.description) || !trusted(status)))
+  if (holds.some(status => !ownsPublicationHold(status, ownsHold, isTrusted)))
     return { ok: true, cleared: false, reason: 'a publication hold that is not the live helper\'s is set; left to its owner' };
   const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh, env });
   return posted.ok ? { ok: true, cleared: true } : posted;

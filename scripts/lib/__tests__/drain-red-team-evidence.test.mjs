@@ -1853,8 +1853,10 @@ describe('finished publication hold recovery', () => {
     const postHold = vi.fn(() => ({ ok: true }));
     const lock = vi.fn(fn => fn());
     const readStatus = vi.fn(() => ({ total_count: 1, statuses: [{ context: `red-team/publication #${f.pr}`,
+      id: 2, created_at: new Date(1_800_000_000_000).toISOString(),
       state: 'failure', description: 'held: finished round publication in progress', creator: { login: 'web-everything' } }] }));
-    return { ...f, path, readCheck, readComments, readStatus, postHold, lock };
+    const gh = vi.fn(() => JSON.stringify(readStatus().statuses));
+    return { ...f, path, readCheck, readComments, readStatus, postHold, lock, gh };
   }
   it('accepts a stale queued marker like a finished marker', () => {
     const f = setup({ status: 'queued', remoteHold: true });
@@ -1868,8 +1870,8 @@ describe('finished publication hold recovery', () => {
   it.each(['finished', 'queued', 'running'])('clears an owned remote %s hold without a marker, idempotently', status => {
     const f = setup();
     rmSync(f.path);
-    f.readCheck.mockReturnValue({ ok: true }); // No marker means no mtime comparison.
     f.readStatus.mockReturnValue({ total_count: 1, statuses: [{ context: `red-team/publication #${f.pr}`,
+      id: 2, created_at: new Date(1_800_000_000_000).toISOString(),
       state: status === 'queued' ? 'pending' : 'failure', description: `held: ${status} round not confirmed published`,
       creator: { login: 'web-everything' } }] });
     expect(readRoundPublicationHold(f)).toBe(true);
@@ -1904,6 +1906,35 @@ describe('finished publication hold recovery', () => {
       expect(settleFinishedPublicationHold(f).ok).toBe(['absent', 'success'].includes(kind));
       expect(f.postHold).not.toHaveBeenCalled();
     });
+  it('without a marker refuses a check older than the hold and clears a newer check', () => {
+    const f = setup();
+    rmSync(f.path);
+    const combined = f.readStatus();
+    combined.statuses[0].description = 'held: queued round not confirmed published';
+    combined.statuses[0].created_at = new Date(1_800_000_002_000).toISOString();
+    f.readStatus.mockReturnValue(combined);
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false,
+      reason: expect.stringContaining('newer than publication hold') });
+    expect(f.postHold).not.toHaveBeenCalled();
+    f.readCheck.mockReturnValue({ ok: true, completedAt: new Date(1_800_000_003_000).toISOString() });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(f.postHold).toHaveBeenCalledTimes(1);
+  });
+  it('refuses a live-check hold beneath the latest writer hold and clears only all-writer history', () => {
+    const f = setup();
+    const latest = f.readStatus().statuses[0];
+    const buried = { ...latest, id: 1, description: 'held: live red-team check not clear: awaiting validation' };
+    f.gh.mockReturnValue(JSON.stringify([latest, buried]));
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false,
+      reason: expect.stringContaining(buried.description) });
+    expect(f.postHold).not.toHaveBeenCalled();
+    expect(existsSync(f.path)).toBe(true);
+    buried.description = 'held: running round not confirmed published';
+    f.gh.mockReturnValue(JSON.stringify([latest, buried]));
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(f.postHold).toHaveBeenCalledTimes(1);
+    expect(existsSync(f.path)).toBe(false);
+  });
   it('clears only the trusted round writer hold; foreign or unreadable status keeps the marker', () => {
     for (const kind of ['live', 'foreign', 'untrusted', 'unknown state', 'unreadable', 'incomplete', 'round', 'success', 'absent']) {
       const f = setup();
@@ -1921,7 +1952,7 @@ describe('finished publication hold recovery', () => {
       const ok = ['round', 'success', 'absent'].includes(kind);
       expect(out.ok, kind).toBe(ok);
       if (['live', 'foreign', 'untrusted', 'unknown state'].includes(kind)) expect(out.reason).toBe(
-        'publication hold not owned by the finished round writer; left to its owner');
+        `publication hold not owned by the finished round writer; left to its owner: ${status.description} (${status.creator.login})`);
       expect(existsSync(f.path), kind).toBe(!ok);
       expect(f.postHold.mock.calls.length, kind).toBe(kind === 'round' ? 1 : 0);
     }
@@ -1936,6 +1967,7 @@ describe('finished publication hold recovery', () => {
         id: 1, name: 'red-team', head_sha: f.head, external_id: `${f.repo}#${f.pr}`, app: { id: fixtureApp },
         status: 'completed', conclusion: 'success', completed_at: new Date(1_800_000_001_000).toISOString(),
       }] });
+      if (args[1].includes('/statuses?')) return JSON.stringify(f.readStatus().statuses);
       return JSON.stringify(f.readStatus());
     });
     const comments = vi.spyOn(prComments, 'readCompletePrComments').mockImplementation((_pr, { exec }) => {
@@ -1943,8 +1975,8 @@ describe('finished publication hold recovery', () => {
       return [cleanResultComment(f)];
     });
     try {
-      expect(settleFinishedPublicationHold({ ...f, readCheck: undefined, readComments: undefined, readStatus: undefined })).toEqual({ ok: true });
-      expect(gh).toHaveBeenCalledTimes(3);
+      expect(settleFinishedPublicationHold({ ...f, gh: undefined, readCheck: undefined, readComments: undefined, readStatus: undefined })).toEqual({ ok: true });
+      expect(gh).toHaveBeenCalledTimes(4);
       for (const [, options] of gh.mock.calls) {
         expect(options.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
         expect(options.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
@@ -1990,7 +2022,9 @@ describe('finished publication hold recovery', () => {
     const f = setup();
     f.env.GH_TOKEN = 'inherited-token';
     const writerEnv = { WE_GH_ROLE: 'app', WE_GH_APP_ENFORCE: '1' };
-    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('{}');
+    f.gh = undefined;
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(args =>
+      args[1] === 'fixture' ? '{}' : JSON.stringify(f.readStatus().statuses));
     f.postHold.mockImplementation(({ gh: post }) => {
       post(['api', 'fixture'], { env: writerEnv });
       return { ok: true };
@@ -1998,7 +2032,7 @@ describe('finished publication hold recovery', () => {
     try {
       expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
       expect(gh).toHaveBeenCalledWith(['api', 'fixture'], { env: writerEnv });
-      expect(gh.mock.calls[0][1].env).toBe(writerEnv);
+      expect(gh.mock.calls.find(([args]) => args[1] === 'fixture')[1].env).toBe(writerEnv);
     } finally { gh.mockRestore(); }
   });
   it.each(['not ok', 'unknown', 'throws'])('keeps the marker when the live check is %s', kind => {

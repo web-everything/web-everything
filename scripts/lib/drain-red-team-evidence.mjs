@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId, readCombinedStatus, redTeamPublicationContext } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId, readCombinedStatus, redTeamPublicationContext, readUnsettledPublicationHolds, ownsPublicationHold } from './red-team-check-run.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { createMqLiveReader, redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -131,10 +131,20 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
         if (markerStat) rmSync(`${path}.unpublished`, { force: true });
         return { ok: true };
       }
-      if (!ownedRoundHold(current) && !(markerStat && current.state === 'failure'
-        && /^held: (pending|running|finished|queued) round (publication in progress|not confirmed published)$/.test(current.description)
-        && isTrustedMarkerAuthor({ user: { login: String(current.creator?.login ?? '') } })))
-        return { ok: false, reason: 'publication hold not owned by the finished round writer; left to its owner' };
+      const ownsRound = (_description, status) => ownedRoundHold(status) || (markerStat && status.state === 'failure'
+        && /^held: (pending|running|finished|queued) round (publication in progress|not confirmed published)$/.test(status.description));
+      const holds = readUnsettledPublicationHolds({ repo, headSha: head, gh: liveGh, context: redTeamPublicationContext(pr) });
+      const foreign = [current, ...holds].find(status => !ownsPublicationHold(status, ownsRound));
+      if (foreign) return { ok: false,
+        reason: `publication hold not owned by the finished round writer; left to its owner: ${foreign.description} (${foreign.creator?.login ?? 'unknown'})` };
+      // A remote-only hold needs its own timestamp; a marker additionally binds the local publication attempt.
+      for (const hold of [current, ...holds]) {
+        const createdAt = Date.parse(hold.created_at);
+        const threshold = markerStat
+          ? Math.max(markerStat.mtimeMs, hold.created_at === undefined ? 0 : createdAt) : createdAt;
+        if (!Number.isFinite(completedAt) || !Number.isFinite(threshold) || completedAt < threshold)
+          return { ok: false, reason: 'red-team check not proven newer than publication hold; operator must inspect publication' };
+      }
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });
       if (cleared?.ok !== true) return { ok: false, reason: cleared?.reason ?? 'finished publication hold clear unconfirmed' };
       if (markerStat) rmSync(`${path}.unpublished`, { force: true });
