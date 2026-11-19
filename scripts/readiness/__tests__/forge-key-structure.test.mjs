@@ -45,6 +45,36 @@ describe('Forge key structure slice 1',()=>{
     expect(createPrivateKey({key:Buffer.from(text,'base64'),format:'der',type:'pkcs1'}).type).toBe('private');
     blocked(Buffer.from(text));
   });
+  it('one normalization layer closes the encoding class (red-team #7076 round 5)',()=>{
+    const ed=Buffer.from('302e020100300506032b657004220420'+'01'.repeat(32),'hex');
+    const jwk=JSON.stringify({kty:'oct',k:'YQ'});
+    const b64=text=>Buffer.from(text).toString('base64');
+    const uri=text=>[...Buffer.from(text)].map(byte=>'%'+byte.toString(16).padStart(2,'0')).join('');
+    const html=text=>[...text].map(char=>'&#'+char.codePointAt(0)+';').join('');
+    // the two red-team payloads
+    blocked(Buffer.from(ed.toString('base64').split('').join('!')));
+    blocked(Buffer.from(uri(jwk)));
+    // single layers
+    blocked(Buffer.from(html(jwk)));
+    blocked(Buffer.from(JSON.stringify(jwk)));
+    blocked(Buffer.from(b64(jwk).split('').join(' , ')));
+    // nested combinations in both orders and three deep
+    blocked(Buffer.from(b64(uri(jwk))));
+    blocked(Buffer.from(uri(b64(jwk))));
+    blocked(Buffer.from(html(b64(jwk))));
+    blocked(Buffer.from(b64(html(uri(jwk)))));
+    blocked(Buffer.from(uri(b64(ed.toString('base64').split('').join('!')))));
+    // prose around an encoded view does not hide it
+    blocked(Buffer.from('config: '+uri(jwk)+' trailing "text"'));
+    expect(keyStructureFinding(Buffer.from('ordinary prose, with punctuation! and 100% effort & more.'))).toBeFalsy();
+  });
+  it('fails closed when nesting exceeds the budget (never silently admits)',()=>{
+    let text=JSON.stringify({kty:'oct',k:'YQ'});
+    for(let layer=0;layer<12;layer++)text=Buffer.from(text).toString('base64');
+    const finding=keyStructureFinding(Buffer.from(text));
+    expect(finding).toBeTruthy();
+    expect(()=>manifestEntry(path,Buffer.from(text),false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
   it('blocks AES-encrypted PKCS#8 DER in every view (audit #7076)',()=>{
     const encrypted=generateKeyPairSync('ed25519').privateKey.export({format:'der',type:'pkcs8',cipher:'aes-256-cbc',passphrase:'pw'});
     for(const encode of Object.values(views))blocked(Buffer.from(encode(encrypted)));

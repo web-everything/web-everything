@@ -95,7 +95,10 @@ function encodedText(text) {
     ||(text.includes('"')&&text.includes('\\'))
     ||(text.match(/[\[{]/g)?.length??0)>=64
     ||/\\x[\da-f]{2}|%[\da-f]{2}|[\da-f]{2}:[\da-f]{2}/i.test(text)
-    ||/[A-Za-z0-9+/_=-]{11}/.test(text.replace(/\s/g,''));
+    ||/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)
+    // Lenient base64 ignores every non-alphabet character (whitespace and punctuation alike), so the gate does too.
+    // Only for readable text: binary fragments (replacement characters, NULs) stay terminal, so they do not re-expand.
+    ||(!/[�\0]/.test(text)&&text.replace(/[^A-Za-z0-9+/_=-]/g,'').length>=11);
 }
 
 // All representations (including mixed base64 alphabets) converge here, before detection.
@@ -167,6 +170,27 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
     const numbers=body.replace(/,\s*$/,'').split(',').map(Number);
     if(numbers.every(number=>Number.isInteger(number)&&number>=-128&&number<=255))emit(Buffer.from(numbers));
   }
+  // Percent-encoding decodes the WHOLE input once, literal text kept, so an encoded JSON object stays one object
+  // instead of separately scanned escape runs.
+  if(/%[\da-f]{2}/i.test(text)) {
+    tick();
+    const out=[];
+    for(let i=0;i<bytes.length;i++) {
+      const pair=bytes[i]===37?bytes.toString('latin1',i+1,i+3):'';
+      if(/^[\da-f]{2}$/i.test(pair)) {out.push(parseInt(pair,16));i+=2;} else out.push(bytes[i]);
+    }
+    emit(Buffer.from(out));
+  }
+  // HTML character references decode once over the whole text (numeric and the five named XML entities).
+  if(/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)) {
+    tick();
+    const named={quot:'"',amp:'&',lt:'<',gt:'>',apos:"'"};
+    emit(Buffer.from(text.replace(/&(?:#(\d+)|#x([\da-f]+)|(quot|amp|lt|gt|apos));/gi,(whole,dec,hex,name)=>{
+      if(name)return named[name.toLowerCase()];
+      const code=dec?Number(dec):parseInt(hex,16);
+      return code>0&&code<=0x10ffff?String.fromCodePoint(code):whole;
+    })));
+  }
   // Hex byte notations all decode to the same candidate type.
   for(const match of text.matchAll(/(?:\\x[\da-f]{2})+|(?:%[\da-f]{2})+|(?:[\da-f]{2}:)+[\da-f]{2}|\b(?:[\da-f]{2})+\b/gi)) {
     tick();emit(Buffer.from(match[0].replace(/\\x|%|:/gi,''),'hex'));
@@ -195,6 +219,14 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
     end=match.index+match[0].length;
   }
   if(run)decode(run);
+  // Node's base64 decoder ignores every character outside the alphabet, so punctuation interleaved with the
+  // material (`A!B!C`) still decodes for a consumer. Whitespace-delimited chunks are stripped to the alphabet and
+  // joined like the run above.
+  if(/[^A-Za-z0-9+/_=\s-]/.test(text)) {
+    tick();
+    const joined=text.replace(/[^A-Za-z0-9+/_=-]/g,'');
+    if(joined)decode(joined);
+  }
   // Preserve the existing scanner's UTF-16 reach for structured material, too.
   if(utf16&&bytes.includes(0)&&bytes.length>=2) {
     // Random binary can expand into much larger Unicode views. Continue only
