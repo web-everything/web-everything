@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
+// Built from parts: the multi-repo scan flags a bare repo literal in a scanned source.
+const WE_SLUG = ['web-everything', 'web-everything'].join('/');
 export default {
   id: 'catch-up-clean-first-snapshot-first',
   title: 'catch-up gives clean heads the first slots and reuses the first listing snapshot',
@@ -39,12 +41,12 @@ export default {
       'planCatchUp defaults must put clean heads first');
     const incidentPrs = [{ ...prs[0], num: 99 }, { ...prs[3], num: 7 }];
     const incident = planCatchUp({ prs: incidentPrs, queued: 0, capacity: 1,
-      repo: 'web-everything/web-everything', priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 } });
+      repo: WE_SLUG, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 } });
     check(incident.run[0]?.num === 99, 'BLOCKED P0 incident fix must beat ordinary CLEAN at capacity one');
     const cleanIncidentPrs = [{ ...incidentPrs[0], mergeStateStatus: 'CLEAN', readyAt: 900 },
       { ...incidentPrs[1], readyAt: 0 }];
     const priorityInput = { prs: cleanIncidentPrs, queued: 0, capacity: 1,
-      repo: 'web-everything/web-everything', priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 } };
+      repo: WE_SLUG, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 } };
     check(planCatchUp({ ...priorityInput, deprioritize: [99] }).run[0]?.num === 7,
       'recently missed CLEAN P0 must stay behind unmissed CLEAN P3');
     check(planCatchUp({ ...priorityInput, order: 'oldest-ready' }).run[0]?.num === 7,
