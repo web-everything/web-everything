@@ -98,7 +98,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, checkoutHasRetryableTestUnit, scanRetryCommand, localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -672,7 +672,11 @@ const laneMatch = /lane-(\d+)/.exec(REPO);
 const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 // Only the known default full command is separable; arbitrary shell commands remain opaque.
 const fullRetryGate = verifySetting('retryFailed', process.env) > 0 && resolvedGate?.decision?.mode === 'full'
-  && /^npm run test:unit(?: && npm run check:standards)?$/.test(resolvedGate.command);
+  && /^npm run test:unit(?: && npm run check:standards)?$/.test(resolvedGate.command)
+  && checkoutHasRetryableTestUnit(REPO);
+if (verifySetting('retryFailed', process.env) > 0 && resolvedGate?.decision?.mode === 'full' && !fullRetryGate) {
+  process.stderr.write('verify-lane: full-gate retry unavailable: cannot prove a hook-free admission-wrapped test:unit; fix failures or run a fresh verify.\n');
+}
 if (fullRetryGate) {
   resolvedGate.testCommand = 'npm run test:unit';
   resolvedGate.standardsCommand = resolvedGate.command.includes('check:standards') ? 'npm run check:standards' : null;
@@ -973,8 +977,12 @@ const alwaysRun = retryableGate
   ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
     scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
-// Retry commands use direct file filters (no VERIFY_SCAN_FILES expansion), and their own execution report.
-async function retryPhase(result, phase, previousOutcome) {
+// Retry commands use direct test-file filters, retain scan inputs, and write their own execution report.
+async function retryPhase(result, phase, previousOutcome, scanCommand) {
+  if (phase === 'scan' && scanRetryCommand(scanCommand, ['npx', 'vitest', 'run']) === null) {
+    process.stderr.write('verify-lane: scan stays red: cannot reproduce its environment; fix the failures or run a fresh verify.\n');
+    return result;
+  }
   const phaseKind = phase === 'vitest' ? 'vitest' : 'scan';
   const audit = await retryFailedPhase({ result, attempts: retryFailed, cwd: realpathSync(REPO),
     mode: isolatedRetryMode === 'untouched' ? 'all' : isolatedRetryMode,
@@ -991,7 +999,9 @@ async function retryPhase(result, phase, previousOutcome) {
         process.stderr.write(`Re-running only ${files.length} failing file(s) in ${phase}, isolated attempt ${attempt}/${retryFailed}: ${files.join(', ')}\n`);
         const timeouts = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? verifySetting('testTimeoutFactor', process.env)).split(' ').filter(Boolean);
         const argv = isolatedRetryArgv(files, [...timeouts, '--reporter=default', '--reporter=json', `--outputFile.json=${report}`]);
-        const retry = await timedRunGate(`${phaseKind}Ms`, argv[0], argv.slice(1), { outcomeKey: `${phase}-retry` });
+        const retry = phase === 'scan'
+          ? await timedRunGate(`${phaseKind}Ms`, scanRetryCommand(scanCommand, argv), undefined, { outcomeKey: `${phase}-retry` })
+          : await timedRunGate(`${phaseKind}Ms`, argv[0], argv.slice(1), { outcomeKey: `${phase}-retry` });
         let retryReportText = null;
         try { if (nodeFs.statSync(report).size <= MAX_TIMEOUT_LOG_BYTES) retryReportText = readFileSync(report, 'utf8'); } catch { /* unproven execution stays red */ }
         return { ...retry, retryReportText };
@@ -1049,7 +1059,7 @@ try {
       const previousOutcome = outcomes.scan;
       let scan = await timedRunGate('scanMs', scanCommand);
       if (scan.exitCode !== 0) process.stderr.write(scanFailureDiagnostic(scan, scanCommand));
-      if (retryFailed > 0) scan = await retryPhase(scan, 'scan', previousOutcome);
+      if (retryFailed > 0) scan = await retryPhase(scan, 'scan', previousOutcome, scanCommand);
       phaseResults.push({ phase: 'scan', result: scan });
       if (!continueAfter(scan)) break;
     }

@@ -4826,3 +4826,9 @@ name in that exact file's retry report must pass; a passing namesake cannot mask
 Oversized/incomplete inventories stay red: fix the failures or run a fresh verify. The recognized full-unit default separates tests
 from standards; opaque explicit combined commands retain their verdict. Recovered files appear in
 marker `flakes` and the advisory coordination-root `.operations/test-flakes.jsonl`; merge CI is unchanged.
+Full-unit recovery requires a runtime read proving the target checkout's `test:unit` is exactly the
+heavy-admission `vitest run` script with neither `pretest:unit` nor `posttest:unit`. Missing, unreadable,
+malformed or oversized package evidence leaves the full gate opaque. Scan retries retain the original
+command's environment assignments, including `VERIFY_SCAN_FILES`; an unrecognized assignment or shell
+shape refuses recovery. Both refusals retain red: fix the failures or run a fresh verify.
+`verify-retry-context.test.mjs` covers package evidence and an untracked deterministic scan violation.
