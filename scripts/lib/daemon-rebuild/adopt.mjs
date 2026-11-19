@@ -197,8 +197,9 @@ export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) 
   } catch { return false; }
 }
 
-const UNSAFE_REMOVAL_RE = /fail|rollback|rolled|reject|closed|unmerged|secur|unload|weaken|revok|broken|regress|\bred\b|conflict|ref-gone|poison|suspect/i;
-const BENIGN_REMOVAL_RE = /pr[- ]?merged|\bmerged\b|in-main|no longer wanted|not wanted|unwanted|retired|superseded|replaced|graduat/i;
+const UNSAFE_REMOVAL_RE = /fail|rollback|rolled|reject|closed|unmerged|not merged|secur|unload|weaken|revok|broken|regress|\bred\b|conflict|ref-gone|poison|suspect/i;
+// Anchored: the whole reason must be one of these phrases (a longer free-text reason is unknown, never benign).
+const BENIGN_REMOVAL_RE = /^(pr[- ]?merged|merged|in-main|no longer wanted|not wanted|retired|superseded|replaced|graduated)\.?$/i;
 
 /**
  * Why did a registered overlay leave? 'benign' (its PR merged, or it is simply no longer wanted), 'unsafe' (dropped for
@@ -207,16 +208,24 @@ const BENIGN_REMOVAL_RE = /pr[- ]?merged|\bmerged\b|in-main|no longer wanted|not
  * @param {{ref:string, decisions?:object[], events?:object[]}} o — this tick's plan decisions plus the overlay audit trail
  * @returns {'benign'|'unsafe'|'unknown'}
  */
-export function classifyOverlayRemoval({ ref, decisions = [], events } = {}) {
+export function classifyOverlayRemoval({ ref, sha, decisions = [], events } = {}) {
   try {
     const d = decisions.find((x) => x?.ref === ref && x.action === 'remove');
     if (d) return d.reason === 'pr-merged' || d.reason === 'in-main' ? 'benign' : 'unsafe';
-    if (!ref || !Array.isArray(events)) return 'unknown';
-    const last = events.filter((e) => e?.ref === ref).at(-1);
+    if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || !Array.isArray(events)) return 'unknown';
+    const history = events.filter((e) => e?.ref === ref);
+    const last = history.at(-1);
     if (!last || !['removed', 'auto-dropped', 'auto-retired'].includes(last.kind)) return 'unknown';
-    const reason = typeof last.reason === 'string' ? last.reason : '';
-    if (!reason.trim()) return 'unknown';
+    const reason = typeof last.reason === 'string' ? last.reason.trim() : '';
+    if (!reason) return 'unknown';
     if (UNSAFE_REMOVAL_RE.test(reason)) return 'unsafe';
+    // The trail must be about THIS applied tip, recorded after the ref was added, and (auto-retired) by an authenticated operator.
+    const removedAt = Date.parse(last.at || '');
+    const addedAt = Math.max(0, ...history.filter((e) => e.kind === 'added').map((e) => Date.parse(e.at || '')).filter(Number.isFinite));
+    if (!Number.isFinite(removedAt) || removedAt < addedAt) return 'unknown';
+    if (last.kind === 'auto-dropped') return reason === 'pr-merged' || reason === 'in-main' ? 'benign' : 'unknown';
+    if (last.tip !== sha) return 'unknown';
+    if (last.kind === 'auto-retired' && !OPERATOR_LOGINS.includes(String(last.actor || '').toLowerCase())) return 'unknown';
     return BENIGN_REMOVAL_RE.test(reason) ? 'benign' : 'unknown';
   } catch { return 'unknown'; }
 }

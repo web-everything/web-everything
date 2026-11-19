@@ -633,7 +633,7 @@ export async function prepareRebuild({
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
         // Adopt the build that passed, then add: benign removals (merged/no longer wanted) and still-registered overlays the
         // build omits queue an incremental rebuild instead of discarding the build; safety/unknown removals still discard.
-        removalSafety: (ref) => classifyOverlayRemoval({ ref, decisions: plan.decisions, events: readOverlayEvents() }),
+        removalSafety: (ref, sha) => classifyOverlayRemoval({ ref, sha, decisions: plan.decisions, events: readOverlayEvents() }),
         readdable: (ref) => wantedRefs.has(ref) && registeredRefs.has(ref),
         dependsOn: (ref) => {
           const deps = (overlaysBefore || []).find((o) => o?.ref === ref)?.dependsOn;

@@ -52,22 +52,35 @@ describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
 });
 
 describe('classifyOverlayRemoval', () => {
-  const ev = (kind, reason) => [{ kind: 'added', ref: 'lane/a' }, { kind, ref: 'lane/a', reason }];
+  const tip = SHA('a');
+  const ev = (kind, reason, extra = {}) => [
+    { kind: 'added', ref: 'lane/a', at: '2026-11-18T20:00:00Z' },
+    { kind, ref: 'lane/a', reason, tip, at: '2026-11-18T21:00:00Z', ...extra },
+  ];
+  const classify = (events) => classifyOverlayRemoval({ ref: 'lane/a', sha: tip, events });
   it('same-tick decisions: merged is benign, closed or gone is unsafe', () => {
     expect(classifyOverlayRemoval({ ref: 'lane/a', decisions: [{ ref: 'lane/a', action: 'remove', reason: 'pr-merged' }] })).toBe('benign');
     expect(classifyOverlayRemoval({ ref: 'lane/a', decisions: [{ ref: 'lane/a', action: 'remove', reason: 'pr-closed' }] })).toBe('unsafe');
     expect(classifyOverlayRemoval({ ref: 'lane/a', decisions: [{ ref: 'lane/a', action: 'remove', reason: 'ref-gone' }] })).toBe('unsafe');
   });
   it('audit trail reasons', () => {
-    expect(classifyOverlayRemoval({ ref: 'lane/a', events: ev('removed', 'PR merged; no longer wanted') })).toBe('benign');
-    expect(classifyOverlayRemoval({ ref: 'lane/a', events: ev('auto-dropped', 'pr-merged') })).toBe('benign');
-    expect(classifyOverlayRemoval({ ref: 'lane/a', events: ev('removed', 'smoke failed, rolled back') })).toBe('unsafe');
-    expect(classifyOverlayRemoval({ ref: 'lane/a', events: ev('removed', 'security unload') })).toBe('unsafe');
-    expect(classifyOverlayRemoval({ ref: 'lane/a', events: ev('removed', 'because') })).toBe('unknown');
-    expect(classifyOverlayRemoval({ ref: 'lane/a', events: ev('removed', '') })).toBe('unknown');
+    expect(classify(ev('removed', 'no longer wanted'))).toBe('benign');
+    expect(classify(ev('auto-dropped', 'pr-merged', { tip: undefined }))).toBe('benign');
+    expect(classify(ev('removed', 'smoke failed, rolled back'))).toBe('unsafe');
+    expect(classify(ev('removed', 'security unload'))).toBe('unsafe');
+    expect(classify(ev('removed', 'not merged'))).toBe('unsafe');
+    expect(classify(ev('removed', 'because'))).toBe('unknown');
+    expect(classify(ev('removed', 'retired after the long review of everything'))).toBe('unknown');
+    expect(classify(ev('removed', ''))).toBe('unknown');
+  });
+  it('requires evidence about this tip, in time order, and an authenticated retirement actor', () => {
+    expect(classify(ev('removed', 'retired', { tip: SHA('9') }))).toBe('unknown');
+    expect(classify(ev('removed', 'retired', { at: '2026-11-18T19:00:00Z' }))).toBe('unknown');
+    expect(classify(ev('auto-retired', 'retired', { actor: 'someone-else' }))).toBe('unknown');
+    expect(classifyOverlayRemoval({ ref: 'lane/a', events: ev('removed', 'retired') })).toBe('unknown'); // no tip supplied
   });
   it('missing or unreadable trail is unknown', () => {
-    expect(classifyOverlayRemoval({ ref: 'lane/a' })).toBe('unknown');
-    expect(classifyOverlayRemoval({ ref: 'lane/a', events: [] })).toBe('unknown');
+    expect(classifyOverlayRemoval({ ref: 'lane/a', sha: tip })).toBe('unknown');
+    expect(classify([])).toBe('unknown');
   });
 });
