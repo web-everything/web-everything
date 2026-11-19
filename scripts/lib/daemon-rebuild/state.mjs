@@ -190,7 +190,7 @@ export function readReadyCandidate(root, env = process.env) {
 }
 
 /** Admission must distinguish absent ready evidence from unreadable or incomplete evidence. */
-export function readReadyCandidateStrict(root, env = process.env, read = readFileSync, { strictPins = true, run = (args, opts) => spawnSync('git', args, opts) } = {}) {
+export function readReadyCandidateStrict(root, env = process.env, read = readFileSync, { strictPins = true, run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], ...opts }) } = {}) {
   let text;
   try { text = read(readyCandidatePath(root, env), 'utf8'); }
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
