@@ -1,9 +1,11 @@
 // Shared admission/apply decision table; fixture data, never filesystem targets.
 export const admissibleTargets = [
-  'docs/guide.md', 'README.md', 'docs/x/y.md', 'notes.mdx', 'docs/example.mjs',
+  'docs/guide.md', 'README.md', 'docs/x/y.md', 'notes.mdx', 'docs/notes.txt',
   'scripts/lib/__tests__/foo.test.mjs', 'src/__tests__/a.test.ts', 'src/a.spec.ts',
 ];
 export const refusedTargets = [
+  // Docs are prose: dotfiles (git behaviour files) and non-prose extensions are refused (audit: docs/.gitignore hides untracked files).
+  'docs/.gitignore', 'docs/.gitattributes', 'docs/a/.hidden.md', 'docs/example.mjs', 'docs/run.sh', 'docs/img.png',
   'scripts/operations/fix-run.mjs', 'vitest.config.ts', 'playwright.config.ts',
   '.github/workflows/ci.yml', '.github/x.md', 'scripts/settings/agy-build.json',
   'package.json', 'docs/package.json', 'backlog/123.md', 'agent-memory-src/x.md',

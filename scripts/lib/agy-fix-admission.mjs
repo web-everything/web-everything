@@ -1,11 +1,15 @@
 import { criticalWorkVerdict } from './critical-work.mjs';
 
-const isDoc = p => /\.(md|mdx)$/.test(p) || /^docs(\/|$)/.test(p);
+// Docs are prose files (md, mdx, txt, rst) or the docs directory itself as a scope; a docs file with another
+// extension (a script, an image, a dotfile) is not documentation. Dotfiles are refused in isAdmissibleTargetPath.
+const isDoc = p => /\.(md|mdx|txt|rst)$/.test(p) || (/^docs(\/|$)/.test(p) && !/\.[^/]+$/.test(p.split('/').at(-1)));
 const isTest = p => /(^|\/)(__tests__|tests)(\/|$)/.test(p) || /\.(test|spec)\.[^/]+$/.test(p);
 /** Kind-agnostic allowlist shared by scope admission and every applied path. */
 export function isAdmissibleTargetPath(p) {
   if (typeof p !== 'string' || !p || p.startsWith('/') || /[\x00-\x1f\x7f-\x9f\\*?\[\]{}:]/.test(p)
-    || p.split('/').some(s => !s || s === '.' || s === '..' || s.toLowerCase() === '.git')) return false;
+    // Any dot-segment is refused: .gitignore/.gitattributes inside docs change how git enumerates and filters files
+    // (an ignore rule hides untracked files from the launcher's whole-run path check; audit).
+    || p.split('/').some(s => !s || s === '.' || s === '..' || s.startsWith('.'))) return false;
   if (/^(\.github|scripts\/settings|backlog|agent-memory-src)(\/|$)/.test(p)
     || /(^|\/)(soak|breaks)(\/|$)/.test(p)
     || /\.(json|yml|yaml|toml)$/.test(p) || /\.real\.test\.mjs$/.test(p)
