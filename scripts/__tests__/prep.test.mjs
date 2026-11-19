@@ -40,6 +40,11 @@ describe('touch classification', () => {
     expect(classifyPaths(['scripts/review-set-label.mjs'])).toEqual(expect.arrayContaining(['review', 'label', 'daemon']));
     expect(classifyPath('docs/guide.md')).toEqual([]);
   });
+  it('normalizes repeated dot segments so they cannot dodge sensitive prefixes', () => {
+    expect(classifyPath('././scripts/lib/novel.mjs')).toEqual(classifyPath('scripts/lib/novel.mjs'));
+    expect(classifyPath('scripts//lib/./novel.mjs')).toEqual(classifyPath('scripts/lib/novel.mjs'));
+    expect(classify({ ...good(), touchSet: ['././scripts/lib/novel.mjs'] }).designPassRequired).toBe(true);
+  });
   it('fails closed for malformed paths', () => expect(classifyPath('../escape')).toEqual(['unknown-sensitive']));
 });
 

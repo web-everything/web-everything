@@ -20,11 +20,13 @@ export function matchesPath(path, glob) {
 export function classifyPath(path, cfg = defaults) {
   if (typeof path !== 'string' || !path || /[\\\x00-\x1f]/.test(path)
     || path.startsWith('/') || path.split('/').includes('..')) return ['unknown-sensitive'];
-  path = path.replace(/^\.\//, '');
+  const trailingSlash = path.endsWith('/');
+  path = path.split('/').filter(part => part !== '' && part !== '.').join('/');
+  if (!path) return ['unknown-sensitive'];
   const found = new Set();
   // A scope glob is a promise about future paths, not a finite changed-file list.
   // Require design review until that promise is expanded to concrete files.
-  if (path.includes('*') || path.endsWith('/')) found.add('unknown-sensitive');
+  if (path.includes('*') || trailingSlash) found.add('unknown-sensitive');
   for (const name of CLASS_NAMES) {
     const globs = [...defaults.classes[name].globs, ...(cfg.classes?.[name]?.globs ?? [])];
     if (globs.some(g => matchesPath(path, g))) found.add(name);
