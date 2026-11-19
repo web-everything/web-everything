@@ -245,7 +245,8 @@ describe('test-isolation markers survive the env allowlist (they only narrow)', 
 });
 
 describe('three-class environment boundary', () => {
-  it.each(['', ' \t\n '])('blank restrictive values (%j) cannot mask ambient restrictions or predicates', blank => {
+  it('empty restrictive values cannot mask ambient restrictions or predicates', () => {
+    const blank = '';
     const markers = { WE_GH_DAEMON_CALLER: 'daemon', XPC_SERVICE_NAME: 'com.we.test', VITEST: 'true',
       WE_UNDER_TEST: '1', LANE_POOL_ROOT: '/isolated/pool', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' };
     for (const [key, value] of Object.entries(markers)) vi.stubEnv(key, value);
@@ -263,6 +264,23 @@ describe('three-class environment boundary', () => {
     for (const key of Object.keys(markers)) expect(absent).not.toHaveProperty(key);
     const ambient = buildAgentInvocation(base(), seam()).options.env;
     for (const key of Object.keys(markers)) expect(ambient).not.toHaveProperty(key);
+  });
+  it.each([' ', '\t'])('preserves whitespace presence markers %j and their daemon/test semantics', marker => {
+    for (const name of ['WE_GH_DAEMON_CALLER', 'VITEST', 'WE_UNDER_TEST']) {
+      const predicate = name === 'WE_GH_DAEMON_CALLER' ? isDaemonCaller : isUnderTest;
+      clearEnv(name);
+      const bag = buildAgentInvocation({ ...base(), inheritEnv: { [name]: marker } }, seam()).options.env;
+      expect(bag[name]).toBe(marker);
+      expect(predicate({ [name]: bag[name] })).toBe(true);
+      vi.stubEnv(name, marker);
+      for (const inheritEnv of [{}, { [name]: '' }, { [name]: 'bag-identity' }]) {
+        const env = buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
+        expect(env[name]).toBe(marker);
+        expect(predicate({ [name]: env[name] })).toBe(true);
+      }
+      expect(predicate({ [name]: buildAgentInvocation(base(), seam()).options.env[name] })).toBe(true);
+      clearEnv(name);
+    }
   });
   it('every value-gated restriction survives a blank or relaxing bag, and relaxing values stay dropped', () => {
     for (const [name, rule] of Object.entries(registry).filter(([, r]) => r.restrictiveValues)) {
@@ -462,8 +480,7 @@ describe('registry identity predicates match the gh shim daemon reader', () => {
     }
     for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) {
       const projected = buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env;
-      // Empty-is-absent is the boundary contract, even for a truthy whitespace presence marker.
-      expect(isDaemonCaller(projected)).toBe(isDaemonCaller({ [name]: value.trim() ? value : '' }));
+      expect(isDaemonCaller(projected)).toBe(isDaemonCaller({ [name]: value }));
       vi.stubEnv(name, name === 'XPC_SERVICE_NAME' ? 'com.we.parent' : 'parent');
       expect(isDaemonCaller(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env)).toBe(true);
       clearEnv(name);

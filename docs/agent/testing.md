@@ -4953,8 +4953,9 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Launcher restriction projection (SEC1 S1 round 5)
 
-An explicit environment bag must not erase parent restrictions. Blank/whitespace restrictive
-markers count as absent, including isolation roots; malformed nonblank roots still refuse.
+An explicit environment bag must not erase parent restrictions. Only the exact empty string
+counts as an absent restrictive marker. Whitespace presence markers survive unchanged, matching
+daemon/test readers; nonempty malformed isolation roots (including whitespace) still refuse.
 Value-gated restrictions emit canonical trimmed lowercase values so exact-string consumers
 (such as heavy-admission container switches) receive an enabling value. An ambient gated
 restriction wins over a different bag mode because modes may have different strengths.
@@ -4971,12 +4972,40 @@ relaxOnly: true; relaxOnly means no value tightens the unset policy. Prefix pred
 raw case-sensitive values, exactly as the daemon reader does. Restrictive entries default to
 ambient precedence; shared lock roots and identities keep the parent, while LANE_POOL_ROOT
 explicitly uses bag precedence to agree with direct-task writable roots. Numeric restrictions
-retain the smaller valid parent/bag quantity strictly below the evidenced default. Counts emit
-positive integers (flooring fractions for integer-only readers); CPU quantities must also satisfy the consumer's >= 1 floor. Byte suffixes
+retain every valid ambient quantity, even at or above the code default, unless the bag supplies
+a valid smaller quantity. Without a valid ambient limit, a bag quantity must be strictly below
+the evidenced default. Counts emit integers (flooring fractions for integer-only readers);
+zero stays invalid unless tighterThan.zeroIsStrict explicitly records a strict zero bound.
+CPU quantities must also satisfy the consumer's >= 1 floor. Byte suffixes
 k/m/g/t use powers of 1024 and emit numeric bytes, so Number-based and Docker readers agree.
 Consumer floors belong in tighterThan.minimum (CPU reader: 1; call-log reader: 1 MiB). Test all
 restrictive entries, including invalid quantities and malformed roots, from both sources.
 Keep policy-relative guards without a fixed numeric default explicitly unresolved.
+
+The final S1 presence sweep forwards DIFF_COVERAGE_BASE, VERIFY_SCAN_FILES and
+WE_DAEMON_OVERLAY_STACK_BASES to pin parent comparison/scan/base evidence; FAKE_GH_FIXTURE
+preserves fixture isolation. DELIVERY_SESSION enables the completion stop check,
+WE_DAEMON_VERSIONS_CLONES_ROOT retains a migration refusal, and WE_GUARD_ORIGIN enables
+both guard-clone origin checks. All use ambient precedence. DIFF_COVERAGE_BASE and
+VERIFY_SCAN_FILES additionally require ambientOnly: true: bag-only comparison bases and
+scan scopes can narrow default verification, so only ambient evidence may set them. Empty
+ambient values do not authorize a bag override. Named regressions reject bag-only HEAD and
+empty scan scopes while retaining parent evidence and whitespace markers. CI stays dropped because it can
+bypass heavy admission; GITHUB_ACTIONS stays dropped because it also enables CI exemptions
+and the read-only-token exception. Guard clone paths, listing bounds, lock waits and timing
+switches remain dropped: they redirect a trusted source or tune an existing check rather than
+enable one. Existing daemon/test identities, roots, exact values and prefix predicates retain
+their classification.
+
+The tighterThan zero sweep enables zeroIsStrict only for WE_TMP_LEAK_MAX (default 50;
+any leftover exceeds zero), WE_HEAVY_ADMISSION_FAST_SLOTS (zero extra slots),
+WE_GH_THROTTLE_HEADER_WAIT_CAP_MS (zero header wait) and WE_GH_THROTTLE_RETRY_CAP_MS
+(zero backoff). Hold/per-caller caps use zero to disable enforcement; count/budget/cpu floors
+reject zero; zero container memory is unlimited. Those and the call-log minimum still reject zero.
+Registry tests pin this list and test every numeric rule from both sources. The drift inventory
+refuses any otherwise-scanned file over 16 MiB with status 2 and its path; repair/split the
+evidence for human review before treating the inventory as complete. A temp-file regression
+exercises the actual oversized-file failure and the inclusive size boundary.
 
 Codex shell_environment_policy.set.PATH uses the same pure projection as spawn env.PATH.
 The launcher finalizes both from snapshots after binary resolution, including the resolved

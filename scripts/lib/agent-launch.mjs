@@ -4,7 +4,7 @@
  * smuggling, expanded ids, accessors, Proxies, argv0, execPath/execArgv, runtime
  * env, shell env, HOME, mutation/aliasing) shared one root: inspected and executed
  * views differed. No caller argv, unclassified env, binary, or spawn options cross this boundary.
- * Parent restrictions must survive projection: nonblank restrictive markers and only
+ * Parent restrictions must survive projection: nonempty restrictive markers and only
  * exact gh auth/throttle shim directories under the real account home survive. Other
  * parent PATH entries cannot select executables; custom shims require pathPrefix.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
@@ -88,20 +88,19 @@ function envRecord(env) {
     if (typeof value !== 'string' || value.includes('\0')) fail(`inheritEnv.${key} must be a NUL-free string`);
   }
 }
-// Parse bounded positive quantities; canonicalize counts for integer-only consumers.
-function quantity(value, unit) {
+// Parse bounded quantities; zero is restrictive only when the reader says so.
+function quantity(value, { unit, minimum = 0, zeroIsStrict = false }) {
   const match = /^(\d+(?:\.\d+)?|\.\d+)([kmgt]?)$/i.exec(String(value).trim());
   if (!match || (unit !== 'bytes' && match[2])) return NaN;
   const parsed = Number(match[1]) * (1024 ** (match[2] ? 'kmgt'.indexOf(match[2].toLowerCase()) + 1 : 0));
   const n = unit === 'count' ? Math.floor(parsed) : parsed;
-  return Number.isFinite(n) && n > 0 ? n : NaN;
+  return Number.isFinite(n) && (n > 0 || (zeroIsStrict && n === 0)) && n >= minimum ? n : NaN;
 }
-function classOf(rule, value) {
+function classOf(rule, value, ceiling = rule?.tighterThan?.default) {
   if ((rule?.class === 'forward-restrictive' || rule?.restrictiveValues || rule?.restrictivePrefixes || rule?.tighterThan)
-    && !String(value).trim()) return 'drop';
+    && value === '') return 'drop';
   if (rule?.tighterThan) {
-    const n = quantity(value, rule.tighterThan.unit);
-    return n >= (rule.tighterThan.minimum ?? 0) && n < rule.tighterThan.default ? 'forward-restrictive' : 'drop';
+    return quantity(value, rule.tighterThan) < ceiling ? 'forward-restrictive' : 'drop';
   }
   if (rule?.restrictiveValues || rule?.restrictivePrefixes) {
     return rule.restrictiveValues?.includes(String(value).trim().toLowerCase())
@@ -112,19 +111,24 @@ function classOf(rule, value) {
 function inheritedEnv(inherit, ambient) {
   const out = Object.create(null);
   const checked = (rule, value, key) => rule.value === 'absolute-path' ? absolute(value, key)
-    : rule.tighterThan ? String(quantity(value, rule.tighterThan.unit))
+    : rule.tighterThan ? String(quantity(value, rule.tighterThan))
     : rule.restrictiveValues?.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : value;
   for (const [key, value] of Object.entries(inherit)) {
-    const rule = envRule(key), cls = classOf(rule, value);
+    const rule = envRule(key);
+    // Parent verification selectors are evidence, not caller capabilities.
+    if (rule?.ambientOnly) continue;
+    const parent = rule?.tighterThan ? quantity(ambient[key], rule.tighterThan) : NaN;
+    // A valid resolved parent limit is the ceiling, even above the code default.
+    const cls = classOf(rule, value, Number.isFinite(parent) ? parent : rule?.tighterThan?.default);
     if (cls === 'forward' || cls === 'forward-restrictive') out[key] = checked(rule, value, key);
   }
   for (const [key, value] of Object.entries(ambient)) {
     const rule = envRule(key);
-    if (classOf(rule, value) !== 'forward-restrictive') continue;
+    if (classOf(rule, value, Infinity) !== 'forward-restrictive') continue;
     // Validate even an overridden ambient root: malformed isolation evidence refuses launch.
     const parent = checked(rule, value, key);
     if (!Object.hasOwn(out, key) || (rule.tighterThan
-      ? quantity(parent, rule.tighterThan.unit) < quantity(out[key], rule.tighterThan.unit)
+      ? quantity(parent, rule.tighterThan) < quantity(out[key], rule.tighterThan)
       : (rule.precedence ?? 'ambient') === 'ambient')) out[key] = parent;
   }
   return out;
