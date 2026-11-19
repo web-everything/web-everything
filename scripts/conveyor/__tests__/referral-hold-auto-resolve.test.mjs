@@ -261,17 +261,28 @@ describe('complete long threads with ruled referral-kind holds', () => {
     }
   });
 
-  it('the default reader (gh stubbed) on a 100+ comment thread yields a complete read and the hold resumes', () => {
+  it('the default reader on a 100+ comment thread uses the verified reader, reads complete, and the hold resumes', () => {
     const full = thread('not-real');
-    const exec = vi.fn(() => JSON.stringify({ comments: full }));
-    const read = defaultReadComments({ repo, number: fx.number }, exec);
-    expect(exec).toHaveBeenCalledTimes(1);
+    const verified = vi.fn(() => full);
+    const read = defaultReadComments({ repo, number: fx.number }, verified);
+    expect(verified).toHaveBeenCalledWith(fx.number, { repo });
     expect(read).toEqual({ comments: full, complete: true });
     const [pr] = enrichPrsWithReferralHolds([asPr(fx, full.slice(0, GH_LIST_COMMENT_CAP))], {
-      repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {}, readComments: a => defaultReadComments(a, exec),
+      repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {}, readComments: a => defaultReadComments(a, verified),
     });
     expect(pr.commentsComplete).toBe(true);
     expect(decide(pr, hold)).toMatchObject({ outcome: 'resume' });
+  });
+
+  it('the default reader without completeness proof throws, so the capped snapshot stays incomplete and the hold stays', () => {
+    const snapshot = thread('not-real').slice(0, GH_LIST_COMMENT_CAP);
+    const unproven = () => { throw new Error('comment count mismatch'); };
+    expect(() => defaultReadComments({ repo, number: fx.number }, unproven)).toThrow(/mismatch/);
+    const [pr] = enrichPrsWithReferralHolds([asPr(fx, snapshot)], {
+      repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {}, readComments: a => defaultReadComments(a, unproven),
+    });
+    expect(pr.commentsComplete).not.toBe(true);
+    expect(decide(pr, hold)).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/may be truncated/) });
   });
 
   it('an explicit commentsComplete:false keeps the hold even for a short thread', () => {

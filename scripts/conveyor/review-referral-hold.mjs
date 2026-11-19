@@ -15,6 +15,7 @@ import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
@@ -749,12 +750,10 @@ export function enrichPrsWithReferralHoldAutoResolve(prs, { repo, env = process.
   });
 }
 
-// `gh pr view --json comments` pages through the whole thread (it is not the 100-comment list cap), so a successful
-// read is complete by construction; say so, or a 100+ comment thread would stay incomplete and its hold never resolve.
-export function defaultReadComments({ repo, number }, exec = execFileSyncThrottled) {
-  const comments = JSON.parse(exec('gh', ['pr', 'view', String(number), ...(repo ? ['--repo', repo] : []), '--json', 'comments'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
-  return { comments, complete: Array.isArray(comments) };
+// The verified paginated reader proves completeness (count, unique ids, bodies) and throws without proof, so a thread
+// it returns is complete; a failed proof throws and enrichment keeps the list snapshot (incomplete, hold stays).
+export function defaultReadComments({ repo, number }, read = readCompletePrComments) {
+  return { comments: read(number, { repo }), complete: true };
 }
 
 export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,
