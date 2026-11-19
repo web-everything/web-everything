@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { REPEAT_LINE_RE } from '../../lib/log-timestamp.mjs';
 import { defaultLogDirs } from '../../../skills-src/conveyor/daemon-log.mjs';
-import { sharedRunsDir } from '../../operations/run-store.mjs';
+import { filterRunFileNames, sharedRunsDir } from '../../operations/run-store.mjs';
 
 const minute = 60_000;
 const date = value => { const n = Date.parse(value); if (!Number.isFinite(n)) throw Error('invalid time'); return n; };
@@ -101,7 +101,8 @@ export function readReviewRuns({ dir = process.env.OPERATION_RUNS_DIR?.trim() ||
   if (runCache.dir === dir && now - runCache.at < minute && now >= runCache.at) return runCache.rows;
   let listing;
   try { listing = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; } // a runs folder that was never created holds no runs
-  const names = listing.filter(n => /^review-pr-.*\.json$/.test(n))
+  // Abandoned attempts still count toward the repeated-review pause alert.
+  const names = filterRunFileNames(listing).filter(n => n.startsWith('review-pr-'))
     .map(n => ({ n, t: statSync(join(dir, n)).mtimeMs })).filter(f => f.t > now - RUN_AGE)
     .sort((a, b) => b.t - a.t);
   if (names.length > RUN_FILES) throw Error('incomplete bounded evidence: review run file cap');

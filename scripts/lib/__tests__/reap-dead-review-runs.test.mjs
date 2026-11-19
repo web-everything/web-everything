@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, utimesSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, utimesSync, rmSync, statSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
@@ -15,16 +15,17 @@ vi.mock('../../operations/run-store.mjs', async importOriginal => {
   return { ...actual, resolveRunsDir: vi.fn(actual.resolveRunsDir), migrateLegacyRuns: vi.fn(actual.migrateLegacyRuns) };
 });
 const HOUR = 3600000, now = Date.parse('2026-11-08T12:00:00Z');
-let dir, env, probes;
+let root, dir, env, probes;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'dead-review-runs-'));
+  root = mkdtempSync(join(tmpdir(), 'dead-review-runs-'));
+  dir = join(root, 'runs'); mkdirSync(dir); mkdirSync(join(root, 'run-tombstones'));
   env = { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'preferences.json'), OPERATION_REVIEW_JOBS_DIR: join(dir, 'jobs') };
   mkdirSync(env.OPERATION_REVIEW_JOBS_DIR);
   probes = { reviewJobs: vi.fn(() => []), pidIdentity: vi.fn(() => ({ alive: false })),
     leases: vi.fn(() => '[]'), sessions: vi.fn(() => '[]') };
 });
-afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
-const effect = (status, more = {}) => ({ key: `effect-${status}`, type: 'review', stepIndex: 0, index: 0, status, ...more });
+afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+const effect = (status, more = {}) => ({ key: `effect-${status}`, type: 'review.ledger-events', payload: { verdict: 'accept' }, stepIndex: 0, index: 0, status, ...more });
 function record(id = 'review-dead', more = {}, age = 8 * HOUR) {
   const r = { ...newRunRecord({ id, op: 'review-pr', input: { pr: 123, repo: 'owner/repo' } }),
     pending: { kind: 'effect', step: 'review', stepIndex: 0 }, ...more };
@@ -36,18 +37,26 @@ function sweep(more = {}) { return reapDeadReviewRuns({ dir, now, env, probes, l
 function kept(reason, more = {}) { expect(sweep(more).kept[reason]).toEqual(['review-dead']); }
 
 it('apply creates exactly one sidecar and preserves run bytes, mtime, verdict and effects', () => {
-  const original = record(undefined, { verdict: { outcome: 'needs-work' }, effects: [effect('in-flight')] });
+  const original = record(undefined, { verdict: { verdict: 'accept' }, effects: [effect('in-flight')] });
   const path = runPath(original.id, dir), before = readFileSync(path), mtime = statSync(path).mtimeMs;
   expect(sweep().reaped).toEqual([original.id]);
   expect(readFileSync(path)).toEqual(before); expect(statSync(path).mtimeMs).toBe(mtime);
   const tombstone = JSON.parse(readFileSync(abandonedPath(original.id, dir), 'utf8'));
   expect(tombstone).toMatchObject({ by: 'reap-dead-review-runs', at: new Date(now).toISOString(),
-    reason: 'dead: no live pid/handle/lease/session; unchanged for >= 6h' });
+    reason: expect.stringContaining('abandoned, effect NOT claimed applied') });
   expect(isRunTerminalOrAbandoned(original, original.id, dir, isRunRecordTerminal)).toBe(true);
   const bytes = readFileSync(abandonedPath(original.id, dir));
   expect(sweep().kept.abandoned).toEqual([original.id]);
   expect(readFileSync(abandonedPath(original.id, dir))).toEqual(bytes);
-  expect(readdirSync(dir).filter(f => f.endsWith('.abandoned.json'))).toHaveLength(1);
+  expect(readdirSync(join(root, 'run-tombstones')).filter(f => f.endsWith('.json'))).toHaveLength(1);
+});
+it('retains a malformed needs-work verdict without creating a sidecar or changing its bytes', () => {
+  const original = record(undefined, { verdict: { outcome: 'needs-work' }, effects: [effect('in-flight')] });
+  const path = runPath(original.id, dir), before = readFileSync(path), mtime = statSync(path).mtimeMs;
+  expect(sweep().kept['rejecting-verdict']).toEqual([original.id]);
+  expect(readFileSync(path)).toEqual(before); expect(statSync(path).mtimeMs).toBe(mtime);
+  expect(isRunAbandoned(original.id, dir)).toBe(false);
+  expect(readdirSync(join(root, 'run-tombstones')).some(f => f.endsWith('.json'))).toBe(false);
 });
 it('never manufactures a verdict when the verdict is null', () => {
   record(); sweep(); expect(tryReadRun('review-dead', dir).verdict).toBeNull();
@@ -56,7 +65,7 @@ it('dry-run leaves file bytes identical and reports wouldReap', () => {
   record(); const before = readFileSync(runPath('review-dead', dir));
   const r = reapDeadReviewRuns({ dir, now, env, probes, log: () => {} });
   expect(r.wouldReap).toEqual(['review-dead']); expect(r.reaped).toEqual([]);
-  expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
+  expect(readdirSync(join(root, 'run-tombstones')).some(f => f.endsWith('.json'))).toBe(false);
   expect(readFileSync(runPath('review-dead', dir))).toEqual(before);
 });
 it('ignores other operations and keeps terminal records without running probes', () => {
@@ -75,7 +84,7 @@ it('keeps mandatoryReferrals pending cursor', () => {
   record(undefined, { pending: { kind: 'effect', step: 'mandatoryReferrals', stepIndex: 0 } }); kept('suspended-mandatory-referrals');
 });
 it('keeps young work without running probes', () => {
-  record(undefined, {}, HOUR); kept('young'); expect(probes.leases).not.toHaveBeenCalled();
+  record(undefined, {}, 10 * 60000); kept('young'); expect(probes.leases).not.toHaveBeenCalled();
 });
 it('keeps corrupt JSON and leaves its bytes untouched', () => {
   writeFileSync(runPath('review-dead', dir), '{corrupt'); kept('unreadable');
@@ -198,7 +207,7 @@ it.each(['leases', 'sessions'])('holds every candidate when the %s listing is {}
   const log = vi.fn(); const result = sweep({ log });
   expect(result.reaped).toEqual([]);
   expect(result.kept['probe-unreadable']).toEqual(['first', 'second']);
-  expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
+  expect(readdirSync(join(root, 'run-tombstones')).some(f => f.endsWith('.json'))).toBe(false);
   expect(log.mock.calls.flat().join('\n')).toContain('restore probe access and retry');
 });
 it.each([
@@ -231,7 +240,7 @@ it.each([
   const log = vi.fn(); const result = sweep({ log });
   expect(result.reaped).toEqual([]);
   expect(result.kept['probe-unreadable']).toEqual(['first', 'second']);
-  expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
+  expect(readdirSync(join(root, 'run-tombstones')).some(f => f.endsWith('.json'))).toBe(false);
   expect(log.mock.calls.flat().join('\n')).toContain('restore probe access and retry');
 });
 it.each([
@@ -245,7 +254,7 @@ it.each([
   const log = vi.fn(); const result = sweep({ log });
   expect(result.reaped).toEqual([]);
   expect(result.kept['probe-unreadable']).toEqual(['first', 'second']);
-  expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
+  expect(readdirSync(join(root, 'run-tombstones')).some(f => f.endsWith('.json'))).toBe(false);
   expect(log.mock.calls.flat().join('\n')).toContain('restore probe access and retry');
 });
 it.each([
@@ -374,7 +383,8 @@ it.each([['dry-run', false], ['apply', true]])('resolves the default dir without
   expect(result[apply ? 'reaped' : 'wouldReap']).toEqual(['review-dead']); // the default dir was really used
   expect(resolveRunsDir).not.toHaveBeenCalled(); // the only resolver that migrates legacy per-clone runs
   expect(migrateLegacyRuns).not.toHaveBeenCalled();
-  expect(readdirSync(shared).filter(f => f.endsWith('.abandoned.json'))).toEqual(apply ? ['review-dead.abandoned.json'] : []);
+  expect(readdirSync(shared)).toEqual(['review-dead.json']);
+  expect(existsSync(abandonedPath('review-dead', shared))).toBe(apply);
 });
 it('re-abandons a resumed run that dies again: stale tombstone is replaced, not reported already-abandoned', () => {
   record();
@@ -389,7 +399,7 @@ it('re-abandons a resumed run that dies again: stale tombstone is replaced, not 
   expect(second.reaped).toEqual(['review-dead']);
   const fresh = new Date(now + 2 * HOUR); utimesSync(abandonedPath('review-dead', dir), fresh, fresh);
   expect(isRunAbandoned('review-dead', dir)).toBe(true);
-  expect(readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
+  expect(readdirSync(join(root, 'run-tombstones')).filter(f => f.endsWith('.tmp'))).toEqual([]);
 });
 it('an unreplaceable stale tombstone (a directory) is kept and does not abort the sweep of other runs', () => {
   record('review-poisoned'); record('review-dead');
@@ -397,7 +407,7 @@ it('an unreplaceable stale tombstone (a directory) is kept and does not abort th
   const r = sweep();
   expect(r.kept['stale-tombstone-unreplaceable']).toEqual(['review-poisoned']);
   expect(r.reaped).toEqual(['review-dead']);
-  expect(readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
+  expect(readdirSync(join(root, 'run-tombstones')).filter(f => f.endsWith('.tmp'))).toEqual([]);
 });
 it.each([['zero-byte', ''], ['partial', '{"at":']])('a crash-left %s tombstone does not make the run permanently un-reapable', (_n, body) => {
   record(); writeFileSync(abandonedPath('review-dead', dir), body);
@@ -467,7 +477,7 @@ it('a newer live record wins over an existing tombstone', () => {
 
 it.each([1, 'true', {}, undefined])('only literal apply:true writes; %j remains dry-run', apply => {
   record(); expect(sweep({ apply }).wouldReap).toEqual(['review-dead']);
-  expect(readdirSync(dir).filter(f => f.endsWith('.abandoned.json'))).toEqual([]);
+  expect(readdirSync(join(root, 'run-tombstones')).filter(f => f.endsWith('.json'))).toEqual([]);
 });
 
 it('a writer landing immediately before sidecar creation remains alive', () => {

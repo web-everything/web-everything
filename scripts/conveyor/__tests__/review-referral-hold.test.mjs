@@ -5,6 +5,7 @@ import { publishAttention, runOnce as pollNeedsYou, unacknowledged, acknowledge 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
+import { markRunAbandoned } from '../../lib/run-abandoned.mjs';
 import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -1265,4 +1266,70 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
       expect(find(pr({ comments: thread([ruling]) }), [reviewRunEvidence(late)])).toEqual({ id: 'review-pr-parked', head });
     });
   });
+});
+
+
+describe('abandoned same-head attempt accounting', () => {
+  it.each([[1, 0], [3, 0], [3, 6], [4, 6], [9, 6]])(
+    '%s abandoned attempts still spend the retry budget with %s cooldown releases', (count, releases) => {
+      const dir = join(temp(), 'runs'); mkdirSync(dir);
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      const memo = new Map();
+      for (let i = 0; i < count; i++) {
+        const r = newRunRecord({ id: `review-pr-abandoned-${i}`, op: 'review-pr', input: { repo, pr: 3481 } });
+        r.findings = { read: { repo, pr: 3481, netBasis: { rev: head } } };
+        r.pending = { kind: 'judge', step: 'judge', stepIndex: 2 };
+        r.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: iso(at + i * 60_000) }];
+        writeRun(r, dir);
+      }
+      const before = readReviewRunEvidence({ dir, memo }); // warm both cache paths before tombstoning
+      for (const row of before) {
+        expect(markRunAbandoned({ id: row.id, dir, now: at + count * 60_000,
+          reason: 'stuck judge', probes: {}, by: 'fixture' }).written).toBe(true);
+      }
+      const p = pr({ labels: [{ name: 'review:pending' }] });
+      const env = { OPERATION_RUNS_DIR: dir, WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: String(releases) };
+      const latest = at + (count - 1) * 60_000, now = latest + 10 * 60_000;
+      for (const rows of [readReviewRunEvidence({ dir, memo }), readReviewRunEvidence({ dir, memo: new Map() })]) {
+        expect(rows).toEqual(before);
+        expect(rows).toHaveLength(count);
+        expect(rows.every(r => r.incomplete)).toBe(true);
+        const held = enrichPrsWithReferralHolds([p], { repo, env, now, readRuns: () => rows })[0].referralHold;
+        if (count === 1) expect(held).toBeNull(); // one abandonment still permits a fresh review
+        else if (releases === 0 || count === 9) {
+          expect(held).toMatchObject({ kind: 'same-head', count, retryAt: null,
+            noVerdict: { exhausted: true, releasesSpent: count - 3, releases } });
+        } else {
+          const retryAt = latest + VERDICT_COOLDOWN_BASE_MS * 2 ** (count - 3);
+          expect(held).toMatchObject({ kind: 'same-head', count, retryAt,
+            noVerdict: { exhausted: false, releasesSpent: count - 3, releases } });
+          expect(enrichPrsWithReferralHolds([p], { repo, env, now: retryAt, readRuns: () => rows })[0].referralHold).toBeNull();
+        }
+        // Cached/injected parked evidence still cannot resume or impose an unfinished referral hold.
+        const parked = rows.map(r => ({ ...r, parked: true, retryableRecordEffect: true,
+          attempted: true, persistenceFailed: true, completedAt: r.startedAt + 1 }));
+        expect(findResumableParkedRun(p, parked, { repo, runsDir: dir })).toBeNull();
+        expect(decideReferralHold(p, parked, { repo, env, now })).toBeNull();
+      }
+    });
+});
+
+
+it('abandoned retries consume an older parked review release instead of bypassing the same-head budget', () => {
+  const dir = join(temp(), 'runs'); mkdirSync(dir);
+  const initial = run(); writeRun(initial, dir);
+  for (let i = 0; i < 3; i++) {
+    const r = newRunRecord({ id: `review-pr-abandoned-after-wake-${i}`, op: 'review-pr', input: { repo, pr: 3481 } });
+    r.findings = { read: { repo, pr: 3481, netBasis: { rev: head } } };
+    r.pending = { kind: 'judge', step: 'judge', stepIndex: 2 };
+    r.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: iso(at + (i + 2) * 60_000) }];
+    writeRun(r, dir);
+    markRunAbandoned({ id: r.id, dir, now: at + 10 * 60_000, reason: 'stuck judge', probes: {}, by: 'fixture' });
+  }
+  const p = pr({ labels: [{ name: 'review:pending' }], comments: [comment('Please review again.', at + 60_000, 'chalbert')] });
+  const rows = readReviewRunEvidence({ dir, memo: new Map() });
+  expect(rows).toHaveLength(4);
+  expect(enrichPrsWithReferralHolds([p], { repo, now: at + 60 * 60_000,
+    env: { OPERATION_RUNS_DIR: dir, WE_REVIEW_NO_VERDICT_COOLDOWN_RELEASES: '0' }, readRuns: () => rows })[0].referralHold)
+    .toMatchObject({ kind: 'same-head', count: 3, retryAt: null, noVerdict: { exhausted: true } });
 });

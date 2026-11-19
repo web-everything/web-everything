@@ -1000,14 +1000,14 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(defaultQueueFile({ WE_RED_TEAM_QUEUE_FILE: override }, home)).toBe(override);
   });
   describe('non-runnable head does not consume an admission', () => {
-    const block = async (f, pr) => {
+    const block = async (f, pr, reason = 'review-unfinished') => {
       f.queue.admit(repo, pr);
-      await f.queue.settle(repo, refused(pr, 'review-unfinished'));
+      await f.queue.settle(repo, refused(pr, reason));
     };
-    it('a review-unfinished head is probed each tick but the next runnable PR is admitted in the same tick', async () => {
+    it.each(['review-unfinished', 'review-abandoned'])('a %s head is probed each tick but the next runnable PR is admitted in the same tick', async reason => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2, 3]));
-      await block(f, 1);
+      await block(f, 1, reason);
       expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2]);
       expect(f.logs.some(line => line.includes('probe example/project#1'))).toBe(true);
       expect(f.logs.some(line => line.includes('admit example/project#2: capacity 1'))).toBe(true);
@@ -1053,7 +1053,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       }))));
       return f.open();
     };
-    it.each(['review-unfinished', 'planner-skip'])('new %s blocks join the tail and preserve turns assigned to probes', reason => {
+    it.each(['review-unfinished', 'review-abandoned', 'planner-skip'])('new %s blocks join the tail and preserve turns assigned to probes', reason => {
       const f = fixture();
       const queue = persistedBlocked(f, reason, [6, 7]);
       queue.admit(repo, 2);
@@ -1137,7 +1137,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(f.open().entries()).toEqual(reopened.entries());
       expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
     });
-    it.each(['review-unfinished', 'planner-skip'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
+    it.each(['review-unfinished', 'review-abandoned', 'planner-skip'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
       const f = fixture();
       let queue = persistedBlocked(f, reason);
       const turns = [[1, 2], [3, 4], [1, 5]]; // selected entries retain queue order in runner input
@@ -1163,7 +1163,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       }
       expect([...seen]).toEqual([1, 2, 3, 4, 5]);
     });
-    it.each(['review-unfinished', 'planner-skip'])('settles all five persisted %s entries over capped ticks', reason => {
+    it.each(['review-unfinished', 'review-abandoned', 'planner-skip'])('settles all five persisted %s entries over capped ticks', reason => {
       const f = fixture();
       const queue = persistedBlocked(f, reason);
       const remaining = [[1, 2, 3, 4, 5], [3, 4, 5], [5]];
