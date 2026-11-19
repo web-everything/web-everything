@@ -984,12 +984,15 @@ describe('the label sink', () => {
 
   // A child that never started (spawn refused) wrote nothing; one that ran and was killed or exited stays UNKNOWN.
   const gateOk = async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' });
-  const staleRefusal = () => {
+  const staleRefusal = (spawn) => {
     try {
       assertOperatorCliFresh(root, {
         label: 'review-set-label', skipUnderVitest: false,
-        env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' },
-        run: args => ({ status: 0, stdout: args[0] === 'rev-list' ? '2' : '' }),
+        env: { WE_OPERATOR_CLI_FRESH_FALLBACK: spawn ? 'on' : 'off' },
+        ...(spawn ? { spawn, cwd: root, argv: [process.execPath, `${root}/scripts/review-set-label.mjs`],
+          exists: () => true, write: () => {} } : {}),
+        run: (args, opts) => ({ status: 0, stdout: args[0] === 'rev-list' ? (opts.cwd === root ? '2' : '0')
+          : args[0] === 'rev-parse' ? `${root}/fresh` : '' }),
         listBehindFiles: () => ['scripts/review-set-label.mjs'],
       });
     } catch (error) { return error.message; }
@@ -1030,9 +1033,12 @@ describe('the label sink', () => {
     expect(freshNode.mock.calls[0][0]).toContain('--to=accepted');
   });
 
-  it.each(['transport', 'missing no-write suffix', 'missing operator marker', 'missing stale marker'])(
+  it.each(['transport', 'missing no-write suffix', 'missing operator marker', 'missing stale marker',
+    'fresh child signal death', 'fresh child error'])(
     '%s failure stays UNKNOWN', async kind => {
-      const text = kind === 'transport' ? 'fatal: unable to access'
+      const text = kind === 'fresh child signal death' ? staleRefusal(() => ({ status: null, signal: 'SIGTERM' }))
+        : kind === 'fresh child error' ? staleRefusal(() => ({ error: new Error('child failed') }))
+        : kind === 'transport' ? 'fatal: unable to access'
         : kind === 'missing no-write suffix' ? staleRefusal().replace('Nothing was changed.', '')
           : staleRefusal().replace(kind === 'missing operator marker' ? OPERATOR_CLI_STALE_MARKER : STALE_MAIN_REFUSAL_MARKER, '');
       expect(isPreWriteRefusal(text)).toBe(false);
@@ -1041,6 +1047,7 @@ describe('the label sink', () => {
       const error = await sinks[REVIEW_EFFECTS.LABEL](payload, CTX).catch(e => e);
       expect(error.message).toContain('outcome is UNKNOWN');
       expect(error.notApplied).toBeUndefined();
+      expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error: error.message })).toBe(false);
     },
   );
   it.each(['ENOENT', 'EAGAIN', 'ENOMEM', 'E2BIG'])('a single home that could not be started (%s) is notApplied', async (code) => {

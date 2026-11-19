@@ -14,14 +14,18 @@ export default {
   card: 'operator stale-guard label retry',
   fixedBy: { sha: 'HEAD', where: SOURCE, paths: [SOURCE] },
   fixPresent(root) {
-    // defineBreakTest needs a synchronous answer. Probe the supplied tree's sink, never its source text.
+    // Probe classifier support separately: a regressed sink must fail the required-pass body,
+    // rather than switch that same failing assertion into defineBreakTest's it.fails branch.
     const code = `
-      const { default: b } = await import(process.argv[1]);
-      const report = await b.run({ sourceRoot: process.argv[2] });
-      process.stdout.write(report.violations.length === 0 ? 'retryable' : 'stranded');
+      try {
+        const { isPreWriteRefusal } = await import(process.argv[1]);
+        const refusal = 'review-set-label: this checkout is 2 commit(s) behind origin/main in code it runs '
+          + '(STALE code from this checkout) — run from an up-to-date lane. Nothing was changed.';
+        process.stdout.write(isPreWriteRefusal(refusal) ? 'retryable' : 'stranded');
+      } catch { process.stdout.write('stranded'); }
     `;
-    const probe = spawnSync(process.execPath, ['--input-type=module', '-e', code, import.meta.url, root], {
-      encoding: 'utf8', timeout: 20_000, maxBuffer: 1024 * 1024,
+    const probe = spawnSync(process.execPath, ['--input-type=module', '-e', code, pathToFileURL(join(root, SOURCE)).href], {
+      encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     return !probe.error && probe.status === 0 && probe.stdout === 'retryable';
