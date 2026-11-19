@@ -1991,7 +1991,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false, read
   // shared-ancestor topology and so failed open while looking protective — see `isForeignLease`, lane-lease.mjs).
   // The parent is the long-lived caller; its PID protects liveness, never ownership.
   const mintedHolder = mintHolderSlug(dir, flags.purpose);
-  const bodyFor = (holder, workerSession) => JSON.stringify(
+  const bodyFor = (holder, workerSession, prior = null) => JSON.stringify(
     leaseBody({
       session, purpose: flags.purpose, acquiredAt: new Date(nowMs).toISOString(), ttlMinutes: ttlMinutesFromFlags(),
       host: hostname(), pid: process.ppid,
@@ -2010,7 +2010,8 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false, read
       // #2413 — `--purpose=workflow-lane` MARKS the lease: it stamps the dedicated `workflowLane: true` field
       // (not free-text purpose) that switches the destructive-op guard fail-closed for this lane, requiring a
       // sibling parallel lane to assert this lease's own minted `session` slug before it can clobber the clone.
-      workflowLane: flags.purpose === WORKFLOW_LANE_PURPOSE,
+      // A same-session re-acquire never drops an existing mark (that would loosen the ownership guard).
+      workflowLane: flags.purpose === WORKFLOW_LANE_PURPOSE || !!prior?.workflowLane,
       // #2560 — persist the ADVISORY predicted file-scope declared via `acquire --scope=` (omitted when empty,
       // so a scope-less acquire's marker is unchanged). This is the real predicted-scope source the live
       // scope-lease collector/observer reads; it NEVER gates the claim (the O_EXCL marker below is the lock).
@@ -2053,7 +2054,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false, read
     const holder = laneHolderSlug(existing) || mintedHolder;
     // …and it KEEPS the declared occupant for the same reason: dropping it would silently un-protect a lane an
     // agent is working in. `--adopt` on the re-acquire is the deliberate way to (re-)claim it.
-    writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing)));
+    writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing), existing));
     return holder;
   }
   if (isLeaseStale(existing, nowMs, ttlMs)) {

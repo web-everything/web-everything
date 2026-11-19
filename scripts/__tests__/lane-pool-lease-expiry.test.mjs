@@ -43,10 +43,11 @@ it.each(['live', 'dirty'])('stale %s lane refuses takeover and reclaim, even wit
   if (kind === 'dirty') expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
 });
 it('re-adopts an owned lane from its cwd without a canonical origin and preserves dirty work', () => {
-  seed({ holder: 'existing-holder' });
+  seed({ holder: 'existing-holder', workflowLane: true });
   writeFileSync(join(lane, 'work'), 'precious work');
   const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', '--json'], lane);
   expect(result.status, result.stderr).toBe(0);
+  expect(readLease().workflowLane).toBe(true);
   expect(readLease().holder).toBe('existing-holder');
   expect(readLease().pid).toBe(process.pid);
   expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
