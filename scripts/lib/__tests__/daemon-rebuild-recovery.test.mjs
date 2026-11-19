@@ -173,7 +173,7 @@ describe('overdue recovery launch bounds', () => {
     expect((await f.invoke()).reason).toBe('rebuild-job-started');
     const rec = f.store.list().records[0];
     f.store.update(rec.id, r => markSucceeded(r, { at: at(2_000_000) }));
-    writeFileSync(join(f.store.dir, `${rec.id}${RESULT_SUFFIX}`), JSON.stringify({ readyRecorded }));
+    writeFileSync(join(f.store.dir, `${rec.id}${RESULT_SUFFIX}`), JSON.stringify({ reason: readyRecorded ? 'ready-recorded' : 'smoke-env-timeout', readyRecorded }));
     f.advance(59999);
     expect(await f.invoke('up-to-date', { store: createJobStore(f.store.dir) })).toMatchObject({ reason: 'rebuild-job-spaced', retryInMs: 1 });
     expect(f.store.list().records).toHaveLength(1);

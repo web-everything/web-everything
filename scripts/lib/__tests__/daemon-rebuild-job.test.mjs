@@ -169,7 +169,7 @@ describe('the job records a passed build; the tick adopts it without re-smoking'
     expect(smoke).toHaveBeenCalledTimes(1);
     expect(readReadyCandidate(cloneDir, env)).toBeNull();
     store.update(queued.id, r => markSucceeded(r, { at: new Date().toISOString() }));
-    writeFileSync(join(store.dir, `${queued.id}${RESULT_SUFFIX}`), JSON.stringify({ readyRecorded: true }));
+    writeFileSync(join(store.dir, `${queued.id}${RESULT_SUFFIX}`), JSON.stringify({ reason: 'ready-recorded', readyRecorded: true }));
     const next = await rebuildCloneAsJob(options);
     expect(next).toMatchObject({ reason: 'rebuild-job-started', plan: { finalSha: latest } });
     expect(head(cloneDir)).toBe(target);

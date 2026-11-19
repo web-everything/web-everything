@@ -68,11 +68,48 @@ export function readRebuildStateStrict(root, env = process.env, read = readFileS
   return readState(root, env, true, read);
 }
 
+const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const string = v => typeof v === 'string' && v.length > 0;
+const date = v => string(v) && Number.isFinite(Date.parse(v));
+const positive = v => Number.isSafeInteger(v) && v > 0;
+const strings = v => Array.isArray(v) && v.every(string);
+const applied = v => Array.isArray(v) && v.every(r => object(r) && string(r.ref) && string(r.sha));
+const fields = (v, required, optional = {}) => object(v)
+  && Object.entries(required).every(([k, valid]) => valid(v[k]))
+  && Object.entries(optional).every(([k, valid]) => !(k in v) || valid(v[k]));
+const backoff = { retryAt: date, attempts: positive };
+const stateShapes = {
+  held: v => fields(v, { reason: string }, { ...backoff, since: date, updatedAt: date })
+    && date(v.updatedAt ?? v.since ?? v.retryAt)
+    // Historical timeout holds predate retryAt/attempts; their persisted date is the deadline origin.
+    && (v.reason !== 'smoke-env-timeout' || date(v.retryAt ?? v.updatedAt ?? v.since)),
+  rejected: v => fields(v, { inputsKey: string }, { ...backoff, reason: string, at: date,
+    harnessBroken: v => typeof v === 'boolean', externalOnly: v => typeof v === 'boolean',
+    envLoad: v => typeof v === 'boolean', dispatchSmoke: v => typeof v === 'boolean' })
+    && (!(v.harnessBroken || v.externalOnly || v.envLoad) || date(v.retryAt)),
+  adopted: v => fields(v, { head: string, inputsKey: string }, { applied, mainSha: string, at: date }),
+  inProgress: v => fields(v, { pid: positive, host: string, startedAt: date, prevHead: string, target: string },
+    { inputsKey: string, mainSha: string, applied, verified: v => typeof v === 'boolean' }),
+  quarantine: v => fields(v, { prevHead: string, reason: string }),
+  unverified: v => fields(v, { head: string, prevHead: string }),
+  building: v => fields(v, { token: string, pid: positive, host: string, startedAt: date,
+    target: string, inputsKey: string, path: string }, { adoptOnly: v => typeof v === 'boolean' }),
+  busySkippedTrees: strings,
+  forceUnverifiedTrees: strings,
+  smokePassed: v => Array.isArray(v) && v.every(r => fields(r, { key: string, tree: string, passedAt: date })),
+  pinnedNotified: v => object(v) && Object.values(v).every(string),
+};
+
 function readState(root, env, strict, read = readFileSync) {
   try {
     const parsed = JSON.parse(read(rebuildStatePath(root, env), 'utf8'));
     if (strict && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) {
       throw new Error('Invalid rebuild state object');
+    }
+    if (strict) for (const [key, valid] of Object.entries(stateShapes)) {
+      if (parsed[key] !== undefined && parsed[key] !== null && !valid(parsed[key])) {
+        throw new Error(`Invalid rebuild state ${key}`);
+      }
     }
     return {
       adopted: parsed?.adopted ?? null,
@@ -130,6 +167,19 @@ export function readReadyCandidate(root, env = process.env) {
   } catch {
     return null;
   }
+}
+
+/** Admission must distinguish absent ready evidence from unreadable or incomplete evidence. */
+export function readReadyCandidateStrict(root, env = process.env, read = readFileSync) {
+  let text;
+  try { text = read(readyCandidatePath(root, env), 'utf8'); }
+  catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
+  const r = JSON.parse(text);
+  if (!fields(r, { prevHead: string, adopt: v => fields(v, { finalSha: string },
+    { inputsKey: string, mainSha: string, applied }) }, { tree: string, passedAt: date })) {
+    throw new Error('Invalid ready candidate');
+  }
+  return r;
 }
 
 export function writeReadyCandidate(root, record, env = process.env) {
