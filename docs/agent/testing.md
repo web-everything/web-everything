@@ -5115,3 +5115,8 @@ path qualification must happen in the shared card renderer so proof and persiste
 In `codex-audit.test.mjs`, pass generated cards through the real held-card parser,
 including U+2028/U+2029 finding text. Normalize line separators at serialization while
 preserving the original finding in the audit record and keeping block-mode bytes pinned.
+
+Keep audit proof dependencies outside held-card filing and CLI loading. Share basename
+qualification through `scripts/lib/qualify-bare-basenames.mjs`; importing the filer from the
+classifier pulls the CLI adapter into review/promotion closures and creates a cycle through
+the audit loader. The import-closure regression in `audit-base-repro.test.mjs` pins this boundary.

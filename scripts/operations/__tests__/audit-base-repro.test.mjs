@@ -4,6 +4,19 @@ import { cardHash, cardLine, classifyPreExisting, parseDiffChangedLines, parseRe
 import { symbolRangeAt } from '../../lib/audit-finding-key.mjs';
 import { AUDITOR_FLOOR } from '../../lib/audit-settings.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
+import { collectImportClosure } from '../../lib/import-closure.mjs';
+import { fileURLToPath } from 'node:url';
+
+it('keeps base-reproduction proof outside held-card filing and CLI loading', () => {
+  const closure = collectImportClosure({ root: fileURLToPath(new URL('../../../', import.meta.url)),
+    entries: ['scripts/operations/audit-base-repro.mjs'] });
+  expect(closure?.complete).toBe(true);
+  expect(closure.files.has('scripts/lib/qualify-bare-basenames.mjs')).toBe(true);
+  for (const file of ['scripts/operations/file-held-cards.mjs', 'scripts/operations/cli-adapter.mjs',
+    'scripts/operations/run.mjs', 'scripts/lib/read-only-ops.mjs']) {
+    expect(closure.files.has(file)).toBe(false);
+  }
+});
 
 const source = 'function X() {\n  return unsafe();\n}\nfunction Y() {\n  return fixed();\n}\n';
 const finding = { text: 'lib/x.mjs:2 missing guard', sourceText: source };
