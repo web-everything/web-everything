@@ -6,7 +6,8 @@ const passing = new Set(['success', 'neutral', 'skipped']);
 const cancelled = new Set(['cancelled', 'timed_out']);
 const runnerLoss = /\blost communication\b|\b(?:self-hosted[ \t]+)?runner[ \t]+(?:(?:has|was|is)[ \t]+)?(?:disconnected|went away|lost connection|stopped responding|failed to (?:start|connect))\b/i;
 const timeout = /\b(?:job|execution|operation) (?:has )?(?:exceeded|timed out)|\bexceeded (?:the )?(?:maximum execution time|time limit)|\bjob was canceled because it exceeded\b/i;
-const intrinsicFailure = /assert|expected|\bexpect\(|\btests?\b|✗|×|\bFAIL\b|process completed with exit code [1-9]\d*/i;
+const intrinsicFailure = /assert|expected|\bexpect\(|\btests?\b|[✓✔☑✅✕✖✗✘×❌]|\bFAIL\b|\bexit(?:[ -]code| code)?\s*[:=]?\s*-?[1-9]\d*/i;
+const JOB_LOG_MAX_BYTES = 4 * 1024 * 1024;
 const summarySteps = new Map([['test', 'Gate on shard results'], ['coverage-merge', 'Require successful shards']]);
 const local = name => typeof name === 'string' ? name.split(' / ').at(-1) : name;
 const stamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
@@ -25,10 +26,7 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
   const candidate = failed.some(check => cancelled.has(check.conclusion) || infraText(outputText(check))
     || !aggregateJobs.includes(local(check.name)) && check.output?.annotations_count > 0);
   let workflow;
-  const durationTimeout = job => {
-    if (!cancelled.has(job.conclusion) || job.steps.some(step => step.conclusion === 'failure')) return false;
-    const start = stamp(job?.started_at), end = stamp(job?.completed_at);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return false;
+  const readWorkflow = () => {
     if (!workflow) {
       // Actions jobs expose timestamps, not timeout-minutes. Read the exact tested workflow,
       // never the checkout's current configuration or an assumed default timeout.
@@ -41,9 +39,21 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
       workflow = yaml.safeLoad(bytes.toString('utf8'), { schema: yaml.JSON_SCHEMA });
       if (!workflow?.jobs || typeof workflow.jobs !== 'object') throw new Error('workflow timeout evidence incomplete');
     }
-    const matches = Object.entries(workflow.jobs).filter(([key, config]) => config && typeof config === 'object'
-      && (key === local(job.name) || config.name === local(job.name)));
-    const minutes = matches.length === 1 ? matches[0][1]['timeout-minutes'] : null;
+    return workflow.jobs;
+  };
+  const matchesJob = (key, config, name) => config && typeof config === 'object'
+    && (config.name ? config.name === local(name) : key === local(name)
+      || config.strategy?.matrix && local(name)?.startsWith(`${key} (`) && local(name).endsWith(')'));
+  const resolveJob = name => {
+    const matches = Object.entries(readWorkflow()).filter(([key, config]) => matchesJob(key, config, name));
+    if (matches.length !== 1) throw new Error('workflow aggregate needs cannot be resolved');
+    return matches[0];
+  };
+  const durationTimeout = job => {
+    if (!cancelled.has(job.conclusion) || job.steps.some(step => step.conclusion === 'failure')) return false;
+    const start = stamp(job?.started_at), end = stamp(job?.completed_at);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return false;
+    const minutes = resolveJob(job.name)[1]['timeout-minutes'];
     return typeof minutes === 'number' && Number.isFinite(minutes) && minutes > 0 && end - start >= minutes * 60_000;
   };
   if (!candidate) return undefined;
@@ -55,7 +65,7 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
   if (attempts.reason || attempts.confirmed !== true && attempts.candidates.length !== failed.length)
     return decline(attempts.reason || 'job attempt evidence unreadable or incomplete');
   try {
-    const runs = new Map(), intrinsicRuns = new Set(), derivedRuns = new Set();
+    const runs = new Map(), infraJobs = new Set(), derivedJobs = new Map();
     const infraNames = [], derivedNames = [];
     for (const check of failed) {
       const identity = mqActionsJob(check, repo);
@@ -84,7 +94,7 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
         && job.steps.filter(step => step.conclusion === 'failure').length === 1
         && job.steps.every(step => passing.has(step.conclusion) || step.name === gate && step.conclusion === 'failure')) {
         derivedNames.push(check.name);
-        derivedRuns.add(run.id);
+        derivedJobs.set(check, run.id);
         continue;
       }
       if (intrinsicFailure.test(outputText(check))) return decline('non-infrastructure failed job');
@@ -101,26 +111,55 @@ export function readMqInfraJobs({ checks, repo, commit, removedAt, aggregateJobs
       }
       const text = `${outputText(check)}\n${annotationText}`;
       if (intrinsicFailure.test(text)) return decline('non-infrastructure failed job');
-      const needsText = !cancelled.has(job.conclusion) || job.steps.some(step => step.conclusion === 'failure');
-      if (needsText) {
-        // Failure conclusions/steps require positive text and a whole bounded log; elapsed time cannot suffice.
-        const log = readLog(`actions/jobs/${identity.id}/logs`);
-        if (typeof log !== 'string' || !log.trim() || Buffer.byteLength(log) >= 4 * 1024 * 1024)
-          return decline('job log evidence unreadable or incomplete');
-        if (intrinsicFailure.test(log) || !(infraText(text) || infraText(log)))
-          return decline('non-infrastructure failed job');
-      } else if (!(infraText(text) || job.steps.some(step => cancelled.has(step.conclusion)) || durationTimeout(job))) {
+      // Cancellation metadata never replaces a whole-log veto: runners can stop after a real failure.
+      const log = readLog(`actions/jobs/${identity.id}/logs`);
+      if (typeof log !== 'string' || !log.trim() || Buffer.byteLength(log) >= JOB_LOG_MAX_BYTES)
+        return decline('job log evidence unreadable, incomplete or exceeds 4-MiB limit');
+      if (intrinsicFailure.test(log)) return decline('non-infrastructure failed job');
+      const noFailedStep = cancelled.has(job.conclusion) && !job.steps.some(step => step.conclusion === 'failure');
+      if (!(infraText(text) || infraText(log) || noFailedStep
+        && (job.steps.some(step => cancelled.has(step.conclusion)) || durationTimeout(job)))) {
         return decline('non-infrastructure failed job');
       }
       infraNames.push(check.name);
-      intrinsicRuns.add(run.id);
+      infraJobs.add(check);
     }
-    if (!infraNames.length || [...derivedRuns].some(run => !intrinsicRuns.has(run)))
-      return decline('derived aggregate has no infrastructure job in the same run');
+    if (!infraNames.length) return decline('derived aggregate has no infrastructure job');
+    const validated = new Set(), visiting = new Set();
+    const validateDerived = check => {
+      if (validated.has(check)) return true;
+      if (visiting.has(check)) return false;
+      visiting.add(check);
+      const [, config] = resolveJob(check.name);
+      const needs = typeof config.needs === 'string' ? [config.needs] : config.needs;
+      if (!Array.isArray(needs) || !needs.length || needs.length > 100
+        || needs.some(key => typeof key !== 'string' || !/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key)))
+        throw new Error('workflow aggregate needs cannot be resolved');
+      let causedByInfra = false;
+      for (const key of needs) {
+        const dependency = readWorkflow()[key];
+        if (!dependency) throw new Error('workflow aggregate needs cannot be resolved');
+        const needed = checks.filter(candidate => matchesJob(key, dependency, candidate.name)
+          && Number(mqActionsJob(candidate, repo)?.run) === derivedJobs.get(check));
+        if (!needed.length) throw new Error('workflow aggregate needs cannot be resolved');
+        for (const candidate of needed) {
+          if (infraJobs.has(candidate)) causedByInfra = true;
+          else if (!passing.has(candidate.conclusion)
+            && (!derivedJobs.has(candidate) || !validateDerived(candidate))) return false;
+        }
+      }
+      if (!causedByInfra) return false;
+      visiting.delete(check);
+      validated.add(check);
+      return true;
+    };
+    for (const check of derivedJobs.keys()) {
+      if (!validateDerived(check)) return decline('derived aggregate needs do not trace to infrastructure failure');
+    }
     const safe = name => name.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
     return { infra: 'infra-jobs', infraNames: infraNames.map(safe), derivedNames: derivedNames.map(safe) };
   } catch (error) {
-    return decline(error?.message?.startsWith('workflow timeout evidence') ? error.message
+    return decline(/^workflow (?:timeout evidence|aggregate needs)/.test(error?.message) ? error.message
       : 'job/run evidence unreadable or incomplete (shared API budget may be exhausted)');
   }
 }

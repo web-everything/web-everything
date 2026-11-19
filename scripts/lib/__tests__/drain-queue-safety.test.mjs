@@ -839,8 +839,7 @@ describe('merge-queue same-head failure admission', () => {
         path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push' });
       const f = { now: Date.parse('2026-11-01T14:00:00Z'), log: vi.fn(), events: [removed()], live: { headRefOid: head, mergeStateStatus: 'CLEAN' },
         runs: [run(12, 'success', '2026-11-01T13:00:00Z'), run(11, 'success', '2026-11-01T11:00:00Z')],
-        // Legacy main-green proofs use startup_failure; cancellations/timeouts now require complete Actions metadata.
-        checks: [{ id: 21, status: 'completed', conclusion: 'startup_failure', output: { title: '', summary: '' } }] };
+        checks: [{ id: 21, status: 'completed', conclusion: 'timed_out', output: { title: '', summary: '' } }] };
       f.exec = vi.fn((command, args) => {
         if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
         if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse();
@@ -857,20 +856,10 @@ describe('merge-queue same-head failure admission', () => {
         }
         if (/\/actions\/jobs\/[0-9]+$/.test(endpoint ?? '')) {
           if (f.jobError) throw new Error('job metadata unavailable');
-          const id = Number(endpoint.split('/').at(-1));
-          const check = f.checks.find(check => check.details_url?.endsWith(`/job/${id}`));
-          return JSON.stringify(f.jobData ?? { id, name: check?.name ?? 'CI / test',
-            run_id: 500, run_attempt: 1, started_at: '2026-11-01T11:00:00Z', completed_at: '2026-11-01T11:10:00Z',
+          return JSON.stringify(f.jobData ?? { id: 9022, name: 'CI / test',
             head_sha: removed().beforeCommit.oid, status: 'completed', conclusion: 'failure',
-            ...(check?.conclusion !== 'failure' ? { conclusion: check?.conclusion } : {}),
-            steps: check?.conclusion !== 'failure'
-              ? [{ name: 'Run', status: 'completed', conclusion: ['cancelled', 'timed_out'].includes(check?.conclusion) ? check.conclusion : 'success' }]
-              : [{ name: 'Gate on shard results', status: 'completed', conclusion: 'failure' }] });
+            steps: [{ name: 'Gate on shard results', conclusion: 'failure' }] });
         }
-        if (endpoint?.endsWith('/actions/runs/500')) return JSON.stringify({ id: 500, run_attempt: 1,
-          path: '.github/workflows/ci.yml', event: 'merge_group', head_sha: removed().beforeCommit.oid,
-          status: 'completed', conclusion: 'failure', updated_at: '2026-11-01T11:10:00Z' });
-        if (endpoint?.endsWith('/logs') && f.jobLog !== undefined) return f.jobLog;
         if (endpoint?.includes('/actions/') || (args[0] === 'run' && args[1] === 'list')) {
           f.mainReads = (f.mainReads ?? 0) + 1;
           if (f.mainError) throw new Error('main runs unavailable');
@@ -900,7 +889,7 @@ describe('merge-queue same-head failure admission', () => {
       test(f);
     }
 
-    it.each(['startup_failure'])('guard preserves the main-green retry for infrastructure check conclusion %s', conclusion => fixture(f => {
+    it.each(['timed_out'])('guard logs retry 1/2 for infrastructure check conclusion %s', conclusion => fixture(f => {
       f.checks[0].conclusion = conclusion;
       expect(f.guard().hold).toBe(false);
       expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
@@ -923,19 +912,16 @@ describe('merge-queue same-head failure admission', () => {
       { id: 24, name: 'soak', status: 'completed', conclusion: 'success' },
     ];
     it.each(['cancelled', 'startup_failure'])(
-      'cancelled/regroup retries %s plus a derived aggregate with its required main evidence and no logs or reruns', conclusion => fixture(f => {
+      'cancelled/regroup retries %s plus a derived aggregate without main, logs or reruns', conclusion => fixture(f => {
         f.checks = regroupChecks(conclusion);
-        f.mainError = conclusion === 'startup_failure';
+        f.mainError = true;
         const result = f.guard();
         expect(result.hold).toBe(false);
         expect(result.line).toContain('mq-same-head-retry:');
-        expect(result.line).toContain(conclusion === 'cancelled'
-          ? 'failed_checks infrastructure retry 1/1 (INFRA: CI / integration; PR CLEAN)'
-          : 'failed_checks cancelled/regroup retry 1/2 (no failed required job; cancelled: CI / integration; aggregate derived: CI / test; PR CLEAN)');
+        expect(result.line).toContain('failed_checks cancelled/regroup retry 1/2 (no failed required job; cancelled: CI / integration; aggregate derived: CI / test; PR CLEAN)');
         expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
-          && !args.some(arg => arg.includes('/logs')))).toBe(true);
-        if (conclusion === 'cancelled') expect(f.mainReads).toBe(2);
-        else expect(f.mainReads).toBeUndefined();
+          && !args.some(arg => arg.includes('/workflows/') || arg.includes('/logs')))).toBe(true);
+        expect(f.mainReads).toBeUndefined();
       }));
     it.each(['intrinsic step', 'missing steps', 'wrong job id', 'wrong commit', 'wrong job name',
       'wrong status', 'wrong conclusion', 'unreadable metadata', 'missing details URL', 'foreign details URL'])(
@@ -1040,7 +1026,7 @@ describe('merge-queue same-head failure admission', () => {
       expect(f.mainReads).toBeUndefined();
       expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
     }));
-    describe.each(['startup_failure'])('pure %s evidence uses the legacy main-green path', conclusion => {
+    describe.each(['cancelled', 'startup_failure'])('pure %s evidence uses the legacy main-green path', conclusion => {
       it.each([1, 10, 11])('requires main green with %i failed jobs, including above the job cap', count => {
         for (const main of ['green', 'red', 'unreadable']) fixture(f => {
           f.checks = Array.from({ length: count }, (_, i) => ({
@@ -1074,25 +1060,25 @@ describe('merge-queue same-head failure admission', () => {
           details_url: `https://github.com/${repo}/actions/runs/500/job/${9100 + i}`,
         }));
         f.checks.push(checks[1]);
+        f.mainError = true;
         const result = f.guard();
         expect(result.hold).toBe(count > 10);
         if (count > 10) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
-        else expect(result.line).toContain('infrastructure retry 1/1');
-        if (count > 10) expect(f.mainReads).toBeUndefined();
-        else expect(f.mainReads).toBe(2);
+        else expect(result.line).toContain('cancelled/regroup retry 1/2');
+        expect(f.mainReads).toBeUndefined();
         expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
       });
     });
-    it('second cancellation failure holds after one retry, including after manual withdrawal', () => {
+    it('second cancelled/regroup retry is allowed at N=2; third holds even after manual withdrawal', () => {
       for (const spent of [1, 2]) fixture(f => {
         f.checks = regroupChecks();
         f.events = [removed(), added, removed()];
         if (spent === 2) f.events.push(added, removed('manual'));
         const result = f.guard();
-        expect(result.hold).toBe(true);
-        expect(result.line).toMatch(/already spent: 1\/1.*operator must inspect/);
-        expect(f.log.mock.calls.some(([line]) => line.startsWith('mq-infra-requeue-exhausted:'))).toBe(true);
-        expect(f.mainReads).toBe(2);
+        expect(result.hold).toBe(spent === 2);
+        if (spent === 1) expect(result.line).toContain('cancelled/regroup retry 2/2');
+        else expect(result.line).toMatch(/already spent: 2\/2.*operator must inspect/);
+        expect(f.mainReads).toBeUndefined();
       });
     });
     it('cancelled/regroup still holds past two failed removals even with fewer than two re-enqueues', () => {
@@ -1124,41 +1110,39 @@ describe('merge-queue same-head failure admission', () => {
           f.events = [removed(), added, removed(), added, removed()];
           const result = f.guard();
           expect(result.hold).toBe(true);
-          expect(result.line).toContain('infrastructure requeue already spent: 1/1');
-          expect(f.mainReads).toBe(2);
+          expect(result.line).toContain(`already spent: 2/${override === '1' ? 1 : 2}`);
+          expect(f.mainReads).toBeUndefined();
         });
       } finally {
         if (previous === undefined) delete process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX;
         else process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX = previous;
       }
     });
-    it.each(['real failure', 'unconfigured aggregate',
+    it.each(['real failure', 'timed_out', 'unconfigured aggregate', 'aggregate timed_out',
       'incomplete', 'unreadable', 'truncated', 'not CLEAN', 'unreadable PR state'])(
       'cancelled/regroup holds with %s evidence', kind => fixture(f => {
         f.checks = regroupChecks();
         if (kind === 'real failure') f.checks.push({ id: 25, name: 'test-shard (1)', status: 'completed', conclusion: 'failure' });
+        if (kind === 'timed_out') f.checks[0].conclusion = 'timed_out';
         if (kind === 'unconfigured aggregate') f.checks[1].name = 'other';
+        if (kind === 'aggregate timed_out') f.checks[1].conclusion = 'timed_out';
         if (kind === 'incomplete') f.checks[3].status = 'in_progress';
         if (kind === 'unreadable') f.checkError = true;
         if (kind === 'truncated') f.checkTotal = 1000;
+        if (kind === 'not CLEAN' || kind === 'unreadable PR state') f.events = [removed(), added, removed()];
         if (kind === 'not CLEAN') f.live.mergeStateStatus = 'BEHIND';
         if (kind === 'unreadable PR state') f.live = null;
         expect(f.guard().hold).toBe(true);
         if (kind === 'not CLEAN' || kind === 'unreadable PR state') {
           expect(f.log.mock.calls[1][0]).toMatch(/PR is not CLEAN/);
-          expect(f.mainReads).toBe(2);
+          expect(f.mainReads).toBeUndefined();
         }
       }));
     it.each([['title', 'Runner disconnected'], ['summary', 'Lost communication with worker'],
       ['summary', 'SELF-HOSTED RUNNER went away']])('guard treats runner loss in output.%s as infrastructure (%s)', (field, text) => fixture(f => {
-      f.checks[0] = { ...regroupChecks()[0], conclusion: 'failure', output: { [field]: text } };
-      f.jobData = { id: 9021, name: 'CI / integration', run_id: 500, run_attempt: 1,
-        head_sha: removed().beforeCommit.oid, status: 'completed', conclusion: 'failure',
-        started_at: '2026-11-01T11:00:00Z', completed_at: '2026-11-01T11:10:00Z',
-        steps: [{ name: 'Run', status: 'completed', conclusion: 'success' }] };
-      f.jobLog = 'Execution interrupted by runner loss.';
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { [field]: text } };
       expect(f.guard().hold).toBe(false);
-      expect(f.log.mock.calls).toEqual([[`mq-same-head-retry: #${pr} head ${head} — failed_checks infrastructure retry 1/1 (INFRA: CI / integration; PR CLEAN); main run 12`]]);
+      expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
     }));
     it('guard holds when any failed check is a real test failure', () => fixture(f => {
       f.checks.push({ id: 22, status: 'completed', conclusion: 'failure', output: { title: 'Assertion failed', summary: 'expected 1 to equal 2' } });
@@ -1215,7 +1199,7 @@ describe('merge-queue same-head failure admission', () => {
       expect(result.line).toMatch(/already spent/);
     }));
     it('logs why the retry was declined: a non-infrastructure failed check and main not red at removal', () => fixture(f => {
-      f.checks = [{ id: 21, status: 'completed', conclusion: 'startup_failure', name: 'test', output: {} },
+      f.checks = [{ id: 21, status: 'completed', conclusion: 'cancelled', name: 'test', output: {} },
         { id: 22, status: 'completed', conclusion: 'failure', name: 'merge-gate', output: { title: '', summary: '' } }];
       f.expectHeld();
       expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — non-infrastructure failed check(s): test, merge-gate; main was not red at removal; failed check(s): test, merge-gate`);

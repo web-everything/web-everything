@@ -18,7 +18,9 @@ export function infraFixture(guard, { checkConclusion = 'timed_out' } = {}) {
     checks: [check(1, 'integration', 135261064381, checkConclusion), check(2, 'test', 135269693446, 'failure')],
     mainRuns: [{ id: 9, run_attempt: 1, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
       status: 'completed', conclusion: 'success', created_at: '2026-11-18T00:00:00Z', updated_at: '2026-11-18T00:30:00Z' }],
-    jobs: {}, runs: {}, logs: {}, annotations: [], workflow: 'jobs:\n  integration:\n    timeout-minutes: 20\n',
+    // Minimal synthetic workflow; the pinned #7103 workflow also has test -> integration.
+    jobs: {}, runs: {}, logs: {}, annotations: [],
+    workflow: 'jobs:\n  integration:\n    timeout-minutes: 20\n  test:\n    needs: integration\n',
   };
   const job = (id, name, conclusion, steps) => ({ id, name, head_sha: commit, run_id: 44434828048,
     run_attempt: 1, status: 'completed', conclusion, started_at: started, completed_at: completed, steps });
@@ -26,6 +28,8 @@ export function infraFixture(guard, { checkConclusion = 'timed_out' } = {}) {
     [step('Set up job'), step('Real-git integration suite'), step('Complete job')]);
   f.jobs[135269693446] = job(135269693446, 'test', 'failure',
     [step('Set up job'), step('Gate on shard results', 'failure'), step('Complete job')]);
+  f.logs[135261064381] = 'Execution interrupted by infrastructure.\n';
+  f.logs[135269693446] = 'Execution interrupted by infrastructure.\n';
   f.runs[44434828048] = { id: 44434828048, run_attempt: 1, head_sha: commit, status: 'completed', conclusion: 'failure',
     event: 'merge_group', path: '.github/workflows/ci.yml', updated_at: completed };
   f.exec = (command, args) => {
@@ -53,6 +57,7 @@ export function infraFixture(guard, { checkConclusion = 'timed_out' } = {}) {
       return JSON.stringify(f.runs[run[1]]);
     }
     if (path?.startsWith('check-runs/')) return JSON.stringify(f.annotations);
+    if (path === 'git/ref/heads/main' && f.mainHead) return JSON.stringify({ object: { sha: f.mainHead } });
     if (path === `contents/.github/workflows/ci.yml?ref=${commit}`) return JSON.stringify({ type: 'file', encoding: 'base64',
       size: Buffer.byteLength(f.workflow), content: Buffer.from(f.workflow).toString('base64') });
     if (path?.startsWith('actions/workflows/ci.yml/runs?')) {

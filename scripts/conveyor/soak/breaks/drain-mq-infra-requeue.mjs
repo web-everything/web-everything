@@ -42,14 +42,27 @@ export default {
     if (!unreadable.guard().hold) violations.push('unreadable job evidence authorized requeue');
     const red = infraFixture(mqSameHeadGuard);
     red.mainRuns[0].conclusion = 'failure';
-    if (!red.guard().hold || !red.lines.some(line => line.includes('main CI is failing')))
+    if (!red.guard().hold || !red.lines.some(line => line.includes('main CI is not green')))
       violations.push('real failing main did not veto infrastructure retry with a main reason');
     red.mainRuns.unshift({ ...red.mainRuns[0], id: 10, conclusion: 'timed_out',
       created_at: '2026-11-18T01:40:00Z', updated_at: '2026-11-18T01:50:00Z' });
     if (!red.guard().hold) violations.push('newer timed-out main run concealed a real main failure');
     const cancelledMain = infraFixture(mqSameHeadGuard);
     cancelledMain.mainRuns[0].conclusion = 'cancelled';
-    if (cancelledMain.guard().hold) violations.push('infra-only main cancellation blocked infrastructure retry');
+    if (!cancelledMain.guard().hold) violations.push('main cancellation without a fresh success authorized retry');
+    const staleMain = infraFixture(mqSameHeadGuard);
+    staleMain.mainHead = staleMain.mainRuns[0].head_sha = 'd'.repeat(40);
+    staleMain.mainRuns[0].created_at = staleMain.mainRuns[0].updated_at = '2026-10-18T00:00:00Z';
+    if (!staleMain.guard().hold) violations.push('month-old main HEAD success authorized retry');
+    const cancelledFailure = infraFixture(mqSameHeadGuard);
+    cancelledFailure.logs[135261064381] = 'Assertion failure\nProcess completed with exit code 1';
+    if (!cancelledFailure.guard().hold) violations.push('cancelled job log with real failure authorized retry');
+    const unrelated = infraFixture(mqSameHeadGuard);
+    unrelated.workflow += '  unit: {}\n';
+    unrelated.workflow = unrelated.workflow.replace('needs: integration', 'needs: unit');
+    unrelated.checks.push({ ...unrelated.checks[0], id: 3, name: 'unit', conclusion: 'skipped',
+      details_url: unrelated.checks[0].details_url.replace('135261064381', '3') });
+    if (!unrelated.guard().hold) violations.push('unrelated timeout authorized aggregate with skipped needs');
     for (const [source, failure] of [['output', 'Runner lost connection tests: 1 failed'],
       ['annotations', '✗ integration suite: 1 failed'], ['logs', '× integration suite: 1 failed']]) {
       const mixed = infraFixture(mqSameHeadGuard);

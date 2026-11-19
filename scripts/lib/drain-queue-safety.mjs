@@ -20,6 +20,8 @@ const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.t
 // Explicit failure reasons only; future enum values require operator inspection.
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+// Hard cap even when the shared main reader proves an older success still belongs to main HEAD.
+const MQ_INFRA_MAIN_RUN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
 const MQ_SUMMARY_TAIL_BYTES = 64 * 1024;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
@@ -163,7 +165,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const infraJobs = retryEvidence?.infra === 'infra-jobs';
   if (infraJobs && (failedChecksRemovals > 1 || reenqueuedAfterFailure > 0))
     return hold('failed_checks (infrastructure requeue already spent: 1/1); operator must inspect history and enqueue manually');
-  const infraJobsRetry = infraJobs && retryEvidence.mainNotFailing === true && retryEvidence.mergeState === 'CLEAN';
+  const infraJobsRetry = infraJobs && retryEvidence.mainGreen === true && retryEvidence.mergeState === 'CLEAN';
   const cancelledRegroup = retryEvidence?.infra === 'cancelled-regroup';
   const cancelledMax = retryEvidence?.mqCancelledRetryMax ?? 2;
   const cancelledRetry = cancelledRegroup && retryEvidence.mergeState === 'CLEAN'
@@ -757,10 +759,137 @@ function readMqRetryEvidence(options) {
   return live(exact ?? base);
 }
 
+function readMqMainRetryState({ repo, exec, removedAt, now, spend }) {
+  const timestamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
+  const passing = new Set(['success', 'neutral', 'skipped']);
+  const infraConclusions = new Set(['cancelled', 'timed_out', 'startup_failure']);
+  // These queries need only their first page, regardless of the workflow's history size.
+  const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
+  const readRunPage = (endpoint, limit, allowEmpty = false) => {
+    spend();
+    const result = JSON.parse(exec('gh', ['api', endpoint],
+      { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+    const runs = result?.workflow_runs;
+    if (!Number.isSafeInteger(result?.total_count) || result.total_count < 0
+      || !Array.isArray(runs) || runs.length !== Math.min(result.total_count, limit)
+      || (runs.length === 0 && !(allowEmpty && result.total_count === 0)))
+      throw new Error('invalid retry evidence page');
+    const ids = new Set();
+    for (const run of runs) {
+      if (!Number.isSafeInteger(run?.id) || run.id <= 0 || ids.has(run.id))
+        throw new Error('invalid retry evidence identity');
+      ids.add(run.id);
+    }
+    return runs;
+  };
+  const newest = readRunPage(`${mainEndpoint}&per_page=100`, 100, true);
+  const runs = readRunPage(`${mainEndpoint}&status=completed&created=<${new Date(removedAt).toISOString()}&per_page=100`, 100, true);
+  const conclusions = new Set([...passing, ...infraConclusions, 'failure', 'action_required', 'stale']);
+  const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
+  if ([...newest, ...runs].some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
+    || run.event !== 'push' || (run.status === 'completed' ? !conclusions.has(run.conclusion)
+      : !unfinished.has(run.status) || run.conclusion !== null)
+    || !Number.isFinite(timestamp(run.created_at))
+    || (run.status === 'completed' && !Number.isFinite(timestamp(run.updated_at))))) throw new Error('invalid main CI run');
+  runs.sort(newestRunFirst);
+  const before = runs.find(run => run.status === 'completed' && timestamp(run.created_at) < removedAt
+    && timestamp(run.updated_at) < removedAt);
+  const mainRed = ['failure', 'cancelled', 'timed_out'].includes(before?.conclusion);
+  newest.sort(newestRunFirst);
+  const ignored = new Set([...infraConclusions].filter(c => c !== 'timed_out').concat('stale', 'action_required'));
+  const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
+  let stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
+  // Freshness is judged by main HEAD: when nothing merged, the newest run for the CURRENT head decides regardless of
+  // age. Any unreadable piece keeps the age rule (fail closed); a cancelled/failed/unfinished run for the head never counts.
+  if (stale && Number.isFinite(now) && deciding.conclusion === 'success') {
+    try {
+      spend();
+      const mainHead = mqOid(JSON.parse(exec('gh', ['api', `repos/${repo}/git/ref/heads/main`],
+        { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))?.object?.sha);
+      const forHead = newest.filter(run => mainHead && mqOid(run.head_sha) === mainHead);
+      if (mainHead && forHead[0]?.id === deciding.id) stale = false;
+    } catch { /* unreadable main head: keep the age rule */ }
+  }
+  return { newest, deciding, stale, mainRed,
+    mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
+    mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
+      : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}` };
+}
+
+/** Legacy evidence always decides first. Only uncovered shapes may spend the remaining shared budget.
+ * Record (rather than memoize) legacy IO so its call counts and mutation ordering stay unchanged.
+ */
+function readMqBaseRetryEvidence(options) {
+  let budget = 30, captured, legacyReading = true;
+  const cache = new Map();
+  const exec = (command, args, opts) => {
+    if (command !== 'gh') return options.exec(command, args, opts);
+    if (!legacyReading && budget <= 0) throw new Error('retry evidence budget exhausted');
+    budget--;
+    const key = JSON.stringify(args);
+    try {
+      const value = options.exec(command, args, opts);
+      cache.set(key, { value });
+      return value;
+    } catch (error) { cache.set(key, { error }); throw error; }
+  };
+  const legacy = readMqLegacyRetryEvidence({ ...options, exec, captureChecks: value => { captured = value; } });
+  legacyReading = false;
+  if (legacy?.infra || !captured) return legacy;
+  const { checks: rawChecks, oid, removedAt } = captured;
+  const cancelled = check => ['cancelled', 'startup_failure'].includes(check.conclusion);
+  const passing = check => ['success', 'neutral', 'skipped'].includes(check.conclusion);
+  const failed = rawChecks.filter(check => !passing(check));
+  // Even declined regroup evidence belongs to the legacy validator: unreadable attempts,
+  // oversized sets and non-CLEAN heads must not trigger extra IO or a different retry allowance.
+  const cancelledRegroup = rawChecks.every(check => check.status === 'completed') && failed.some(cancelled)
+    && failed.some(check => check.conclusion === 'failure' && options.retryPolicy.mqAggregateJobs.includes(localJob(check.name)))
+    && failed.every(check => cancelled(check) || check.conclusion === 'failure'
+      && options.retryPolicy.mqAggregateJobs.includes(localJob(check.name)));
+  if (cancelledRegroup || !failed.some(check => check.conclusion === 'failure'
+    && options.retryPolicy.mqAggregateJobs.includes(localJob(check.name)))) return legacy;
+  const replay = (command, args, opts) => {
+    const result = command === 'gh' && cache.get(JSON.stringify(args));
+    if (!result) return exec(command, args, opts);
+    if (result.error) throw result.error;
+    return result.value;
+  };
+  const infraRead = (path, json = true) => {
+    const value = replay('gh', ['api', `repos/${options.repo}/${path}`], {
+      encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
+      stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
+    });
+    return json ? JSON.parse(value) : value;
+  };
+  const infraJobs = readMqInfraJobs({ checks: rawChecks, repo: options.repo, commit: oid, removedAt,
+    aggregateJobs: options.retryPolicy.mqAggregateJobs, readJson: infraRead, readLog: path => infraRead(path, false) });
+  if (!infraJobs) return legacy;
+  if (infraJobs.infra !== 'infra-jobs') return { ...infraJobs, infraJobsDeclined: true };
+  try {
+    const { newest, deciding, mainGreen, mainGreenReason } = readMqMainRetryState({
+      repo: options.repo, exec: replay, removedAt, now: options.now, spend: () => {},
+    });
+    if (!newest.length) throw new Error('missing main CI runs');
+    const timestamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
+    const bounded = deciding?.status === 'completed' && deciding.conclusion === 'success'
+      && [deciding.created_at, deciding.updated_at].every(value => Number.isFinite(timestamp(value))
+        && timestamp(value) <= options.now && options.now - timestamp(value) <= MQ_INFRA_MAIN_RUN_MAX_AGE_MS)
+      && timestamp(deciding.updated_at) >= timestamp(deciding.created_at);
+    return { ...infraJobs, mainGreen: mainGreen && bounded, mainRunId: deciding?.id ?? null,
+      logReason: !mainGreen || !bounded
+        ? `main CI is not green (${mainGreenReason}; successful run must be created and updated within 24h); operator must inspect main CI and enqueue manually` : null,
+      mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head: options.head, exec }) };
+  } catch {
+    return { infraJobsDeclined: true,
+      logReason: 'main CI evidence unreadable or incomplete (shared API budget may be exhausted); operator must inspect main CI and enqueue manually' };
+  }
+}
+
 /** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.
  * Incomplete evidence leaves the historical hold in place for operator inspection.
  */
-function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, readFreeze, now = Date.now() }) {
+function readMqLegacyRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, readFreeze, now = Date.now(), captureChecks = () => {} }) {
   try {
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
@@ -798,33 +927,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       throw new Error('truncated retry evidence; operator must inspect full history');
     };
     const rawChecks = readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs');
-    const infraRead = (path, json = true) => {
-      if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
-      const value = exec('gh', ['api', `repos/${repo}/${path}`], {
-        encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
-        stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
-      });
-      return json ? JSON.parse(value) : value;
-    };
-    const infraConclusions = new Set(['cancelled', 'timed_out', 'startup_failure']);
-    const passing = new Set(['success', 'neutral', 'skipped']);
-    const infraJobs = readMqInfraJobs({ checks: rawChecks, repo, commit: oid, removedAt,
-      aggregateJobs: retryPolicy.mqAggregateJobs, readJson: infraRead, readLog: path => infraRead(path, false) });
-    if (infraJobs) {
-      if (infraJobs.infra !== 'infra-jobs') return { ...infraJobs, infraJobsDeclined: true };
-      try {
-        const { newest, deciding } = readMainState({ ignoreTimeouts: true });
-        if (!newest.length) throw new Error('missing main CI runs');
-        // Cancellation/timeouts are infrastructure, but a real failing main run still vetoes retry.
-        return { ...infraJobs, mainNotFailing: deciding?.conclusion !== 'failure', mainRunId: deciding?.id ?? null,
-          logReason: deciding?.conclusion === 'failure'
-            ? `main CI is failing (newest completed run ${deciding.id} concluded failure); operator must inspect main CI before retrying` : null,
-          mergeState: budget-- > 0 ? readMqMergeState({ repo, pr, head, exec }) : null };
-      } catch {
-        return { infraJobsDeclined: true,
-          logReason: 'main CI evidence unreadable or incomplete (shared API budget may be exhausted); operator must inspect main CI and enqueue manually' };
-      }
-    }
+    captureChecks({ checks: rawChecks, oid, removedAt });
     const cancelled = check => ['cancelled', 'startup_failure'].includes(check.conclusion);
     const passingCheck = check => ['success', 'neutral', 'skipped'].includes(check.conclusion);
     const rawFailed = rawChecks.filter(check => !passingCheck(check));
@@ -853,6 +956,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     if (!cancelledRegroup && (removals.length > 2 || timeline.nodes.filter(event => event?.__typename === 'AddedToMergeQueueEvent'
       && timeline.nodes.indexOf(event) > timeline.nodes.indexOf(removals[0])).length >= 2)) return null;
     const checks = attempts.checks;
+    const infraConclusions = new Set(['cancelled', 'timed_out', 'startup_failure']);
+    const passing = new Set(['success', 'neutral', 'skipped']);
     if (checks.some(check => check.status !== 'completed'
       || !(passing.has(check.conclusion) || infraConclusions.has(check.conclusion) || check.conclusion === 'failure')))
       return null;
@@ -925,7 +1030,17 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         }
       } catch { blocked = true; /* unreadable gate log: the hold stays */ }
     }
-    const noLogInfra = failed.every(cancelledOnly) || freezeProven;
+    let noLogInfra = failed.every(cancelledOnly) || freezeProven;
+    if (noLogInfra && !freezeProven && failed.length > MQ_INFRA_MAX_JOBS) {
+      // Complete cancellation identities retain the legacy no-log path, even above the
+      // job-reader cap. Unbound oversized evidence cannot bypass that cap on conclusions alone.
+      const cancelledAttempts = inspectMqReruns({
+        checks: checks.map(check => cancelledOnly(check) ? { ...check, conclusion: 'failure' } : check),
+        repo, commit: oid, removedAt,
+      });
+      noLogInfra = !cancelledAttempts.reason && (cancelledAttempts.confirmed === true
+        || cancelledAttempts.candidates.length === failed.length);
+    }
     let logReason = null;
     const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
     const logVerdicts = new Map();
@@ -1013,59 +1128,9 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     if (rerun.reason) logReason = rerun.reason;
     if (attempts.reason) infra = false;
     else if (!logReason && attempts.confirmed) infra = true;
-    function readMainState({ ignoreTimeouts = false } = {}) {
-      // These queries need only their first page, regardless of the workflow's history size.
-      const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
-      const readRunPage = (endpoint, limit, allowEmpty = false) => {
-        if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
-        const result = JSON.parse(exec('gh', ['api', endpoint],
-          { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
-            stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
-        const runs = result?.workflow_runs;
-        if (!Number.isSafeInteger(result?.total_count) || result.total_count < 0
-          || !Array.isArray(runs) || runs.length !== Math.min(result.total_count, limit)
-          || (runs.length === 0 && !(allowEmpty && result.total_count === 0)))
-          throw new Error('invalid retry evidence page');
-        const ids = new Set();
-        for (const run of runs) {
-          if (!Number.isSafeInteger(run?.id) || run.id <= 0 || ids.has(run.id))
-            throw new Error('invalid retry evidence identity');
-          ids.add(run.id);
-        }
-        return runs;
-      };
-      const newest = readRunPage(`${mainEndpoint}&per_page=100`, 100, true);
-      const runs = readRunPage(`${mainEndpoint}&status=completed&created=<${new Date(removedAt).toISOString()}&per_page=100`, 100, true);
-      const conclusions = new Set([...passing, ...infraConclusions, 'failure', 'action_required', 'stale']);
-      const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
-      if ([...newest, ...runs].some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
-        || run.event !== 'push' || (run.status === 'completed' ? !conclusions.has(run.conclusion)
-          : !unfinished.has(run.status) || run.conclusion !== null)
-        || !Number.isFinite(timestamp(run.created_at))
-        || (run.status === 'completed' && !Number.isFinite(timestamp(run.updated_at))))) throw new Error('invalid main CI run');
-      runs.sort(newestRunFirst);
-      const before = runs.find(run => run.status === 'completed' && timestamp(run.created_at) < removedAt
-        && timestamp(run.updated_at) < removedAt);
-      const mainRed = ['failure', 'cancelled', 'timed_out'].includes(before?.conclusion);
-      newest.sort(newestRunFirst);
-      // Legacy retries treat timed_out as red; infrastructure admission looks past it for real failures.
-      const ignored = new Set([...infraConclusions].filter(c => ignoreTimeouts || c !== 'timed_out').concat('stale', 'action_required'));
-      const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
-      let stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
-      // Freshness is judged by main HEAD: when nothing merged, the newest run for the CURRENT head decides regardless of
-      // age. Any unreadable piece keeps the age rule (fail closed); a cancelled/failed/unfinished run for the head never counts.
-      if (stale && Number.isFinite(now) && deciding.conclusion === 'success') {
-        try {
-          if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
-          const mainHead = mqOid(JSON.parse(exec('gh', ['api', `repos/${repo}/git/ref/heads/main`],
-            { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))?.object?.sha);
-          const forHead = newest.filter(run => mainHead && mqOid(run.head_sha) === mainHead);
-          if (mainHead && forHead[0]?.id === deciding.id) stale = false;
-        } catch { /* unreadable main head: keep the age rule */ }
-      }
-      return { newest, deciding, stale, mainRed };
-    }
-    const { newest, deciding, stale, mainRed } = readMainState();
+    const { newest, deciding, stale, mainRed, mainGreen, mainGreenReason } = readMqMainRetryState({
+      repo, exec, removedAt, now, spend: () => { if (budget-- <= 0) throw new Error('retry evidence budget exhausted'); },
+    });
     const mergeState = readMqMergeState({ repo, pr, head, exec });
     if (attempts.confirmed && mergeState !== 'CLEAN')
       logReason = `PR is not CLEAN (${typeof mergeState === 'string' && /^[A-Z_]{1,32}$/.test(mergeState) ? mergeState : 'unknown'})`;
@@ -1161,12 +1226,11 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       } catch { flaky = false; }
     }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
-    return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
+    return { mainGreen: mainGreen
         && !(freezePending && (newest.some(run => run.status !== 'completed')
           || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
-      mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
-        : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
+      mainGreenReason,
       failedNames,
       derivedNames,
       infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,

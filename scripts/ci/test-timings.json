@@ -1032,8 +1032,7 @@
   "scripts/lib/__tests__/drain-red-team-evidence.test.mjs": 15.37,
   "scripts/lib/__tests__/drain-skip-reasons.test.mjs": 0.02,
   "scripts/lib/__tests__/drain-workflow-edit-hold.test.mjs": 0.03,
-  "scripts/lib/__tests__/drain-queue-safety-infra-requeue.test.mjs": 0.1,
-  "scripts/conveyor/soak/breaks/drain-mq-infra-requeue.soak.test.mjs": 0.2,
+  "scripts/lib/__tests__/drain-queue-safety-infra-requeue.test.mjs": 0.28,
   "scripts/lib/__tests__/duplicate-bornas-added.test.mjs": 0.01,
   "scripts/lib/__tests__/duplicate-id-tripwire.test.mjs": 0.01,
   "scripts/lib/__tests__/enqueue-catchup-dedupe.test.mjs": 0.06,
@@ -1967,6 +1966,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/drain-mq-infra-requeue.soak.test.mjs": 1.25,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/owed-ci-rerun-planned-but-never-executed.soak.test.mjs": 2,

@@ -414,12 +414,27 @@ negative answers without file reads remain unverifiable.
 ## Drain red-team disposition and retry evidence
 
 Merge-queue check-run conclusions and Actions job conclusions may differ for timeouts; keep both
-in fixtures. Pure cancellation/timeout/runner-loss requeues require complete, commit/run/attempt-bound
-Actions metadata and a CLEAN head. Validate derived aggregate steps separately, retain the strict
-before-removal timestamp boundary, and count re-enqueues from the existing timeline: one automatic
-retry per head, including manual withdrawals. Exercise red main without reading main CI, exhaustion
-on the drain log channel, and unreadable metadata in `drain-queue-safety-infra-requeue.test.mjs`.
-Legacy main-green fixtures use `startup_failure` so they continue testing that separate evidence path.
+in fixtures. The additive infra-jobs path requires complete, commit/run/attempt-bound Actions metadata
+and a CLEAN head. Validate derived aggregate steps separately, retain the strict before-removal
+timestamp boundary, and count re-enqueues from the existing timeline: one automatic infra-jobs
+retry per head, including manual withdrawals. Infrastructure admission uses the shared main-green
+reader and ordering, plus a hard 24h cap on both creation and update of the deciding success, even
+when it still belongs to main HEAD. Read whole bounded logs for cancelled/timed-out jobs regardless
+of failed-step metadata; test-failure text vetoes retry. Derived aggregates must resolve their direct
+`needs` from the workflow at the tested commit, with a same-run infrastructure dependency and no
+non-infrastructure failed dependency. Missing graphs, logs, or main evidence hold for manual inspection.
+Exercise these refusals, exhaustion on the drain log channel, and unreadable/oversized evidence in
+`drain-queue-safety-infra-requeue.test.mjs` and the matching soak break. Historical #7103's workflow
+at `6955b8c7f78d9d3a679d2992ab5a2fdd8f3d77b3` lists `integration` in `test.needs`;
+the smaller injected workflow is synthetic, not a copy of that complete graph.
+Run the legacy retry reader first, preserving cancelled/regroup, quarantine, infra/main-red and their
+read counts and retry bounds. Pure cancellations retain the legacy main-green route without Actions
+reads and its two-retry allowance; sets above ten jobs with incomplete identities hold for manual
+inspection. A proven freeze ejection remains exempt from that job limit. Infra-jobs follows no legacy infrastructure classification;
+legacy regroup-shaped refusals stay with that validator. Share a 30-call ceiling across legacy and
+fallback IO, replay completed evidence reads, and take the authorizing PR-state read live last.
+Guard fixtures exercise cancelled Actions jobs via timed-out check-runs; direct classifier fixtures
+also pin #7103's cancelled check-run shape without overriding the legacy regroup policy.
 
 Stale abandonment publishes a complete marker before replacing the writer, under the shared status
 claim. Its intent binds the old writer digest, evidence digest, timestamp and the exact JSON bytes
