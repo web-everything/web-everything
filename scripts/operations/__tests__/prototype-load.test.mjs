@@ -3396,7 +3396,7 @@ it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))(
 
 describe('R1075 degraded daemon admission', () => {
   const signal = { daemon: 'wev-control', kind: 'overlay-adoption-overdue', at: new Date(-7200000).toISOString() };
-  const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'studio', repo: 'https://example.com/org/repo', steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+  const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'studio', repo: 'https://example.com/org/repo', steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
   marker.sig = urgentSignature(marker, urgentKey);
   const degraded = options => fixture({ daemonEvents: JSON.stringify(signal), testCheck: async () => null, urgentLedger: JSON.stringify(marker), ...options });
   it('loads without a CI test check using the existing signed receipt and logs daemon evidence', async () => {
@@ -3410,7 +3410,7 @@ describe('R1075 degraded daemon admission', () => {
   it('preserves ordinary green-CI admission without a receipt', async () => {
     const f = degraded({ urgentLedger: undefined, testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
     expect(await f.run()).toMatchObject({ ok: true, registered: true });
-    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+    expect(f.records.some(r => r.kind?.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
   });
   it.each(['missing readiness', 'carried audit'])('preserves normal green-CI admission with %s', async kind => {
     const fingerprint = 'a'.repeat(64);
@@ -3420,7 +3420,7 @@ describe('R1075 degraded daemon admission', () => {
       }),
       testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
     expect(await f.run()).toMatchObject({ ok: true, registered: true });
-    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+    expect(f.records.some(r => r.kind?.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
   });
   it.each(['green', 'absent', 'red'])('degradation never makes %s CI admission stricter', async state => {
     const testCheck = async () => state === 'absent' ? null : ({ sha: SHA, name: 'test', status: 'completed',

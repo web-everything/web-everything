@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,12 +9,6 @@ import ts from 'typescript';
 // remote PR reads and live smoke are deliberately outside this event contract.
 vi.mock('../daemon-rebuild/prepare.mjs', () => ({ prepareRebuild: vi.fn() }));
 vi.mock('../daemon-rebuild/smoke.mjs', () => ({ smokeAndAdopt: vi.fn() }));
-vi.mock('node:child_process', async importOriginal => {
-  const real = await importOriginal();
-  return { ...real, spawnSync: (cmd, args, opts) => cmd !== 'gh' ? real.spawnSync(cmd, args, opts)
-    : args[0] === 'repo' ? { status: 0, stdout: JSON.stringify({ nameWithOwner: 'web-everything/web-everything', url: 'https://github.com/web-everything/web-everything' }) }
-      : args[0] === 'pr' && args[1] === 'list' ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' } };
-});
 
 import * as rebuild from '../daemon-rebuild/rebuild.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
@@ -79,6 +73,22 @@ describe('rebuildClone coordination events', () => {
       repo.seedOriginBranch(ref, { 'repair.mjs': 'export const repair = true;\n' });
       repo.git(['fetch', 'origin']);
       const tip = repo.git(['rev-parse', `origin/${ref}`]).trim();
+      // Exercise the real subprocess boundary: a builtin-module mock can be
+      // bypassed by native ESM imports. Only GitHub answers are fixtures.
+      const bin = join(scratch, 'bin');
+      const ghCalls = join(scratch, 'gh-calls');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh
+printf '%s\\n' "$*" >> "$WE_TEST_GH_CALLS"
+case "$1 $2" in
+  "repo view") printf '%s\\n' '{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}' ;;
+  "pr list") printf '%s\\n' '[]' ;;
+  *) exit 1 ;;
+esac
+`);
+      chmodSync(join(bin, 'gh'), 0o755);
+      options.env.PATH = `${bin}:${process.env.PATH}`;
+      options.env.WE_TEST_GH_CALLS = ghCalls;
       mkdirSync(options.env.WE_DAEMON_OVERLAY_DIR);
       writeFileSync(overlayFilePath(options.root, options.env), JSON.stringify({ clone: options.root, overlays: [{ ref }] }));
       recordPendingAdoption(options.root, { ref, sha: tip, degradedFastPath: { sha: tip, branch: ref, daemon: 'review' } }, { env: options.env });
@@ -87,6 +97,12 @@ describe('rebuildClone coordination events', () => {
       await rebuildClone(options);
       expect(readOverlayState(options.root, { env: options.env }).overlays).toEqual([]);
       expect(readPendingAdoptions(options.root, { env: options.env })).toEqual([]);
+      // Both the initial plan and the proof under the retirement lock must
+      // read fresh repository/PR evidence through the isolated executable.
+      const queries = readFileSync(ghCalls, 'utf8').trim().split('\n');
+      expect(queries).toHaveLength(4);
+      expect(queries.filter(q => q.startsWith('repo view '))).toHaveLength(2);
+      expect(queries.filter(q => q.startsWith('pr list --repo github.com/web-everything/web-everything --head lane/refused '))).toHaveLength(2);
       expect(readFileSync(alertsFilePath(options.root, options.env), 'utf8')).toContain('NEEDS-YOU');
       expect(options.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'prototype-load.degraded-fast-path-failed', detail: expect.objectContaining({ rollback: expect.objectContaining({ retired: true }) }) }), expect.anything());
     });
