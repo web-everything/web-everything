@@ -290,3 +290,22 @@ export function planFetchFailed({ row, git, gh, repo, mainRef = 'origin/main' })
       evidence: { refGone: true, prState: 'MERGED', mergeCommit, prVia: 'head-ref', deletedTip } };
   } catch { return keep(); }
 }
+
+/** Real retirement proof: refresh each registered ref's tracking ref, then decide with git and GitHub evidence. */
+export function defaultRetirePlanner({ rows, proofRows = [], git, gh }) {
+  const refresh = (row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0;
+  const fetched = rows.filter(refresh);
+  // Registrations withheld from `rows` (the candidate being loaded) can still be the base a sibling is redundant with.
+  // Each is cited only after its own tracking ref was refreshed: a stale tip is no proof, and a base gone from origin is not cited.
+  const listed = new Set(rows.map((row) => row.ref));
+  const wantedBases = new Set(fetched.map((row) => mergeRefBase(row.ref)).filter(Boolean));
+  const proof = proofRows.filter((row) => wantedBases.has(row.ref) && !listed.has(row.ref) && refresh(row));
+  const unfetchedRows = rows.filter((row) => !fetched.includes(row));
+  if (!unfetchedRows.length && !fetched.length) return [];
+  // GitHub evidence is bound to origin's repository and host, for fetched and unfetched registrations alike.
+  const { repo, gh: originGh } = resolveOriginRepository({ git, gh });
+  // A deleted branch retires only on proof of its last tip (planFetchFailed); everything else is kept.
+  const unfetched = unfetchedRows.map((row) => planFetchFailed({ row, git, gh: originGh, repo }));
+  if (!fetched.length) return unfetched;
+  return [...planRetirements({ rows: fetched, proofRows: proof, git, gh: originGh, repo }), ...unfetched];
+}

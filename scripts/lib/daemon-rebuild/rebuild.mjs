@@ -3,6 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { checkDegradedFailures } from '../../operations/degraded-load-rollback.mjs';
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
@@ -110,7 +111,12 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, eventOptions);
     }
+    for (const alert of result.alerts ?? []) {
+      if (['ready-candidate-discarded', 'ready-candidate-discarded-needs-you'].includes(alert.kind))
+        await emitEvent({ ...alert, daemon: basename(options.root) }, eventOptions);
+    }
     // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
+    await checkDegradedFailures({ root: options.root, result, env: { ...process.env, ...options.env }, emit: (e, o) => emitEvent(e, o) });
     await checkPendingAdoptions({
       root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
       emit: (event) => emitEvent(event, eventOptions),
