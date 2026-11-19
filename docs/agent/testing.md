@@ -4758,15 +4758,6 @@ Keep binary health/cache under the evidence directory's `binary/` subfolder; roo
 Register binary maintenance's exclusive lock in `LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`.
 The source scan in `scripts/operations/__tests__/audit-verdict.test.mjs` requires every lock holder
 to stay on the protected audit floor, so concurrency findings block publication.
-## Pre-existing audit exemption evidence (R1053)
-
-Keep proof-mode fixtures explicit about `auditPolicy` (`releaseStage`, `requirePayBy`,
-`requireOnMain`); a missing or partial policy must retain findings for human review.
-Pay-by fixtures inject trusted persisted card text through `readCard`, never a date in
-model finding text. A confirmed held card satisfies existence (D5). Security fixtures
-for every B class must supply separate `written`, `expedite`, and `needsYou` confirmations,
-and exercise a persisted-card write that drops the needs-you line. Keep the block-mode
-stdout/record golden unchanged when changing proof-mode policy.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
