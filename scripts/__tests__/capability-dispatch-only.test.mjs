@@ -1,9 +1,10 @@
 /** @repo-scanning-test scope=files — capability admission rules are checked per changed source. */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import ts from 'typescript';
 import { scanScope, scopedScanFiles } from '../lib/repo-scan-tests.mjs';
+import { assertCapability } from '../lib/repo-profile.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
 const scope = scanScope();
@@ -16,6 +17,7 @@ const allowlist = new Set([
   'scripts/merge-ai-prs.mjs', // Lander enqueue and direct merge dispatch only.
   'scripts/operations/promote-draft-pr-dispatch.mjs', // Draft promotion only.
   'scripts/operations/ci-heal-pr-dispatch.mjs', // S1 CI-heal dispatch admission.
+  'scripts/operations/red-team-gate-apply.mjs', // Live follow-up card launch only; send-back stays available.
 ]);
 function sources(dir) {
   return readdirSync(resolve(root, dir), { withFileTypes: true }).flatMap(entry => {
@@ -55,6 +57,32 @@ describe('capabilities admit dispatch only', () => {
     'Object.keys(CONSTELLATION_REPOS).map(repo => assertCapability(repo, "review"))',
     'repos.flatMap(repo => repo.capabilities?.fix ? [repo] : [])',
   ])('detects a capability roster regression: %s', source => expect(rosterFilters(source)).toHaveLength(1));
+
+  it('keeps live red-team admission only at card launch and refuses unknown/capability-off repos', () => {
+    const source = readFileSync(resolve(root, 'scripts/operations/red-team-gate-apply.mjs'), 'utf8');
+    const file = ts.createSourceFile('red-team-gate-apply.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const admissions = [];
+    function visit(node) {
+      if (ts.isCallExpression(node) && node.expression.getText(file) === 'assertCapability') admissions.push(node);
+      ts.forEachChild(node, visit);
+    }
+    visit(file);
+    expect(admissions).toHaveLength(1);
+    const callback = admissions[0].parent.parent.parent.parent.parent;
+    expect(ts.isArrowFunction(callback)).toBe(true);
+    expect(ts.isPropertyAssignment(callback.parent)).toBe(true);
+    expect(callback.parent.name.getText(file)).toBe('fileCard');
+    const launch = vi.fn(() => ({ ok: true }));
+    const fileCard = new Function('assertCapability', 'spawnPreventionLandingJob',
+      `return (${callback.getText(file)});`)(assertCapability, launch);
+    for (const repo of ['longshore', 'unknown/repo']) {
+      expect(fileCard({ repo })).toMatchObject({ ok: false, error: expect.any(String) });
+    }
+    expect(launch).not.toHaveBeenCalled();
+    expect(fileCard({ repo: 'we' })).toEqual({ ok: true });
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch).toHaveBeenCalledWith({ repo: 'we' }, { sessionPrefix: 'red-team-card' });
+  });
 
   it.skipIf(scope !== null && !scope.has('scripts/merge-ai-prs.mjs'))('keeps lander admissions at write boundaries, with no roster filtering', () => {
     const source = readFileSync(resolve(root, 'scripts/merge-ai-prs.mjs'), 'utf8');
@@ -121,6 +149,7 @@ const remainingUnguardedWrites = [
   {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Apply lifecycle/park/review label","call":"exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"exec('gh', apiArgs(repo, headRef))"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Fresh queue rollup GraphQL query read (field-bearing API calls remain conservatively inventoried)","call":"exec('gh', ['api', 'graphql', '-F', `owner=${owner}`, '-F', `name=${name}`, '-f', `query=${query}`])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Apply lifecycle/park/review label","call":"exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Apply lifecycle/park/review label","call":"execFileSync('gh', ['pr', 'edit', String(num), ...repoFlag(repo), '--add-label', label])"},

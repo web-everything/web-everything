@@ -110,14 +110,23 @@ function guardedStatements(action) {
 }
 
 describe('lander write path inventory', () => {
-  it.each(['healNnnCollision({ laneRef: v.headRef', 'rebaseDropManifest({'])('%s refuses capability-off before branch push / CI restart', action => {
-    const push = vi.fn(() => ({ action: 'rebased' }));
-    const run = compile(`for (const v of [{repo: 'longshore', headRef: 'lane/x'}]) { ${guardedStatements(action)} }`, {
-      assertCapability, localSlug: 'we', healNnnCollision: push, rebaseDropManifest: push,
-      laneRef: 'lane/x', HEAL_COLLISION: true, gitRunner: vi.fn(), cloneDir: undefined,
+  it('keeps the selected rebase callback wired to manifest rebuilds', () => {
+    expect(declaration('rebase').initializer.expression.getText(file)).toBe('routeRebaseBeforeEnqueue');
+    const route = nodes.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'routeRebaseBeforeEnqueue');
+    const rebuild = route.parameters[1].name.elements.find(n => n.name.getText(file) === 'rebase');
+    expect(rebuild.initializer.getText(file)).toBe('rebaseDropManifest');
+  });
+
+  describe.each(['healNnnCollision({ laneRef: v.headRef', 'rebase({'])('%s capability admission', action => {
+    it.each(['longshore', 'unknown/repo', 'we'])('admits %s only when supported before branch push / CI restart', repo => {
+      const push = vi.fn(() => ({ action: 'rebased' }));
+      const run = compile(`for (const v of [{repo, headRef: 'lane/x'}]) { ${guardedStatements(action)} }`, {
+        repo, assertCapability, localSlug: 'we', healNnnCollision: push, rebase: push,
+        laneRef: 'lane/x', HEAL_COLLISION: true, gitRunner: vi.fn(), cloneDir: undefined,
+      });
+      run();
+      expect(push).toHaveBeenCalledTimes(repo === 'we' ? 1 : 0);
     });
-    run();
-    expect(push).not.toHaveBeenCalled();
   });
 
   it('shared freshness/workflow/stale-merge refresh refuses capability-off before push or CI rerun', () => {
