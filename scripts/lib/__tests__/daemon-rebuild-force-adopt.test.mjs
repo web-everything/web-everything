@@ -790,6 +790,20 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     return { originDir, cloneDir, env, F };
   };
 
+  it.each(['early', 'recovery'])('between-tick %s launch preserves the force watch; tick-start advances it once', async (launchedBy) => {
+    const { cloneDir, env } = await forceAdoptF();
+    const watchBefore = readForceWatch(cloneDir, env);
+    expect(watchBefore.ticksLeft).toBe(5);
+    const probe = vi.fn(healthy);
+    await tick(cloneDir, env, { launchedBy, runSmoke: passing(), forceWatchProbe: probe });
+    expect(probe).not.toHaveBeenCalled();
+    expect(readForceWatch(cloneDir, env)).toEqual(watchBefore);
+
+    await tick(cloneDir, env, { launchedBy: 'tick-start', runSmoke: passing(), forceWatchProbe: probe });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ ticksLeft: watchBefore.ticksLeft - 1 });
+  });
+
   it('readyOnly job process never ticks the force watch', async () => {
     const { cloneDir, env, F } = await forceAdoptF();
     const watchBefore = readForceWatch(cloneDir, env);

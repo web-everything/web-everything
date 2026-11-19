@@ -3,6 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { resolveRecovery } from './recovery.mjs';
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
@@ -123,6 +124,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     }
     // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
     await checkPendingAdoptions({
+      overdueMs: resolveRecovery({ env: options.env, log: m => options.log?.error?.(m) }).overlayOverdueMs,
       root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
       emit: (event) => emitEvent(event, eventOptions),
     });
@@ -132,10 +134,10 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
 }
 
 /** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
- *  clone to the last-good build on a failed check or a crash loop. Never throws; the job process (readyOnly) skips it. */
+ *  clone to the last-good build on a failed check or a crash loop. Never throws; readyOnly and between-tick launches skip it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
-  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false } = options;
-  if (!root || readyOnly) return;
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, launchedBy = 'tick-start' } = options;
+  if (!root || readyOnly || launchedBy !== 'tick-start') return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
     await runForceWatchTick({
@@ -187,14 +189,15 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
+  asJob, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
+  spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
-      root, env, log, mainOnly, entries,
+      root, env, log, mainOnly, entries, launchOnly, launchedBy, waitInFlightTickMs,
       adopt: (o = {}) => rebuildCloneInternal({
         root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
         dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
@@ -267,9 +270,14 @@ async function rebuildCloneInternal({
   const readyOnHead = !!pendingReady
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
-  const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
-  }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
+  let prepareEnteredMs = null;
+  const prep = await withWriteLock(root, () => {
+    prepareEnteredMs = now();
+    return prepareRebuild({
+      root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
+    });
+  }, readyOnHead ? finalizeLockOpts : admissionLockOpts);
+  const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
@@ -284,10 +292,10 @@ async function rebuildCloneInternal({
       // Not counted as rebuild starvation: escalating to the long starved wait would re-block the very reader.
       log.error?.(`daemon-rebuild: backed off — reader ${prep.heldBy ?? '?'} was refused ${prep.starved ?? '?'} consecutive time(s) and has priority; nothing was moved, the next tick retries (#4044 reader fairness)`);
     }
-    return { moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
+    return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0, moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
   }
   if (prep.value.terminal) {
-    return { ...prep.value.result, alerts: prep.value.alerts };
+    return { ...prep.value.result, alerts: prep.value.alerts, waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0 };
   }
   const {
     plan, prevHead, lease, overlays: overlaysBefore = [], alerts: prepAlerts,
@@ -309,6 +317,7 @@ async function rebuildCloneInternal({
 
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
   try {
+    const smokeSlotStartedMs = now();
     const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep,
       onWait: async () => {
         const renewed = await withWriteLock(root, () => {
@@ -320,6 +329,7 @@ async function rebuildCloneInternal({
         if (!renewed.ok) throw new Error(`daemon-rebuild: could not renew queued build lease (${renewed.reason}) — the next tick retries`);
       },
     });
+    const waitSmokeSlotMs = Math.max(0, now() - smokeSlotStartedMs);
     try {
       if (!slot.acquired) {
         try {
@@ -329,13 +339,14 @@ async function rebuildCloneInternal({
             writeRebuildState(root, st, stEnv);
           }, finalLockOpts);
         } catch { /* the owner's next call takes an unreleased lease back anyway */ }
-        return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
+        return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs, moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
       }
-      return await smokeAndAdopt({
+      const result = await smokeAndAdopt({
         root, env, stEnv, log, run, runSmoke,
         stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
         finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
       });
+      return { ...result, waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs };
     } finally {
       await slot.release();
     }
