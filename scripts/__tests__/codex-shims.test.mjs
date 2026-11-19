@@ -1,9 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { CODEX_SHIM_DIR, codexShimPath, buildCodexDirectTaskArgv } from '../codex-direct-task.mjs';
+import { CODEX_SHIM_DIR, buildCodexDirectTaskArgv } from '../codex-direct-task.mjs';
+
+import { buildAgentPath } from '../lib/agent-launch.mjs';
+
+// Exercise the launcher's PATH projection directly; no legacy direct-task PATH export.
+const shimPath = env => buildAgentPath({ parentPaths: [env.PATH], home: userInfo().homedir,
+  pathPrefix: CODEX_SHIM_DIR, nodePath: process.execPath });
 
 // Fake project with a stub node_modules/.bin/vitest so the shim's pass-through is observable.
 function fixture() {
@@ -16,7 +22,7 @@ function fixture() {
   return dir;
 }
 const run = (cmd, args, { held, cwd } = {}) => {
-  const env = { ...process.env, PATH: codexShimPath(process.env) };
+  const env = { ...process.env, PATH: shimPath(process.env) };
   delete env.WE_HEAVY_ADMISSION_HELD;
   if (held) env.WE_HEAVY_ADMISSION_HELD = '1';
   return spawnSync(cmd, args, { cwd, env, encoding: 'utf8' });
@@ -67,8 +73,12 @@ describe('codex shims (R650)', () => {
     const r = spawnSync(join(CODEX_SHIM_DIR, 'npx'), ['--version'], { cwd, env, encoding: 'utf8', timeout: 20000 });
     expect(r.status).toBe(0);
   });
-  it('PATH resolves the shim first, and argv sets it for non-review runs only', () => {
-    expect(codexShimPath({ PATH: '/usr/bin' }).split(':')[0]).toBe(CODEX_SHIM_DIR);
+  it('PATH resolves the heavy-admission shim first, and argv sets it for non-review runs only', () => {
+    const PATH = shimPath({ PATH: '/usr/bin' });
+    expect(PATH.split(':')[0]).toBe(CODEX_SHIM_DIR);
+    const refused = spawnSync('vitest', ['run'], { cwd, env: { PATH }, encoding: 'utf8' });
+    expect(refused.status).toBe(97);
+    expect(refused.stderr).toContain('heavy-admission');
     const base = { route: { model: 'm', effort: 'low' }, cwd: '/x', outputLastMessageFile: '/x/o', env: { PATH: '/usr/bin' } };
     expect(buildCodexDirectTaskArgv(base).join(' ')).toContain(`shell_environment_policy.set.PATH=`);
     expect(buildCodexDirectTaskArgv({ ...base, review: true }).join(' ')).not.toContain('set.PATH');

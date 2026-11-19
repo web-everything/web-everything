@@ -5047,6 +5047,12 @@ Pure Codex argv construction precedes binary resolution. Orchestrator argv
 expectations must account explicitly for the launcher's final PATH, including the
 resolved agent directory, and assert that shell PATH equals spawn PATH. Stub the
 ambient PATH in those fixtures so host shim installation does not choose the result.
+
+CLI fixtures that record agent argv must embed their output path in the fake binary rather
+than forward unknown environment controls such as `ARGV_OUT`. Supply binary-lookup evidence
+through the existing filesystem preload; never select a fixture agent through ambient PATH.
+The launcher environment-registry and literal-launch tripwire tests are registered full-tree
+scanners: changes under scripts or skills select them even without an import dependency.
 ## Urgent prototype verification
 
 `node scripts/operations/run.mjs urgent-verify --sha=<full sha>` requires a clean checkout at

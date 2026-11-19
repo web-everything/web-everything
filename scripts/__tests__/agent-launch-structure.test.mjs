@@ -1,4 +1,6 @@
-/** Literal-call lint tripwire only, NOT the security boundary. Aliases/dynamic commands need later slices. */
+/** Literal-call lint tripwire only, NOT the security boundary. Aliases/dynamic commands need later slices.
+ * @repo-scanning-test scope=full — complete literal launch counts under scripts and symlinked skills.
+ */
 import { describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
@@ -22,20 +24,20 @@ function literalLaunches(source) {
 }
 function offenders() {
   const found = {};
-  function scan(path, ancestors = new Set()) {
+  function walk(path, ancestors = new Set()) {
     const real = realpathSync(path);
     if (ancestors.has(real)) throw Error(`cyclic source directory: ${path}`);
     if (statSync(path).isDirectory()) {
       const next = new Set([...ancestors, real]);
       for (const entry of readdirSync(path)) {
-        if (!['__tests__', 'tests', 'fixtures', 'node_modules', '.git'].includes(entry)) scan(join(path, entry), next);
+        if (!['__tests__', 'tests', 'fixtures', 'node_modules', '.git'].includes(entry)) walk(join(path, entry), next);
       }
     } else if (path.endsWith('.mjs') && !/\.(?:test|spec)\.mjs$/.test(path)) {
       const count = literalLaunches(readFileSync(path, 'utf8')).length;
       if (count) found[relative(root, path)] = count;
     }
   }
-  for (const dir of ['scripts', '.claude/skills']) scan(join(root, dir));
+  for (const dir of ['scripts', '.claude/skills']) walk(join(root, dir));
   return found;
 }
 function overPin(counts, pins) {

@@ -16,6 +16,7 @@ import { resolveTranscriptCheckPolicy } from '../lib/codex-transcript-policy.mjs
 import { fixLoopConfig } from '../conveyor/fix-loop-ledger.mjs';
 import { assertMainNotStale } from '../lib/main-staleness.mjs';
 
+// @repo-scanning-test scope=full — complete literal env-read inventory under scripts and symlinked skills.
 const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const registry = JSON.parse(readFileSync(join(root, 'scripts/lib/agent-launch-env-registry.json'), 'utf8'));
 // Same bounded inventory used to generate the registry. Include literal bracket and optional reads,
