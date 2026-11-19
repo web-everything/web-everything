@@ -334,7 +334,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload shard flake records
-        if: always()
+        if: ${{ always() && needs.changes.outputs.light != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: flaky-unit-${{ matrix.shard }}

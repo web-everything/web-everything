@@ -102,7 +102,8 @@ describe('ci.yml test-shard steps — no fail-open list construction', () => {
 it('covered first runs retain coverage on failure, with always-uploaded flake evidence', () => {
   expect(stepRun('Unit suite shard')).toContain('--coverage.reportOnFailure=true');
   const upload = steps.find(s => s.name === 'Upload shard flake records');
-  expect(upload.if).toBe('always()');
+  // Uploaded even after a red step, but skipped on card-only PRs like every other expensive shard step.
+  expect(upload.if).toBe("${{ always() && needs.changes.outputs.light != 'true' }}");
   expect(upload.with['if-no-files-found']).toBe('ignore');
   expect(upload.with.path).toBe('web-everything/coverage/flaky-unit-*.json');
 });
