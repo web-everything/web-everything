@@ -1990,7 +1990,6 @@ exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9)
     await runner.run(request);
     const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
     expect(receipt.code).toBe(0);
-    await stat(join(root,'receipts',request.run+'.uid-unconfirmed'));
     await stat(join(root,'receipts','worker-active'));
     const second=await runner.prepare({nonce:'c'.repeat(32),label:'abcdef-2'});
     await expect(runner.run({...request,nonce:'c'.repeat(32),run:second.run})).rejects.toThrow(/busy|interrupted|unconfirmed/);
