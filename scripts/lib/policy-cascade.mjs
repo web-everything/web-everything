@@ -25,8 +25,7 @@
  *
  *   Never throws. A missing platform file is "layer not set"; an unreadable one is skipped and named in `errors`.
  */
-import { boundedPlatformText, PLATFORM_FILE_MAX_BYTES } from './platform-preferences-io.mjs';
-export { PLATFORM_FILE_MAX_BYTES } from './platform-preferences-io.mjs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,19 +61,17 @@ function mergeLeaves(base, over) {
  * repo platform copies are ignored with a warning. Never throws.
  * @returns {{prefs:object, errors:string[]}}
  */
-export function readPlatformPreferences({ env = process.env, readFile = path => boundedPlatformText(path), operatorPath = operatorPreferencesPath(env), warn = message => console.error(message) } = {}) {
-  const override = String(env?.[PLATFORM_PREFERENCES_ENV] ?? env?.WE_PLATFORM_PREFERENCES ?? '').trim();
-  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPath];
+export function readPlatformPreferences({ env = process.env, readFile = readFileSync, warn = message => console.error(message) } = {}) {
+  const override = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
+  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(env)];
   const prefs = {};
   const errors = [];
   for (const path of paths) {
     try {
-      const text = String(readFile(path, 'utf8'));
-      if (Buffer.byteLength(text) > PLATFORM_FILE_MAX_BYTES) throw Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
-      const data = JSON.parse(text);
+      const data = JSON.parse(String(readFile(path, 'utf8')));
       if (!isObj(data)) { errors.push(`${path}: not a JSON object`); continue; }
       for (const [k, v] of Object.entries(data)) {
-        if (['routingOverrides', 'findingClasses'].includes(k) && (path !== (override || operatorPath)
+        if (['routingOverrides', 'findingClasses'].includes(k) && (path !== operatorPreferencesPath(env)
           || [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH].some(repoPath => resolve(repoPath) === resolve(path)))) {
           warn(`policy-cascade: ${path}: ignoring ${k}; only the operator-owned preferences file may set it`);
           continue;

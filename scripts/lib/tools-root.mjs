@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { CLONES_DIR_NAME } from './daemon-clone-layout.mjs';
 
-export function boundedToolsText(path, fs = nativeFs, limit = PLATFORM_FILE_MAX_BYTES) {
+export function boundedToolsText(path, fs = nativeFs, limit = 256 * 1024) {
   const fd = fs.openSync(path, 'r');
   try {
     const bytes = Buffer.alloc(limit + 1);
@@ -42,7 +42,7 @@ export function resolveToolsRoot({ scriptRelPath, env = process.env, home = home
     if (candidate === undefined) {
       // Executable tooling selection is host-only: repository platform layers cannot authorize re-exec.
       let prefs;
-      try { prefs = JSON.parse(boundedToolsText(env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'), fs)); }
+      try { prefs = JSON.parse(boundedToolsText(env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'), fs, PLATFORM_FILE_MAX_BYTES)); }
       catch (error) { if (error?.code === 'ENOENT') return { active: false }; throw error; }
       if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) throw Error('platform preferences must be an object');
       candidate = prefs.tools?.root;

@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, readPlatformPreferences, readOperatorPolicy } from './policy-cascade.mjs';
 export const hostStateRoot = () => join(userInfo().homedir, '.cache', 'we-host-overload');
-export function boundedText(path, maxBytes = PLATFORM_FILE_MAX_BYTES) {
+export function boundedText(path, maxBytes = 256 * 1024) {
   const fd = openSync(path, 'r');
   try {
     const bytes = Buffer.alloc(maxBytes + 1);
@@ -95,7 +95,7 @@ export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = pr
 export function loadHostOverloadSettings({ env = process.env, log, toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/host-overload.json') } = {}) {
   const canonical = {};
   const p = readPlatformPreferences({ env, readFile: (path) => {
-    const text = boundedText(path);
+    const text = boundedText(path, PLATFORM_FILE_MAX_BYTES);
     // Preserve sibling leaves across the canonical reader's legacy/default files too.
     // Validate each file before merging, so later overrides cannot conceal invalid policy.
     Object.assign(canonical, flatten(JSON.parse(text), 'platform'));

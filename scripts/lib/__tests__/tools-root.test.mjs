@@ -48,7 +48,7 @@ const liveGuardFixture = () => {
     WE_PLATFORM_PREFERENCES: join(base, 'absent.json') };
 };
 const rejectionCases = [
-  ['tools-root input exceeds byte limit; use local tooling', o => write(join(root, 'package.json'), ' '.repeat(PLATFORM_FILE_MAX_BYTES + 1))],
+  ['tools-root input exceeds byte limit; use local tooling', o => write(join(root, 'package.json'), ' '.repeat(256 * 1024 + 1))],
   ['platform preferences must be an object', o => {
     const prefs = join(base, 'prefs.json'); write(prefs, '[]'); o.env = { WE_PLATFORM_PREFERENCES: prefs };
   }],
@@ -263,7 +263,7 @@ describe('tools.root resolution and guard', () => {
   });
 
   it.each(['preferences', 'package'])('bounds %s read requests and cumulative bytes, with local fallback for oversized input', kind => {
-    const limit = PLATFORM_FILE_MAX_BYTES;
+    const limit = kind === 'preferences' ? PLATFORM_FILE_MAX_BYTES : 256 * 1024;
     const path = kind === 'preferences' ? join(base, 'oversized.json') : join(root, 'package.json');
     write(path, ' '.repeat(limit * 2 + 17));
     let bytesRead = 0;
