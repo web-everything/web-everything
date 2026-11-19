@@ -18,6 +18,7 @@ import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLo
 import { urgentSignature } from '../urgent-verify-marker.mjs';
 const urgentKey = Buffer.alloc(32, 7);
 import * as prototypeLoad from '../prototype-load.mjs';
+import { cardHash } from '../audit-base-repro.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
 import { resolveOperation } from '../run.mjs';
 import { createRegistry } from '../registry.mjs';
@@ -55,6 +56,7 @@ function fixture(options = {}) {
   const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
   const fs = {
     readFileSync(p) {
+      if (options.exemptionFiles && Object.hasOwn(options.exemptionFiles, p)) return options.exemptionFiles[p];
       reads.push(p);
       if (p.endsWith('/urgent-full-green.jsonl')) {
         if (options.urgentLedger === undefined) throw new Error('unreadable urgent ledger');
@@ -632,6 +634,31 @@ describe('prototype-load ruled-WEAKENED admission', () => {
 });
 
 describe('prototype-load canonical audit admission', () => {
+  it.each(['current', 'mode revoked', 'card removed', 'needs-you removed', 'new protected path', 'unreadable settings'])('revalidates persisted exemptions before loading: %s', kind => {
+    const key = 'x.mjs|X|B2', line = 'x.mjs:2 unsafe return';
+    const exemption = { key, line, relation: 'SAME', cardHash: cardHash(key), base: { sha: TREE, path: 'x.mjs', line: 2, quote: 'return unsafe();' } };
+    const card = `- [R1053] today ET: pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${TREE.slice(0, 10)}: ${line}`;
+    const escalation = `- [R1053][needs-you] today ET: security pre-existing (B2) ${key}`;
+    const exemptionFiles = {
+      [resolve(dirname(fileURLToPath(import.meta.url)), '../../settings/codex-audit.json')]: kind === 'unreadable settings' ? '{bad' : JSON.stringify({ audit: {
+        preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, releaseStage: 'prerelease', cards: { requirePayBy: false },
+        ...(kind === 'new protected path' ? { raceBlockPaths: ['x.mjs'] } : {}),
+      } }),
+      '/home/test/workspace/.operations/handoff/cards-to-file.md': [kind === 'card removed' ? '' : card, kind === 'needs-you removed' ? '' : escalation].join('\n'),
+      '/home/test/workspace/.operations/coordination/pre-existing-findings.jsonl': JSON.stringify({ key, cardHash: exemption.cardHash }),
+    };
+    const f = auditedFixture('refuse', { exemptionFiles, auditBaseInMain: TREE,
+      audits: auditLines([auditRecord({ modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [exemption] })]) });
+    return f.run().then(out => {
+      if (kind === 'current') {
+        expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true } });
+      } else {
+        expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'exemption-stale' } });
+        expect(out.fallback).toMatch(/human review|restore/i);
+        expect(mutations(f, 'add')).toHaveLength(0);
+      }
+    });
+  });
   it('has no tool-file mode: admission always refuses without canonical evidence', () => {
     const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped).not.toHaveProperty('canonicalAuditMode');
