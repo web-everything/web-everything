@@ -1956,6 +1956,8 @@ describe('timeout catch-up back-off', () => {
 describe('concurrent catch-up rounds', () => {
   const concurrent = (extra = {}) => catchUpSetup({
     manualFinish: true,
+    // These concurrency contracts model a round whose snapshot has already been published.
+    existsSyncImpl: () => true,
     resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3, busyIntervalSeconds: 60 } }),
     readCapacity: () => ({ capacity: 8, source: 'test' }),
     readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4, 5].map(n => candidate(n, n)) }),
@@ -2885,4 +2887,138 @@ it('catch-up miss backoff uses a nondefault TTL from the resolved setting', asyn
   await f.handle.catchUp();
   f.advance(600_000); await f.handle.catchUp();
   expect(f.calls).toHaveLength(2);
+});
+
+
+describe('catch-up clean-first and snapshot-first settings', () => {
+  it.each(['cleanFirst', 'snapshotFirst'])('resolves and logs %s through standard, platform and tool layers', leaf => {
+    const standard = resolveSetting();
+    expect(standard.catchUp[leaf]).toBe(true);
+    expect(standard.line).toContain(`catchUp.${leaf}=true (standard)`);
+    const platform = resolveSetting({}, { platform: { catchUp: { [leaf]: false } } });
+    expect(platform.catchUp[leaf]).toBe(false);
+    expect(platform.sources[`catchUp.${leaf}`]).toBe('platform');
+    expect(platform.line).toContain(`catchUp.${leaf}=false (platform)`);
+    const tool = resolveSetting({ catchUp: { [leaf]: false } }, { platform: { catchUp: { [leaf]: true } } });
+    expect(tool.catchUp[leaf]).toBe(false);
+    expect(tool.sources[`catchUp.${leaf}`]).toBe('tool');
+    expect(tool.line).toContain(`catchUp.${leaf}=false (tool)`);
+    for (const invalid of ['false', null, 0, {}]) {
+      expect(resolveSetting({ catchUp: { [leaf]: invalid } }).catchUp[leaf]).toBe(true);
+      const fallback = resolveSetting({ catchUp: { [leaf]: invalid } }, { platform: { catchUp: { [leaf]: false } } });
+      expect(fallback.catchUp[leaf]).toBe(false);
+      expect(fallback.sources[`catchUp.${leaf}`]).toBe('platform');
+      expect(fallback.invalid).toContain(`catchUp.${leaf}=${JSON.stringify(invalid)}`);
+    }
+  });
+
+  it('declares both defaults in the settings file and resolves their tool provenance', () => {
+    const declared = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/merge-queue.json'), 'utf8'));
+    expect(declared.mergeQueue.enqueueOnEvent.catchUp).toMatchObject({ cleanFirst: true, snapshotFirst: true, concurrency: 3 });
+    const setting = resolveEnqueueOnEventSetting({ env: {} });
+    expect(setting.catchUp).toMatchObject({ cleanFirst: true, snapshotFirst: true });
+    expect(setting.sources).toMatchObject({ 'catchUp.cleanFirst': 'tool', 'catchUp.snapshotFirst': 'tool' });
+  });
+});
+
+describe('planCatchUp final clean-first partition', () => {
+  const prs = [
+    candidate(1, 1, { mergeStateStatus: 'BLOCKED', itemIds: ['urgent'] }),
+    candidate(2, 2), candidate(3, 3, { mergeStateStatus: 'HAS_HOOKS', itemIds: ['urgent'] }),
+    candidate(4, 4, { mergeStateStatus: 'UNSTABLE' }), candidate(5, 5, { mergeStateStatus: 'BEHIND' }),
+    candidate(6, 6, { mergeStateStatus: undefined }), candidate(7, 7, { mergeStateStatus: 'UNKNOWN' }),
+  ];
+  const input = { prs, queued: 0, capacity: 2, buildPriority: ['urgent'], deprioritize: [3] };
+  it('puts CLEAN and HAS_HOOKS first after all sorts, retaining priority and every non-clean candidate', () => {
+    const plan = planCatchUp(input);
+    expect(plan.run.map(p => p.num)).toEqual([2, 3]);
+    expect(plan.later).toEqual([1, 4, 5, 6, 7]);
+    expect(plan.skipped).toEqual([]);
+    // With no prior miss, build priority stays intact inside the clean partition.
+    expect(planCatchUp({ ...input, deprioritize: [] }).run.map(p => p.num)).toEqual([3, 2]);
+  });
+  it('keeps the existing priority/miss order when cleanFirst is disabled', () => {
+    const plan = planCatchUp({ ...input, cleanFirst: false });
+    expect([...plan.run.map(p => p.num), ...plan.later]).toEqual([1, 2, 4, 5, 6, 7, 3]);
+  });
+  it('treats unreadable merge state as not clean and retains it', () => {
+    const unreadable = candidate(1, 0, { mergeStateStatus: {} });
+    const plan = planCatchUp({ prs: [unreadable, candidate(2, 1)], queued: 0, capacity: 1 });
+    expect(plan.run.map(p => p.num)).toEqual([2]);
+    expect(plan.later).toEqual([1]);
+  });
+});
+
+describe('catch-up snapshot-first scheduling', () => {
+  const flush = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
+  const fixture = (extra = {}) => catchUpSetup({
+    manualFinish: true,
+    resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3 } }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3].map(n => candidate(n, n)) }),
+    ...extra,
+  });
+
+  it('waits for the snapshot, then fills the configured concurrency while the writer is active', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(1);
+      const path = f.calls[0].args.find(a => a.startsWith('--listing-snapshot=')).split('=')[1];
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.calls).toHaveLength(1);
+      writeFileSync(path, '{}');
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.calls).toHaveLength(3);
+      expect(f.calls.every(c => c.args.includes(`--listing-snapshot=${path}`))).toBe(true);
+      f.children.forEach(c => c.finish());
+      expect(await round).toHaveLength(3);
+    } finally {
+      f.handle.kill();
+      f.children.forEach(c => c.emit('close', 143));
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['error', 'timeout'])('starts the next writer after %s leaves the active set empty without a snapshot', async failure => {
+    vi.useFakeTimers();
+    const f = fixture({ timeoutMs: 1000, existsSyncImpl: () => false });
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(1);
+      if (failure === 'error') f.children[0].emit('error', Error('writer failed before publishing'));
+      else {
+        f.children[0].kill = () => f.children[0].emit('close', 143);
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      await flush();
+      expect(f.calls).toHaveLength(2);
+      f.children[1].finish();
+      await flush();
+      expect(f.calls).toHaveLength(3);
+      f.children[2].finish();
+      expect(await round).toHaveLength(3);
+    } finally {
+      f.handle.kill();
+      f.children.forEach(c => c.emit('close', 143));
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['disabled', 'check throws'])('retains normal concurrency when snapshot-first is %s', async mode => {
+    const f = fixture({
+      existsSyncImpl: () => { if (mode === 'check throws') throw Error('unreadable'); return false; },
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp,
+        concurrency: 3, snapshotFirst: mode !== 'disabled' } }),
+    });
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(3);
+      f.children.forEach(c => c.finish());
+      await round;
+    } finally { f.handle.kill(); f.children.forEach(c => c.emit('close', 143)); }
+  });
 });

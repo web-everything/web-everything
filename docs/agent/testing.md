@@ -2551,6 +2551,10 @@ retained attempts must stay within the latest room, and cannot use a failed snap
 Catch-up concurrency tests use manually completed child processes to prove the cap while siblings
 remain active, including concurrency 1. Re-read live queue depth/capacity before each start and
 reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
+Snapshot-first catch-up fixtures must model whether the round snapshot exists: legacy concurrency
+contracts inject an already-published snapshot; writer tests hold it absent, publish during an active child,
+and cover failed/timed-out writers releasing the next attempt. Clean-first is a final stable partition,
+so test prior priority/miss ordering within both groups and retain every non-clean candidate.
 A batching deferral stops new starts but lets existing children finish their locked admission checks.
 Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
 scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
