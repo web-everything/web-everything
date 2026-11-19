@@ -4,7 +4,7 @@
  * Inject the existing primitive so synchronous returns, promises and child handles stay intact.
  */
 import { spawn, spawnSync, exec, execFile, execSync, execFileSync } from 'node:child_process';
-import { types } from 'node:util';
+import { snapshotInput } from './plain-data-snapshot.mjs';
 import { spawnToCompletion } from './spawn-to-completion.mjs';
 import { isAgentLaunchTestPrimitive } from './agent-launch.test-seam.mjs';
 
@@ -12,10 +12,12 @@ import { isAgentLaunchTestPrimitive } from './agent-launch.test-seam.mjs';
 const approvedPrimitives = new Set([spawn, spawnSync, exec, execFile, execSync, execFileSync]);
 
 // Share one policy across Node options, env wrappers and shell assignment words.
-const executionEnvironment = /^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*)$/i;
+const executionEnvironment = /^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*|HOME|ZDOTDIR|XDG_CONFIG_HOME|XDG_CONFIG_DIRS|GIT_CONFIG.*|GIT_EXEC_PATH|GIT_SSH_COMMAND)$/i;
 const environmentName = /^[A-Za-z_][A-Za-z0-9_]*$/;
-function rejectExecutionEnvironment(key) {
-  if (executionEnvironment.test(key)) {
+const startupLocation = /^(?:HOME|ZDOTDIR|XDG_CONFIG_HOME|XDG_CONFIG_DIRS)$/i;
+function rejectExecutionEnvironment(key, value) {
+  if (executionEnvironment.test(key)
+    && !(startupLocation.test(key) && (value === process.env[key] || String(value) === process.env[key]))) {
     throw new SyntaxError('execution redirection environment is unsupported; remove loader, lookup and shell startup overrides');
   }
 }
@@ -24,43 +26,12 @@ function validateAssignment(word) {
   const equals = word.indexOf('=');
   if (equals < 0) throw new SyntaxError('unsupported environment assignment; use literal argv');
   const key = word.slice(0, equals);
-  rejectExecutionEnvironment(key);
+  rejectExecutionEnvironment(key, word.slice(equals + 1));
   if (!environmentName.test(key)) throw new SyntaxError('unsupported environment name; use literal argv');
 }
 
 // No caller needs Node's fork: its JavaScript module/execArgv grammar is not agent argv.
 // Keep execution-redirection options closed for every remaining primitive, too.
-function snapshotInput(value, ancestors = new Set()) {
-  // Descriptor inspection alone cannot identify a Proxy: its traps can forge descriptors.
-  if (types.isProxy(value)) throw new SyntaxError('Proxy input is unsupported; use plain data and literal argv');
-  if (value === null || typeof value !== 'object') return value;
-  const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
-  if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array)) {
-    throw new SyntaxError('non-plain input is unsupported; use plain data and literal argv');
-  }
-  if (ancestors.has(value)) throw new SyntaxError('cyclic input is unsupported; use plain data and literal argv');
-  ancestors.add(value);
-  const copy = array ? [] : Object.create(null);
-  let indices = 0, length;
-  for (const key of Reflect.ownKeys(value)) {
-    const property = Object.getOwnPropertyDescriptor(value, key);
-    if (!property || !Object.hasOwn(property, 'value')) {
-      throw new SyntaxError('accessor input is unsupported; use plain data and literal argv');
-    }
-    if (array && key === 'length') { length = property.value; continue; }
-    if (array) {
-      if (typeof key !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= 0xffffffff) {
-        throw new SyntaxError('non-plain array is unsupported; use literal argv without custom properties');
-      }
-      indices++;
-    }
-    Object.defineProperty(copy, key, { value: snapshotInput(property.value, ancestors), enumerable: true });
-  }
-  if (array && indices !== length) throw new SyntaxError('sparse array is unsupported; use dense literal argv');
-  ancestors.delete(value);
-  return Object.freeze(copy);
-}
-
 function snapshotInvocation(args, primitive) {
   const forwarded = [...args];
   const stringCommand = primitive === exec || primitive === execSync;
@@ -84,10 +55,10 @@ function snapshotInvocation(args, primitive) {
       }
       for (const key of Reflect.ownKeys(snapshot.env)) {
         if (typeof key !== 'string') throw new SyntaxError('environment names must be strings');
-        rejectExecutionEnvironment(key);
         if (!['string', 'number', 'boolean', 'undefined'].includes(typeof snapshot.env[key]) && snapshot.env[key] !== null) {
           throw new SyntaxError('environment values must be literal data');
         }
+        rejectExecutionEnvironment(key, snapshot.env[key]);
       }
     } else {
       snapshot.env = inheritedEnvironment();
@@ -105,8 +76,8 @@ function snapshotInvocation(args, primitive) {
 
 function inheritedEnvironment() {
   const env = { ...process.env };
-  // Keep the inherited executable lookup path; explicit PATH overrides still refuse.
-  for (const key of Object.keys(env)) if (key.toUpperCase() !== 'PATH' && executionEnvironment.test(key)) delete env[key];
+  // Keep the parent's real home and executable lookup path; refuse explicit redirection.
+  for (const key of Object.keys(env)) if (!['PATH', 'HOME'].includes(key.toUpperCase()) && executionEnvironment.test(key)) delete env[key];
   return Object.freeze(env);
 }
 
@@ -146,6 +117,7 @@ function refuse(reason, descriptor, log, cause) {
 
 /** The native id already present in argv, never a reporting slug or a newly minted id. */
 export function agentResumeId(argv = []) {
+  argv = snapshotInput(argv);
   // This helper also accepts argv without a binary: Codex's subcommands identify its grammar.
   const commands = typeof argv === 'string' ? normaliseScript(argv, 0, true)
     : [normaliseOptions(argv, argv.some(word => CODEX_SUBCOMMANDS.has(word)) ? 'codex' : 'claude')];
@@ -168,7 +140,7 @@ const CODEX_SHORT_VALUE_OPTIONS = new Set(['-a', '-c', '-i', '-p', '-o']);
 const RESUME_OPTIONS = new Set(['--resume', '--session-id', '-r']);
 const isOption = word => word.length > 1 && word.startsWith('-');
 const agentExecutable = /(?:^|[/\\])(claude|codex)$/;
-const shellExecutable = /(?:^|[/\\])(?:ba|z|da|k)?sh$/;
+const shellExecutable = /(?:^|[/\\])(?:(?:ba|z|da|k)?sh|fish)$/;
 const separator = Symbol('shell command separator');
 const MAX_WRAPPERS = 32;
 
@@ -320,12 +292,12 @@ function normaliseCommand(words, depth = 0, shell = false) {
     return [];
   }
   if (shellExecutable.test(command)) {
-    let i = 0;
-    for (; i < argv.length; i++) {
-      if (/^-[eilnruvxf]*c[eilnruvxf]*$/.test(argv[i])) return normaliseScript(argv[i + 1], depth + 1);
-      if (!/^-[eilnruvxf]+$/.test(argv[i]) && !['--login', '--noprofile', '--norc'].includes(argv[i])) break;
+    // Only these exact noninteractive forms have a reviewed startup policy. Unknown
+    // flags, combined clusters, login/interactive modes and script/stdin modes refuse.
+    if (!/(?:^|[/\\])(?:sh|bash|zsh)$/.test(command) || argv[0] !== '-c') {
+      throw new SyntaxError('shell startup files are unsupported; use literal argv or plain sh/bash/zsh -c');
     }
-    throw new SyntaxError('shell without a literal -c script');
+    return normaliseScript(argv[1], depth + 1);
   }
   const wrapper = command.split(/[/\\]/).at(-1);
   let i = 0;
@@ -378,25 +350,28 @@ function isThenable(value) {
   try { return typeof value.then === 'function'; } catch { return true; }
 }
 
+function snapshotLaunchInputs(inputs, primitive) {
+  try {
+    // The rest array is ours; Array.isArray never invokes caller Proxy traps.
+    if ((primitive === exec || primitive === execSync) && Array.isArray(inputs[2][1])) {
+      throw new SyntaxError('execution options must be an object, never an argv array; use literal argv with spawn or execFile');
+    }
+    return snapshotInput(inputs);
+  } catch (cause) {
+    // No field of the original descriptor is safe to read on snapshot failure.
+    refuse(`cannot snapshot launch inputs; use literal argv and plain data; ${cause.message}`,
+      undefined, s => process.stderr.write(s), cause);
+  }
+}
+
 /**
  * Execute exactly one primitive with its original arguments and return value.
  * `resumeId` is an explicit key even for management commands/fresh launches (null/undefined).
  * The guard is synchronous: a promise is refused rather than accidentally launching before it resolves.
  */
 export function launchAgent(descriptor, primitive, ...args) {
-  let log = (s) => process.stderr.write(s);
-  try {
-    descriptor = snapshotInput(descriptor);
-    if (typeof descriptor?.log === 'function') log = descriptor.log;
-    // Check the overload before recursively copying arrays, including array-shaped options.
-    if ((primitive === exec || primitive === execSync) && Array.isArray(args[1])) {
-      throw new SyntaxError('execution options must be an object, never an argv array; use literal argv with spawn or execFile');
-    }
-    args = snapshotInput(args);
-  } catch (cause) {
-    // The original descriptor may itself contain hostile accessors or Proxy traps.
-    refuse(`cannot snapshot launch inputs; use literal argv and plain data; ${cause.message}`, undefined, log, cause);
-  }
+  [descriptor, primitive, args] = snapshotLaunchInputs([descriptor, primitive, args], primitive);
+  const log = typeof descriptor?.log === 'function' ? descriptor.log : s => process.stderr.write(s);
   if (!descriptor || typeof descriptor !== 'object') refuse('descriptor is required', descriptor, log);
   if (!descriptor.mode) refuse('mode is required', descriptor, log);
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
@@ -443,6 +418,7 @@ export function launchAgent(descriptor, primitive, ...args) {
 
 /** Preserve spawnToCompletion's options/result and the injected spawnFn seam at the OS boundary. */
 export function launchAgentToCompletion(descriptor, command, argv, options, io = {}) {
+  [descriptor, command, argv, options, io] = snapshotLaunchInputs([descriptor, command, argv, options, io]);
   return spawnToCompletion(command, argv, options, {
     ...io, spawnFn: (...args) => launchAgent(descriptor, io.spawnFn ?? spawn, ...args),
   });

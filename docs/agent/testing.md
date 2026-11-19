@@ -4900,3 +4900,23 @@ have parsed native evidence equal to its descriptor, including through shell wra
 Use a historical blob import for before-proof when Git writes are prohibited; preserve
 the historical implementation and resolve only its relative dependency import. Never
 disable a current guard to manufacture a failure. No actual agent process is needed.
+
+
+## Agent launch startup locations and completion snapshots (R37.29–30)
+
+The R37 runtime table in `scripts/__tests__/agent-launch.test.mjs` covers startup-directory
+and Git execution/config overrides across options, env wrappers, inline assignments and
+export/declare statements. Preserve inherited HOME and CLAUDE_CONFIG_DIR; remove inherited
+ZDOTDIR/XDG configuration locations and Git overrides. Explicit HOME/ZDOTDIR/XDG locations
+must equal the parent's value. Only plain sh/bash/zsh `-c` wrappers are reviewed; refuse
+other shell modes/flags with a literal-argv fallback. Real bash/zsh probes first demonstrate
+that harmless startup files execute with overridden directories, then prove launcher refusal
+before the guard or startup-file side effect. Plain `-c` positive controls execute aliased Node.
+
+Snapshot caller data as the first statement of each launch/completion entry point, before
+option destructuring or spreading; forward only those copies. Share the plain-data snapshot
+validator with spawnToCompletion and the resume extractor. Getter/Proxy rows assert zero
+side effects, including completion-only options (encoding, timeout, maxBuffer, killSignal),
+injected IO and descriptor fields. Oversized sparse argv refuses with dense literal argv as
+the fallback. Keep old login-shell resume fixtures on plain `-c` so they still exercise resume
+evidence; dedicated startup rows prove login/interactive refusal before guards.

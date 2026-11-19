@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
+import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { findAgentLaunches } from './fixtures/agent-launch-source.mjs';
 import { registerAgentLaunchTestPrimitive } from '../lib/agent-launch.test-seam.mjs';
 
@@ -25,19 +26,25 @@ const DENIED_ENVIRONMENT_KEYS = [
   'NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CA_CERTS', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
   'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', 'BASH_ENV', 'ENV', 'PATH', 'SHELLOPTS', 'BASHOPTS',
   'PS4', 'PROMPT_COMMAND', 'IFS', 'CDPATH', 'GLOBIGNORE', 'BASH_FUNC_injected%%',
+  'ZDOTDIR', 'XDG_CONFIG_HOME', 'XDG_CONFIG_DIRS', 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0',
+  'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS', 'GIT_EXEC_PATH', 'GIT_SSH_COMMAND',
+  'git_config_global', 'git_exec_path', 'git_ssh_command', 'HOME',
   'node_options', 'Node_Path', 'node_extra_ca_certs', 'ld_preload', 'DyLd_INSERT_LIBRARIES',
 ];
+
+const STARTUP_LOCATIONS = ['HOME', 'ZDOTDIR', 'XDG_CONFIG_HOME', 'XDG_CONFIG_DIRS'];
+const STRIPPED_ENVIRONMENT_KEYS = DENIED_ENVIRONMENT_KEYS.filter(key => !['PATH', 'HOME'].includes(key));
 
 const inheritedOptions = () => {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
-    if (/^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*)$/i.test(key)) delete env[key];
+    if (/^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*|ZDOTDIR|XDG_CONFIG_HOME|XDG_CONFIG_DIRS|GIT_CONFIG.*|GIT_EXEC_PATH|GIT_SSH_COMMAND)$/i.test(key)) delete env[key];
   }
   return { env };
 };
 
 // Real probes alias Node as a literal agent executable; no agent CLI is started.
-function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field }) {
+async function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field }) {
   const dir = mkdtempSync(join(tmpdir(), 'r37-runtime-'));
   const nodeAlias = join(dir, 'claude'), marker = 'BYPASS_EXECUTED';
   symlinkSync(process.execPath, nodeAlias);
@@ -47,6 +54,48 @@ function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field
   let argv = ['-c', safeScript], command = 'bash', calls = 0;
   const savedEnvironment = process.env;
   try {
+    if (runtimeProbe === 'unchanged-location') {
+      process.env = { ...savedEnvironment, [field]: 'R37_PARENT' };
+      const assignment = `${field}=R37_PARENT`;
+      const primitive = testPrimitive();
+      const forms = {
+        options: ['claude', [], { env: { [field]: 'R37_PARENT' } }],
+        env: ['env', [assignment, 'claude']],
+        inline: ['sh', ['-c', `${assignment} claude`]],
+        export: ['sh', ['-c', `export ${assignment}; claude`]],
+        declare: ['bash', ['-c', `declare -x ${assignment}; claude`]],
+      };
+      descriptor.launchGuard = () => { calls++; return true; };
+      launchAgent(descriptor, primitive, ...forms[variant]);
+      expect(calls).toBe(1);
+      expect(primitive).toHaveBeenCalledTimes(1);
+      return;
+    }
+    if (runtimeProbe === 'startup-file') {
+      const markerPath = join(dir, 'startup-ran');
+      command = field;
+      argv = [variant, safeScript];
+      options.env = { [command === 'bash' ? 'HOME' : 'ZDOTDIR']: dir };
+      writeFileSync(join(dir, command === 'bash' ? '.bashrc' : '.zshenv'), `printf startup > '${markerPath}'\n`);
+      // Establish that this host really reads the harmless fixture before testing refusal.
+      const control = childProcess.spawnSync(command, argv, { ...options, env: { ...inheritedOptions().env, ...options.env } });
+      expect(control.error).toBeUndefined();
+      expect(control.status).toBe(0);
+      expect(existsSync(markerPath)).toBe(true);
+      rmSync(markerPath);
+      descriptor.launchGuard = () => { calls++; return true; };
+      expect(() => launchAgent(descriptor, childProcess.spawnSync, command, argv, options)).toThrow(AgentLaunchRefusedError);
+      expect(calls).toBe(0);
+      expect(existsSync(markerPath)).toBe(false);
+      return;
+    }
+    if (runtimeProbe === 'plain-shell') {
+      const result = launchAgent(descriptor, childProcess.spawnSync, field, argv, options);
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('SAFE_EXECUTED');
+      return;
+    }
     if (runtimeProbe === 'inherited') {
       process.env = { ...savedEnvironment, BASH_ENV: '/dev/stdin' };
       options.input = `echo ${marker}\n`;
@@ -72,8 +121,9 @@ function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field
       return;
     }
     if (runtimeProbe === 'environment-snapshot') {
-      process.env = { ...savedEnvironment, R37_SAFE: 'before' };
-      for (const key of DENIED_ENVIRONMENT_KEYS.filter(key => key !== 'PATH')) process.env[key] = 'untrusted';
+      process.env = { ...savedEnvironment, R37_SAFE: 'before',
+        ...(variant === 'claude-config' ? { CLAUDE_CONFIG_DIR: 'fixture-config' } : {}) };
+      for (const key of STRIPPED_ENVIRONMENT_KEYS) process.env[key] = 'untrusted';
       const before = process.env;
       descriptor.launchGuard = () => { process.env.R37_SAFE = marker; process.env.BASH_ENV = '/dev/stdin'; return true; };
       const inspect = testPrimitive((...args) => args);
@@ -87,7 +137,9 @@ function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field
       expect(forwarded.env).not.toBe(before);
       expect(forwarded.env.R37_SAFE).toBe('before');
       expect(forwarded.env.PATH).toBe(savedEnvironment.PATH);
-      for (const key of DENIED_ENVIRONMENT_KEYS.filter(key => key !== 'PATH')) expect(Object.hasOwn(forwarded.env, key)).toBe(false);
+      expect(forwarded.env.HOME).toBe(savedEnvironment.HOME);
+      expect(forwarded.env.CLAUDE_CONFIG_DIR).toBe(variant === 'claude-config' ? 'fixture-config' : savedEnvironment.CLAUDE_CONFIG_DIR);
+      for (const key of STRIPPED_ENVIRONMENT_KEYS) expect(Object.hasOwn(forwarded.env, key)).toBe(false);
       expect(JSON.stringify(forwarded)).not.toContain(marker);
       return;
     }
@@ -109,6 +161,8 @@ function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field
       expect(calls).toBe(0);
       return;
     }
+    descriptor.launchGuard = () => { calls++; return true; };
+    let io = { spawnFn: childProcess.spawn };
     const hostile = () => { calls++; return calls === 1 ? safeScript : `echo ${marker}`; };
     if (variant === 'argv-getter') Object.defineProperty(argv, '1', { get: hostile });
     if (variant === 'argv-proxy') argv = new Proxy(argv, { get(target, key, receiver) { return key === '1' ? hostile() : Reflect.get(target, key, receiver); } });
@@ -118,6 +172,8 @@ function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field
     if (variant === 'oversized-sparse-argv') argv = new Array(0xffffffff);
     if (variant === 'array-subclass') argv = new (class extends Array {})(...argv);
     if (variant === 'options-getter') Object.defineProperty(options, field, { get: hostile });
+    if (variant === 'io-getter') Object.defineProperty(io, 'spawnFn', { get: hostile });
+    if (variant === 'environment-coercion') options.env = { [field]: { toString: hostile } };
     if (variant === 'environment-getter') { options.env = {}; Object.defineProperty(options.env, 'SAFE', { get: hostile }); }
     if (variant === 'cyclic-options') options.cycle = options;
     if (variant === 'options-prototype') Object.setPrototypeOf(options, { get shell() { return hostile(); } });
@@ -128,11 +184,17 @@ function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field
     const suppliedDescriptor = variant === 'descriptor-proxy' ? new Proxy(descriptor, proxyTraps) : descriptor;
     const suppliedOptions = variant === 'options-proxy' ? new Proxy(options, proxyTraps) : options;
     if (variant === 'environment-proxy') options.env = new Proxy({}, proxyTraps);
+    if (variant === 'io-proxy') io = new Proxy(io, proxyTraps);
     let result, error;
-    try { result = launchAgent(suppliedDescriptor, childProcess.spawnSync, command, argv, suppliedOptions); }
+    try {
+      result = primitive === 'completion' ? await launchAgentToCompletion(suppliedDescriptor, command, argv, suppliedOptions, io)
+        : primitive === 'spawnToCompletion' ? await spawnToCompletion(command, argv, suppliedOptions, io)
+          : primitive === 'agentResumeId' ? agentResumeId(argv)
+            : launchAgent(suppliedDescriptor, childProcess.spawnSync, command, argv, suppliedOptions);
+    }
     catch (cause) { error = cause; }
     expect(`${result?.stdout ?? ''}${result?.stderr ?? ''}`).not.toContain(marker);
-    expect(error).toBeInstanceOf(AgentLaunchRefusedError);
+    expect(error).toBeInstanceOf(['spawnToCompletion', 'agentResumeId'].includes(primitive) ? SyntaxError : AgentLaunchRefusedError);
     expect(error.message).toContain('use literal argv');
     expect(calls).toBe(0);
   } finally { process.env = savedEnvironment; rmSync(dir, { recursive: true, force: true }); }
@@ -140,6 +202,53 @@ function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field
 
 // Audit probes exercise the real boundary with harmless OS commands or injected primitives.
 it.each([
+  ...[['bash', '-ic'], ['zsh', '-c']].map(([field, variant]) => ({
+    name: `R37.29 real ${field} ${variant} refuses a startup-directory override before guard or startup code`,
+    runtimeProbe: 'startup-file', field, variant,
+  })),
+  ...['sh', 'bash', 'zsh'].map(field => ({
+    name: `R37.29 real plain ${field} -c remains allowed with inherited HOME`, runtimeProbe: 'plain-shell', field,
+  })),
+  ...['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish'].flatMap(command => [
+    ['-i', '-c'], ['-l', '-c'], ['--login', '-c'], ['--rcfile', 'startup', '-c'],
+    ['--init-file=startup', '-c'], ['--init-file', 'startup', '-c'], ['--rcfile=startup', '-c'],
+    ['-ic'], ['-lc'], ['-ilc'], ['-cil'], ['-xic'], [], ['startup'], ['--unknown', '-c'],
+    ['--noprofile', '--norc', '-ic'],
+  ].map(prefix => ({
+    name: `R37.29 refuses startup or unreviewed shell form ${command} ${prefix.join(' ')}`,
+    command, argv: [...prefix, `claude --resume ${SID}`], resumeId: SID, refused: true, reason: 'use literal argv',
+  }))),
+  ...['dash', 'ksh', 'fish'].map(command => ({
+    name: `R37.29 refuses unreviewed ${command} -c`, command, argv: ['-c', `claude --resume ${SID}`],
+    resumeId: SID, refused: true, reason: 'use literal argv',
+  })),
+  ...['completion', 'spawnToCompletion'].flatMap(primitive => [
+    ...['encoding', 'timeout', 'maxBuffer', 'killSignal', 'shell', 'env', 'cwd'].map(field => ({
+      name: `R37.30 ${primitive} refuses options ${field} getter before side effects`,
+      runtimeProbe: 'snapshot', primitive, variant: 'options-getter', field,
+    })),
+    ...['argv-getter', 'argv-proxy', 'environment-getter', 'environment-proxy', 'options-proxy',
+      'revoked-proxy', 'iterator-getter', 'options-prototype', 'oversized-sparse-argv', 'io-getter', 'io-proxy'].map(variant => ({
+      name: `R37.30 ${primitive} refuses ${variant} without side effects`, runtimeProbe: 'snapshot', primitive, variant,
+    })),
+  ]),
+  ...['mode', 'resumeId', 'log', 'launchGuard'].map(field => ({
+    name: `R37.30 completion refuses descriptor ${field} getter without side effects`,
+    runtimeProbe: 'snapshot', primitive: 'completion', variant: 'descriptor-getter', field,
+  })),
+  { name: 'R37.30 completion refuses descriptor Proxy without traps', runtimeProbe: 'snapshot', primitive: 'completion', variant: 'descriptor-proxy' },
+  ...['argv-getter', 'argv-proxy', 'iterator-getter'].map(variant => ({
+    name: `R37.30 agentResumeId refuses ${variant} without side effects`, runtimeProbe: 'snapshot', primitive: 'agentResumeId', variant,
+  })),
+  ...STARTUP_LOCATIONS.map(field => ({
+    name: `R37.30 refuses ${field} coercion without side effects`, runtimeProbe: 'snapshot', variant: 'environment-coercion', field,
+  })),
+  ...STARTUP_LOCATIONS.flatMap(field => ['options', 'env', 'inline', 'export', 'declare'].map(variant => ({
+    name: `R37.29 permits unchanged explicit inherited ${field} via ${variant}`,
+    runtimeProbe: 'unchanged-location', field, variant,
+  }))),
+  { name: 'R37.29 preserves explicit CLAUDE_CONFIG_DIR', options: { env: { CLAUDE_CONFIG_DIR: 'fixture-config' } } },
+  { name: 'R37.29 preserves inherited CLAUDE_CONFIG_DIR and real HOME', runtimeProbe: 'environment-snapshot', variant: 'claude-config' },
   ...['absent-env', 'undefined-env', 'null-env'].map(variant => ({
     name: `R37.27 real spawnSync neutralises inherited BASH_ENV=/dev/stdin (${variant})`, runtimeProbe: 'inherited', variant,
   })),
@@ -160,7 +269,7 @@ it.each([
   ...['mode', 'resumeId', 'log', 'launchGuard'].map(field => ({
     name: `R37.28 real spawnSync refuses descriptor ${field} accessor`, runtimeProbe: 'snapshot', variant: 'descriptor-getter', field,
   })),
-  ...['shell', 'env', 'cwd'].map(field => ({
+  ...['encoding', 'timeout', 'maxBuffer', 'killSignal', 'shell', 'env', 'cwd'].map(field => ({
     name: `R37.28 real spawnSync refuses options ${field} accessor`, runtimeProbe: 'snapshot', variant: 'options-getter', field,
   })),
   { name: 'R37.24 real fork cannot execute unrelated JavaScript with fresh Codex evidence', realPrimitive: 'fork',
@@ -307,7 +416,8 @@ it.each([
   ]),
   ...['preset', 'renamed', 'receiver', 'proxy'].map(opaque => ({
     name: `R37.5 uninspectable ${opaque} primitive refuses with explicit unbound fallback`,
-    opaque, command: 'claude', argv: ['--resume', SID], resumeId: SID, refused: true, reason: 'unbound primitive' })),
+    opaque, command: 'claude', argv: ['--resume', SID], resumeId: SID, refused: true,
+    reason: opaque === 'proxy' ? 'Proxy input is unsupported' : 'unbound primitive' })),
   { name: 'R37.5 bound primitive with no call-time arguments', opaque: 'preset', noArgs: true, resumeId: SID, refused: true },
   { name: 'R37.5 bound fresh primitive also refuses', opaque: 'preset', refused: true },
   { name: 'R37.5 explicit unbound matching resume control', command: 'claude', argv: ['--resume', SID], resumeId: SID, mode: 'claude-resume' },
@@ -406,9 +516,10 @@ it.each([
   if (opaque === 'proxy') invoke = new Proxy(primitive, { apply(target) { return target('claude', ['--resume', 'other-id']); } });
   const options = suppliedOptions ?? (shell || mutateShell ? { shell: shell ?? false } : undefined);
   const expectedOptions = { ...options, env: options?.env ?? inheritedOptions().env };
+  const launchGuard = vi.fn(() => true);
   const execute = () => {
     if (findings.length) throw new Error('structural launch gate refused');
-    return launchAgent({ mode, resumeId, log() {},
+    return launchAgent({ mode, resumeId, log() {}, launchGuard,
       ...((mutate || mutateView || mutateShell || guard) ? { launchGuard(view) {
         expect(Object.isFrozen(view)).toBe(true);
         expect(Object.isFrozen(view.argv)).toBe(true);
@@ -423,6 +534,7 @@ it.each([
     if (source) expect(findings).toMatchObject([{ kind: 'module', reason: expect.stringContaining('outside approved boundary') }]);
     expect(execute).toThrow(reason ?? /refused/);
     expect(primitive).not.toHaveBeenCalled();
+    expect(launchGuard).not.toHaveBeenCalled();
   } else {
     expect(findings).toEqual([]);
     execute();
@@ -600,7 +712,7 @@ describe('transparent execution', () => {
 describe('resume validation across execution forms', () => {
   it.each([
     ['env', ['sh', '-c', `claude --resume ${SID}`]],
-    ['nohup', ['env', 'SID=fixture', '/bin/bash', '-lc', `codex exec resume ${SID}`]],
+    ['nohup', ['env', 'SID=fixture', '/bin/bash', '-c', `codex exec resume ${SID}`]],
     ['env', ['sh', '-c', `env sh -c 'claude --resume ${SID}'`]],
     [`env sh -c 'claude --resume ${SID}'`],
   ])('validates native resume ids through nested shell wrappers (%j)', (...args) => {
@@ -656,7 +768,7 @@ describe('resume validation across execution forms', () => {
     [`claude -r${SID}`],
     [`env FOO=bar claude -r ${SID} && codex exec resume ${SID}`],
     ['sh', ['-c', `claude --resume ${SID}`]],
-    ['/bin/bash', ['-lc', `codex exec resume '${SID}'`]],
+    ['/bin/bash', ['-c', `codex exec resume '${SID}'`]],
     [`sh -c 'claude --resume ${SID}'`],
     ['sh', `-c 'claude -r ${SID}'`],
   ];
@@ -880,7 +992,7 @@ describe('an empty descriptor resumeId never satisfies a missing native id', () 
     ['claude', ['--resume', '']], ['claude', ['--resume', ' ']], ['claude', ['--resume=  ']],
     ['codex', ['exec', 'resume']], ['codex', ['exec', 'resume', '--last']], ['codex', ['exec', 'resume', '--json']],
     ['claude', '--resume'], ['claude', 'claude -r ""'],
-    ['sh', ['-c', 'claude --resume']], ['sh', ['-c', 'codex exec resume --last']], ['bash', ['-lc', 'claude --session-id=']],
+    ['sh', ['-c', 'claude --resume']], ['sh', ['-c', 'codex exec resume --last']], ['bash', ['-c', 'claude --session-id=']],
     ['sh -c "claude --resume"', []],
   ];
   it.each(missing.map(c => [JSON.stringify(c), c]))('refuses %s with resumeId empty, null, undefined or whitespace', (_label, [command, argv]) => {

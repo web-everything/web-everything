@@ -62,8 +62,11 @@
  * @returns {Promise<{stdout: string, stderr: string, resourceUsage: object|null}>}
  */
 import { spawn } from 'node:child_process';
+import { snapshotInput } from './plain-data-snapshot.mjs';
 
-export function spawnToCompletion(cmd, argv, opts = {}, { spawnFn = spawn } = {}) {
+export function spawnToCompletion(cmd, argv, opts = {}, io = {}) {
+  [cmd, argv, opts, io] = snapshotInput([cmd, argv, opts, io]);
+  const { spawnFn = spawn } = io;
   const {
     encoding = 'utf8', maxBuffer = 8 * 1024 * 1024, timeout = 0, killSignal = 'SIGKILL', ...spawnOpts
   } = opts;

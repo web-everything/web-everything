@@ -81,17 +81,17 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
   },
   {
     "file": "scripts/lib/agent-launch.mjs",
-    "fingerprint": "module-sha256-v2:a17b7d92a6d65613306ff407378f632a1dfbfa79ef92c8b91387160d1937a78d",
+    "fingerprint": "module-sha256-v2:381d3ac06415387d0e8436774f2619169d0dda9ed3085b8e2a5ca0e5f43814f5",
     "function": "launchAgent",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:f7909e43373916f4d394201c269c5ae25a29c8ffbc8c25a38fcade26cf95a30a",
+    "moduleFingerprint": "module-sha256-v2:db51d9964d7232884a27e8b575a18d2c8f7bc303ccf4e0ff04662385c9dafb10",
   },
   {
     "file": "scripts/lib/agent-launch.mjs",
-    "fingerprint": "module-sha256-v2:4db8d1022792a74a662ef204b1775ac870ad6a31248f940bcbeb48415a21d1cc",
+    "fingerprint": "module-sha256-v2:9ffc377e1bc47a1a1690239fb763429213901930bc5742d0e7ae88d1bf8f4699",
     "function": "launchAgentToCompletion",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:f7909e43373916f4d394201c269c5ae25a29c8ffbc8c25a38fcade26cf95a30a",
+    "moduleFingerprint": "module-sha256-v2:db51d9964d7232884a27e8b575a18d2c8f7bc303ccf4e0ff04662385c9dafb10",
   },
   {
     "file": "scripts/lib/claude-sessions.mjs",
@@ -144,10 +144,10 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
   },
   {
     "file": "scripts/lib/spawn-to-completion.mjs",
-    "fingerprint": "module-sha256-v2:066ae634356525abf92339d27563ecf89479323f2fa6fff763732944698a875b",
+    "fingerprint": "module-sha256-v2:2994630f29a7a3de1320d98595232fc01db9a1c6ae17d87478a1b927bd0510fd",
     "function": "spawnToCompletion",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:70cb48abd2037a8755194eb0415107a6ddeee974c1dde61cbeb41a49b8c48a2c",
+    "moduleFingerprint": "module-sha256-v2:e344e5f66de880757e586685448bb09b86b39e74f50453c2ddfc6f4a73252d53",
   },
   {
     "file": "scripts/operations/codex-delivery-provider.mjs",
