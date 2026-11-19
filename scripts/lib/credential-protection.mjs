@@ -87,6 +87,28 @@ function globRegex(pattern) {
   }
   return new RegExp(`^(?:${out})$`);
 }
+// Conservative: could this glob basename match some name starting with ".env"? Walks the first four
+// pattern characters against ".env"; a star or brace is treated as a possible match (fail closed).
+function envPrefixPossible(name) {
+  const target = '.env';
+  let i = 0;
+  for (let t = 0; t < target.length; t++) {
+    const c = name[i];
+    if (c === undefined) return false;
+    if (c === '*') { if (i === 0) return false; return true; } // a leading star is covered by the witness names above
+    if (c === '{') return name.includes('}', i);
+    if (c === '?') { i++; continue; }
+    if (c === '[') {
+      const end = name.indexOf(']', i + 1);
+      if (end < 0) return false;
+      try { if (!new RegExp(`^${'[' + name.slice(i + 1, end).replace(/^!/, '^').replace(/\\/g, '\\\\') + ']'}$`).test(target[t])) return false; } catch { return true; }
+      i = end + 1; continue;
+    }
+    if (c !== target[t]) return false;
+    i++;
+  }
+  return !examples.has(name);
+}
 function patternHit(word, options) {
   const full = resolve(options.repoRoot, expandHome(word, options.home));
   if (!/[*?\[{]/.test(full)) return classifyProtectedPath(word, options);
@@ -98,7 +120,7 @@ function patternHit(word, options) {
         const regex = globRegex(name);
         // Include the pattern's literal suffix to witness arbitrary .env variants.
         const suffix = name.replace(/[*?\[\]{}!,]/g, '');
-        if (['.env', '.env.local', `.env${suffix}`].some(v => !examples.has(v) && regex.test(v))) {
+        if (['.env', '.env.local', `.env${suffix}`].some(v => !examples.has(v) && regex.test(v)) || envPrefixPossible(name)) {
           return { decision: 'deny', path: full, reason: entry.reason };
         }
       } else {

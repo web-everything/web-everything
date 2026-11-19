@@ -78,6 +78,12 @@ for (const word of ['~/.sshfoo*', '~/.sshfo?', '~/.s[ab]h/key', '~/.{sshfoo,awsf
     assert.equal(classifyBashCommand(`cat ${word}`, options).decision, 'pass');
   });
 }
+test('globbed .env variants deny; unrelated globs pass', () => {
+  for (const word of ['.env.[p]roduction', '.e?v.local', '.env.prod*', '.[e]nv', '.*', 'sub/.env.{a,b}']) {
+    assert.equal(classifyBashCommand(`cat ${word}`, options).decision, 'deny', word);
+  }
+  for (const word of ['envfile*', 'README.*','src/en?.js']) assert.equal(classifyBashCommand(`cat ${word}`, options).decision, 'pass', word);
+});
 test('listing protected globs remains metadata only', () => {
   assert.equal(classifyBashCommand('ls ~/.ss?', options).decision, 'pass');
 });
