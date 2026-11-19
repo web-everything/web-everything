@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { netDiffFingerprint, carriesAcross } from '../net-diff-fingerprint.mjs';
 
 let dir; const git = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -54,14 +54,15 @@ describe('netDiffFingerprint / carriesAcross', () => {
     expect(fe).toMatch(/^[0-9a-f]{64}$/); expect(carriesAcross(fe, ff)).toBe(false);
   });
   it('isolates every Git call from replacement objects and grafts and preserves all diff protections', () => {
-    const calls = []; let graft;
+    const calls = [];
     const exec = (c, a, o) => {
       calls.push(a);
       expect(a.slice(0, 3)).toEqual(['-C', dir, '--no-replace-objects']);
       expect(o.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
-      graft = o.env.GIT_GRAFT_FILE;
-      expect(existsSync(dirname(graft))).toBe(true);
-      expect(existsSync(graft)).toBe(false);
+      expect(o.env.GIT_GRAFT_FILE).toBe('/dev/null');
+      const config = Object.fromEntries(Array.from({ length: Number(o.env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [o.env[`GIT_CONFIG_KEY_${i}`], o.env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(config).toMatchObject({ 'core.commitGraph': 'false', 'core.fsmonitor': 'false', 'core.hooksPath': '/dev/null' });
       return execFileSync(c, a, o);
     };
     expect(netDiffFingerprint(dir, 'main', S.A, { exec })).toMatch(/^[0-9a-f]{64}$/);
@@ -70,7 +71,6 @@ describe('netDiffFingerprint / carriesAcross', () => {
     expect(diff).toEqual(expect.arrayContaining(['--no-relative', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options']));
     // No --text: the binary marker keeps binary replacements of mechanical files visible to the fingerprint.
     expect(diff).not.toContain('--text');
-    expect(existsSync(dirname(graft))).toBe(false);
   });
   it('diff.relative=true from a subdirectory cannot omit changes outside that directory', () => {
     const expected = netDiffFingerprint(dir, S.base, S.A);
@@ -111,14 +111,12 @@ describe('netDiffFingerprint / carriesAcross', () => {
       rmSync(graft, { force: true });
     }
   });
-  it('Git failure returns no carry evidence and removes the graft scratch directory', () => {
-    let scratch;
+  it('Git failure returns no carry evidence with commit-graph and grafts disabled', () => {
     const fingerprint = netDiffFingerprint(dir, S.base, S.A, { exec: (_c, _a, options) => {
-      scratch = dirname(options.env.GIT_GRAFT_FILE);
+      expect(options.env.GIT_GRAFT_FILE).toBe('/dev/null');
       throw new Error('unreadable git');
     } });
     expect(fingerprint).toBeNull();
-    expect(existsSync(scratch)).toBe(false);
     expect(carriesAcross(fingerprint, 'a'.repeat(64))).toBe(false);
   });
   it('unreadable fingerprints never carry', () => {

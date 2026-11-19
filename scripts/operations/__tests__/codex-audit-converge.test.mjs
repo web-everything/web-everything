@@ -542,7 +542,7 @@ describe('converge IO boundaries', () => {
     spawnSync.mockReturnValue({ status: 1 }); expect(deps.isAncestor(PRIOR, HEAD)).toBe(false);
     spawnSync.mockReturnValue({ status: 0 }); expect(deps.isAncestor(PRIOR, HEAD)).toBe(true);
     expect(spawnSync.mock.calls.at(-1)[1]).toEqual(['--no-replace-objects', 'merge-base', '--is-ancestor', PRIOR, HEAD]);
-    expect(spawnSync.mock.calls.at(-1)[2].env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: expect.stringContaining('no-grafts') });
+    expect(spawnSync.mock.calls.at(-1)[2].env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' });
     spawnSync.mockReturnValue({ status: 128 }); expect(() => deps.isAncestor(PRIOR, HEAD)).toThrow();
     spawnSync.mockReturnValue({ status: null, error: new Error('maxBuffer exceeded') });
     expect(() => deps.isAncestor(PRIOR, HEAD)).toThrow();

@@ -286,13 +286,52 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     expect(f.deps.runCodex('prompt')).toBe('NOT WEAKENED');
     expect(f.spawnSync.mock.calls[0]).toEqual(['git', ['rev-parse', '--git-path', 'index'],
       expect.objectContaining({ cwd: '/repo' })]);
-    expect(f.spawnSync.mock.calls[0][2].env).toBeUndefined();
+    expect(f.spawnSync.mock.calls[0][2].env.GIT_GRAFT_FILE).toBe('/dev/null');
     expect(f.fs.copyFileSync).toHaveBeenCalledWith(indexPath.startsWith('/') ? indexPath : '/repo/' + indexPath,
       '/scratch/audit-1/index');
-    expect(f.spawnSync.mock.calls[1][2].env).toEqual({ ...process.env, GIT_INDEX_FILE: '/scratch/audit-1/index',
-      GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/scratch/audit-1/no-grafts' });
+    expect(f.spawnSync.mock.calls[1][2].env).toMatchObject({ GIT_INDEX_FILE: '/scratch/audit-1/index',
+      GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' });
     expect(f.fs.copyFileSync.mock.invocationCallOrder[0]).toBeLessThan(f.spawnSync.mock.invocationCallOrder[1]);
     expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
+  });
+
+  it('pins commit-graph, graft and shared config on every history read and auditor launch', () => {
+    const f = adapter();
+    f.spawnSync.mockReturnValue({ status: 0, stdout: BASE + '\n' });
+    f.deps.resolveSha('main');
+    f.deps.refsPointingAt(HEAD);
+    f.deps.hasCommit(BASE);
+    f.deps.isAncestor(BASE, HEAD);
+    f.spawnSync.mockReturnValueOnce({ status: 0, stdout: 'false\n' });
+    expect(f.deps.isShallow()).toBe(false);
+    f.spawnSync.mockReturnValueOnce({ status: 0, stdout: '.git/index\n' });
+    f.spawnSync.mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' }) });
+    f.deps.runCodex('prompt');
+    expect(f.spawnSync).toHaveBeenCalledTimes(7);
+    for (const [, , { env }] of f.spawnSync.mock.calls) {
+      expect(env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' });
+      const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(config).toMatchObject({ 'core.commitGraph': 'false', 'core.fsmonitor': 'false', 'core.hooksPath': '/dev/null' });
+    }
+  });
+
+  it('remote main drops executable transport overrides and pins SSH and restricted protocols', () => {
+    const keys = ['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_SSH_VARIANT', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_PROXY_COMMAND'];
+    const saved = keys.map(key => process.env[key]);
+    try {
+      for (const key of keys) process.env[key] = 'untrusted-command';
+      const f = adapter();
+      f.spawnSync.mockReturnValue({ status: 0, stdout: `${BASE}\trefs/heads/main\n` });
+      expect(f.deps.remoteMainSha()).toBe(BASE);
+      const env = f.spawnSync.mock.calls[0][2].env;
+      for (const key of keys) expect(env).not.toHaveProperty(key);
+      const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(config).toMatchObject({ 'core.sshCommand': 'ssh', 'protocol.allow': 'never', 'protocol.ssh.allow': 'always' });
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+    }
   });
 
   it('runs real Git with an absent repository index, isolates intent-to-add and removes scratch', () => {

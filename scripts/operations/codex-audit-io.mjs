@@ -1,4 +1,5 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { laneGitHardeningEnv, laneHistoryProofEnv, scrubInheritedGitEnv } from '../lib/lane-git-hardening.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
@@ -71,44 +72,42 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
       return contents.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
     },
-    refsPointingAt: head => run('git', ['for-each-ref', `--points-at=${head}`, '--format=%(refname:short)', 'refs/remotes/origin/'], 30_000)
+    refsPointingAt: head => run('git', ['for-each-ref', `--points-at=${head}`, '--format=%(refname:short)', 'refs/remotes/origin/'], 30_000, laneHistoryProofEnv())
       .split(/\r?\n/).filter(Boolean).map(ref => ref.replace(/^origin\//, '')),
     isShallow() {
-      const value = run('git', ['rev-parse', '--is-shallow-repository'], 30_000).trim();
+      const value = run('git', ['rev-parse', '--is-shallow-repository'], 30_000, laneHistoryProofEnv()).trim();
       if (!['true', 'false'].includes(value)) throw new Error('audit shallow status unavailable');
       return value === 'true';
     },
     remoteMainSha() {
-      const output = run('git', ['ls-remote', 'origin', 'refs/heads/main'], 30_000);
+      const env = laneGitHardeningEnv(scrubInheritedGitEnv(), { remoteProbe: true });
+      // These transport overrides are not removed by the shared helper.
+      delete env.GIT_SSH_VARIANT;
+      delete env.GIT_PROXY_COMMAND;
+      const output = run('git', ['ls-remote', 'origin', 'refs/heads/main'], 30_000, env);
       const match = /^([0-9a-fA-F]{40})\trefs\/heads\/main\r?\n?$/.exec(output);
       if (!match || match[0] !== output) throw new Error('audit remote main unavailable');
       return match[1].toLowerCase();
     },
     hasCommit(sha) {
       run('git', ['--no-replace-objects', 'cat-file', '-e', `${sha}^{commit}`], 30_000,
-        { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' });
+        laneHistoryProofEnv());
       return true;
     },
     isAncestor(prior, head) {
-      // A fresh directory guarantees this graft path does not exist, regardless of repo config.
-      const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-history-'));
-      try {
-        const result = spawnSync('git', ['--no-replace-objects', 'merge-base', '--is-ancestor', prior, head], {
-          cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
-          env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: join(scratch, 'no-grafts') },
-        });
-        if (result.error || ![0, 1].includes(result.status)) throw new Error('audit ancestry unavailable');
-        return result.status === 0;
-      } finally {
-        fs.rmSync(scratch, { recursive: true, force: true });
-      }
+      const result = spawnSync('git', ['--no-replace-objects', 'merge-base', '--is-ancestor', prior, head], {
+        cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+        env: laneHistoryProofEnv(),
+      });
+      if (result.error || ![0, 1].includes(result.status)) throw new Error('audit ancestry unavailable');
+      return result.status === 0;
     },
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
-    resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
+    resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000, laneHistoryProofEnv()).trim(),
     runCodex(prompt) {
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));
       try {
-        const indexPath = resolve(cwd, run('git', ['rev-parse', '--git-path', 'index'], 30_000).trim());
+        const indexPath = resolve(cwd, run('git', ['rev-parse', '--git-path', 'index'], 30_000, laneHistoryProofEnv()).trim());
         const scratchIndex = join(scratch, 'index');
         try { fs.copyFileSync(indexPath, scratchIndex); }
         catch (error) {
@@ -119,8 +118,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
           '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
-          { ...process.env, GIT_INDEX_FILE: scratchIndex, GIT_NO_REPLACE_OBJECTS: '1',
-            GIT_GRAFT_FILE: join(scratch, 'no-grafts') }));
+          { ...laneHistoryProofEnv(), GIT_INDEX_FILE: scratchIndex }));
         if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
           throw new Error('Codex failed or returned incomplete evidence');
         }

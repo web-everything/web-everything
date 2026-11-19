@@ -4951,8 +4951,11 @@ including older union members) require a full audit (exit 2). Independently requ
 ancestry check, reject shallow repositories (exit 2; fetch origin first to unshallow).
 Normalize resolved, recorded and remote-main SHAs to lowercase before convergence comparisons
 and Git calls, including union membership, empty-audit and exact-head refusals and anchor lineage.
-Ancestry and the auditor environment disable replace objects and point `GIT_GRAFT_FILE`
-at a nonexistent scratch path alongside the isolated `GIT_INDEX_FILE`.
+All history proofs and the auditor use `laneHistoryProofEnv`: replace objects off,
+`GIT_GRAFT_FILE=/dev/null`, `core.commitGraph=false` and shared lane pins. The auditor
+retains its isolated `GIT_INDEX_FILE`. Remote-main probes use the shared restricted
+transport pins and drop SSH, askpass and proxy command environment overrides; injected
+spawn tests assert these protections, including commit-graph disabling on every history call.
 Read main via `git ls-remote origin refs/heads/main`, accepting exactly one 40-hex main line
 (failure or malformed output exits 3). Require that commit locally with `git cat-file -e`
 (exit 2, "fetch origin first"); never trust local `origin/main` for coverage. Require
@@ -4986,7 +4989,7 @@ The canonical question hash stays stable: hardened full-pass instructions live o
 Full records store the hardened review marker. The shared net-diff fingerprint helper uses
 `--no-relative` plus its existing diff flags and `--end-of-options` (never `--text`: the binary
 marker keeps binary replacements of mechanical files such as test-timings.json visible); every Git call
-uses `--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1` and a fresh nonexistent graft path.
+uses `--no-replace-objects` and the same shared history-proof environment.
 Real Git tests pin subdirectory/relative-config invariance. Old fingerprints may fail to
 carry and require a fresh audit; gate consumer selection rules remain unchanged.
 

@@ -9,9 +9,7 @@
  *   never carries.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
 import { normalizeDiffFingerprint } from './review-escalation.mjs';
 
 const REF = /^[A-Za-z0-9][A-Za-z0-9._/@^~-]*$/;
@@ -22,12 +20,9 @@ const FP = /^[0-9a-f]{64}$/i;
  * @returns {string|null}
  */
 export function netDiffFingerprint(repo, base, head, { exec = execFileSync } = {}) {
-  let scratch;
   try {
     if (typeof repo !== 'string' || !repo || !REF.test(String(base ?? '')) || !REF.test(String(head ?? ''))) return null;
-    // A fresh directory guarantees the graft file is absent, including with hostile inherited Git settings.
-    scratch = mkdtempSync(join(tmpdir(), 'net-diff-fingerprint-'));
-    const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: join(scratch, 'no-grafts') };
+    const env = laneHistoryProofEnv();
     const raw = (args) => exec('git', ['-C', repo, '--no-replace-objects', ...args], {
       env, encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024,
     });
@@ -44,7 +39,6 @@ export function netDiffFingerprint(repo, base, head, { exec = execFileSync } = {
     catch { text = `\0latin1\n${bytes.toString('latin1')}`; } // invalid bytes stay distinct (a lossy decode would merge 0xFE and 0xFF)
     return normalizeDiffFingerprint(text);
   } catch { return null; }
-  finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
 }
 
 /** PURE: a recorded fingerprint covers the live head only when both are real fingerprints and equal. */

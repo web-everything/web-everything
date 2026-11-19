@@ -8,13 +8,27 @@ import { withRealRepo } from './helpers/real-repo.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 import { main, QUESTION_HASH, REVIEW_COMMAND } from '../codex-audit.mjs';
 
+// Remote proofs forbid file transport in production. Only these local fixtures opt into it.
+function createLocalTransportDeps(options) {
+  return createAuditDeps({ ...options, spawnSync: (command, args, opts) =>
+    spawnSync(command, command === 'git' && args[0] === 'ls-remote'
+      ? ['-c', 'protocol.file.allow=always', ...args] : args, opts) });
+}
+
 describe('codex-audit real IO', () => {
+  it('refuses a local-file remote under the production remote proof policy', async () => {
+    await withRealRepo(async ({ root: repo, git }) => {
+      git(['remote', 'add', 'origin', repo]);
+      expect(() => createAuditDeps({ cwd: repo }).remoteMainSha()).toThrow('audit subprocess failed');
+    });
+  });
+
   it('resolves a branch and commit SHA to the full 40-hex commit in a real repo', async () => {
     await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
       const sha = head();
       git(['branch', 'audit-target', sha]);
       commit({ 'next.txt': 'another commit\n' });
-      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      const deps = createLocalTransportDeps({ cwd: repo, home: join(tmp, 'home') });
 
       expect(head()).not.toBe(sha);
       expect(sha).toMatch(/^[0-9a-f]{40}$/);
@@ -38,7 +52,7 @@ describe('codex-audit real IO', () => {
       git(['remote', 'add', 'origin', repo]);
       git(['config', 'core.bigFileThreshold', '1']);
       writeFileSync(join(repo, '.git/info/attributes'), '* binary\n');
-      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      const deps = createLocalTransportDeps({ cwd: repo, home: join(tmp, 'home') });
       expect(deps.refsPointingAt(current)).toContain('lane/audit');
       expect(deps.isAncestor(prior, current)).toBe(true);
       expect(deps.isAncestor(current, prior)).toBe(false);
@@ -82,8 +96,8 @@ describe('codex-audit real IO', () => {
         expect(command).toBe(process.execPath);
         scratch = dirname(options.env.GIT_INDEX_FILE);
         expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
-        expect(options.env.GIT_GRAFT_FILE).toBe(join(scratch, 'no-grafts'));
-        expect(existsSync(options.env.GIT_GRAFT_FILE)).toBe(false);
+        expect(options.env.GIT_GRAFT_FILE).toBe('/dev/null');
+        expect(execFileSync('git', ['config', '--get', 'core.commitGraph'], options).trim()).toBe('false');
         const delta = spawnSync('git', args, options);
         expect(delta.status).toBe(0);
         expect(delta.stdout).toContain('diff --git a/outside.txt b/outside.txt');
@@ -114,7 +128,7 @@ describe('codex-audit real IO', () => {
       git(['update-ref', 'refs/remotes/origin/main', base]);
       git(['update-ref', 'refs/heads/main', base]);
       git(['remote', 'add', 'origin', repo]);
-      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      const deps = createLocalTransportDeps({ cwd: repo, home: join(tmp, 'home') });
       const errors = [];
       const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
         readRecords: () => [{ at: '2026-11-17T00:00:00Z', base, head: prior, ref: 'lane/audit',
@@ -145,7 +159,7 @@ describe('codex-audit real IO', () => {
       git(['update-ref', 'refs/heads/main', b]);
       git(['update-ref', 'refs/remotes/origin/main', h]);
       git(['remote', 'add', 'origin', repo]);
-      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      const deps = createLocalTransportDeps({ cwd: repo, home: join(tmp, 'home') });
       const errors = [];
       let reviews = 0;
       const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
@@ -186,7 +200,7 @@ describe('codex-audit real IO', () => {
 
   it('throws for an unknown ref in a real repo', async () => {
     await withRealRepo(async ({ root: repo, tmp }) => {
-      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      const deps = createLocalTransportDeps({ cwd: repo, home: join(tmp, 'home') });
 
       expect(() => deps.resolveSha('missing-audit-ref'))
         .toThrow('audit subprocess failed or exceeded its bound');
