@@ -269,7 +269,8 @@ describe('attempted mandatory referrals', () => {
     try {
       for (const persist of [false, true]) {
         const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
-        expect(rows).toEqual([reviewRunEvidence(valid), reviewRunEvidence(invalid)]);
+        expect(rows).toEqual([reviewRunEvidence(valid),
+          { ...reviewRunEvidence(invalid), ...(state === 'incomplete' ? { misnamed: true } : {}) }]);
         if (state === 'parked') expect(hold(pr(), [rows[1]])).not.toBeNull();
         else expect(rows[1]).toMatchObject(state === 'completed' ? { parked: false } : { incomplete: true });
       }
@@ -277,6 +278,54 @@ describe('attempted mandatory referrals', () => {
       expect(() => tryReadRun(invalid.id, dir)).toThrow(/invalid run id/);
       expect(() => runPath(invalid.id, dir)).toThrow(/invalid run id/);
       expect(alert).toHaveBeenCalledTimes(1);
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each(['none', 'run', 'referral'])('requires a verdict before a newer misnamed record can supersede a persistence-failure hold (%s)', source => {
+    const dir = temp();
+    const failed = run({ failure: true });
+    const newer = { ...run({ time: at + 1 }), id: 'review-pr-no verdict' };
+    delete newer.verdict;
+    delete newer.findings.referralVerdict;
+    newer.pending = null;
+    if (source === 'run') newer.verdict = { verdict: 'accept', pendingReferrals: [] };
+    if (source === 'referral') newer.findings.referralVerdict = { verdict: 'accept', pendingReferrals: [] };
+    writeRun(failed, dir);
+    writeFileSync(join(dir, `${newer.id}.json`), JSON.stringify(newer));
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      for (const persist of [false, true]) {
+        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
+        const recovered = rows.find(row => row.id === newer.id);
+        if (source === 'none') {
+          expect(recovered).toMatchObject({ misnamed: true, incomplete: true, completedAt: null, pending: ['review-incomplete'] });
+          expect(hold(pr(), rows)).toMatchObject({ persistenceFailed: true, retryAt: at + REFERRAL_RETRY_MS[0] });
+          expect(findResumableParkedRun(pr(), rows, { repo })).toEqual({ id: failed.id, head });
+        } else {
+          expect(recovered.incomplete).toBeUndefined();
+          expect(recovered).toMatchObject({ completedAt: at + 1, parked: false });
+          expect(hold(pr(), rows)).toBeNull();
+        }
+      }
+    } finally { alert.mockRestore(); }
+  });
+
+  it('counts misnamed no-verdict incomplete evidence toward no-verdict retries', () => {
+    const dir = temp();
+    for (let i = 0; i < 3; i++) {
+      const r = { ...run({ time: at + i }), id: `review-pr-no verdict-${i}`, pending: null };
+      delete r.verdict;
+      delete r.findings.referralVerdict;
+      writeFileSync(join(dir, `${r.id}.json`), JSON.stringify(r));
+    }
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });
+      expect(rows).toHaveLength(3);
+      expect(rows.every(r => r.misnamed && r.incomplete && r.completedAt === null)).toBe(true);
+      expect(decideSameHeadHold(pr({ labels: [{ name: 'review:pending' }] }), rows,
+        { repo, env: {}, now: at + 1, retry: { cooldownReleases: 0, source: 'standard' } }))
+        .toMatchObject({ count: 3, noVerdict: { exhausted: true } });
     } finally { alert.mockRestore(); }
   });
 

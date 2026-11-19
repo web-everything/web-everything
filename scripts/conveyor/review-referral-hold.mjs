@@ -51,8 +51,9 @@ const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 /** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
- * A run suspended at human confirmation has completed its panel, although the operation is pending. */
-export function reviewRunEvidence(run) {
+ * A run suspended at human confirmation has completed its panel, although the operation is pending.
+ * Misnamed-record recovery requires a verdict as well as completion timing. */
+export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
@@ -119,10 +120,11 @@ export function reviewRunEvidence(run) {
       });
   } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
-  if (!Number.isFinite(completedAt)) {
+  if (!Number.isFinite(completedAt) || (requireVerdict && typeof verdict?.verdict !== 'string')) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
       ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
@@ -214,7 +216,8 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
       const errors = validateRunRecord(run).errors.filter(error => !error.startsWith('invalid run id '));
       if (errors.length) throw new Error(errors.join('; '));
       if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) throw new Error('no PR number');
-      const evidence = reviewRunEvidence(run);
+      // A stray record's timing alone cannot prove a verdict or supersede a persistence-failure hold.
+      const evidence = reviewRunEvidence(run, { requireVerdict: true });
       reportInvalidRunEntry(path);
       return evidence ? [evidence] : [];
     } catch (error) {
@@ -356,7 +359,7 @@ function latestReviewAttempt(history) {
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
@@ -390,7 +393,8 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
-  const attempts = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  // Misnamed incomplete evidence spends no-verdict retries, but cannot supersede a referral hold.
+  const attempts = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(attempts);
   const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);
