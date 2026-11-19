@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from '../agy-sandbox.mjs';
@@ -182,3 +182,13 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     }
   },
 );
+
+it('documents that direct file-write confinement excludes service-mediated writes', () => {
+  for (const path of ['../agy-sandbox.mjs', '../../../docs/agent/testing.md']) {
+    const text = readFileSync(new URL(path, import.meta.url), 'utf8');
+    expect(text).toContain("process's own file writes only");
+    expect(text).toContain('Mach/XPC/LaunchServices-mediated writes');
+    for (const command of ['defaults', 'open', 'osascript', 'launchctl']) expect(text).toContain(command);
+    expect(text).toContain('out of scope');
+  }
+});

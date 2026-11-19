@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { criticalWorkVerdict } from '../critical-work.mjs';
-import { deriveAgyFixAdmission, isAdmissibleTargetPath } from '../agy-fix-admission.mjs';
+import { deriveAgyFixAdmission, isAdmissibleTargetPath, isAdmissibleTargetScope } from '../agy-fix-admission.mjs';
 
 import { admissibleTargets, refusedTargets } from './fixtures/agy-target-path-cases.mjs';
 
@@ -134,4 +134,26 @@ describe('the repair-dispatch chain tests that hold enforcement assertions are n
     'scripts/conveyor/__tests__/fix-executor-routing.test.mjs',
     'scripts/lib/__tests__/fix-executor-chain.test.mjs',
   ])('refuses %s', path => { expect(isAdmissibleTargetPath(path)).toBe(false); });
+});
+
+it('admits existing docs directories only as scopes, never as applied files', () => {
+  expect(isAdmissibleTargetScope('docs')).toBe(true);
+  // Existing directories still pass through the critical-work boundary.
+  expect(isAdmissibleTargetScope('docs/agent')).toBe(false);
+  expect(isAdmissibleTargetScope('docs/nonexistent-directory')).toBe(false);
+  expect(isAdmissibleTargetPath('docs')).toBe(false);
+  expect(isAdmissibleTargetPath('docs/agent')).toBe(false);
+});
+
+it('keeps tests directory scopes admissible while refusing them as applied files', () => {
+  expect(isAdmissibleTargetScope('tests')).toBe(true);
+  expect(isAdmissibleTargetPath('tests')).toBe(false);
+  expect(admit({ size: 1, scope: ['tests'] })).toEqual({ kind: 'test-fix', size: 1, scope: ['tests'] });
+});
+
+it('documents kindMaxSize as direct-build-only while repair dispatch stays size 1', () => {
+  const text = readFileSync(new URL('../../../docs/agent/testing.md', import.meta.url), 'utf8');
+  expect(text).toContain('For direct `runConfinedAgyBuild` calls only');
+  expect(text).toContain('Repair dispatch always requires `size === 1`');
+  expect(admit({ taskKind: 'doc-fix', size: 3, scope: ['docs'] })).toBeNull();
 });

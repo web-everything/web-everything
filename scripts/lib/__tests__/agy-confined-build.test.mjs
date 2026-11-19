@@ -61,8 +61,10 @@ function fixture() {
           return readFileSync(p, 'utf8');
         },
         exec: (bin, args, opts) => {
+          options.beforeExec?.(args, clone);
           commands.push(args);
           execCalls.push({ bin, args, opts });
+          if (options.numstat !== undefined && args.includes('--numstat')) return options.numstat;
           if (options.raw !== undefined && args.includes('--raw')) return options.raw;
           if (options.untracked !== undefined && args.includes('ls-files')) return options.untracked;
           try { return execFileSync(bin, args, opts); }
@@ -259,7 +261,7 @@ describe('launcher-owned atomic application', () => {
     expect(f.commands.find(a => a.includes('clone'))).toEqual(expect.arrayContaining(['--no-hardlinks', '--template=']));
     for (const args of f.commands) expect(args.slice(0, 4)).toEqual(['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null']);
     expect(f.commands.some(a => a.includes('--index'))).toBe(false);
-    expect(f.commands.find(a => a.includes('apply'))).toContain('--include=docs/*');
+    expect(f.commands.find(a => a.includes('apply') && !a.includes('--numstat'))).toContain('--include=docs/*');
   });
   it.each([
     ['test-fix', 'docs', 'docs/__tests__/package.json'],
@@ -543,4 +545,65 @@ it('cleans transcript and discards clone edits when the sandbox launcher fails',
   expect(readFileSync(join(f.lane, 'docs/a.md'), 'utf8')).toBe('before\n');
   expect(existsSync(transcriptDir)).toBe(false);
   expect(existsSync(f.clone())).toBe(false);
+});
+
+describe('final patch enforcement', () => {
+  it.each(['tracked', 'untracked'])('voids executable %s additions', async type => {
+    const f = fixture();
+    expect(await f.run(dir => {
+      writeFileSync(join(dir, 'docs/new.md'), 'new prose\n');
+      chmodSync(join(dir, 'docs/new.md'), 0o755);
+      if (type === 'tracked') git(dir, 'add', 'docs/new.md');
+    })).toMatchObject({ status: 'voided', applied: [] });
+    expect(f.commands.some(a => a.includes('apply'))).toBe(false);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+  it.each(['docs/x.json', 'docs/.gitignore'])('voids %s introduced between raw and final patch reads', async path => {
+    const f = fixture();
+    if (path.endsWith('.gitignore')) {
+      writeFileSync(join(f.lane, path), '# before\n');
+      commit(f.lane);
+    }
+    let mutated = false;
+    expect(await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n'), {
+      beforeExec: (args, dir) => {
+        if (!mutated && args.includes('diff') && args.includes('--binary') && !args.includes('--no-index')) {
+          mutated = true;
+          writeFileSync(join(dir, path), 'changed\n');
+          if (path.endsWith('.json')) git(dir, 'add', path);
+        }
+      },
+    })).toMatchObject({ status: 'voided', applied: [] });
+    expect(mutated).toBe(true);
+    expect(f.commands.some(a => a.includes('apply') && !a.includes('--numstat'))).toBe(false);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+  it.each(['new file mode 100755', 'old mode 100644\nnew mode 100755'])
+  ('voids late final patch mode changes: %s', async mode => {
+    const f = fixture();
+    let mutated = false;
+    expect(await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n'), {
+      beforeExec: (args, dir) => {
+        if (!mutated && args.includes('diff') && args.includes('--binary') && !args.includes('--no-index')) {
+          mutated = true;
+          if (mode.startsWith('new file')) {
+            writeFileSync(join(dir, 'docs/new.md'), 'new\n');
+            chmodSync(join(dir, 'docs/new.md'), 0o755);
+            git(dir, 'add', 'docs/new.md');
+          } else chmodSync(join(dir, 'docs/a.md'), 0o755);
+        }
+      },
+    })).toMatchObject({ status: 'voided', applied: [] });
+    expect(mutated).toBe(true);
+    expect(f.commands.some(a => a.includes('apply'))).toBe(false);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+});
+
+it.each(['', 'unreadable\0'])('voids incomplete final-patch path evidence %j', async numstat => {
+  const f = fixture();
+  expect(await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n'), { numstat }))
+    .toMatchObject({ status: 'voided', applied: [] });
+  expect(f.commands.some(a => a.includes('apply') && !a.includes('--numstat'))).toBe(false);
+  expect(git(f.lane, 'status', '--porcelain')).toBe('');
 });

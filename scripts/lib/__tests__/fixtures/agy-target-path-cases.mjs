@@ -1,9 +1,16 @@
 // Shared admission/apply decision table; fixture data, never filesystem targets.
 export const admissibleTargets = [
+  'tests/helper.cjs', 'src/__tests__/helper.js', 'src/foo-unit.test.ts',
   'docs/guide.md', 'README.md', 'docs/x/y.md', 'notes.mdx', 'docs/notes.txt',
   'scripts/lib/__tests__/foo.test.mjs', 'src/__tests__/a.test.ts', 'src/a.spec.ts',
 ];
 export const refusedTargets = [
+  'docs/a.test.mjs', 'docs/__tests__/a.test.ts',
+  'docs/Makefile', 'docs/Dockerfile', 'docs/install', 'docs/CODEOWNERS',
+  'tests/run.sh', '__tests__/setup.mjs', 'src/__tests__/setup.js', 'tests/helper.py', 'src/a.test.sh',
+  'scripts/__tests__/pr-merge-gate.test.js', 'scripts/__tests__/gate-entrypoint-integration.test.ts',
+  'scripts/__tests__/pr-merge-gate.test.mjs', 'scripts/__tests__/gate-entrypoint-integration.test.mjs',
+  'scripts/lib/__tests__/pr-merge-gate-unit.test.mjs', 'scripts/__tests__/gate-entrypoint-e2e.test.mjs',
   // Docs are prose: dotfiles (git behaviour files) and non-prose extensions are refused (audit: docs/.gitignore hides untracked files).
   'docs/.gitignore', 'docs/.gitattributes', 'docs/a/.hidden.md', 'docs/example.mjs', 'docs/run.sh', 'docs/img.png',
   'scripts/operations/fix-run.mjs', 'vitest.config.ts', 'playwright.config.ts',

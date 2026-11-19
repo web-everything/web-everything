@@ -1,11 +1,22 @@
+import { statSync } from 'node:fs';
+import { URL } from 'node:url';
 import { criticalWorkVerdict } from './critical-work.mjs';
 
-// Docs are prose files (md, mdx, txt, rst) or the docs directory itself as a scope; a docs file with another
-// extension (a script, an image, a dotfile) is not documentation. Dotfiles are refused in isAdmissibleTargetPath.
-const isDoc = p => /\.(md|mdx|txt|rst)$/.test(p) || (/^docs(\/|$)/.test(p) && !/\.[^/]+$/.test(p.split('/').at(-1)));
-const isTest = p => /(^|\/)(__tests__|tests)(\/|$)/.test(p) || /\.(test|spec)\.[^/]+$/.test(p);
-/** Kind-agnostic allowlist shared by scope admission and every applied path. */
-export function isAdmissibleTargetPath(p) {
+const isDoc = p => /\.(md|mdx|txt|rst)$/.test(p);
+const isDirectory = p => {
+  try { return statSync(new URL(`../../${p}`, import.meta.url)).isDirectory(); }
+  catch { return false; }
+};
+const isDocScope = p => isDoc(p) || p === 'docs' || p.startsWith('docs/') && isDirectory(p);
+const isTest = p => /\.(mjs|js|ts|cjs)$/.test(p)
+  && (/(^|\/)(__tests__|tests)\//.test(p) || /\.(test|spec)\.[^/]+$/.test(p))
+  && !/(^|\/)setup(?:[.-]|Tests)/i.test(p);
+// A test scope is a prefix only; every applied file is still checked by isTest, so no filesystem probe is needed.
+const isTestScope = p => isTest(p) || /(^|\/)(__tests__|tests)(\/|$)/.test(p) && !/\.[^/]+$/.test(p);
+/** Applied files must be prose or code tests; directory prefixes are scope-only. */
+export const isAdmissibleTargetPath = p => admissible(p, false);
+export const isAdmissibleTargetScope = p => admissible(p, true);
+function admissible(p, scope) {
   if (typeof p !== 'string' || !p || p.startsWith('/') || /[\x00-\x1f\x7f-\x9f\\*?\[\]{}:]/.test(p)
     // Any dot-segment is refused: .gitignore/.gitattributes inside docs change how git enumerates and filters files
     // (an ignore rule hides untracked files from the launcher's whole-run path check; audit).
@@ -14,12 +25,17 @@ export function isAdmissibleTargetPath(p) {
     || /(^|\/)(soak|breaks)(\/|$)/.test(p)
     || /\.(json|yml|yaml|toml)$/.test(p) || /\.real\.test\.mjs$/.test(p)
     || /(^|\/)(?:[^/]*\.config\.[^/]+|tsconfig[^/]*|[^/]*\.lockb?)$/.test(p)
-    || !(isDoc(p) || isTest(p))) return false;
+    || p.startsWith('docs/') && !isDoc(p) && !(scope && isDirectory(p))
+    || !((scope ? isDocScope(p) : isDoc(p)) || (scope ? isTestScope(p) : isTest(p)))) return false;
   // Fixtures and tests of critical modules protect enforcement: a test is admissible only when its SUBJECT is not critical.
   if (/(^|\/)fixtures?(\/|$)/.test(p)) return false;
-  const subject = p.replace(/(^|\/)__tests__\//, '$1').replace(/\.(test|spec)(\.[^/.]+)$/, '$2');
+  const subject = p.replace(/(^|\/)(?:__tests__|tests)\//, '$1')
+    .replace(/\.(test|spec)(\.[^/.]+)$/, '$2').replace(/(?:-integration|-e2e|-unit)+(\.[^/.]+)$/, '$1');
+  // Top-level script tests also exercise modules housed in scripts/lib.
+  const subjects = [subject, subject.replace(/^scripts\/(?!.*\/)/, 'scripts/lib/')]
+    .flatMap(p => [p, p.replace(/\.(mjs|js|ts|cjs)$/, '.mjs')]);
   try {
-    return criticalWorkVerdict({ filesTouched: [p, `${p}/`, ...(subject === p ? [] : [subject])] }).critical === false;
+    return criticalWorkVerdict({ filesTouched: [p, `${p}/`, ...subjects] }).critical === false;
   } catch { return false; } // Unknown criticality uses the next provider/operator.
 }
 
@@ -37,8 +53,8 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
   const scope = item.scope == null ? launchScope : parseScope(item.scope);
   const taskKind = item.taskKind ?? item.taskType ?? item.kind ?? launch.taskKind ?? 'fix';
   const size = item.size ?? launch.size;
-  if (!scope.length || scope.length > 20 || !scope.every(isAdmissibleTargetPath)) return null;
-  if (!launchScope.length || launchScope.length > 20 || !launchScope.every(isAdmissibleTargetPath)
+  if (!scope.length || scope.length > 20 || !scope.every(isAdmissibleTargetScope)) return null;
+  if (!launchScope.length || launchScope.length > 20 || !launchScope.every(isAdmissibleTargetScope)
     || !scope.every(p => launchScope.some(root => p === root || p.startsWith(`${root}/`)))) return null;
   // Recheck the actual admitted paths, including directory forms, against the routing gate.
   try {
@@ -47,7 +63,7 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
   } catch { return null; } // Unknown criticality advances to the next provider/operator.
   if (!Number.isFinite(size) || size !== 1) return null;
   if (typeof taskKind !== 'string' || !/^[a-z][a-z0-9-]*$/.test(taskKind)) return null;
-  const kind = taskKind === 'fix' && scope.every(isDoc) ? 'doc-fix'
-    : taskKind === 'fix' && scope.every(isTest) ? 'test-fix' : taskKind;
+  const kind = taskKind === 'fix' && scope.every(isDocScope) ? 'doc-fix'
+    : taskKind === 'fix' && scope.every(isTestScope) ? 'test-fix' : taskKind;
   return { kind, size, scope };
 }

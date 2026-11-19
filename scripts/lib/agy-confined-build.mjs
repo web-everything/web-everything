@@ -1,4 +1,4 @@
-/** R1062/S7: sandbox-exec enforced filesystem confinement plus patch/transcript checks.
+/** R1062/S7: sandbox-exec confines the process's own file writes, plus patch/transcript checks.
  * The launcher alone applies admitted hunks; agy's git operations remain forbidden. */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -11,7 +11,7 @@ import { buildScratchCloneArgv, summarizeAgyEvents, runAgyDirectExec } from '../
 import { AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
 import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { isAdmissibleTargetPath } from './agy-fix-admission.mjs';
+import { isAdmissibleTargetPath, isAdmissibleTargetScope } from './agy-fix-admission.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
 // The juror's SAFE_GIT is private; keep its pins at every git boundary, including injected exec.
@@ -184,7 +184,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
         maxSize: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 } });
     log(formatCascadeSourcesLine('agyBuild', resolved));
     if (resolved.invalid.length || typeof kind !== 'string' || !kind.trim() || !Number.isFinite(size) || size < 0
-      || !Array.isArray(scope) || !scope.length || scope.length > 20 || !Array.from(scope).every(isAdmissibleTargetPath)
+      || !Array.isArray(scope) || !scope.length || scope.length > 20 || !Array.from(scope).every(isAdmissibleTargetScope)
       || typeof laneDir !== 'string' || !laneDir.trim() || typeof task !== 'string' || !task.trim())
       return result('refused', ['missing or invalid kind/size/scope/task/lane; use another fix provider or request human review']);
     if (!(resolved.value.allowedKinds.includes(kind) && size <= resolved.value.kindMaxSize)
@@ -242,7 +242,6 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     if (spawnError || outcome?.code !== 0 || outcome?.timedOut) return result('failed', ['agy build failed; use the next fix provider']);
     const diffFlags = ['--no-ext-diff', '--no-textconv', '--no-renames'];
     const raw = cloneGit(['-C', clone, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
-    const paths = [];
     const rejectPath = p => !isAdmissibleTargetPath(p) || !inScope(p, scope);
     for (let i = 0; i < raw.length && raw[i]; i += 2) {
       const match = /^:(\d{6}) (\d{6}) [a-f0-9]+ [a-f0-9]+ ([AMD])$/.exec(raw[i]);
@@ -250,20 +249,29 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
       if (!match || rejectPath(p)) return result('voided', ['unsafe or out-of-scope changed path']);
       const [, oldMode, newMode] = match;
       if (![oldMode, newMode].every(m => ['000000', '100644', '100755'].includes(m))
+        || oldMode === '000000' && newMode === '100755'
         || oldMode !== '000000' && newMode !== '000000' && oldMode !== newMode)
         return result('voided', ['symlink, submodule or mode change rejected']);
-      paths.push(p);
     }
     let patch = cloneGit(['-C', clone, 'diff', '--binary', ...diffFlags, startHead]);
     const untracked = cloneGit(['-C', clone, 'ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean);
     for (const p of untracked) {
       if (rejectPath(p)) return result('voided', ['unsafe or out-of-scope untracked path']);
       const st = lstatSync(join(clone, p));
-      if (!st.isFile() || st.isSymbolicLink()) return result('voided', ['untracked symlink or special file rejected']);
+      if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o111)) return result('voided', ['untracked symlink or special file rejected']);
       patch += cloneGit(['diff', '--no-index', '--binary', ...diffFlags, '--', '/dev/null', p], { cwd: clone, diffExit: true });
-      paths.push(p);
     }
     if (/^(GIT binary patch|Binary files )/m.test(patch)) return result('voided', ['binary diff rejected']);
+    if (/^(old mode|new mode) /m.test(patch)
+      || [...patch.matchAll(/^new file mode (.*)$/gm)].some(([, mode]) => mode !== '100644'))
+      return result('voided', ['unsafe final patch mode']);
+    // Derive the applied paths from the exact final bytes, never the earlier live-clone diff.
+    const finalPaths = patch ? git(['apply', '--numstat', '-z', '-'], { input: patch }).split('\0').filter(Boolean).map(row => {
+      const match = /^\d+\t\d+\t(.+)$/.exec(row);
+      if (!match) throw new Error('unreadable final patch paths');
+      return match[1];
+    }) : [];
+    if (patch && !finalPaths.length || finalPaths.some(rejectPath)) return result('voided', ['unsafe or out-of-scope final patch path']);
     // A dirty lane is allowed, but an intervening edit and any apply conflict fail atomically.
     if (changedControl(before, { [laneDir]: gitControlFiles(laneDir) }).length
       || changedCheckouts(before, { [laneDir]: snapshotCheckout(laneDir, snapExec) }).length)
@@ -271,7 +279,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     if (patch) git(['-C', laneDir, 'apply', '--whitespace=nowarn',
       ...scope.flatMap(s => [`--include=${s}`, `--include=${s}/*`]), '-'], { input: patch });
     const summary = summarizeAgyEvents(events);
-    return result('ok', [], { applied: [...new Set(paths)], finalMessage: summary.finalResponse || summary.agentMessages.at(-1) || '', stdout: outcome.stdout ?? '' });
+    return result('ok', [], { applied: [...new Set(finalPaths)], finalMessage: summary.finalResponse || summary.agentMessages.at(-1) || '', stdout: outcome.stdout ?? '' });
   } catch {
     return result('voided', ['confinement or atomic apply evidence failed; use another fix provider or request human review']);
   } finally {

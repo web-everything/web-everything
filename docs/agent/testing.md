@@ -4853,10 +4853,11 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 
 `agy-confined-build.test.mjs` uses temporary local Git repositories and injected fake agy
 execution; it never launches agy. Admission requires kind, numeric size and literal repo-relative
-file/directory scope prefixes (at most 20 entries). Allowed kinds require size at/below
+file/directory scope prefixes (at most 20 entries). For direct `runConfinedAgyBuild` calls only, allowed kinds require size at/below
 `kindMaxSize` (default 3, `WE_AGY_BUILD_KIND_MAX_SIZE`, positive integer); alternatively,
 any kind with size at/below `maxSize` remains admitted (R1062). Missing/nonfinite sizes refuse;
 settings must remain readable, with environment overrides above settings above defaults.
+Repair dispatch always requires `size === 1`, independently of these direct-build settings.
 Keep whole-run rejection cases for mixed scope, Git controls, escaping/new symlinks, modes,
 binary/submodule changes, traversal, Git calls, moved HEAD, changed real lane and incomplete
 or rewritten transcripts. The launcher applies the admitted patch without staging or committing.
@@ -4874,7 +4875,10 @@ Slice B supersedes the production-unavailable note above: macOS builds launch th
 The scrubbed environment retains only PATH, USER, LOGNAME, SHELL, LANG, LC_* and TERM;
 HOME is the real home and TMPDIR/TMP/TEMP point to a launcher-created private temp directory.
 No token or settings are copied and no private HOME is created or deleted.
-Writes are default-denied, with exactly the disposable clone, per-run private temp directory,
+The profile confines the process's own file writes only. Mach/XPC/LaunchServices-mediated writes
+(`defaults`, `open`, `osascript`, `launchctl`) are out of scope. No service-mediated write protection
+is claimed; the REAL probes below exercise direct file IO only (doc-presence regression).
+Direct file writes are default-denied, with exactly the disposable clone, per-run private temp directory,
 `~/.gemini/antigravity-cli/log` (subpath), and `/dev/null`, `/dev/tty`, `/dev/dtracehelper` granted.
 `AGY_STATE_WRITE_DIRS` names exactly the measured log requirement; extend it only with measured evidence.
 The private temp is made outside the clone, lane and home workspace. The transcript directory is
@@ -4899,17 +4903,22 @@ read fails with EPERM. It runs system sh/cat/ls without touching real home secre
 redirected-log refusal, and a REAL fake-home launcher probe for login/log access and other-home write denial.
 The injected build tests separately cover unsupported hosts and missing sandbox-exec without launching a worker.
 The scoped files are agy-sandbox, agy-confined-launcher, agy-confined-build and agy-fix-admission;
-run them only through host heavy-admission. These edits were authored without running tests.
+run them only through host heavy-admission.
 
-The shared kind-agnostic `isAdmissibleTargetPath` allowlist gates scope admission and every
-tracked/untracked changed path. Only normalized repo-relative documentation (`docs/**` or `.md`/`.mdx`)
-and tests (`**/__tests__/**` or `.test.*`/`.spec.*`) qualify. Refuse `.github/**`, `scripts/settings/**`,
+The shared kind-agnostic allowlist separates `isAdmissibleTargetScope` from applied-file
+`isAdmissibleTargetPath` checks. Scopes may name `docs` or existing directories under it;
+applied documentation must have a prose extension (`md`, `mdx`, `txt`, `rst`). Tests require
+`mjs`, `js`, `ts` or `cjs`, with a `.test`/`.spec` name or a `tests`/`__tests__` directory;
+setup files and fixtures refuse. Test subjects, including stems stripped of `-integration`,
+`-e2e` and `-unit`, are checked for criticality, including top-level script tests of `scripts/lib` modules. Refuse `.github/**`, `scripts/settings/**`,
 `backlog/**`, `agent-memory-src/**`, soak/breaks tests, `.real.test.mjs`, JSON/YAML/TOML,
 config names, lockfiles, tsconfig names, and every path the shared critical-work verdict marks critical.
 Traversal, empty/dot/backslash segments, controls, glob characters and `.git` segments at any depth
 refuse. All other paths refuse by default, including source, scripts and enforcement code.
 Every test path must also be inside the item's scope; the item may only narrow the launch scope.
-A single violation voids the whole patch before application. Kind gates and `kindMaxSize`/`maxSize`
+The exact final patch is rechecked for every path before apply, including changes introduced
+after the raw diff read. New files must be mode 100644; executable additions and all
+old/new mode transitions refuse. A single violation voids the whole patch before application. Kind gates and `kindMaxSize`/`maxSize`
 settings remain independent: even a size-1 feature job can change only allowlisted paths.
 Build transcript admission checks
 every tool update against the native-tool allowlist and clone containment regardless of status;
@@ -4926,7 +4935,7 @@ refuse. Refusals record an unproductive outcome so the existing provider chain a
 
 
 Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER;
-credential exposure equals the existing agy review seat (real HOME login); writes are confined to the disposable clone, a private temp dir and agy's log dir; only the allowed diff (docs and in-scope tests, allowlist) is kept and goes through review; shells and tools inside the clone are out of scope (R1049).
+credential exposure equals the existing agy review seat (real HOME login); the process's own file writes are confined to the disposable clone, a private temp dir and agy's log dir; only the allowed diff (docs and in-scope tests, allowlist) is kept and goes through review; shells and tools inside the clone are out of scope (R1049).
 The shared documentation/test allowlist is intersected with the launch scope (an item scope may only
 narrow it, with criticality re-checked), before the normal review and audit path. Network stays allowed
 for agy's API; credentials are not protected from the worker. This is the accepted operator ruling (R1062).

@@ -11,7 +11,9 @@ const safePath = p => {
 };
 const inside = (p, root) => p === root || p.startsWith(`${root}/`);
 
-/** Pure SBPL builder. Inputs are canonical absolute paths resolved by the launcher.
+/** Confines the process's own file writes only. Mach/XPC/LaunchServices-mediated writes
+ * (defaults, open, osascript, launchctl) are out of scope; this is not a service sandbox.
+ * Pure SBPL builder. Inputs are canonical absolute paths resolved by the launcher.
  * deniedPaths lets the launcher resolve secret symlinks; extraDeniedPaths supports isolated probes. */
 export function buildSandboxProfile({ transcriptDir, cloneDir, privateTempDir, laneDir, homeDir, workspaceOps,
   agyBinDir, homebrewPrefix, workspaceDir = join(homeDir, 'workspace'), deniedPaths = sandboxSecretPaths(homeDir), extraDeniedPaths = [] }) {
