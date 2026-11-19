@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
+import { buildConflictFindingBody, defaultPostConflictFinding, ownsConflictFindingReceipt } from '../lib/conflict-finding.mjs';
 export { buildConflictFindingBody, defaultPostConflictFinding };
 /**
  * @file scripts/conveyor/parked-pr-conflict-watch.mjs
@@ -1306,7 +1306,7 @@ export function defaultRevertBounce({ pr, repo, headRefOid, findingToken, provid
   const ours = typeof findingToken === 'string' && /^[a-f0-9-]{36}$/.test(findingToken)
     && Array.isArray(comments) && comments.length > 0
     && isTrustedMarkerAuthor(comments.at(-1))
-    && comments.at(-1).body?.includes(`<!-- conflict-watch-bounce:${findingToken} -->`);
+    && ownsConflictFindingReceipt(comments.at(-1).body, findingToken);
   if (!/^[a-f0-9]{40}$/i.test(headRefOid ?? '') || live?.headRefOid !== headRefOid
     || !Array.isArray(labels) || !labels.includes('review:changes') || !ours
     || labels.some(name => /^(review:|redteam:|advisory:|ready-to-merge$)/.test(name) && name !== 'review:changes')) {
@@ -1380,6 +1380,47 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
   if (repo) argv.push(`--repo=${repo}`);
   // #x5n4zn3 — was bare (no timeout).
   exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+}
+
+/** Gate every bounce and each durable write against the exact judged snapshot.
+ * A held bounce is retried by a later sweep with fresh evidence.
+ */
+export function bounceIfStillConflicting({
+  pr, judgedHead, repo, postFindingArgs = {}, readPrLive = defaultReadPrLive,
+  postFinding = defaultPostConflictFinding, revertBounce = defaultRevertBounce,
+  log = line => console.error(line), now = Date.now(), entry = {}, prepare = () => {},
+}) {
+  const stopped = new Error('conflict-cleared-before-bounce');
+  const hold = () => {
+    entry.routedTo = stopped.message;
+    log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${stopped.message}`);
+    throw stopped;
+  };
+  const beforeWrite = (_stepName) => {
+    let live = null;
+    try { live = readPrLive({ pr, repo }); } catch { /* fail closed */ }
+    if (!/^[a-f0-9]{40}$/i.test(judgedHead ?? '') || live?.headRefOid !== judgedHead
+      || live?.mergeable !== 'CONFLICTING') hold();
+  };
+  let finding;
+  try {
+    beforeWrite('prepare');
+    prepare();
+    finding = postFinding({ ...postFindingArgs, pr, repo, headRefOid: judgedHead, beforeWrite });
+  } catch (error) {
+    if (error === stopped) return false;
+    throw error;
+  }
+  let after = null;
+  try { after = readPrLive({ pr, repo }); } catch { /* cannot confirm write */ }
+  if (after?.headRefOid !== judgedHead || after?.mergeable !== 'CONFLICTING') {
+    const skipped = revertBounce({ pr, repo, headRefOid: judgedHead, findingToken: finding?.findingToken });
+    entry.routedTo = skipped || (after?.headRefOid !== judgedHead
+      ? 'bounce-reverted-head-moved' : 'bounce-reverted-conflict-unconfirmed');
+    log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${entry.routedTo}`);
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -1456,6 +1497,7 @@ export function watchParkedPrConflicts({
   let membershipChecked = false;
   let membershipUnknown = null;
   for (const pr of Array.isArray(prs) ? prs : []) {
+    const judgedHead = pr?.headRefOid;
     // Group ownership needs the default repo and a readable group state before any routing. Both are checked once
     // per sweep; an empty, null or failed repo resolution, or an unreadable state, FAILS CLOSED: every PR is held
     // this sweep (either would read every PR as "not a group member" and route an open group's PRs).
@@ -1516,6 +1558,10 @@ export function watchParkedPrConflicts({
       && hasReviewLabel(pr?.labels, CONFLICT_LABEL) && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human);
     if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) continue;
     const entry = { num: pr?.number, isConflicting, ...plan, commented: false };
+    const bounce = (postFindingArgs = {}, prepare) => bounceIfStillConflicting({
+      pr, judgedHead, repo: resolvedRepo, postFindingArgs, prepare,
+      readPrLive, postFinding, revertBounce, log, now, entry,
+    });
     // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
     // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
     const reassertIdleConflict = (comments, variant) => {
@@ -1554,7 +1600,7 @@ export function watchParkedPrConflicts({
           return;
         }
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
-        if (!dryRun) postFinding({ pr, repo: resolvedRepo });
+        if (!dryRun && !bounce()) { results.push(entry); return; }
         entry.routedTo = variant
           ? `reconcile-finding (idle conflict-bounce re-asserted, ${variant} — xkugvzd)`
           : 'reconcile-finding (idle conflict-bounce re-asserted — #2793)';
@@ -1574,7 +1620,7 @@ export function watchParkedPrConflicts({
         if (findWatcherStandDownComment(recoveryComments) && !isWatcherMarkerAlreadySuperseded(recoveryComments)) {
           if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
           if (!dryRun) {
-            postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+            if (!bounce({ sameLineConflict: true })) { results.push(entry); continue; }
             postSupersedeComment({ pr, repo: resolvedRepo, provider, sameLineConflict: true });
           }
           entry.supersededStandDown = true;
@@ -1660,7 +1706,7 @@ export function watchParkedPrConflicts({
         if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable && !operatorAnswered && !gitClean) {
           if (sameLineConflict === 'fixer') {
             if (!dryRun) {
-              postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+              if (!bounce({ sameLineConflict: true })) { results.push(entry); continue; }
               postSupersedeComment({ pr, repo: resolvedRepo, provider, sameLineConflict: true });
             }
             entry.supersededStandDown = true;
@@ -1681,7 +1727,7 @@ export function watchParkedPrConflicts({
           // (`isWatcherMarkerAlreadySuperseded`) and the dispatch gate (`isStandDownSuperseded`) key on, so it must
           // only exist once the finding really went out. If `postFinding` throws, no supersede is posted and the
           // next sweep retries — instead of a "routed to a fix agent" note with no fix request behind it.
-          postFinding({ pr, repo: resolvedRepo, appendOnlyStatute, reviewHumanFixable: isStatuteTier && !appendOnlyStatute && !operatorAnswered && !resync, ...(resync ? { resync: true } : {}) });
+          if (!bounce({ appendOnlyStatute, reviewHumanFixable: isStatuteTier && !appendOnlyStatute && !operatorAnswered && !resync, ...(resync ? { resync: true } : {}) })) { results.push(entry); continue; }
           // A missing supersede leaves the marker unsuperseded, so this same branch re-runs next sweep (the PR still
           // carries `review:human` + the conflict label) — only report it as superseded once it really posted.
           try { postSupersedeComment({ pr, repo: resolvedRepo, provider }); } catch { superseded = false; }
@@ -1794,32 +1840,6 @@ export function watchParkedPrConflicts({
           const threadComments = listPrComments({ number: pr?.number, repo: resolvedRepo });
           priorWatcherStandDown = Boolean(findWatcherStandDownComment(threadComments)) && !isWatcherMarkerAlreadySuperseded(threadComments);
         } catch { priorWatcherStandDown = false; }
-
-        // Keep this check next to the write, after all slower classification reads.
-        const bounce = (extra, beforeWrite = () => {}) => {
-          let live = null;
-          try { live = readPrLive({ pr, repo: resolvedRepo }); } catch { /* fail closed */ }
-          const reason = !/^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '') || live?.headRefOid !== pr.headRefOid
-            || live?.mergeable !== 'CONFLICTING' ? 'conflict-cleared-before-bounce' : null;
-          if (reason) {
-            entry.routedTo = reason;
-            log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${reason}`);
-            return false;
-          }
-          const headRefOid = live.headRefOid;
-          beforeWrite();
-          const finding = postFinding({ pr, repo: resolvedRepo, headRefOid, ...extra });
-          let after = null;
-          try { after = readPrLive({ pr, repo: resolvedRepo }); } catch { /* cannot confirm write */ }
-          if (after?.headRefOid !== headRefOid || after?.mergeable !== 'CONFLICTING') {
-            const skipped = revertBounce({ pr, repo: resolvedRepo, headRefOid, findingToken: finding?.findingToken });
-            entry.routedTo = skipped || (after?.headRefOid !== headRefOid
-              ? 'bounce-reverted-head-moved' : 'bounce-reverted-conflict-unconfirmed');
-            log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${entry.routedTo}`);
-            return false;
-          }
-          return true;
-        };
 
         if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable && sameLineConflict === 'fixer') {
           let comments = [];
@@ -2095,21 +2115,21 @@ export function watchParkedPrConflicts({
         // never retried. Leaving the label unapplied on a throw here means the WHOLE branch — alert-dedup
         // included — retries cleanly on the next sweep instead.
         if (standDown && sameLineConflict === 'fixer') {
-          if (!hasRecentConflictFindingComment(existingComments, markerScope)) postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+          if (!hasRecentConflictFindingComment(existingComments, markerScope) && !bounce({ sameLineConflict: true })) { results.push(entry); continue; }
           entry.routedTo = 'reconcile-finding (same-line conflict → fixer)';
         } else if (standDown) {
           if (!hasRecentConflictStandDownComment(existingComments, markerScope)) postStandDown({ pr, repo: resolvedRepo });
           entry.routedTo = 'stand-down';
         } else if (isStatuteTier && appendOnlyStatute) {
-          if (!hasRecentConflictFindingComment(existingComments, markerScope)) postFinding({ pr, repo: resolvedRepo, appendOnlyStatute: true });
+          if (!hasRecentConflictFindingComment(existingComments, markerScope) && !bounce({ appendOnlyStatute: true })) { results.push(entry); continue; }
           entry.routedTo = 'reconcile-finding (append-only statute)';
         } else if (isStatuteTier && reviewHumanFixable) {
-          if (!hasRecentConflictFindingComment(existingComments, markerScope)) postFinding({ pr, repo: resolvedRepo, reviewHumanFixable: true });
+          if (!hasRecentConflictFindingComment(existingComments, markerScope) && !bounce({ reviewHumanFixable: true })) { results.push(entry); continue; }
           entry.routedTo = 'reconcile-finding (review-human statute amendment)';
         } else if (queued) {
           entry.routedTo = 'deferred-to-drain'; // bounced by a later sweep once QUEUED_CONFLICT_GRACE_MS passes
         } else {
-          if (!hasRecentConflictFindingComment(existingComments, markerScope)) postFinding({ pr, repo: resolvedRepo });
+          if (!hasRecentConflictFindingComment(existingComments, markerScope) && !bounce()) { results.push(entry); continue; }
           entry.routedTo = 'reconcile-finding';
         }
         provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);

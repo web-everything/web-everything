@@ -1,6 +1,9 @@
 /** Shared conflict finding body and bounce transport for the watcher and drain.
  * Kept independent of the watcher/operations import graph so drain and standards CLIs can load it.
  */
+import { createGhProvider } from './review-label-provider.mjs';
+import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
+import { runReconcileFindingCli } from '../conveyor/reconcile-finding.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -79,9 +82,10 @@ export function buildConflictFindingBody(pr, { appendOnlyStatute = false, review
   ].join('\n');
 }
 
-export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null, headRefOid }) {
+export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null, headRefOid, beforeWrite, provider = createGhProvider(), listPrComments = defaultListPrComments, writerOptions = {} }) {
   const bodyPath = join(tmpdir(), `reconcile-finding-conflict-${pr?.number}-${randomUUID()}.md`);
   const findingToken = headRefOid ? randomUUID() : null;
+  const completed = new Set();
   writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync, sameLineConflict, enqueueRefusal }) + (findingToken ? `\n\n<!-- conflict-watch-bounce:${findingToken} -->` : ''), 'utf8');
   try {
     const argv = [
@@ -91,8 +95,19 @@ export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appe
     if (headRefOid) argv.push(`--expect-head=${headRefOid}`);
     if (repo) argv.push(`--repo=${repo}`);
     // #x5n4zn3 — was bare (no timeout).
-    exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+    if (beforeWrite && exec === execFileSync) {
+      runReconcileFindingCli({ writerOptions: { ...writerOptions, throwOnRefusal: true, afterWrite: step => completed.add(step) }, emit: () => {}, argv: argv.slice(1), beforeWrite, provider });
+    } else exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
     return { findingToken };
+  } catch (error) {
+    // A comment-first bounce can be stopped after publishing its finding but
+    // before applying review:changes. Retire only that exact trusted receipt:
+    // otherwise deduplication would suppress the next sweep's fix request.
+    // The append-only shadow ledger remains audit history; no label is restored.
+    if (completed.has('comment') && !completed.has('label')) {
+      invalidateConflictFinding({ findingToken, pr, repo, headRefOid, provider, listPrComments });
+    }
+    throw error;
   } finally {
     try { unlinkSync(bodyPath); } catch { /* best-effort cleanup only */ }
   }
@@ -104,12 +119,21 @@ export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appe
  */
 export function invalidateConflictFinding({ findingToken, pr, repo, headRefOid, provider, listPrComments }) {
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(findingToken ?? '')) throw new Error('conflict finding rollback: invalid receipt');
-  const marker = `<!-- conflict-watch-bounce:${findingToken} -->`;
   const comments = listPrComments({ number: pr.number, repo });
   const matches = Array.isArray(comments) ? comments.filter(comment =>
-    isTrustedMarkerAuthor(comment) && typeof comment?.body === 'string' && comment.body.includes(marker)) : [];
+    isTrustedMarkerAuthor(comment) && typeof comment?.body === 'string' && ownsConflictFindingReceipt(comment.body, findingToken)) : [];
   if (matches.length !== 1 || !matches[0].id) throw new Error('conflict finding rollback: finding unreadable or ambiguous; bounce retained');
   provider.editComment(repo, matches[0].id,
     `Conflict-watch bounce reverted for head ${headRefOid}: the post-write read did not confirm the judged conflict.`,
     { pr: pr.number });
+}
+
+/** The renderer neutralizes HTML delimiters in supplied prose. Accept only the
+ * exact transport receipt in either historical raw or production-rendered form.
+ * Authorship remains the caller's separate required check.
+ */
+export function ownsConflictFindingReceipt(body, findingToken) {
+  const marker = `<!-- conflict-watch-bounce:${findingToken} -->`;
+  return typeof body === 'string' && (body.includes(marker)
+    || body.includes(marker.replace('<!--', '&lt;!--').replace('-->', '--&gt;')));
 }

@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { defaultReadPrLive, defaultRevertBounce,
   defaultPostConflictFinding } from '../parked-pr-conflict-watch.mjs';
 import { invalidateConflictFinding } from '../../lib/conflict-finding.mjs';
-import { runReviewLabelCli } from '../../review-set-label.mjs';
+import { readFileSync } from 'node:fs';
+import * as watch from '../parked-pr-conflict-watch.mjs';
+import { buildReconcileFindingBody } from '../reconcile-finding.mjs';
+import { buildVerdictComment, runReviewLabelCli } from '../../review-set-label.mjs';
 
 const head = 'a'.repeat(40), moved = 'b'.repeat(40);
 const pr = { number: 7183, headRefOid: head };
@@ -87,7 +90,7 @@ describe('changes writer head pin', () => {
 describe('conflict finding rollback receipt', () => {
   const findingToken = '12345678-1234-1234-1234-123456789abc';
   const marker = `<!-- conflict-watch-bounce:${findingToken} -->`;
-  const comment = { id: 'IC_bounce', body: `finding\n${marker}`, author: { login: 'web-everything' } };
+  const comment = { id: 'IC_bounce', body: buildVerdictComment({ to: 'changes', actor: 'watch', body: buildReconcileFindingBody(`finding\n${marker}`) }), author: { login: 'web-everything' } };
   it('edits exactly the trusted finding identified by the transport receipt', () => {
     const provider = { editComment: vi.fn() };
     invalidateConflictFinding({ findingToken, pr, repo, headRefOid: head, provider,
@@ -114,4 +117,131 @@ describe('conflict finding rollback receipt', () => {
       listPrComments: () => [comment], provider: { editComment: () => { throw new Error('edit unavailable'); } } }))
       .toThrow('edit unavailable');
   });
+});
+
+
+describe('single conflict bounce choke point', () => {
+  it('has no direct finding calls outside the choke point', () => {
+    const source = readFileSync('scripts/conveyor/parked-pr-conflict-watch.mjs', 'utf8')
+      .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
+    const start = source.indexOf('export function bounceIfStillConflicting(');
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf('\nexport ', start + 1);
+    const outside = source.slice(0, start) + source.slice(end);
+    expect(outside).not.toMatch(/\bpostFinding\s*\(/);
+  });
+  it.each(['ledger', 'comment', 'label'])('holds on a head move immediately before %s', step => {
+    const writes = [], log = vi.fn(), revertBounce = vi.fn();
+    let live = { headRefOid: head, mergeable: 'CONFLICTING' };
+    const postFinding = ({ beforeWrite }) => {
+      for (const name of ['ledger', 'comment', 'label']) {
+        if (name === step) live = { headRefOid: moved, mergeable: 'CONFLICTING' };
+        beforeWrite(name);
+        writes.push(name);
+      }
+    };
+    expect(watch.bounceIfStillConflicting({ pr, judgedHead: head, repo, postFinding,
+      postFindingArgs: {}, readPrLive: () => live, revertBounce, log })).toBe(false);
+    expect(writes).toEqual(['ledger', 'comment', 'label'].slice(0, ['ledger', 'comment', 'label'].indexOf(step)));
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/\d{4}-.*conflict-cleared-before-bounce/));
+    expect(revertBounce).not.toHaveBeenCalled();
+  });
+  it.each([null, { headRefOid: head, mergeable: 'UNKNOWN' }, { headRefOid: head, mergeable: 'MERGEABLE' }])(
+    'holds incomplete or cleared evidence %j', live => {
+      const postFinding = vi.fn();
+      expect(watch.bounceIfStillConflicting({ pr, judgedHead: head, repo, postFinding,
+        readPrLive: () => live, log: () => {} })).toBe(false);
+      expect(postFinding).not.toHaveBeenCalled();
+    });
+  it.each([undefined, 'short'])('holds an invalid judged head %s', judgedHead => {
+    const postFinding = vi.fn();
+    expect(watch.bounceIfStillConflicting({ pr, judgedHead, repo, postFinding,
+      readPrLive: () => ({ headRefOid: head, mergeable: 'CONFLICTING' }), log: () => {} })).toBe(false);
+    expect(postFinding).not.toHaveBeenCalled();
+  });
+});
+
+// Exercise the actual transport, reconcile harness and renderer: a fake writer
+// calling the callback itself cannot prove the production write boundaries.
+describe('production finding write boundaries', () => {
+  for (const step of ['ledger', 'comment', 'label']) {
+    it.each(['moved', 'MERGEABLE', 'UNKNOWN', 'null', 'unreadable', 'oversized'])(
+      `stops before ${step} when live evidence becomes %s`, evidence => {
+        const writes = [], thread = [], log = vi.fn();
+        const index = ['ledger', 'comment', 'label'].indexOf(step);
+        const provider = {
+          readPrState: () => ({ headRefOid: head, labels: [], comments: [], state: 'OPEN', body: '' }),
+          readLabels: () => [],
+          postComment: (_repo, _pr, body) => { expect(body).toContain('&lt;!-- conflict-watch-bounce:'); writes.push('comment');
+            thread.push({ id: 'IC_partial', body, author: { login: 'web-everything' } }); },
+          editComment: vi.fn((_repo, id, body) => { thread.find(c => c.id === id).body = body; }),
+          setLabels: () => writes.push('label'),
+        };
+        let reads = 0;
+        const readPrLive = () => {
+          if (++reads === index + 2) {
+            if (evidence === 'unreadable' || evidence === 'oversized') throw new Error(evidence);
+            if (evidence === 'null') return null;
+            return { headRefOid: evidence === 'moved' ? moved : head,
+              mergeable: evidence === 'moved' ? 'CONFLICTING' : evidence };
+          }
+          return { headRefOid: head, mergeable: 'CONFLICTING' };
+        };
+        expect(watch.bounceIfStillConflicting({ pr, judgedHead: head, repo, readPrLive, log,
+          postFindingArgs: { provider, listPrComments: () => thread, writerOptions: { emit: () => {},
+            appendVerdict: () => { writes.push('ledger'); return { ok: true }; }, signalFix: () => {} } },
+        })).toBe(false);
+        expect(writes).toEqual(['ledger', 'comment', 'label'].slice(0, index));
+        expect(provider.editComment).toHaveBeenCalledTimes(step === 'label' ? 1 : 0);
+        expect(watch.hasRecentConflictFindingComment(thread)).toBe(false);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('conflict-cleared-before-bounce'));
+      });
+  }
+});
+
+
+describe('partial bounce recovery', () => {
+  it.each(['ledger', 'comment', 'label'])(
+    'keeps the next conflicting sweep dispatchable after refusal before %s', step => {
+      const now = Date.parse('2026-11-19T20:00:00Z'), thread = [];
+      let labels = ['review:pending'], liveReads = 0, refuse = true;
+      const snapshot = () => ({ ...pr, headRefName: 'lane/7183', baseRefName: 'main',
+        mergeable: 'CONFLICTING', labels, files: [{ path: 'scripts/x.mjs' }] });
+      const provider = {
+        readPrState: () => ({ ...snapshot(), state: 'OPEN', body: '', comments: thread }),
+        readLabels: () => labels,
+        postComment: (_repo, _pr, body) => thread.push({ id: `IC_${thread.length}`,
+          body, createdAt: new Date(now).toISOString(), author: { login: 'web-everything' } }),
+        editComment: vi.fn((_repo, id, body) => { thread.find(c => c.id === id).body = body; }),
+        ensureLabel: () => {},
+        setLabels: vi.fn((_repo, _pr, { add, remove }) => {
+          labels = labels.filter(label => !remove.includes(label));
+          if (add && !labels.includes(add)) labels.push(add);
+        }),
+      };
+      const postFinding = vi.fn(options => defaultPostConflictFinding({ ...options, provider,
+        listPrComments: () => thread,
+        writerOptions: { appendVerdict: () => ({ ok: true }), signalFix: () => {} },
+      }));
+      const sweep = () => watch.watchParkedPrConflicts({ repo, listPrs: () => [snapshot()],
+        provider, postFinding, listPrComments: () => thread, now, log: () => {},
+        inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
+        sameLineConflict: 'fixer', listAgents: () => [], labelRemovedAtMs: () => 0,
+        listPrFiles: () => snapshot().files, computeConflictDisposition: () => 'real',
+        computeConflictingPaths: () => ['scripts/x.mjs'],
+        readPrLive: () => {
+          const boundary = ['ledger', 'comment', 'label'].indexOf(step) + 2;
+          return { headRefOid: head, mergeable: refuse && ++liveReads === boundary ? 'MERGEABLE' : 'CONFLICTING' };
+        },
+      });
+      expect(sweep()[0]).toMatchObject({ routedTo: 'conflict-cleared-before-bounce' });
+      expect(labels).not.toContain('review:changes');
+      expect(watch.hasRecentConflictFindingComment(thread, { now })).toBe(false);
+      expect(provider.editComment).toHaveBeenCalledTimes(step === 'label' ? 1 : 0);
+      refuse = false;
+      expect(sweep()[0].error).toBeUndefined();
+      expect(postFinding).toHaveBeenCalledTimes(2);
+      expect(labels).toContain('review:changes');
+      expect(watch.hasRecentConflictFindingComment(thread, { now })).toBe(true);
+    });
 });

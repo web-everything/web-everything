@@ -1,3 +1,5 @@
+import { buildVerdictComment } from '../../review-set-label.mjs';
+import { buildReconcileFindingBody } from '../reconcile-finding.mjs';
 /**
  * @file parked-pr-conflict-watch.test.mjs — `#xw0odtv`. PURE logic tests for `isParkedConflictTarget` /
  * `planConflictLabelChange` + IO-shell tests over injected fakes (no `gh` process anywhere in this file),
@@ -97,9 +99,12 @@ const noopRouting = () => ({ postFinding: () => {}, postStandDown: () => {} });
 function watchConfirmedHistoricalConflict(options) {
   const head = 'a'.repeat(40);
   return watchParkedPrConflicts({
-    readPrLive: () => ({ headRefOid: head, mergeable: 'CONFLICTING' }),
+    readPrLive: ({ pr }) => ({ headRefOid: pr.headRefOid, mergeable: 'CONFLICTING' }),
     ...options,
-    listPrs: args => options.listPrs(args).map(pr => ({ ...pr, headRefOid: head })),
+    listPrs: args => {
+      const listed = options.listPrs(args);
+      return Array.isArray(listed) ? listed.map(pr => ({ ...pr, headRefOid: pr.headRefOid ?? head })) : listed;
+    },
   });
 }
 
@@ -125,7 +130,7 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
       setLabels: (repo, pr, spec) => calls.push(['setLabels', repo, pr, spec]),
       postComment: (repo, pr, body) => calls.push(['postComment', repo, pr, body]),
     };
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting() });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting() });
     expect(results).toEqual([{ num: 1920, isConflicting: true, add: CONFLICT_LABEL, remove: [], newlyDetected: true, commented: true, routedTo: 'reconcile-finding' }]);
     // #4118 — the label now applies LAST, only once the alert + dispatch are known-good (see this file's own
     // header, "IDEMPOTENCY, NO SEPARATE STORE" section's #4118 update, and `CONFLICT_RETRY_WINDOW_MS`).
@@ -139,7 +144,7 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     const calls = [];
     const provider = { ensureLabel: (...a) => calls.push(a), setLabels: (...a) => calls.push(a), postComment: (...a) => calls.push(a) };
     const seen = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting(),
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting(),
       inCardGroupFn: q => { seen.push(q); return true; } });
     expect(results).toEqual([]);
     expect(calls).toEqual([]);
@@ -157,7 +162,7 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
       const provider = { currentRepo: vi.fn(() => 'resolved/repo'),
         ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
       const postFinding = vi.fn(), postStandDown = vi.fn();
-      const results = watchParkedPrConflicts({ repo: null, sameLineConflict: 'stand-down', provider,
+      const results = watchConfirmedHistoricalConflict({ repo: null, sameLineConflict: 'stand-down', provider,
         postFinding, postStandDown, listPrs: () => [{ ...REAL_1920_SNAPSHOT,
           number: role === 'combined' ? 2000 : 1920, headRefName: branch }] });
       expect(results).toEqual([]);
@@ -178,7 +183,7 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     const provider = { currentRepo: vi.fn(currentRepo), ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
     const postFinding = vi.fn(), postStandDown = vi.fn();
     const inCardGroupFn = vi.fn(() => false);
-    const results = watchParkedPrConflicts({ repo: null, sameLineConflict: 'stand-down', provider, postFinding, postStandDown, inCardGroupFn,
+    const results = watchConfirmedHistoricalConflict({ repo: null, sameLineConflict: 'stand-down', provider, postFinding, postStandDown, inCardGroupFn,
       listPrs: () => [REAL_1920_SNAPSHOT, { ...REAL_1920_SNAPSHOT, number: 1921 }] });
     expect(results).toEqual([]);
     for (const effect of [provider.ensureLabel, provider.setLabels, provider.postComment, postFinding, postStandDown])
@@ -197,14 +202,14 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     try {
       const provider = { currentRepo: vi.fn(() => 'resolved/repo'), ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
       const postFinding = vi.fn(), postStandDown = vi.fn();
-      const results = watchParkedPrConflicts({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown,
+      const results = watchConfirmedHistoricalConflict({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown,
         listPrs: () => [REAL_1920_SNAPSHOT] });
       expect(results).toEqual([]);
       for (const effect of [provider.ensureLabel, provider.setLabels, provider.postComment, postFinding, postStandDown])
         expect(effect).not.toHaveBeenCalled();
       // A readable state with no group lets the same PR through (the hold is only for "unknown").
       writeFileSync(statePath, JSON.stringify({ groups: [], failed: {} }));
-      watchParkedPrConflicts({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown, ...noopRouting(),
+      watchConfirmedHistoricalConflict({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown, ...noopRouting(),
         listPrs: () => [REAL_1920_SNAPSHOT] });
       expect(provider.setLabels).toHaveBeenCalled();
     } finally {
@@ -217,7 +222,7 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     const healed = { ...REAL_1920_SNAPSHOT, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [...REAL_1920_SNAPSHOT.labels, { name: CONFLICT_LABEL }] };
     const calls = [];
     const provider = { setLabels: (repo, pr, spec) => calls.push(['setLabels', repo, pr, spec]) };
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [healed], provider });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [healed], provider });
     expect(results).toEqual([{ num: 1920, isConflicting: false, add: null, remove: [CONFLICT_LABEL], newlyDetected: false, newlyResolved: true, commented: false }]);
     expect(calls).toEqual([['setLabels', 'web-everything/web-everything', 1920, { add: undefined, remove: [CONFLICT_LABEL] }]]);
   });
@@ -443,7 +448,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     const routed = [];
     const listPrs = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number, o.repo]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number, o.repo]),
@@ -466,7 +471,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       number: 1921, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }],
       files: [{ path: 'docs/agent/platform-decisions.md' }],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -488,7 +493,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       number: 1922, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }],
       files: Array.from({ length: GH_FILES_GRAPHQL_CAP - 1 }, (_, i) => ({ path: `scripts/f${i}.mjs` })),
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -504,7 +509,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     let listPrFilesArgs;
     const truncated = Array.from({ length: GH_FILES_GRAPHQL_CAP }, (_, i) => ({ path: `scripts/f${i}.mjs` }));
     const listPrs = () => [{ number: 1923, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }], files: truncated }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -520,7 +525,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const routed = [];
     const truncated = Array.from({ length: GH_FILES_GRAPHQL_CAP }, (_, i) => ({ path: `scripts/f${i}.mjs` }));
     const listPrs = () => [{ number: 1925, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }], files: truncated }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -534,7 +539,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const routed = [];
     const truncated = Array.from({ length: GH_FILES_GRAPHQL_CAP }, (_, i) => ({ path: `scripts/f${i}.mjs` })); // no statute file at all
     const listPrs = () => [{ number: 1924, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }], files: truncated }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -547,7 +552,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
   it('is idempotent — a second sweep on an already-labelled, still-conflicting PR makes zero gh calls', () => {
     const provider = fakeProvider();
     const listPrs = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }, { name: CONFLICT_LABEL }] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider });
     expect(results).toEqual([]);
     expect(provider.calls).toEqual([]);
   });
@@ -555,7 +560,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
   it('clears the label (no comment) once the conflict resolves', () => {
     const provider = fakeProvider();
     const listPrs = () => [{ number: 1920, mergeable: 'MERGEABLE', labels: [{ name: 'review:human' }, { name: CONFLICT_LABEL }] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider });
     expect(results).toEqual([{ num: 1920, isConflicting: false, add: null, remove: [CONFLICT_LABEL], newlyDetected: false, newlyResolved: true, commented: false }]);
     expect(provider.calls).toEqual([['setLabels', 'o/n', 1920, { add: undefined, remove: [CONFLICT_LABEL] }]]);
   });
@@ -564,7 +569,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     const routed = [];
     const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider,
       postRearm: (o) => routed.push(['rearm', o.pr.number, o.repo]),
       postFinding: (o) => routed.push(['finding', o.pr.number, o.repo]),
@@ -582,7 +587,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     const routed = [];
     const listPrs = () => [{ number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postRearm: (o) => routed.push(['rearm', o.pr.number]),
       postFinding: (o) => routed.push(['finding', o.pr.number]),
@@ -598,7 +603,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     const routed = [];
     const listPrs = () => [{ number: 1920, mergeable: 'MERGEABLE', labels: [CONFLICT_LABEL, 'review:changes'] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, dryRun: true,
       postRearm: (o) => routed.push(o),
     });
@@ -612,7 +617,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     provider.currentRepo = () => 'resolved/repo';
     const routed = [];
     const listPrs = () => [1, 2].map((number) => ({ number, mergeable: 'MERGEABLE', labels: [CONFLICT_LABEL, 'review:changes'] }));
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       listPrs, provider,
       postRearm: (o) => {
         routed.push([o.pr.number, o.repo]);
@@ -635,7 +640,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const liveFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 1920, repo: 'we' }), state: 'working', pid: 4242, pidAlive: true };
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [liveFixAgent],
@@ -656,7 +661,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const stuckFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 1920, repo: 'we' }), state: 'blocked', pid: 4242, pidAlive: true };
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [stuckFixAgent],
@@ -669,7 +674,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const provider = fakeProvider();
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [], // no live agents at all
@@ -684,7 +689,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const doneFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 1920, repo: 'we' }), state: 'done', pid: 4242, pidAlive: true };
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [doneFixAgent],
@@ -698,7 +703,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const otherPrFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 4242, repo: 'we' }), state: 'working', pidAlive: true };
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [otherPrFixAgent],
@@ -710,7 +715,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const provider = fakeProvider();
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => { throw new Error('claude agents --json failed'); },
@@ -723,7 +728,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       let called = false;
       const provider = fakeProvider();
       const listPrs = () => [{ number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }] }];
-      watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider, postRearm: () => {},
         listAgents: () => { called = true; return []; },
       });
@@ -758,7 +763,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
         postNoteComment.mockClear();
         notifyDesktopChecked.mockClear();
         const provider = fakeProvider();
-        const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+        const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
           repo: 'o/n', listPrs: () => [pr], provider, postRearm: () => { throw new Error('must never rearm while deferred'); },
           listAgents: () => [liveFixAgent], listPrComments: () => [],
         });
@@ -774,7 +779,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
         const since = 1_000_000;
         const now = since + REARM_DEFERRED_BOUND_MS - 1; // just under the bound
         const comments = [{ body: `${REARM_DEFERRED_MARKER}\n\nwithheld`, createdAt: new Date(since).toISOString(), author: { login: 'web-everything' } }];
-        const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+        const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
           repo: 'o/n', listPrs: () => [pr], provider, postRearm: () => { throw new Error('must never rearm while deferred'); },
           listAgents: () => [liveFixAgent], listPrComments: () => comments, now,
         });
@@ -792,7 +797,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
         const now = since + REARM_DEFERRED_BOUND_MS + 1; // just over the bound
         const comments = [{ body: `${REARM_DEFERRED_MARKER}\n\nwithheld`, createdAt: new Date(since).toISOString(), author: { login: 'web-everything' } }];
         let rearmed = false;
-        const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+        const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
           repo: 'o/n', listPrs: () => [pr], provider, postRearm: () => { rearmed = true; },
           listAgents: () => [liveFixAgent], listPrComments: () => comments, now,
         });
@@ -817,7 +822,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
           { body: `${REARM_DEFERRED_MARKER}\n\nwithheld`, createdAt: new Date(since).toISOString(), author: { login: 'web-everything' } },
           { body: buildNoteComment(note), author: { login: 'web-everything' } },
         ];
-        const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+        const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
           repo: 'o/n', listPrs: () => [pr], provider, postRearm: () => {},
           listAgents: () => [liveFixAgent], listPrComments: () => comments, now,
         });
@@ -844,7 +849,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
         const staleFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 2741, repo: 'we' }), state: 'working', pidAlive: true };
         const REAL_RESOLVED_AT = Date.parse('2026-09-26T18:47:45Z'); // real: GitHub's own MERGEABLE-again read
         let rearmed = false;
-        const sweep = (now, comments) => watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+        const sweep = (now, comments) => watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
           repo: 'web-everything/web-everything', listPrs: () => [pr2741], provider,
           postRearm: () => { rearmed = true; }, listAgents: () => [staleFixAgent], listPrComments: () => comments, now,
         });
@@ -877,7 +882,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     const routed = [];
     const listPrs = () => [{ number: 1920, mergeable, labels: [CONFLICT_LABEL, 'review:changes'] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, postRearm: (o) => routed.push(o) });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, postRearm: (o) => routed.push(o) });
     expect(results).toEqual([]);
     expect(provider.calls).toEqual([]);
     expect(routed).toEqual([]);
@@ -887,7 +892,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     const routed = [];
     const listPrs = () => [{ number: 1920, mergeable: 'MERGEABLE', labels: ['review:changes'] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, postRearm: (o) => routed.push(o) });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, postRearm: (o) => routed.push(o) });
     expect(results).toEqual([]);
     expect(provider.calls).toEqual([]);
     expect(routed).toEqual([]);
@@ -905,7 +910,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     const routed = [];
     const listPrs = () => [{ number: 1853, mergeable: 'CONFLICTING', labels: [] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(o.pr.number),
       computeConflictDisposition: () => null,
@@ -917,7 +922,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
   it('dry-run: reports the plan, makes zero gh calls', () => {
     const provider = fakeProvider();
     const listPrs = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, dryRun: true });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, dryRun: true });
     expect(results).toEqual([{ num: 1920, isConflicting: true, add: CONFLICT_LABEL, remove: [], newlyDetected: true, commented: false }]);
     expect(provider.calls).toEqual([]);
   });
@@ -932,7 +937,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     // #4118 — the label write now happens LAST (after the alert + dispatch), so this failure surfaces only
     // once routing has already been attempted; `...noopRouting()` isolates the assertion to the label failure
     // itself, exactly as it already does in every other test that reaches a real dispatch call.
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, ...noopRouting() });
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs, provider, ...noopRouting() });
     expect(results).toHaveLength(2);
     expect(results.every((r) => r.error === 'boom')).toBe(true);
   });
@@ -946,7 +951,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const provider = fakeProvider();
     provider.currentRepo = () => 'resolved/repo';
     const listPrs = () => [{ number: 1932, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: null, listPrs, provider, ...noopRouting() }); // no --repo given
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: null, listPrs, provider, ...noopRouting() }); // no --repo given
     expect(results).toEqual([{ num: 1932, isConflicting: true, add: CONFLICT_LABEL, remove: [], newlyDetected: true, commented: true, routedTo: 'reconcile-finding' }]);
     expect(provider.calls).toEqual([
       ['postComment', 'resolved/repo', 1932],
@@ -967,13 +972,13 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     provider.currentRepo = () => { currentRepoCalls += 1; return 'should-not-be-used'; };
     // Case 1: repo supplied — currentRepo must stay unconsulted.
     const listPrsA = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }] }];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs: listPrsA, provider, ...noopRouting() });
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs: listPrsA, provider, ...noopRouting() });
     expect(currentRepoCalls).toBe(0);
     // Case 2: even already-labelled PRs need a repo for the ownership read before routing.
     const listPrsB = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }, { name: CONFLICT_LABEL }] }];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: null, listPrs: listPrsB, provider, ...noopRouting() });
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down', repo: null, listPrs: listPrsB, provider, ...noopRouting() });
     expect(currentRepoCalls).toBe(1);
-    watchParkedPrConflicts({ repo: null, listPrs: () => [], provider });
+    watchConfirmedHistoricalConflict({ repo: null, listPrs: () => [], provider });
     expect(currentRepoCalls).toBe(1);
   });
 });
@@ -1091,7 +1096,7 @@ describe('#4118 — crash-safety: the label applies LAST, after the alert + disp
     // The fake `postFinding` simulates what `defaultPostConflictFinding` really does on success: leaves a
     // durable finding comment on the thread (via `reconcile-finding.mjs`) — without this, the SECOND sweep's
     // `hasRecentConflictFindingComment` marker check has no way to tell "already dispatched" from "never tried".
-    const first = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const first = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider: crashingProvider,
       postFinding: (o) => {
         routed.push(o);
@@ -1108,7 +1113,7 @@ describe('#4118 — crash-safety: the label applies LAST, after the alert + disp
     // sweep already posted.
     const recovered = fakeProvider();
     const routed2 = [];
-    const second = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const second = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider: recovered,
       listPrComments: () => postedComments, labelRemovedAtMs: () => 0,
       postFinding: (o) => routed2.push(o), postStandDown: () => {},
@@ -1132,7 +1137,7 @@ describe('#4118 — crash-safety: the label applies LAST, after the alert + disp
       ensureLabel: () => {}, setLabels: () => {},
       postComment: (repo, num, body) => postedComments.push({ body, createdAt: new Date().toISOString(), author: { login: 'web-everything' } }),
     };
-    const first = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const first = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider: provider1,
       postFinding: () => { throw new Error('simulated dispatch crash'); }, postStandDown: () => {},
     });
@@ -1141,7 +1146,7 @@ describe('#4118 — crash-safety: the label applies LAST, after the alert + disp
 
     const recovered = fakeProvider();
     const routed = [];
-    const second = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const second = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider: recovered,
       listPrComments: () => postedComments, labelRemovedAtMs: () => 0,
       postFinding: (o) => routed.push(o), postStandDown: () => {},
@@ -1162,7 +1167,7 @@ describe('#4118 — crash-safety: the label applies LAST, after the alert + disp
     };
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider,
       listPrComments: () => [oldEpisodeAlert], labelRemovedAtMs: () => 0,
       postFinding: (o) => routed.push(o), postStandDown: () => {},
@@ -1199,7 +1204,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
     ];
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider, now,
       listPrComments: () => comments, labelRemovedAtMs: () => now - 5 * 60_000,
       postFinding: (o) => routed.push(o), postStandDown: () => {},
@@ -1216,7 +1221,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
     ];
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider, now,
       listPrComments: () => comments, labelRemovedAtMs: () => now - 5 * 60_000,
       postFinding: (o) => routed.push(o), postStandDown: () => {},
@@ -1231,7 +1236,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
     const comments = [{ body: buildConflictComment({ num: 4123 }, {}), createdAt: iso(60_000), author: trusted }];
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider, now,
       listPrComments: () => comments, labelRemovedAtMs: () => null,
       postFinding: (o) => routed.push(o), postStandDown: () => {},
@@ -1247,7 +1252,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
 
   it('a fresh statute-tier episode posts its OWN stand-down even with an old episode\'s stand-down on the thread', () => {
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [statutePr(4124)], provider: fakeProvider(), now,
       listPrComments: () => [standDownAt(3 * 24 * 60 * 60_000)], labelRemovedAtMs: () => now - 2 * 24 * 60 * 60_000,
       postFinding: () => {}, postStandDown: (o) => routed.push(o.pr.number),
@@ -1258,7 +1263,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
 
   it('a stale out-of-window stand-down never suppresses a fresh one, even with no recorded label removal', () => {
     const routed = [];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [statutePr(4125)], provider: fakeProvider(), now,
       listPrComments: () => [standDownAt(CONFLICT_RETRY_WINDOW_MS + 60_000)], labelRemovedAtMs: () => 0,
       postFinding: () => {}, postStandDown: (o) => routed.push(o.pr.number),
@@ -1269,7 +1274,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
   it('a crash-retry of the stand-down in the SAME episode does not re-post it', () => {
     const routed = [];
     const provider = fakeProvider();
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [statutePr(4126)], provider, now,
       listPrComments: () => [standDownAt(60_000)], labelRemovedAtMs: () => 0,
       postFinding: () => {}, postStandDown: (o) => routed.push(o.pr.number),
@@ -1281,7 +1286,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
 
   it('the episode boundary is only read when the thread has comments to judge', () => {
     let reads = 0;
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [statutePr(4127)], provider: fakeProvider(), now,
       listPrComments: () => [], labelRemovedAtMs: () => { reads += 1; return 0; },
       postFinding: () => {}, postStandDown: () => {},
@@ -1297,7 +1302,7 @@ describe('#4118 — a resolved conflict\'s rearm is crash-safe (rearm first, lab
     const calls = [];
     const provider = { setLabels: (repo, num, spec) => calls.push(['setLabels', num, spec]) };
     const pr = { number: 4128, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
-    const first = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const first = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider, listAgents: () => [],
       postRearm: () => { throw new Error('simulated rearm crash'); },
     });
@@ -1305,7 +1310,7 @@ describe('#4118 — a resolved conflict\'s rearm is crash-safe (rearm first, lab
     expect(calls).toEqual([]); // label NOT removed — still retryable
 
     const rearmed = [];
-    const second = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const second = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider, listAgents: () => [],
       postRearm: (o) => { rearmed.push(o.pr.number); calls.push(['rearm', o.pr.number]); },
     });
@@ -1780,7 +1785,7 @@ describe('buildSupersedeStandDownComment', () => {
 
 describe('watchParkedPrConflicts — #xu2krte Fork 2 review-human statute amendment (fresh detection)', () => {
   const basePr = (over = {}) => ({
-    number: 2549, mergeable: 'CONFLICTING', headRefName: 'lane/3681-ratify-daemon-lifecycle',
+    number: 2549, headRefOid: 'a'.repeat(40), mergeable: 'CONFLICTING', headRefName: 'lane/3681-ratify-daemon-lifecycle',
     labels: [{ name: 'review:human' }], files: [{ path: 'docs/agent/platform-decisions.md' }], ...over,
   });
   const fakeProvider = () => {
@@ -1791,7 +1796,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 review-human statute amendm
   it('review:human + non-append-only + NOT overlapping main → routes to the fixer, not stand-down', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [basePr()], provider,
       listPrPatches: () => ({ 'docs/agent/platform-decisions.md': PR_HUNK_10_13 }),
       listMainStatutePatches: () => ({ 'docs/agent/platform-decisions.md': MAIN_HUNK_NONOVERLAPPING }),
@@ -1799,7 +1804,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 review-human statute amendm
       postStandDown: (o) => routed.push(['stand-down', o]),
     });
     expect(results[0].routedTo).toBe('reconcile-finding (review-human statute amendment)');
-    expect(routed).toEqual([['finding', { pr: basePr(), repo: 'o/n', reviewHumanFixable: true }]]);
+    expect(routed).toEqual([['finding', { pr: basePr(), repo: 'o/n', reviewHumanFixable: true, headRefOid: 'a'.repeat(40), beforeWrite: expect.any(Function) }]]);
     // The comment says the conflict-only mechanical resolution, never the stand-down "judgment call" wording.
     const commentCall = provider.calls.find((c) => c[0] === 'postComment');
     expect(commentCall[3]).toMatch(/resolve the conflict only|being resolved mechanically/i);
@@ -1809,7 +1814,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 review-human statute amendm
   it('review:human + non-append-only + DOES overlap main → still stands down (a true competing edit)', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [basePr()], provider,
       listPrPatches: () => ({ 'docs/agent/platform-decisions.md': PR_HUNK_10_13 }),
       listMainStatutePatches: () => ({ 'docs/agent/platform-decisions.md': MAIN_HUNK_OVERLAPPING }),
@@ -1824,7 +1829,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 review-human statute amendm
     const provider = fakeProvider();
     const routed = [];
     const pr = basePr({ labels: [{ name: 'review:pending' }] });
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider,
       listPrPatches: () => ({ 'docs/agent/platform-decisions.md': PR_HUNK_10_13 }),
       // A caller with no review:human never even reaches listMainStatutePatches — assert that directly.
@@ -1840,7 +1845,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 review-human statute amendm
     const provider = fakeProvider();
     const routed = [];
     const appendOnlyPatch = '@@ -20,0 +21,3 @@\n+### New Rule\n+body\n+more body\n ---\n';
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [basePr()], provider,
       listPrPatches: () => ({ 'docs/agent/platform-decisions.md': appendOnlyPatch }),
       listMainStatutePatches: () => { throw new Error('must not be called — append-only short-circuits first'); },
@@ -1856,7 +1861,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
   const watcherMarkerComment = { body: buildStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' }), author: { login: 'web-everything' } };
   const humanJudgmentComment = { body: buildStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }), author: { login: 'web-everything' } };
   const alreadyLabelledPr = (over = {}) => ({
-    number: 2549, mergeable: 'CONFLICTING', headRefName: 'lane/3681-ratify-daemon-lifecycle',
+    number: 2549, headRefOid: 'a'.repeat(40), mergeable: 'CONFLICTING', headRefName: 'lane/3681-ratify-daemon-lifecycle',
     labels: [{ name: 'review:human' }, { name: CONFLICT_LABEL }], ...over,
   });
   const fakeProvider = () => {
@@ -1867,7 +1872,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
   it('a watcher-marked, already-labelled PR that NOW qualifies (no overlap) supersedes the marker and dispatches', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [alreadyLabelledPr()], provider,
       listPrComments: () => [watcherMarkerComment],
       listPrFiles: () => ['docs/agent/platform-decisions.md'],
@@ -1880,7 +1885,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
       num: 2549, isConflicting: true, add: null, remove: [], newlyDetected: false, commented: false,
       supersededStandDown: true, routedTo: 'reconcile-finding (review-human statute amendment, marker superseded)',
     }]);
-    expect(routed).toEqual([['finding', { pr: alreadyLabelledPr(), repo: 'o/n', appendOnlyStatute: false, reviewHumanFixable: true }]]);
+    expect(routed).toEqual([['finding', { pr: alreadyLabelledPr(), repo: 'o/n', appendOnlyStatute: false, reviewHumanFixable: true, headRefOid: 'a'.repeat(40), beforeWrite: expect.any(Function) }]]);
     expect(provider.calls).toEqual([['postComment', 'o/n', 2549, expect.stringMatching(/superseded/i)]]);
   });
 
@@ -1890,7 +1895,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
   it('a watcher marker ALREADY followed by a supersede comment is not re-superseded or re-dispatched', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [alreadyLabelledPr()], provider,
       listPrComments: () => [watcherMarkerComment, { body: buildSupersedeStandDownComment({ num: 2549 }) }],
       listPrFiles: () => { throw new Error('must not re-classify an already-superseded marker'); },
@@ -1905,7 +1910,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
   it('a NEW watcher stand-down posted after an old supersede is re-checked (only the latest marker counts)', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [alreadyLabelledPr()], provider,
       listPrComments: () => [watcherMarkerComment, { body: buildSupersedeStandDownComment({ num: 2549 }) }, watcherMarkerComment],
       listPrFiles: () => ['docs/agent/platform-decisions.md'],
@@ -1922,7 +1927,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
     const run = (postFinding) => {
       const order = [];
       const provider = { ensureLabel: () => {}, setLabels: () => {}, postComment: () => order.push('supersede') };
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs: () => [alreadyLabelledPr()], provider,
         listPrComments: () => [watcherMarkerComment],
         listPrFiles: () => ['docs/agent/platform-decisions.md'],
@@ -1946,7 +1951,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
   it('a watcher-marked PR that STILL overlaps main leaves the stand-down exactly alone — no re-post, no dispatch', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [alreadyLabelledPr()], provider,
       listPrComments: () => [watcherMarkerComment],
       listPrFiles: () => ['docs/agent/platform-decisions.md'],
@@ -1982,7 +1987,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
 
     it('BEFORE: git-clean + GitHub-conflicting with no answer and a real-looking diff but a conflicting probe still stands down', () => {
       const routed = [];
-      const results = watchParkedPrConflicts(stuckInputs({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict(stuckInputs({ sameLineConflict: 'stand-down',
         provider: fakeProvider(), listPrComments: () => [stoodDown], computeConflictDisposition: () => 'real',
         postFinding: (o) => routed.push(['finding', o]), postStandDown: (o) => routed.push(['stand-down', o]),
       }));
@@ -1993,7 +1998,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
     it('git merge-tree clean while GitHub says CONFLICTING: dispatches a plain re-sync finding and supersedes the marker', () => {
       const routed = [];
       const provider = fakeProvider();
-      const results = watchParkedPrConflicts(stuckInputs({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict(stuckInputs({ sameLineConflict: 'stand-down',
         provider, listPrComments: () => [stoodDown], computeConflictDisposition: () => 'clean',
         postFinding: (o) => routed.push(['finding', o]), postStandDown: (o) => routed.push(['stand-down', o]),
       }));
@@ -2006,7 +2011,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
 
     it('a failed disposition probe fails closed: the stand-down stays', () => {
       const routed = [];
-      const results = watchParkedPrConflicts(stuckInputs({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict(stuckInputs({ sameLineConflict: 'stand-down',
         provider: fakeProvider(), listPrComments: () => [stoodDown],
         computeConflictDisposition: () => { throw new Error('git blew up'); },
         postFinding: (o) => routed.push(o),
@@ -2018,7 +2023,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
     it('a later operator answer naming the stand-down lifts it for that episode, even on a real conflict', () => {
       const routed = [];
       const provider = fakeProvider();
-      const results = watchParkedPrConflicts(stuckInputs({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict(stuckInputs({ sameLineConflict: 'stand-down',
         provider, listPrComments: () => [stoodDown, operatorAnswer()], computeConflictDisposition: () => 'real',
         postFinding: (o) => routed.push(['finding', o]), postStandDown: (o) => routed.push(['stand-down', o]),
       }));
@@ -2032,7 +2037,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
       const other = buildOperatorAnswer({ standDownId: 'IC_other', reason: 'go', actor: 'chalbert', channel: 'chat' });
       for (const answer of [{ body: other, author: { login: 'chalbert' } }, operatorAnswer({ author: { login: 'mallory' } })]) {
         const routed = [];
-        const results = watchParkedPrConflicts(stuckInputs({ sameLineConflict: 'stand-down',
+        const results = watchConfirmedHistoricalConflict(stuckInputs({ sameLineConflict: 'stand-down',
           provider: fakeProvider(), listPrComments: () => [stoodDown, answer], computeConflictDisposition: () => 'real',
           postFinding: (o) => routed.push(o),
         }));
@@ -2065,7 +2070,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
   it('an already-labelled PR with NO watcher marker (e.g. already dispatched, or a fix agent\'s OWN stand-down) is left alone', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [alreadyLabelledPr()], provider,
       listPrComments: () => [humanJudgmentComment],
       listPrFiles: () => { throw new Error('must not fetch files when no watcher marker is present'); },
@@ -2081,7 +2086,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
     const provider = fakeProvider();
     const listPrFilesCalls = [];
     const pr = alreadyLabelledPr({ labels: [{ name: 'review:accepted' }, { name: CONFLICT_LABEL }] });
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [pr], provider,
       labelAgeMs: () => 0, // grace not yet due
       listPrFiles: () => { listPrFilesCalls.push(1); return []; },
@@ -2092,7 +2097,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
 
   it('a real dry run reports the same routing decision without writing anything', () => {
     const provider = fakeProvider();
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [alreadyLabelledPr()], dryRun: true, provider,
       listPrComments: () => [watcherMarkerComment],
       listPrFiles: () => ['docs/agent/platform-decisions.md'],
@@ -2200,7 +2205,7 @@ describe('stale conflict read', () => {
     const [entry] = fixture.run();
     expect(fixture.options.postFinding).toHaveBeenCalledTimes(1);
     expect(fixture.options.postFinding).toHaveBeenCalledWith({
-      pr: fixture.pr, repo: fixture.options.repo, headRefOid: CONFLICT_HEAD_7183,
+      pr: fixture.pr, repo: fixture.options.repo, headRefOid: CONFLICT_HEAD_7183, beforeWrite: expect.any(Function),
     });
     expect(entry?.routedTo).toContain('reconcile-finding');
   });
@@ -2263,7 +2268,7 @@ describe('bounce head-bound', () => {
         postFinding: vi.fn(options => defaultPostConflictFinding({ ...options, exec: (_file, argv) => {
           const path = argv.find(arg => arg.startsWith('--body-file=')).slice('--body-file='.length);
           bodyPaths.push(path);
-          thread.push({ id: 'IC_bounce', body: readFileSync(path, 'utf8'),
+          thread.push({ id: 'IC_bounce', body: buildVerdictComment({ to: 'changes', actor: 'watch', body: buildReconcileFindingBody(readFileSync(path, 'utf8')) }),
             createdAt: new Date(CONFLICT_NOW_7183).toISOString(), author: { login: 'web-everything' } });
         } })),
       });
@@ -2333,7 +2338,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('first sighting: labelled + commented (drain goes first), NOT bounced yet', () => {
     const provider = fakeProvider(); const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', 'ready-to-merge') }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
     });
     expect(r.routedTo).toBe('deferred-to-drain');
@@ -2346,7 +2351,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('already flagged, grace NOT yet elapsed → nothing happens', () => {
     const provider = fakeProvider(); const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS - 1000, listPrFiles: () => [],
     });
@@ -2419,7 +2424,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
       labels: L('review:human'),
       files: [{ path: 'scripts/lib/daemon-self-sync.mjs' }],
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
       listPrFiles: () => { throw new Error('must not be called for a stacked PR'); },
     });
@@ -2438,7 +2443,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
       number: 1920, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:human'),
       files: [{ path: 'scripts/lib/daemon-self-sync.mjs' }],
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
     });
     expect(r.routedTo).toBe('reconcile-finding');
@@ -2454,7 +2459,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
       number: 2578, mergeable: 'CONFLICTING', baseRefName: 'lane/3681-ratify-daemon-lifecycle',
       labels: L('review:accepted', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => { throw new Error('must not be called for a stacked PR'); },
     });
@@ -2469,7 +2474,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
       number: 2578, mergeable: 'CONFLICTING', baseRefName: 'lane/3681-ratify-daemon-lifecycle',
       labels: L('review:accepted', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, dryRun: true,
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => { throw new Error('must not be called'); },
     });
@@ -2506,7 +2511,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('dry-run reports the grace-expired routing decision instead of skipping the branch, and makes no writes', () => {
     const provider = fakeProvider(); const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, dryRun: true,
       postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
@@ -2519,7 +2524,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('grace elapsed but label age unknown → waits (never bounces on a guess)', () => {
     const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('ready-to-merge', CONFLICT_LABEL) }];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => null, listPrFiles: () => [],
     });
@@ -2553,7 +2558,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('#4118 (b) — still waits when the fallback alert comment is also unavailable (unchanged safe default)', () => {
     const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('ready-to-merge', CONFLICT_LABEL) }];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => null, listPrComments: () => [], listPrFiles: () => [],
     });
@@ -2564,7 +2569,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     const routed = [];
     const recentAlert = { body: buildConflictComment({ num: 2514 }, {}), createdAt: new Date().toISOString(), author: { login: 'web-everything' } };
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => null, listPrComments: () => [recentAlert], listPrFiles: () => [],
     });
@@ -2582,7 +2587,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
       author: { login: 'some-random-user' },
     };
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => null, listPrComments: () => [forgedOldAlert], listPrFiles: () => [],
     });
@@ -2592,7 +2597,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('statute-tier: handed to a human at first sighting, and NEVER re-posted by the grace path once the marker is on the PR', () => {
     const routed = [];
     const statuteFiles = [{ path: 'docs/agent/platform-decisions.md' }];
-    const first = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const first = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [{ number: 2505, mergeable: 'CONFLICTING', labels: L('review:accepted'), files: statuteFiles }],
       provider: fakeProvider(), postFinding: () => routed.push('finding'), postStandDown: () => routed.push('sd'),
     });
@@ -2601,7 +2606,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     // `countStandDownComments`), not from a bare "isStatuteTier implies already handled" assumption (that
     // assumption is exactly what left #2505 stuck: a QUEUED PR that is NOT statute-tier at detection is deferred
     // to the drain, never handed to a human, so it can reach this grace path statute-tier for the FIRST time).
-    const later = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const later = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [{ number: 2505, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }],
       provider: fakeProvider(), postFinding: () => routed.push('finding'), postStandDown: () => routed.push('sd'),
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS * 2, listPrFiles: () => statuteFiles,
@@ -2620,7 +2625,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     const removedAt = Date.parse('2026-09-20T00:00:00Z');
     const oldStandDown = { body: STAND_DOWN_MARKER, createdAt: '2026-09-19T00:00:00Z', author: { login: 'web-everything' } };
     const newStandDown = { body: STAND_DOWN_MARKER, createdAt: '2026-09-21T00:00:00Z', author: { login: 'web-everything' } };
-    const run = (comments) => watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const run = (comments) => watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [{ number: 2506, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }],
       provider: fakeProvider(), postFinding: () => routed.push('finding'), postStandDown: () => routed.push('sd'),
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS * 2, listPrFiles: () => statuteFiles,
@@ -2634,7 +2639,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
 
   it('healed by the drain within the grace window → label removed, nothing bounced', () => {
     const provider = fakeProvider(); const routed = [];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [{ number: 2514, mergeable: 'MERGEABLE', labels: L('review:accepted', CONFLICT_LABEL) }],
       provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {}, postRearm: () => routed.push('rearm'),
     });
@@ -2751,7 +2756,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     it('a manifest-only conflict (computeConflictDisposition → "manifest-only") is UNCHANGED — still waits out the grace', () => {
       const routed = [];
       const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', CONFLICT_LABEL) }];
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider: fakeProvider(),
         postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
         computeConflictDisposition: () => 'manifest-only',
@@ -2778,7 +2783,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     it('an UNCLASSIFIABLE conflict (computeConflictDisposition → null) fails toward the existing wait — the safe direction', () => {
       const routed = [];
       const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', CONFLICT_LABEL) }];
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider: fakeProvider(),
         postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
         computeConflictDisposition: () => null,
@@ -2790,7 +2795,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
 
     it('a REAL conflict is reported even in dry-run — never silent about why it skipped the wait', () => {
       const listPrs = () => [{ number: 2596, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL) }];
-      const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider: fakeProvider(), dryRun: true,
         computeConflictDisposition: () => 'real',
         labelAgeMs: () => { throw new Error('must not be called'); },
@@ -2809,7 +2814,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
         number: 2578, mergeable: 'CONFLICTING', baseRefName: 'lane/3681-ratify-daemon-lifecycle',
         labels: L('review:accepted', CONFLICT_LABEL),
       }];
-      const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider: fakeProvider(),
         postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
         computeConflictDisposition: () => 'real',
@@ -2872,7 +2877,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       number: 2709, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', baseRefName: 'main',
       headRefName: 'lane/2709-fix', labels: L('checking'),
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       computeConflictDisposition: (o) => { expect(o.pr.number).toBe(2709); return 'manifest-only'; },
@@ -2891,7 +2896,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
   it('a `current` mechanical result (tip already rebased and manifest-free) is treated the same as `rebased`', () => {
     const provider = fakeProvider();
     const listPrs = () => [{ number: 2710, mergeable: 'CONFLICTING', headRefName: 'lane/2710-x', labels: L('checking') }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       computeConflictDisposition: () => 'clean',
       attemptMechanicalRebase: () => ({ action: 'current', newCommit: 'abc123' }),
@@ -2907,7 +2912,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     const listPrs = () => [{
       number: 1853, mergeable: 'CONFLICTING', headRefName: 'lane/1853-x', labels: [],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number, o.repo]),
       computeConflictDisposition: () => 'real',
@@ -2928,7 +2933,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     const provider = fakeProvider();
     const routed = [];
     const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       computeConflictDisposition: () => 'manifest-only',
@@ -2943,7 +2948,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     const routed = [];
     let rebaseCalls = 0;
     const listPrs = () => [{ number: 1855, mergeable: 'CONFLICTING', labels: [] }]; // no headRefName at all
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       computeConflictDisposition: () => null,
@@ -2961,7 +2966,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     const listPrs = () => [{
       number: 2578, mergeable: 'CONFLICTING', baseRefName: 'lane/3681-ratify-daemon-lifecycle', labels: [],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       attemptMechanicalRebase: () => { rebaseCalls += 1; return { action: 'rebased' }; },
     });
@@ -2996,7 +3001,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       number: 2709, mergeable: 'MERGEABLE', baseRefName: 'lane/2708-queue-cap-fast-lane',
       headRefName: 'lane/2709-fix-4138', labels: L('checking'),
     };
-    const sweep = (extra = {}) => watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const sweep = (extra = {}) => watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs: () => [{ ...pr }], provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       ...extra,
@@ -3038,7 +3043,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     it('posts NO attempt marker on a clean success — the common healthy path stays exactly as quiet as before this fix', () => {
       const provider = fakeProvider();
       const listPrs = () => [{ number: 2709, mergeable: 'CONFLICTING', headRefName: 'lane/2709-fix', labels: L('checking') }];
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
         computeConflictDisposition: () => 'clean',
         attemptMechanicalRebase: () => ({ action: 'rebased', newCommit: 'deadbeef' }),
@@ -3051,7 +3056,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     it('a `skip`/`error` outcome posts the durable attempt marker BEFORE falling through to the ordinary bounce', () => {
       const provider = fakeProvider();
       const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
         postFinding: () => {},
         computeConflictDisposition: () => 'manifest-only',
@@ -3066,7 +3071,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     it('a THROW from attemptMechanicalRebase (a stale lock, a corrupted ref) is caught and treated as `action:\'error\'` — no longer escapes the whole per-PR handler', () => {
       const provider = fakeProvider();
       const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
         postFinding: () => {},
         computeConflictDisposition: () => 'clean',
@@ -3087,7 +3092,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       }));
       const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
       let rebaseCalls = 0;
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
         postFinding: () => {},
         computeConflictDisposition: () => 'clean',
@@ -3109,7 +3114,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
       const routed = [];
       let rebaseCalls = 0;
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
         postFinding: (o) => routed.push(['finding', o.pr.number]),
         computeConflictDisposition: () => 'clean',
@@ -3148,7 +3153,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
         { body: buildNoteComment(note), author: { login: 'web-everything' } },
       ];
       const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
-      const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
         postFinding: () => {},
         computeConflictDisposition: () => 'clean',
@@ -3184,7 +3189,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       const outcomes = [];
       for (let sweep = 1; sweep <= 4; sweep += 1) {
         const attemptsBeforeThisSweep = countUnownedRebaseAttempts(thread);
-        const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+        const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
           repo: 'web-everything/web-everything', listPrs: () => [pr2709], provider,
           postFinding: (o) => routed.push(o.pr.number),
           computeConflictDisposition: () => 'manifest-only', // real shape: the shared .lane-manifest.json collision
@@ -3245,7 +3250,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
     // UNCHANGED `recheckCandidate` path instead — a Y-shaped control, not a revert), the PR is silently skipped
     // whenever there is no watcher stand-down marker to re-examine (`findWatcherStandDownComment` finds none).
     const provider = fakeProvider();
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'web-everything/web-everything', listPrs: () => [{ ...PR_2793, labels: L('review:human', 'merge-status:conflicting') }],
       provider, listPrComments: () => [], postFinding: () => {},
     });
@@ -3255,7 +3260,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
   it('GREEN — #2793\'s real shape (review:pending, idle, 0 conflict-fix rounds spent) is re-routed to reconcile-finding', () => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider,
       postFinding: (o) => routed.push(o.pr.number), listPrComments: () => [],
     });
@@ -3275,7 +3280,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
   ])('an unreadable comment thread (listPrComments %s) posts nothing — it cannot hide a spent round cap', (_name, listPrComments) => {
     const provider = fakeProvider();
     const routed = [];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider,
       postFinding: (o) => routed.push(o.pr.number), listPrComments,
     });
@@ -3287,7 +3292,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
   it('a PR still carrying a LIVE `review:changes` bounce is left alone — a fix cycle may genuinely be in flight', () => {
     const provider = fakeProvider();
     const postFinding = vi.fn();
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'web-everything/web-everything',
       listPrs: () => [{ ...PR_2793, labels: L('review:changes', 'merge-status:conflicting') }],
       provider, postFinding, listPrComments: () => [],
@@ -3303,7 +3308,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
       body: buildConflictFindingBody({ num: 2793, headRefName: PR_2793.headRefName }),
       createdAt: '2026-09-27T05:00:00Z', author: { login: 'web-everything' },
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider, postFinding,
       listPrComments: () => alreadyReasserted, now: Date.parse('2026-09-27T05:10:00Z'),
     });
@@ -3318,7 +3323,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
       { body: buildConflictFindingBody({ num: 2793, headRefName: PR_2793.headRefName }), createdAt: '2026-09-27T02:00:00Z', author: { login: 'web-everything' } },
       { body: `${CONFLICT_FIX_COMMENT_MARKER}\n\nround 2`, createdAt: '2026-09-27T04:00:00Z', author: { login: 'web-everything' } },
     ];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider, postFinding,
       listPrComments: () => thread, now: Date.parse('2026-09-27T05:50:00Z'),
     });
@@ -3336,7 +3341,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
     const atCap = Array.from({ length: CONFLICT_FIX_ROUND_CAP }, (_, i) => ({
       body: `${CONFLICT_FIX_COMMENT_MARKER}\n\nround ${i + 1}`, createdAt: `2026-09-27T0${i + 1}:00:00Z`, author: { login: 'web-everything' },
     }));
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider, postFinding,
       listPrComments: () => atCap, now: Date.parse('2026-09-27T05:50:00Z'),
     });
@@ -3385,7 +3390,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
       number: 2505, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }],
       files: [{ path: 'docs/agent/platform-decisions.md' }],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number, o.appendOnlyStatute]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3421,7 +3426,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
       number: 2506, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }],
       files: [{ path: 'docs/agent/platform-decisions.md' }, { path: 'docs/agent/some-other-statute.md' }],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3444,7 +3449,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
         { path: 'scripts/lib/review-policy.contract.json' },
       ],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3464,7 +3469,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
       number: 2508, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }],
       files: [{ path: 'docs/agent/platform-decisions.md' }],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3481,7 +3486,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
       number: 2505, mergeable: 'CONFLICTING', labels: [{ name: 'review:accepted' }],
       files: [{ path: 'docs/agent/platform-decisions.md' }],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3526,7 +3531,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
   it('an ordinary non-statute conflict never pays for a patch fetch (listPrPatches uncalled)', () => {
     let called = false;
     const listPrs = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }] }];
-    watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(),
       postFinding: () => {}, postStandDown: () => {},
       listPrPatches: () => { called = true; return {}; },
@@ -3590,7 +3595,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(),
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3608,7 +3613,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(),
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3670,7 +3675,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2768, mergeable: 'CONFLICTING', labels: L('review:pending'), files: mixedFiles(),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: () => routed.push(['stand-down']),
@@ -3688,7 +3693,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2549, mergeable: 'CONFLICTING', labels: L('review:human', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: () => routed.push(['stand-down']),
@@ -3708,7 +3713,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(),
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3810,7 +3815,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
       { body: buildSupersedeStandDownComment({ number: 2772 }), createdAt: '2026-09-27T02:00:00Z', viewerDidAuthor: true, author: { login: 'web-everything' } },
     ];
     const routed = [];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n',
       listPrs: () => [{ number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL) }],
       provider: fakeProvider(),
@@ -3828,7 +3833,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
 
   it('recheckCandidate: a failed supersede is not reported as superseded', () => {
     const priorStandDown = { body: buildStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } };
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n',
       listPrs: () => [{ number: 2549, mergeable: 'CONFLICTING', labels: L('review:human', CONFLICT_LABEL) }],
       provider: fakeProvider(),
@@ -3845,7 +3850,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
 
 it('skips a deferred discovery pass without posting a finding', () => {
   const postFinding = vi.fn();
-  expect(watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+  expect(watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
     listPrs: () => ({ outcome: 'deferred-low-budget', deferred: true }), postFinding,
   })).toEqual([]);
   expect(postFinding).not.toHaveBeenCalled();

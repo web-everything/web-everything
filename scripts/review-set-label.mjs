@@ -1166,6 +1166,10 @@ export function runReviewLabelCli({
   // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
+  appendVerdict: appendVerdictFn = appendVerdict,
+  beforeWrite = () => {},
+  afterWrite = () => {},
+  throwOnRefusal = false,
   closeConfirmRuns = closeConfirmRunsAfterClearance,
   // The fix daemon's wake signal after a `review:changes` write; injected by tests so no run touches a real mailbox.
   signalFix = signalFixDispatch,
@@ -1176,7 +1180,11 @@ export function runReviewLabelCli({
   // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
   // module-level one stays for the CLI bootstrap below, which owns fd 1 for real.
-  const fail = (message, code = 2) => { emit(`${JSON.stringify({ error: message })}\n`); process.exit(code); };
+  const fail = (message, code = 2) => {
+    emit(`${JSON.stringify({ error: message })}\n`);
+    if (throwOnRefusal) throw new Error(message);
+    process.exit(code);
+  };
   let repo = (argv.find((a) => a.startsWith('--repo=')) || '').slice('--repo='.length);
   const actorArg = (argv.find((a) => a.startsWith('--actor=')) || '').slice('--actor='.length);
   const actor = actorArg || defaultActor;
@@ -1236,7 +1244,7 @@ export function runReviewLabelCli({
   }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedChanges && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm, pinned changes or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
@@ -2038,11 +2046,20 @@ export function runReviewLabelCli({
   };
   recheckMissingRearm();
 
+  const guardWrite = step => {
+    beforeWrite(step);
+    if (pinnedChanges) {
+      let live;
+      try { live = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
+      if (live?.headRefOid !== expectedHead) fail('live head differs from --expect-head; write refused', 1);
+    }
+  };
   const ledgerVerdict = verdictForLabelTarget(to);
+  guardWrite('ledger');
   let clearingLedgerMiss = false;
   let clearingLedgerError;
   try {
-    const appended = appendVerdict(buildVerdictRecord({
+    const appended = appendVerdictFn(buildVerdictRecord({
       repo,
       pr: Number(pr),
       verdict: ledgerVerdict,
@@ -2062,6 +2079,7 @@ export function runReviewLabelCli({
       independence: independence ? independence.status : null,
       source: 'review-set-label',
     }));
+    if (appended.ok) afterWrite('ledger');
     if (!appended.ok) {
       process.stderr.write(`review-set-label: verdict-ledger append REFUSED (#3007 shadow) — ${appended.errors.join('; ')}\n`);
       // F4 (`#verdict-ledger-pr-state-store` rule 4): a CLEARING verdict whose git write missed does NOT clear.
@@ -2136,8 +2154,10 @@ export function runReviewLabelCli({
         preSwapLabels = fresh.labels.map(l => typeof l === 'string' ? l : l.name);
       }
     }
+    guardWrite('label');
     try {
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
+      afterWrite('label');
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);
     }
@@ -2163,9 +2183,11 @@ export function runReviewLabelCli({
       } else {
         try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
       }
+      guardWrite('comment');
       try {
         restampedAt = Date.now();
         provider.postComment(repo, pr, commentBody);
+        afterWrite('comment');
         return;
       } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
       if (pinnedPlainRearm && attempt < 2) rearmRetrySleep(1000);
@@ -2392,6 +2414,8 @@ export function runReviewLabelCli({
 
   emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision, labels: newLabels }),
     ...(gateRefresh ? { gateRefresh } : {}) })}\n`);
+  // The conflict-watch transport runs this harness in process.
+  if (throwOnRefusal) return;
   process.exit(0);
 }
 

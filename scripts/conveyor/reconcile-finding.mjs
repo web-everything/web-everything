@@ -128,6 +128,8 @@ export function runReconcileFindingCli({
   provider = undefined,
   locateBodyFile = checkBodyFileLocation,
   roots = bodyFileRoots(),
+  beforeWrite,
+  writerOptions = {},
 } = {}) {
   const fail = (message, code = 2) => { emit(`${JSON.stringify({ error: message })}\n`); process.exit(code); };
   const usage = 'usage: reconcile-finding.mjs <pr> --body-file=<path to the finding write-up> '
@@ -167,6 +169,8 @@ export function runReconcileFindingCli({
   const verdictBody = buildReconcileFindingBody(raw);
 
   runReviewLabelCli({
+    ...writerOptions,
+    beforeWrite,
     argv,
     emit,
     // `provider` is passed through only when the caller supplied one — omitting the key lets
