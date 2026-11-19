@@ -1,7 +1,7 @@
 /** Refused R1075 candidates never need a forced-build rollback: withdraw through guarded retirement. */
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { retireRegistration } from '../daemon-overlay.mjs';
+import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
 import { defaultRetirePlanner } from './prototype-retire.mjs';
 
 const run = (cmd, args, cwd, env) => {
@@ -24,13 +24,35 @@ export async function rollbackDegradedLoad({ root, ref, sha, fastPath, reason, e
     const entry = state.overlays.find(r => r.ref === ref);
     if (!entry) rollback = { retired: true, absent: true };
     else {
-      // Same protections as the ordinary retirement planner (pinned closed PRs, edge resolution, merged/superseded proof).
-      // Unproven retirement keeps the overlay: the load stays registered, is refused, and NEEDS-YOU is raised.
+      // Failed unmerged work is withdrawn, not declared merged. All other keep
+      // decisions, pinned entries and approved edge resolutions remain protected.
       const plan = await planner({ rows: [entry], proofRows: state.overlays, git: gitArgs, gh: ghArgs });
-      const decision = Array.isArray(plan) ? plan.find(d => d?.ref === ref && d.action === 'retire' && /^[a-f0-9]{40}$/.test(d.tip ?? '')) : null;
+      const mayWithdraw = (d, row) => d?.action === 'keep'
+        && ['unique-commits-not-on-main', 'pr-open'].includes(d.reason) && !row.pinned && !row.edgeResolution;
+      const select = (decisions, row) => Array.isArray(decisions) ? decisions.find(d => d?.ref === ref
+        && d.tip === sha && /^[a-f0-9]{40}$/.test(sha ?? '')
+        && (d.action === 'retire' || mayWithdraw(d, row))) : null;
+      const decision = select(plan, entry);
       rollback = decision
-        ? await retire({ root, ref, expectedTip: decision.tip, expectedEntry: entry, by: 'prototype-load.degraded-fast-path', env,
-          deps: { ...(tip ? { tip } : {}), ...(prove ? { prove } : {}) } })
+        ? await retire({ root, ref, expectedTip: sha, expectedEntry: entry, by: 'prototype-load.degraded-fast-path', env,
+          deps: {
+            tip: tip ?? (r => {
+              const current = gitArgs(['ls-remote', 'origin', `refs/heads/${r}`]);
+              if (current.code !== 0) throw new Error('unreadable remote tip');
+              return current.stdout.trim().split(/\s+/)[0];
+            }),
+            prove: prove ?? (current => {
+              // Re-prove under retireRegistration's add guard, including uncached
+              // stack ancestry. Its identity and pre/post-drop tip checks still apply.
+              const registry = readOverlayState(root, { env });
+              if (registry.corrupt) return { action: 'keep', reason: 'registry-unreadable' };
+              const fresh = select(planner({ rows: [current], proofRows: registry.overlays, git: gitArgs, gh: ghArgs }), current);
+              if (!fresh) return { action: 'keep', reason: 'retirement-unproved' };
+              if (fresh.action === 'retire') return fresh;
+              return proveOverlayWithdrawal({ root, ref, tip: sha, reason: 'degraded-smoke-failed', env,
+                git: (...args) => gitArgs(args) });
+            }),
+          } })
         : { retired: false, refused: 'retirement-unproved', kept: true };
     }
   } catch (e) { rollback = { retired: false, refused: String(e.message || e) }; }

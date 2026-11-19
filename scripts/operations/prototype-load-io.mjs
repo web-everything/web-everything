@@ -351,6 +351,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     let stage = 'bad-input';
     let pendingAdoption = null;
     let degradedEventWritten = false;
+    let degradedRegistrationPresent = false;
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
     // Once the replacement is registered, failures name the retained contained registrations.
     const keptNote = () => {
@@ -488,15 +489,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
+      // Assess eligibility here; select the fallback only after ordinary CI admission is known.
       // Only this log read can enable R1075; extra caller fields have no authority.
+      let degradedEvidence;
       if (!input.urgent && config.degradedFastPath.enabled && !settingErrors.length && !platform.errors.length) {
         let events;
         try { events = fs.readFileSync(daemonEventsPath({ env, home: env.HOME }), 'utf8'); } catch { /* no evidence */ }
         const assessment = assessDegraded({ events, daemon: input.daemon, clone: out.clone,
           now: now(), afterMinutes: config.degradedFastPath.degradedAfterMinutes });
         if (assessment.degraded) {
-          out.degradedFastPath = { ...assessment.evidence, branch: input.branch, sha: input.sha, daemon: input.daemon, marker: null };
-          input = { ...input, urgent: true, reason: `Daemon degraded for ${assessment.evidence.ageMinutes} minutes: ${assessment.evidence.signals.map(s => `${s.kind}@${s.at}`).join(', ')}` };
+          degradedEvidence = { ...assessment.evidence, branch: input.branch, sha: input.sha, daemon: input.daemon, marker: null };
         }
       }
       stage = 'no-ready';
@@ -507,7 +509,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an
       // earlier load of different code must not strand the branch: the check-run path below writes fresh readiness.
       const hasReady = readyRecordSpeaksFor(readyRecords, input, readyFp);
-      if (!out.gate && (hasReady || out.degradedFastPath)) {
+      if (!out.gate && hasReady) {
         const mismatch = diagnoseWaiverMismatch(readyRecords, input, config.ruledWeakened);
         if (mismatch) return stop('no-ready', { detail: 'waiver-mismatch', mismatch: { field: mismatch.field, record: mismatch.record, waiver: mismatch.waiver }, fallback: `Fix-ready record exists but no ruledWeakened waiver matches exactly: ${mismatch.message}. Make the waiver's ref, sha and ruling equal the record's.` });
         return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Fix the latest readiness evidence; arguments are labels only.' });
@@ -521,12 +523,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return ancestor(base, 'origin/main');
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
-      // Degraded fast-path admission never carries an older head's audit across a matching net-diff fingerprint: it needs
-      // the canonical audit of this exact candidate sha, or it refuses (no fingerprint means no carry).
-      out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, out.degradedFastPath ? null : liveFp,
+      out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
         { ruledWeakened: out.gate }) };
-      if (out.degradedFastPath && out.gate?.ruledWeakened?.findings.some(f => /\b(?:security|B[- ]class|R37)\b|(?:^|\s)\[B\]/i.test(f)))
-        return stop('no-canonical-audit', { detail: 'security-finding', fallback: 'Fix the security finding and obtain an exact-SHA canonical audit before retrying.' });
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
@@ -554,10 +552,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (result.code !== 0) return null;
         const data = JSON.parse(result.stdout);
         // Any observed exact-SHA failure vetoes urgent loading, independently of suite selection or binding.
-        urgentCiFailed = input.urgent && Array.isArray(data?.check_runs) && data.check_runs.some(r =>
+        urgentCiFailed = Array.isArray(data?.check_runs) && data.check_runs.some(r =>
           r?.head_sha === sha && r.status === 'completed'
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(r.conclusion));
-        if (urgentCiFailed) return null;
+        if (input.urgent && urgentCiFailed) return null;
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
         if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
           || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count
@@ -577,7 +575,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           || runsData.workflow_runs.some(r => !r || !Number.isSafeInteger(r.check_suite_id) || !validSha(r.head_sha) || typeof r.path !== 'string'))
           throw new Error('malformed, incomplete or oversized CI workflows');
         const bound = testWorkflowBound(evidence, runsData, sha, config.testWorkflowPath);
-        if (input.urgent && !bound) throw new Error('unbound CI workflow');
+        if ((input.urgent || degradedEvidence) && !bound) throw new Error('unbound CI workflow');
         return bound ? evidence : null;
       });
       if (input.urgent && !urgentReason(input.reason)) return stop('no-ready', { detail: 'no-urgent-marker', fallback: 'Supply --reason with at least 10 characters after trimming, or wait for passing CI.' });
@@ -585,13 +583,28 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
       catch (e) { return stop('no-ready', { detail: 'ci-evidence-unreadable', error: String(e.message || e),
         fallback: 'Repair the CI evidence reader or wait for complete, readable CI evidence (at most 100 checks and workflow runs), then retry.' }); }
-      if (urgentCiFailed || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
+      const passingTest = checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.appId === TEST_CHECK_APP_ID
+        && checkRun.status === 'completed' && checkRun.conclusion === 'success';
+      if (!passingTest && degradedEvidence) {
+        out.degradedFastPath = degradedEvidence;
+        input = { ...input, urgent: true, reason: `Daemon degraded for ${degradedEvidence.ageMinutes} minutes: ${degradedEvidence.signals.map(s => `${s.kind}@${s.at}`).join(', ')}` };
+        if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Record green scoped fix-ready evidence before using degraded admission.' });
+        // No carried audit or textual waiver classification may substitute for exact-SHA proof.
+        out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, null, { ruledWeakened: out.gate }) };
+        // Audit findings currently have no structured security class. Unknown classification
+        // cannot establish that a waived finding is safe for the CI fallback.
+        if (out.gate.ruledWeakened) return stop('no-canonical-audit', { detail: 'security-finding',
+          fallback: 'Obtain a NOT WEAKENED exact-SHA audit or wait for passing CI; unclassified findings cannot waive the degraded gate.' });
+        if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
+          fallback: 'Obtain a NOT WEAKENED canonical audit on this exact SHA before retrying degraded admission.' });
+      }
+      if ((input.urgent && urgentCiFailed) || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
         return stop('no-ready', { detail: 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
       if (input.urgent && checkRun != null && !(checkRun.sha === input.sha && checkRun.name === 'test'
         && (['queued', 'in_progress'].includes(checkRun.status)
           || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
-      if (out.degradedFastPath || checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
+      if (!passingTest) {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
         let ledger, shards, expectedSteps, origin;
         try {
@@ -822,9 +835,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // Persist intent before any registration mutation; failure refuses admission.
         appendUrgent(urgentIntent);
         if (out.degradedFastPath) {
-          degradedEventWritten = await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path', daemon: input.daemon,
+          const intentRecorded = await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path-attempted', daemon: input.daemon,
             detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
-          if (!degradedEventWritten) throw new Error('degraded event log unwritable; repair logging and retry');
+          if (!intentRecorded) throw new Error('degraded event log unwritable; repair logging and retry');
         }
       }
       if (out.degradedFastPath) {
@@ -868,10 +881,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             const state = await readState(out.clone, { env: childEnv });
             absent = state?.corrupt === false && Array.isArray(state.overlays)
               && state.overlays.every(e => safeRegistrationRef(e?.ref) && e.ref !== out.effectiveRef);
+            degradedRegistrationPresent = Boolean(out.degradedFastPath) && state?.corrupt === false
+              && Array.isArray(state.overlays) && state.overlays.every(e => safeRegistrationRef(e?.ref))
+              && state.overlays.some(e => e.ref === out.effectiveRef);
           } catch { /* Unknown state keeps the persisted urgent intent monitored. */ }
           if (absent) appendUrgent({ ...urgentIntent,
             type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
         }
+      }
+      if (out.degradedFastPath && out.registered) {
+        degradedEventWritten = await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path', daemon: input.daemon,
+          detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
+        if (!degradedEventWritten) throw new Error('degraded admission event unwritable; inspect tracking and retry');
       }
       const readyPath = expand(config.readyRecordPath);
       fs.mkdirSync(dirname(readyPath), { recursive: true });
@@ -977,7 +998,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out;
     } catch (e) { return stop(stage, { error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
     finally {
-      if (out.degradedFastPath && !input.dryRun && !degradedEventWritten) {
+      if (out.degradedFastPath && (out.registered || degradedRegistrationPresent) && !input.dryRun && !degradedEventWritten) {
         await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path', daemon: out.daemon,
           detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
       }
@@ -992,7 +1013,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // refused/unverifiable loads or a load already adopted during its wait to emit misleading notices.
       // A degraded load that failed after registration and ran no rollback keeps its pending-adoption tracking, so the
       // asynchronous smoke-failure rollback can still find it; only a finished rollback or an adopted load clears it.
-      const keepDegradedTracking = Boolean(out.degradedFastPath) && !out.ok && !out.rollback;
+      const keepDegradedTracking = Boolean(out.degradedFastPath) && Boolean(out.registered || degradedRegistrationPresent) && !out.ok && !out.rollback;
       if (out.adoptionEventTracked && !keepDegradedTracking && (!out.rollback || (out.rollback.retired === true && out.rollback.eventRecorded)) && (out.result !== 'registered-pending' || !out.ok)) {
         clearPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       }

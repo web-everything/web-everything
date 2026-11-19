@@ -3399,10 +3399,59 @@ describe('R1075 degraded daemon admission', () => {
     expect(f.readyWrites.at(-1).testCheck.reason).not.toContain('caller');
     expect(f.records).toContainEqual(expect.objectContaining({ kind: 'prototype-load.degraded-fast-path', daemon: 'control', detail: expect.objectContaining({ branch: BASE.branch, sha: SHA, marker }) }));
   });
-  it('requires a receipt even with green CI', async () => {
+  it('preserves ordinary green-CI admission without a receipt', async () => {
     const f = degraded({ urgentLedger: undefined, testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
-    expect(await f.run()).toMatchObject({ ok: false, detail: 'no-urgent-marker', registered: false });
-    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path-failed')).toBe(true);
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+  });
+  it.each(['missing readiness', 'carried audit'])('preserves normal green-CI admission with %s', async kind => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ urgentLedger: undefined,
+      ...(kind === 'missing readiness' ? { ready: '' } : {
+        audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint })]), fingerprint: () => fingerprint,
+      }),
+      testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+  });
+  it.each(['green', 'absent', 'red'])('degradation never makes %s CI admission stricter', async state => {
+    const testCheck = async () => state === 'absent' ? null : ({ sha: SHA, name: 'test', status: 'completed',
+      conclusion: state === 'green' ? 'success' : 'failure', appId: prototypeLoad.TEST_CHECK_APP_ID });
+    const healthy = await degraded({ daemonEvents: '', testCheck, urgentLedger: undefined }).run();
+    const stuck = await degraded({ testCheck, urgentLedger: undefined }).run();
+    if (healthy.ok) expect(stuck.ok).toBe(true);
+    else expect(stuck.ok).toBe(false);
+    if (state === 'green') expect(stuck.degradedFastPath).toBeUndefined();
+  });
+  it.each(['green', 'absent', 'red'])('receipt-backed degraded admission supplements the healthy path with %s CI', async state => {
+    const testCheck = async () => state === 'absent' ? null : ({ sha: SHA, name: 'test', status: 'completed',
+      conclusion: state === 'green' ? 'success' : 'failure', appId: prototypeLoad.TEST_CHECK_APP_ID });
+    const healthy = await degraded({ daemonEvents: '', testCheck }).run();
+    const stuck = await degraded({ testCheck }).run();
+    expect(healthy.ok).toBe(state === 'green');
+    expect(stuck.ok).toBe(state !== 'red');
+  });
+  it('preserves ordinary merging onto main when degraded CI is green', async () => {
+    const f = degraded({ behind: true, urgentLedger: undefined,
+      testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, effectiveSha: MERGE });
+  });
+  it('clears pending tracking when registration fails', async () => {
+    const f = degraded({ addFails: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'register-failed' });
+    expect([...f.pendingFiles.values()]).toHaveLength(0);
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
+  it('retains tracking when the failed add actually persisted the registration', async () => {
+    const f = degraded({ addFails: true, persistBeforeAddFailure: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'register-failed' });
+    expect([...f.pendingFiles.values()]).toHaveLength(1);
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(true);
+  });
+  it('records no admitted fast-path event on early refusal', async () => {
+    const f = degraded({ ready: '' });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false });
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
   });
   it('requires an existing green scoped fix-ready record', async () => {
     expect(await degraded({ ready: '' }).run()).toMatchObject({ ok: false, detail: 'no-fix-ready-record' });
@@ -3428,12 +3477,14 @@ describe('R1075 degraded daemon admission', () => {
     expect(platform.settings.sources['degradedFastPath.enabled']).toBe('platform');
     expect(platform.degradedFastPath).toBeUndefined();
   });
-  it('permits non-security WEAKENED only with matching ruled disclosure', async () => {
+  it('preserves ruled WEAKENED on green CI but refuses unclassified findings on the fast path', async () => {
     const findings = ['scripts/tool.mjs:1 intentional scope relaxation'];
     const ready = JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R1075', auditDisclosed: findings });
     const audits = auditLines([auditRecord({ base: 'e'.repeat(40), verdict: 'WEAKENED', findings })]);
     expect(await degraded({ ready, audits }).run()).toMatchObject({ ok: false, stopReason: 'no-ready' });
-    expect(await degraded({ ready, audits, settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] } }).run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    const options = { ready, audits, settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] } };
+    expect(await degraded(options).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'security-finding' });
+    expect(await degraded({ ...options, testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) }).run()).toMatchObject({ ok: true });
   });
   it('keeps fingerprint matching: a newer WEAKENED on the same fingerprint still blocks', async () => {
     const fingerprint = 'a'.repeat(64);
@@ -3446,8 +3497,8 @@ describe('R1075 degraded daemon admission', () => {
     const f = degraded({ daemonEvents: 'truncated jsonl' });
     expect(await f.run({ evidence: { signals: [signal], ageMinutes: 120 } })).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
   });
-  it('security findings cannot be waived on this path', async () => {
-    const findings = ['scripts/tool.mjs:1 B-class security reachable today (R37)'];
+  it.each(['security', 'B-class', 'B class', 'R37', '[B]', 'insecure temp file', 'arbitrary code execution', 'unclassified relaxation'])('findings cannot be waived on this path: %s', async text => {
+    const findings = [`scripts/tool.mjs:1 ${text}`];
     const f = degraded({ ready: JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R1075', auditDisclosed: findings }),
       settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] },
       audits: auditLines([auditRecord({ base: 'e'.repeat(40), verdict: 'WEAKENED', findings })]) });
