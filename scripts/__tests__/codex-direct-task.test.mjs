@@ -148,8 +148,13 @@ describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mod
     expect(flagValue(argv, '-s')).toBe('workspace-write');
     expect(flagValue(argv, '-C')).toBe('/tmp/scratch');
     expect(argv).toContain('--skip-git-repo-check');
-    // No positional prompt anywhere in argv — the task rides stdin (avoids the #3371-probe-0 stdin trap).
-    expect(argv.some((a) => a.includes('Add') || a.includes('task'))).toBe(false);
+    // Every token is an option or its value; paths/config can legitimately contain the word "task".
+    // A positional prompt must fail regardless of its wording (#3371-probe-0 stdin trap).
+    for (let i = 1; i < argv.length; i++) {
+      if (['--json', '--skip-git-repo-check'].includes(argv[i])) continue;
+      expect(['-s', '-C', '-m', '-c']).toContain(argv[i]);
+      expect(typeof argv[++i]).toBe('string');
+    }
   });
 
   it('requires a non-empty cwd', () => {
@@ -1433,10 +1438,13 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const { fn: spawnFn } = fakeSpawn('{"type":"turn.completed","usage":{}}\n');
       const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
       const loadTranscriptCheck = vi.fn(async () => { throw new Error('checker dependency missing'); });
+      const env = { ...process.env };
+      delete env.WE_CODEX_TRANSCRIPT_CHECK_MODE;
+      if (configuredMode !== undefined) env.WE_CODEX_TRANSCRIPT_CHECK_MODE = configuredMode;
       try {
         const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', selfReview: false,
           stream: false, execFn, spawnFn, log: vi.fn(), loadTranscriptCheck,
-          env: { ...process.env, WE_CODEX_TRANSCRIPT_CHECK_MODE: configuredMode } });
+          env });
         expect(loadTranscriptCheck).toHaveBeenCalledOnce();
         expect(report.exitCode).toBe(0);
         expect(report.transcriptCheck).toEqual({ mode, error: 'checker dependency missing' });

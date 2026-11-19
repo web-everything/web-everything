@@ -3565,6 +3565,15 @@ CLI preloads must also supply binary-lookup evidence. Never require an installed
 or add a CLI/env override for fixtures. Test lookup with explicit temporary directories
 through `findAgentBinary`; production retains its private fixed installation list.
 
+The launch environment registry classifies literal env reads under `scripts/` and
+`.claude/skills/`; the bounded rg drift test refuses incomplete inventories. Classify
+new names before forwarding them. `inheritEnv` is snapshotted plain string data:
+unknown/drop names stay out, and omitted restrictive identities/isolation markers
+survive from the ambient environment. A value that can relax a guard belongs in
+`drop` even if another value tightens it. Keep locale forwarding exact so an unknown
+`LC_*_OPTIONS` name cannot pass a broad family rule. The launch tripwire pins counts
+per approved file; adding a site to an already approved file must fail too.
+
 Every new bypass-widening condition needs one negative test per conjunct. Security
 checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
 and other system evidence so hermetic tests exercise the production checks.

@@ -21,7 +21,7 @@ function literalLaunches(source) {
   return found;
 }
 function offenders() {
-  const found = [];
+  const found = {};
   function scan(path, ancestors = new Set()) {
     const real = realpathSync(path);
     if (ancestors.has(real)) throw Error(`cyclic source directory: ${path}`);
@@ -30,17 +30,24 @@ function offenders() {
       for (const entry of readdirSync(path)) {
         if (!['__tests__', 'tests', 'fixtures', 'node_modules', '.git'].includes(entry)) scan(join(path, entry), next);
       }
-    } else if (path.endsWith('.mjs') && !/\.(?:test|spec)\.mjs$/.test(path) && literalLaunches(readFileSync(path, 'utf8')).length) {
-      found.push(relative(root, path));
+    } else if (path.endsWith('.mjs') && !/\.(?:test|spec)\.mjs$/.test(path)) {
+      const count = literalLaunches(readFileSync(path, 'utf8')).length;
+      if (count) found[relative(root, path)] = count;
     }
   }
   for (const dir of ['scripts', '.claude/skills']) scan(join(root, dir));
-  return found.sort();
+  return found;
+}
+function overPin(counts, pins) {
+  for (const [file, pin] of Object.entries(pins)) {
+    if (!Number.isSafeInteger(pin) || pin < 0) throw Error(`invalid launch pin for ${file}`);
+  }
+  return Object.entries(counts).filter(([file, count]) => count > (Object.hasOwn(pins, file) ? pins[file] : 0));
 }
 describe('literal agent process call tripwire', () => {
-  it('rejects every new offender outside the explicit S1 baseline', () => {
+  it('rejects unlisted files and count increases within the explicit S1 baseline', () => {
     const allowed = JSON.parse(readFileSync(join(root, 'scripts/lib/agent-launch-approved.json'), 'utf8'));
-    expect(offenders().filter(path => !allowed.includes(path))).toEqual([]);
+    expect(overPin(offenders(), allowed)).toEqual([]);
   });
   it('recognizes all literal process primitives, strings with commands and namespace calls', () => {
     for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork', 'spawnFn']) {
@@ -48,7 +55,17 @@ describe('literal agent process call tripwire', () => {
     }
     expect(literalLaunches('spawn(`claude`, []);')).toHaveLength(1);
     expect(literalLaunches("spawn('git', []); log('claude'); spawn(agent, []); // exec('codex')")).toEqual([]);
-    const allowed = ['old.mjs'];
-    expect(['old.mjs', 'new.mjs'].filter(path => !allowed.includes(path))).toEqual(['new.mjs']);
+  });
+  it('rejects one extra launch in an approved file, while preserving the existing site', () => {
+    const existing = "spawn('claude', []);";
+    const pins = { 'approved.mjs': 1 };
+    const scan = source => ({ 'approved.mjs': literalLaunches(source).length });
+    expect(overPin(scan(existing), pins)).toEqual([]);
+    expect(overPin(scan(`${existing}\nexecFile('codex', []);`), pins)).toEqual([['approved.mjs', 2]]);
+    expect(overPin({ 'new.mjs': 1 }, pins)).toEqual([['new.mjs', 1]]);
+    expect(overPin({ 'approved.mjs': 0 }, pins)).toEqual([]);
+  });
+  it('fails closed on a malformed pin rather than exempting its file', () => {
+    for (const pin of [null, '1', -1, 1.5]) expect(() => overPin({ 'old.mjs': 1 }, { 'old.mjs': pin })).toThrow(/invalid launch pin/);
   });
 });

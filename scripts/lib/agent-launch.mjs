@@ -3,23 +3,20 @@
  * PR #7022's fourteen attack classes (shell/env/other wrappers, raw options, option
  * smuggling, expanded ids, accessors, Proxies, argv0, execPath/execArgv, runtime
  * env, shell env, HOME, mutation/aliasing) shared one root: inspected and executed
- * views differed. No caller argv, env, binary, or spawn options cross this boundary.
+ * views differed. No caller argv, unclassified env, binary, or spawn options cross this boundary.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
  */
 import { spawn } from 'node:child_process';
-import { accessSync, constants, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { types } from 'node:util';
+import { fileURLToPath } from 'node:url';
 
 const FIXED_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
-const ENV_KEYS = ['USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR'];
-// Test-isolation markers only NARROW what the child's tooling may touch (under-test.cjs, guardedPoolRoot), so a
-// sandboxed parent keeps its sandbox. The widening escape hatch WE_ALLOW_REAL_LANE_POOL_IN_TESTS is never passed.
-const ISOLATION_KEYS = ['VITEST', 'WE_UNDER_TEST'];
-const ISOLATION_ROOTS = ['LANE_POOL_ROOT'];
+const ENV_REGISTRY = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'agent-launch-env-registry.json'), 'utf8'));
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot', 'lanePoolRoot', 'underTest'];
+const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot', 'inheritEnv'];
 const CODEX = ['sandbox', 'outputSchemaFile', 'outputLastMessageFile', 'ephemeral', 'addDirs', 'model', 'config', 'resumeThreadId'];
 const CLAUDE = ['print', 'sessionId', 'resumeId', 'model', 'outputFormat', 'verbose', 'prompt'];
 const fail = reason => { throw new TypeError(`agent-launch: ${reason}`); };
@@ -77,6 +74,43 @@ function paths(value, name) {
   if (!Array.isArray(value)) fail(`${name} must be an array`);
   return value.map(p => absolute(p, name));
 }
+// Exact names take precedence over simple trailing-* prefixes. Unknown names fail closed.
+function envRule(key) {
+  if (Object.hasOwn(ENV_REGISTRY, key)) return ENV_REGISTRY[key];
+  return Object.entries(ENV_REGISTRY).find(([pattern]) => pattern.endsWith('*') && key.startsWith(pattern.slice(0, -1)))?.[1];
+}
+function envRecord(env) {
+  record(env, 'inheritEnv');
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== 'string' || value.includes('\0')) fail(`inheritEnv.${key} must be a NUL-free string`);
+  }
+}
+// A value-dependent var (registry `restrictiveValues`) is forward-restrictive only when it holds one of
+// its tightening values (e.g. WE_GH_AUTH_PERSONAL_FALLBACK=refuse); any other value is dropped.
+function classOf(rule, value) {
+  if (Array.isArray(rule?.restrictiveValues)) {
+    return rule.restrictiveValues.includes(String(value).trim().toLowerCase()) ? 'forward-restrictive' : 'drop';
+  }
+  return rule?.class;
+}
+function inheritedEnv(inherit, ambient) {
+  const out = Object.create(null);
+  for (const [key, value] of Object.entries(inherit)) {
+    const rule = envRule(key), cls = classOf(rule, value);
+    if (cls === 'forward' || cls === 'forward-restrictive') {
+      out[key] = rule.value === 'absolute-path' ? absolute(value, key) : value;
+    }
+  }
+  for (const [key, value] of Object.entries(ambient)) {
+    const rule = envRule(key);
+    if (classOf(rule, value) !== 'forward-restrictive') continue;
+    // A malformed ambient isolation root is a refusal, even if the bag supplies another root.
+    const checked = rule.value === 'absolute-path' ? absolute(value, key) : value;
+    // The bag cannot remove a restriction: a dropped (relaxing) bag value yields to the ambient tightening one.
+    if (!Object.hasOwn(out, key)) out[key] = checked;
+  }
+  return out;
+}
 function configValue(key, value) {
   switch (key) {
     case 'model_reasoning_effort': return choice(value, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], key);
@@ -98,8 +132,8 @@ function argsFrom(d) {
   choice(d.agent, ['claude', 'codex'], 'agent');
   for (const key of Object.keys(d)) if (![...COMMON, ...(d.agent === 'codex' ? CODEX : CLAUDE)].includes(key)) fail(`unknown field ${key}`);
   absolute(d.cwd, 'cwd'); flag(d.processGroup, 'processGroup');
-  for (const key of ['pathPrefix', 'tempRoot', 'lanePoolRoot']) if (d[key] !== undefined) absolute(d[key], key);
-  flag(d.underTest, 'underTest');
+  for (const key of ['pathPrefix', 'tempRoot']) if (d[key] !== undefined) absolute(d[key], key);
+  if (d.inheritEnv !== undefined) envRecord(d.inheritEnv);
   if (d.model !== undefined && (!/^[a-z0-9][a-z0-9._:/-]*$/i.test(text(d.model, 'model')) || /\s/.test(d.model))) fail('model must be a model name');
   const args = [];
   const option = (key, token, check = text) => { if (d[key] !== undefined) args.push(token, check(d[key], key)); };
@@ -157,16 +191,13 @@ export function buildAgentArgs(descriptor) { return argsFrom(snapshot(descriptor
 export function buildAgentInvocation(descriptor, io) {
   const d = snapshot(descriptor);
   const args = argsFrom(d);
+  // Copy trusted process.env before any IO seam can mutate it; it is not a plain record itself.
+  const ambient = snapshot({ ...process.env });
+  const forwarded = inheritedEnv(d.inheritEnv ?? ambient, ambient);
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }
   catch { fail('cwd must be an existing directory'); }
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
-  const env = { PATH: [d.pathPrefix, FIXED_PATH, dirname(file)].filter(Boolean).join(':'), HOME: userInfo().homedir };
-  for (const key of [...ENV_KEYS, ...ISOLATION_KEYS]) if (process.env[key] !== undefined) env[key] = process.env[key];
-  // Dropping a set-but-malformed isolation root would widen the child's reach, so refuse instead.
-  for (const key of ISOLATION_ROOTS) if (process.env[key] !== undefined) env[key] = absolute(process.env[key], key);
-  // The launching parent's own isolation (its env bag, not process.env) is explicit grammar and wins.
-  if (d.lanePoolRoot !== undefined) env.LANE_POOL_ROOT = d.lanePoolRoot;
-  if (d.underTest === true) env.WE_UNDER_TEST = '1';
+  const env = { ...forwarded, PATH: [d.pathPrefix, FIXED_PATH, dirname(file)].filter(Boolean).join(':'), HOME: userInfo().homedir };
   if (d.tempRoot !== undefined) for (const key of ['TMPDIR', 'TMP', 'TEMP']) env[key] = d.tempRoot;
   return { file, args, options: { shell: false, cwd: d.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: d.processGroup === true } };
 }

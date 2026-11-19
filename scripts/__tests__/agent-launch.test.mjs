@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { userInfo, tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { join, dirname, isAbsolute } from 'node:path';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync, readFileSync } from 'node:fs';
 import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary } from '../lib/agent-launch.mjs';
 import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
 
@@ -10,6 +11,7 @@ const cwd = process.cwd();
 const base = () => ({ agent: 'codex', cwd, model: 'gpt-5.6-sol', sandbox: 'workspace-write' });
 const claude = () => ({ agent: 'claude', cwd, print: true, sessionId: SID, prompt: 'hello' });
 const seam = () => ({ spawn: vi.fn(() => 'child'), resolveBinary: vi.fn(() => process.execPath) });
+const registry = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../lib/agent-launch-env-registry.json'), 'utf8'));
 function refused(descriptor, reason) {
   const io = seam();
   expect(() => launchAgent(descriptor, io)).toThrow(reason);
@@ -159,8 +161,9 @@ describe('built invocation positive controls', () => {
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledWith(process.execPath, expected, expect.objectContaining({ shell: false, detached: true, cwd, stdio: ['pipe', 'pipe', 'pipe'] }));
     expect(isAbsolute(io.spawn.mock.calls[0][0])).toBe(true);
-    expect(Object.keys(io.spawn.mock.calls[0][2].env).every(k => ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR',
-      'VITEST', 'WE_UNDER_TEST', 'LANE_POOL_ROOT'].includes(k))).toBe(true);
+    // This explicit env bag only supplies PATH (owned by the launcher), so only ambient restrictive names survive.
+    expect(Object.keys(io.spawn.mock.calls[0][2].env).every(k => ['PATH', 'HOME'].includes(k)
+      || registry[k]?.class === 'forward-restrictive')).toBe(true);
   });
   it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
     const tempRoot = '/task "quote" \\ $TMP';
@@ -230,6 +233,78 @@ describe('test-isolation markers survive the env allowlist (they only narrow)', 
   });
 });
 
+describe('three-class environment boundary', () => {
+  it('retains every restrictive ambient variable even when the caller bag omits them', () => {
+    const restrictive = Object.fromEntries(Object.entries(registry).filter(([, rule]) => rule.class === 'forward-restrictive')
+      .map(([key, rule]) => [key, rule.value === 'absolute-path' ? '/isolated/pool' : 'restrictive-identity']));
+    for (const [key, value] of Object.entries(restrictive)) vi.stubEnv(key, value);
+    expect(buildAgentInvocation({ ...base(), inheritEnv: {} }, seam()).options.env).toMatchObject(restrictive);
+  });
+  it('uses bag values when present, and does not inherit ambient neutral metadata for an explicit bag', () => {
+    vi.stubEnv('WE_GH_DAEMON_CALLER', 'host-daemon'); vi.stubEnv('USER', 'host-user');
+    const env = buildAgentInvocation({ ...base(), inheritEnv: { WE_GH_DAEMON_CALLER: 'bag-daemon', LC_MESSAGES: 'C' } }, seam()).options.env;
+    expect(env).toMatchObject({ WE_GH_DAEMON_CALLER: 'bag-daemon', LC_MESSAGES: 'C' });
+    expect(env).not.toHaveProperty('USER');
+  });
+  it('drops every registered drop name and unknown names from both sources, retaining launcher-owned paths', () => {
+    const dropped = Object.keys(registry).filter(key => registry[key].class === 'drop' && !key.endsWith('*'));
+    const unknown = ['SEC1_UNKNOWN', 'LC_HOSTILE_OPTIONS', 'LC_HOSTILE_TOKEN', 'CUSTOM_OPTIONS'];
+    const bag = Object.fromEntries([...dropped, ...unknown].map(key => [key, 'hostile']));
+    for (const [key, value] of Object.entries(bag)) vi.stubEnv(key, value);
+    const ambient = buildAgentInvocation(base(), seam()).options.env;
+    const explicit = buildAgentInvocation({ ...base(), inheritEnv: bag }, seam()).options.env;
+    for (const env of [ambient, explicit]) {
+      for (const key of [...dropped, ...unknown].filter(key => !['PATH', 'HOME'].includes(key))) expect(env, key).not.toHaveProperty(key);
+      expect(env.HOME).toBe(userInfo().homedir);
+      expect(env.PATH).toBe(`/usr/bin:/bin:/usr/sbin:/sbin:${dirname(process.execPath)}`);
+    }
+  });
+  it('drops the enabling value of personal-auth fallback from either source (refuse is covered below)', () => {
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'allow');
+    expect(buildAgentInvocation(base(), seam()).options.env).not.toHaveProperty('WE_GH_AUTH_PERSONAL_FALLBACK');
+    expect(buildAgentInvocation({ ...base(), inheritEnv: { WE_GH_AUTH_PERSONAL_FALLBACK: 'allow' } }, seam()).options.env)
+      .not.toHaveProperty('WE_GH_AUTH_PERSONAL_FALLBACK');
+  });
+  it('refuses malformed roots from either source and refuses masking a malformed ambient root', () => {
+    for (const bad of ['', 'relative', '-root', '/nul\0']) {
+      refused({ ...base(), inheritEnv: { LANE_POOL_ROOT: bad } }, /LANE_POOL_ROOT/);
+      if (!bad.includes('\0')) {
+        vi.stubEnv('LANE_POOL_ROOT', bad);
+        refused({ ...base(), inheritEnv: { LANE_POOL_ROOT: '/safe' } }, /LANE_POOL_ROOT/);
+        vi.stubEnv('LANE_POOL_ROOT', undefined);
+      }
+    }
+  });
+  it('requires a plain string record and keeps legacy isolation fields outside the closed grammar', () => {
+    for (const inheritEnv of [[], null, 'USER=safe', { USER: 1 }, { USER: undefined }, { USER: 'nul\0' }]) {
+      refused({ ...base(), inheritEnv }, /inheritEnv/);
+    }
+    for (const field of ['lanePoolRoot', 'underTest']) refused({ ...base(), [field]: true }, new RegExp(field));
+    const getter = vi.fn(); const bag = {}; Object.defineProperty(bag, 'USER', { get: getter });
+    refused({ ...base(), inheritEnv: bag }, /accessor/);
+    refused({ ...base(), inheritEnv: new Proxy({}, {}) }, /Proxy/);
+    expect(getter).not.toHaveBeenCalled();
+  });
+  it('snapshots bag and ambient env before a resolver can mutate either source', () => {
+    vi.stubEnv('WE_GH_DAEMON_CALLER', 'original-daemon');
+    const bag = { USER: 'original-user' };
+    const io = seam(); io.resolveBinary.mockImplementation(() => {
+      bag.USER = 'changed-user'; bag.NODE_OPTIONS = '--import=evil';
+      process.env.WE_GH_DAEMON_CALLER = 'changed-daemon';
+      return process.execPath;
+    });
+    launchAgent({ ...base(), inheritEnv: bag }, io);
+    expect(io.spawn.mock.calls[0][2].env).toMatchObject({ USER: 'original-user', WE_GH_DAEMON_CALLER: 'original-daemon' });
+    expect(io.spawn.mock.calls[0][2].env).not.toHaveProperty('NODE_OPTIONS');
+  });
+  it('keeps direct-task env-bag isolation and daemon identities in the launched child', () => {
+    const env = { LANE_POOL_ROOT: '/caller/pool', VITEST: 'caller-vitest', WE_UNDER_TEST: 'caller-test', WE_GH_DAEMON_CALLER: 'caller-daemon' };
+    const d = buildCodexDirectTaskDescriptor({ cwd, env, model: 'gpt-5.6-sol', effort: 'high' });
+    expect(d.inheritEnv).toBe(env);
+    expect(buildAgentInvocation(d, seam()).options.env).toMatchObject(env);
+  });
+});
+
 describe('admission hook point (#7090 moves runtime admission here)', () => {
   it('defaults to allow and passes the exact final spec, frozen', () => {
     const io = seam(); io.admit = vi.fn(() => true);
@@ -251,5 +326,23 @@ describe('admission hook point (#7090 moves runtime admission here)', () => {
     const io = seam(); io.admit = spec => { try { spec.args.push('--dangerous'); } catch { /* frozen */ } return true; };
     launchAgent(base(), io);
     expect(io.spawn.mock.calls[0][1]).not.toContain('--dangerous');
+  });
+});
+
+describe('value-gated auth vars forward only their tightening values', () => {
+  const envOf = (inheritEnv) => buildAgentInvocation({ ...base(), ...(inheritEnv ? { inheritEnv } : {}) }, seam()).options.env;
+  it('forwards refuse/app and drops allow/personal, from either source', () => {
+    expect(envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: ' Refuse ', WE_GITHUB_AUTH: 'app' }))
+      .toMatchObject({ WE_GH_AUTH_PERSONAL_FALLBACK: ' Refuse ', WE_GITHUB_AUTH: 'app' });
+    const relaxed = envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', WE_GITHUB_AUTH: 'personal' });
+    expect(relaxed).not.toHaveProperty('WE_GH_AUTH_PERSONAL_FALLBACK');
+    expect(relaxed).not.toHaveProperty('WE_GITHUB_AUTH');
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'refuse');
+    expect(envOf()).toMatchObject({ WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' });
+  });
+  it('a relaxing bag value cannot override an ambient tightening one', () => {
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'refuse'); vi.stubEnv('WE_GITHUB_AUTH', 'app');
+    expect(envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', WE_GITHUB_AUTH: 'personal' }))
+      .toMatchObject({ WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_AUTH: 'app' });
   });
 });
