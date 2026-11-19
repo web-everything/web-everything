@@ -16,7 +16,7 @@ export function resolveHotPatchSettings({ env = process.env, tool = hotPatchDefa
   const strings = v => Array.isArray(v) && v.length > 0 && v.every(s => typeof s === 'string' && s.length > 0);
   const r = cascadePolicy('hotPatch', tool, { env, log, envValues, standard: hotPatchDefaults,
     valid: { ticks: v => positive(v) && Number.isInteger(v), minMinutes: positive, owedPrMinutes: positive,
-      owedMergeHours: positive, wake: v => typeof v === 'boolean', wakeMinIntervalMs: positive,
+      owedMergeHours: positive, queueExemptionMinutes: positive, wake: v => typeof v === 'boolean', wakeMinIntervalMs: positive,
       maxFiles: positive, maxPathChars: positive, ioTimeoutMs: positive, registrationTimeoutMs: positive,
       maxOutputBytes: positive, eligibleKinds: strings, neverPatchPaths: strings } });
   // Settings may extend protection; a preset never waives the never-patch floor.

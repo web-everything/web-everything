@@ -5320,3 +5320,12 @@ filesystem writes, and exercise rollback retry in a fresh Node process so in-mem
 markers cannot substitute for persisted evidence. Hot-patch watches keep their exact
 build binding when HEAD moves; ordinary force-adopt watches retain their successor behavior.
 Owed reconciliation runs inside the existing force-watch tick, without another scheduler.
+
+Hot-patch audit regressions (`audit-1/2/3`) require the owed ledger before the no-PR
+registration exception, re-read its exact invocation binding and clone HEAD, and withdraw
+registration if that evidence disappears. The adoption/rollback machinery and hot-patch
+settings remain in the non-waivable protection floor. `--queued` stores `inMergeQueueAt`;
+each owed tick uses the shared live membership reader and refuses unknown origins or
+unreadable membership. Without live evidence, the pure fallback expires after
+`hotPatch.queueExemptionMinutes` (120 by default); old records lacking a timestamp
+have no fallback exemption. A registration crash now retains its owed ledger.

@@ -3,6 +3,7 @@
   "minMinutes": 15,
   "owedPrMinutes": 120,
   "owedMergeHours": 24,
+  "queueExemptionMinutes": 120,
   "wake": true,
   "wakeMinIntervalMs": 120000,
   "maxFiles": 1024,
@@ -15,6 +16,13 @@
     "**/*security*", "**/*credential*", "**/*secret*", "**/*auth*", "**/*password*", ".env*", "**/.env*",
     ".claude/**", ".githooks/**", "scripts/hooks/**", "scripts/guard-*",
     "scripts/**/*merge-gate*", "scripts/**/*verify*", "scripts/ci/**",
-    "**/*migration*", "**/*migrate*"
+    "**/*migration*", "**/*migrate*",
+    "scripts/hot-patch.mjs", "scripts/lib/hot-patch.mjs", "scripts/lib/hot-patch-settings.*",
+    "scripts/lib/daemon-rebuild/smoke.mjs", "scripts/lib/daemon-rebuild/adopt.mjs",
+    "scripts/lib/daemon-rebuild/prepare.mjs", "scripts/lib/daemon-rebuild/rebuild.mjs",
+    "scripts/lib/daemon-rebuild/rebuild-job.mjs", "scripts/lib/daemon-rebuild/state.mjs",
+    "scripts/lib/daemon-rebuild/lease.mjs", "scripts/lib/daemon-rebuild/recovery.mjs",
+    "scripts/lib/daemon-force-adopt.mjs", "scripts/lib/daemon-overlays.mjs", "scripts/lib/overlay-adoption.mjs",
+    "scripts/lib/daemon-load-overlay.mjs", "scripts/lib/daemon-self-sync.mjs", "scripts/lib/daemon-rebuild-early-watch.mjs"
   ]
 }

@@ -16,6 +16,8 @@ import { addOverlay, removeOverlay as dropOverlay, readOverlayState, appendOverl
 import { writeRebuildRequest } from './daemon-clone-lock.mjs';
 import { classifyTouchSet, STANDARD_DELIVERY_FLOW } from './delivery-flow.mjs';
 import { resolveHotPatchSettings, hotPatchDefaults } from './hot-patch-settings.mjs';
+import { readMergeQueueMembership } from './enqueue-on-event.mjs';
+import { repoSlugFromRemote } from './lane-verify.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 
 const validSha = s => typeof s === 'string' && /^[a-f0-9]{40}$/.test(s);
@@ -82,11 +84,15 @@ export function classifyHotPatch(input = {}) {
 }
 
 /** PURE. Queue membership exempts only the merge deadline, never the PR/verify obligation. */
-export function evaluateOwed({ record, now = Date.now() }) {
+export function evaluateOwed({ record, now = Date.now(), settings = hotPatchDefaults, queueVerified = null }) {
   const at = typeof now === 'function' ? now() : Number(now);
   if (!Number.isFinite(at) || !Number.isFinite(Date.parse(record?.owed?.mergeBy))
     || !Number.isFinite(Date.parse(record?.owed?.prBy))) return 'block-new';
-  if (at >= Date.parse(record.owed.mergeBy) && !record.merged && record.inMergeQueue !== true) return 'rollback';
+  const queuedAt = Date.parse(record.inMergeQueueAt);
+  const queued = record.inMergeQueue === true && (queueVerified === true
+    || (queueVerified === null && Number.isFinite(queuedAt) && queuedAt <= at
+      && at - queuedAt < settings.queueExemptionMinutes * 60_000));
+  if (at >= Date.parse(record.owed.mergeBy) && !record.merged && !queued) return 'rollback';
   if (at >= Date.parse(record.owed.prBy) && (!record.owed.pr || record.owed.verify !== 'green')) return 'block-new';
   return 'ok';
 }
@@ -142,15 +148,29 @@ export async function requestHotPatch({ root, env = process.env, daemon, branch,
   });
   if (!result.ok || dryRun) return result;
   let entry, accepted = false;
+  const head = cloneHead(root);
+  const assertRegistration = () => {
+    if (!head || cloneHead(root) !== head || !isDeepStrictEqual(readHotPatch(root, env), reservation))
+      throw new Error('head-or-record-changed; repair state or use ordinary delivery');
+  };
   try {
-    await registerOverlay();
+    const published = mutate(root, env, (record, watch, state) => {
+      const result = check(record, watch, state);
+      if (result.ok) { write(root, env, reservation); assertRegistration(); }
+      return { result };
+    });
+    if (!published.ok) return published;
+    assertRegistration();
+    await registerOverlay(assertRegistration);
+    assertRegistration();
     const overlays = readOverlayState(root, { env });
     entry = overlays.overlays.find(o => o.ref === branch);
     if (overlays.corrupt || !entry) throw new Error('overlay registration unavailable');
     if (await emit({ kind: 'hot-patch-loaded', daemon, detail: { root, sha, branch } }) === false) throw new Error('wake event failed');
     const committed = mutate(root, env, (record, watch, state) => {
-      const result = check(record, watch, state);
-      if (!result.ok) return { result };
+      assertRegistration();
+      if (watch || state === 'unreadable') throw new Error('watch changed during registration');
+      const result = { ok: true, record: reservation };
       const fresh = readOverlayState(root, { env });
       if (fresh.corrupt || !isDeepStrictEqual(entry, fresh.overlays.find(o => o.ref === branch))) throw new Error('overlay changed');
       write(root, env, reservation);
@@ -182,6 +202,10 @@ export async function requestHotPatch({ root, env = process.env, daemon, branch,
 /** Called only for a smoke-passed candidate and again under the ready-adoption lock. */
 export function openHotPatchWatch({ root, env = process.env, plan, lastGood, smokePassed, now = Date.now }) {
   const settings = resolveHotPatchSettings({ env });
+  try {
+    readFileSync(pendingPath(root, env), 'utf8');
+    return { ok: false, reason: 'hot-patch-registration-pending' };
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
   return mutate(root, env, (record, watch, state) => {
     const matching = record && (record.sha === plan.finalSha
       || plan.applied?.some(a => a.ref === record.branch && a.sha === record.sha));
@@ -256,7 +280,7 @@ export async function recordVerifyResult({ root, env = process.env, sha, result,
   return out;
 }
 
-export function recordHotPatchPr({ root, env = process.env, sha, pr, inMergeQueue = false }) {
+export function recordHotPatchPr({ root, env = process.env, sha, pr, inMergeQueue = false, now = Date.now }) {
   if (typeof sha === 'string') sha = sha.toLowerCase();
   if (!Number.isSafeInteger(pr) || pr <= 0) return { ok: false, reason: 'invalid-pr' };
   return mutate(root, env, record => {
@@ -265,7 +289,8 @@ export function recordHotPatchPr({ root, env = process.env, sha, pr, inMergeQueu
     if (state.corrupt) throw new Error('overlay state unreadable');
     const entry = state.overlays.find(o => o.ref === record.branch);
     if (entry) addOverlay(root, { ...entry, pr }, { env, expectedOverlay: entry });
-    write(root, env, { ...record, owed: { ...record.owed, pr }, inMergeQueue: inMergeQueue === true });
+    write(root, env, { ...record, owed: { ...record.owed, pr }, inMergeQueue: inMergeQueue === true,
+      inMergeQueueAt: inMergeQueue === true ? new Date(typeof now === 'function' ? now() : now).toISOString() : null });
     return { result: { ok: true } };
   });
 }
@@ -285,18 +310,27 @@ export async function closeHotPatch({ root, env = process.env, sha, reason = 'me
   return result;
 }
 
-export async function runOwedTick({ root, env = process.env, now = Date.now,
+// One shared, throttled queue read per owed tick; unknown origin/membership grants no exemption.
+async function readHotPatchQueue({ root, env, num }) {
+  const remote = spawnSync('git', ['remote', 'get-url', 'origin'],
+    { cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 4096 });
+  const repo = remote.status === 0 ? repoSlugFromRemote(remote.stdout) : null;
+  return repo ? readMergeQueueMembership({ repo, num, env }) : { ok: false };
+}
+
+export async function runOwedTick({ root, env = process.env, now = Date.now, readQueue = readHotPatchQueue,
   emit = e => appendDaemonEvent(e, { env }), removeOverlay = removeHotPatchOverlay }) {
+  try {
+    const pending = JSON.parse(readFileSync(pendingPath(root, env), 'utf8'));
+    if (pending.pid > 0) {
+      try { process.kill(pending.pid, 0); return 'block-new'; }
+      catch (e) { if (e.code !== 'ESRCH') throw e; }
+    }
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  rmSync(pendingPath(root, env), { force: true });
   const record = readHotPatch(root, env);
   if (!record) {
     // Only registrations explicitly owned by this path may be reconciled.
-    try {
-      const pending = JSON.parse(readFileSync(pendingPath(root, env), 'utf8'));
-      if (pending.pid > 0) {
-        try { process.kill(pending.pid, 0); return 'block-new'; }
-        catch (e) { if (e.code !== 'ESRCH') throw e; }
-      }
-    } catch (e) { if (e.code !== 'ENOENT') throw e; }
     const state = readOverlayState(root, { env });
     if (state.corrupt) throw new Error('overlay state unreadable; repair before adoption');
     for (const entry of state.overlays.filter(o => o.reason === 'R1100 hot-patch'))
@@ -304,7 +338,16 @@ export async function runOwedTick({ root, env = process.env, now = Date.now,
     rmSync(pendingPath(root, env), { force: true });
     return 'ok';
   }
-  const verdict = evaluateOwed({ record, now });
+  const settings = resolveHotPatchSettings({ env });
+  const at = typeof now === 'function' ? now() : Number(now);
+  let queueVerified = false;
+  if (record.inMergeQueue === true && record.owed.pr) {
+    try {
+      const membership = await readQueue({ root, env, num: record.owed.pr });
+      queueVerified = membership?.ok === true && membership.inQueue === true;
+    } catch { /* Unreadable membership owes ordinary rollback. */ }
+  }
+  const verdict = evaluateOwed({ record, now: at, settings, queueVerified });
   if (verdict === 'rollback' || record.rollbackPending) {
     // Keep the ledger until the watch actually reverts the running build. A failed rollback remains owed.
     const marked = updateResult({ root, env, sha: record.sha, reason: record.rollbackPending ?? 'owed-merge-deadline' });

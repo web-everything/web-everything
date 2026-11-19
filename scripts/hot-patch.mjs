@@ -89,9 +89,13 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd(), 
       if (result.ok) {
         const before = readOverlayState(root, { env });
         if (before.corrupt || before.overlays.some(o => o.ref === f.branch)) throw new Error('overlay state unreadable or branch already registered; use a fresh branch');
-        result = await requestHotPatch({ ...request, registerOverlay: () => invoke(process.execPath,
-          [join(dirname(fileURLToPath(import.meta.url)), 'daemon-overlay.mjs'), 'add',
-            `--clone=${root}`, `--ref=${f.branch}`, `--expected-sha=${f.sha}`, '--pinned', '--allow-no-pr', '--reason=R1100 hot-patch', '--json'], settings.registrationTimeoutMs) });
+        result = await requestHotPatch({ ...request, registerOverlay: assertRegistration => {
+          if (pin(f.sha) !== f.sha) throw new Error('hot-patch head changed');
+          assertRegistration();
+          return invoke(process.execPath,
+            [join(dirname(fileURLToPath(import.meta.url)), 'daemon-overlay.mjs'), 'add',
+              `--clone=${root}`, `--ref=${f.branch}`, `--expected-sha=${f.sha}`, '--pinned', '--allow-no-pr', '--reason=R1100 hot-patch', '--json'], settings.registrationTimeoutMs);
+        } });
       }
     } else if (command === 'verify-result') result = await recordVerifyResult({ root, env, sha: f.sha, result: f.result });
     else if (command === 'pr') result = recordHotPatchPr({ root, env, sha: f.sha, pr: Number(f.pr), inMergeQueue: f.queued });

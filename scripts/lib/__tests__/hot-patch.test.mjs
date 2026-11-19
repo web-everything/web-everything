@@ -69,11 +69,14 @@ test('checklist-7: unknown, oversized and malformed classifier evidence refuses 
 test('settings use cascade provenance and retain never-patch floor', fixture(({ env }) => {
   writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ hotPatch: { ticks: 12, wake: false } }));
   const logs = [];
-  const settings = resolveHotPatchSettings({ env: { ...env, WE_HOT_PATCH: '{"ticks":14}', WE_POLICY_CASCADE_LOG: '1' },
+  const settings = resolveHotPatchSettings({ env: { ...env, WE_HOT_PATCH: '{"ticks":14,"queueExemptionMinutes":60}', WE_POLICY_CASCADE_LOG: '1' },
     tool: { owedPrMinutes: 30, neverPatchPaths: ['extra/**'] }, log: line => logs.push(line) });
   assert.equal(settings.ticks, 14); assert.equal(settings.wake, false); assert.equal(settings.owedPrMinutes, 30);
   assert(settings.neverPatchPaths.includes('extra/**')); assert(settings.neverPatchPaths.includes('scripts/guard-*'));
   assert.match(logs.join('\n'), /ticks=14.*env/);
+  assert.equal(hotPatchDefaults.queueExemptionMinutes, 120);
+  assert.equal(settings.queueExemptionMinutes, 60);
+  assert.match(logs.join('\n'), /queueExemptionMinutes=60.*env/);
 }));
 
 test('checklist-4: concurrent requests for one daemon open exactly once; dry-run and deadlines', fixture(async ({ request, events, env, root }) => {
@@ -103,6 +106,7 @@ test('owed decisions: ok, PR missing, verify missing, merge rollback and queue e
   assert.equal(evaluateOwed({ record, now: at + 120 * 60000 }), 'ok');
   assert.equal(evaluateOwed({ record, now: at + 24 * 3600000 }), 'rollback');
   record.inMergeQueue = true;
+  record.inMergeQueueAt = new Date(at + 24 * 3600000).toISOString();
   assert.equal(evaluateOwed({ record, now: at + 24 * 3600000 }), 'ok');
   record.owed.verify = 'pending';
   assert.equal(evaluateOwed({ record, now: at + 24 * 3600000 }), 'block-new');
@@ -236,6 +240,9 @@ function cliGitFixture({ root, env }, baseFiles = { 'README.md': 'base\n' }) {
     calls.push({ cmd, args, options });
     if (cmd === 'git') return spawnSync(cmd, args, options);
     assert.equal(cmd, process.execPath); assert(args.includes('add')); assert(args.includes('--pinned'));
+    const record = readHotPatch(root, env);
+    assert.equal(record.daemon, root); assert.equal(record.sha, args.find(a => a.startsWith('--expected-sha=')).split('=')[1]);
+    assert(args.includes('--allow-no-pr'));
     registrations++;
     addOverlay(root, { ref: 'lane/repair', pinned: true }, { env });
     return { status: 0, stdout: '{}', stderr: '' };
@@ -387,7 +394,7 @@ for (const failure of ['overlay', 'event']) {
   test(`checklist-8: failed ${failure} leaves no open record or reservation`, fixture(async ({ root, env, request }) => {
     const out = await requestHotPatch({ ...request,
       ...(failure === 'overlay' ? { registerOverlay: () => { addOverlay(root, { ref: request.branch, pinned: true, reason: 'R1100 hot-patch' }, { env }); throw new Error('overlay failed'); } }
-        : { emit: () => { assert.equal(readHotPatch(root, env), null);
+        : { emit: () => { assert.equal(readHotPatch(root, env).sha, request.sha);
           assert.equal(readOverlays(root, { env }).length, 1); throw new Error('sink failed'); } }) });
     assert.equal(out.ok, false);
     assert.equal(readHotPatch(root, env), null); assert.equal(existsSync(`${hotPatchPath(root, env)}.pending`), false);
@@ -396,17 +403,15 @@ for (const failure of ['overlay', 'event']) {
   }));
 }
 
-test('checklist-9: tick withdraws crash-orphan overlay before it can adopt unwatched', fixture(async f => {
+test('checklist-9: crash after registration retains the owed ledger and rolls back on deadline', fixture(async f => {
   const { root, env, plan, git } = f;
   git(['checkout', '-q', 'main']);
   // Die after the real registration, bypassing finally as an actual crash would.
   nativeWriteProbe(`request.emit = () => process.exit(0); await requestHotPatch(request); assert.fail('must exit before publication');`, f);
-  assert.equal(readHotPatch(root, env), null); assert.equal(readOverlays(root, { env }).length, 1);
+  assert.equal(readHotPatch(root, env).sha, sha); assert.equal(readOverlays(root, { env }).length, 1);
   assert.equal(existsSync(`${hotPatchPath(root, env)}.pending`), true);
-  assert.equal(openHotPatchWatch({ root, env, plan, lastGood: { head: good }, smokePassed: true }).ok, false);
-  assert.equal(await runOwedTick({ root, env }), 'ok');
+  assert.equal(await runOwedTick({ root, env, now: () => Date.now() + 25 * 3600000 }), 'rollback');
   assert.deepEqual(readOverlays(root, { env }), []); assert.equal(readForceWatch(root, env), null);
-  assert.equal(existsSync(`${hotPatchPath(root, env)}.pending`), false);
   assert.equal(git(['rev-parse', 'HEAD']), good);
 }));
 
@@ -510,4 +515,106 @@ test('checklist-5: a watch for a different build cannot authorize this patch', f
   const watch = readForceWatch(root, env);
   writeFileSync(watchPath(root, env), JSON.stringify({ ...watch, sha: good }));
   assert.equal(arm().ok, false); assert.equal(readForceWatch(root, env).sha, good);
+}));
+
+
+for (const path of [
+  'scripts/hot-patch.mjs', 'scripts/lib/hot-patch.mjs', 'scripts/lib/hot-patch-settings.json',
+  'scripts/lib/hot-patch-settings.mjs',
+  ...['smoke', 'adopt', 'prepare', 'rebuild', 'rebuild-job', 'state', 'lease', 'recovery'].map(n => `scripts/lib/daemon-rebuild/${n}.mjs`),
+  ...['daemon-force-adopt', 'daemon-overlays', 'overlay-adoption', 'daemon-load-overlay', 'daemon-self-sync', 'daemon-rebuild-early-watch'].map(n => `scripts/lib/${n}.mjs`),
+]) {
+  test(`audit-2: adoption and rollback floor cannot be waived: ${path}`, () => {
+    assert.equal(classifyHotPatch({ files: [path], kind: 'incident',
+      settings: { ...hotPatchDefaults, neverPatchPaths: [] } }).ok, false);
+  });
+}
+
+for (const change of ['missing', 'wrong-daemon', 'wrong-sha', 'head']) {
+  test(`audit-1: registration refuses ${change} evidence before passing no-PR bypass`, fixture(async f => {
+    const c = cliGitFixture(f);
+    c.put('scripts/lib/daemon-tool.mjs', 'fix\n'); const patch = c.commit();
+    const run = c.deps.run; let pins = 0;
+    c.deps.run = (cmd, args, options) => {
+      // Second pin occurs after this invocation has written its ledger, before registration.
+      if (cmd === 'git' && args.includes(`${patch}^{commit}`) && ++pins === 2) {
+        const record = readHotPatch(f.root, f.env);
+        assert.equal(record.sha, patch);
+        if (change === 'missing') rmSync(hotPatchPath(f.root, f.env));
+        else if (change === 'head') f.git(['commit', '--allow-empty', '-qm', 'successor']);
+        else writeFileSync(hotPatchPath(f.root, f.env), JSON.stringify({ ...record,
+          ...(change === 'wrong-daemon' ? { daemon: 'other' } : { sha: good }) }));
+      }
+      return run(cmd, args, options);
+    };
+    assert.equal(await main(c.argv(patch), c.deps), 1);
+    assert.equal(c.registrations(), 0);
+    assert.deepEqual(readOverlays(f.root, { env: f.env }), []);
+  }));
+}
+
+test('audit-1: ledger removed during registration withdraws the no-PR overlay', fixture(async f => {
+  const c = cliGitFixture(f);
+  c.put('scripts/lib/daemon-tool.mjs', 'fix\n'); const patch = c.commit(), run = c.deps.run;
+  c.deps.run = (cmd, args, options) => {
+    const out = run(cmd, args, options);
+    if (cmd === process.execPath) rmSync(hotPatchPath(f.root, f.env));
+    return out;
+  };
+  assert.equal(await main(c.argv(patch), c.deps), 1);
+  assert.equal(c.registrations(), 1);
+  assert.deepEqual(readOverlays(f.root, { env: f.env }), []);
+}));
+
+for (const membership of [{ ok: true, inQueue: false }, { ok: false }, null]) {
+  test(`audit-3: caller queued claim cannot waive rollback on nonmembership or unreadable queue: ${JSON.stringify(membership)}`, fixture(async ({ root, env, request }) => {
+    await requestHotPatch(request);
+    recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
+    await recordVerifyResult({ root, env, sha, result: 'green' });
+    let reads = 0;
+    const readQueue = async ({ num }) => { assert.equal(num, 42); reads++; return membership; };
+    assert.equal(await runOwedTick({ root, env, now: at + 24 * 3600000, readQueue }), 'rollback');
+    assert.equal(reads, 1); assert.deepEqual(readOverlays(root, { env }), []);
+  }));
+}
+
+test('audit-3: historical, expired and future queue timestamps cannot grant fallback exemption', () => {
+  const record = { inMergeQueue: true, owed: { pr: 42, verify: 'green',
+    prBy: new Date(at).toISOString(), mergeBy: new Date(at).toISOString() } };
+  for (const timestamp of [undefined, 'bad', new Date(at - 120 * 60000).toISOString(), new Date(at + 1).toISOString()]) {
+    assert.equal(evaluateOwed({ record: { ...record, inMergeQueueAt: timestamp }, now: at }), 'rollback');
+  }
+  assert.equal(evaluateOwed({ record: { ...record, inMergeQueueAt: new Date(at - 60000).toISOString() },
+    now: at, settings: { ...hotPatchDefaults, queueExemptionMinutes: 1 } }), 'rollback');
+});
+
+test('audit-3: every owed tick rechecks real queue membership, including after a successful check', fixture(async ({ root, env, request }) => {
+  await requestHotPatch(request);
+  recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
+  assert.equal(readHotPatch(root, env).inMergeQueueAt, new Date(at).toISOString());
+  await recordVerifyResult({ root, env, sha, result: 'green' });
+  let reads = 0;
+  const readQueue = async () => ({ ok: true, inQueue: ++reads === 1 });
+  const args = { root, env, now: at + 24 * 3600000, readQueue };
+  assert.equal(await runOwedTick(args), 'ok');
+  assert.equal(await runOwedTick(args), 'rollback'); assert.equal(reads, 2);
+}));
+
+
+test('audit-3: default queue reader refuses unknown origin instead of trusting --queued', fixture(async ({ root, env, request }) => {
+  await requestHotPatch(request);
+  recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
+  await recordVerifyResult({ root, env, sha, result: 'green' });
+  assert.equal(await runOwedTick({ root, env, now: at + 24 * 3600000 }), 'rollback');
+}));
+
+
+test('audit-1: prewritten ledger cannot authorize adoption while registration is pending', fixture(async ({ root, env, request, arm }) => {
+  const out = await requestHotPatch({ ...request, registerOverlay: assertRegistration => {
+    assertRegistration();
+    addOverlay(root, { ref: request.branch, pinned: true }, { env });
+    assert.equal(arm().ok, false);
+    assert.equal(readForceWatch(root, env), null);
+  } });
+  assert.equal(out.ok, true); assert.equal(arm().ok, true);
 }));
