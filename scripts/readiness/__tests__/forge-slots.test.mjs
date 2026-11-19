@@ -98,4 +98,41 @@ describe('Forge slot settings', () => {
     expect(setup).toContain('Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS');
     expect(setup).toContain(`printf 'Environment=FORGE_EXEC_SLOTS=%s\\n' "$FORGE_EXEC_SLOTS" >> /etc/systemd/system/forge-exec-sweep.service`);
   });
+  it.each([128, 129])('setup revalidates retained slot-%i before any provisioning', count => {
+    const dir = fixture();
+    const pool = join(dir, 'pool'); mkdirSync(pool); mkdirSync(join(pool, `slot-${count}`));
+    const guard = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('if ! id forge-exec'))
+      .replaceAll('/srv/forge-exec', pool);
+    writeFileSync(join(dir, 'forge-setup.sh'), guard + '\nprintf "provisioning"\n');
+    const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 65536, env: {PATH: process.env.PATH, FORGE_HOST: 'forge-b'},
+    });
+    expect(result.status, result.stderr).toBe(count > 128 ? 1 : 0);
+    expect(result.stdout).toBe(count > 128 ? '' : 'provisioning');
+    if (count > 128) expect(result.stderr).toContain('forge-setup: FORGE_EXEC_SLOTS must be 1..128');
+  });
+  it.each([
+    ['installed users', 14, 11, {}, 14],
+    ['installed paths', 11, 14, {}, 14],
+    ['larger resolved count', 4, 6, {FORGE_HOST: 'forge'}, 14],
+    ['explicit count', 14, 14, {FORGE_EXEC_SLOTS: '8'}, 8],
+    ['UID override', 14, 14, {FORGE_EGRESS_UIDS: '999'}, 0],
+    ['unreadable user database', 14, 14, {PASSWD_FAIL: '1'}, -1],
+    ['missing retained user', 14, 14, {MISSING_SLOT: '14'}, -1],
+  ])('standalone egress respects %s', (_, users, paths, overrides, count) => {
+    const dir = fixture();
+    const pool = join(dir, 'pool'); mkdirSync(pool); mkdirSync(join(pool, `slot-${paths}`));
+    writeFileSync(join(dir, 'forge-egress.sh'), readFileSync(join(source, 'forge-egress.sh'), 'utf8')
+      .replaceAll('/srv/forge-exec', pool));
+    writeFileSync(join(dir, 'getent'), `#!/bin/bash\n[[ -z "\${PASSWD_FAIL:-}" ]] || exit 1\nprintf 'test-slot-${users}:x:2014:2014::/:/bin/false\\n'\n`, {mode: 0o755});
+    writeFileSync(join(dir, 'id'), '#!/bin/bash\nk=${2##*-}\n[[ "$k" != "${MISSING_SLOT:-}" ]] || exit 1\necho $((2000 + k))\n', {mode: 0o755});
+    const result = spawnSync('/bin/bash', [join(dir, 'forge-egress.sh'), 'render'], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+      env: {PATH: dir + ':' + process.env.PATH, FORGE_HOST: 'forge-b', FORGE_EGRESS_USER_PREFIX: 'test-slot-',
+        FORGE_EGRESS_STATE_DIR: join(dir, 'state'), FORGE_EGRESS_REGISTRY_V4: '', FORGE_EGRESS_REGISTRY_V6: '', ...overrides},
+    });
+    expect(result.status, result.stderr).toBe(count < 0 ? 1 : 0);
+    if (count < 0) expect(result.stdout).toBe('');
+    else expect(result.stdout).toContain(`meta skuid { ${count === 0 ? '999' : Array.from({length: count}, (_, i) => 2001 + i).join(', ')} } jump slot_egress`);
+  });
 });

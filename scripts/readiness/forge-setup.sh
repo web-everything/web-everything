@@ -62,6 +62,10 @@ for existing in /srv/forge-exec/slot-*; do
     echo "forge-setup: setting lower than installed pool; keeping $FORGE_EXEC_SLOTS installed slots; inspect reservations before manual retirement" >&2
   fi
 done
+if [[ ! "$FORGE_EXEC_SLOTS" =~ ^[1-9][0-9]*$ ]] || (( FORGE_EXEC_SLOTS > 128 )); then
+  echo 'forge-setup: FORGE_EXEC_SLOTS must be 1..128' >&2
+  exit 1
+fi
 if ! id forge-exec >/dev/null 2>&1; then
   useradd --system --user-group --home-dir /srv/forge-exec --shell /bin/bash forge-exec
 fi

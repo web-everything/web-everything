@@ -19,6 +19,26 @@
 set -euo pipefail
 
 SLOTS=$(bash "$(dirname -- "$0")/forge-slots.sh")
+# Standalone refreshes must also contain a pool retained after settings were lowered.
+# Explicit counts and UID fixtures keep their existing override semantics.
+if [[ -z "${FORGE_EXEC_SLOTS+x}" && -z "${FORGE_EGRESS_UIDS+x}" ]]; then
+  if command -v getent >/dev/null 2>&1; then
+    installed_users=$(getent passwd)
+  else
+    installed_users=$(< /etc/passwd)
+  fi
+  prefix=${FORGE_EGRESS_USER_PREFIX:-forge-exec-}
+  while IFS=: read -r user rest; do
+    [[ "$user" == "$prefix"* ]] || continue
+    suffix=${user#"$prefix"}
+    if [[ "$suffix" =~ ^[1-9][0-9]*$ ]] && (( suffix > SLOTS )); then SLOTS=$suffix; fi
+  done <<<"$installed_users"
+  for existing in /srv/forge-exec/slot-*; do
+    if [[ "$existing" =~ /slot-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > SLOTS )); then
+      SLOTS=${BASH_REMATCH[1]}
+    fi
+  done
+fi
 REGISTRY_HOST=registry.npmjs.org
 TABLE=forge_exec_egress
 
